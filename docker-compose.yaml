@@ -1,0 +1,14 @@
+services:
+  app-listener:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-listener
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    cap_add:
+      - BPF
+      - SYS_ADMIN
+    volumes:
+      - ${MONITOR_DIR:-./data}:/data:ro
