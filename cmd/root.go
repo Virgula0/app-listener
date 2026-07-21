@@ -13,10 +13,15 @@ var rootCmd = &cobra.Command{
 	Use:   "app-listener",
 	Short: "Monitor file system events using eBPF",
 	Long:  `app-listener is a TUI application that monitors file system operations using eBPF.`,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		initLogger()
+		return nil
+	},
 }
 
+var logLevel string
+
 func Execute() error {
-	initLogger()
 	return rootCmd.Execute()
 }
 
@@ -28,10 +33,17 @@ func initLogger() {
 		DisableLevelTruncation: true,
 		PadLevelText:           true,
 	})
-	log.SetOutput(os.Stdout)
-	log.SetLevel(log.InfoLevel)
+	log.SetOutput(os.Stderr)
+
+	level, err := log.ParseLevel(logLevel)
+	if err != nil {
+		log.Warnf("invalid log level %q, using info", logLevel)
+		level = log.InfoLevel
+	}
+	log.SetLevel(level)
 }
 
 func init() {
+	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "info", "Set log level (debug, info, warn, error)")
 	rootCmd.AddCommand(monitor.MonitorCmd)
 }

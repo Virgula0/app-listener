@@ -6,4 +6,5 @@ const (
 
 var (
 	Recursive bool
+	Depth     int
 )

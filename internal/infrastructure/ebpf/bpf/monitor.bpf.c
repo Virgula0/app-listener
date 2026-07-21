@@ -1,7 +1,7 @@
-#include <linux/types.h>
-#include <linux/bpf.h>
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 
 #define MAX_PATH 256
 
@@ -63,33 +63,50 @@ static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, co
 	return 0;
 }
 
-SEC("kprobe/__x64_sys_openat")
-int trace_openat(struct pt_regs *ctx)
+/*
+ * On modern hardened kernels (>= 6.x), the syscall entry path
+ * (entry_SYSCALL_64) uses PUSH_AND_CLEAR_REGS which zeros all GPRs
+ * before calling the __x64_sys_* wrapper. This means PT_REGS_PARM*(ctx)
+ * returns 0 for all args when hooked via kprobe on __x64_sys_*.
+ * 
+ * Instead we hook the internal functions (do_sys_open, ksys_read, etc.)
+ * which receive the actual syscall arguments directly in registers.
+ */
+
+SEC("kprobe/do_sys_open")
+int trace_do_sys_open(struct pt_regs *ctx)
 {
 	const char *filename = (const char *)PT_REGS_PARM2(ctx);
 	return emit_event(EVENT_OPEN, 0, filename, NULL);
 }
 
-SEC("kprobe/__x64_sys_open")
-int trace_open(struct pt_regs *ctx)
+SEC("kprobe/do_sys_openat2")
+int trace_do_sys_openat2(struct pt_regs *ctx)
 {
-	const char *filename = (const char *)PT_REGS_PARM1(ctx);
+	const char *filename = (const char *)PT_REGS_PARM2(ctx);
 	return emit_event(EVENT_OPEN, 0, filename, NULL);
 }
 
-SEC("kprobe/__x64_sys_read")
-int trace_read(struct pt_regs *ctx)
+SEC("kprobe/ksys_read")
+int trace_ksys_read(struct pt_regs *ctx)
 {
 	__u32 fd = (__u32)PT_REGS_PARM1(ctx);
 	return emit_event(EVENT_READ, fd, NULL, NULL);
 }
 
-SEC("kprobe/__x64_sys_write")
-int trace_write(struct pt_regs *ctx)
+SEC("kprobe/ksys_write")
+int trace_ksys_write(struct pt_regs *ctx)
 {
 	__u32 fd = (__u32)PT_REGS_PARM1(ctx);
 	return emit_event(EVENT_WRITE, fd, NULL, NULL);
 }
+
+/*
+ * For the remaining operations (unlinkat, renameat2, etc.) we keep the
+ * __x64_sys_* hooks. These will fire but the path args will be empty
+ * on hardened kernels due to register clearing.
+ * TODO: find internal function equivalents for these operations.
+ */
 
 SEC("kprobe/__x64_sys_unlinkat")
 int trace_unlinkat(struct pt_regs *ctx)

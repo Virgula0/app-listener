@@ -1,0 +1,19 @@
+# Build output
+build/
+
+# Generated BPF bindings (intermediate)
+build/generated/
+
+# BPF compiled objects (generated)
+*.bpf.o
+
+# vmlinux.h is generated from BTF
+vmlinux.h
+
+# IDE / local
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
