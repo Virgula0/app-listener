@@ -8,7 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/Virgula0/app-listener/internal/infrastructure/ebpf"
+	"github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 const maxEvents = 500

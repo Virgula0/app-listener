@@ -11,7 +11,7 @@ import (
 
 	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/printers"
-	"github.com/Virgula0/app-listener/internal/infrastructure/ebpf"
+	"github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/tui"
 )
 
@@ -61,8 +61,7 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 	}
 
 	if entity.Depth > 0 && !entity.Recursive {
-		log.Warn("--depth requires --recursive, ignoring depth")
-		entity.Depth = 0
+		return errors.New("--depth requires --recursive flag")
 	}
 
 	printers.PrintLogo()
