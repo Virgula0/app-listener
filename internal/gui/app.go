@@ -37,7 +37,7 @@ type guiModel struct {
 	filtered  []ebpf.FileEvent
 	filter    string
 	mu        sync.RWMutex
-	directory string
+	paths     []string
 	recursive bool
 	depth     int
 	cols      *columnState
@@ -291,12 +291,12 @@ func (hr *headerRenderer) Destroy() {}
 
 // ── Run ────────────────────────────────────────────────────────────────────
 
-func Run(events <-chan ebpf.FileEvent, directory string, recursive bool, depth int) {
+func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) {
 	m := &guiModel{
 		events:    events,
 		allEvents: make([]ebpf.FileEvent, 0, 500),
 		filtered:  make([]ebpf.FileEvent, 0, 500),
-		directory: directory,
+		paths:     paths,
 		recursive: recursive,
 		depth:     depth,
 		cols:      newColumnState(colDefaultWidths),
@@ -312,8 +312,8 @@ func Run(events <-chan ebpf.FileEvent, directory string, recursive bool, depth i
 	}
 
 	infoLabel := widget.NewLabel(
-		fmt.Sprintf("Directory: %s  |  Recursive: %s  |  Events: 0  |  Uptime: 0s",
-			directory, recursiveStr))
+		fmt.Sprintf("Watching: %s  |  Recursive: %s  |  Events: 0  |  Uptime: 0s",
+			strings.Join(paths, ", "), recursiveStr))
 
 	filterEntry := widget.NewEntry()
 	filterEntry.SetPlaceHolder("Filter by path, process, or event type...")
@@ -375,8 +375,8 @@ func (m *guiModel) listenEvents(
 		fyne.Do(func() {
 			list.Refresh()
 			infoLabel.SetText(fmt.Sprintf(
-				"Directory: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
-				m.directory, recursiveStr, count, uptime,
+				"Watching: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
+				strings.Join(m.paths, ", "), recursiveStr, count, uptime,
 			))
 		})
 	}
@@ -396,8 +396,8 @@ func (m *guiModel) uptimeTicker(
 		uptime := time.Since(startTime).Round(time.Second)
 		fyne.Do(func() {
 			infoLabel.SetText(fmt.Sprintf(
-				"Directory: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
-				m.directory, recursiveStr, count, uptime,
+				"Watching: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
+				strings.Join(m.paths, ", "), recursiveStr, count, uptime,
 			))
 		})
 	}

@@ -64,13 +64,8 @@ static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, co
 }
 
 /*
- * On modern hardened kernels (>= 6.x), the syscall entry path
- * (entry_SYSCALL_64) uses PUSH_AND_CLEAR_REGS which zeros all GPRs
- * before calling the __x64_sys_* wrapper. This means PT_REGS_PARM*(ctx)
- * returns 0 for all args when hooked via kprobe on __x64_sys_*.
- * 
- * Instead we hook the internal functions (do_sys_open, ksys_read, etc.)
- * which receive the actual syscall arguments directly in registers.
+ * Internal kernel function kprobes – args are passed in registers correctly
+ * on all kernel versions.
  */
 
 SEC("kprobe/do_sys_open")
@@ -102,47 +97,60 @@ int trace_ksys_write(struct pt_regs *ctx)
 }
 
 /*
- * For the remaining operations (unlinkat, renameat2, etc.) we keep the
- * __x64_sys_* hooks. These will fire but the path args will be empty
- * on hardened kernels due to register clearing.
- * TODO: find internal function equivalents for these operations.
+ * Tracepoints for syscall entry – work on all kernels including hardened
+ * 6.x where __x64_sys_* kprobes have zeroed registers.
+ * The trace_event_raw_sys_enter backing struct is provided by vmlinux.h (BTF).
  */
 
-SEC("kprobe/__x64_sys_unlinkat")
-int trace_unlinkat(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_open")
+int trace_open(struct trace_event_raw_sys_enter *ctx)
 {
-	const char *pathname = (const char *)PT_REGS_PARM2(ctx);
+	const char *filename = (const char *)ctx->args[0];
+	return emit_event(EVENT_OPEN, 0, filename, NULL);
+}
+
+SEC("tracepoint/syscalls/sys_enter_openat")
+int trace_openat(struct trace_event_raw_sys_enter *ctx)
+{
+	const char *filename = (const char *)ctx->args[1];
+	return emit_event(EVENT_OPEN, 0, filename, NULL);
+}
+
+SEC("tracepoint/syscalls/sys_enter_unlinkat")
+int trace_unlinkat(struct trace_event_raw_sys_enter *ctx)
+{
+	const char *pathname = (const char *)ctx->args[1];
 	return emit_event(EVENT_DELETE, 0, pathname, NULL);
 }
 
-SEC("kprobe/__x64_sys_renameat2")
-int trace_renameat2(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_renameat2")
+int trace_renameat2(struct trace_event_raw_sys_enter *ctx)
 {
-	const char *oldname = (const char *)PT_REGS_PARM2(ctx);
-	const char *newname = (const char *)PT_REGS_PARM4(ctx);
+	const char *oldname = (const char *)ctx->args[1];
+	const char *newname = (const char *)ctx->args[3];
 	return emit_event(EVENT_RENAME, 0, oldname, newname);
 }
 
-SEC("kprobe/__x64_sys_symlinkat")
-int trace_symlinkat(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_symlinkat")
+int trace_symlinkat(struct trace_event_raw_sys_enter *ctx)
 {
-	const char *target = (const char *)PT_REGS_PARM1(ctx);
-	const char *linkpath = (const char *)PT_REGS_PARM3(ctx);
+	const char *target = (const char *)ctx->args[0];
+	const char *linkpath = (const char *)ctx->args[2];
 	return emit_event(EVENT_SYMLINK, 0, target, linkpath);
 }
 
-SEC("kprobe/__x64_sys_linkat")
-int trace_linkat(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_linkat")
+int trace_linkat(struct trace_event_raw_sys_enter *ctx)
 {
-	const char *oldpath = (const char *)PT_REGS_PARM2(ctx);
-	const char *newpath = (const char *)PT_REGS_PARM4(ctx);
+	const char *oldpath = (const char *)ctx->args[1];
+	const char *newpath = (const char *)ctx->args[3];
 	return emit_event(EVENT_HARDLINK, 0, oldpath, newpath);
 }
 
-SEC("kprobe/__x64_sys_mkdirat")
-int trace_mkdirat(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_mkdirat")
+int trace_mkdirat(struct trace_event_raw_sys_enter *ctx)
 {
-	const char *pathname = (const char *)PT_REGS_PARM2(ctx);
+	const char *pathname = (const char *)ctx->args[1];
 	return emit_event(EVENT_MKDIR, 0, pathname, NULL);
 }
 

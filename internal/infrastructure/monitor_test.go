@@ -14,8 +14,12 @@ func TestMonitorUnitTest(t *testing.T) {
 	suite.Run(t, new(monitorUnitTest))
 }
 
-func (s *monitorUnitTest) TestInWatchDir() {
-	m := &Monitor{watchDir: "/tmp/watch"}
+func dirTarget(dir string) []Target {
+	return []Target{{Dir: dir, IsDir: true}}
+}
+
+func (s *monitorUnitTest) TestInWatchPath() {
+	m := &Monitor{targets: dirTarget("/tmp/watch")}
 
 	tests := []struct {
 		name     string
@@ -26,21 +30,65 @@ func (s *monitorUnitTest) TestInWatchDir() {
 		{name: "child path", path: "/tmp/watch/file.txt", expected: true},
 		{name: "nested child", path: "/tmp/watch/sub/dir/file.txt", expected: true},
 		{name: "non matching", path: "/var/log/syslog", expected: false},
-		{name: "similar prefix match", path: "/tmp/watch_extra", expected: true},
+		{name: "similar prefix no longer matches", path: "/tmp/watch_extra", expected: false},
 		{name: "empty path", path: "", expected: false},
 		{name: "root path", path: "/", expected: false},
 	}
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			result := m.inWatchDir(tt.path)
+			result := m.inWatchPath(tt.path, "")
+			s.Require().Equal(tt.expected, result)
+		})
+	}
+}
+
+func (s *monitorUnitTest) TestInWatchPathFileTarget() {
+	m := &Monitor{targets: []Target{{Dir: "/parent", File: "target.txt", IsDir: false}}}
+
+	tests := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{name: "exact basename", path: "target.txt", expected: true},
+		{name: "full path", path: "/parent/target.txt", expected: true},
+		{name: "different file", path: "/parent/other.txt", expected: false},
+		{name: "empty", path: "", expected: false},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			result := m.inWatchPath(tt.path, "")
+			s.Require().Equal(tt.expected, result)
+		})
+	}
+}
+
+func (s *monitorUnitTest) TestInWatchPathDest() {
+	m := &Monitor{targets: dirTarget("/watch")}
+
+	tests := []struct {
+		name     string
+		path     string
+		dest     string
+		expected bool
+	}{
+		{name: "path matches", path: "/watch/file", dest: "", expected: true},
+		{name: "dest matches", path: "", dest: "/watch/new", expected: true},
+		{name: "neither matches", path: "/other", dest: "", expected: false},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			result := m.inWatchPath(tt.path, tt.dest)
 			s.Require().Equal(tt.expected, result)
 		})
 	}
 }
 
 func (s *monitorUnitTest) TestMatchesFilterNonRecursive() {
-	m := &Monitor{watchDir: "/watch", recursive: false}
+	m := &Monitor{targets: dirTarget("/watch"), recursive: false}
 
 	tests := []struct {
 		name     string
@@ -64,7 +112,7 @@ func (s *monitorUnitTest) TestMatchesFilterNonRecursive() {
 }
 
 func (s *monitorUnitTest) TestMatchesFilterRecursiveNoDepth() {
-	m := &Monitor{watchDir: "/watch", recursive: true, depth: 0}
+	m := &Monitor{targets: dirTarget("/watch"), recursive: true, depth: 0}
 
 	tests := []struct {
 		name     string
@@ -75,7 +123,7 @@ func (s *monitorUnitTest) TestMatchesFilterRecursiveNoDepth() {
 		{name: "direct child", path: "/watch/file.txt", expected: true},
 		{name: "nested child", path: "/watch/sub/file.txt", expected: true},
 		{name: "deeply nested", path: "/watch/a/b/c/d/e.txt", expected: true},
-		{name: "outside watch (not rejected by matchesFilter alone)", path: "/other/file.txt", expected: true},
+		{name: "outside watch", path: "/other/file.txt", expected: false},
 	}
 
 	for _, tt := range tests {
@@ -88,7 +136,7 @@ func (s *monitorUnitTest) TestMatchesFilterRecursiveNoDepth() {
 }
 
 func (s *monitorUnitTest) TestMatchesFilterRecursiveWithDepth() {
-	m := &Monitor{watchDir: "/watch", recursive: true, depth: 2}
+	m := &Monitor{targets: dirTarget("/watch"), recursive: true, depth: 2}
 
 	tests := []struct {
 		name     string
@@ -100,7 +148,7 @@ func (s *monitorUnitTest) TestMatchesFilterRecursiveWithDepth() {
 		{name: "depth 2", path: "/watch/sub/file.txt", expected: true},
 		{name: "depth 3 (exceeds)", path: "/watch/a/b/file.txt", expected: false},
 		{name: "depth 4 (exceeds)", path: "/watch/a/b/c/d.txt", expected: false},
-		{name: "outside watch (exceeds depth due to rel path)", path: "/other/file.txt", expected: false},
+		{name: "outside watch", path: "/other/file.txt", expected: false},
 	}
 
 	for _, tt := range tests {

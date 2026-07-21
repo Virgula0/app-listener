@@ -2,8 +2,10 @@ package monitor
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
@@ -16,53 +18,81 @@ import (
 	"github.com/Virgula0/app-listener/internal/tui"
 )
 
-var MonitorCmd = &cobra.Command{
-	Use:   "monitor <directory>",
-	Short: "Monitor a directory for file system events",
-	Long: `Monitor a directory for file system events using eBPF.
+var watchPaths []string
 
-Supports recursive monitoring with configurable depth.
+var MonitorCmd = &cobra.Command{
+	Use:   "monitor",
+	Short: "Monitor files/directories for file system events",
+	Long: `Monitor one or more files or directories for file system events using eBPF.
+
+Use -w/--watch (repeatable) to specify paths to monitor.
+Accepts directories (to monitor all files within) or single files.
+When monitoring a file, only events for that specific file are shown.
 
 Examples:
-  app-listener monitor /tmp
-  app-listener monitor /var/log --recursive
-  app-listener monitor /home --recursive --depth 3`,
-	Args: cobra.ExactArgs(1),
+  app-listener monitor -w /tmp
+  app-listener monitor -w /var/log --recursive
+  app-listener monitor -w /home --recursive --depth 3
+  app-listener monitor -w /path/to/file.txt
+  app-listener monitor -w /dir1 -w /dir2 -w /path/to/file`,
+	Args: cobra.NoArgs,
 	RunE: runMonitor,
 }
 
 func init() {
+	MonitorCmd.Flags().StringSliceVarP(&watchPaths, "watch", "w", nil,
+		"Path to monitor (repeatable, required)")
 	MonitorCmd.Flags().BoolVarP(&entity.Recursive, "recursive", "r", false,
 		"Monitor directory recursively (default: false)")
 	MonitorCmd.Flags().IntVarP(&entity.Depth, "depth", "d", 0,
 		"Maximum directory depth (requires --recursive) (default: 0)")
 }
 
+type rawTarget struct {
+	absPath string
+	isDir   bool
+}
+
 func runMonitor(cmd *cobra.Command, args []string) error {
-	directory := args[0]
+	if len(watchPaths) == 0 {
+		return errors.New("at least one -w/--watch path is required")
+	}
 
-	absDir, err := filepath.Abs(directory)
+	rawTargets, err := resolveTargets(watchPaths)
 	if err != nil {
-		log.Errorf("Invalid directory path: %v", err)
 		return err
 	}
 
-	info, err := os.Stat(absDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			log.Errorf("Directory does not exist: %s", absDir)
-		} else {
-			log.Errorf("Cannot access directory %s: %v", absDir, err)
-		}
-		return err
-	}
-	if !info.IsDir() {
-		log.Errorf("Not a directory: %s", absDir)
+	if err := validateTargets(rawTargets); err != nil {
 		return err
 	}
 
-	if entity.Depth > 0 && !entity.Recursive {
+	recursive := entity.Recursive
+	depth := entity.Depth
+
+	if depth > 0 && !recursive {
 		return errors.New("--depth requires --recursive flag")
+	}
+
+	ebpfTargets := make([]ebpf.Target, len(rawTargets))
+	for i, rt := range rawTargets {
+		t := ebpf.Target{Path: rt.absPath, IsDir: rt.isDir}
+		if rt.isDir {
+			t.Dir = rt.absPath
+		} else {
+			t.Dir = filepath.Dir(rt.absPath)
+			t.File = filepath.Base(rt.absPath)
+		}
+		ebpfTargets[i] = t
+	}
+
+	for _, rt := range rawTargets {
+		if !rt.isDir && recursive {
+			log.Warnf("--recursive is ignored when monitoring a single file (%s)", rt.absPath)
+		}
+		if !rt.isDir && depth > 0 {
+			log.Warnf("--depth is ignored when monitoring a single file (%s)", rt.absPath)
+		}
 	}
 
 	printers.PrintLogo()
@@ -75,10 +105,8 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Infof("eBPF available — starting monitor")
-	log.Debugf("Monitoring directory: %s (recursive: %v, depth: %d)",
-		absDir, entity.Recursive, entity.Depth)
 
-	mon, err := ebpf.NewMonitor(absDir, entity.Recursive, entity.Depth)
+	mon, err := ebpf.NewMonitor(ebpfTargets, recursive, depth)
 	if err != nil {
 		log.Errorf("Failed to create monitor: %v", err)
 		return err
@@ -91,11 +119,16 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 
 	defer mon.Stop()
 
+	displayPaths := make([]string, len(rawTargets))
+	for i, rt := range rawTargets {
+		displayPaths[i] = rt.absPath
+	}
+
 	if entity.GUI {
-		gui.Run(mon.Events(), absDir, entity.Recursive, entity.Depth)
+		gui.Run(mon.Events(), displayPaths, recursive, depth)
 	} else {
 		p := tea.NewProgram(
-			tui.NewModel(mon.Events(), absDir, entity.Recursive, entity.Depth),
+			tui.NewModel(mon.Events(), displayPaths, recursive, depth),
 			tea.WithAltScreen(),
 		)
 
@@ -106,4 +139,79 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func resolveTargets(paths []string) ([]rawTarget, error) {
+	seen := make(map[string]bool)
+	var targets []rawTarget
+
+	for _, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			log.Errorf("Invalid path %q: %v", p, err)
+			return nil, err
+		}
+
+		if seen[abs] {
+			return nil, fmt.Errorf("duplicate watch path: %s", abs)
+		}
+		seen[abs] = true
+
+		info, err := os.Stat(abs)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				log.Errorf("Path does not exist: %s", abs)
+			} else {
+				log.Errorf("Cannot access path %s: %v", abs, err)
+			}
+			return nil, err
+		}
+
+		targets = append(targets, rawTarget{absPath: abs, isDir: info.IsDir()})
+	}
+
+	return targets, nil
+}
+
+func validateTargets(targets []rawTarget) error {
+	for i, a := range targets {
+		for j, b := range targets {
+			if i == j {
+				continue
+			}
+
+			if a.isDir && b.isDir {
+				if isSubDir(a.absPath, b.absPath) {
+					return fmt.Errorf(
+						"%q is a subdirectory of %q — remove the more specific path",
+						b.absPath, a.absPath)
+				}
+				if isSubDir(b.absPath, a.absPath) {
+					return fmt.Errorf(
+						"%q is a subdirectory of %q — remove the more specific path",
+						a.absPath, b.absPath)
+				}
+			}
+
+			if !a.isDir && b.isDir && pathWithinDir(a.absPath, b.absPath) {
+				return fmt.Errorf(
+					"%q is already covered by directory %q — remove the redundant file path",
+					a.absPath, b.absPath)
+			}
+			if a.isDir && !b.isDir && pathWithinDir(b.absPath, a.absPath) {
+				return fmt.Errorf(
+					"%q is already covered by directory %q — remove the redundant file path",
+					b.absPath, a.absPath)
+			}
+		}
+	}
+	return nil
+}
+
+func isSubDir(child, parent string) bool {
+	return strings.HasPrefix(child+"/", parent+"/")
+}
+
+func pathWithinDir(path, dir string) bool {
+	return strings.HasPrefix(path+"/", dir+"/")
 }

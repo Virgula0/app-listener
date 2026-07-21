@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -57,18 +58,18 @@ type model struct {
 	width    int
 	height   int
 
-	directory string
+	paths     []string
 	recursive bool
 	depth     int
 	startTime time.Time
 	eventID   int
 }
 
-func NewModel(events <-chan ebpf.FileEvent, directory string, recursive bool, depth int) tea.Model {
+func NewModel(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) tea.Model {
 	return &model{
 		events:    events,
 		lines:     make([]eventLine, 0, maxEvents),
-		directory: directory,
+		paths:     paths,
 		recursive: recursive,
 		depth:     depth,
 		startTime: time.Now(),
@@ -194,8 +195,8 @@ func (m *model) View() string {
 	header := headerStyle.Render("app-listener — File System Monitor (eBPF)")
 
 	info := infoStyle.Render(fmt.Sprintf(
-		"Directory: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
-		m.directory,
+		"Watching: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
+		strings.Join(m.paths, ", "),
 		recursiveStr,
 		m.eventID,
 		time.Since(m.startTime).Round(time.Second),

@@ -59,6 +59,8 @@ type MonitorProgramSpecs struct {
 	TraceKsysWrite    *ebpf.ProgramSpec `ebpf:"trace_ksys_write"`
 	TraceLinkat       *ebpf.ProgramSpec `ebpf:"trace_linkat"`
 	TraceMkdirat      *ebpf.ProgramSpec `ebpf:"trace_mkdirat"`
+	TraceOpen         *ebpf.ProgramSpec `ebpf:"trace_open"`
+	TraceOpenat       *ebpf.ProgramSpec `ebpf:"trace_openat"`
 	TraceRenameat2    *ebpf.ProgramSpec `ebpf:"trace_renameat2"`
 	TraceSymlinkat    *ebpf.ProgramSpec `ebpf:"trace_symlinkat"`
 	TraceUnlinkat     *ebpf.ProgramSpec `ebpf:"trace_unlinkat"`
@@ -122,6 +124,8 @@ type MonitorPrograms struct {
 	TraceKsysWrite    *ebpf.Program `ebpf:"trace_ksys_write"`
 	TraceLinkat       *ebpf.Program `ebpf:"trace_linkat"`
 	TraceMkdirat      *ebpf.Program `ebpf:"trace_mkdirat"`
+	TraceOpen         *ebpf.Program `ebpf:"trace_open"`
+	TraceOpenat       *ebpf.Program `ebpf:"trace_openat"`
 	TraceRenameat2    *ebpf.Program `ebpf:"trace_renameat2"`
 	TraceSymlinkat    *ebpf.Program `ebpf:"trace_symlinkat"`
 	TraceUnlinkat     *ebpf.Program `ebpf:"trace_unlinkat"`
@@ -135,6 +139,8 @@ func (p *MonitorPrograms) Close() error {
 		p.TraceKsysWrite,
 		p.TraceLinkat,
 		p.TraceMkdirat,
+		p.TraceOpen,
+		p.TraceOpenat,
 		p.TraceRenameat2,
 		p.TraceSymlinkat,
 		p.TraceUnlinkat,
