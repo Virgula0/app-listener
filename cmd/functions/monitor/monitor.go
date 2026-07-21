@@ -32,9 +32,9 @@ Examples:
 
 func init() {
 	MonitorCmd.Flags().BoolVarP(&entity.Recursive, "recursive", "r", false,
-		"Monitor directory recursively")
+		"Monitor directory recursively (default: false)")
 	MonitorCmd.Flags().IntVarP(&entity.Depth, "depth", "d", 0,
-		"Maximum directory depth (requires --recursive)")
+		"Maximum directory depth (requires --recursive) (default: 0)")
 }
 
 func runMonitor(cmd *cobra.Command, args []string) error {

@@ -2,4 +2,3 @@ build/
 .git
 .github
 *.md
-Makefile

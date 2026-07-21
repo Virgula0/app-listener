@@ -1,4 +1,4 @@
-.PHONY: build build-linux install-linter install-deps generate run lint test tidy clean
+.PHONY: build build-linux install-linter install-deps generate run lint test test-integration deploy deploy-down tidy clean
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
@@ -49,15 +49,27 @@ lint:
 .PHONY: lint
 
 test:
-	go test ./... --count=1 -p 1
+	go test $$(go list ./... | grep -v /tests) --count=1 -p 1
 .PHONY: test
+
+test-integration:
+	go test ./tests/ -v --count=1 -timeout 15m
+.PHONY: test-integration
+
+deploy:
+	docker compose up --build -d
+.PHONY: deploy
+
+deploy-down:
+	docker compose down
+.PHONY: deploy-down
 
 tidy:
 	go mod tidy
 .PHONY: tidy
 
 clean:
-	rm -rf $(OUTPUT_DIR) \
+	rm -rf $(OUTPUT_DIR) build/test \
 		internal/infrastructure/monitor_bpf.go \
 		internal/infrastructure/embeds/ \
 		internal/infrastructure/bpf/vmlinux.h
