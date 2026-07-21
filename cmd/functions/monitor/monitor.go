@@ -11,6 +11,7 @@ import (
 
 	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/printers"
+	"github.com/Virgula0/app-listener/internal/gui"
 	"github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/tui"
 )
@@ -90,14 +91,18 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 
 	defer mon.Stop()
 
-	p := tea.NewProgram(
-		tui.NewModel(mon.Events(), absDir, entity.Recursive, entity.Depth),
-		tea.WithAltScreen(),
-	)
+	if entity.GUI {
+		gui.Run(mon.Events(), absDir, entity.Recursive, entity.Depth)
+	} else {
+		p := tea.NewProgram(
+			tui.NewModel(mon.Events(), absDir, entity.Recursive, entity.Depth),
+			tea.WithAltScreen(),
+		)
 
-	if _, err := p.Run(); err != nil {
-		log.Errorf("TUI error: %v", err)
-		return err
+		if _, err := p.Run(); err != nil {
+			log.Errorf("TUI error: %v", err)
+			return err
+		}
 	}
 
 	return nil

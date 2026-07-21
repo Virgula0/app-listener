@@ -7,4 +7,5 @@ const (
 var (
 	Recursive bool
 	Depth     int
+	GUI       bool
 )

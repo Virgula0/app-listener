@@ -6,7 +6,7 @@ OUTPUT_DIR  = build/linux
 build: generate build-linux
 
 build-linux:
-	GOOS=linux GOARCH=amd64 go build -o $(OUTPUT_DIR)/$(BINARY_NAME) .
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o $(OUTPUT_DIR)/$(BINARY_NAME) .
 .PHONY: build-linux
 
 GEN_DIR = build/generated
@@ -41,7 +41,7 @@ install-deps:
 .PHONY: install-deps
 
 run:
-	go run ./... monitor $(ARGS)
+	CGO_ENABLED=1 go run ./... monitor $(ARGS)
 .PHONY: run
 
 lint:
@@ -49,7 +49,7 @@ lint:
 .PHONY: lint
 
 test:
-	go test $$(go list ./... | grep -v /tests) --count=1 -p 1
+	CGO_ENABLED=1 go test $$(go list ./... | grep -v /tests) --count=1 -p 1
 .PHONY: test
 
 test-integration:
