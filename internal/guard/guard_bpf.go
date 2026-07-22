@@ -81,7 +81,9 @@ type GuardMapSpecs struct {
 	GuardComms  *ebpf.MapSpec `ebpf:"guard_comms"`
 	GuardConfig *ebpf.MapSpec `ebpf:"guard_config"`
 	GuardInodes *ebpf.MapSpec `ebpf:"guard_inodes"`
+	GuardPath   *ebpf.MapSpec `ebpf:"guard_path"`
 	Rb          *ebpf.MapSpec `ebpf:"rb"`
+	TmpBuf      *ebpf.MapSpec `ebpf:"tmp_buf"`
 }
 
 // GuardVariableSpecs contains global variables before they are loaded into the kernel.
@@ -113,7 +115,9 @@ type GuardMaps struct {
 	GuardComms  *ebpf.Map `ebpf:"guard_comms"`
 	GuardConfig *ebpf.Map `ebpf:"guard_config"`
 	GuardInodes *ebpf.Map `ebpf:"guard_inodes"`
+	GuardPath   *ebpf.Map `ebpf:"guard_path"`
 	Rb          *ebpf.Map `ebpf:"rb"`
+	TmpBuf      *ebpf.Map `ebpf:"tmp_buf"`
 }
 
 func (m *GuardMaps) Close() error {
@@ -121,7 +125,9 @@ func (m *GuardMaps) Close() error {
 		m.GuardComms,
 		m.GuardConfig,
 		m.GuardInodes,
+		m.GuardPath,
 		m.Rb,
+		m.TmpBuf,
 	)
 }
 

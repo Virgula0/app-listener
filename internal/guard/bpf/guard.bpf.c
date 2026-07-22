@@ -61,6 +61,20 @@ struct {
 } guard_comms SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, char[MAX_PATH]);
+} guard_path SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, char[MAX_PATH]);
+} tmp_buf SEC(".maps"); // only used by guard_path_symlink for oldname_buf
+
+struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 24);
 } rb SEC(".maps");
@@ -101,71 +115,88 @@ static __always_inline struct inode *get_inode_from_path(void *ctx_path)
 
 static __always_inline long read_path(struct dentry *dentry, char *buf, int buf_size)
 {
-	char tmp[64];
-	int pos = buf_size;
-	buf[--pos] = '\0';
+    char tmp[64];
+    int pos = MAX_PATH;
 
-	struct dentry *d = dentry;
+    pos--;
+    buf[pos & (MAX_PATH - 1)] = '\0';
 
-	#pragma unroll
-	for (int i = 0; i < 48; i++) {
-		if (!d)
-			break;
+    struct dentry *d = dentry;
 
-		struct dentry *parent;
-		bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
-		if (!parent || parent == d)
-			break;
+    // Notice we removed #pragma unroll. Modern verifiers handle bounded loops
+    // beautifully without exploding the instruction limit.
+    for (int i = 0; i < 32; i++) {
+        if (!d)
+            break;
 
-		const unsigned char *name_ptr;
-		bpf_probe_read_kernel(&name_ptr, sizeof(name_ptr), &d->d_name.name);
-		if (!name_ptr)
-			break;
+        struct dentry *parent;
+        bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
+        if (!parent || parent == d)
+            break;
 
-		long ret = bpf_probe_read_kernel_str(tmp, sizeof(tmp), name_ptr);
-		if (ret <= 1)
-			break;
+        const unsigned char *name_ptr;
+        bpf_probe_read_kernel(&name_ptr, sizeof(name_ptr), &d->d_name.name);
+        if (!name_ptr)
+            break;
 
-		int name_len = ret - 1;
+        long ret = bpf_probe_read_kernel_str(tmp, sizeof(tmp), name_ptr);
+        if (ret <= 1)
+            break;
 
-		pos -= name_len;
-		if (pos < 0)
-			break;
+        int name_len = ret - 1;
 
-		#pragma unroll
-		for (int j = 0; j < 64; j++) {
-			if (j >= name_len) break;
-			buf[pos + j] = tmp[j];
-		}
+        if (pos < name_len)
+            break;
 
-		if (pos <= 0)
-			break;
-		buf[--pos] = '/';
+        pos -= name_len;
 
-		d = parent;
-	}
+        // Cache the masked position to help the verifier understand the baseline
+        int start_pos = pos & (MAX_PATH - 1);
 
-	return pos < buf_size - 1 ? pos : -1;
+        // Removed #pragma unroll here as well
+        for (int j = 0; j < 64; j++) {
+            if (j >= name_len) break;
+            buf[(start_pos + j) & (MAX_PATH - 1)] = tmp[j & 63];
+        }
+
+        if (pos <= 0)
+            break;
+
+        pos--;
+        buf[pos & (MAX_PATH - 1)] = '/';
+
+        d = parent;
+    }
+
+    // Return the offset directly (no bounds check needed here, already bounded)
+    return pos;
 }
 
-static __always_inline void fill_path(struct dentry *dentry, char *out)
+static void fill_path(struct dentry *dentry, char *out)
 {
-	if (!dentry) {
-		out[0] = '\0';
-		return;
-	}
-	char buf[MAX_PATH] = {};
-	long off = read_path(dentry, buf, sizeof(buf));
-	if (off >= 0 && off < sizeof(buf)) {
-		// Use bpf_probe_read_kernel_str to safely read from our own stack
-		// This avoids the verifier's variable-offset stack read restrictions
-		bpf_probe_read_kernel_str(out, MAX_PATH, buf + off);
-	} else {
-		out[0] = '\0';
-	}
+    if (!dentry) {
+        out[0] = '\0';
+        return;
+    }
+    __u32 key = 0;
+    char *buf = bpf_map_lookup_elem(&tmp_buf, &key);
+    if (!buf) {
+        out[0] = '\0';
+        return;
+    }
+
+    long off = read_path(dentry, buf, MAX_PATH);
+
+    // 'off' is guaranteed to be >= 0 based on our new read_path implementation
+    if (off < MAX_PATH) {
+        off &= (MAX_PATH - 1);
+        bpf_probe_read_kernel_str(out, MAX_PATH, buf + off);
+    } else {
+        out[0] = '\0';
+    }
 }
 
-static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, const char *dest_str, struct dentry *dest_dentry)
+static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry)
 {
 	__u32 key = 0;
 	__u64 *mode = bpf_map_lookup_elem(&guard_config, &key);
@@ -193,11 +224,14 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 		e->fd = 0;
 		e->blocked = is_blocked ? 1 : 0;
 		bpf_get_current_comm(e->comm, sizeof(e->comm));
-		
+
 		fill_path(dentry, e->path);
 
 		if (dest_str) {
-			bpf_probe_read_kernel_str(e->dest, sizeof(e->dest), dest_str);
+			if (dest_is_user)
+				bpf_probe_read_user_str(e->dest, sizeof(e->dest), dest_str);
+			else
+				bpf_probe_read_kernel_str(e->dest, sizeof(e->dest), dest_str);
 		} else if (dest_dentry) {
 			fill_path(dest_dentry, e->dest);
 		} else {
@@ -223,7 +257,7 @@ int guard_file_open(unsigned long long *ctx)
 	if (read_inode_guard(inode)) {
 		struct dentry *dentry;
 		bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
-		return check_and_emit(EVENT_OPEN, dentry, NULL, NULL);
+		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
 	}
 	return 0;
 }
@@ -241,7 +275,7 @@ int guard_mmap_file(unsigned long long *ctx)
 	if (read_inode_guard(inode)) {
 		struct dentry *dentry;
 		bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
-		return check_and_emit(EVENT_MMAP, dentry, NULL, NULL);
+		return check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL);
 	}
 	return 0;
 }
@@ -257,12 +291,12 @@ int guard_path_unlink(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_DELETE, dentry, NULL, NULL);
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_DELETE, dentry, NULL, NULL);
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
 	}
 
 	return 0;
@@ -280,12 +314,12 @@ int guard_path_rename(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, new_dentry);
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, new_dentry);
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
 	}
 
 	return 0;
@@ -294,15 +328,54 @@ int guard_path_rename(unsigned long long *ctx)
 SEC("lsm/path_symlink")
 int guard_path_symlink(unsigned long long *ctx)
 {
-	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
-	struct dentry *dentry = (struct dentry *)ctx[1];
-	const char *old_name = (const char *)ctx[2];
+    struct dentry *dentry = (struct dentry *)ctx[1];
+    const char *old_name = (const char *)ctx[2];
 
-	if (read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_SYMLINK, dentry, old_name, NULL);
-	}
-	
-	return 0;
+    // 1. Check if the symlink is being created INSIDE a guarded directory
+    struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
+    if (read_inode_guard(parent_inode)) {
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+    }
+
+    // 2. Check if the symlink TARGET points INTO the guarded path
+    __u32 key = 0;
+    char *oldname_buf = bpf_map_lookup_elem(&tmp_buf, &key);
+    if (!oldname_buf)
+        return 0;
+
+    long ret = bpf_probe_read_kernel_str(oldname_buf, MAX_PATH, old_name);
+    if (ret <= 0)
+        return 0;
+
+    char *stored_path = bpf_map_lookup_elem(&guard_path, &key);
+    if (!stored_path)
+        return 0;
+
+    // Prefix match logic to protect contents of a watched directory
+    bool match = true;
+    for (int i = 0; i < MAX_PATH; i++) {
+        if (stored_path[i] == '\0') {
+            // We reached the end of the guarded path.
+            // It is a match if the symlink target ends here exactly,
+            // continues as a sub-directory, or if the stored path had a trailing slash.
+            if (oldname_buf[i] == '\0' || oldname_buf[i] == '/' || (i > 0 && stored_path[i-1] == '/')) {
+                break;
+            }
+            // Otherwise, it's just a similarly named folder (e.g., /bypasses_fake)
+            match = false;
+            break;
+        }
+        if (oldname_buf[i] != stored_path[i]) {
+            match = false;
+            break;
+        }
+    }
+
+    if (match) {
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+    }
+
+    return 0;
 }
 
 SEC("lsm/path_link")
@@ -317,14 +390,14 @@ int guard_path_link(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, new_dentry);
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[1]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, new_dentry);
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
 	}
-	
+
 	return 0;
 }
 
@@ -335,7 +408,7 @@ int guard_path_mkdir(unsigned long long *ctx)
 	struct dentry *dentry = (struct dentry *)ctx[1];
 
 	if (read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_MKDIR, dentry, NULL, NULL);
+		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL);
 	}
 
 	return 0;

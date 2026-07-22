@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -149,6 +150,13 @@ func (g *Guard) populateMaps() error {
 		}
 	}
 
+	// Store the guarded path for symlink target matching
+	var pathBuf [256]byte
+	copy(pathBuf[:], g.path)
+	if err := g.objs.GuardPath.Put(uint32(0), pathBuf); err != nil {
+		return fmt.Errorf("storing guarded path: %w", err)
+	}
+
 	return nil
 }
 
@@ -251,6 +259,7 @@ func (g *Guard) readEvent(rd *ringbuf.Reader) (*GuardEvent, bool) {
 	}
 
 	fe := be.toFileEvent()
+	fe.Timestamp = time.Now().UnixNano()
 
 	ge := &GuardEvent{
 		FileEvent: fe,
