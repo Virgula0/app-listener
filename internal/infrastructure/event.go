@@ -1,5 +1,7 @@
 package ebpf
 
+import "strings"
+
 type EventType int
 
 const (
@@ -82,4 +84,36 @@ func cstr(b []byte) string {
 		i++
 	}
 	return string(b[:i])
+}
+
+func ParseEventType(s string) (EventType, bool) {
+	switch strings.ToUpper(s) {
+	case "OPEN":
+		return EventOpen, true
+	case "READ":
+		return EventRead, true
+	case "WRITE":
+		return EventWrite, true
+	case "DELETE":
+		return EventDelete, true
+	case "RENAME":
+		return EventRename, true
+	case "SYMLINK":
+		return EventSymlink, true
+	case "HARDLINK":
+		return EventHardlink, true
+	case "MKDIR":
+		return EventMkdir, true
+	case "MMAP":
+		return EventMmap, true
+	default:
+		return 0, false
+	}
+}
+
+func EventTypes() []EventType {
+	return []EventType{
+		EventOpen, EventRead, EventWrite, EventDelete,
+		EventRename, EventSymlink, EventHardlink, EventMkdir, EventMmap,
+	}
 }

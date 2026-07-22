@@ -3,10 +3,10 @@ package cmd
 import (
 	"os"
 
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
 	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/functions/monitor"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 var rootCmd = &cobra.Command{

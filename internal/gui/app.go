@@ -15,6 +15,7 @@ import (
 	"github.com/jezek/xgb/xproto"
 
 	"github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/procstats"
 )
 
 var colLabels = []string{"Time", "Type", "Process", "Path", "Detail"}
@@ -41,6 +42,9 @@ type guiModel struct {
 	recursive bool
 	depth     int
 	cols      *columnState
+
+	prevEventID  int
+	eventsPerSec float64
 }
 
 func (m *guiModel) applyFilter() {
@@ -89,14 +93,14 @@ func newDataRow(cols *columnState) *dataRow {
 	for range colLabels {
 		l := widget.NewLabel("")
 		l.Selectable = true
-		l.Wrapping = fyne.TextTruncate
+		l.Truncation = fyne.TextTruncateClip
 		r.cells = append(r.cells, l)
 	}
 	r.ExtendBaseWidget(r)
 	return r
 }
 
-func (r *dataRow) setEvent(ev ebpf.FileEvent) {
+func (r *dataRow) setEvent(ev *ebpf.FileEvent) {
 	r.cells[0].SetText(time.Unix(0, ev.Timestamp).Format("15:04:05.000"))
 	r.cells[1].SetText(ev.Type.String())
 	r.cells[2].SetText(ev.Comm)
@@ -311,9 +315,16 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 		recursiveStr = fmt.Sprintf("yes (depth:%d)", depth)
 	}
 
-	infoLabel := widget.NewLabel(
+	infoLabel := widget.NewLabelWithStyle(
 		fmt.Sprintf("Watching: %s  |  Recursive: %s  |  Events: 0  |  Uptime: 0s",
-			strings.Join(paths, ", "), recursiveStr))
+			strings.Join(paths, ", "), recursiveStr),
+		fyne.TextAlignLeading,
+		fyne.TextStyle{Monospace: true})
+
+	resLabel := widget.NewLabelWithStyle(
+		"Memory: —  |  CPU: —  |  Events/s: —",
+		fyne.TextAlignLeading,
+		fyne.TextStyle{Monospace: true, Bold: true})
 
 	filterEntry := widget.NewEntry()
 	filterEntry.SetPlaceHolder("Filter by path, process, or event type...")
@@ -336,7 +347,7 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 		func(id widget.ListItemID, item fyne.CanvasObject) {
 			row := item.(*dataRow)
 			ev := m.getFiltered(id)
-			row.setEvent(ev)
+			row.setEvent(&ev)
 		},
 	)
 
@@ -344,14 +355,14 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 		list.Refresh()
 	}
 
-	top := container.NewVBox(infoLabel, filterEntry, header)
-	content := container.NewBorder(top, nil, nil, nil, list)
+	infoBox := container.NewVBox(infoLabel, filterEntry, header)
+	content := container.NewBorder(infoBox, resLabel, nil, nil, list)
 	win.SetContent(content)
 	win.Resize(fyne.NewSize(1100, 650))
 
 	startTime := time.Now()
 	go m.listenEvents(infoLabel, list, startTime, recursiveStr)
-	go m.uptimeTicker(infoLabel, startTime, recursiveStr)
+	go m.uptimeTicker(infoLabel, resLabel, startTime, recursiveStr)
 	floatWindow()
 
 	win.ShowAndRun()
@@ -383,24 +394,54 @@ func (m *guiModel) listenEvents(
 }
 
 func (m *guiModel) uptimeTicker(
-	infoLabel *widget.Label, startTime time.Time, recursiveStr string,
+	infoLabel *widget.Label, resLabel *widget.Label,
+	startTime time.Time, recursiveStr string,
 ) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		m.mu.RLock()
+		m.mu.Lock()
 		count := len(m.allEvents)
-		m.mu.RUnlock()
+		eventsDelta := m.eventID() - m.prevEventID
+		m.eventsPerSec = float64(eventsDelta)
+		m.prevEventID = m.eventID()
+		m.mu.Unlock()
 
 		uptime := time.Since(startTime).Round(time.Second)
+		resText := m.formatResourceBar(startTime)
+
 		fyne.Do(func() {
 			infoLabel.SetText(fmt.Sprintf(
 				"Watching: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
 				strings.Join(m.paths, ", "), recursiveStr, count, uptime,
 			))
+			resLabel.SetText(resText)
 		})
 	}
+}
+
+func (m *guiModel) eventID() int {
+	return len(m.allEvents)
+}
+
+func (m *guiModel) formatResourceBar(startTime time.Time) string {
+	s, err := procstats.Read()
+	if err != nil {
+		return "Memory: --  |  CPU: --  |  Events/s: --"
+	}
+
+	rssMB := float64(s.RSS) / 1024 / 1024
+	cpuTotal := s.CPUUser + s.CPUSys
+	cpuSec := cpuTotal.Seconds()
+	uptimeSec := time.Since(startTime).Seconds()
+	cpuPct := 0.0
+	if uptimeSec > 0 {
+		cpuPct = (cpuSec / uptimeSec) * 100
+	}
+
+	return fmt.Sprintf("Memory: %.1f MB  |  CPU: %.1f%%  |  Events/s: %.0f",
+		rssMB, cpuPct, m.eventsPerSec)
 }
 
 // ── X11 float hint ─────────────────────────────────────────────────────────
@@ -472,7 +513,11 @@ func findTopLevelWindow(conn *xgb.Conn, root xproto.Window, substr string) xprot
 }
 
 func internAtom(conn *xgb.Conn, name string) xproto.Atom {
-	reply, err := xproto.InternAtom(conn, false, uint16(len(name)), name).Reply()
+	nameLen := len(name)
+	if nameLen > 65535 {
+		return 0
+	}
+	reply, err := xproto.InternAtom(conn, false, uint16(nameLen), name).Reply()
 	if err != nil {
 		return 0
 	}

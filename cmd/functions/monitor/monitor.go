@@ -41,6 +41,8 @@ Examples:
 	RunE: runMonitor,
 }
 
+var eventsFlag []string
+
 func init() {
 	MonitorCmd.Flags().StringSliceVarP(&watchPaths, "watch", "w", nil,
 		"Path to monitor (repeatable, required)")
@@ -50,6 +52,8 @@ func init() {
 		"Maximum directory depth (requires --recursive) (default: 0)")
 	MonitorCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
+	MonitorCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
+		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP; default: all)")
 }
 
 type rawTarget struct {
@@ -58,17 +62,9 @@ type rawTarget struct {
 }
 
 func runMonitor(cmd *cobra.Command, args []string) error {
-	if len(watchPaths) == 0 {
-		return errors.New("at least one -w/--watch path is required")
-	}
-
-	rawTargets, err := resolveTargets(watchPaths)
-	if err != nil {
-		return err
-	}
-
-	if err := validateTargets(rawTargets); err != nil {
-		return err
+	rawTargets, targetErr := prepareTargets()
+	if targetErr != nil {
+		return targetErr
 	}
 
 	recursive := entity.Recursive
@@ -78,6 +74,108 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 		return errors.New("--depth requires --recursive flag")
 	}
 
+	ebpfTargets := buildEBPFTargets(rawTargets)
+	warnIgnoredFlags(rawTargets, recursive, depth)
+
+	if eventsErr := parseEventsFlag(); eventsErr != nil {
+		return eventsErr
+	}
+
+	printers.PrintLogo()
+
+	if ebpfErr := checkEBPF(); ebpfErr != nil {
+		return ebpfErr
+	}
+
+	mon, monitorErr := ebpf.NewMonitor(ebpfTargets, recursive, depth)
+	if monitorErr != nil {
+		return fmt.Errorf("creating monitor: %w", monitorErr)
+	}
+
+	mon.SetEventTypes(entity.EventTypes)
+
+	if startErr := mon.Start(); startErr != nil {
+		return fmt.Errorf("starting monitor: %w", startErr)
+	}
+
+	defer mon.Stop()
+
+	displayPaths := makeDisplayPaths(rawTargets)
+
+	switch {
+	case entity.Headless:
+		runHeadless(mon)
+	case entity.GUI:
+		gui.Run(mon.Events(), displayPaths, recursive, depth)
+	default:
+		return runTUI(mon, displayPaths, recursive, depth)
+	}
+
+	return nil
+}
+
+func prepareTargets() ([]rawTarget, error) {
+	if len(watchPaths) == 0 {
+		return nil, errors.New("at least one -w/--watch path is required")
+	}
+
+	rawTargets, err := resolveTargets(watchPaths)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateTargets(rawTargets); err != nil {
+		return nil, err
+	}
+	return rawTargets, nil
+}
+
+func checkEBPF() error {
+	log.Info("Checking eBPF availability...")
+	if err := ebpf.Check(); err != nil {
+		log.Errorf("eBPF check failed: %v", err)
+		return err
+	}
+	log.Info("eBPF available — starting monitor")
+	return nil
+}
+
+func makeDisplayPaths(rawTargets []rawTarget) []string {
+	paths := make([]string, len(rawTargets))
+	for i, rt := range rawTargets {
+		paths[i] = rt.absPath
+	}
+	return paths
+}
+
+func runHeadless(mon *ebpf.Monitor) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case ev, ok := <-mon.Events():
+			if !ok {
+				return
+			}
+			log.Infof("EVENT|%s|%s|%s|%d|%s|%d",
+				ev.Type.String(), ev.Comm, ev.Path, ev.PID, ev.Dest, ev.FD)
+		case <-sig:
+			return
+		}
+	}
+}
+
+func runTUI(mon *ebpf.Monitor, paths []string, recursive bool, depth int) error {
+	p := tea.NewProgram(
+		tui.NewModel(mon.Events(), paths, recursive, depth),
+		tea.WithAltScreen(),
+	)
+
+	_, runErr := p.Run()
+	return runErr
+}
+
+func buildEBPFTargets(rawTargets []rawTarget) []ebpf.Target {
 	ebpfTargets := make([]ebpf.Target, len(rawTargets))
 	for i, rt := range rawTargets {
 		t := ebpf.Target{Path: rt.absPath, IsDir: rt.isDir}
@@ -89,7 +187,10 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 		}
 		ebpfTargets[i] = t
 	}
+	return ebpfTargets
+}
 
+func warnIgnoredFlags(rawTargets []rawTarget, recursive bool, depth int) {
 	for _, rt := range rawTargets {
 		if !rt.isDir && recursive {
 			log.Warnf("--recursive is ignored when monitoring a single file (%s)", rt.absPath)
@@ -98,67 +199,23 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 			log.Warnf("--depth is ignored when monitoring a single file (%s)", rt.absPath)
 		}
 	}
+}
 
-	printers.PrintLogo()
-
-	log.Infof("Checking eBPF availability...")
-
-	if checkErr := ebpf.Check(); checkErr != nil {
-		log.Errorf("eBPF check failed: %v", checkErr)
-		return checkErr
+func parseEventsFlag() error {
+	if len(eventsFlag) == 0 {
+		entity.EventTypes = ebpf.EventTypes()
+		return nil
 	}
 
-	log.Infof("eBPF available — starting monitor")
-
-	mon, err := ebpf.NewMonitor(ebpfTargets, recursive, depth)
-	if err != nil {
-		log.Errorf("Failed to create monitor: %v", err)
-		return err
-	}
-
-	if err := mon.Start(); err != nil {
-		log.Errorf("Failed to start monitor: %v", err)
-		return err
-	}
-
-	defer mon.Stop()
-
-	displayPaths := make([]string, len(rawTargets))
-	for i, rt := range rawTargets {
-		displayPaths[i] = rt.absPath
-	}
-
-	if entity.Headless {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-
-		for {
-			select {
-			case ev, ok := <-mon.Events():
-				if !ok {
-					return nil
-				}
-				msg := fmt.Sprintf("EVENT|%s|%s|%s|%d|%s|%d",
-					ev.Type.String(), ev.Comm, ev.Path, ev.PID, ev.Dest, ev.FD)
-				log.Infof(msg)
-			case <-sig:
-				return nil
-			}
+	var parsed []ebpf.EventType
+	for _, s := range eventsFlag {
+		et, ok := ebpf.ParseEventType(strings.TrimSpace(s))
+		if !ok {
+			return fmt.Errorf("unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP)", s)
 		}
-	} else if entity.GUI {
-		gui.Run(mon.Events(), displayPaths, recursive, depth)
-	} else {
-		p := tea.NewProgram(
-			tui.NewModel(mon.Events(), displayPaths, recursive, depth),
-			tea.WithAltScreen(),
-		)
-
-		if _, err := p.Run(); err != nil {
-			log.Errorf("TUI error: %v", err)
-			return err
-		}
+		parsed = append(parsed, et)
 	}
-
+	entity.EventTypes = parsed
 	return nil
 }
 
@@ -200,31 +257,37 @@ func validateTargets(targets []rawTarget) error {
 			if i == j {
 				continue
 			}
-
-			if a.isDir && b.isDir {
-				if isSubDir(a.absPath, b.absPath) {
-					return fmt.Errorf(
-						"%q is a subdirectory of %q — remove the more specific path",
-						b.absPath, a.absPath)
-				}
-				if isSubDir(b.absPath, a.absPath) {
-					return fmt.Errorf(
-						"%q is a subdirectory of %q — remove the more specific path",
-						a.absPath, b.absPath)
-				}
-			}
-
-			if !a.isDir && b.isDir && pathWithinDir(a.absPath, b.absPath) {
-				return fmt.Errorf(
-					"%q is already covered by directory %q — remove the redundant file path",
-					a.absPath, b.absPath)
-			}
-			if a.isDir && !b.isDir && pathWithinDir(b.absPath, a.absPath) {
-				return fmt.Errorf(
-					"%q is already covered by directory %q — remove the redundant file path",
-					b.absPath, a.absPath)
+			if err := validatePair(a, b); err != nil {
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+func validatePair(a, b rawTarget) error {
+	if a.isDir && b.isDir {
+		if isSubDir(a.absPath, b.absPath) {
+			return fmt.Errorf(
+				"%q is a subdirectory of %q — remove the more specific path",
+				b.absPath, a.absPath)
+		}
+		if isSubDir(b.absPath, a.absPath) {
+			return fmt.Errorf(
+				"%q is a subdirectory of %q — remove the more specific path",
+				a.absPath, b.absPath)
+		}
+	}
+
+	if !a.isDir && b.isDir && pathWithinDir(a.absPath, b.absPath) {
+		return fmt.Errorf(
+			"%q is already covered by directory %q — remove the redundant file path",
+			a.absPath, b.absPath)
+	}
+	if a.isDir && !b.isDir && pathWithinDir(b.absPath, a.absPath) {
+		return fmt.Errorf(
+			"%q is already covered by directory %q — remove the redundant file path",
+			b.absPath, a.absPath)
 	}
 	return nil
 }

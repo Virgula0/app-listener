@@ -34,10 +34,11 @@ type Monitor struct {
 	mu      sync.Mutex
 	stopped bool
 
-	targets   []Target
-	recursive bool
-	depth     int
-	ownPID    int
+	targets    []Target
+	recursive  bool
+	depth      int
+	ownPID     int
+	eventTypes []EventType
 
 	watchInodes map[string]string // "dev:ino" → watched path for hardlink detection
 }
@@ -48,12 +49,13 @@ func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
 	}
 
 	m := &Monitor{
-		events:    make(chan FileEvent, 1024),
-		done:      make(chan struct{}),
-		targets:   targets,
-		recursive: recursive,
-		depth:     depth,
-		ownPID:    os.Getpid(),
+		events:     make(chan FileEvent, 1024),
+		done:       make(chan struct{}),
+		targets:    targets,
+		recursive:  recursive,
+		depth:      depth,
+		ownPID:     os.Getpid(),
+		eventTypes: EventTypes(),
 	}
 
 	var objs MonitorObjects
@@ -129,6 +131,12 @@ func (m *Monitor) Events() <-chan FileEvent {
 	return m.events
 }
 
+func (m *Monitor) SetEventTypes(types []EventType) {
+	if len(types) > 0 {
+		m.eventTypes = types
+	}
+}
+
 func (m *Monitor) Start() error {
 	rd, err := ringbuf.NewReader(m.objs.Rb)
 	if err != nil {
@@ -149,55 +157,75 @@ func (m *Monitor) readLoop(rd *ringbuf.Reader) {
 	defer rd.Close()
 
 	for {
-		record, err := rd.Read()
-		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
-				return
-			}
-			log.Errorf("ringbuf read error: %v", err)
-			continue
+		ev, ok := m.readEvent(rd)
+		if !ok {
+			return
 		}
-
-		var be bpfEvent
-		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &be); err != nil {
-			log.Errorf("decode event: %v", err)
-			continue
-		}
-
-		ev := be.toFileEvent()
-		ev.Timestamp = time.Now().UnixNano()
-
-		if int(ev.PID) == m.ownPID {
-			continue
-		}
-
-		ev.Path = m.resolveRelativePath(ev.PID, ev.Path)
-		ev.Dest = m.resolveRelativePath(ev.PID, ev.Dest)
-
-		m.resolveFDPath(&ev)
-
-		// Resolve symlinks so that cat on a symlink to a watched file is detected.
-		ev.Path = m.resolveSymlinkToTarget(ev.Path)
-
-		if !m.inWatchPath(ev.Path, ev.Dest) {
-			// If still no match, try hardlink detection via inode.
-			if hardlinkPath := m.checkHardlinkByInode(ev.Path); hardlinkPath != "" {
-				ev.Path = hardlinkPath
-			} else {
-				continue
-			}
-		}
-
-		if !m.matchesFilter(&ev) {
+		if ev == nil {
 			continue
 		}
 
 		select {
-		case m.events <- ev:
+		case m.events <- *ev:
 		case <-m.done:
 			return
 		}
 	}
+}
+
+func (m *Monitor) readEvent(rd *ringbuf.Reader) (*FileEvent, bool) {
+	record, err := rd.Read()
+	if err != nil {
+		if errors.Is(err, ringbuf.ErrClosed) {
+			return nil, false
+		}
+		log.Errorf("ringbuf read error: %v", err)
+		return nil, true
+	}
+
+	var be bpfEvent
+	if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &be); err != nil {
+		log.Errorf("decode event: %v", err)
+		return nil, true
+	}
+
+	ev := be.toFileEvent()
+	ev.Timestamp = time.Now().UnixNano()
+
+	if int(ev.PID) == m.ownPID {
+		return nil, true
+	}
+
+	ev.Path = m.resolveRelativePath(ev.PID, ev.Path)
+	ev.Dest = m.resolveRelativePath(ev.PID, ev.Dest)
+
+	m.resolveFDPath(&ev)
+
+	if !m.eventTypeAllowed(ev.Type) {
+		return nil, true
+	}
+
+	// Resolve symlinks so that cat on a symlink to a watched file is detected.
+	ev.Path = m.resolveSymlinkToTarget(ev.Path)
+
+	if m.inWatchPath(ev.Path, ev.Dest) {
+		if m.matchesFilter(&ev) {
+			return &ev, true
+		}
+		return nil, true
+	}
+
+	// If still no match, try hardlink detection via inode.
+	hardlinkPath := m.checkHardlinkByInode(ev.Path)
+	if hardlinkPath == "" {
+		return nil, true
+	}
+	ev.Path = hardlinkPath
+
+	if m.matchesFilter(&ev) {
+		return &ev, true
+	}
+	return nil, true
 }
 
 func (m *Monitor) resolveRelativePath(pid uint32, path string) string {
@@ -250,45 +278,58 @@ func (m *Monitor) matchesAnyTarget(p string) bool {
 }
 
 func (m *Monitor) matchesFilter(ev *FileEvent) bool {
-	path := ev.Path
-	if path == "" {
+	if ev.Path == "" {
 		return false
 	}
 
 	for _, t := range m.targets {
-		if !t.IsDir {
-			if path == t.File || strings.HasSuffix(path, "/"+t.File) {
-				return true
-			}
-			continue
-		}
-		if !m.isWithinDir(path, t.Dir) {
-			continue
-		}
-		if m.recursive && m.depth == 0 {
+		if m.matchTarget(ev.Path, t) {
 			return true
 		}
-		if !m.recursive {
-			rel, err := filepath.Rel(t.Dir, path)
-			if err != nil {
-				continue
-			}
-			if rel == "." || !strings.Contains(rel, string(filepath.Separator)) {
-				return true
-			}
-		}
-		if m.recursive && m.depth > 0 {
-			rel, err := filepath.Rel(t.Dir, path)
-			if err != nil {
-				continue
-			}
-			depth := 0
-			if rel != "." {
-				depth = len(strings.Split(rel, string(filepath.Separator)))
-			}
-			if depth <= m.depth {
-				return true
-			}
+	}
+	return false
+}
+
+func (m *Monitor) matchTarget(path string, t Target) bool {
+	if !t.IsDir {
+		return path == t.File || strings.HasSuffix(path, "/"+t.File)
+	}
+	if !m.isWithinDir(path, t.Dir) {
+		return false
+	}
+	if m.recursive && m.depth == 0 {
+		return true
+	}
+	if !m.recursive {
+		return m.matchDirectChildren(path, t.Dir)
+	}
+	return m.matchRecursiveDepth(path, t.Dir)
+}
+
+func (m *Monitor) matchDirectChildren(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || !strings.Contains(rel, string(filepath.Separator))
+}
+
+func (m *Monitor) matchRecursiveDepth(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	depth := 0
+	if rel != "." {
+		depth = len(strings.Split(rel, string(filepath.Separator)))
+	}
+	return depth <= m.depth
+}
+
+func (m *Monitor) eventTypeAllowed(et EventType) bool {
+	for _, allowed := range m.eventTypes {
+		if et == allowed {
+			return true
 		}
 	}
 	return false

@@ -10,11 +10,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/procstats"
 )
 
 const maxEvents = 500
 
 type eventMsg ebpf.FileEvent
+type statsMsg struct{}
 
 var (
 	appStyle = lipgloss.NewStyle().Margin(1, 2)
@@ -26,6 +28,26 @@ var (
 
 	infoStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("250"))
+
+	resourceStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("236")).
+			Foreground(lipgloss.Color("255")).
+			Padding(0, 1)
+
+	resourceLabelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("244"))
+
+	cpuStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("214"))
+
+	memStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("76"))
+
+	epsStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("141"))
 
 	footerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("240"))
@@ -64,6 +86,10 @@ type model struct {
 	depth     int
 	startTime time.Time
 	eventID   int
+
+	lastStats    *procstats.Stats
+	prevEventID  int
+	eventsPerSec float64
 }
 
 func NewModel(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) tea.Model {
@@ -78,7 +104,10 @@ func NewModel(events <-chan ebpf.FileEvent, paths []string, recursive bool, dept
 }
 
 func (m *model) Init() tea.Cmd {
-	return listenForEvents(m.events)
+	return tea.Batch(
+		listenForEvents(m.events),
+		tickStats(),
+	)
 }
 
 func listenForEvents(ch <-chan ebpf.FileEvent) tea.Cmd {
@@ -91,21 +120,27 @@ func listenForEvents(ch <-chan ebpf.FileEvent) tea.Cmd {
 	}
 }
 
+func tickStats() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return statsMsg{}
+	})
+}
+
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		headerHeight := 5
-		footerHeight := 1
+		headerHeight := 3
+		footerHeight := 3
 		m.width = msg.Width
 		m.height = msg.Height
 
 		if !m.ready {
-			vp := viewport.New(m.width-4, m.height-headerHeight-footerHeight)
+			vp := viewport.New(m.width-4, m.height-headerHeight-footerHeight-1)
 			m.viewport = vp
 			m.ready = true
 		} else {
 			m.viewport.Width = m.width - 4
-			m.viewport.Height = m.height - headerHeight - footerHeight
+			m.viewport.Height = m.height - headerHeight - footerHeight - 1
 		}
 
 		m.renderViewport()
@@ -117,6 +152,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 
 		return m, listenForEvents(m.events)
+
+	case statsMsg:
+		m.updateStats()
+		m.renderViewport()
+
+		return m, tickStats()
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -130,6 +171,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *model) updateStats() {
+	s, err := procstats.Read()
+	if err != nil {
+		return
+	}
+
+	eventsDelta := m.eventID - m.prevEventID
+	m.eventsPerSec = float64(eventsDelta)
+	m.prevEventID = m.eventID
+	m.lastStats = s
 }
 
 func (m *model) addEvent(ev *ebpf.FileEvent) {
@@ -203,6 +256,8 @@ func (m *model) View() string {
 		time.Since(m.startTime).Round(time.Second),
 	))
 
+	resLine := m.renderResourceBar()
+
 	footer := footerStyle.Render("Press q or ctrl+c to exit")
 
 	return appStyle.Render(lipgloss.JoinVertical(
@@ -211,7 +266,33 @@ func (m *model) View() string {
 		"",
 		info,
 		m.viewport.View(),
+		resLine,
 		"",
 		footer,
 	))
+}
+
+func (m *model) renderResourceBar() string {
+	if m.lastStats == nil {
+		return ""
+	}
+
+	rssMB := float64(m.lastStats.RSS) / 1024 / 1024
+	cpuTotal := m.lastStats.CPUUser + m.lastStats.CPUSys
+	cpuSec := cpuTotal.Seconds()
+	uptimeSec := time.Since(m.startTime).Seconds()
+	cpuPct := 0.0
+	if uptimeSec > 0 {
+		cpuPct = (cpuSec / uptimeSec) * 100
+	}
+
+	rss := memStyle.Render(fmt.Sprintf("%.1f MB", rssMB))
+	cpu := cpuStyle.Render(fmt.Sprintf("%.1f%%", cpuPct))
+	eps := epsStyle.Render(fmt.Sprintf("%.0f/s", m.eventsPerSec))
+
+	return resourceStyle.Render(
+		resourceLabelStyle.Render(" Mem:") + " " + rss +
+			resourceLabelStyle.Render("  CPU:") + " " + cpu +
+			resourceLabelStyle.Render("  Evt/s:") + " " + eps,
+	)
 }
