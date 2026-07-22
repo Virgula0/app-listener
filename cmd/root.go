@@ -4,6 +4,7 @@ import (
 	"os"
 
 	"github.com/Virgula0/app-listener/cmd/entity"
+	"github.com/Virgula0/app-listener/cmd/functions/guard"
 	"github.com/Virgula0/app-listener/cmd/functions/monitor"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -11,10 +12,12 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "app-listener",
-	Short: "Monitor file system events using eBPF",
-	Long: `app-listener is a TUI/GUI application that monitors file system operations using eBPF.
-		
-Use --gui to launch the graphical interface instead of the terminal TUI.`,
+	Short: "Monitor and guard file system events using eBPF",
+	Long: `app-listener is a TUI/GUI application that monitors and guards
+file system operations using eBPF.
+
+Use --gui to launch the graphical interface instead of the terminal TUI
+(only available for the monitor subcommand).`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		initLogger()
 		return nil
@@ -49,4 +52,5 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "info", "Set log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().BoolVarP(&entity.GUI, "gui", "", false, "Launch GUI instead of TUI (default: false)")
 	rootCmd.AddCommand(monitor.MonitorCmd)
+	rootCmd.AddCommand(guard.GuardCmd)
 }

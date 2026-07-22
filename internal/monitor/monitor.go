@@ -1,4 +1,4 @@
-package ebpf
+package monitor
 
 import (
 	"bytes"
@@ -18,46 +18,41 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	log "github.com/sirupsen/logrus"
-)
 
-type Target struct {
-	Path  string // original path (for display)
-	Dir   string // parent dir (for files) or the dir itself
-	File  string // basename (empty for directories)
-	IsDir bool
-}
+	"github.com/Virgula0/app-listener/internal/infrastructure"
+)
 
 type Monitor struct {
 	objs    MonitorObjects
 	links   []link.Link
-	events  chan FileEvent
+	events  chan ebpf.FileEvent
 	done    chan struct{}
 	mu      sync.Mutex
 	stopped bool
 
-	targets    []Target
+	targets    []ebpf.Target
 	recursive  bool
 	depth      int
 	ownPID     int
-	eventTypes atomic.Value // stores []EventType
+	eventTypes atomic.Value // stores []ebpf.EventType
 
 	watchInodes map[string]string // "dev:ino" → watched path for hardlink detection
 }
 
-func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
+func NewMonitor(targets []ebpf.Target, recursive bool, depth int) (*Monitor, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("failed to remove memlock rlimit: %v", err)
 	}
 
 	m := &Monitor{
-		events:    make(chan FileEvent, 1024),
+		events:    make(chan ebpf.FileEvent, 1024),
 		done:      make(chan struct{}),
 		targets:   targets,
 		recursive: recursive,
 		depth:     depth,
 		ownPID:    os.Getpid(),
 	}
-	m.eventTypes.Store(EventTypes())
+	m.eventTypes.Store(ebpf.EventTypes())
 
 	var objs MonitorObjects
 	if err := LoadMonitorObjects(&objs, nil); err != nil {
@@ -73,12 +68,9 @@ func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
 	}
 
 	attachments := []attachDef{
-		// VFS-level kprobes catch ALL open/read/write (syscalls, io_uring, execve, etc.)
-		// Path is resolved from dentry manually instead of using bpf_d_path.
 		{objs.TraceVfsOpen, "kprobe", "", "vfs_open"},
 		{objs.TraceVfsRead, "kprobe", "", "vfs_read"},
 		{objs.TraceVfsWrite, "kprobe", "", "vfs_write"},
-		// Additional read-variant kprobes (readv, copy_file_range, splice, sendfile)
 		{objs.TraceVfsReadv, "kprobe", "", "vfs_readv"},
 		{objs.TraceVfsCopyFileRange, "kprobe", "", "vfs_copy_file_range"},
 		{objs.TraceDoSplice, "kprobe", "", "do_splice"},
@@ -86,15 +78,12 @@ func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
 		{objs.TraceSpliceFileRange, "kprobe", "", "splice_file_range"},
 		{objs.TraceDoSendfile, "kprobe", "", "do_sendfile"},
 		{objs.TraceVfsIterRead, "kprobe", "", "vfs_iter_read"},
-		// Memory-mapped I/O via kprobe (works without tracefs)
 		{objs.TraceSecurityMmapFile, "kprobe", "", "security_mmap_file"},
-		// Tracepoints for filesystem metadata operations
 		{objs.TraceUnlinkat, "tracepoint", "syscalls", "sys_enter_unlinkat"},
 		{objs.TraceRenameat2, "tracepoint", "syscalls", "sys_enter_renameat2"},
 		{objs.TraceSymlinkat, "tracepoint", "syscalls", "sys_enter_symlinkat"},
 		{objs.TraceLinkat, "tracepoint", "syscalls", "sys_enter_linkat"},
 		{objs.TraceMkdirat, "tracepoint", "syscalls", "sys_enter_mkdirat"},
-		// Legacy tracepoint for mmap (kept for tracefs-enabled systems)
 		{objs.TraceMmap, "tracepoint", "syscalls", "sys_enter_mmap"},
 	}
 
@@ -123,16 +112,16 @@ func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
 	for i, t := range targets {
 		paths[i] = t.Path
 	}
-	log.Infof("monitor created — %d probes/tracepoints attached, watching: %s",
+	log.Infof("monitor created \u2014 %d probes/tracepoints attached, watching: %s",
 		len(m.links), strings.Join(paths, ", "))
 	return m, nil
 }
 
-func (m *Monitor) Events() <-chan FileEvent {
+func (m *Monitor) Events() <-chan ebpf.FileEvent {
 	return m.events
 }
 
-func (m *Monitor) SetEventTypes(types []EventType) {
+func (m *Monitor) SetEventTypes(types []ebpf.EventType) {
 	if len(types) > 0 {
 		m.eventTypes.Store(types)
 	}
@@ -149,7 +138,7 @@ func (m *Monitor) Start() error {
 	for i, t := range m.targets {
 		paths[i] = t.Path
 	}
-	log.Infof("monitor started — watching: %s", strings.Join(paths, ", "))
+	log.Infof("monitor started \u2014 watching: %s", strings.Join(paths, ", "))
 	go m.readLoop(rd)
 	return nil
 }
@@ -174,7 +163,7 @@ func (m *Monitor) readLoop(rd *ringbuf.Reader) {
 	}
 }
 
-func (m *Monitor) readEvent(rd *ringbuf.Reader) (*FileEvent, bool) {
+func (m *Monitor) readEvent(rd *ringbuf.Reader) (*ebpf.FileEvent, bool) {
 	record, err := rd.Read()
 	if err != nil {
 		if errors.Is(err, ringbuf.ErrClosed) {
@@ -184,13 +173,13 @@ func (m *Monitor) readEvent(rd *ringbuf.Reader) (*FileEvent, bool) {
 		return nil, true
 	}
 
-	var be bpfEvent
+	var be ebpf.BpfEvent
 	if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &be); err != nil {
 		log.Errorf("decode event: %v", err)
 		return nil, true
 	}
 
-	ev := be.toFileEvent()
+	ev := be.ToFileEvent()
 	ev.Timestamp = time.Now().UnixNano()
 
 	if int(ev.PID) == m.ownPID {
@@ -206,7 +195,6 @@ func (m *Monitor) readEvent(rd *ringbuf.Reader) (*FileEvent, bool) {
 		return nil, true
 	}
 
-	// Resolve symlinks so that cat on a symlink to a watched file is detected.
 	ev.Path = m.resolveSymlinkToTarget(ev.Path)
 
 	if m.inWatchPath(ev.Path, ev.Dest) {
@@ -216,7 +204,6 @@ func (m *Monitor) readEvent(rd *ringbuf.Reader) (*FileEvent, bool) {
 		return nil, true
 	}
 
-	// If still no match, try hardlink detection via inode.
 	hardlinkPath := m.checkHardlinkByInode(ev.Path)
 	if hardlinkPath == "" {
 		return nil, true
@@ -240,8 +227,8 @@ func (m *Monitor) resolveRelativePath(pid uint32, path string) string {
 	return filepath.Join(cwd, path)
 }
 
-func (m *Monitor) resolveFDPath(ev *FileEvent) {
-	if ev.Type != EventMmap {
+func (m *Monitor) resolveFDPath(ev *ebpf.FileEvent) {
+	if ev.Type != ebpf.EventMmap {
 		return
 	}
 	if ev.Path != "" {
@@ -278,7 +265,7 @@ func (m *Monitor) matchesAnyTarget(p string) bool {
 	return false
 }
 
-func (m *Monitor) matchesFilter(ev *FileEvent) bool {
+func (m *Monitor) matchesFilter(ev *ebpf.FileEvent) bool {
 	if ev.Path == "" {
 		return false
 	}
@@ -291,7 +278,7 @@ func (m *Monitor) matchesFilter(ev *FileEvent) bool {
 	return false
 }
 
-func (m *Monitor) matchTarget(path string, t Target) bool {
+func (m *Monitor) matchTarget(path string, t ebpf.Target) bool {
 	if !t.IsDir {
 		return path == t.File || strings.HasSuffix(path, "/"+t.File)
 	}
@@ -327,8 +314,8 @@ func (m *Monitor) matchRecursiveDepth(path, dir string) bool {
 	return depth <= m.depth
 }
 
-func (m *Monitor) eventTypeAllowed(et EventType) bool {
-	types := m.eventTypes.Load().([]EventType)
+func (m *Monitor) eventTypeAllowed(et ebpf.EventType) bool {
+	types := m.eventTypes.Load().([]ebpf.EventType)
 	for _, allowed := range types {
 		if et == allowed {
 			return true
@@ -341,8 +328,6 @@ func (m *Monitor) isWithinDir(path, dir string) bool {
 	return path == dir || strings.HasPrefix(path, dir+"/")
 }
 
-// populateWatchInodes scans watched targets and records their (dev, inode)
-// pairs so we can detect hardlink access by inode match.
 func (m *Monitor) populateWatchInodes() {
 	for _, t := range m.targets {
 		if !t.IsDir {
@@ -383,8 +368,6 @@ func (m *Monitor) scanDirInodes(dir string, currentDepth int) {
 	}
 }
 
-// resolveSymlinkToTarget resolves all symlinks in path and, if the resolved
-// path falls within a watched target, returns the resolved path.
 func (m *Monitor) resolveSymlinkToTarget(path string) string {
 	if path == "" || m.matchesAnyTarget(path) {
 		return path
@@ -399,8 +382,6 @@ func (m *Monitor) resolveSymlinkToTarget(path string) string {
 	return path
 }
 
-// checkHardlinkByInode stats the given path and, if its (dev, inode) matches
-// a pre-recorded watched file, returns the corresponding watched path.
 func (m *Monitor) checkHardlinkByInode(path string) string {
 	if path == "" || len(m.watchInodes) == 0 {
 		return ""

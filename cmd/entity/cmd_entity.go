@@ -4,6 +4,7 @@ import "github.com/Virgula0/app-listener/internal/infrastructure"
 
 const (
 	MonitorKey = "monitor"
+	GuardKey   = "guard"
 )
 
 var (

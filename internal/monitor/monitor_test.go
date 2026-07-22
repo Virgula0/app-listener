@@ -1,4 +1,4 @@
-package ebpf
+package monitor
 
 import (
 	"os"
@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+
+	"github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 type monitorUnitTest struct {
@@ -17,8 +19,8 @@ func TestMonitorUnitTest(t *testing.T) {
 	suite.Run(t, new(monitorUnitTest))
 }
 
-func dirTarget(dir string) []Target {
-	return []Target{{Dir: dir, IsDir: true}}
+func dirTarget(dir string) []ebpf.Target {
+	return []ebpf.Target{{Dir: dir, IsDir: true}}
 }
 
 func (s *monitorUnitTest) TestInWatchPath() {
@@ -47,7 +49,7 @@ func (s *monitorUnitTest) TestInWatchPath() {
 }
 
 func (s *monitorUnitTest) TestInWatchPathFileTarget() {
-	m := &Monitor{targets: []Target{{Dir: "/parent", File: "target.txt", IsDir: false}}}
+	m := &Monitor{targets: []ebpf.Target{{Dir: "/parent", File: "target.txt", IsDir: false}}}
 
 	tests := []struct {
 		name     string
@@ -107,7 +109,7 @@ func (s *monitorUnitTest) TestMatchesFilterNonRecursive() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			ev := &FileEvent{Path: tt.path}
+			ev := &ebpf.FileEvent{Path: tt.path}
 			result := m.matchesFilter(ev)
 			s.Require().Equal(tt.expected, result)
 		})
@@ -131,7 +133,7 @@ func (s *monitorUnitTest) TestMatchesFilterRecursiveNoDepth() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			ev := &FileEvent{Path: tt.path}
+			ev := &ebpf.FileEvent{Path: tt.path}
 			result := m.matchesFilter(ev)
 			s.Require().Equal(tt.expected, result)
 		})
@@ -156,7 +158,7 @@ func (s *monitorUnitTest) TestMatchesFilterRecursiveWithDepth() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			ev := &FileEvent{Path: tt.path}
+			ev := &ebpf.FileEvent{Path: tt.path}
 			result := m.matchesFilter(ev)
 			s.Require().Equal(tt.expected, result)
 		})
@@ -173,19 +175,15 @@ func (s *monitorUnitTest) TestResolveSymlinkToTarget() {
 
 	m := &Monitor{targets: dirTarget(watchedDir)}
 
-	// symlink outside → target inside watched dir
 	symOutside := filepath.Join(dir, "outside_link")
 	s.Require().NoError(os.Symlink(watchedFile, symOutside))
 
-	// symlink inside watched dir → another target inside
 	symInside := filepath.Join(watchedDir, "inside_link")
 	s.Require().NoError(os.Symlink(watchedFile, symInside))
 
-	// symlink to watched dir itself
 	symDir := filepath.Join(dir, "dir_link")
 	s.Require().NoError(os.Symlink(watchedDir, symDir))
 
-	// regular file not inside watched dir
 	otherFile := filepath.Join(dir, "other.txt")
 	s.Require().NoError(os.WriteFile(otherFile, []byte("other"), 0644))
 
@@ -207,7 +205,7 @@ func (s *monitorUnitTest) TestResolveSymlinkToTarget() {
 		{
 			name:     "symlink inside watched dir",
 			path:     symInside,
-			expected: symInside, // already inside, no resolution needed
+			expected: symInside,
 		},
 		{
 			name:     "symlink to watched dir with subpath",
@@ -237,11 +235,9 @@ func (s *monitorUnitTest) TestCheckHardlinkByInode() {
 	watchedFile := filepath.Join(watchedDir, "target.txt")
 	s.Require().NoError(os.WriteFile(watchedFile, []byte("data"), 0644))
 
-	// hardlink to watched file
 	hardlinkPath := filepath.Join(dir, "mylink")
 	s.Require().NoError(os.Link(watchedFile, hardlinkPath))
 
-	// Setup monitor with pre-scanned inodes
 	m := &Monitor{
 		targets:     dirTarget(watchedDir),
 		watchInodes: make(map[string]string),
@@ -293,7 +289,7 @@ func (s *monitorUnitTest) TestPopulateWatchInodes_SingleFile() {
 	s.Require().NoError(os.WriteFile(targetFile, []byte("data"), 0644))
 
 	m := &Monitor{
-		targets: []Target{
+		targets: []ebpf.Target{
 			{Dir: dir, File: "target.txt", IsDir: false, Path: targetFile},
 		},
 		watchInodes: make(map[string]string),
@@ -324,7 +320,6 @@ func (s *monitorUnitTest) TestPopulateWatchInodes_Directory() {
 	}
 	m.populateWatchInodes()
 
-	// Should have 3 files (a.txt, b.txt, sub/c.txt)
 	s.Require().Len(m.watchInodes, 3)
 	for _, val := range m.watchInodes {
 		s.Contains(val, dir)
@@ -339,7 +334,6 @@ func (s *monitorUnitTest) TestResolveSymlinkToTarget_Chained() {
 	watchedFile := filepath.Join(watchedDir, "secret.txt")
 	s.Require().NoError(os.WriteFile(watchedFile, []byte("data"), 0644))
 
-	// link1 -> link2 -> watchedFile
 	link2 := filepath.Join(dir, "link2")
 	s.Require().NoError(os.Symlink(watchedFile, link2))
 	link1 := filepath.Join(dir, "link1")
@@ -359,7 +353,6 @@ func (s *monitorUnitTest) TestResolveSymlinkToTarget_Relative() {
 	watchedFile := filepath.Join(watchedDir, "secret.txt")
 	s.Require().NoError(os.WriteFile(watchedFile, []byte("data"), 0644))
 
-	// symlink with relative target ../watched/secret.txt
 	subDir := filepath.Join(dir, "sub")
 	s.Require().NoError(os.Mkdir(subDir, 0755))
 	relSymlink := filepath.Join(subDir, "link")
@@ -397,8 +390,8 @@ func (s *monitorUnitTest) TestResolveFDPath_SkipsReadWrite() {
 	targetFile := filepath.Join(dir, "target.txt")
 	s.Require().NoError(os.WriteFile(targetFile, []byte("data"), 0644))
 
-	for _, typ := range []EventType{EventRead, EventWrite} {
-		ev := &FileEvent{
+	for _, typ := range []ebpf.EventType{ebpf.EventRead, ebpf.EventWrite} {
+		ev := &ebpf.FileEvent{
 			PID:  uint32(os.Getpid()),
 			FD:   3,
 			Type: typ,
@@ -406,8 +399,6 @@ func (s *monitorUnitTest) TestResolveFDPath_SkipsReadWrite() {
 		m := &Monitor{}
 		m.resolveFDPath(ev)
 
-		// vfs_read/vfs_write set Path directly in BPF; resolveFDPath
-		// only handles EventMmap. The path should remain empty.
 		s.Require().Empty(ev.Path, "resolveFDPath must not resolve fd for %s", typ)
 	}
 }
@@ -421,10 +412,10 @@ func (s *monitorUnitTest) TestResolveFDPath_Mmap() {
 	s.Require().NoError(err)
 	defer f.Close()
 
-	ev := &FileEvent{
+	ev := &ebpf.FileEvent{
 		PID:  uint32(os.Getpid()),
 		FD:   uint32(f.Fd()),
-		Type: EventMmap,
+		Type: ebpf.EventMmap,
 	}
 	m := &Monitor{}
 	m.resolveFDPath(ev)
@@ -433,16 +424,15 @@ func (s *monitorUnitTest) TestResolveFDPath_Mmap() {
 }
 
 func (s *monitorUnitTest) TestResolveFDPath_SkipNonFdType() {
-	ev := &FileEvent{
+	ev := &ebpf.FileEvent{
 		PID:  1234,
 		FD:   5,
-		Type: EventOpen,
+		Type: ebpf.EventOpen,
 		Path: "/some/path",
 	}
 	m := &Monitor{}
 	m.resolveFDPath(ev)
 
-	// Path should remain unchanged (EventOpen not handled by resolveFDPath)
 	s.Require().Equal("/some/path", ev.Path)
 }
 
@@ -472,46 +462,43 @@ func (s *monitorUnitTest) TestCheckHardlinkByInode_Preexisting() {
 	watchedFile := filepath.Join(watchedDir, "target.txt")
 	s.Require().NoError(os.WriteFile(watchedFile, []byte("data"), 0644))
 
-	// Hardlink created BEFORE monitor starts
 	hardlinkPath := filepath.Join(dir, "preexisting_hardlink")
 	s.Require().NoError(os.Link(watchedFile, hardlinkPath))
 
-	// Monitor startup path: scan watched dir inodes
 	m := &Monitor{
 		targets:     dirTarget(watchedDir),
 		watchInodes: make(map[string]string),
 	}
 	m.populateWatchInodes()
 
-	// Access via hardlink should be detected
 	result := m.checkHardlinkByInode(hardlinkPath)
 	s.Require().Equal(watchedFile, result)
 }
 
 func TestSetEventTypesRace(t *testing.T) {
 	m := &Monitor{}
-	m.eventTypes.Store(EventTypes())
+	m.eventTypes.Store(ebpf.EventTypes())
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for range 100 {
-			m.SetEventTypes([]EventType{EventOpen, EventRead})
+			m.SetEventTypes([]ebpf.EventType{ebpf.EventOpen, ebpf.EventRead})
 		}
 	}()
 
 	for range 100 {
-		m.eventTypeAllowed(EventOpen)
-		m.eventTypeAllowed(EventRead)
-		m.eventTypeAllowed(EventWrite)
+		m.eventTypeAllowed(ebpf.EventOpen)
+		m.eventTypeAllowed(ebpf.EventRead)
+		m.eventTypeAllowed(ebpf.EventWrite)
 	}
 	wg.Wait()
 }
 
 func TestEventTypeAllowedConcurrent(t *testing.T) {
 	m := &Monitor{}
-	m.eventTypes.Store([]EventType{EventOpen, EventRead, EventWrite, EventDelete})
+	m.eventTypes.Store([]ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventWrite, ebpf.EventDelete})
 
 	var wg sync.WaitGroup
 	for range 10 {
@@ -519,9 +506,9 @@ func TestEventTypeAllowedConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 100 {
-				_ = m.eventTypeAllowed(EventOpen)
-				_ = m.eventTypeAllowed(EventWrite)
-				_ = m.eventTypeAllowed(EventMmap)
+				_ = m.eventTypeAllowed(ebpf.EventOpen)
+				_ = m.eventTypeAllowed(ebpf.EventWrite)
+				_ = m.eventTypeAllowed(ebpf.EventMmap)
 			}
 		}()
 	}
@@ -530,10 +517,10 @@ func TestEventTypeAllowedConcurrent(t *testing.T) {
 
 func TestSetEventTypesBeforeStartNoRace(t *testing.T) {
 	m := &Monitor{}
-	m.SetEventTypes([]EventType{EventOpen})
+	m.SetEventTypes([]ebpf.EventType{ebpf.EventOpen})
 
-	types := m.eventTypes.Load().([]EventType)
-	if len(types) != 1 || types[0] != EventOpen {
+	types := m.eventTypes.Load().([]ebpf.EventType)
+	if len(types) != 1 || types[0] != ebpf.EventOpen {
 		t.Fatalf("unexpected event types: %v", types)
 	}
 }

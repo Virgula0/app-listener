@@ -53,7 +53,7 @@ type FileEvent struct {
 	Timestamp int64
 }
 
-type bpfEvent struct {
+type BpfEvent struct {
 	PID  uint32
 	UID  uint32
 	GID  uint32
@@ -65,20 +65,20 @@ type bpfEvent struct {
 	Dest [256]byte
 }
 
-func (e *bpfEvent) toFileEvent() FileEvent {
+func (e *BpfEvent) ToFileEvent() FileEvent {
 	return FileEvent{
 		PID:  e.PID,
 		UID:  e.UID,
 		GID:  e.GID,
 		Type: EventType(e.Type),
 		FD:   e.FD,
-		Comm: cstr(e.Comm[:]),
-		Path: cstr(e.Path[:]),
-		Dest: cstr(e.Dest[:]),
+		Comm: Cstr(e.Comm[:]),
+		Path: Cstr(e.Path[:]),
+		Dest: Cstr(e.Dest[:]),
 	}
 }
 
-func cstr(b []byte) string {
+func Cstr(b []byte) string {
 	i := 0
 	for i < len(b) && b[i] != 0 {
 		i++

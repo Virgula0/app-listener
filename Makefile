@@ -1,7 +1,8 @@
-.PHONY: build build-linux install-linter install-deps generate run lint test test-integration deploy deploy-down tidy clean
+.PHONY: build build-linux install-linter install-deps generate generate-monitor generate-guard run run-guard lint test test-integration deploy deploy-down tidy clean
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
+GEN_DIR     = build/generated
 
 build: generate build-linux
 
@@ -9,25 +10,42 @@ build-linux:
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o $(OUTPUT_DIR)/$(BINARY_NAME) .
 .PHONY: build-linux
 
-GEN_DIR = build/generated
+generate: generate-monitor generate-guard
 
-generate:
-	@mkdir -p $(GEN_DIR) internal/infrastructure/embeds
-	GOPACKAGE=ebpf GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+generate-monitor:
+	@mkdir -p $(GEN_DIR) internal/monitor/embeds
+	GOPACKAGE=monitor GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
 		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
-		Monitor ./internal/infrastructure/bpf/monitor.bpf.c
-	@mv $(GEN_DIR)/monitor_bpf.go internal/infrastructure/monitor_bpf.go
-	@mv $(GEN_DIR)/monitor_bpf.o internal/infrastructure/embeds/monitor_bpf.o
-	@sed -i 's|monitor_bpf\.o|embeds/monitor_bpf.o|' internal/infrastructure/monitor_bpf.go
+		Monitor ./internal/monitor/bpf/monitor.bpf.c
+	@mv $(GEN_DIR)/monitor_bpf.go internal/monitor/monitor_bpf.go
+	@mv $(GEN_DIR)/monitor_bpf.o internal/monitor/embeds/monitor_bpf.o
+	@sed -i 's|monitor_bpf\.o|embeds/monitor_bpf.o|' internal/monitor/monitor_bpf.go
 	@rm -rf $(GEN_DIR)
-	@echo "BPF generation complete"
-.PHONY: generate
+	@echo "Monitor BPF generation complete"
+.PHONY: generate-monitor
+
+generate-guard:
+	@mkdir -p $(GEN_DIR) internal/guard/embeds
+	GOPACKAGE=guard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+		-cc clang \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86" \
+		-target bpf \
+		-output-dir $(GEN_DIR) \
+		Guard ./internal/guard/bpf/guard.bpf.c
+	@mv $(GEN_DIR)/guard_bpf.go internal/guard/guard_bpf.go
+	@mv $(GEN_DIR)/guard_bpf.o internal/guard/embeds/guard_bpf.o
+	@sed -i 's|guard_bpf\.o|embeds/guard_bpf.o|' internal/guard/guard_bpf.go
+	@rm -rf $(GEN_DIR)
+	@echo "Guard BPF generation complete"
+.PHONY: generate-guard
 
 bpftool-headers:
-	bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null > internal/infrastructure/bpf/vmlinux.h
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null \
+		> internal/monitor/bpf/vmlinux.h
+	cp internal/monitor/bpf/vmlinux.h internal/guard/bpf/vmlinux.h
 .PHONY: bpftool-headers
 
 install-linter:
@@ -43,6 +61,10 @@ install-deps:
 run:
 	CGO_ENABLED=1 go run ./... monitor $(ARGS)
 .PHONY: run
+
+run-guard:
+	CGO_ENABLED=1 go run ./... guard $(ARGS)
+.PHONY: run-guard
 
 lint:
 	@golangci-lint run
@@ -71,7 +93,6 @@ tidy:
 
 clean:
 	rm -rf $(OUTPUT_DIR) build/test \
-		internal/infrastructure/monitor_bpf.go \
-		internal/infrastructure/embeds/ \
-		internal/infrastructure/bpf/vmlinux.h
+		internal/monitor/monitor_bpf.go internal/monitor/embeds/ internal/monitor/bpf/vmlinux.h \
+		internal/guard/guard_bpf.go internal/guard/embeds/ internal/guard/bpf/vmlinux.h
 .PHONY: clean

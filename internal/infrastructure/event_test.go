@@ -29,7 +29,7 @@ func (s *eventUnitTest) TestCstr() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			result := cstr(tt.input)
+			result := Cstr(tt.input)
 			s.Require().Equal(tt.expected, result)
 		})
 	}
@@ -68,7 +68,7 @@ func (s *eventUnitTest) TestBpfEventToFileEvent() {
 	var dest [256]byte
 	copy(dest[:], "/tmp/test2.txt")
 
-	be := &bpfEvent{
+	be := &BpfEvent{
 		PID:  1234,
 		UID:  1000,
 		GID:  1000,
@@ -79,7 +79,7 @@ func (s *eventUnitTest) TestBpfEventToFileEvent() {
 		Dest: dest,
 	}
 
-	fe := be.toFileEvent()
+	fe := be.ToFileEvent()
 
 	s.Require().Equal(uint32(1234), fe.PID)
 	s.Require().Equal(uint32(1000), fe.UID)
@@ -92,8 +92,8 @@ func (s *eventUnitTest) TestBpfEventToFileEvent() {
 }
 
 func (s *eventUnitTest) TestBpfEventToFileEventZeroValue() {
-	be := &bpfEvent{}
-	fe := be.toFileEvent()
+	be := &BpfEvent{}
+	fe := be.ToFileEvent()
 
 	s.Require().Equal(uint32(0), fe.PID)
 	s.Require().Equal(EventType(0), fe.Type)
