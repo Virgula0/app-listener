@@ -3,6 +3,7 @@ package ebpf
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -485,4 +486,54 @@ func (s *monitorUnitTest) TestCheckHardlinkByInode_Preexisting() {
 	// Access via hardlink should be detected
 	result := m.checkHardlinkByInode(hardlinkPath)
 	s.Require().Equal(watchedFile, result)
+}
+
+func TestSetEventTypesRace(t *testing.T) {
+	m := &Monitor{}
+	m.eventTypes.Store(EventTypes())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			m.SetEventTypes([]EventType{EventOpen, EventRead})
+		}
+	}()
+
+	for range 100 {
+		m.eventTypeAllowed(EventOpen)
+		m.eventTypeAllowed(EventRead)
+		m.eventTypeAllowed(EventWrite)
+	}
+	wg.Wait()
+}
+
+func TestEventTypeAllowedConcurrent(t *testing.T) {
+	m := &Monitor{}
+	m.eventTypes.Store([]EventType{EventOpen, EventRead, EventWrite, EventDelete})
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				_ = m.eventTypeAllowed(EventOpen)
+				_ = m.eventTypeAllowed(EventWrite)
+				_ = m.eventTypeAllowed(EventMmap)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestSetEventTypesBeforeStartNoRace(t *testing.T) {
+	m := &Monitor{}
+	m.SetEventTypes([]EventType{EventOpen})
+
+	types := m.eventTypes.Load().([]EventType)
+	if len(types) != 1 || types[0] != EventOpen {
+		t.Fatalf("unexpected event types: %v", types)
+	}
 }

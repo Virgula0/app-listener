@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,7 +39,7 @@ type Monitor struct {
 	recursive  bool
 	depth      int
 	ownPID     int
-	eventTypes []EventType
+	eventTypes atomic.Value // stores []EventType
 
 	watchInodes map[string]string // "dev:ino" → watched path for hardlink detection
 }
@@ -49,14 +50,14 @@ func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
 	}
 
 	m := &Monitor{
-		events:     make(chan FileEvent, 1024),
-		done:       make(chan struct{}),
-		targets:    targets,
-		recursive:  recursive,
-		depth:      depth,
-		ownPID:     os.Getpid(),
-		eventTypes: EventTypes(),
+		events:    make(chan FileEvent, 1024),
+		done:      make(chan struct{}),
+		targets:   targets,
+		recursive: recursive,
+		depth:     depth,
+		ownPID:    os.Getpid(),
 	}
+	m.eventTypes.Store(EventTypes())
 
 	var objs MonitorObjects
 	if err := LoadMonitorObjects(&objs, nil); err != nil {
@@ -133,7 +134,7 @@ func (m *Monitor) Events() <-chan FileEvent {
 
 func (m *Monitor) SetEventTypes(types []EventType) {
 	if len(types) > 0 {
-		m.eventTypes = types
+		m.eventTypes.Store(types)
 	}
 }
 
@@ -327,7 +328,8 @@ func (m *Monitor) matchRecursiveDepth(path, dir string) bool {
 }
 
 func (m *Monitor) eventTypeAllowed(et EventType) bool {
-	for _, allowed := range m.eventTypes {
+	types := m.eventTypes.Load().([]EventType)
+	for _, allowed := range types {
 		if et == allowed {
 			return true
 		}
