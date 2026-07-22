@@ -70,17 +70,29 @@ func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
 	}
 
 	attachments := []attachDef{
-		{objs.TraceDoSysOpen, "kprobe", "", "do_sys_open"},
-		{objs.TraceDoSysOpenat2, "kprobe", "", "do_sys_openat2"},
-		{objs.TraceKsysRead, "kprobe", "", "ksys_read"},
-		{objs.TraceKsysWrite, "kprobe", "", "ksys_write"},
-		{objs.TraceOpen, "tracepoint", "syscalls", "sys_enter_open"},
-		{objs.TraceOpenat, "tracepoint", "syscalls", "sys_enter_openat"},
+		// VFS-level kprobes catch ALL open/read/write (syscalls, io_uring, execve, etc.)
+		// Path is resolved from dentry manually instead of using bpf_d_path.
+		{objs.TraceVfsOpen, "kprobe", "", "vfs_open"},
+		{objs.TraceVfsRead, "kprobe", "", "vfs_read"},
+		{objs.TraceVfsWrite, "kprobe", "", "vfs_write"},
+		// Additional read-variant kprobes (readv, copy_file_range, splice, sendfile)
+		{objs.TraceVfsReadv, "kprobe", "", "vfs_readv"},
+		{objs.TraceVfsCopyFileRange, "kprobe", "", "vfs_copy_file_range"},
+		{objs.TraceDoSplice, "kprobe", "", "do_splice"},
+		{objs.TraceDoSpliceDirect, "kprobe", "", "do_splice_direct"},
+		{objs.TraceSpliceFileRange, "kprobe", "", "splice_file_range"},
+		{objs.TraceDoSendfile, "kprobe", "", "do_sendfile"},
+		{objs.TraceVfsIterRead, "kprobe", "", "vfs_iter_read"},
+		// Memory-mapped I/O via kprobe (works without tracefs)
+		{objs.TraceSecurityMmapFile, "kprobe", "", "security_mmap_file"},
+		// Tracepoints for filesystem metadata operations
 		{objs.TraceUnlinkat, "tracepoint", "syscalls", "sys_enter_unlinkat"},
 		{objs.TraceRenameat2, "tracepoint", "syscalls", "sys_enter_renameat2"},
 		{objs.TraceSymlinkat, "tracepoint", "syscalls", "sys_enter_symlinkat"},
 		{objs.TraceLinkat, "tracepoint", "syscalls", "sys_enter_linkat"},
 		{objs.TraceMkdirat, "tracepoint", "syscalls", "sys_enter_mkdirat"},
+		// Legacy tracepoint for mmap (kept for tracefs-enabled systems)
+		{objs.TraceMmap, "tracepoint", "syscalls", "sys_enter_mmap"},
 	}
 
 	for _, a := range attachments {
@@ -200,7 +212,7 @@ func (m *Monitor) resolveRelativePath(pid uint32, path string) string {
 }
 
 func (m *Monitor) resolveFDPath(ev *FileEvent) {
-	if ev.Type != EventRead && ev.Type != EventWrite {
+	if ev.Type != EventMmap {
 		return
 	}
 	if ev.Path != "" {

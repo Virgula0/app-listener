@@ -39,6 +39,7 @@ var (
 		ebpf.EventSymlink:  lipgloss.NewStyle().Foreground(lipgloss.Color("45")),
 		ebpf.EventHardlink: lipgloss.NewStyle().Foreground(lipgloss.Color("45")),
 		ebpf.EventMkdir:    lipgloss.NewStyle().Foreground(lipgloss.Color("184")),
+		ebpf.EventMmap:     lipgloss.NewStyle().Foreground(lipgloss.Color("99")),
 	}
 
 	timeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))

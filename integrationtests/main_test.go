@@ -1,4 +1,4 @@
-package tests
+package integrationtests
 
 import (
 	"context"
@@ -30,7 +30,7 @@ func TestMain(m *testing.M) {
 
 	amd64Bin = absPath("../build/test/app-listener-amd64")
 
-	cmd := exec.Command("go", "build", "-o", amd64Bin, "..")
+	cmd := exec.Command("go", "build", "-tags", "ci", "-o", amd64Bin, "..")
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if err := cmd.Run(); err != nil {
@@ -39,7 +39,7 @@ func TestMain(m *testing.M) {
 	}
 
 	arm64Bin = absPath("../build/test/app-listener-arm64")
-	cmd2 := exec.Command("go", "build", "-o", arm64Bin, "..")
+	cmd2 := exec.Command("go", "build", "-tags", "ci", "-o", arm64Bin, "..")
 	cmd2.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
 	cmd2.Stderr = os.Stderr
 	if err := cmd2.Run(); err != nil {

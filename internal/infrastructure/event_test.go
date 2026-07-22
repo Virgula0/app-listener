@@ -49,6 +49,7 @@ func (s *eventUnitTest) TestEventTypeString() {
 		{name: "symlink", etype: EventSymlink, expected: "SYMLINK"},
 		{name: "hardlink", etype: EventHardlink, expected: "HARDLINK"},
 		{name: "mkdir", etype: EventMkdir, expected: "MKDIR"},
+		{name: "mmap", etype: EventMmap, expected: "MMAP"},
 		{name: "unknown", etype: EventType(99), expected: "UNKNOWN"},
 	}
 

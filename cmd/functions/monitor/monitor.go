@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
@@ -46,6 +48,8 @@ func init() {
 		"Monitor directory recursively (default: false)")
 	MonitorCmd.Flags().IntVarP(&entity.Depth, "depth", "d", 0,
 		"Maximum directory depth (requires --recursive) (default: 0)")
+	MonitorCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
+		"Run without TUI, print events to stderr (for testing/scripting)")
 }
 
 type rawTarget struct {
@@ -124,7 +128,24 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 		displayPaths[i] = rt.absPath
 	}
 
-	if entity.GUI {
+	if entity.Headless {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+		for {
+			select {
+			case ev, ok := <-mon.Events():
+				if !ok {
+					return nil
+				}
+				msg := fmt.Sprintf("EVENT|%s|%s|%s|%d|%s|%d",
+					ev.Type.String(), ev.Comm, ev.Path, ev.PID, ev.Dest, ev.FD)
+				log.Infof(msg)
+			case <-sig:
+				return nil
+			}
+		}
+	} else if entity.GUI {
 		gui.Run(mon.Events(), displayPaths, recursive, depth)
 	} else {
 		p := tea.NewProgram(

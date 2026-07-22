@@ -109,7 +109,7 @@ func (r *dataRow) setEvent(ev ebpf.FileEvent) {
 
 	detail := ""
 	switch ev.Type {
-	case ebpf.EventRead, ebpf.EventWrite:
+	case ebpf.EventRead, ebpf.EventWrite, ebpf.EventMmap:
 		detail = fmt.Sprintf("fd=%d", ev.FD)
 	case ebpf.EventRename, ebpf.EventSymlink, ebpf.EventHardlink:
 		detail = ev.Dest

@@ -49,11 +49,12 @@ lint:
 .PHONY: lint
 
 test:
-	CGO_ENABLED=1 go test $$(go list ./... | grep -v /tests) --count=1 -p 1
+	CGO_ENABLED=1 go test $$(go list ./... | grep -v /integrationtests) --count=1 -p 1
 .PHONY: test
 
 test-integration:
-	go test ./tests/ -v --count=1 -timeout 15m
+	$(MAKE) -C integrationtests/exploits
+	go test ./integrationtests/ -v --count=1 -timeout 15m
 .PHONY: test-integration
 
 deploy:

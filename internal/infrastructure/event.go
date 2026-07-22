@@ -11,6 +11,7 @@ const (
 	EventSymlink
 	EventHardlink
 	EventMkdir
+	EventMmap
 )
 
 func (t EventType) String() string {
@@ -31,6 +32,8 @@ func (t EventType) String() string {
 		return "HARDLINK"
 	case EventMkdir:
 		return "MKDIR"
+	case EventMmap:
+		return "MMAP"
 	default:
 		return "UNKNOWN"
 	}

@@ -19,3 +19,9 @@ vmlinux.h
 *.swo
 *~
 .DS_Store
+
+# Compiled exploit binaries (C sources are tracked)
+integrationtests/exploits/*
+!integrationtests/exploits/*.c
+!integrationtests/exploits/Makefile
+!integrationtests/exploits/README.md

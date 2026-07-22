@@ -53,17 +53,23 @@ type MonitorSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type MonitorProgramSpecs struct {
-	TraceDoSysOpen    *ebpf.ProgramSpec `ebpf:"trace_do_sys_open"`
-	TraceDoSysOpenat2 *ebpf.ProgramSpec `ebpf:"trace_do_sys_openat2"`
-	TraceKsysRead     *ebpf.ProgramSpec `ebpf:"trace_ksys_read"`
-	TraceKsysWrite    *ebpf.ProgramSpec `ebpf:"trace_ksys_write"`
-	TraceLinkat       *ebpf.ProgramSpec `ebpf:"trace_linkat"`
-	TraceMkdirat      *ebpf.ProgramSpec `ebpf:"trace_mkdirat"`
-	TraceOpen         *ebpf.ProgramSpec `ebpf:"trace_open"`
-	TraceOpenat       *ebpf.ProgramSpec `ebpf:"trace_openat"`
-	TraceRenameat2    *ebpf.ProgramSpec `ebpf:"trace_renameat2"`
-	TraceSymlinkat    *ebpf.ProgramSpec `ebpf:"trace_symlinkat"`
-	TraceUnlinkat     *ebpf.ProgramSpec `ebpf:"trace_unlinkat"`
+	TraceDoSendfile       *ebpf.ProgramSpec `ebpf:"trace_do_sendfile"`
+	TraceDoSplice         *ebpf.ProgramSpec `ebpf:"trace_do_splice"`
+	TraceDoSpliceDirect   *ebpf.ProgramSpec `ebpf:"trace_do_splice_direct"`
+	TraceLinkat           *ebpf.ProgramSpec `ebpf:"trace_linkat"`
+	TraceMkdirat          *ebpf.ProgramSpec `ebpf:"trace_mkdirat"`
+	TraceMmap             *ebpf.ProgramSpec `ebpf:"trace_mmap"`
+	TraceRenameat2        *ebpf.ProgramSpec `ebpf:"trace_renameat2"`
+	TraceSecurityMmapFile *ebpf.ProgramSpec `ebpf:"trace_security_mmap_file"`
+	TraceSpliceFileRange  *ebpf.ProgramSpec `ebpf:"trace_splice_file_range"`
+	TraceSymlinkat        *ebpf.ProgramSpec `ebpf:"trace_symlinkat"`
+	TraceUnlinkat         *ebpf.ProgramSpec `ebpf:"trace_unlinkat"`
+	TraceVfsCopyFileRange *ebpf.ProgramSpec `ebpf:"trace_vfs_copy_file_range"`
+	TraceVfsIterRead      *ebpf.ProgramSpec `ebpf:"trace_vfs_iter_read"`
+	TraceVfsOpen          *ebpf.ProgramSpec `ebpf:"trace_vfs_open"`
+	TraceVfsRead          *ebpf.ProgramSpec `ebpf:"trace_vfs_read"`
+	TraceVfsReadv         *ebpf.ProgramSpec `ebpf:"trace_vfs_readv"`
+	TraceVfsWrite         *ebpf.ProgramSpec `ebpf:"trace_vfs_write"`
 }
 
 // MonitorMapSpecs contains maps before they are loaded into the kernel.
@@ -118,32 +124,44 @@ type MonitorVariables struct {
 //
 // It can be passed to LoadMonitorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type MonitorPrograms struct {
-	TraceDoSysOpen    *ebpf.Program `ebpf:"trace_do_sys_open"`
-	TraceDoSysOpenat2 *ebpf.Program `ebpf:"trace_do_sys_openat2"`
-	TraceKsysRead     *ebpf.Program `ebpf:"trace_ksys_read"`
-	TraceKsysWrite    *ebpf.Program `ebpf:"trace_ksys_write"`
-	TraceLinkat       *ebpf.Program `ebpf:"trace_linkat"`
-	TraceMkdirat      *ebpf.Program `ebpf:"trace_mkdirat"`
-	TraceOpen         *ebpf.Program `ebpf:"trace_open"`
-	TraceOpenat       *ebpf.Program `ebpf:"trace_openat"`
-	TraceRenameat2    *ebpf.Program `ebpf:"trace_renameat2"`
-	TraceSymlinkat    *ebpf.Program `ebpf:"trace_symlinkat"`
-	TraceUnlinkat     *ebpf.Program `ebpf:"trace_unlinkat"`
+	TraceDoSendfile       *ebpf.Program `ebpf:"trace_do_sendfile"`
+	TraceDoSplice         *ebpf.Program `ebpf:"trace_do_splice"`
+	TraceDoSpliceDirect   *ebpf.Program `ebpf:"trace_do_splice_direct"`
+	TraceLinkat           *ebpf.Program `ebpf:"trace_linkat"`
+	TraceMkdirat          *ebpf.Program `ebpf:"trace_mkdirat"`
+	TraceMmap             *ebpf.Program `ebpf:"trace_mmap"`
+	TraceRenameat2        *ebpf.Program `ebpf:"trace_renameat2"`
+	TraceSecurityMmapFile *ebpf.Program `ebpf:"trace_security_mmap_file"`
+	TraceSpliceFileRange  *ebpf.Program `ebpf:"trace_splice_file_range"`
+	TraceSymlinkat        *ebpf.Program `ebpf:"trace_symlinkat"`
+	TraceUnlinkat         *ebpf.Program `ebpf:"trace_unlinkat"`
+	TraceVfsCopyFileRange *ebpf.Program `ebpf:"trace_vfs_copy_file_range"`
+	TraceVfsIterRead      *ebpf.Program `ebpf:"trace_vfs_iter_read"`
+	TraceVfsOpen          *ebpf.Program `ebpf:"trace_vfs_open"`
+	TraceVfsRead          *ebpf.Program `ebpf:"trace_vfs_read"`
+	TraceVfsReadv         *ebpf.Program `ebpf:"trace_vfs_readv"`
+	TraceVfsWrite         *ebpf.Program `ebpf:"trace_vfs_write"`
 }
 
 func (p *MonitorPrograms) Close() error {
 	return _MonitorClose(
-		p.TraceDoSysOpen,
-		p.TraceDoSysOpenat2,
-		p.TraceKsysRead,
-		p.TraceKsysWrite,
+		p.TraceDoSendfile,
+		p.TraceDoSplice,
+		p.TraceDoSpliceDirect,
 		p.TraceLinkat,
 		p.TraceMkdirat,
-		p.TraceOpen,
-		p.TraceOpenat,
+		p.TraceMmap,
 		p.TraceRenameat2,
+		p.TraceSecurityMmapFile,
+		p.TraceSpliceFileRange,
 		p.TraceSymlinkat,
 		p.TraceUnlinkat,
+		p.TraceVfsCopyFileRange,
+		p.TraceVfsIterRead,
+		p.TraceVfsOpen,
+		p.TraceVfsRead,
+		p.TraceVfsReadv,
+		p.TraceVfsWrite,
 	)
 }
 

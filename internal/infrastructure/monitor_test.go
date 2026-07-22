@@ -329,3 +329,160 @@ func (s *monitorUnitTest) TestPopulateWatchInodes_Directory() {
 		s.Contains(val, dir)
 	}
 }
+
+func (s *monitorUnitTest) TestResolveSymlinkToTarget_Chained() {
+	dir := s.T().TempDir()
+
+	watchedDir := filepath.Join(dir, "watched")
+	s.Require().NoError(os.Mkdir(watchedDir, 0755))
+	watchedFile := filepath.Join(watchedDir, "secret.txt")
+	s.Require().NoError(os.WriteFile(watchedFile, []byte("data"), 0644))
+
+	// link1 -> link2 -> watchedFile
+	link2 := filepath.Join(dir, "link2")
+	s.Require().NoError(os.Symlink(watchedFile, link2))
+	link1 := filepath.Join(dir, "link1")
+	s.Require().NoError(os.Symlink(link2, link1))
+
+	m := &Monitor{targets: dirTarget(watchedDir)}
+
+	result := m.resolveSymlinkToTarget(link1)
+	s.Require().Equal(watchedFile, result)
+}
+
+func (s *monitorUnitTest) TestResolveSymlinkToTarget_Relative() {
+	dir := s.T().TempDir()
+
+	watchedDir := filepath.Join(dir, "watched")
+	s.Require().NoError(os.Mkdir(watchedDir, 0755))
+	watchedFile := filepath.Join(watchedDir, "secret.txt")
+	s.Require().NoError(os.WriteFile(watchedFile, []byte("data"), 0644))
+
+	// symlink with relative target ../watched/secret.txt
+	subDir := filepath.Join(dir, "sub")
+	s.Require().NoError(os.Mkdir(subDir, 0755))
+	relSymlink := filepath.Join(subDir, "link")
+	s.Require().NoError(os.Symlink("../watched/secret.txt", relSymlink))
+
+	m := &Monitor{targets: dirTarget(watchedDir)}
+
+	result := m.resolveSymlinkToTarget(relSymlink)
+	s.Require().Equal(watchedFile, result)
+}
+
+func (s *monitorUnitTest) TestResolveSymlinkToTarget_NonMatching() {
+	dir := s.T().TempDir()
+
+	watchedDir := filepath.Join(dir, "watched")
+	s.Require().NoError(os.Mkdir(watchedDir, 0755))
+	watchedFile := filepath.Join(watchedDir, "secret.txt")
+	s.Require().NoError(os.WriteFile(watchedFile, []byte("data"), 0644))
+
+	outsideDir := filepath.Join(dir, "outside")
+	s.Require().NoError(os.Mkdir(outsideDir, 0755))
+	outsideFile := filepath.Join(outsideDir, "other.txt")
+	s.Require().NoError(os.WriteFile(outsideFile, []byte("other"), 0644))
+	symToOutside := filepath.Join(dir, "link_to_outside")
+	s.Require().NoError(os.Symlink(outsideFile, symToOutside))
+
+	m := &Monitor{targets: dirTarget(watchedDir)}
+
+	result := m.resolveSymlinkToTarget(symToOutside)
+	s.Require().Equal(symToOutside, result, "non-matching symlink should return original path")
+}
+
+func (s *monitorUnitTest) TestResolveFDPath_SkipsReadWrite() {
+	dir := s.T().TempDir()
+	targetFile := filepath.Join(dir, "target.txt")
+	s.Require().NoError(os.WriteFile(targetFile, []byte("data"), 0644))
+
+	for _, typ := range []EventType{EventRead, EventWrite} {
+		ev := &FileEvent{
+			PID:  uint32(os.Getpid()),
+			FD:   3,
+			Type: typ,
+		}
+		m := &Monitor{}
+		m.resolveFDPath(ev)
+
+		// vfs_read/vfs_write set Path directly in BPF; resolveFDPath
+		// only handles EventMmap. The path should remain empty.
+		s.Require().Empty(ev.Path, "resolveFDPath must not resolve fd for %s", typ)
+	}
+}
+
+func (s *monitorUnitTest) TestResolveFDPath_Mmap() {
+	dir := s.T().TempDir()
+	targetFile := filepath.Join(dir, "target.txt")
+	s.Require().NoError(os.WriteFile(targetFile, []byte("data"), 0644))
+
+	f, err := os.Open(targetFile)
+	s.Require().NoError(err)
+	defer f.Close()
+
+	ev := &FileEvent{
+		PID:  uint32(os.Getpid()),
+		FD:   uint32(f.Fd()),
+		Type: EventMmap,
+	}
+	m := &Monitor{}
+	m.resolveFDPath(ev)
+
+	s.Require().Equal(targetFile, ev.Path)
+}
+
+func (s *monitorUnitTest) TestResolveFDPath_SkipNonFdType() {
+	ev := &FileEvent{
+		PID:  1234,
+		FD:   5,
+		Type: EventOpen,
+		Path: "/some/path",
+	}
+	m := &Monitor{}
+	m.resolveFDPath(ev)
+
+	// Path should remain unchanged (EventOpen not handled by resolveFDPath)
+	s.Require().Equal("/some/path", ev.Path)
+}
+
+func (s *monitorUnitTest) TestResolveRelativePath_Absolute() {
+	m := &Monitor{}
+	result := m.resolveRelativePath(uint32(os.Getpid()), "/absolute/path")
+	s.Require().Equal("/absolute/path", result)
+}
+
+func (s *monitorUnitTest) TestResolveRelativePath_Relative() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.Chdir(dir))
+
+	targetFile := filepath.Join(dir, "target.txt")
+	s.Require().NoError(os.WriteFile(targetFile, []byte("data"), 0644))
+
+	m := &Monitor{}
+	result := m.resolveRelativePath(uint32(os.Getpid()), "target.txt")
+	s.Require().Equal(targetFile, result)
+}
+
+func (s *monitorUnitTest) TestCheckHardlinkByInode_Preexisting() {
+	dir := s.T().TempDir()
+
+	watchedDir := filepath.Join(dir, "watched")
+	s.Require().NoError(os.Mkdir(watchedDir, 0755))
+	watchedFile := filepath.Join(watchedDir, "target.txt")
+	s.Require().NoError(os.WriteFile(watchedFile, []byte("data"), 0644))
+
+	// Hardlink created BEFORE monitor starts
+	hardlinkPath := filepath.Join(dir, "preexisting_hardlink")
+	s.Require().NoError(os.Link(watchedFile, hardlinkPath))
+
+	// Monitor startup path: scan watched dir inodes
+	m := &Monitor{
+		targets:     dirTarget(watchedDir),
+		watchInodes: make(map[string]string),
+	}
+	m.populateWatchInodes()
+
+	// Access via hardlink should be detected
+	result := m.checkHardlinkByInode(hardlinkPath)
+	s.Require().Equal(watchedFile, result)
+}

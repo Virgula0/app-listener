@@ -1,4 +1,4 @@
-package tests
+package integrationtests
 
 import (
 	"fmt"
@@ -20,8 +20,8 @@ func verifyEBPF(s *IntegrationSuite, code int, out string) {
 		"eBPF check should pass:\n%s", out)
 	s.Require().True(strings.Contains(out, "monitor started"),
 		"monitor should start:\n%s", out)
-	s.Require().True(strings.Contains(out, "kprobes attached"),
-		"kprobes should attach:\n%s", out)
+	s.Require().True(strings.Contains(out, "monitor created"),
+		"monitor should create probes:\n%s", out)
 	s.Require().True(strings.Contains(out, "could not open a new TTY"),
 		"should fail only due to missing TTY:\n%s", out)
 }
@@ -31,7 +31,7 @@ func (s *IntegrationSuite) TestEBPF_Check() {
 	defer c.Terminate(s.ctx)
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "/watch", "--recursive"})
+	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive"})
 	verifyEBPF(s, code, out)
 }
 
@@ -40,7 +40,7 @@ func (s *IntegrationSuite) TestEBPF_CheckWithDepth() {
 	defer c.Terminate(s.ctx)
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "/watch", "--recursive", "--depth", "2"})
+	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive", "--depth", "2"})
 	verifyEBPF(s, code, out)
 }
 
@@ -50,7 +50,7 @@ func (s *IntegrationSuite) TestEBPF_FullStack() {
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 
-	monitorCmd := fmt.Sprintf("nohup /app-listener monitor /watch --recursive --depth 3 > /tmp/monitor.log 2>&1 &")
+	monitorCmd := fmt.Sprintf("nohup /app-listener monitor -w /watch --recursive --depth 3 > /tmp/monitor.log 2>&1 &")
 	_, _ = s.exec(c, []string{"sh", "-c", monitorCmd})
 	time.Sleep(3 * time.Second)
 
@@ -70,8 +70,8 @@ func (s *IntegrationSuite) TestEBPF_FullStack() {
 	if codeLog == 0 {
 		s.Require().True(strings.Contains(outLog, "eBPF available"),
 			"monitor log missing eBPF check:\n%s", outLog)
-		s.Require().True(strings.Contains(outLog, "kprobes attached"),
-			"monitor log missing kprobes:\n%s", outLog)
+		s.Require().True(strings.Contains(outLog, "monitor created"),
+			"monitor log missing probe attachment:\n%s", outLog)
 	}
 }
 
