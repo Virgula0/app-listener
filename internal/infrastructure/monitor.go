@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	cilium "github.com/cilium/ebpf"
@@ -37,6 +38,8 @@ type Monitor struct {
 	recursive bool
 	depth     int
 	ownPID    int
+
+	watchInodes map[string]string // "dev:ino" → watched path for hardlink detection
 }
 
 func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
@@ -98,6 +101,9 @@ func NewMonitor(targets []Target, recursive bool, depth int) (*Monitor, error) {
 		m.links = append(m.links, l)
 	}
 
+	m.watchInodes = make(map[string]string)
+	m.populateWatchInodes()
+
 	paths := make([]string, len(targets))
 	for i, t := range targets {
 		paths[i] = t.Path
@@ -158,8 +164,16 @@ func (m *Monitor) readLoop(rd *ringbuf.Reader) {
 
 		m.resolveFDPath(&ev)
 
+		// Resolve symlinks so that cat on a symlink to a watched file is detected.
+		ev.Path = m.resolveSymlinkToTarget(ev.Path)
+
 		if !m.inWatchPath(ev.Path, ev.Dest) {
-			continue
+			// If still no match, try hardlink detection via inode.
+			if hardlinkPath := m.checkHardlinkByInode(ev.Path); hardlinkPath != "" {
+				ev.Path = hardlinkPath
+			} else {
+				continue
+			}
 		}
 
 		if !m.matchesFilter(&ev) {
@@ -270,6 +284,81 @@ func (m *Monitor) matchesFilter(ev *FileEvent) bool {
 
 func (m *Monitor) isWithinDir(path, dir string) bool {
 	return path == dir || strings.HasPrefix(path, dir+"/")
+}
+
+// populateWatchInodes scans watched targets and records their (dev, inode)
+// pairs so we can detect hardlink access by inode match.
+func (m *Monitor) populateWatchInodes() {
+	for _, t := range m.targets {
+		if !t.IsDir {
+			m.addInode(t.Path)
+		} else {
+			m.scanDirInodes(t.Dir, 0)
+		}
+	}
+}
+
+func (m *Monitor) addInode(path string) {
+	var s syscall.Stat_t
+	if err := syscall.Stat(path, &s); err != nil {
+		return
+	}
+	key := fmt.Sprintf("%d:%d", s.Dev, s.Ino)
+	m.watchInodes[key] = path
+}
+
+func (m *Monitor) scanDirInodes(dir string, currentDepth int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		fullPath := filepath.Join(dir, entry.Name())
+		if entry.IsDir() {
+			if !m.recursive {
+				continue
+			}
+			if m.depth > 0 && currentDepth+1 > m.depth {
+				continue
+			}
+			m.scanDirInodes(fullPath, currentDepth+1)
+			continue
+		}
+		m.addInode(fullPath)
+	}
+}
+
+// resolveSymlinkToTarget resolves all symlinks in path and, if the resolved
+// path falls within a watched target, returns the resolved path.
+func (m *Monitor) resolveSymlinkToTarget(path string) string {
+	if path == "" || m.matchesAnyTarget(path) {
+		return path
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path
+	}
+	if m.matchesAnyTarget(resolved) {
+		return resolved
+	}
+	return path
+}
+
+// checkHardlinkByInode stats the given path and, if its (dev, inode) matches
+// a pre-recorded watched file, returns the corresponding watched path.
+func (m *Monitor) checkHardlinkByInode(path string) string {
+	if path == "" || len(m.watchInodes) == 0 {
+		return ""
+	}
+	var s syscall.Stat_t
+	if err := syscall.Stat(path, &s); err != nil {
+		return ""
+	}
+	key := fmt.Sprintf("%d:%d", s.Dev, s.Ino)
+	if watchedPath, ok := m.watchInodes[key]; ok {
+		return watchedPath
+	}
+	return ""
 }
 
 func (m *Monitor) Stop() {

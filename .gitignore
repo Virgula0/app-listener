@@ -1,8 +1,10 @@
 # Build output
-build/
+build/linux/
 
 # Generated BPF bindings (intermediate)
 build/generated/
+
+build/test
 
 # BPF compiled objects (generated)
 *.bpf.o
