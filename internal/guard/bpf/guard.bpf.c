@@ -5,6 +5,8 @@
 
 #define MAX_PATH 256
 #define MAX_COMM_LEN 16
+#define MAY_READ  0x00000001
+#define MAY_WRITE 0x00000002
 
 enum event_type {
 	EVENT_OPEN,
@@ -111,6 +113,29 @@ static __always_inline struct inode *get_inode_from_path(void *ctx_path)
 	struct inode *i;
 	bpf_probe_read_kernel(&i, sizeof(i), &d->d_inode);
 	return i;
+}
+
+// Check whether the operation targets a guarded path by examining
+// both the file's own inode and its parent directory's inode.
+static __always_inline int is_guarded_access(struct dentry *dentry, struct inode *file_inode)
+{
+	if (read_inode_guard(file_inode))
+		return 1;
+
+	if (!dentry)
+		return 0;
+
+	struct dentry *parent;
+	bpf_probe_read_kernel(&parent, sizeof(parent), &dentry->d_parent);
+	if (!parent || parent == dentry)
+		return 0;
+
+	struct inode *parent_inode;
+	bpf_probe_read_kernel(&parent_inode, sizeof(parent_inode), &parent->d_inode);
+	if (parent_inode && parent_inode != file_inode && read_inode_guard(parent_inode))
+		return 1;
+
+	return 0;
 }
 
 static __always_inline long read_path(struct dentry *dentry, char *buf, int buf_size)
@@ -251,14 +276,17 @@ int guard_file_open(unsigned long long *ctx)
 	if (!file)
 		return 0;
 
+	struct dentry *dentry;
+	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
+	if (!dentry)
+		return 0;
+
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
-	if (read_inode_guard(inode)) {
-		struct dentry *dentry;
-		bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
+	if (is_guarded_access(dentry, inode))
 		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
-	}
+
 	return 0;
 }
 
@@ -269,15 +297,45 @@ int guard_mmap_file(unsigned long long *ctx)
 	if (!file)
 		return 0;
 
+	struct dentry *dentry;
+	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
+	if (!dentry)
+		return 0;
+
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
-	if (read_inode_guard(inode)) {
-		struct dentry *dentry;
-		bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
+	if (is_guarded_access(dentry, inode))
 		return check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL);
-	}
+
 	return 0;
+}
+
+SEC("lsm/file_permission")
+int guard_file_permission(unsigned long long *ctx)
+{
+	struct file *file = (struct file *)ctx[0];
+	int mask = (int)ctx[1];
+	if (!file)
+		return 0;
+
+	// Only intercept read and write permission checks
+	if (!(mask & (MAY_READ | MAY_WRITE)))
+		return 0;
+
+	struct dentry *dentry;
+	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+
+	if (!is_guarded_access(dentry, inode))
+		return 0;
+
+	__u32 event_type = (mask & MAY_WRITE) ? EVENT_WRITE : EVENT_READ;
+	return check_and_emit(event_type, dentry, NULL, false, NULL);
 }
 
 SEC("lsm/path_unlink")

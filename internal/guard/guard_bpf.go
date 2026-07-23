@@ -65,13 +65,14 @@ type GuardSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type GuardProgramSpecs struct {
-	GuardFileOpen    *ebpf.ProgramSpec `ebpf:"guard_file_open"`
-	GuardMmapFile    *ebpf.ProgramSpec `ebpf:"guard_mmap_file"`
-	GuardPathLink    *ebpf.ProgramSpec `ebpf:"guard_path_link"`
-	GuardPathMkdir   *ebpf.ProgramSpec `ebpf:"guard_path_mkdir"`
-	GuardPathRename  *ebpf.ProgramSpec `ebpf:"guard_path_rename"`
-	GuardPathSymlink *ebpf.ProgramSpec `ebpf:"guard_path_symlink"`
-	GuardPathUnlink  *ebpf.ProgramSpec `ebpf:"guard_path_unlink"`
+	GuardFileOpen       *ebpf.ProgramSpec `ebpf:"guard_file_open"`
+	GuardFilePermission *ebpf.ProgramSpec `ebpf:"guard_file_permission"`
+	GuardMmapFile       *ebpf.ProgramSpec `ebpf:"guard_mmap_file"`
+	GuardPathLink       *ebpf.ProgramSpec `ebpf:"guard_path_link"`
+	GuardPathMkdir      *ebpf.ProgramSpec `ebpf:"guard_path_mkdir"`
+	GuardPathRename     *ebpf.ProgramSpec `ebpf:"guard_path_rename"`
+	GuardPathSymlink    *ebpf.ProgramSpec `ebpf:"guard_path_symlink"`
+	GuardPathUnlink     *ebpf.ProgramSpec `ebpf:"guard_path_unlink"`
 }
 
 // GuardMapSpecs contains maps before they are loaded into the kernel.
@@ -141,18 +142,20 @@ type GuardVariables struct {
 //
 // It can be passed to LoadGuardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type GuardPrograms struct {
-	GuardFileOpen    *ebpf.Program `ebpf:"guard_file_open"`
-	GuardMmapFile    *ebpf.Program `ebpf:"guard_mmap_file"`
-	GuardPathLink    *ebpf.Program `ebpf:"guard_path_link"`
-	GuardPathMkdir   *ebpf.Program `ebpf:"guard_path_mkdir"`
-	GuardPathRename  *ebpf.Program `ebpf:"guard_path_rename"`
-	GuardPathSymlink *ebpf.Program `ebpf:"guard_path_symlink"`
-	GuardPathUnlink  *ebpf.Program `ebpf:"guard_path_unlink"`
+	GuardFileOpen       *ebpf.Program `ebpf:"guard_file_open"`
+	GuardFilePermission *ebpf.Program `ebpf:"guard_file_permission"`
+	GuardMmapFile       *ebpf.Program `ebpf:"guard_mmap_file"`
+	GuardPathLink       *ebpf.Program `ebpf:"guard_path_link"`
+	GuardPathMkdir      *ebpf.Program `ebpf:"guard_path_mkdir"`
+	GuardPathRename     *ebpf.Program `ebpf:"guard_path_rename"`
+	GuardPathSymlink    *ebpf.Program `ebpf:"guard_path_symlink"`
+	GuardPathUnlink     *ebpf.Program `ebpf:"guard_path_unlink"`
 }
 
 func (p *GuardPrograms) Close() error {
 	return _GuardClose(
 		p.GuardFileOpen,
+		p.GuardFilePermission,
 		p.GuardMmapFile,
 		p.GuardPathLink,
 		p.GuardPathMkdir,

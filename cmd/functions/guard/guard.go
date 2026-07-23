@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/charmbracelet/bubbletea"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/Virgula0/app-listener/cmd/common"
@@ -48,6 +49,8 @@ func init() {
 		"Binary paths to whitelist (repeatable, mutually exclusive with -b)")
 	GuardCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
 		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP; default: all)")
+	GuardCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
+		"Run without TUI, print events to stderr (for testing/scripting)")
 }
 
 func runGuard(cmd *cobra.Command, args []string) error {
@@ -80,6 +83,11 @@ func runGuard(cmd *cobra.Command, args []string) error {
 	}
 
 	defer g.Stop()
+
+	if entity.Headless {
+		runGuardHeadless(g)
+		return nil
+	}
 
 	return runGuardTUI(g, guardPath, mode, binaries)
 }
@@ -114,6 +122,24 @@ func resolveGuardConfig() (guard.Mode, []guard.BinaryEntry, error) {
 	}
 
 	return mode, binaries, nil
+}
+
+func runGuardHeadless(g *guard.Guard) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case ev, ok := <-g.Events():
+			if !ok {
+				return
+			}
+			log.Infof("GUARD|%s|%s|%s|%d|%s|%t|%d",
+				ev.Type.String(), ev.Comm, ev.Path, ev.PID, ev.Dest, ev.Blocked, ev.UID)
+		case <-sig:
+			return
+		}
+	}
 }
 
 func runGuardTUI(g *guard.Guard, guardPath string, mode guard.Mode, binaries []guard.BinaryEntry) error {
