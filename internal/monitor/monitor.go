@@ -79,11 +79,12 @@ func NewMonitor(targets []ebpf.Target, recursive bool, depth int) (*Monitor, err
 		{objs.TraceDoSendfile, "kprobe", "", "do_sendfile"},
 		{objs.TraceVfsIterRead, "kprobe", "", "vfs_iter_read"},
 		{objs.TraceSecurityMmapFile, "kprobe", "", "security_mmap_file"},
-		{objs.TraceUnlinkat, "tracepoint", "syscalls", "sys_enter_unlinkat"},
-		{objs.TraceRenameat2, "tracepoint", "syscalls", "sys_enter_renameat2"},
-		{objs.TraceSymlinkat, "tracepoint", "syscalls", "sys_enter_symlinkat"},
-		{objs.TraceLinkat, "tracepoint", "syscalls", "sys_enter_linkat"},
-		{objs.TraceMkdirat, "tracepoint", "syscalls", "sys_enter_mkdirat"},
+		{objs.TraceVfsMkdir, "kprobe", "", "vfs_mkdir"},
+		{objs.TraceVfsRmdir, "kprobe", "", "vfs_rmdir"},
+		{objs.TraceVfsUnlink, "kprobe", "", "vfs_unlink"},
+		{objs.TraceVfsRename, "kprobe", "", "vfs_rename"},
+		{objs.TraceVfsSymlink, "kprobe", "", "vfs_symlink"},
+		{objs.TraceVfsLink, "kprobe", "", "vfs_link"},
 		{objs.TraceMmap, "tracepoint", "syscalls", "sys_enter_mmap"},
 	}
 

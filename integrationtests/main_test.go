@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -136,4 +137,57 @@ func absPath(p string) string {
 		panic(err)
 	}
 	return abs
+}
+
+// readMonitorLog returns the raw content of the monitor log file.
+func (s *IntegrationSuite) readMonitorLog(c testcontainers.Container) string {
+	_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/monitor.log 2>/dev/null || true"})
+	return out
+}
+
+// newEventTypes extracts unique event type names (OPEN, READ, …) from EVENT|
+// lines that appear in newLog but were not yet present in oldLog.
+func newEventTypes(oldLog, newLog string) []string {
+	if newLog == "" {
+		return nil
+	}
+
+	// areLinesDelta is true when newLog and oldLog share a common prefix.
+	areLinesDelta := oldLog != "" && len(newLog) > len(oldLog)/2
+
+	var tail string
+	if areLinesDelta {
+		oldLines := strings.Split(oldLog, "\n")
+		newLines := strings.Split(newLog, "\n")
+		if len(newLines) > len(oldLines) {
+			tail = strings.Join(newLines[len(oldLines):], "\n")
+		}
+	} else {
+		tail = newLog
+	}
+
+	if tail == "" {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	var result []string
+	for _, line := range strings.Split(tail, "\n") {
+		if idx := strings.Index(line, "EVENT|"); idx >= 0 {
+			rest := line[idx+6:]
+			parts := strings.SplitN(rest, "|", 2)
+			if len(parts) >= 1 && parts[0] != "" && !seen[parts[0]] {
+				seen[parts[0]] = true
+				result = append(result, parts[0])
+			}
+		}
+	}
+	return result
+}
+
+// requireNewEventType asserts that the event type appears in the log delta.
+func (s *IntegrationSuite) requireNewEventType(oldLog, newLog, expected string) {
+	events := newEventTypes(oldLog, newLog)
+	s.Require().True(slices.Contains(events, expected),
+		"expected EVENT|%s in new log lines, got %v", expected, events)
 }

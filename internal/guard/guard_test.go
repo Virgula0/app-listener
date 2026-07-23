@@ -179,3 +179,38 @@ func (s *guardUnitTest) TestBlockedFieldMapping() {
 		})
 	}
 }
+
+func (s *guardUnitTest) TestBpfEventToGuardEventAllEventTypes() {
+	eventTypes := []struct {
+		name     string
+		bpfType  uint32
+		goType   ebpf.EventType
+	}{
+		{name: "open", bpfType: 0, goType: ebpf.EventOpen},
+		{name: "read", bpfType: 1, goType: ebpf.EventRead},
+		{name: "write", bpfType: 2, goType: ebpf.EventWrite},
+		{name: "delete", bpfType: 3, goType: ebpf.EventDelete},
+		{name: "rename", bpfType: 4, goType: ebpf.EventRename},
+		{name: "symlink", bpfType: 5, goType: ebpf.EventSymlink},
+		{name: "hardlink", bpfType: 6, goType: ebpf.EventHardlink},
+		{name: "mkdir", bpfType: 7, goType: ebpf.EventMkdir},
+		{name: "mmap", bpfType: 8, goType: ebpf.EventMmap},
+	}
+
+	for _, et := range eventTypes {
+		s.Run(et.name, func() {
+			be := bpfGuardEvent{
+				PID:     1234,
+				Type:    et.bpfType,
+				Blocked: 1,
+				Comm:    func() (c [16]byte) { copy(c[:], "test"); return }(),
+			}
+
+			fe := be.toFileEvent()
+
+			s.Require().Equal(et.goType, fe.Type, "event type %s should map to %v", et.name, et.goType)
+			s.Require().Equal(uint32(1234), fe.PID)
+			s.Require().Equal("test", fe.Comm)
+		})
+	}
+}

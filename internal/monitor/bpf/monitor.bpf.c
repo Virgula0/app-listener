@@ -34,6 +34,13 @@ struct {
 	__uint(max_entries, 1 << 24);
 } rb SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, char[MAX_PATH]);
+} tmp_buf SEC(".maps");
+
 static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, const char *dest)
 {
 	struct event *e;
@@ -111,8 +118,8 @@ static __always_inline int emit_event_kern(__u32 type, __u32 fd, const char *pat
 static __always_inline long read_path(struct dentry *dentry, char *buf, int buf_size)
 {
 	char tmp[64];
-	int pos = buf_size;
-	buf[--pos] = '\0';
+	int pos = buf_size - 1;
+	buf[pos & (MAX_PATH - 1)] = '\0';
 
 	#pragma unroll
 	for (int i = 0; i < 48; i++) {
@@ -139,24 +146,49 @@ static __always_inline long read_path(struct dentry *dentry, char *buf, int buf_
 
 		int name_len = ret - 1;
 
-		pos -= name_len;
-		if (pos < 0)
+		if (pos < name_len)
 			break;
+
+		pos -= name_len;
 
 		#pragma unroll
 		for (int j = 0; j < 64; j++) {
 			if (j >= name_len) break;
-			buf[pos + j] = tmp[j];
+			buf[(pos + j) & (MAX_PATH - 1)] = tmp[j];
 		}
 
 		if (pos <= 0)
 			break;
-		buf[--pos] = '/';
+
+		pos--;
+		buf[pos & (MAX_PATH - 1)] = '/';
 
 		dentry = d_parent;
 	}
 
 	return pos < buf_size - 1 ? pos : -1;
+}
+
+static void fill_path(struct dentry *dentry, char *out)
+{
+	if (!dentry) {
+		out[0] = '\0';
+		return;
+	}
+	__u32 key = 0;
+	char *buf = bpf_map_lookup_elem(&tmp_buf, &key);
+	if (!buf) {
+		out[0] = '\0';
+		return;
+	}
+
+	long off = read_path(dentry, buf, MAX_PATH);
+
+	if (off >= 0 && off < MAX_PATH) {
+		bpf_probe_read_kernel_str(out, MAX_PATH, buf + off);
+	} else {
+		out[0] = '\0';
+	}
 }
 
 SEC("kprobe/vfs_open")
@@ -442,50 +474,151 @@ int trace_security_mmap_file(struct pt_regs *ctx)
 }
 
 /*
- * Tracepoints for filesystem metadata operations.
+ * VFS-level kprobes for filesystem metadata operations.
+ *
+ * These replace tracepoint/syscalls/sys_enter_* because tracepoints
+ * require debugfs/tracefs to be mounted, which is not always available
+ * in containers. VFS kprobes work wherever kprobes are supported.
+ *
+ * vfs_mkdir     – catches both mkdir and mkdirat syscalls
+ * vfs_rmdir     – catches rmdir and unlinkat(AT_REMOVEDIR)
+ * vfs_unlink    – catches both unlink and unlinkat syscalls
+ * vfs_rename    – catches both rename and renameat2 syscalls
+ * vfs_symlink   – catches both symlink and symlinkat syscalls
+ * vfs_link      – catches both link and linkat syscalls
+ *
+ * For handlers that need two path buffers (rename, link), we use
+ * fill_path() with the tmp_buf percpu array to avoid exceeding the
+ * BPF stack limit (512 bytes).
  */
 
-SEC("tracepoint/syscalls/sys_enter_unlinkat")
-int trace_unlinkat(struct trace_event_raw_sys_enter *ctx)
+SEC("kprobe/vfs_mkdir")
+int trace_vfs_mkdir(struct pt_regs *ctx)
 {
-	const char *pathname = (const char *)ctx->args[1];
-	return emit_event(EVENT_DELETE, 0, pathname, NULL);
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM3(ctx);
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_MKDIR, 0, buf + off, NULL);
 }
 
-SEC("tracepoint/syscalls/sys_enter_renameat2")
-int trace_renameat2(struct trace_event_raw_sys_enter *ctx)
+SEC("kprobe/vfs_rmdir")
+int trace_vfs_rmdir(struct pt_regs *ctx)
 {
-	const char *oldname = (const char *)ctx->args[1];
-	const char *newname = (const char *)ctx->args[3];
-	return emit_event(EVENT_RENAME, 0, oldname, newname);
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM3(ctx);
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_DELETE, 0, buf + off, NULL);
 }
 
-SEC("tracepoint/syscalls/sys_enter_symlinkat")
-int trace_symlinkat(struct trace_event_raw_sys_enter *ctx)
+SEC("kprobe/vfs_unlink")
+int trace_vfs_unlink(struct pt_regs *ctx)
 {
-	const char *target = (const char *)ctx->args[0];
-	const char *linkpath = (const char *)ctx->args[2];
-	return emit_event(EVENT_SYMLINK, 0, target, linkpath);
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM3(ctx);
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_DELETE, 0, buf + off, NULL);
 }
 
-SEC("tracepoint/syscalls/sys_enter_linkat")
-int trace_linkat(struct trace_event_raw_sys_enter *ctx)
+SEC("kprobe/vfs_rename")
+int trace_vfs_rename(struct pt_regs *ctx)
 {
-	const char *oldpath = (const char *)ctx->args[1];
-	const char *newpath = (const char *)ctx->args[3];
-	return emit_event(EVENT_HARDLINK, 0, oldpath, newpath);
+	struct renamedata *rd = (struct renamedata *)PT_REGS_PARM1(ctx);
+	if (!rd)
+		return 0;
+
+	struct dentry *old_dentry, *new_dentry;
+	if (bpf_probe_read_kernel(&old_dentry, sizeof(old_dentry), &rd->old_dentry))
+		return 0;
+	if (bpf_probe_read_kernel(&new_dentry, sizeof(new_dentry), &rd->new_dentry))
+		return 0;
+	if (!old_dentry || !new_dentry)
+		return 0;
+
+	struct event *e;
+	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	e->pid = bpf_get_current_pid_tgid() >> 32;
+	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+	e->gid = (bpf_get_current_uid_gid() >> 32) & 0xFFFFFFFF;
+	e->type = EVENT_RENAME;
+	e->fd = 0;
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+
+	fill_path(old_dentry, e->path);
+	fill_path(new_dentry, e->dest);
+
+	bpf_ringbuf_submit(e, 0);
+	return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_mkdirat")
-int trace_mkdirat(struct trace_event_raw_sys_enter *ctx)
+SEC("kprobe/vfs_symlink")
+int trace_vfs_symlink(struct pt_regs *ctx)
 {
-	const char *pathname = (const char *)ctx->args[1];
-	return emit_event(EVENT_MKDIR, 0, pathname, NULL);
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM3(ctx);
+	if (!dentry)
+		return 0;
+
+	const char *symname = (const char *)PT_REGS_PARM4(ctx);
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_SYMLINK, 0, buf + off, symname);
+}
+
+SEC("kprobe/vfs_link")
+int trace_vfs_link(struct pt_regs *ctx)
+{
+	struct dentry *old_dentry = (struct dentry *)PT_REGS_PARM1(ctx);
+	struct dentry *new_dentry = (struct dentry *)PT_REGS_PARM4(ctx);
+	if (!old_dentry || !new_dentry)
+		return 0;
+
+	struct event *e;
+	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	e->pid = bpf_get_current_pid_tgid() >> 32;
+	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+	e->gid = (bpf_get_current_uid_gid() >> 32) & 0xFFFFFFFF;
+	e->type = EVENT_HARDLINK;
+	e->fd = 0;
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+
+	fill_path(old_dentry, e->path);
+	fill_path(new_dentry, e->dest);
+
+	bpf_ringbuf_submit(e, 0);
+	return 0;
 }
 
 /*
  * Memory-mapped I/O – maps a file into memory so reads happen without
- * any read-family syscall.
+ * any read-family syscall. Keeps the mmap tracepoint because it also
+ * captures the file descriptor and works alongside security_mmap_file.
  */
 
 SEC("tracepoint/syscalls/sys_enter_mmap")

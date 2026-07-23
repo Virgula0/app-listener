@@ -524,3 +524,75 @@ func TestSetEventTypesBeforeStartNoRace(t *testing.T) {
 		t.Fatalf("unexpected event types: %v", types)
 	}
 }
+
+func (s *monitorUnitTest) TestEventTypeAllowedAllTypes() {
+	m := &Monitor{}
+	m.eventTypes.Store(ebpf.EventTypes())
+
+	for _, et := range ebpf.EventTypes() {
+		s.Run(et.String(), func() {
+			s.Require().True(m.eventTypeAllowed(et), "event type %s should be allowed by default", et)
+		})
+	}
+}
+
+func (s *monitorUnitTest) TestEventTypeAllowedMkdir() {
+	m := &Monitor{}
+	m.eventTypes.Store(ebpf.EventTypes())
+
+	s.Require().True(m.eventTypeAllowed(ebpf.EventMkdir))
+}
+
+func (s *monitorUnitTest) TestResolveRelativePathMkdirRelative() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.Chdir(dir))
+
+	m := &Monitor{}
+	result := m.resolveRelativePath(uint32(os.Getpid()), "newdir")
+	expected := filepath.Join(dir, "newdir")
+	s.Require().Equal(expected, result)
+}
+
+func (s *monitorUnitTest) TestMatchesFilterMkdirNewDir() {
+	m := &Monitor{targets: dirTarget("/watch"), recursive: false}
+
+	tests := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{name: "direct child new dir", path: "/watch/newdir", expected: true},
+		{name: "new dir with depth", path: "/watch/sub/newdir", expected: false},
+		{name: "outside watch", path: "/other/newdir", expected: false},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			ev := &ebpf.FileEvent{Path: tt.path, Type: ebpf.EventMkdir}
+			result := m.matchesFilter(ev)
+			s.Require().Equal(tt.expected, result)
+		})
+	}
+}
+
+func (s *monitorUnitTest) TestMatchesFilterMkdirNewDirRecursive() {
+	m := &Monitor{targets: dirTarget("/watch"), recursive: true, depth: 0}
+
+	tests := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{name: "direct child new dir", path: "/watch/newdir", expected: true},
+		{name: "nested new dir", path: "/watch/a/b/newdir", expected: true},
+		{name: "outside watch", path: "/other/newdir", expected: false},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			ev := &ebpf.FileEvent{Path: tt.path, Type: ebpf.EventMkdir}
+			result := m.matchesFilter(ev)
+			s.Require().Equal(tt.expected, result)
+		})
+	}
+}

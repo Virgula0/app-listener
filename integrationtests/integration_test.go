@@ -50,12 +50,14 @@ func (s *IntegrationSuite) TestEBPF_FullStack() {
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 
-	monitorCmd := fmt.Sprintf("nohup /app-listener monitor -w /watch --recursive --depth 3 > /tmp/monitor.log 2>&1 &")
+	monitorCmd := fmt.Sprintf("nohup /app-listener monitor -w /watch --recursive --depth 3 --headless > /tmp/monitor.log 2>&1 &")
 	_, _ = s.exec(c, []string{"sh", "-c", monitorCmd})
 	time.Sleep(3 * time.Second)
 
 	codeCheck, outCheck := s.exec(c, []string{"pgrep", "-f", "app-listener"})
 	s.Require().Equalf(0, codeCheck, "monitor process not running after start:\n%s", outCheck)
+
+	logBefore := s.readMonitorLog(c)
 
 	s.exec(c, []string{"touch", "/watch/test.txt"})
 	s.exec(c, []string{"sh", "-c", "echo hello > /watch/test.txt"})
@@ -66,13 +68,168 @@ func (s *IntegrationSuite) TestEBPF_FullStack() {
 	codeAfter, outAfter := s.exec(c, []string{"pgrep", "-f", "app-listener"})
 	s.Require().Equalf(0, codeAfter, "monitor crashed after file events:\n%s", outAfter)
 
-	codeLog, outLog := s.exec(c, []string{"cat", "/tmp/monitor.log"})
-	if codeLog == 0 {
-		s.Require().True(strings.Contains(outLog, "eBPF available"),
-			"monitor log missing eBPF check:\n%s", outLog)
-		s.Require().True(strings.Contains(outLog, "monitor created"),
-			"monitor log missing probe attachment:\n%s", outLog)
+	logAfter := s.readMonitorLog(c)
+	if logAfter != "" {
+		s.Require().True(strings.Contains(logAfter, "eBPF available"),
+			"monitor log missing eBPF check:\n%s", logAfter)
+		s.Require().True(strings.Contains(logAfter, "monitor created"),
+			"monitor log missing probe attachment:\n%s", logAfter)
+		s.requireNewEventType(logBefore, logAfter, "MKDIR")
 	}
+}
+
+// ---------------------------------------------------------------
+// Comprehensive event coverage test
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestMonitorAllEvents() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+
+	// Copy mmap exploit binary for MMAP event
+	mmapHostPath := absPath("./exploits/mmap")
+	err := c.CopyFileToContainer(s.ctx, mmapHostPath, "/mmap_exploit", 0755)
+	s.Require().NoError(err, "copy mmap exploit")
+
+	// Start monitor and save initial log (contains startup events)
+	s.startMonitorStd(c, "/watch")
+	logBefore := s.readMonitorLog(c)
+
+	// 1. OPEN + WRITE: create file
+	s.exec(c, []string{"sh", "-c", "echo 'test data' > /watch/data.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter := s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "OPEN")
+	s.requireNewEventType(logBefore, logAfter, "WRITE")
+	logBefore = logAfter
+
+	// 2. READ: cat the file
+	s.exec(c, []string{"sh", "-c", "cat /watch/data.txt > /dev/null"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "READ")
+	logBefore = logAfter
+
+	// 3. RENAME: rename file
+	s.exec(c, []string{"mv", "/watch/data.txt", "/watch/renamed.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "RENAME")
+	logBefore = logAfter
+
+	// 4. SYMLINK: create symlink
+	s.exec(c, []string{"ln", "-s", "/watch/renamed.txt", "/watch/link"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "SYMLINK")
+	logBefore = logAfter
+
+	// 5. HARDLINK: create hardlink
+	s.exec(c, []string{"ln", "/watch/renamed.txt", "/watch/hardlink"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "HARDLINK")
+	logBefore = logAfter
+
+	// 6. MKDIR: create directory
+	s.exec(c, []string{"mkdir", "/watch/subdir"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "MKDIR")
+	logBefore = logAfter
+
+	// 7. DELETE: remove file
+	s.exec(c, []string{"rm", "/watch/renamed.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "DELETE")
+	logBefore = logAfter
+
+	// 8. MMAP + OPEN: run mmap exploit on hardlink (still exists after rm)
+	s.exec(c, []string{"/mmap_exploit", "/watch/hardlink"})
+	time.Sleep(2 * time.Second)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "MMAP")
+	s.requireNewEventType(logBefore, logAfter, "OPEN")
+
+	s.stopMonitor(c)
+}
+
+func (s *IntegrationSuite) TestMonitorSingleFile() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+
+	// Create watched file before starting monitor (must exist for inode resolution)
+	s.exec(c, []string{"sh", "-c", "echo 'initial data' > /watch/target.txt"})
+
+	// Copy mmap exploit binary for MMAP event
+	mmapHostPath := absPath("./exploits/mmap")
+	err := c.CopyFileToContainer(s.ctx, mmapHostPath, "/mmap_exploit", 0755)
+	s.Require().NoError(err, "copy mmap exploit")
+
+	// Start monitor watching the specific file (not a directory)
+	s.startMonitorStd(c, "/watch/target.txt")
+	logBefore := s.readMonitorLog(c)
+
+	// 1. OPEN + READ: cat the file
+	s.exec(c, []string{"sh", "-c", "cat /watch/target.txt > /dev/null"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter := s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "OPEN")
+	s.requireNewEventType(logBefore, logAfter, "READ")
+	logBefore = logAfter
+
+	// 2. WRITE: append to the file
+	s.exec(c, []string{"sh", "-c", "echo 'more data' >> /watch/target.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "WRITE")
+	logBefore = logAfter
+
+	// 3. HARDLINK: create hardlink to watched file (event path matches target)
+	s.exec(c, []string{"ln", "/watch/target.txt", "/watch/hardlink"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "HARDLINK")
+	logBefore = logAfter
+
+	// SYMLINK skipped for single-file watch: the event's path is the new symlink
+	// location (e.g., /watch/link), not the watched file. In Docker overlay2, the
+	// dentry resolves to an inaccessible overlay path that matchTarget rejects.
+	// SYMLINK is covered by TestMonitorAllEvents (directory watch).
+
+	// 5. RENAME: rename the watched file away (event path matches target)
+	s.exec(c, []string{"mv", "/watch/target.txt", "/watch/renamed.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "RENAME")
+	logBefore = logAfter
+
+	// 6. MMAP: re-create the file at the watched path, then run mmap exploit
+	s.exec(c, []string{"sh", "-c", "echo 'mmap data' > /watch/target.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	// Ignore OPEN+WRITE from re-creation, just advance the log cursor
+	logBefore = logAfter
+
+	s.exec(c, []string{"/mmap_exploit", "/watch/target.txt"})
+	time.Sleep(2 * time.Second)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "MMAP")
+	s.requireNewEventType(logBefore, logAfter, "OPEN")
+	logBefore = logAfter
+
+	// 7. DELETE: remove the re-created file (path matches target)
+	s.exec(c, []string{"rm", "/watch/target.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "DELETE")
+
+	s.stopMonitor(c)
 }
 
 // ---------------------------------------------------------------
@@ -93,7 +250,7 @@ func (s *IntegrationSuite) TestCrossArch_EBPF_ARM64() {
 	defer c.Terminate(s.ctx)
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "/watch", "--recursive"})
+	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive"})
 	verifyEBPF(s, code, out)
 }
 
@@ -112,7 +269,7 @@ func (s *IntegrationSuite) TestMultiDistro_Alpine_EBPF() {
 	defer c.Terminate(s.ctx)
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "/watch", "--recursive"})
+	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive"})
 	verifyEBPF(s, code, out)
 }
 
@@ -121,6 +278,6 @@ func (s *IntegrationSuite) TestMultiDistro_Fedora_EBPF() {
 	defer c.Terminate(s.ctx)
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "/watch", "--recursive"})
+	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive"})
 	verifyEBPF(s, code, out)
 }
