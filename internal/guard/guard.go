@@ -49,12 +49,14 @@ type Guard struct {
 	mu      sync.Mutex
 	stopped bool
 
-	path     string
-	mode     Mode
-	binaries []BinaryEntry
+	path      string
+	mode      Mode
+	binaries  []BinaryEntry
+	recursive bool
+	depth     int
 }
 
-func NewGuard(path string, mode Mode, binaries []BinaryEntry) (*Guard, error) {
+func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, depth int) (*Guard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("failed to remove memlock rlimit: %v", err)
 	}
@@ -63,11 +65,13 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry) (*Guard, error) {
 	copy(entries, binaries)
 
 	g := &Guard{
-		events:   make(chan GuardEvent, 1024),
-		done:     make(chan struct{}),
-		path:     path,
-		mode:     mode,
-		binaries: entries,
+		events:    make(chan GuardEvent, 1024),
+		done:      make(chan struct{}),
+		path:      path,
+		mode:      mode,
+		binaries:  entries,
+		recursive: recursive,
+		depth:     depth,
 	}
 
 	var objs GuardObjects
@@ -129,7 +133,7 @@ func (g *Guard) populateMaps() error {
 	}
 
 	if info.IsDir() {
-		if err := g.scanDirInodes(g.path); err != nil {
+		if err := g.scanDirInodes(g.path, 0); err != nil {
 			return err
 		}
 	} else {
@@ -182,7 +186,7 @@ func (g *Guard) addInode(path string) error {
 	return nil
 }
 
-func (g *Guard) scanDirInodes(dir string) error {
+func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
 	if err := g.addInode(dir); err != nil {
 		return err
 	}
@@ -195,7 +199,13 @@ func (g *Guard) scanDirInodes(dir string) error {
 	for _, entry := range entries {
 		fullPath := filepath.Join(dir, entry.Name())
 		if entry.IsDir() {
-			if err := g.scanDirInodes(fullPath); err != nil {
+			if !g.recursive {
+				continue
+			}
+			if g.depth > 0 && currentDepth+1 >= g.depth {
+				continue
+			}
+			if err := g.scanDirInodes(fullPath, currentDepth+1); err != nil {
 				return err
 			}
 		} else {

@@ -19,9 +19,11 @@ import (
 )
 
 var (
-	blacklistPaths []string
-	whitelistPaths []string
-	eventsFlag     []string
+	blacklistPaths  []string
+	whitelistPaths  []string
+	eventsFlag      []string
+	guardRecursive  bool
+	guardDepth      int
 )
 
 var GuardCmd = &cobra.Command{
@@ -51,6 +53,10 @@ func init() {
 		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP; default: all)")
 	GuardCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
+	GuardCmd.Flags().BoolVarP(&guardRecursive, "recursive", "r", true,
+		"Guard directory recursively")
+	GuardCmd.Flags().IntVarP(&guardDepth, "depth", "d", 0,
+		"Maximum directory depth to guard (default: 0 = unlimited, 1 = root files only, 2 = root + one subdirectory level, etc.)")
 }
 
 func runGuard(cmd *cobra.Command, args []string) error {
@@ -73,7 +79,7 @@ func runGuard(cmd *cobra.Command, args []string) error {
 		return checkErr
 	}
 
-	g, guardErr := guard.NewGuard(guardPath, mode, binaries)
+	g, guardErr := guard.NewGuard(guardPath, mode, binaries, guardRecursive, guardDepth)
 	if guardErr != nil {
 		return fmt.Errorf("creating guard: %w", guardErr)
 	}

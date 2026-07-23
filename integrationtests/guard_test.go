@@ -556,3 +556,182 @@ func (s *IntegrationSuite) checkKernelSupport(c testcontainers.Container) bool {
 		"uname -r | grep -Eq '^4\\.(1[4-9]|[2-9][0-9])|^5\\.[0-9]|^6\\.[0-9]' && echo supported || echo unsupported"})
 	return code == 0
 }
+
+// ---------------------------------------------------------------
+// Test: non-recursive guard — deeply nested files are NOT protected
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_NonRecursive() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	// Set up a 3-level hierarchy:
+	//   /watch/
+	//   ├── top.txt               (level 1, direct child)
+	//   └── subdir/               (level 1, direct child dir)
+	//       └── deep.txt          (level 2)
+	s.exec(c, []string{"mkdir", "-p", "/watch/subdir"})
+	s.exec(c, []string{"sh", "-c", "echo top > /watch/top.txt"})
+	s.exec(c, []string{"sh", "-c", "echo deep > /watch/subdir/deep.txt"})
+
+	// Guard WITHOUT recursion — only the root and its direct children
+	// are pre-populated in the inode map.
+	s.startGuardStd(c, "/watch", "--recursive=false")
+	logBefore := s.readGuardLog(c)
+
+	// 1. Direct child file IS blocked (own inode in map)
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/top.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "direct child file should be blocked: %s", out)
+
+	// 2. File in direct child subdir is NOT blocked (non-recursive does not
+	//    add subdirectory inodes to the BPF map).
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/subdir/deep.txt > /dev/null 2>&1"})
+	s.Require().Equalf(0, code, "file in subdir should NOT be blocked (non-recursive): %s", out)
+
+	// 3. mkdir inside subdir is NOT blocked (same reason)
+	code, out = s.exec(c, []string{"mkdir", "-p", "/watch/subdir/newchild"})
+	s.Require().Equalf(0, code, "mkdir in subdir should NOT be blocked: %s", out)
+	// Clean up
+	s.exec(c, []string{"rmdir", "/watch/subdir/newchild"})
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	// Only the top.txt OPEN event should be present and blocked; no subdir events
+	s.Require().NotEmpty(deltaEvents, "expected at least one blocked event")
+	// All events should be blocked (only root-level events fire)
+	for _, e := range deltaEvents {
+		s.Require().Truef(e.Blocked, "event %s|%s should be blocked", e.Type, e.Comm)
+	}
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Test: depth-limit guard — files beyond depth are NOT blocked
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_DepthLimit() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	// Set up a 4-level hierarchy:
+	//   /watch/                   (level 0)
+	//   ├── top.txt               (level 1)
+	//   ├── subdir/               (level 1)
+	//   │   ├── mid.txt           (level 2)
+	//   │   └── inner/            (level 2)
+	//   │       └── deep.txt      (level 3)
+	s.exec(c, []string{"mkdir", "-p", "/watch/subdir/inner"})
+	s.exec(c, []string{"sh", "-c", "echo top > /watch/top.txt"})
+	s.exec(c, []string{"sh", "-c", "echo mid > /watch/subdir/mid.txt"})
+	s.exec(c, []string{"sh", "-c", "echo deep > /watch/subdir/inner/deep.txt"})
+
+	// Guard with depth=2: level 0,1,2 are guarded; level 3+ is not.
+	// inner/ is NOT added to the BPF inode map (boundary dir skipped),
+	// so deep.txt at level 3 has no parent inode in the map.
+	s.startGuardStd(c, "/watch", "--recursive", "--depth", "2")
+	logBefore := s.readGuardLog(c)
+
+	// 1. Direct child file (level 1) — blocked
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/top.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "direct child should be blocked: %s", out)
+
+	// 2. File at depth 2 inside subdir — blocked (own inode in map)
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/subdir/mid.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "depth-2 file should be blocked: %s", out)
+
+	// 3. File at depth 3 inside inner/ — NOT blocked (inner/ at depth boundary
+	//    is NOT in the BPF inode map, so the parent check misses).
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/subdir/inner/deep.txt > /dev/null 2>&1"})
+	s.Require().Equalf(0, code, "depth-3 file should NOT be blocked: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	s.Require().NotEmpty(deltaEvents, "expected blocked events")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Test: binary whitelist with recursive guard
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Whitelist_Recursive() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch/subdir"})
+	s.exec(c, []string{"sh", "-c", "echo 'recursive whitelist' > /watch/target.txt"})
+	s.exec(c, []string{"sh", "-c", "echo 'subdir file' > /watch/subdir/target.txt"})
+
+	// Whitelist cat — cat is allowed at any depth with default recursive=true
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/cat")
+
+	// 1. cat at root — allowed
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/target.txt > /dev/null 2>&1"})
+	s.Require().Equalf(0, code, "cat at root should be allowed: %s", out)
+
+	// 2. cat in subdir — allowed (recursive)
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/subdir/target.txt > /dev/null 2>&1"})
+	s.Require().Equalf(0, code, "cat in subdir should be allowed: %s", out)
+
+	// 3. rm at root — NOT whitelisted, blocked
+	code, out = s.exec(c, []string{"rm", "/watch/target.txt"})
+	s.Require().NotEqualf(0, code, "rm should be blocked: %s", out)
+
+	// Clean up
+	s.exec(c, []string{"rm", "-f", "/watch/target.txt", "/watch/subdir/target.txt"})
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Test: binary blacklist with depth-limited guard
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Blacklist_Depth() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	// Hierarchy:
+	//   /watch/
+	//   ├── target.txt            (level 1)
+	//   └── subdir/               (level 1)
+	//       ├── nested.txt        (level 2)
+	//       └── inner/            (level 2)
+	//           └── deep.txt      (level 3)
+	s.exec(c, []string{"mkdir", "-p", "/watch/subdir/inner"})
+	s.exec(c, []string{"sh", "-c", "echo 'depth blacklist' > /watch/target.txt"})
+	s.exec(c, []string{"sh", "-c", "echo nested > /watch/subdir/nested.txt"})
+	s.exec(c, []string{"sh", "-c", "echo deep > /watch/subdir/inner/deep.txt"})
+
+	// Blacklist rm with depth=1: only level 1 is guarded; files at depth 2+
+	// leak (subdir/ added as dir inode at depth limit, but inner/ is not).
+	// Since inner/ is NOT in the inode map, deep.txt's parent check passes
+	// and rm succeeds.
+	s.startGuardStd(c, "/watch", "-b", "/usr/bin/rm", "--recursive", "--depth", "1")
+
+	// 1. rm at level 1 — blocked (own inode + blacklisted comm)
+	code, out := s.exec(c, []string{"rm", "/watch/target.txt"})
+	s.Require().NotEqualf(0, code, "rm at root should be blocked: %s", out)
+
+	// 2. rm at level 2 (nested.txt) — NOT blocked (subdir/ at depth boundary
+	//    is NOT in the BPF inode map, so the parent check misses).
+	code, out = s.exec(c, []string{"rm", "/watch/subdir/nested.txt"})
+	s.Require().Equalf(0, code, "rm at depth 2 should NOT be blocked: %s", out)
+
+	// 3. rm at level 3 (deep.txt) — NOT blocked (inner/ also NOT in map)
+	code, out = s.exec(c, []string{"rm", "/watch/subdir/inner/deep.txt"})
+	s.Require().Equalf(0, code, "rm at depth 3 should NOT be blocked: %s", out)
+
+	// 4. Create a NEW file at depth 3 — allowed (inner/ NOT in inode map)
+	code, out = s.exec(c, []string{"sh", "-c", "touch /watch/subdir/inner/new_file.txt 2>&1"})
+	s.Require().Equalf(0, code, "creating new file at depth 3 should NOT be blocked: %s", out)
+
+	// 5. Read the new file via cat — allowed (cat not blacklisted, and
+	//    inner/ NOT in inode map anyway).
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/subdir/inner/new_file.txt > /dev/null 2>&1"})
+	s.Require().Equalf(0, code, "cat at depth 3 should NOT be blocked: %s", out)
+
+	s.stopGuard(c)
+}
