@@ -64,6 +64,13 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} guard_exe_inodes SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1);
 	__type(key, __u32);
 	__type(value, char[MAX_PATH]);
@@ -82,6 +89,42 @@ struct {
 } rb SEC(".maps");
 
 char LICENSE[] SEC("license") = "GPL";
+
+// Read the exe file inode of the current process for anti-spoof verification.
+static __always_inline int get_current_exe_inode(struct inode_key *ik)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (!task)
+		return 0;
+
+	struct mm_struct *mm;
+	bpf_probe_read_kernel(&mm, sizeof(mm), &task->mm);
+	if (!mm)
+		return 0;
+
+	struct file *exe_file;
+	bpf_probe_read_kernel(&exe_file, sizeof(exe_file), &mm->exe_file);
+	if (!exe_file)
+		return 0;
+
+	struct inode *exe_inode;
+	bpf_probe_read_kernel(&exe_inode, sizeof(exe_inode), &exe_file->f_inode);
+	if (!exe_inode)
+		return 0;
+
+	bpf_probe_read_kernel(&ik->ino, sizeof(ik->ino), &exe_inode->i_ino);
+
+	struct super_block *sb;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &exe_inode->i_sb);
+	if (!sb)
+		return 0;
+
+	dev_t dev;
+	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+	ik->dev = dev;
+
+	return 1;
+}
 
 static __always_inline int read_inode_guard(struct inode *inode)
 {
@@ -226,18 +269,30 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 	__u32 key = 0;
 	__u64 *mode = bpf_map_lookup_elem(&guard_config, &key);
 	if (!mode)
-		return 0;
+		return -EPERM;
 
 	struct comm_key ck = {};
 	bpf_get_current_comm(&ck, sizeof(ck));
 
 	__u8 *found = bpf_map_lookup_elem(&guard_comms, &ck);
 
+	// Verify exe inode to prevent comm spoofing (prctl PR_SET_NAME).
+	// When a comm matches, also verify the executable's inode is in
+	// guard_exe_inodes. If not, the comm is spoofed.
+	bool exe_matches = false;
+	if (found) {
+		struct inode_key exe_ik = {};
+		if (get_current_exe_inode(&exe_ik)) {
+			__u8 *exe_found = bpf_map_lookup_elem(&guard_exe_inodes, &exe_ik);
+			exe_matches = exe_found != NULL;
+		}
+	}
+
 	int is_blocked;
 	if (*mode == 0)
-		is_blocked = found != NULL;
+		is_blocked = found != NULL && exe_matches;
 	else
-		is_blocked = found == NULL;
+		is_blocked = found == NULL || !exe_matches;
 
 	struct guard_event *e;
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);

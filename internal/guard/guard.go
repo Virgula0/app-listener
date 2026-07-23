@@ -80,6 +80,9 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	}
 	g.objs = objs
 
+	// Populate BPF maps first (sets operating mode and inode map), then
+	// attach LSM hooks. This avoids the guard blocking its own filesystem
+	// operations during startup (readdir, stat, etc.).
 	if err := g.populateMaps(); err != nil {
 		g.cleanup()
 		return nil, fmt.Errorf("populating BPF maps: %w", err)
@@ -90,6 +93,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		hook string
 	}{
 		{g.objs.GuardFileOpen, "file_open"},
+		{g.objs.GuardFilePermission, "file_permission"},
 		{g.objs.GuardMmapFile, "mmap_file"},
 		{g.objs.GuardPathUnlink, "path_unlink"},
 		{g.objs.GuardPathRename, "path_rename"},
@@ -151,6 +155,23 @@ func (g *Guard) populateMaps() error {
 		var val uint8 = 1
 		if err := g.objs.GuardComms.Put(key, val); err != nil {
 			return fmt.Errorf("storing comm %q in map: %w", b.Comm, err)
+		}
+
+		// Store the binary's exe inode for anti-spoof verification.
+		// The BPF program reads current->mm->exe_file->f_inode and
+		// checks it against guard_exe_inodes to prevent prctl-based
+		// comm spoofing.
+		var es syscall.Stat_t
+		if err := syscall.Stat(b.Path, &es); err != nil {
+			log.Warnf("cannot stat binary %s for exe inode: %v", b.Path, err)
+			continue
+		}
+		inodeKey := GuardInodeKey{
+			Dev: uint64((unix.Major(es.Dev) << 20) | unix.Minor(es.Dev)),
+			Ino: es.Ino,
+		}
+		if err := g.objs.GuardExeInodes.Put(inodeKey, val); err != nil {
+			return fmt.Errorf("storing exe inode for %s: %w", b.Path, err)
 		}
 	}
 
