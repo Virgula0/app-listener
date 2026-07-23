@@ -233,6 +233,159 @@ func (s *IntegrationSuite) TestMonitorSingleFile() {
 }
 
 // ---------------------------------------------------------------
+// Event filter tests (-e option)
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestMonitorEventFilter_Selective() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+
+	// Start monitor with a filter that excludes OPEN, WRITE, SYMLINK, MKDIR, MMAP
+	s.startMonitorStd(c, "/watch", "-e", "READ,HARDLINK,DELETE")
+	logBefore := s.readMonitorLog(c)
+
+	// 1. Create file → generates OPEN+WRITE (both filtered → no events)
+	s.exec(c, []string{"sh", "-c", "echo 'filter data' > /watch/filter.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter := s.readMonitorLog(c)
+	events := newEventTypes(logBefore, logAfter)
+	s.Require().Emptyf(events, "OPEN+WRITE should be filtered out, got %v", events)
+	logBefore = logAfter
+
+	// 2. Read file → generates OPEN+READ (OPEN filtered, READ allowed)
+	s.exec(c, []string{"sh", "-c", "cat /watch/filter.txt > /dev/null"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "READ")
+	s.requireNoNewEventType(logBefore, logAfter, "OPEN")
+	logBefore = logAfter
+
+	// 3. Create hardlink → generates HARDLINK (allowed)
+	s.exec(c, []string{"ln", "/watch/filter.txt", "/watch/filter-hl"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "HARDLINK")
+	logBefore = logAfter
+
+	// 4. Delete → generates DELETE (allowed)
+	s.exec(c, []string{"rm", "/watch/filter.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "DELETE")
+	// DELETE consumes the file, so hardlink is orphaned — clean up
+	s.exec(c, []string{"rm", "-f", "/watch/filter-hl"})
+
+	s.stopMonitor(c)
+}
+
+func (s *IntegrationSuite) TestMonitorEventFilter_SingleType() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+
+	// Start monitor watching only DELETE events
+	s.startMonitorStd(c, "/watch", "-e", "DELETE")
+	logBefore := s.readMonitorLog(c)
+
+	// 1. Create file → OPEN+WRITE both filtered → no events
+	s.exec(c, []string{"sh", "-c", "echo 'delete test' > /watch/todelete.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter := s.readMonitorLog(c)
+	events := newEventTypes(logBefore, logAfter)
+	s.Require().Emptyf(events, "OPEN+WRITE should be filtered out, got %v", events)
+	logBefore = logAfter
+
+	// 2. Read file → OPEN+READ both filtered → no events
+	s.exec(c, []string{"sh", "-c", "cat /watch/todelete.txt > /dev/null"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	events = newEventTypes(logBefore, logAfter)
+	s.Require().Emptyf(events, "OPEN+READ should be filtered out, got %v", events)
+	logBefore = logAfter
+
+	// 3. Delete → DELETE allowed → should appear
+	s.exec(c, []string{"rm", "/watch/todelete.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "DELETE")
+
+	s.stopMonitor(c)
+}
+
+// ---------------------------------------------------------------
+// Event filter tests: single-file watch
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestMonitorEventFilter_Selective_FileWatch() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	// Watched file must exist before starting the monitor (inode resolution)
+	s.exec(c, []string{"sh", "-c", "echo 'filter data' > /watch/target.txt"})
+
+	// Watch a single file with filter that excludes OPEN, WRITE, SYMLINK, MMAP
+	s.startMonitorStd(c, "/watch/target.txt", "-e", "READ,HARDLINK,DELETE")
+	logBefore := s.readMonitorLog(c)
+
+	// 1. Read file → OPEN+READ (OPEN filtered, READ allowed)
+	s.exec(c, []string{"sh", "-c", "cat /watch/target.txt > /dev/null"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter := s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "READ")
+	s.requireNoNewEventType(logBefore, logAfter, "OPEN")
+	logBefore = logAfter
+
+	// 2. Create hardlink → HARDLINK allowed (catch via inode)
+	s.exec(c, []string{"ln", "/watch/target.txt", "/watch/filter-hl"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "HARDLINK")
+	logBefore = logAfter
+
+	// 3. Delete → DELETE allowed
+	s.exec(c, []string{"rm", "/watch/target.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "DELETE")
+	s.exec(c, []string{"rm", "-f", "/watch/filter-hl"})
+
+	s.stopMonitor(c)
+}
+
+func (s *IntegrationSuite) TestMonitorEventFilter_SingleType_FileWatch() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	// Watched file must exist before starting the monitor (inode resolution)
+	s.exec(c, []string{"sh", "-c", "echo 'delete target' > /watch/target.txt"})
+
+	// Watch a single file, only DELETE events
+	s.startMonitorStd(c, "/watch/target.txt", "-e", "DELETE")
+	logBefore := s.readMonitorLog(c)
+
+	// 1. Read file → OPEN+READ both filtered → no events
+	s.exec(c, []string{"sh", "-c", "cat /watch/target.txt > /dev/null"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter := s.readMonitorLog(c)
+	events := newEventTypes(logBefore, logAfter)
+	s.Require().Emptyf(events, "OPEN+READ should be filtered out, got %v", events)
+	logBefore = logAfter
+
+	// 2. Delete → DELETE allowed → should appear
+	s.exec(c, []string{"rm", "/watch/target.txt"})
+	time.Sleep(500 * time.Millisecond)
+	logAfter = s.readMonitorLog(c)
+	s.requireNewEventType(logBefore, logAfter, "DELETE")
+
+	s.stopMonitor(c)
+}
+
+// ---------------------------------------------------------------
 // Cross-architecture tests (QEMU)
 // ---------------------------------------------------------------
 

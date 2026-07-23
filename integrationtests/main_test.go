@@ -191,3 +191,9 @@ func (s *IntegrationSuite) requireNewEventType(oldLog, newLog, expected string) 
 	s.Require().True(slices.Contains(events, expected),
 		"expected EVENT|%s in new log lines, got %v", expected, events)
 }
+
+func (s *IntegrationSuite) requireNoNewEventType(oldLog, newLog, unexpected string) {
+	events := newEventTypes(oldLog, newLog)
+	s.Require().False(slices.Contains(events, unexpected),
+		"unexpected EVENT|%s found in new log lines (got %v)", unexpected, events)
+}
