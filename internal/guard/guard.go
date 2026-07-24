@@ -88,6 +88,21 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		return nil, fmt.Errorf("populating BPF maps: %w", err)
 	}
 
+	// For each hook, track which hooks are critical (must attach for
+	// the guard to provide meaningful protection):
+	//
+	//   file_open, file_permission – required.  Without these, files
+	//   can be opened and read without restriction.  The guard will
+	//   fail if they cannot attach.
+	//
+	//   All other hooks – optional.  If they fail, a reduced set of
+	//   protection is available (e.g. no mmap, rename, or unlink
+	//   blocking).
+	required := map[string]bool{
+		"file_open":       true,
+		"file_permission": true,
+	}
+
 	attachments := []struct {
 		prog *cilium.Program
 		hook string
@@ -100,21 +115,39 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		{g.objs.GuardPathSymlink, "path_symlink"},
 		{g.objs.GuardPathLink, "path_link"},
 		{g.objs.GuardPathMkdir, "path_mkdir"},
+		{g.objs.GuardSbMount, "sb_mount"},
 	}
 
+	var failedRequired []string
 	for _, a := range attachments {
 		l, err := link.AttachLSM(link.LSMOptions{
 			Program: a.prog,
 		})
 		if err != nil {
-			log.Warnf("skipping LSM hook %s: %v", a.hook, err)
+			if required[a.hook] {
+				failedRequired = append(failedRequired, a.hook)
+				log.Errorf("CRITICAL: required LSM hook %s failed to attach: %v", a.hook, err)
+			} else {
+				log.Warnf("skipping optional LSM hook %s: %v", a.hook, err)
+			}
 			continue
 		}
 		g.links = append(g.links, l)
 	}
 
-	log.Infof("guard created \u2014 %d LSM hooks attached, watching: %s (%s)",
-		len(g.links), path, modeString(mode))
+	if len(failedRequired) > 0 {
+		g.cleanup()
+		return nil, fmt.Errorf(
+			"required LSM hooks failed to attach: %v — read/write/open protection unavailable. "+
+				"Ensure your kernel supports BPF LSM (CONFIG_BPF_LSM=y) and LSM=bpf is in the "+
+				"boot command line (/sys/kernel/security/lsm). "+
+				"The guard REQUIRES the file_open and file_permission hooks; if they cannot attach, "+
+				"the guard cannot provide meaningful protection and will refuse to start",
+			failedRequired)
+	}
+
+	log.Infof("guard created \u2014 %d/%d LSM hooks attached, watching: %s (%s)",
+		len(g.links), len(attachments), path, modeString(mode))
 	return g, nil
 }
 
@@ -182,6 +215,49 @@ func (g *Guard) populateMaps() error {
 		return fmt.Errorf("storing guarded path: %w", err)
 	}
 
+	// Detect and block the backing block device
+	//
+	// When a guarded path is on a real block device (e.g. /dev/sda1,
+	// /dev/mapper/cryptlvm), tools like debugfs(8) can open the block
+	// device directly and read the file contents without ever calling
+	// open() on the guarded file path — bypassing VFS access control.
+	//
+	// We automatically detect the backing device and add it to a BPF
+	// map so that any open() on that block device is blocked.
+	if err := g.addBackingBlockDevice(); err != nil {
+		log.Warnf("backing block device detection: %v", err)
+	}
+
+	return nil
+}
+
+// addBackingBlockDevice resolves the block device that backs the guarded
+// path and adds it to guard_fs_devices so that raw opens of that block
+// device are blocked.
+func (g *Guard) addBackingBlockDevice() error {
+	var s syscall.Stat_t
+	if err := syscall.Stat(g.path, &s); err != nil {
+		return fmt.Errorf("stating guarded path: %w", err)
+	}
+
+	major := unix.Major(s.Dev)
+	if major == 0 {
+		// Pseudo-filesystem (tmpfs, overlay, procfs, etc.) — no backing
+		// block device to block.
+		return nil
+	}
+
+	// Encode as the BPF map key (32-bit dev_t).
+	minor := unix.Minor(s.Dev)
+	rdev := major<<20 | minor
+
+	var val uint8 = 1
+	if err := g.objs.GuardFsDevices.Put(uint32(rdev), val); err != nil {
+		return fmt.Errorf("storing backing block device %d:%d in map: %w", major, minor, err)
+	}
+
+	log.Infof("blocking raw access to backing block device %d:%d for guarded path %s",
+		major, minor, g.path)
 	return nil
 }
 
@@ -224,6 +300,12 @@ func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
 				continue
 			}
 			if g.depth > 0 && currentDepth+1 >= g.depth {
+				// Add the directory inode even though we don't recurse.
+				// This protects files inside boundary directories via the
+				// parent inode check in is_guarded_access.
+				if err := g.addInode(fullPath); err != nil {
+					return err
+				}
 				continue
 			}
 			if err := g.scanDirInodes(fullPath, currentDepth+1); err != nil {
@@ -311,6 +393,14 @@ func (g *Guard) verifyHash(ge *GuardEvent) {
 	}
 
 	if !g.isGuardedBinary(exePath) {
+		return
+	}
+
+	exeBase := filepath.Base(exePath)
+	if len(exeBase) > 15 {
+		exeBase = exeBase[:15]
+	}
+	if ge.Comm != exeBase {
 		log.Warnf("process %d (%s) spoofed comm \u2014 actual binary: %s",
 			ge.PID, ge.Comm, exePath)
 	}

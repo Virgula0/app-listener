@@ -73,6 +73,7 @@ type GuardProgramSpecs struct {
 	GuardPathRename     *ebpf.ProgramSpec `ebpf:"guard_path_rename"`
 	GuardPathSymlink    *ebpf.ProgramSpec `ebpf:"guard_path_symlink"`
 	GuardPathUnlink     *ebpf.ProgramSpec `ebpf:"guard_path_unlink"`
+	GuardSbMount        *ebpf.ProgramSpec `ebpf:"guard_sb_mount"`
 }
 
 // GuardMapSpecs contains maps before they are loaded into the kernel.
@@ -82,6 +83,7 @@ type GuardMapSpecs struct {
 	GuardComms     *ebpf.MapSpec `ebpf:"guard_comms"`
 	GuardConfig    *ebpf.MapSpec `ebpf:"guard_config"`
 	GuardExeInodes *ebpf.MapSpec `ebpf:"guard_exe_inodes"`
+	GuardFsDevices *ebpf.MapSpec `ebpf:"guard_fs_devices"`
 	GuardInodes    *ebpf.MapSpec `ebpf:"guard_inodes"`
 	GuardPath      *ebpf.MapSpec `ebpf:"guard_path"`
 	Rb             *ebpf.MapSpec `ebpf:"rb"`
@@ -117,6 +119,7 @@ type GuardMaps struct {
 	GuardComms     *ebpf.Map `ebpf:"guard_comms"`
 	GuardConfig    *ebpf.Map `ebpf:"guard_config"`
 	GuardExeInodes *ebpf.Map `ebpf:"guard_exe_inodes"`
+	GuardFsDevices *ebpf.Map `ebpf:"guard_fs_devices"`
 	GuardInodes    *ebpf.Map `ebpf:"guard_inodes"`
 	GuardPath      *ebpf.Map `ebpf:"guard_path"`
 	Rb             *ebpf.Map `ebpf:"rb"`
@@ -128,6 +131,7 @@ func (m *GuardMaps) Close() error {
 		m.GuardComms,
 		m.GuardConfig,
 		m.GuardExeInodes,
+		m.GuardFsDevices,
 		m.GuardInodes,
 		m.GuardPath,
 		m.Rb,
@@ -153,6 +157,7 @@ type GuardPrograms struct {
 	GuardPathRename     *ebpf.Program `ebpf:"guard_path_rename"`
 	GuardPathSymlink    *ebpf.Program `ebpf:"guard_path_symlink"`
 	GuardPathUnlink     *ebpf.Program `ebpf:"guard_path_unlink"`
+	GuardSbMount        *ebpf.Program `ebpf:"guard_sb_mount"`
 }
 
 func (p *GuardPrograms) Close() error {
@@ -165,6 +170,7 @@ func (p *GuardPrograms) Close() error {
 		p.GuardPathRename,
 		p.GuardPathSymlink,
 		p.GuardPathUnlink,
+		p.GuardSbMount,
 	)
 }
 

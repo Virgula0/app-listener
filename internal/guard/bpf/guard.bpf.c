@@ -77,6 +77,13 @@ struct {
 } guard_path SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, __u32);
+	__type(value, __u8);
+} guard_fs_devices SEC(".maps"); // block devices hosting guarded filesystems
+
+struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
@@ -160,6 +167,31 @@ static __always_inline struct inode *get_inode_from_path(void *ctx_path)
 
 // Check whether the operation targets a guarded path by examining
 // both the file's own inode and its parent directory's inode.
+#define S_IFMT  00170000
+#define S_IFBLK 0060000
+
+// Check if the inode is a block device whose dev_t matches a
+// guarded filesystem.  This catches debugfs, dd, and any raw
+// block device reader that bypasses VFS access control.
+static __always_inline int is_guarded_block_device(struct inode *inode)
+{
+	if (!inode)
+		return 0;
+
+	umode_t mode;
+	bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode);
+
+	// Check if this is a block device (S_ISBLK)
+	if ((mode & S_IFMT) != S_IFBLK)
+		return 0;
+
+	__u32 rdev;
+	bpf_probe_read_kernel(&rdev, sizeof(rdev), &inode->i_rdev);
+
+	__u8 *val = bpf_map_lookup_elem(&guard_fs_devices, &rdev);
+	return val != NULL;
+}
+
 static __always_inline int is_guarded_access(struct dentry *dentry, struct inode *file_inode)
 {
 	if (read_inode_guard(file_inode))
@@ -288,11 +320,23 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 		}
 	}
 
+	// Detect kernel threads (no userspace mm).  These execute on behalf of
+	// user processes (e.g., io_uring workers, SQPOLL threads) and cannot be
+	// identified via comm or exe inode.  Block them unconditionally.
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct mm_struct *current_mm = NULL;
+	if (task)
+		bpf_probe_read_kernel(&current_mm, sizeof(current_mm), &task->mm);
+
 	int is_blocked;
-	if (*mode == 0)
+	if (!current_mm) {
+		// Kernel thread — cannot verify identity.  Block by default.
+		is_blocked = 1;
+	} else if (*mode == 0) {
 		is_blocked = found != NULL && exe_matches;
-	else
+	} else {
 		is_blocked = found == NULL || !exe_matches;
+	}
 
 	struct guard_event *e;
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
@@ -342,6 +386,13 @@ int guard_file_open(unsigned long long *ctx)
 	if (is_guarded_access(dentry, inode))
 		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
 
+	// Block access to the block device that hosts a guarded filesystem.
+	// Without this, tools like debugfs, dd, and fsck can read guarded
+	// files by opening the raw block device and interpreting filesystem
+	// metadata directly (bypassing VFS entirely).
+	if (is_guarded_block_device(inode))
+		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+
 	return 0;
 }
 
@@ -374,10 +425,10 @@ int guard_file_permission(unsigned long long *ctx)
 	if (!file)
 		return 0;
 
-	// Only intercept read and write permission checks
-	if (!(mask & (MAY_READ | MAY_WRITE)))
-		return 0;
-
+	// Intercept ALL file_permission checks (read, write, execute, etc.)
+	// We verify the file is guarded and check the access policy below.
+	// The mask parameter is intentionally ignored — we block any permission
+	// check on a guarded file if the accessor is not authorized.
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
 	if (!dentry)
@@ -432,6 +483,15 @@ int guard_path_rename(unsigned long long *ctx)
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+	}
+
+	// Also check the destination parent directory.  This prevents renaming
+	// files from outside the guarded area INTO a guarded directory, and
+	// blocks renames into depth-boundary directories that were added to
+	// the guard_inodes map.
+	struct inode *new_parent_inode = get_inode_from_path((void *)ctx[2]);
+	if (new_parent_inode && new_parent_inode != inode && read_inode_guard(new_parent_inode)) {
 		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
 	}
 
@@ -522,6 +582,31 @@ int guard_path_mkdir(unsigned long long *ctx)
 
 	if (read_inode_guard(parent_inode)) {
 		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL);
+	}
+
+	return 0;
+}
+
+SEC("lsm/sb_mount")
+int guard_sb_mount(unsigned long long *ctx)
+{
+	// ctx[1] is the mount point path (struct path *)
+	struct path *mount_path = (struct path *)ctx[1];
+	if (!mount_path)
+		return 0;
+
+	struct dentry *dentry;
+	bpf_probe_read_kernel(&dentry, sizeof(dentry), &mount_path->dentry);
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+	if (!inode)
+		return 0;
+
+	if (read_inode_guard(inode)) {
+		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
 	}
 
 	return 0;

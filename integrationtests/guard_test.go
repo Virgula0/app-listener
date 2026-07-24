@@ -497,6 +497,7 @@ var guardExploitTests = []guardExploitTest{
 	{name: "pread64", binary: "pread64", events: []string{"OPEN"}},
 	{name: "readv", binary: "readv", events: []string{"OPEN"}},
 	{name: "sendfile", binary: "sendfile", events: []string{"OPEN"}},
+	{name: "splice", binary: "splice", events: []string{"OPEN"}},
 }
 
 func (s *IntegrationSuite) TestGuard_Exploits() {
@@ -734,4 +735,122 @@ func (s *IntegrationSuite) TestGuard_Blacklist_Depth() {
 	s.Require().Equalf(0, code, "cat at depth 3 should NOT be blocked: %s", out)
 
 	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: fork+exec with inherited fd
+//
+// The POC opens a guarded file WITHOUT O_CLOEXEC, forks, and the
+// child exec's a target binary (e.g. /usr/bin/cat) that reads from
+// the inherited fd.  file_permission fires with the new binary's
+// context and should block it if the binary is blacklisted.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_ForkExecFD() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
+	s.exec(c, []string{"sh", "-c", "echo 'fork+exec bypass target' > /watch/target.txt"})
+
+	exploitHostPath := absPath("./exploits/fork_exec_fd")
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/fork_exec_fd", 0755)
+	s.Require().NoError(err, "copy fork_exec_fd binary")
+
+	s.startGuardStd(c, "/watch", "-b", "/usr/bin/cat")
+
+	code, out := s.exec(c, []string{"/exploits/fork_exec_fd", "/watch/target.txt", "/usr/bin/cat"})
+	s.Require().NotEqualf(0, code,
+		"fork_exec_fd bypass should be blocked (cat is blacklisted): %s", out)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: SCM_RIGHTS fd passing + exec
+//
+// The POC opens a guarded file, passes the fd to a child process
+// via SCM_RIGHTS, then the child exec's cat which reads from the
+// passed fd.  file_permission should block it.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_SCMRights() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
+	s.exec(c, []string{"sh", "-c", "echo 'SCM_RIGHTS bypass target' > /watch/target.txt"})
+
+	exploitHostPath := absPath("./exploits/scm_rights_pass")
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/scm_rights_pass", 0755)
+	s.Require().NoError(err, "copy scm_rights_pass binary")
+
+	s.startGuardStd(c, "/watch", "-b", "/usr/bin/cat")
+
+	code, out := s.exec(c, []string{"/exploits/scm_rights_pass", "/watch/target.txt"})
+	s.Require().NotEqualf(0, code,
+		"SCM_RIGHTS bypass should be blocked (cat is blacklisted): %s", out)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: open_by_handle_at — open file by inode handle
+//
+// Uses name_to_handle_at() + open_by_handle_at() to open a file
+// without specifying a filesystem path.  The guard's file_open
+// hook catches this because vfs_open resolves the dentry from
+// the handle.  Requires CONFIG_FHANDLE + CAP_DAC_READ_SEARCH.
+// Skipped if the kernel does not support name_to_handle_at.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
+	s.exec(c, []string{"sh", "-c", "echo 'handle bypass target' > /watch/target.txt"})
+
+	exploitHostPath := absPath("./exploits/open_by_handle_at")
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/open_by_handle_at", 0755)
+	s.Require().NoError(err, "copy open_by_handle_at binary")
+
+	s.startGuardStd(c, "/watch")
+	logBefore := s.readGuardLog(c)
+
+	code, out := s.exec(c, []string{"/exploits/open_by_handle_at", "/watch/target.txt"})
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	if code != 0 && len(deltaEvents) == 0 {
+		s.T().Skipf("open_by_handle_at not supported on this kernel: %s", out)
+	}
+
+	s.Require().NotEqualf(0, code,
+		"open_by_handle_at should be blocked by guard: %s", out)
+	s.requireBlockedEvent(deltaEvents, "OPEN")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: raw block device — read via debugfs on loop device
+//
+// This test requires loop device support in Docker and is skipped
+// in automated CI.  Run manually on a real host to verify:
+//
+//   sudo ./integrationtests/exploits/raw_block_device /dev/mapper/cryptlvm /home/user/secret.txt
+//
+// Before the fix: debugfs opens the block device and reads the file
+//   without triggering any guard event — VFS bypass.
+//
+// After the fix: the guard auto-detects the backing block device for
+//   each watched path and blocks open() on that device via the
+//   guard_fs_devices BPF map.  The above command should now fail
+//   with the guard blocking the block device access.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_RawBlockDevice() {
+	s.T().Skip("requires loop device support and a real ext4 filesystem — run manually")
 }
