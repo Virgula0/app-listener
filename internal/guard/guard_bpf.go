@@ -65,29 +65,33 @@ type GuardSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type GuardProgramSpecs struct {
-	GuardFileOpen       *ebpf.ProgramSpec `ebpf:"guard_file_open"`
-	GuardFilePermission *ebpf.ProgramSpec `ebpf:"guard_file_permission"`
-	GuardMmapFile       *ebpf.ProgramSpec `ebpf:"guard_mmap_file"`
-	GuardPathLink       *ebpf.ProgramSpec `ebpf:"guard_path_link"`
-	GuardPathMkdir      *ebpf.ProgramSpec `ebpf:"guard_path_mkdir"`
-	GuardPathRename     *ebpf.ProgramSpec `ebpf:"guard_path_rename"`
-	GuardPathSymlink    *ebpf.ProgramSpec `ebpf:"guard_path_symlink"`
-	GuardPathUnlink     *ebpf.ProgramSpec `ebpf:"guard_path_unlink"`
-	GuardSbMount        *ebpf.ProgramSpec `ebpf:"guard_sb_mount"`
+	GuardFileOpen          *ebpf.ProgramSpec `ebpf:"guard_file_open"`
+	GuardFilePermission    *ebpf.ProgramSpec `ebpf:"guard_file_permission"`
+	GuardMmapFile          *ebpf.ProgramSpec `ebpf:"guard_mmap_file"`
+	GuardPathLink          *ebpf.ProgramSpec `ebpf:"guard_path_link"`
+	GuardPathMkdir         *ebpf.ProgramSpec `ebpf:"guard_path_mkdir"`
+	GuardPathRename        *ebpf.ProgramSpec `ebpf:"guard_path_rename"`
+	GuardPathSymlink       *ebpf.ProgramSpec `ebpf:"guard_path_symlink"`
+	GuardPathUnlink        *ebpf.ProgramSpec `ebpf:"guard_path_unlink"`
+	GuardPtraceAccessCheck *ebpf.ProgramSpec `ebpf:"guard_ptrace_access_check"`
+	GuardSbMount           *ebpf.ProgramSpec `ebpf:"guard_sb_mount"`
+	GuardTaskAlloc         *ebpf.ProgramSpec `ebpf:"guard_task_alloc"`
+	GuardTaskFree          *ebpf.ProgramSpec `ebpf:"guard_task_free"`
 }
 
 // GuardMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type GuardMapSpecs struct {
-	GuardComms     *ebpf.MapSpec `ebpf:"guard_comms"`
-	GuardConfig    *ebpf.MapSpec `ebpf:"guard_config"`
-	GuardExeInodes *ebpf.MapSpec `ebpf:"guard_exe_inodes"`
-	GuardFsDevices *ebpf.MapSpec `ebpf:"guard_fs_devices"`
-	GuardInodes    *ebpf.MapSpec `ebpf:"guard_inodes"`
-	GuardPath      *ebpf.MapSpec `ebpf:"guard_path"`
-	Rb             *ebpf.MapSpec `ebpf:"rb"`
-	TmpBuf         *ebpf.MapSpec `ebpf:"tmp_buf"`
+	GuardComms       *ebpf.MapSpec `ebpf:"guard_comms"`
+	GuardConfig      *ebpf.MapSpec `ebpf:"guard_config"`
+	GuardExeInodes   *ebpf.MapSpec `ebpf:"guard_exe_inodes"`
+	GuardFsDevices   *ebpf.MapSpec `ebpf:"guard_fs_devices"`
+	GuardInodes      *ebpf.MapSpec `ebpf:"guard_inodes"`
+	GuardPath        *ebpf.MapSpec `ebpf:"guard_path"`
+	GuardTaintedPids *ebpf.MapSpec `ebpf:"guard_tainted_pids"`
+	Rb               *ebpf.MapSpec `ebpf:"rb"`
+	TmpBuf           *ebpf.MapSpec `ebpf:"tmp_buf"`
 }
 
 // GuardVariableSpecs contains global variables before they are loaded into the kernel.
@@ -116,14 +120,15 @@ func (o *GuardObjects) Close() error {
 //
 // It can be passed to LoadGuardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type GuardMaps struct {
-	GuardComms     *ebpf.Map `ebpf:"guard_comms"`
-	GuardConfig    *ebpf.Map `ebpf:"guard_config"`
-	GuardExeInodes *ebpf.Map `ebpf:"guard_exe_inodes"`
-	GuardFsDevices *ebpf.Map `ebpf:"guard_fs_devices"`
-	GuardInodes    *ebpf.Map `ebpf:"guard_inodes"`
-	GuardPath      *ebpf.Map `ebpf:"guard_path"`
-	Rb             *ebpf.Map `ebpf:"rb"`
-	TmpBuf         *ebpf.Map `ebpf:"tmp_buf"`
+	GuardComms       *ebpf.Map `ebpf:"guard_comms"`
+	GuardConfig      *ebpf.Map `ebpf:"guard_config"`
+	GuardExeInodes   *ebpf.Map `ebpf:"guard_exe_inodes"`
+	GuardFsDevices   *ebpf.Map `ebpf:"guard_fs_devices"`
+	GuardInodes      *ebpf.Map `ebpf:"guard_inodes"`
+	GuardPath        *ebpf.Map `ebpf:"guard_path"`
+	GuardTaintedPids *ebpf.Map `ebpf:"guard_tainted_pids"`
+	Rb               *ebpf.Map `ebpf:"rb"`
+	TmpBuf           *ebpf.Map `ebpf:"tmp_buf"`
 }
 
 func (m *GuardMaps) Close() error {
@@ -134,6 +139,7 @@ func (m *GuardMaps) Close() error {
 		m.GuardFsDevices,
 		m.GuardInodes,
 		m.GuardPath,
+		m.GuardTaintedPids,
 		m.Rb,
 		m.TmpBuf,
 	)
@@ -149,15 +155,18 @@ type GuardVariables struct {
 //
 // It can be passed to LoadGuardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type GuardPrograms struct {
-	GuardFileOpen       *ebpf.Program `ebpf:"guard_file_open"`
-	GuardFilePermission *ebpf.Program `ebpf:"guard_file_permission"`
-	GuardMmapFile       *ebpf.Program `ebpf:"guard_mmap_file"`
-	GuardPathLink       *ebpf.Program `ebpf:"guard_path_link"`
-	GuardPathMkdir      *ebpf.Program `ebpf:"guard_path_mkdir"`
-	GuardPathRename     *ebpf.Program `ebpf:"guard_path_rename"`
-	GuardPathSymlink    *ebpf.Program `ebpf:"guard_path_symlink"`
-	GuardPathUnlink     *ebpf.Program `ebpf:"guard_path_unlink"`
-	GuardSbMount        *ebpf.Program `ebpf:"guard_sb_mount"`
+	GuardFileOpen          *ebpf.Program `ebpf:"guard_file_open"`
+	GuardFilePermission    *ebpf.Program `ebpf:"guard_file_permission"`
+	GuardMmapFile          *ebpf.Program `ebpf:"guard_mmap_file"`
+	GuardPathLink          *ebpf.Program `ebpf:"guard_path_link"`
+	GuardPathMkdir         *ebpf.Program `ebpf:"guard_path_mkdir"`
+	GuardPathRename        *ebpf.Program `ebpf:"guard_path_rename"`
+	GuardPathSymlink       *ebpf.Program `ebpf:"guard_path_symlink"`
+	GuardPathUnlink        *ebpf.Program `ebpf:"guard_path_unlink"`
+	GuardPtraceAccessCheck *ebpf.Program `ebpf:"guard_ptrace_access_check"`
+	GuardSbMount           *ebpf.Program `ebpf:"guard_sb_mount"`
+	GuardTaskAlloc         *ebpf.Program `ebpf:"guard_task_alloc"`
+	GuardTaskFree          *ebpf.Program `ebpf:"guard_task_free"`
 }
 
 func (p *GuardPrograms) Close() error {
@@ -170,7 +179,10 @@ func (p *GuardPrograms) Close() error {
 		p.GuardPathRename,
 		p.GuardPathSymlink,
 		p.GuardPathUnlink,
+		p.GuardPtraceAccessCheck,
 		p.GuardSbMount,
+		p.GuardTaskAlloc,
+		p.GuardTaskFree,
 	)
 }
 

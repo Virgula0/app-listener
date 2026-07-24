@@ -854,3 +854,150 @@ func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
 func (s *IntegrationSuite) TestGuard_Bypass_RawBlockDevice() {
 	s.T().Skip("requires loop device support and a real ext4 filesystem — run manually")
 }
+
+// ---------------------------------------------------------------
+// Test: runtime mkdir — new directories under recursive guard are
+// lazily discovered via file_open, so files inside are blocked.
+// Uses blacklist mode: only /usr/bin/cat is blacklisted.  Other
+// commands (mkdir, sh, mv) are allowed, simulating a whitelisted
+// binary creating new directories at runtime.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"touch", "/watch/pre_existing.txt"})
+
+	// Blacklist cat only — all other binaries (mkdir, sh, mv) are allowed
+	s.startGuardStd(c, "/watch", "--recursive", "-b", "/usr/bin/cat")
+	logBefore := s.readGuardLog(c)
+
+	// Pre-existing file: cat should be blocked
+	code, out := s.exec(c, []string{"/usr/bin/cat", "/watch/pre_existing.txt"})
+	s.Require().NotEqualf(0, code, "pre-existing file should be blocked for cat: %s", out)
+
+	// Create a new subdirectory AFTER guard started using mkdir (not blacklisted)
+	code, out = s.exec(c, []string{"mkdir", "/watch/runtime_dir"})
+	s.Require().Equalf(0, code, "mkdir should succeed (not blacklisted): %s", out)
+
+	// Create a file inside (shell not blacklisted → allowed)
+	code, out = s.exec(c, []string{"sh", "-c", "echo secret > /watch/runtime_dir/data.txt"})
+	s.Require().Equalf(0, code, "shell file creation should succeed: %s", out)
+
+	// Lazy discovery fires during the above open → parent added to guard_inodes.
+	// Now read with cat (blacklisted) → should be blocked.
+	code, out = s.exec(c, []string{"/usr/bin/cat", "/watch/runtime_dir/data.txt"})
+	s.Require().NotEqualf(0, code, "file in runtime-created dir should be blocked for cat: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Test: runtime mkdir with non-recursive guard — new directories
+// are NOT auto-discovered (recursive flag is 0), so files inside
+// are NOT blocked even for blacklisted binaries.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_RuntimeNewDir_NonRecursive() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"touch", "/watch/top.txt"})
+
+	// Non-recursive guard, blacklist cat
+	s.startGuardStd(c, "/watch", "--recursive=false", "-b", "/usr/bin/cat")
+
+	// Pre-existing file: cat blocked
+	code, out := s.exec(c, []string{"/usr/bin/cat", "/watch/top.txt"})
+	s.Require().NotEqualf(0, code, "pre-existing file should be blocked for cat: %s", out)
+
+	// Create a new subdirectory after guard started
+	code, out = s.exec(c, []string{"mkdir", "/watch/runtime_dir"})
+	s.Require().Equalf(0, code, "mkdir should succeed: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c", "echo data > /watch/runtime_dir/data.txt"})
+	s.Require().Equalf(0, code, "file creation should succeed: %s", out)
+
+	// Should NOT be blocked (non-recursive → discover_guarded_parent checks
+	// should_add_new_dir, which would return 0, so parent is NOT added)
+	code, out = s.exec(c, []string{"/usr/bin/cat", "/watch/runtime_dir/data.txt"})
+	s.Require().Equalf(0, code, "file in runtime dir should NOT be blocked (non-recursive): %s", out)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Test: rename a directory from outside into the guarded area.
+// The rename succeeds (moving into guarded area is allowed), but
+// the moved directory's inode is added to guard_inodes so files
+// inside become guarded.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_RuntimeRenameDir() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"mkdir", "-p", "/outside"})
+	s.exec(c, []string{"mkdir", "/outside/data"})
+	s.exec(c, []string{"sh", "-c", "echo secret > /outside/data/file.txt"})
+
+	// Guard watches /watch recursively, blacklist cat
+	s.startGuardStd(c, "/watch", "--recursive", "-b", "/usr/bin/cat")
+	logBefore := s.readGuardLog(c)
+
+	// Rename the outside directory into the guarded area.
+	// The rename itself is allowed (source was not guarded, mv not blacklisted).
+	code, out := s.exec(c, []string{"mv", "/outside/data", "/watch/data"})
+	s.Require().Equalf(0, code, "rename into guarded area should succeed: %s", out)
+	time.Sleep(1 * time.Second)
+
+	// Now that data/ is under /watch, its contents should be guarded.
+	// The rename hook adds the moved-in directory's inode to guard_inodes.
+	code, out = s.exec(c, []string{"/usr/bin/cat", "/watch/data/file.txt"})
+	s.Require().NotEqualf(0, code, "file in moved-in dir should be blocked for cat: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Test: rename a file (not a directory) into the guarded area.
+// Files do not get their own inode added on rename-in, but the
+// file is now under a guarded parent so it IS blocked (by parent
+// inode check).
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_RuntimeRenameFile() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"mkdir", "-p", "/outside"})
+	s.exec(c, []string{"sh", "-c", "echo data > /outside/file.txt"})
+
+	// Guard watches /watch recursively, blacklist cat
+	s.startGuardStd(c, "/watch", "--recursive", "-b", "/usr/bin/cat")
+	logBefore := s.readGuardLog(c)
+
+	// Rename a regular file into the guarded area
+	code, out := s.exec(c, []string{"mv", "/outside/file.txt", "/watch/file.txt"})
+	s.Require().Equalf(0, code, "rename file into guarded area should succeed: %s", out)
+	time.Sleep(1 * time.Second)
+
+	// The file is now under /watch guarded parent — accessing should be blocked
+	code, out = s.exec(c, []string{"/usr/bin/cat", "/watch/file.txt"})
+	s.Require().NotEqualf(0, code, "file moved into guarded area should be blocked for cat: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+
+	s.stopGuard(c)
+}

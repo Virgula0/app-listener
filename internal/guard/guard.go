@@ -116,6 +116,9 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		{g.objs.GuardPathLink, "path_link"},
 		{g.objs.GuardPathMkdir, "path_mkdir"},
 		{g.objs.GuardSbMount, "sb_mount"},
+		{g.objs.GuardPtraceAccessCheck, "ptrace_access_check"},
+		{g.objs.GuardTaskAlloc, "task_alloc"},
+		{g.objs.GuardTaskFree, "task_free"},
 	}
 
 	var failedRequired []string
@@ -159,9 +162,19 @@ func modeString(mode Mode) string {
 }
 
 func (g *Guard) populateMaps() error {
-	// Set the operating mode
+	// Set the operating mode, recursive flag, and depth
 	if err := g.objs.GuardConfig.Put(uint32(0), uint64(g.mode)); err != nil {
 		return fmt.Errorf("setting mode in config: %w", err)
+	}
+	recursiveVal := uint64(0)
+	if g.recursive {
+		recursiveVal = 1
+	}
+	if err := g.objs.GuardConfig.Put(uint32(1), recursiveVal); err != nil {
+		return fmt.Errorf("setting recursive in config: %w", err)
+	}
+	if err := g.objs.GuardConfig.Put(uint32(2), uint64(g.depth)); err != nil {
+		return fmt.Errorf("setting depth in config: %w", err)
 	}
 
 	info, err := os.Stat(g.path)

@@ -43,7 +43,7 @@ struct inode_key {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
+	__uint(max_entries, 3);  // [0]=mode, [1]=recursive, [2]=depth
 	__type(key, __u32);
 	__type(value, __u64);
 } guard_config SEC(".maps");
@@ -82,6 +82,16 @@ struct {
 	__type(key, __u32);
 	__type(value, __u8);
 } guard_fs_devices SEC(".maps"); // block devices hosting guarded filesystems
+
+// Tracks processes that have guarded file content in their address space.
+// Once tainted, process_vm_readv, ptrace, and /proc/<pid>/mem access
+// against this PID are blocked unless the caller is whitelisted.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32);   // PID (TGID) of the tainted process
+	__type(value, __u8);  // 1 = tainted
+} guard_tainted_pids SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -169,6 +179,7 @@ static __always_inline struct inode *get_inode_from_path(void *ctx_path)
 // both the file's own inode and its parent directory's inode.
 #define S_IFMT  00170000
 #define S_IFBLK 0060000
+#define S_IFDIR 0040000
 
 // Check if the inode is a block device whose dev_t matches a
 // guarded filesystem.  This catches debugfs, dd, and any raw
@@ -191,6 +202,116 @@ static __always_inline int is_guarded_block_device(struct inode *inode)
 	__u8 *val = bpf_map_lookup_elem(&guard_fs_devices, &rdev);
 	return val != NULL;
 }
+
+// Mark the current process as tainted — it now has guarded file content
+// in its address space.  Subsequent ptrace/process_vm_readv attempts
+// from non-whitelisted processes will be blocked.
+static __always_inline void mark_tainted(void)
+{
+	__u32 pid = bpf_get_current_pid_tgid() >> 32;
+	__u8 val = 1;
+	bpf_map_update_elem(&guard_tainted_pids, &pid, &val, BPF_ANY);
+}
+
+// Add an inode to guard_inodes.  Used by inode_mkdir and path_rename
+// to auto-discover new directories at runtime.
+static __always_inline void add_inode_to_guard(struct inode *inode)
+{
+	if (!inode)
+		return;
+
+	struct inode_key ikey = {};
+	bpf_probe_read_kernel(&ikey.ino, sizeof(ikey.ino), &inode->i_ino);
+
+	struct super_block *sb;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return;
+
+	dev_t dev;
+	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+	ikey.dev = dev;
+
+	__u8 v = 1;
+	bpf_map_update_elem(&guard_inodes, &ikey, &v, BPF_ANY);
+}
+
+// Check if a newly created directory should be auto-added to guard_inodes
+// based on the guard's recursive and depth settings.
+static __always_inline int should_add_new_dir(void)
+{
+	__u32 key = 1;
+	__u64 *recursive = bpf_map_lookup_elem(&guard_config, &key);
+	if (!recursive || *recursive == 0)
+		return 0;
+	// depth is handled by the parent-inode check in is_guarded_access.
+	// We always add the immediate new directory; depth beyond that is
+	// naturally limited by parent-inode lookups.
+	return 1;
+}
+
+// Check if the accessed file is /proc/<pid>/mem for a tainted PID.
+// The guard can't protect /proc filesystem inodes (they're not in the
+// guarded inode map), so we must explicitly detect this vector.
+static __always_inline int is_proc_mem_of_tainted(struct dentry *dentry)
+{
+	if (!dentry)
+		return 0;
+
+	// Check if this dentry's name is "mem"
+	const unsigned char *name_ptr;
+	bpf_probe_read_kernel(&name_ptr, sizeof(name_ptr), &dentry->d_name.name);
+	if (!name_ptr)
+		return 0;
+
+	char name[8];
+	long ret = bpf_probe_read_kernel_str(name, sizeof(name), name_ptr);
+	if (ret <= 0)
+		return 0;
+
+	// Must be exactly "mem"
+	if (name[0] != 'm' || name[1] != 'e' || name[2] != 'm' || name[3] != '\0')
+		return 0;
+
+	// Check parent dentry (the PID directory)
+	struct dentry *parent;
+	bpf_probe_read_kernel(&parent, sizeof(parent), &dentry->d_parent);
+	if (!parent || parent == dentry)
+		return 0;
+
+	const unsigned char *pname_ptr;
+	bpf_probe_read_kernel(&pname_ptr, sizeof(pname_ptr), &parent->d_name.name);
+	if (!pname_ptr)
+		return 0;
+
+	char pname[16];
+	ret = bpf_probe_read_kernel_str(pname, sizeof(pname), pname_ptr);
+	if (ret <= 0)
+		return 0;
+
+	// Parse parent name as a numeric PID
+	__u32 pid = 0;
+	for (int i = 0; i < 12; i++) {
+		char c = pname[i];
+		if (c >= '0' && c <= '9') {
+			pid = pid * 10 + (c - '0');
+		} else if (c == '\0') {
+			break;
+		} else {
+			return 0;  // not a numeric directory
+		}
+	}
+	if (pid == 0)
+		return 0;
+
+	__u8 *val = bpf_map_lookup_elem(&guard_tainted_pids, &pid);
+	return val != NULL;
+}
+
+// Check /proc/<pid>/fd/<n> — opening it creates a file struct pointing
+// to the actual file, which goes through security_file_open with the
+// real file's dentry/inode, so is_guarded_access catches it.
+// We only need to explicitly guard /proc/<pid>/mem here.
 
 static __always_inline int is_guarded_access(struct dentry *dentry, struct inode *file_inode)
 {
@@ -368,6 +489,58 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 	return is_blocked ? -EPERM : 0;
 }
 
+// Lazy directory discovery for file_open.
+// When a file is accessed inside a newly-created directory whose inode is
+// not yet in guard_inodes, walk up the dentry tree to find a guarded ancestor
+// and add the immediate parent of the file to guard_inodes.  This bridges
+// the gap between mkdir time (when the inode isn't available via LSM) and
+// file-open time (when the directory inode exists and can be added).
+// Depth is not enforced for runtime discoveries — the alternative (leaving
+// new directories unguarded) is a worse security hole.
+static __always_inline void discover_guarded_parent(struct dentry *dentry)
+{
+	if (!dentry)
+		return;
+
+	struct dentry *parent;
+	bpf_probe_read_kernel(&parent, sizeof(parent), &dentry->d_parent);
+	if (!parent || parent == dentry)
+		return;
+
+	struct inode *parent_inode;
+	bpf_probe_read_kernel(&parent_inode, sizeof(parent_inode), &parent->d_inode);
+	if (!parent_inode)
+		return;
+
+	if (read_inode_guard(parent_inode))
+		return;
+
+	// Respect non-recursive mode: only discover parents when recursive=1
+	if (!should_add_new_dir())
+		return;
+
+	struct dentry *ancestor = parent;
+	for (int i = 0; i < 16; i++) {
+		struct dentry *next;
+		bpf_probe_read_kernel(&next, sizeof(next), &ancestor->d_parent);
+		if (!next || next == ancestor)
+			return;
+		ancestor = next;
+
+		struct inode *anc_inode;
+		bpf_probe_read_kernel(&anc_inode, sizeof(anc_inode), &ancestor->d_inode);
+		if (!anc_inode)
+			return;
+		if (anc_inode == parent_inode)
+			return;
+
+		if (read_inode_guard(anc_inode)) {
+			add_inode_to_guard(parent_inode);
+			return;
+		}
+	}
+}
+
 SEC("lsm/file_open")
 int guard_file_open(unsigned long long *ctx)
 {
@@ -383,8 +556,22 @@ int guard_file_open(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
-	if (is_guarded_access(dentry, inode))
-		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+	// Block /proc/<pid>/mem access when the target PID is tainted
+	if (is_proc_mem_of_tainted(dentry))
+		return -EPERM;
+
+	// Lazy directory discovery: if a file's parent is newly created and not
+	// yet in guard_inodes but a higher ancestor is guarded, add the parent.
+	// This prevents bypasses where a whitelisted binary creates a directory
+	// at runtime and an attacker reads files inside.
+	discover_guarded_parent(dentry);
+
+	if (is_guarded_access(dentry, inode)) {
+		int ret = check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+		if (ret == 0)
+			mark_tainted();
+		return ret;
+	}
 
 	// Block access to the block device that hosts a guarded filesystem.
 	// Without this, tools like debugfs, dd, and fsck can read guarded
@@ -411,8 +598,12 @@ int guard_mmap_file(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
-	if (is_guarded_access(dentry, inode))
-		return check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL);
+	if (is_guarded_access(dentry, inode)) {
+		int ret = check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL);
+		if (ret == 0)
+			mark_tainted();
+		return ret;
+	}
 
 	return 0;
 }
@@ -425,14 +616,15 @@ int guard_file_permission(unsigned long long *ctx)
 	if (!file)
 		return 0;
 
-	// Intercept ALL file_permission checks (read, write, execute, etc.)
-	// We verify the file is guarded and check the access policy below.
-	// The mask parameter is intentionally ignored — we block any permission
-	// check on a guarded file if the accessor is not authorized.
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
 	if (!dentry)
 		return 0;
+
+	// Block read access to /proc/<pid>/mem when the target PID is tainted.
+	// This catches reads on an already-open fd (opened before taint).
+	if (is_proc_mem_of_tainted(dentry))
+		return -EPERM;
 
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
@@ -441,7 +633,10 @@ int guard_file_permission(unsigned long long *ctx)
 		return 0;
 
 	__u32 event_type = (mask & MAY_WRITE) ? EVENT_WRITE : EVENT_READ;
-	return check_and_emit(event_type, dentry, NULL, false, NULL);
+	int ret = check_and_emit(event_type, dentry, NULL, false, NULL);
+	if (ret == 0)
+		mark_tainted();
+	return ret;
 }
 
 SEC("lsm/path_unlink")
@@ -492,7 +687,18 @@ int guard_path_rename(unsigned long long *ctx)
 	// the guard_inodes map.
 	struct inode *new_parent_inode = get_inode_from_path((void *)ctx[2]);
 	if (new_parent_inode && new_parent_inode != inode && read_inode_guard(new_parent_inode)) {
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		if (ret != 0)
+			return ret;  // blocked — reject the rename
+		// Allowed — if the source is a directory, add its inode
+		// to guard_inodes so its new location is guarded.
+		if (should_add_new_dir()) {
+			umode_t old_mode;
+			bpf_probe_read_kernel(&old_mode, sizeof(old_mode), &inode->i_mode);
+			if ((old_mode & S_IFMT) == S_IFDIR)
+				add_inode_to_guard(inode);
+		}
+		return 0;
 	}
 
 	return 0;
@@ -609,5 +815,79 @@ int guard_sb_mount(unsigned long long *ctx)
 		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
 	}
 
+	return 0;
+}
+
+// Block ptrace / process_vm_readv / process_vm_writev against any process
+// that has guarded file content in its address space (tainted PID).
+// Once a process opens/reads a guarded file, no non-whitelisted process
+// can ptrace it or read its memory via process_vm_readv.
+SEC("lsm/ptrace_access_check")
+int guard_ptrace_access_check(struct task_struct *child, unsigned int mode)
+{
+	if (!child)
+		return 0;
+
+	__u32 pid;
+	bpf_probe_read_kernel(&pid, sizeof(pid), &child->tgid);
+
+	__u8 *val = bpf_map_lookup_elem(&guard_tainted_pids, &pid);
+	if (!val)
+		return 0;  // child is not tainted — allow
+
+	// Child is tainted.  Check if the caller is whitelisted.
+	struct comm_key ck = {};
+	bpf_get_current_comm(&ck, sizeof(ck));
+
+	__u8 *found = bpf_map_lookup_elem(&guard_comms, &ck);
+	if (!found)
+		return -EPERM;
+
+	// Verify exe inode to prevent comm spoofing
+	struct inode_key exe_ik = {};
+	if (get_current_exe_inode(&exe_ik)) {
+		__u8 *exe_found = bpf_map_lookup_elem(&guard_exe_inodes, &exe_ik);
+		if (!exe_found)
+			return -EPERM;
+	}
+
+	return 0;
+}
+
+// When a tainted process forks, the child inherits the parent's address
+// space (including file mappings).  Mark the child as tainted too so that
+// process_vm_readv on the child is also blocked.
+SEC("lsm/task_alloc")
+int guard_task_alloc(struct task_struct *task, unsigned long clone_flags)
+{
+	if (!task)
+		return 0;
+
+	__u32 parent_pid = bpf_get_current_pid_tgid() >> 32;
+
+	__u8 *val = bpf_map_lookup_elem(&guard_tainted_pids, &parent_pid);
+	if (!val)
+		return 0;  // parent not tainted
+
+	__u32 child_pid;
+	bpf_probe_read_kernel(&child_pid, sizeof(child_pid), &task->tgid);
+
+	__u8 v = 1;
+	bpf_map_update_elem(&guard_tainted_pids, &child_pid, &v, BPF_ANY);
+	return 0;
+}
+
+// Clean up the tainted PID entry when the process exits, preventing
+// stale entries when the PID is reused by a different process.
+SEC("lsm/task_free")
+int guard_task_free(struct task_struct *task)
+{
+	if (!task)
+		return 0;
+
+	__u32 pid;
+	bpf_probe_read_kernel(&pid, sizeof(pid), &task->tgid);
+
+	bpf_map_delete_elem(&guard_tainted_pids, &pid);
 	return 0;
 }
