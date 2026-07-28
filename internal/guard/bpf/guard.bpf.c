@@ -4,9 +4,10 @@
 #include <errno.h>
 
 #define MAX_PATH 256
-#define MAX_COMM_LEN 16
 #define MAY_READ  0x00000001
 #define MAY_WRITE 0x00000002
+#define GUARD_BLOCK 1
+#define GUARD_ALLOW 2
 
 enum event_type {
 	EVENT_OPEN,
@@ -27,13 +28,9 @@ struct guard_event {
 	__u32 type;
 	__u32 fd;
 	__u32 blocked;
-	char comm[MAX_COMM_LEN];
+	char comm[16];
 	char path[MAX_PATH];
 	char dest[MAX_PATH];
-};
-
-struct comm_key {
-	char comm[MAX_COMM_LEN];
 };
 
 struct inode_key {
@@ -58,16 +55,9 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 64);
-	__type(key, struct comm_key);
-	__type(value, __u8);
-} guard_comms SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 64);
 	__type(key, struct inode_key);
 	__type(value, __u8);
-} guard_exe_inodes SEC(".maps");
+} guard_exe_actions SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -421,26 +411,12 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 	if (!mode)
 		return -EPERM;
 
-	struct comm_key ck = {};
-	bpf_get_current_comm(&ck, sizeof(ck));
-
-	__u8 *found = bpf_map_lookup_elem(&guard_comms, &ck);
-
-	// Verify exe inode to prevent comm spoofing (prctl PR_SET_NAME).
-	// When a comm matches, also verify the executable's inode is in
-	// guard_exe_inodes. If not, the comm is spoofed.
-	bool exe_matches = false;
-	if (found) {
-		struct inode_key exe_ik = {};
-		if (get_current_exe_inode(&exe_ik)) {
-			__u8 *exe_found = bpf_map_lookup_elem(&guard_exe_inodes, &exe_ik);
-			exe_matches = exe_found != NULL;
-		}
-	}
+	// Save mode value early to avoid verifier pointer-tracking concerns
+	__u64 mode_val = *mode;
 
 	// Detect kernel threads (no userspace mm).  These execute on behalf of
 	// user processes (e.g., io_uring workers, SQPOLL threads) and cannot be
-	// identified via comm or exe inode.  Block them unconditionally.
+	// identified via exe inode.  Block them unconditionally.
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct mm_struct *current_mm = NULL;
 	if (task)
@@ -448,12 +424,18 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 
 	int is_blocked;
 	if (!current_mm) {
-		// Kernel thread — cannot verify identity.  Block by default.
 		is_blocked = 1;
-	} else if (*mode == 0) {
-		is_blocked = found != NULL && exe_matches;
 	} else {
-		is_blocked = found == NULL || !exe_matches;
+		struct inode_key exe_ik = {};
+		__u8 *action = NULL;
+		if (get_current_exe_inode(&exe_ik))
+			action = bpf_map_lookup_elem(&guard_exe_actions, &exe_ik);
+
+		if (mode_val == 0) {
+			is_blocked = action != NULL && *action == GUARD_BLOCK;
+		} else {
+			is_blocked = action == NULL || *action != GUARD_ALLOW;
+		}
 	}
 
 	struct guard_event *e;
@@ -853,20 +835,13 @@ int guard_ptrace_access_check(struct task_struct *child, unsigned int mode)
 		return 0;  // child is not tainted — allow
 
 	// Child is tainted.  Check if the caller is whitelisted.
-	struct comm_key ck = {};
-	bpf_get_current_comm(&ck, sizeof(ck));
-
-	__u8 *found = bpf_map_lookup_elem(&guard_comms, &ck);
-	if (!found)
+	struct inode_key exe_ik = {};
+	if (!get_current_exe_inode(&exe_ik))
 		return -EPERM;
 
-	// Verify exe inode to prevent comm spoofing
-	struct inode_key exe_ik = {};
-	if (get_current_exe_inode(&exe_ik)) {
-		__u8 *exe_found = bpf_map_lookup_elem(&guard_exe_inodes, &exe_ik);
-		if (!exe_found)
-			return -EPERM;
-	}
+	__u8 *action = bpf_map_lookup_elem(&guard_exe_actions, &exe_ik);
+	if (!action || *action != GUARD_ALLOW)
+		return -EPERM;
 
 	return 0;
 }

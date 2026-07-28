@@ -30,6 +30,11 @@ const (
 	ModeWhitelist
 )
 
+const (
+	GUARD_BLOCK = 1
+	GUARD_ALLOW = 2
+)
+
 type BinaryEntry struct {
 	Path string
 	Hash [sha256.Size]byte
@@ -193,20 +198,6 @@ func (g *Guard) populateMaps() error {
 	}
 
 	for _, b := range g.binaries {
-		var key struct {
-			Comm [16]byte
-		}
-		copy(key.Comm[:], b.Comm)
-
-		var val uint8 = 1
-		if err := g.objs.GuardComms.Put(key, val); err != nil {
-			return fmt.Errorf("storing comm %q in map: %w", b.Comm, err)
-		}
-
-		// Store the binary's exe inode for anti-spoof verification.
-		// The BPF program reads current->mm->exe_file->f_inode and
-		// checks it against guard_exe_inodes to prevent prctl-based
-		// comm spoofing.
 		var es syscall.Stat_t
 		if err := syscall.Stat(b.Path, &es); err != nil {
 			log.Warnf("cannot stat binary %s for exe inode: %v", b.Path, err)
@@ -216,8 +207,12 @@ func (g *Guard) populateMaps() error {
 			Dev: uint64((unix.Major(es.Dev) << 20) | unix.Minor(es.Dev)),
 			Ino: es.Ino,
 		}
-		if err := g.objs.GuardExeInodes.Put(inodeKey, val); err != nil {
-			return fmt.Errorf("storing exe inode for %s: %w", b.Path, err)
+		action := uint8(GUARD_BLOCK)
+		if g.mode == ModeWhitelist {
+			action = uint8(GUARD_ALLOW)
+		}
+		if err := g.objs.GuardExeActions.Put(inodeKey, action); err != nil {
+			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
 		}
 	}
 

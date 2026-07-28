@@ -767,6 +767,38 @@ func (s *IntegrationSuite) TestGuard_Bypass_ForkExecFD() {
 }
 
 // ---------------------------------------------------------------
+// Bypass: symlink to a blacklisted binary
+//
+// An attacker may create a symlink to a blacklisted binary and run
+// it under a different name to bypass guard:
+//
+//   ln -s /usr/bin/cat /tmp/myreader
+//   /tmp/myreader /watch/secret.txt
+//
+// The guard uses exe-inode identity (resolves symlinks), so the
+// symlinked binary is recognized as the same executable and blocked.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_Bypass_SymlinkBinary() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"sh", "-c", "echo 'secret' > /watch/target.txt"})
+
+	// Create a symlink to a blacklisted binary
+	s.exec(c, []string{"ln", "-sf", "/usr/bin/cat", "/tmp/myreader"})
+
+	s.startGuardStd(c, "/watch", "-b", "/usr/bin/cat")
+
+	// Should be blocked even when accessed via the symlink
+	code, out := s.exec(c, []string{"/tmp/myreader", "/watch/target.txt"})
+	s.Require().NotEqualf(0, code,
+		"symlink to blacklisted binary should be blocked: %s", out)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
 // Bypass: SCM_RIGHTS fd passing + exec
 //
 // The POC opens a guarded file, passes the fd to a child process
@@ -858,9 +890,9 @@ func (s *IntegrationSuite) TestGuard_Bypass_RawBlockDevice() {
 // ---------------------------------------------------------------
 // Test: runtime mkdir — new directories under recursive guard are
 // lazily discovered via file_open, so files inside are blocked.
-// Uses blacklist mode: only /usr/bin/cat is blacklisted.  Other
-// commands (mkdir, sh, mv) are allowed, simulating a whitelisted
-// binary creating new directories at runtime.
+// Uses blacklist mode: only /usr/bin/cat is blacklisted.  Uses
+// gnumkdir (non-hardlinked) because /usr/bin/mkdir is hardlinked to
+// cat on this Ubuntu image and would be blocked by exe-inode identity.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
@@ -869,7 +901,10 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"touch", "/watch/pre_existing.txt"})
 
-	// Blacklist cat only — all other binaries (mkdir, sh, mv) are allowed
+	// Guard uses exe-inode identity (resolves symlinks).  On this Ubuntu image
+	// /usr/bin/cat and /usr/bin/mkdir are hardlinked (same exe inode), so
+	// blacklisting cat also blocks mkdir.  Use gnumkdir (a separate, non-hardlinked
+	// binary) to create the directory.
 	s.startGuardStd(c, "/watch", "--recursive", "-b", "/usr/bin/cat")
 	logBefore := s.readGuardLog(c)
 
@@ -877,9 +912,9 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
 	code, out := s.exec(c, []string{"/usr/bin/cat", "/watch/pre_existing.txt"})
 	s.Require().NotEqualf(0, code, "pre-existing file should be blocked for cat: %s", out)
 
-	// Create a new subdirectory AFTER guard started using mkdir (not blacklisted)
-	code, out = s.exec(c, []string{"mkdir", "/watch/runtime_dir"})
-	s.Require().Equalf(0, code, "mkdir should succeed (not blacklisted): %s", out)
+	// Create a new subdirectory AFTER guard started (via gnumkdir, not blacklisted)
+	code, out = s.exec(c, []string{"/usr/bin/gnumkdir", "/watch/runtime_dir"})
+	s.Require().Equalf(0, code, "dir creation via gnumkdir should succeed: %s", out)
 
 	// Create a file inside (shell not blacklisted → allowed)
 	code, out = s.exec(c, []string{"sh", "-c", "echo secret > /watch/runtime_dir/data.txt"})
@@ -909,16 +944,18 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir_NonRecursive() {
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"touch", "/watch/top.txt"})
 
-	// Non-recursive guard, blacklist cat
+	// Guard uses exe-inode identity; cat and mkdir are hardlinked (same exe
+	// inode), so blacklisting cat also blocks mkdir.  Use gnumkdir (separate,
+	// non-hardlinked binary) to create the directory.
 	s.startGuardStd(c, "/watch", "--recursive=false", "-b", "/usr/bin/cat")
 
 	// Pre-existing file: cat blocked
 	code, out := s.exec(c, []string{"/usr/bin/cat", "/watch/top.txt"})
 	s.Require().NotEqualf(0, code, "pre-existing file should be blocked for cat: %s", out)
 
-	// Create a new subdirectory after guard started
-	code, out = s.exec(c, []string{"mkdir", "/watch/runtime_dir"})
-	s.Require().Equalf(0, code, "mkdir should succeed: %s", out)
+	// Create a new subdirectory after guard started (via gnumkdir, not blacklisted)
+	code, out = s.exec(c, []string{"/usr/bin/gnumkdir", "/watch/runtime_dir"})
+	s.Require().Equalf(0, code, "dir creation via gnumkdir should succeed: %s", out)
 
 	code, out = s.exec(c, []string{"sh", "-c", "echo data > /watch/runtime_dir/data.txt"})
 	s.Require().Equalf(0, code, "file creation should succeed: %s", out)
