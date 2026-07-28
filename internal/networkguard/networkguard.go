@@ -1,0 +1,336 @@
+package networkguard
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+
+	cilium "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
+	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
+
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+)
+
+type BinaryEntry struct {
+	Path string
+	Hash [sha256.Size]byte
+	Comm string
+}
+
+type NetGuardEvent struct {
+	ebpf.NetEvent
+	Blocked bool
+}
+
+type NetGuard struct {
+	objs   GuardNetObjects
+	links  []link.Link
+	events chan NetGuardEvent
+	done   chan struct{}
+	mu     sync.Mutex
+	stop   bool
+
+	blockList []BinaryEntry
+	allowList []BinaryEntry
+	eventset  []ebpf.NetEventType
+	ownPID    int
+}
+
+func NewNetGuard(blockList, allowList []BinaryEntry, eventset []ebpf.NetEventType) (*NetGuard, error) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Warnf("failed to remove memlock rlimit: %v", err)
+	}
+
+	bl := make([]BinaryEntry, len(blockList))
+	copy(bl, blockList)
+	al := make([]BinaryEntry, len(allowList))
+	copy(al, allowList)
+
+	es := eventset
+	if len(es) == 0 {
+		es = ebpf.NetEventTypes()
+	}
+
+	g := &NetGuard{
+		events:    make(chan NetGuardEvent, 1024),
+		done:      make(chan struct{}),
+		blockList: bl,
+		allowList: al,
+		eventset:  es,
+		ownPID:    os.Getpid(),
+	}
+
+	var objs GuardNetObjects
+	if err := LoadGuardNetObjects(&objs, nil); err != nil {
+		return nil, fmt.Errorf("loading network guard BPF objects: %w", err)
+	}
+	g.objs = objs
+
+	if err := g.populateMaps(); err != nil {
+		g.cleanup()
+		return nil, fmt.Errorf("populating BPF maps: %w", err)
+	}
+
+	required := map[string]bool{
+		"socket_connect": true,
+		"socket_bind":    true,
+		"socket_listen":  true,
+	}
+
+	attachments := []struct {
+		prog *cilium.Program
+		hook string
+	}{
+		{g.objs.GuardNetSocketConnect, "socket_connect"},
+		{g.objs.GuardNetSocketBind, "socket_bind"},
+		{g.objs.GuardNetSocketListen, "socket_listen"},
+		{g.objs.GuardNetSocketSendmsg, "socket_sendmsg"},
+		{g.objs.GuardNetSocketRecvmsg, "socket_recvmsg"},
+	}
+
+	var failedRequired []string
+	for _, a := range attachments {
+		l, err := link.AttachLSM(link.LSMOptions{
+			Program: a.prog,
+		})
+		if err != nil {
+			if required[a.hook] {
+				failedRequired = append(failedRequired, a.hook)
+				log.Errorf("CRITICAL: required LSM hook %s failed to attach: %v", a.hook, err)
+			} else {
+				log.Warnf("skipping optional LSM hook %s: %v", a.hook, err)
+			}
+			continue
+		}
+		g.links = append(g.links, l)
+	}
+
+	if len(failedRequired) > 0 {
+		g.cleanup()
+		return nil, fmt.Errorf(
+			"required LSM hooks failed to attach: %v — network blocking unavailable. "+
+				"Ensure your kernel supports BPF LSM (CONFIG_BPF_LSM=y) and LSM=bpf is in the "+
+				"boot command line (/sys/kernel/security/lsm).",
+			failedRequired)
+	}
+
+	log.Infof("network guard created \u2014 %d/%d LSM hooks attached, block: %d, allow: %d, events: %v",
+		len(g.links), len(attachments), len(blockList), len(allowList), eventsetSummary(es))
+	return g, nil
+}
+
+func eventsetSummary(es []ebpf.NetEventType) string {
+	parts := make([]string, len(es))
+	for i, et := range es {
+		parts[i] = et.String()
+	}
+	return strings.Join(parts, ",")
+}
+
+const (
+	bpfBlock uint8 = 1
+	bpfAllow uint8 = 2
+)
+
+func (g *NetGuard) populateMaps() error {
+	for _, et := range g.eventset {
+		key := uint32(et)
+		if err := g.objs.GuardNetEvents.Put(key, uint64(1)); err != nil {
+			return fmt.Errorf("setting event type %d in filter: %w", et, err)
+		}
+	}
+
+	for _, b := range g.blockList {
+		ik, err := statInodeKey(b.Path)
+		if err != nil {
+			return fmt.Errorf("stating blocked binary %s: %w", b.Path, err)
+		}
+		if err := g.objs.GuardNetExeActions.Put(ik, bpfBlock); err != nil {
+			return fmt.Errorf("storing exe inode for blocked %s: %w", b.Path, err)
+		}
+	}
+
+	for _, b := range g.allowList {
+		ik, err := statInodeKey(b.Path)
+		if err != nil {
+			return fmt.Errorf("stating allowed binary %s: %w", b.Path, err)
+		}
+		if err := g.objs.GuardNetExeActions.Put(ik, bpfAllow); err != nil {
+			return fmt.Errorf("storing exe inode for allowed %s: %w", b.Path, err)
+		}
+	}
+
+	return nil
+}
+
+func statInodeKey(path string) (*GuardNetInodeKey, error) {
+	var es syscall.Stat_t
+	if err := syscall.Stat(path, &es); err != nil {
+		return nil, err
+	}
+	return &GuardNetInodeKey{
+		Dev: uint64(mkdev(unix.Major(es.Dev), unix.Minor(es.Dev))),
+		Ino: es.Ino,
+	}, nil
+}
+
+func mkdev(major, minor uint32) uint32 {
+	return (major << 20) | minor
+}
+
+func (g *NetGuard) Events() <-chan NetGuardEvent {
+	return g.events
+}
+
+func (g *NetGuard) Start() error {
+	rd, err := ringbuf.NewReader(g.objs.GuardNetRb)
+	if err != nil {
+		g.cleanup()
+		return fmt.Errorf("ringbuf reader: %w", err)
+	}
+
+	log.Infof("network guard started \u2014 %d blocked, %d allowed", len(g.blockList), len(g.allowList))
+	go g.readLoop(rd)
+	return nil
+}
+
+func (g *NetGuard) readLoop(rd *ringbuf.Reader) {
+	defer rd.Close()
+
+	for {
+		ev, ok := g.readEvent(rd)
+		if !ok {
+			return
+		}
+		if ev == nil {
+			continue
+		}
+
+		select {
+		case g.events <- *ev:
+		case <-g.done:
+			return
+		}
+	}
+}
+
+func (g *NetGuard) readEvent(rd *ringbuf.Reader) (*NetGuardEvent, bool) {
+	record, err := rd.Read()
+	if err != nil {
+		if errors.Is(err, ringbuf.ErrClosed) {
+			return nil, false
+		}
+		log.Errorf("ringbuf read error: %v", err)
+		return nil, true
+	}
+
+	var be struct {
+		PID      uint32
+		UID      uint32
+		GID      uint32
+		Type     uint32
+		Proto    uint32
+		Size     uint32
+		FD       uint32
+		AF       uint32
+		Saddr    [4]uint32
+		Daddr    [4]uint32
+		Sport    uint16
+		Dport    uint16
+		Comm     [16]byte
+		TID      uint32
+		NetNS    uint64
+		CgroupID uint64
+		Blocked  uint32
+	}
+	if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &be); err != nil {
+		log.Errorf("decode net guard event: %v", err)
+		return nil, true
+	}
+
+	if int(be.PID) == g.ownPID {
+		return nil, true
+	}
+
+	ev := NetGuardEvent{
+		NetEvent: ebpf.NetEvent{
+			PID:       be.PID,
+			TID:       be.TID,
+			UID:       be.UID,
+			GID:       be.GID,
+			Type:      ebpf.NetEventType(be.Type),
+			Protocol:  be.Proto,
+			Size:      be.Size,
+			FD:        be.FD,
+			Comm:      ebpf.Cstr(be.Comm[:]),
+			NetNS:     be.NetNS,
+			CgroupID:  be.CgroupID,
+			Timestamp: 0,
+		},
+		Blocked: be.Blocked != 0,
+	}
+
+	ev.SrcAddr = ebpf.FormatAddr(be.AF, be.Saddr[:], be.Sport)
+	ev.DstAddr = ebpf.FormatAddr(be.AF, be.Daddr[:], be.Dport)
+
+	return &ev, true
+}
+
+func (g *NetGuard) Stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.stop {
+		return
+	}
+	g.stop = true
+	close(g.done)
+	g.cleanup()
+}
+
+func (g *NetGuard) cleanup() {
+	for _, l := range g.links {
+		l.Close()
+	}
+	g.links = nil
+	g.objs.Close()
+}
+
+func ComputeBinaryEntry(path string) (BinaryEntry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, err)
+	}
+
+	hash := sha256.Sum256(data)
+	comm := filepath.Base(path)
+
+	if len(comm) > 15 {
+		comm = comm[:15]
+	}
+
+	return BinaryEntry{
+		Path: path,
+		Hash: hash,
+		Comm: comm,
+	}, nil
+}
+
+func binarySummary(binaries []BinaryEntry) string {
+	parts := make([]string, len(binaries))
+	for i, b := range binaries {
+		parts[i] = fmt.Sprintf("%s [sha256:%x..%x]", b.Path, b.Hash[:4], b.Hash[28:])
+	}
+	return strings.Join(parts, ", ")
+}

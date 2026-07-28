@@ -6,6 +6,7 @@ import (
 	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/functions/guard"
 	"github.com/Virgula0/app-listener/cmd/functions/monitor"
+	"github.com/Virgula0/app-listener/cmd/functions/networkguard"
 	"github.com/Virgula0/app-listener/cmd/functions/networkmonitor"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -55,4 +56,5 @@ func init() {
 	rootCmd.AddCommand(monitor.MonitorCmd)
 	rootCmd.AddCommand(guard.GuardCmd)
 	rootCmd.AddCommand(networkmonitor.NetworkMonitorCmd)
+	rootCmd.AddCommand(networkguard.NetworkGuardCmd)
 }
