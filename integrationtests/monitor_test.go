@@ -3,6 +3,7 @@ package integrationtests
 import (
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -103,7 +104,9 @@ func (s *IntegrationSuite) TestMonitorAllEvents() {
 	// 1. OPEN + WRITE: create file
 	s.exec(c, []string{"sh", "-c", "echo 'test data' > /watch/data.txt"})
 	logAfter := s.waitForEventType(c, logBefore, "OPEN", 5*time.Second)
-	s.waitForEventType(c, logAfter, "WRITE", 5*time.Second)
+	if !slices.Contains(newEventTypes(logBefore, logAfter), "WRITE") {
+		logAfter = s.waitForEventType(c, logAfter, "WRITE", 5*time.Second)
+	}
 	logBefore = s.readMonitorLog(c)
 
 	// 2. READ: cat the file
@@ -139,7 +142,9 @@ func (s *IntegrationSuite) TestMonitorAllEvents() {
 	// 8. MMAP + OPEN: run mmap exploit on hardlink (still exists after rm)
 	s.exec(c, []string{"/mmap_exploit", "/watch/hardlink"})
 	logAfter = s.waitForEventType(c, logBefore, "MMAP", 5*time.Second)
-	s.waitForEventType(c, logAfter, "OPEN", 5*time.Second)
+	if !slices.Contains(newEventTypes(logBefore, logAfter), "OPEN") {
+		s.waitForEventType(c, logAfter, "OPEN", 5*time.Second)
+	}
 
 	s.stopMonitor(c)
 }
@@ -165,7 +170,9 @@ func (s *IntegrationSuite) TestMonitorSingleFile() {
 	// 1. OPEN + READ: cat the file
 	s.exec(c, []string{"sh", "-c", "cat /watch/target.txt > /dev/null"})
 	logAfter := s.waitForEventType(c, logBefore, "OPEN", 5*time.Second)
-	s.waitForEventType(c, logAfter, "READ", 5*time.Second)
+	if !slices.Contains(newEventTypes(logBefore, logAfter), "READ") {
+		s.waitForEventType(c, logAfter, "READ", 5*time.Second)
+	}
 	logBefore = s.readMonitorLog(c)
 
 	// 2. WRITE: append to the file
@@ -195,7 +202,9 @@ func (s *IntegrationSuite) TestMonitorSingleFile() {
 
 	s.exec(c, []string{"/mmap_exploit", "/watch/target.txt"})
 	logAfter = s.waitForEventType(c, logBefore, "MMAP", 5*time.Second)
-	s.waitForEventType(c, logAfter, "OPEN", 5*time.Second)
+	if !slices.Contains(newEventTypes(logBefore, logAfter), "OPEN") {
+		s.waitForEventType(c, logAfter, "OPEN", 5*time.Second)
+	}
 	logBefore = logAfter
 
 	// 7. DELETE: remove the re-created file (path matches target)
@@ -411,7 +420,9 @@ func (s *IntegrationSuite) TestMonitor_NonRecursive() {
 	// 1. Direct child file — events detected
 	s.exec(c, []string{"sh", "-c", "cat /watch/top.txt > /dev/null"})
 	logAfter := s.waitForEventType(c, logBefore, "OPEN", 5*time.Second)
-	s.waitForEventType(c, logAfter, "READ", 3*time.Second)
+	if !slices.Contains(newEventTypes(logBefore, logAfter), "READ") {
+		s.waitForEventType(c, logAfter, "READ", 3*time.Second)
+	}
 
 	// 2. File in subdir — events NOT detected (non-recursive)
 	logBefore = s.readMonitorLog(c)
@@ -490,7 +501,9 @@ func (s *IntegrationSuite) TestMonitor_Recursive() {
 	// 1. Direct child — detected
 	s.exec(c, []string{"sh", "-c", "cat /watch/top.txt > /dev/null"})
 	logAfter := s.waitForEventType(c, logBefore, "OPEN", 5*time.Second)
-	s.waitForEventType(c, logAfter, "READ", 3*time.Second)
+	if !slices.Contains(newEventTypes(logBefore, logAfter), "READ") {
+		s.waitForEventType(c, logAfter, "READ", 3*time.Second)
+	}
 
 	// 2. Nested file in subdir — detected (recursive)
 	logBefore = s.readMonitorLog(c)
