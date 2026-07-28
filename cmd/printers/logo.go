@@ -3,9 +3,9 @@ package printers
 import log "github.com/sirupsen/logrus"
 
 func PrintLogo() {
-	log.Info("╔══════════════════════════════╗")
-	log.Info("║        app-listener          ║")
-	log.Info("║    File System Monitor       ║")
-	log.Info("║         (eBPF)               ║")
-	log.Info("╚══════════════════════════════╝")
+	log.Info("╔══════════════════════════════════╗")
+	log.Info("║           App-Listener           ║")
+	log.Info("║   File System & Network Monitor  ║")
+	log.Info("║              (eBPF)              ║")
+	log.Info("╚══════════════════════════════════╝")
 }

@@ -3,8 +3,9 @@ package entity
 import "github.com/Virgula0/app-listener/internal/infrastructure"
 
 const (
-	MonitorKey = "monitor"
-	GuardKey   = "guard"
+	MonitorKey        = "monitor"
+	GuardKey          = "guard"
+	NetworkMonitorKey = "network-monitor"
 )
 
 var (

@@ -1,6 +1,6 @@
 # app-listener
 
-Monitor or guard file system operations (open, read, write, delete, rename, symlink, hardlink, mkdir, mmap) using eBPF.
+Monitor or guard file system operations (open, read, write, delete, rename, symlink, hardlink, mkdir, mmap) and network operations (TCP connect/accept/close, UDP send/recv, DNS) using eBPF.
 
 ## How it works
 
@@ -9,12 +9,14 @@ app-listener uses eBPF programs that attach to kernel hooks and emit events into
 **eBPF layer**: C programs compiled to BPF bytecode via clang/LLVM, embedded in the Go binary (`//go:embed`). They attach to:
 - **kprobes** — `vfs_open`, `vfs_read`, `vfs_write`, `vfs_unlink`, `vfs_rename`, `vfs_symlink`, `vfs_link`, `vfs_mkdir`, `vfs_rmdir`, `security_mmap_file`, and splice/sendfile/copy_file_range variants (monitor mode)
 - **LSM hooks** — `file_open`, `file_permission`, `mmap_file`, `path_unlink`, `path_rename`, `path_link`, `path_mkdir` (guard mode, blocks access)
+- **Tracepoints** — `syscalls/sys_enter_connect`, `sys_enter_accept4`, `sys_enter_sendto`, `sys_enter_recvfrom`, `sys_enter_sendmsg`, `sys_enter_recvmsg`, `sys_enter_close` (network-monitor mode)
+- **kretprobe** — `inet_csk_accept` for TCP accept client address capture (network-monitor mode)
 
 **Userspace layer**: The Go binary opens the ring buffer, decodes raw events into typed `FileEvent` structs, applies path matching and recursion/depth filtering, and either prints to the TUI/log or enforces access policy.
 
 ## Requirements
 
-- **Linux kernel** 5.x+ with `CONFIG_BPF`, `CONFIG_KPROBES`, `CONFIG_DEBUG_INFO_BTF` (monitor mode)
+- **Linux kernel** 5.x+ with `CONFIG_BPF`, `CONFIG_KPROBES`, `CONFIG_DEBUG_INFO_BTF` (monitor/network-monitor mode)
 - **Guard mode** additionally requires `CONFIG_BPF_LSM` (available since 5.4+, LSM-enabled kernels)
 - clang + LLVM (only needed to regenerate BPF bindings)
 - bpftool (optional, for regenerating `vmlinux.h`)
@@ -81,6 +83,43 @@ sudo ./build/linux/app-listener guard /data --recursive --depth 2 -b /usr/bin/ca
 
 Guard mode uses binary **SHA256 hashes** to identify processes — not path names — so renaming a blacklisted binary does not bypass the policy.
 
+### network-monitor — watch network operations
+
+Traces network operations (TCP, UDP, ICMP, DNS, etc.) of specific binaries using eBPF tracepoints. Only events from watched binaries are shown.
+
+```bash
+# Watch all network ops from bash
+sudo ./build/linux/app-listener network-monitor /usr/bin/bash
+
+# Watch specific binaries
+sudo ./build/linux/app-listener network-monitor /usr/bin/curl /usr/bin/wget
+
+# Filter by event type
+sudo ./build/linux/app-listener network-monitor /usr/sbin/nginx -e CONNECT,ACCEPT,DNS
+
+# Headless logging
+sudo ./build/linux/app-listener network-monitor /usr/bin/tcpdump --headless
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<binary>` | required | Binary paths to watch (one or more positional args) |
+| `-e, --events <list>` | all | Event filter: comma-separated (`CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS`) |
+| `--headless` | `false` | No TUI, log NETEVENT\| events to stderr |
+
+Binary identity is verified by **exe inode** (the BPF program reads `current->mm->exe_file->f_inode`), preventing comm-spoofing via `prctl(PR_SET_NAME)`.
+
+#### Network event types
+
+| Event | Description | BPF Hook |
+|-------|-------------|----------|
+| `CONNECT` | Outbound connect (TCP, UDP connect, raw) | `tracepoint/syscalls/sys_enter_connect` |
+| `ACCEPT` | Inbound connection accepted (TCP) | `kretprobe/inet_csk_accept`, `tracepoint/syscalls/sys_enter_accept[4]` |
+| `SEND` | Data sent (any protocol) | `tracepoint/syscalls/sys_enter_sendto`, `sys_enter_sendmsg` |
+| `RECV` | Data received (any protocol) | `tracepoint/syscalls/sys_enter_recvfrom`, `sys_enter_recvmsg` |
+| `CLOSE` | Socket close | `tracepoint/syscalls/sys_enter_close` (with socket fd detection) |
+| `DNS` | DNS query (port 53/853) | Detected via `sys_enter_connect`/`sys_enter_sendto` to port 53 |
+
 ## Quick Start
 
 ```bash
@@ -95,6 +134,9 @@ sudo ./build/linux/app-listener guard /tmp
 
 # Guard mode — only cat is allowed
 sudo ./build/linux/app-listener guard /tmp -w /usr/bin/cat
+
+# Network monitor mode — watch bash network ops
+sudo ./build/linux/app-listener network-monitor /usr/bin/bash
 ```
 
 Exit the TUI with `q` or `Ctrl+C`.
@@ -108,6 +150,7 @@ Exit the TUI with `q` or `Ctrl+C`.
 | `make generate` | Regenerate all BPF C → Go bindings |
 | `make generate-monitor` | Regenerate monitor BPF bindings |
 | `make generate-guard` | Regenerate guard BPF bindings |
+| `make generate-networkmonitor` | Regenerate network-monitor BPF bindings |
 | `make bpftool-headers` | Regenerate `vmlinux.h` from running kernel BTF |
 | `make lint` | Run golangci-lint |
 | `make test` | Run unit tests (non-integration) |
@@ -132,11 +175,13 @@ cmd/
   root.go              — cobra root command, --log-level flag
   functions/monitor/   — "monitor" subcommand, wires eBPF + TUI/headless
   functions/guard/     — "guard" subcommand, wires eBPF LSM + TUI/headless
+  functions/networkmonitor/ — "network-monitor" subcommand, wires eBPF tracepoints + TUI/headless
   entity/              — shared flag types (Recursive, Depth, Headless, EventTypes)
 
 internal/
   infrastructure/
     event.go           — FileEvent, BpfEvent types shared by both modes
+    networkevent.go    — NetEvent, NetBpfEvent types for network-monitor mode
     target.go          — Target type (path resolution)
     checker.go         — eBPF runtime availability check
     bpf/               — shared BPF helpers (if any)
@@ -149,15 +194,23 @@ internal/
     monitor.go         — loads BPF, attaches kprobes, reads ringbuf, filters path/depth/event types
 
   guard/
-    bpf/guard.bpf.c    — BPF C source: LSM hooks + BPF maps for inode/policy tracking
-    bpf/vmlinux.h      — generated CO-RE header
+    bpf/guard.bpf.c    — BPF C source: LSM hooks for file_open, file_permission, mmap, …
+    bpf/vmlinux.h      — shared CO-RE header
     embeds/guard_bpf.o — compiled BPF ELF (embedded)
     guard_bpf.go       — bpf2go generated Go bindings
     guard.go           — loads BPF, attaches LSM programs, manages inode/comm maps, enforces policy
 
+  networkmonitor/
+    bpf/networkmonitor.bpf.c — BPF C source: tracepoints for connect, accept, sendto, recvfrom, …
+    bpf/vmlinux.h            — shared CO-RE header
+    embeds/networkmonitor_bpf.o — compiled BPF ELF (embedded)
+    networkmonitor_bpf.go    — bpf2go generated Go bindings
+    networkmonitor.go        — loads BPF, attaches tracepoints, manages exe inode map, binary filtering
+
   tui/
     model.go           — bubbletea TUI with viewport, colored events (monitor)
     guardmodel.go      — bubbletea TUI for guard mode
+    network_model.go   — bubbletea TUI for network-monitor mode
 
 integrationtests/
   main_test.go         — suite setup, container helpers, log diff utilities
@@ -175,3 +228,4 @@ integrationtests/
 - **Embedded BPF**: The compiled BPF `.o` is embedded in the Go binary — no runtime compilation or external dependencies.
 - **PID filter**: Events from the monitor's own process are discarded to avoid feedback loops.
 - **Binary identity via SHA256**: Guard identifies processes by cryptographic hash of the executable, not by path — renaming a binary does not bypass policy.
+- **Binary identity via exe inode**: Network-monitor identifies processes by the exe file inode read directly from `current->mm->exe_file->f_inode` in BPF, preventing comm-spoofing.

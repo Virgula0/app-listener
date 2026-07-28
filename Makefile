@@ -1,4 +1,4 @@
-.PHONY: build build-linux install-linter install-deps generate generate-monitor generate-guard run run-guard lint test test-integration deploy deploy-down tidy clean
+.PHONY: build build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration deploy deploy-down tidy clean
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
@@ -18,7 +18,7 @@ build-linux:
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o $(OUTPUT_DIR)/$(BINARY_NAME) .
 .PHONY: build-linux
 
-generate: generate-monitor generate-guard
+generate: generate-monitor generate-guard generate-networkmonitor
 
 generate-monitor:
 	@mkdir -p $(GEN_DIR) internal/monitor/embeds
@@ -50,6 +50,21 @@ generate-guard:
 	@echo "Guard BPF generation complete"
 .PHONY: generate-guard
 
+generate-networkmonitor:
+	@mkdir -p $(GEN_DIR) internal/networkmonitor/embeds
+	GOPACKAGE=networkmonitor GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+		-cc clang \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86" \
+		-target bpf \
+		-output-dir $(GEN_DIR) \
+		NetMon ./internal/networkmonitor/bpf/networkmonitor.bpf.c
+	@mv $(GEN_DIR)/netmon_bpf.go internal/networkmonitor/networkmonitor_bpf.go
+	@mv $(GEN_DIR)/netmon_bpf.o internal/networkmonitor/embeds/networkmonitor_bpf.o
+	@sed -i 's|netmon_bpf\.o|embeds/networkmonitor_bpf.o|' internal/networkmonitor/networkmonitor_bpf.go
+	@rm -rf $(GEN_DIR)
+	@echo "Network monitor BPF generation complete"
+.PHONY: generate-networkmonitor
+
 bpftool-headers:
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null \
 		> internal/monitor/bpf/vmlinux.h
@@ -73,6 +88,10 @@ run:
 run-guard:
 	CGO_ENABLED=1 go run ./... guard $(ARGS)
 .PHONY: run-guard
+
+run-networkmonitor:
+	CGO_ENABLED=1 go run ./... network-monitor $(ARGS)
+.PHONY: run-networkmonitor
 
 lint:
 	@golangci-lint run
@@ -102,5 +121,6 @@ tidy:
 clean:
 	rm -rf $(OUTPUT_DIR) build/test \
 		internal/monitor/monitor_bpf.go internal/monitor/embeds/ internal/monitor/bpf/vmlinux.h \
-		internal/guard/guard_bpf.go internal/guard/embeds/ internal/guard/bpf/vmlinux.h
+		internal/guard/guard_bpf.go internal/guard/embeds/ internal/guard/bpf/vmlinux.h \
+		internal/networkmonitor/networkmonitor_bpf.go internal/networkmonitor/embeds/ internal/networkmonitor/bpf/vmlinux.h
 .PHONY: clean
