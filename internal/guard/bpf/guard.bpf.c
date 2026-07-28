@@ -237,16 +237,13 @@ static __always_inline void add_inode_to_guard(struct inode *inode)
 }
 
 // Check if a newly created directory should be auto-added to guard_inodes
-// based on the guard's recursive and depth settings.
+// based on the guard's recursive setting.
 static __always_inline int should_add_new_dir(void)
 {
 	__u32 key = 1;
 	__u64 *recursive = bpf_map_lookup_elem(&guard_config, &key);
 	if (!recursive || *recursive == 0)
 		return 0;
-	// depth is handled by the parent-inode check in is_guarded_access.
-	// We always add the immediate new directory; depth beyond that is
-	// naturally limited by parent-inode lookups.
 	return 1;
 }
 
@@ -491,12 +488,12 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 
 // Lazy directory discovery for file_open.
 // When a file is accessed inside a newly-created directory whose inode is
-// not yet in guard_inodes, walk up the dentry tree to find a guarded ancestor
-// and add the immediate parent of the file to guard_inodes.  This bridges
-// the gap between mkdir time (when the inode isn't available via LSM) and
-// file-open time (when the directory inode exists and can be added).
-// Depth is not enforced for runtime discoveries — the alternative (leaving
-// new directories unguarded) is a worse security hole.
+// not yet in guard_inodes, walk up the dentry tree to find the farthest
+// guarded ancestor (closest to root) and add the immediate parent of the
+// file to guard_inodes — but only if the parent is strictly within the
+// configured depth limit.  Boundary directories (those at the exact depth
+// limit) are not added, which prevents the guard from extending a level
+// deeper than the user specified.
 static __always_inline void discover_guarded_parent(struct dentry *dentry)
 {
 	if (!dentry)
@@ -519,26 +516,46 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 	if (!should_add_new_dir())
 		return;
 
+	// Read the depth limit. 0 means unlimited.
+	__u32 depth_key = 2;
+	__u64 *depth = bpf_map_lookup_elem(&guard_config, &depth_key);
+	bool has_limit = depth != NULL && *depth > 0;
+	__u64 max_steps = has_limit ? *depth : 16;
+
+	// Walk up from parent, tracking the farthest (closest to root) guarded
+	// ancestor found.  We continue walking even after finding a guarded
+	// ancestor because we need the farthest one to correctly compute the
+	// absolute depth of the parent directory.
 	struct dentry *ancestor = parent;
-	for (int i = 0; i < 16; i++) {
+	__u64 farthest_steps = 0;
+	bool found_guarded = false;
+
+	for (int i = 0; i < 16 && i < max_steps; i++) {
 		struct dentry *next;
 		bpf_probe_read_kernel(&next, sizeof(next), &ancestor->d_parent);
 		if (!next || next == ancestor)
-			return;
+			break;
 		ancestor = next;
 
 		struct inode *anc_inode;
 		bpf_probe_read_kernel(&anc_inode, sizeof(anc_inode), &ancestor->d_inode);
 		if (!anc_inode)
-			return;
+			break;
 		if (anc_inode == parent_inode)
-			return;
+			break;
 
 		if (read_inode_guard(anc_inode)) {
-			add_inode_to_guard(parent_inode);
-			return;
+			farthest_steps = i + 1;
+			found_guarded = true;
 		}
 	}
+
+	// Only add the parent if we found a guarded ancestor and the parent is
+	// strictly within the depth limit.  A parent at exactly `depth` levels
+	// from the farthest guarded ancestor is a boundary directory that should
+	// NOT be added — otherwise files one level deeper become guarded.
+	if (found_guarded && (!has_limit || farthest_steps < *depth))
+		add_inode_to_guard(parent_inode);
 }
 
 SEC("lsm/file_open")

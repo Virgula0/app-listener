@@ -313,12 +313,6 @@ func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
 				continue
 			}
 			if g.depth > 0 && currentDepth+1 >= g.depth {
-				// Add the directory inode even though we don't recurse.
-				// This protects files inside boundary directories via the
-				// parent inode check in is_guarded_access.
-				if err := g.addInode(fullPath); err != nil {
-					return err
-				}
 				continue
 			}
 			if err := g.scanDirInodes(fullPath, currentDepth+1); err != nil {
