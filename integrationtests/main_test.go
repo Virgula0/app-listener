@@ -197,3 +197,23 @@ func (s *IntegrationSuite) requireNoNewEventType(oldLog, newLog, unexpected stri
 	s.Require().False(slices.Contains(events, unexpected),
 		"unexpected EVENT|%s found in new log lines (got %v)", unexpected, events)
 }
+
+// waitForEventType polls the monitor log until expected event type appears or timeout.
+// Returns the updated log content. Fails the test if timeout reached.
+func (s *IntegrationSuite) waitForEventType(c testcontainers.Container, oldLog string, expected string, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		newLog := s.readMonitorLog(c)
+		events := newEventTypes(oldLog, newLog)
+		for _, evt := range events {
+			if evt == expected {
+				return newLog
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	newLog := s.readMonitorLog(c)
+	s.Require().Failf("timeout waiting for event",
+		"expected EVENT|%s within %v, got events: %v", expected, timeout, newEventTypes(oldLog, newLog))
+	return newLog
+}

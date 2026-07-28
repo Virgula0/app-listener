@@ -3,6 +3,7 @@ package ebpf
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/cilium/ebpf"
@@ -14,9 +15,41 @@ const (
 	unprivilegedBpfPath = "/proc/sys/kernel/unprivileged_bpf_disabled"
 	bpfJitEnablePath    = "/proc/sys/net/core/bpf_jit_enable"
 	bpfJitHardenPath    = "/proc/sys/net/core/bpf_jit_harden"
+	osReleasePath       = "/proc/sys/kernel/osrelease"
 )
 
+// requireKernel51 checks that the running kernel is 5.x or newer.
+// The pre-compiled BPF .o targets x86_64 and relies on CO-RE (BTF),
+// which requires at least kernel 5.x.
+func requireKernel51() error {
+	data, err := os.ReadFile(osReleasePath)
+	if err != nil {
+		return fmt.Errorf("cannot detect kernel version (%s): %w", osReleasePath, err)
+	}
+	release := strings.TrimSpace(string(data))
+
+	parts := strings.SplitN(release, ".", 3)
+	if len(parts) < 2 {
+		return fmt.Errorf("unexpected kernel version format %q (expected MAJOR.MINOR.*)", release)
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return fmt.Errorf("cannot parse kernel major version %q: %w", parts[0], err)
+	}
+
+	if major < 5 {
+		return fmt.Errorf("kernel %s is too old: kernel 5.x or newer is required (found %d.%s)", release, major, parts[1])
+	}
+
+	return nil
+}
+
 func Check() error {
+	if err := requireKernel51(); err != nil {
+		return fmt.Errorf("kernel version check failed: %w", err)
+	}
+
 	spec := &ebpf.ProgramSpec{
 		Type: ebpf.SocketFilter,
 		Instructions: asm.Instructions{

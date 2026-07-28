@@ -74,6 +74,7 @@ func NewMonitor(targets []ebpf.Target, recursive bool, depth int) (*Monitor, err
 		{objs.TraceVfsReadv, "kprobe", "", "vfs_readv"},
 		{objs.TraceVfsCopyFileRange, "kprobe", "", "vfs_copy_file_range"},
 		{objs.TraceDoSplice, "kprobe", "", "do_splice"},
+		{objs.TraceDoSplice, "kprobe", "", "__do_splice"},
 		{objs.TraceDoSpliceDirect, "kprobe", "", "do_splice_direct"},
 		{objs.TraceSpliceFileRange, "kprobe", "", "splice_file_range"},
 		{objs.TraceDoSendfile, "kprobe", "", "do_sendfile"},

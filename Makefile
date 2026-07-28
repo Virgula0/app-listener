@@ -4,7 +4,15 @@ BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
 GEN_DIR     = build/generated
 
-build: generate build-linux
+.PHONY: require-kernel51
+require-kernel51:
+	@kernel_ver=$$(uname -r | cut -d. -f1); \
+	if [ -z "$$kernel_ver" ] || [ "$$kernel_ver" -lt 5 ] 2>/dev/null; then \
+		echo "ERROR: kernel $$(uname -r) is too old: kernel 5.x or newer is required (build host detected $${kernel_ver}.x)"; \
+		exit 1; \
+	fi
+
+build: require-kernel51 generate build-linux
 
 build-linux:
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o $(OUTPUT_DIR)/$(BINARY_NAME) .
