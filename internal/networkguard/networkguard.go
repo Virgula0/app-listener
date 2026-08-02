@@ -22,6 +22,13 @@ import (
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
+type Mode int
+
+const (
+	ModeBlacklist Mode = iota
+	ModeWhitelist
+)
+
 type BinaryEntry struct {
 	Path string
 	Hash [sha256.Size]byte
@@ -41,21 +48,20 @@ type NetGuard struct {
 	mu     sync.Mutex
 	stop   bool
 
-	blockList []BinaryEntry
-	allowList []BinaryEntry
-	eventset  []ebpf.NetEventType
-	ownPID    int
+	mode     Mode
+	binaries []BinaryEntry
+	unsafe   bool
+	eventset []ebpf.NetEventType
+	ownPID   int
 }
 
-func NewNetGuard(blockList, allowList []BinaryEntry, eventset []ebpf.NetEventType) (*NetGuard, error) {
+func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType, unsafe bool) (*NetGuard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("failed to remove memlock rlimit: %v", err)
 	}
 
-	bl := make([]BinaryEntry, len(blockList))
-	copy(bl, blockList)
-	al := make([]BinaryEntry, len(allowList))
-	copy(al, allowList)
+	bins := make([]BinaryEntry, len(binaries))
+	copy(bins, binaries)
 
 	es := eventset
 	if len(es) == 0 {
@@ -63,12 +69,13 @@ func NewNetGuard(blockList, allowList []BinaryEntry, eventset []ebpf.NetEventTyp
 	}
 
 	g := &NetGuard{
-		events:    make(chan NetGuardEvent, 1024),
-		done:      make(chan struct{}),
-		blockList: bl,
-		allowList: al,
-		eventset:  es,
-		ownPID:    os.Getpid(),
+		events:   make(chan NetGuardEvent, 1024),
+		done:     make(chan struct{}),
+		mode:     mode,
+		binaries: bins,
+		unsafe:   unsafe,
+		eventset: es,
+		ownPID:   os.Getpid(),
 	}
 
 	var objs GuardNetObjects
@@ -125,8 +132,16 @@ func NewNetGuard(blockList, allowList []BinaryEntry, eventset []ebpf.NetEventTyp
 			failedRequired)
 	}
 
-	log.Infof("network guard created \u2014 %d/%d LSM hooks attached, block: %d, allow: %d, events: %v",
-		len(g.links), len(attachments), len(blockList), len(allowList), eventsetSummary(es))
+	modeLabel := "blacklist"
+	if mode == ModeWhitelist {
+		modeLabel = "whitelist"
+	}
+	unsafeLabel := ""
+	if unsafe {
+		unsafeLabel = " [UNSAFE]"
+	}
+	log.Infof("network guard created (mode=%s%s) \u2014 %d/%d LSM hooks attached, binaries: %d, events: %v",
+		modeLabel, unsafeLabel, len(g.links), len(attachments), len(binaries), eventsetSummary(es))
 	return g, nil
 }
 
@@ -141,6 +156,10 @@ func eventsetSummary(es []ebpf.NetEventType) string {
 const (
 	bpfBlock uint8 = 1
 	bpfAllow uint8 = 2
+
+	// Default actions for guard_net_config[0]
+	defaultAllow uint64 = 0
+	defaultBlock uint64 = 1
 )
 
 func (g *NetGuard) populateMaps() error {
@@ -151,23 +170,40 @@ func (g *NetGuard) populateMaps() error {
 		}
 	}
 
-	for _, b := range g.blockList {
-		ik, err := statInodeKey(b.Path)
-		if err != nil {
-			return fmt.Errorf("stating blocked binary %s: %w", b.Path, err)
-		}
-		if err := g.objs.GuardNetExeActions.Put(ik, bpfBlock); err != nil {
-			return fmt.Errorf("storing exe inode for blocked %s: %w", b.Path, err)
-		}
+	// Set default action: whitelist mode → block by default, blacklist → allow by default
+	var defaultAction uint64 = defaultAllow
+	if g.mode == ModeWhitelist {
+		defaultAction = defaultBlock
+	}
+	if err := g.objs.GuardNetConfig.Put(uint32(0), defaultAction); err != nil {
+		return fmt.Errorf("setting default action: %w", err)
 	}
 
-	for _, b := range g.allowList {
+	// Config[1]: blocking_enabled — always on for both blacklist and whitelist modes
+	if err := g.objs.GuardNetConfig.Put(uint32(1), uint64(1)); err != nil {
+		return fmt.Errorf("setting blocking enabled: %w", err)
+	}
+
+	// Config[2]: unsafe_families — guard AF_UNIX too (only with --unsafe in whitelist mode)
+	unsafeFamilies := uint64(0)
+	if g.unsafe {
+		unsafeFamilies = 1
+	}
+	if err := g.objs.GuardNetConfig.Put(uint32(2), unsafeFamilies); err != nil {
+		return fmt.Errorf("setting unsafe families: %w", err)
+	}
+
+	bpfVal := bpfBlock
+	if g.mode == ModeWhitelist {
+		bpfVal = bpfAllow
+	}
+	for _, b := range g.binaries {
 		ik, err := statInodeKey(b.Path)
 		if err != nil {
-			return fmt.Errorf("stating allowed binary %s: %w", b.Path, err)
+			return fmt.Errorf("stating binary %s: %w", b.Path, err)
 		}
-		if err := g.objs.GuardNetExeActions.Put(ik, bpfAllow); err != nil {
-			return fmt.Errorf("storing exe inode for allowed %s: %w", b.Path, err)
+		if err := g.objs.GuardNetExeActions.Put(ik, bpfVal); err != nil {
+			return fmt.Errorf("storing exe inode for %s: %w", b.Path, err)
 		}
 	}
 
@@ -200,7 +236,15 @@ func (g *NetGuard) Start() error {
 		return fmt.Errorf("ringbuf reader: %w", err)
 	}
 
-	log.Infof("network guard started \u2014 %d blocked, %d allowed", len(g.blockList), len(g.allowList))
+	modeLabel := "blacklist"
+	if g.mode == ModeWhitelist {
+		modeLabel = "whitelist"
+	}
+	unsafeLabel := ""
+	if g.unsafe {
+		unsafeLabel = " [UNSAFE]"
+	}
+	log.Infof("network guard started (mode=%s%s) \u2014 %d binaries", modeLabel, unsafeLabel, len(g.binaries))
 	go g.readLoop(rd)
 	return nil
 }
@@ -334,3 +378,5 @@ func binarySummary(binaries []BinaryEntry) string {
 	}
 	return strings.Join(parts, ", ")
 }
+
+

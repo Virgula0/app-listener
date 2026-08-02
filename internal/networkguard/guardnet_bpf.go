@@ -71,6 +71,7 @@ type GuardNetProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type GuardNetMapSpecs struct {
+	GuardNetConfig     *ebpf.MapSpec `ebpf:"guard_net_config"`
 	GuardNetEvents     *ebpf.MapSpec `ebpf:"guard_net_events"`
 	GuardNetExeActions *ebpf.MapSpec `ebpf:"guard_net_exe_actions"`
 	GuardNetRb         *ebpf.MapSpec `ebpf:"guard_net_rb"`
@@ -102,6 +103,7 @@ func (o *GuardNetObjects) Close() error {
 //
 // It can be passed to LoadGuardNetObjects or ebpf.CollectionSpec.LoadAndAssign.
 type GuardNetMaps struct {
+	GuardNetConfig     *ebpf.Map `ebpf:"guard_net_config"`
 	GuardNetEvents     *ebpf.Map `ebpf:"guard_net_events"`
 	GuardNetExeActions *ebpf.Map `ebpf:"guard_net_exe_actions"`
 	GuardNetRb         *ebpf.Map `ebpf:"guard_net_rb"`
@@ -109,6 +111,7 @@ type GuardNetMaps struct {
 
 func (m *GuardNetMaps) Close() error {
 	return _GuardNetClose(
+		m.GuardNetConfig,
 		m.GuardNetEvents,
 		m.GuardNetExeActions,
 		m.GuardNetRb,

@@ -53,8 +53,8 @@ type netGuardModel struct {
 	width    int
 	height   int
 
-	blockList    []networkguard.BinaryEntry
-	allowList    []networkguard.BinaryEntry
+	mode     networkguard.Mode
+	binaries []networkguard.BinaryEntry
 	startTime    time.Time
 	eventID      int
 	blocked      int
@@ -65,12 +65,12 @@ type netGuardModel struct {
 	eventsPerSec float64
 }
 
-func NewNetGuardModel(events <-chan networkguard.NetGuardEvent, blockList, allowList []networkguard.BinaryEntry) tea.Model {
+func NewNetGuardModel(events <-chan networkguard.NetGuardEvent, mode networkguard.Mode, binaries []networkguard.BinaryEntry) tea.Model {
 	return &netGuardModel{
-		events:    events,
-		lines:     make([]netGuardEventLine, 0, maxNetGuardEvents),
-		blockList: blockList,
-		allowList: allowList,
+		events:   events,
+		lines:    make([]netGuardEventLine, 0, maxNetGuardEvents),
+		mode:     mode,
+		binaries: binaries,
 		startTime: time.Now(),
 	}
 }
@@ -241,8 +241,11 @@ func (m *netGuardModel) View() string {
 		Bold(true).
 		Render(title))
 
-	fmt.Fprintf(&b, " Block: %s\n", m.listSummary(m.blockList))
-	fmt.Fprintf(&b, " Allow: %s\n", m.listSummary(m.allowList))
+	modeLabel := "BLACKLIST"
+	if m.mode == networkguard.ModeWhitelist {
+		modeLabel = "WHITELIST"
+	}
+	fmt.Fprintf(&b, " Mode: %s  Binaries: %s\n", netGuardModeStyle.Render(modeLabel), m.listSummary(m.binaries))
 	fmt.Fprint(&b, " "+m.renderResourceBar()+"\n\n")
 	fmt.Fprint(&b, m.viewport.View())
 

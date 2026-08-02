@@ -1,6 +1,7 @@
 package networkguard
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -24,67 +25,98 @@ var (
 	blacklistPaths []string
 	whitelistPaths []string
 	eventsFlag     []string
+	unsafeFlag     bool
 )
 
 var NetworkGuardCmd = &cobra.Command{
 	Use:   "network-guard",
 	Short: "Block network operations of specific binaries using eBPF LSM",
-	Long: `Block network operations (TCP, UDP, DNS, etc.) of one or more
+	Long: `Block or allow network operations (TCP, UDP, DNS, etc.) of specific
 binary executables using eBPF LSM programs.
 
-Block network operations of listed binaries (blacklist) and optionally
-allow others (whitelist) to bypass blocking. A binary cannot be in both lists.
+Blacklist mode (-b): block AF_INET/AF_INET6 network operations for the
+listed binaries. Everything else is allowed. This mode is safe for desktop
+environments since only the listed binaries are affected.
+
+Whitelist mode (-w): block AF_INET/AF_INET6 network operations for all
+binaries except the listed ones. Add --unsafe to also block AF_UNIX
+sockets (used by X11, D-Bus, etc.) — this may break desktop applications.
+--unsafe is only available with -w.
+
+The two modes are mutually exclusive.
 
 Examples:
   app-listener network-guard -b /usr/bin/curl
   app-listener network-guard -b /usr/bin/curl /usr/bin/wget -e CONNECT,SEND
   app-listener network-guard -w /usr/bin/vim -e CONNECT,LISTEN
-  app-listener network-guard -b /usr/bin/curl -w /usr/bin/ssh`,
+  app-listener network-guard -w /usr/bin/python3 --unsafe`,
 	Args: cobra.NoArgs,
 	RunE: runNetworkGuard,
 }
 
 func init() {
 	NetworkGuardCmd.Flags().StringSliceVarP(&blacklistPaths, "blacklist", "b", nil,
-		"Binary paths to blacklist (block network operations)")
+		"Binary paths to blacklist (block AF_INET/AF_INET6 network operations)")
 	NetworkGuardCmd.Flags().StringSliceVarP(&whitelistPaths, "whitelist", "w", nil,
-		"Binary paths to whitelist (bypass network blocking)")
+		"Binary paths to whitelist (allow AF_INET/AF_INET6, block everything else)")
 	NetworkGuardCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
-		"Event types to block (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all)")
+		"Event types to intercept (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all)")
 	NetworkGuardCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
+	NetworkGuardCmd.Flags().BoolVarP(&unsafeFlag, "unsafe", "", false,
+		"Also block AF_UNIX sockets (only valid with -w). May break desktop applications that use X11/D-Bus communication")
 }
 
 func runNetworkGuard(cmd *cobra.Command, args []string) error {
-	if len(blacklistPaths) == 0 && len(whitelistPaths) == 0 {
+	hasBlacklist := len(blacklistPaths) > 0
+	hasWhitelist := len(whitelistPaths) > 0
+
+	if hasBlacklist && hasWhitelist {
+		return errors.New("--blacklist (-b) and --whitelist (-w) are mutually exclusive")
+	}
+	if !hasBlacklist && !hasWhitelist {
 		return errors.New("specify at least one binary with --blacklist (-b) or --whitelist (-w)")
 	}
 
-	if err := checkDuplicatePaths(blacklistPaths, whitelistPaths); err != nil {
-		return err
+	if unsafeFlag && hasBlacklist {
+		return errors.New("--unsafe is only available with --whitelist (-w)")
 	}
 
-	blockBinaries := make([]networkguard.BinaryEntry, 0, len(blacklistPaths))
-	for _, p := range blacklistPaths {
-		entry, err := networkguard.ComputeBinaryEntry(p)
-		if err != nil {
-			return fmt.Errorf("processing blacklist binary %q: %w", p, err)
-		}
-		blockBinaries = append(blockBinaries, entry)
+	mode := networkguard.ModeBlacklist
+	binPaths := blacklistPaths
+	if hasWhitelist {
+		mode = networkguard.ModeWhitelist
+		binPaths = whitelistPaths
 	}
 
-	allowBinaries := make([]networkguard.BinaryEntry, 0, len(whitelistPaths))
-	for _, p := range whitelistPaths {
+	binaries := make([]networkguard.BinaryEntry, 0, len(binPaths))
+	for _, p := range binPaths {
 		entry, err := networkguard.ComputeBinaryEntry(p)
 		if err != nil {
-			return fmt.Errorf("processing whitelist binary %q: %w", p, err)
+			return fmt.Errorf("processing binary %q: %w", p, err)
 		}
-		allowBinaries = append(allowBinaries, entry)
+		binaries = append(binaries, entry)
 	}
 
 	parsedEvents, err := parseNetGuardEventsFlag(eventsFlag)
 	if err != nil {
 		return err
+	}
+
+	if unsafeFlag {
+		fmt.Fprintf(os.Stderr, `
+WARNING: --unsafe also blocks AF_UNIX sockets (used by X11, D-Bus, etc.)
+for all binaries. This may break desktop applications and cause system
+instability. Only proceed if you understand these risks.
+
+Continue? [y/N] `)
+
+		reader := bufio.NewReader(os.Stdin)
+		response, _ := reader.ReadString('\n')
+		response = strings.TrimSpace(strings.ToLower(response))
+		if response != "y" && response != "yes" {
+			return errors.New("aborted by user")
+		}
 	}
 
 	printers.PrintLogo()
@@ -93,7 +125,7 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 		return checkErr
 	}
 
-	g, guardErr := networkguard.NewNetGuard(blockBinaries, allowBinaries, parsedEvents)
+	g, guardErr := networkguard.NewNetGuard(mode, binaries, parsedEvents, unsafeFlag)
 	if guardErr != nil {
 		return fmt.Errorf("creating network guard: %w", guardErr)
 	}
@@ -109,20 +141,7 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	return runTUI(g, blockBinaries, allowBinaries)
-}
-
-func checkDuplicatePaths(blacklist, whitelist []string) error {
-	seen := make(map[string]bool, len(blacklist))
-	for _, p := range blacklist {
-		seen[p] = true
-	}
-	for _, p := range whitelist {
-		if seen[p] {
-			return fmt.Errorf("binary %q cannot be both blacklisted and whitelisted", p)
-		}
-	}
-	return nil
+	return runTUI(g, mode, binaries)
 }
 
 func parseNetGuardEventsFlag(flag []string) ([]ebpf.NetEventType, error) {
@@ -160,12 +179,12 @@ func runHeadless(g *networkguard.NetGuard) {
 	}
 }
 
-func runTUI(g *networkguard.NetGuard, blockBinaries, allowBinaries []networkguard.BinaryEntry) error {
+func runTUI(g *networkguard.NetGuard, mode networkguard.Mode, binaries []networkguard.BinaryEntry) error {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	p := tea.NewProgram(
-		tui.NewNetGuardModel(g.Events(), blockBinaries, allowBinaries),
+		tui.NewNetGuardModel(g.Events(), mode, binaries),
 		tea.WithAltScreen(),
 	)
 

@@ -55,6 +55,17 @@ struct {
 } guard_net_events SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 3);
+	__type(key, __u32);
+	__type(value, __u64);
+} guard_net_config SEC(".maps");
+/* config[0] = default_action (0=allow, 1=block)
+ * config[1] = blocking_enabled (0=events only, 1=real blocking)
+ * config[2] = unsafe_families (0=AF_INET/AF_INET6 only, 1=all families)
+ */
+
+struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 64);
 	__type(key, struct inode_key);
@@ -116,10 +127,46 @@ static __always_inline int check_watched(void)
 		return WATCH_NONE;
 
 	__u8 *action = bpf_map_lookup_elem(&guard_net_exe_actions, &exe_ik);
-	if (!action)
-		return WATCH_NONE;
+	if (action)
+		return (*action == GUARD_ALLOW) ? WATCH_ALLOW : WATCH_BLOCK;
 
-	return (*action == GUARD_ALLOW) ? WATCH_ALLOW : WATCH_BLOCK;
+	// Fall back to default action.
+	// config[0]: 0 = allow (blacklist mode), 1 = block (whitelist mode).
+	__u32 key = 0;
+	__u64 *default_action = bpf_map_lookup_elem(&guard_net_config, &key);
+	if (default_action && *default_action == 1)
+		return WATCH_BLOCK;
+	return WATCH_NONE;
+}
+
+static __always_inline int is_socket_guarded(struct socket *sock)
+{
+	if (!sock)
+		return 0;
+
+	// Check unsafe families flag (config[2]).
+	__u32 config_key = 2;
+	__u64 *unsafe = bpf_map_lookup_elem(&guard_net_config, &config_key);
+	if (unsafe && *unsafe == 1)
+		return 1; // unsafe: guard all socket families
+
+	// Safe mode: only guard AF_INET and AF_INET6.
+	struct sock *sk;
+	bpf_probe_read_kernel(&sk, sizeof(sk), &sock->sk);
+	if (!sk)
+		return 0;
+
+	short family;
+	bpf_probe_read_kernel(&family, sizeof(family),
+			      &sk->__sk_common.skc_family);
+	return (family == AF_INET || family == AF_INET6) ? 1 : 0;
+}
+
+static __always_inline int should_block(void)
+{
+	__u32 key = 1;
+	__u64 *enabled = bpf_map_lookup_elem(&guard_net_config, &key);
+	return (enabled && *enabled == 1) ? 1 : 0;
 }
 
 static __always_inline int is_event_type_allowed(__u32 type)
@@ -180,6 +227,9 @@ int guard_net_socket_connect(unsigned long long *ctx)
 	if (!sock)
 		return 0;
 
+	if (!is_socket_guarded(sock))
+		return 0;
+
 	__u32 type = NET_CONNECT;
 	if (!is_event_type_allowed(type))
 		return 0;
@@ -227,7 +277,9 @@ int guard_net_socket_connect(unsigned long long *ctx)
 	read_inet_addr(addr, addrlen, &e.af, e.daddr, &e.dport);
 
 	emit_event(&e);
-	return (action == WATCH_BLOCK) ? -EPERM : 0;
+	if (action == WATCH_BLOCK && should_block())
+		return -EPERM;
+	return 0;
 }
 
 SEC("lsm/socket_bind")
@@ -235,6 +287,9 @@ int guard_net_socket_bind(unsigned long long *ctx)
 {
 	struct socket *sock = (struct socket *)ctx[0];
 	if (!sock)
+		return 0;
+
+	if (!is_socket_guarded(sock))
 		return 0;
 
 	__u32 type = NET_BIND;
@@ -284,7 +339,9 @@ int guard_net_socket_bind(unsigned long long *ctx)
 	read_inet_addr(addr, addrlen, &e.af, e.saddr, &e.sport);
 
 	emit_event(&e);
-	return (action == WATCH_BLOCK) ? -EPERM : 0;
+	if (action == WATCH_BLOCK && should_block())
+		return -EPERM;
+	return 0;
 }
 
 SEC("lsm/socket_listen")
@@ -292,6 +349,9 @@ int guard_net_socket_listen(unsigned long long *ctx)
 {
 	struct socket *sock = (struct socket *)ctx[0];
 	if (!sock)
+		return 0;
+
+	if (!is_socket_guarded(sock))
 		return 0;
 
 	__u32 type = NET_LISTEN;
@@ -338,7 +398,9 @@ int guard_net_socket_listen(unsigned long long *ctx)
 	}
 
 	emit_event(&e);
-	return (action == WATCH_BLOCK) ? -EPERM : 0;
+	if (action == WATCH_BLOCK && should_block())
+		return -EPERM;
+	return 0;
 }
 
 SEC("lsm/socket_sendmsg")
@@ -346,6 +408,9 @@ int guard_net_socket_sendmsg(unsigned long long *ctx)
 {
 	struct socket *sock = (struct socket *)ctx[0];
 	if (!sock)
+		return 0;
+
+	if (!is_socket_guarded(sock))
 		return 0;
 
 	__u32 type;
@@ -416,7 +481,9 @@ int guard_net_socket_sendmsg(unsigned long long *ctx)
 	}
 
 	emit_event(&e);
-	return (action == WATCH_BLOCK) ? -EPERM : 0;
+	if (action == WATCH_BLOCK && should_block())
+		return -EPERM;
+	return 0;
 }
 
 SEC("lsm/socket_recvmsg")
@@ -424,6 +491,9 @@ int guard_net_socket_recvmsg(unsigned long long *ctx)
 {
 	struct socket *sock = (struct socket *)ctx[0];
 	if (!sock)
+		return 0;
+
+	if (!is_socket_guarded(sock))
 		return 0;
 
 	__u32 type = NET_RECV;
@@ -469,5 +539,7 @@ int guard_net_socket_recvmsg(unsigned long long *ctx)
 	}
 
 	emit_event(&e);
-	return (action == WATCH_BLOCK) ? -EPERM : 0;
+	if (action == WATCH_BLOCK && should_block())
+		return -EPERM;
+	return 0;
 }
