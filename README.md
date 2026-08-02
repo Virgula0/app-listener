@@ -17,7 +17,7 @@ app-listener uses eBPF programs that attach to kernel hooks and emit events into
 ## Requirements
 
 - **Linux kernel** 5.x+ with `CONFIG_BPF`, `CONFIG_KPROBES`, `CONFIG_DEBUG_INFO_BTF` (monitor/network-monitor mode)
-- **Guard mode** additionally requires `CONFIG_BPF_LSM` (available since 5.4+, LSM-enabled kernels)
+- **Guard and network-guard modes** additionally require `CONFIG_BPF_LSM` (available since 5.4+, LSM-enabled kernels)
 - clang + LLVM (only needed to regenerate BPF bindings)
 - bpftool (optional, for regenerating `vmlinux.h`)
 - Go 1.24+
@@ -120,6 +120,55 @@ Binary identity is verified by **exe inode** (the BPF program reads `current->mm
 | `CLOSE` | Socket close | `tracepoint/syscalls/sys_enter_close` (with socket fd detection) |
 | `DNS` | DNS query (port 53/853) | Detected via `sys_enter_connect`/`sys_enter_sendto` to port 53 |
 
+### network-guard — block or allow network operations
+
+Blocks or allows network operations (TCP, UDP, DNS, etc.) of specific binaries by attaching eBPF LSM programs to the connect, bind, listen, sendmsg and recvmsg hooks. Supports blacklist and whitelist modes.
+
+```bash
+# Block all network ops from curl
+sudo ./build/linux/app-listener network-guard -b /usr/bin/curl
+
+# Block curl and wget, only CONNECT + SEND
+sudo ./build/linux/app-listener network-guard -b /usr/bin/curl /usr/bin/wget -e CONNECT,SEND
+
+# Whitelist: only vim may use the network, everything else is blocked
+sudo ./build/linux/app-listener network-guard -w /usr/bin/vim
+
+# Whitelist + keep system DNS/network daemons working
+sudo ./build/linux/app-listener network-guard -w /usr/bin/firefox --auto-infra
+
+# Headless
+sudo ./build/linux/app-listener network-guard -b /usr/bin/wget --headless
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-b, --blacklist <binary>` | — | Block AF_INET/AF_INET6 operations for the listed binaries only; everything else is allowed. Repeatable, mutually exclusive with `-w`. |
+| `-w, --whitelist <binary>` | — | Whitelist mode: block AF_INET/AF_INET6 for **all** binaries except the listed ones (default deny). Repeatable, mutually exclusive with `-b`. |
+| `--unsafe` | `false` | Also block AF_UNIX sockets (used by X11, D-Bus, systemd activation). Only valid with `-w`, and may break desktop applications. Requires confirmation. |
+| `--auto-infra` | `false` | Automatically allowlist running essential system network daemons (DNS resolver, network manager, etc.). Only valid with `-w`. |
+| `-e, --events <list>` | all | Event filter: comma-separated (`CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN`) |
+| `--headless` | `false` | No TUI, log NETGUARD\| events to stderr |
+
+Binary identity is verified by the **exe inode** (`current->mm->exe_file->f_inode`), the same mechanism used by network-monitor — comm-spoofing via `prctl(PR_SET_NAME)` cannot bypass the policy.
+
+#### Picking binaries: use the real executable, not a wrapper
+
+Because identity is matched by exe inode, the path you pass must be the **actual binary** the process runs — not a shell-script wrapper. On many distributions `/usr/bin/firefox` is a `#!/bin/sh` script that just does `exec /usr/lib/firefox/firefox "$@"`; the running processes' exe is `/usr/lib/firefox/firefox`, so whitelisting (or blacklisting) `/usr/bin/firefox` matches nothing and the default action applies to all its traffic.
+
+Before starting the guard, resolve the real binary first:
+
+```bash
+# While the application is running:
+ls -l /proc/$(pgrep -n firefox)/exe          # → /usr/lib/firefox/firefox
+readlink -f /usr/bin/firefox                 # follows symlink chains
+
+# Then use the real path:
+sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
+```
+
+Note that `readlink -f` resolves symlinks but **not** shell wrappers (a `#!/bin/sh` script is still a script). For wrapper scripts, read the `exec` target inside the file and use that path.
+
 ## Quick Start
 
 ```bash
@@ -137,6 +186,12 @@ sudo ./build/linux/app-listener guard /tmp -w /usr/bin/cat
 
 # Network monitor mode — watch bash network ops
 sudo ./build/linux/app-listener network-monitor /usr/bin/bash
+
+# Network-guard mode — block only curl
+sudo ./build/linux/app-listener network-guard -b /usr/bin/curl
+
+# Network-guard mode — whitelist firefox, keep DNS working
+sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
 ```
 
 Exit the TUI with `q` or `Ctrl+C`.
@@ -151,6 +206,7 @@ Exit the TUI with `q` or `Ctrl+C`.
 | `make generate-monitor` | Regenerate monitor BPF bindings |
 | `make generate-guard` | Regenerate guard BPF bindings |
 | `make generate-networkmonitor` | Regenerate network-monitor BPF bindings |
+| `make generate-networkguard` | Regenerate network-guard BPF bindings |
 | `make bpftool-headers` | Regenerate `vmlinux.h` from running kernel BTF |
 | `make lint` | Run golangci-lint |
 | `make test` | Run unit tests (non-integration) |
@@ -176,6 +232,7 @@ cmd/
   functions/monitor/   — "monitor" subcommand, wires eBPF + TUI/headless
   functions/guard/     — "guard" subcommand, wires eBPF LSM + TUI/headless
   functions/networkmonitor/ — "network-monitor" subcommand, wires eBPF tracepoints + TUI/headless
+  functions/networkguard/  — "network-guard" subcommand, wires eBPF LSM hooks + TUI/headless
   entity/              — shared flag types (Recursive, Depth, Headless, EventTypes)
 
 internal/
@@ -207,6 +264,13 @@ internal/
     networkmonitor_bpf.go    — bpf2go generated Go bindings
     networkmonitor.go        — loads BPF, attaches tracepoints, manages exe inode map, binary filtering
 
+  networkguard/
+    bpf/networkguard.bpf.c   — BPF C source: LSM hooks for socket_connect, socket_bind, socket_listen, sendmsg, recvmsg
+    bpf/vmlinux.h            — shared CO-RE header
+    embeds/guardnet_bpf.o    — compiled BPF ELF (embedded)
+    guardnet_bpf.go          — bpf2go generated Go bindings
+    networkguard.go          — loads BPF, attaches LSM programs, enforces blacklist/whitelist policy, --auto-infra discovery
+
   tui/
     model.go           — bubbletea TUI with viewport, colored events (monitor)
     guardmodel.go      — bubbletea TUI for guard mode
@@ -229,3 +293,6 @@ integrationtests/
 - **PID filter**: Events from the monitor's own process are discarded to avoid feedback loops.
 - **Binary identity via SHA256**: Guard identifies processes by cryptographic hash of the executable, not by path — renaming a binary does not bypass policy.
 - **Binary identity via exe inode**: Network-monitor identifies processes by the exe file inode read directly from `current->mm->exe_file->f_inode` in BPF, preventing comm-spoofing.
+- **LSM socket hooks for network-guard**: blocking is enforced by returning `-EPERM` from `socket_connect`, `socket_bind`, `socket_listen`, `socket_sendmsg` and `socket_recvmsg` — the only kernel mechanism that can deny a socket operation.
+- **Safety boundary in whitelist mode**: by default whitelist mode only guards AF_INET/AF_INET6, leaving AF_UNIX (D-Bus, X11, systemd activation) untouched so desktop environments keep working. `--unsafe` extends guarding to all address families, at the risk of breaking the desktop.
+- **`--auto-infra` keeps the system resolvable**: whitelist mode denies AF_INET/AF_INET6 for every process not explicitly allowed, including essential system daemons. Without an exception, `systemd-resolved` — which performs upstream DNS lookups on behalf of all processes (via the `resolve` NSS module) — would be blocked, breaking name resolution even for whitelisted apps. `--auto-infra` discovers running infra daemons (`systemd-resolved`, `NetworkManager`, `systemd-networkd`) via `/proc/*/exe` and allowlists them automatically.

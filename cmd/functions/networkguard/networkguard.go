@@ -26,6 +26,7 @@ var (
 	whitelistPaths []string
 	eventsFlag     []string
 	unsafeFlag     bool
+	autoInfraFlag  bool
 )
 
 var NetworkGuardCmd = &cobra.Command{
@@ -43,13 +44,21 @@ binaries except the listed ones. Add --unsafe to also block AF_UNIX
 sockets (used by X11, D-Bus, etc.) — this may break desktop applications.
 --unsafe is only available with -w.
 
+--auto-infra (only with -w): automatically allowlist the essential system
+network daemons (DNS resolver, network manager, etc.) that must stay online
+for whitelisted applications to function — e.g. systemd-resolved, which
+performs upstream DNS lookups on behalf of every process.
+
+
+
 The two modes are mutually exclusive.
 
 Examples:
   app-listener network-guard -b /usr/bin/curl
   app-listener network-guard -b /usr/bin/curl /usr/bin/wget -e CONNECT,SEND
   app-listener network-guard -w /usr/bin/vim -e CONNECT,LISTEN
-  app-listener network-guard -w /usr/bin/python3 --unsafe`,
+  app-listener network-guard -w /usr/bin/python3 --unsafe
+  app-listener network-guard -w /usr/bin/firefox --auto-infra`,
 	Args: cobra.NoArgs,
 	RunE: runNetworkGuard,
 }
@@ -65,6 +74,8 @@ func init() {
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	NetworkGuardCmd.Flags().BoolVarP(&unsafeFlag, "unsafe", "", false,
 		"Also block AF_UNIX sockets (only valid with -w). May break desktop applications that use X11/D-Bus communication")
+	NetworkGuardCmd.Flags().BoolVarP(&autoInfraFlag, "auto-infra", "", false,
+		"Automatically allowlist running system network daemons (e.g. the DNS resolver) in -w mode so they keep working")
 }
 
 func runNetworkGuard(cmd *cobra.Command, args []string) error {
@@ -82,6 +93,10 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 		return errors.New("--unsafe is only available with --whitelist (-w)")
 	}
 
+	if autoInfraFlag && !hasWhitelist {
+		return errors.New("--auto-infra is only available with --whitelist (-w)")
+	}
+
 	mode := networkguard.ModeBlacklist
 	binPaths := blacklistPaths
 	if hasWhitelist {
@@ -96,6 +111,22 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("processing binary %q: %w", p, err)
 		}
 		binaries = append(binaries, entry)
+	}
+
+	var infraPaths []string
+	if hasWhitelist && autoInfraFlag {
+		var err error
+		infraPaths, err = networkguard.DiscoverInfraBinaries()
+		if err != nil {
+			return fmt.Errorf("discovering infrastructure binaries: %w", err)
+		}
+		for _, p := range infraPaths {
+			entry, err := networkguard.ComputeBinaryEntry(p)
+			if err != nil {
+				return fmt.Errorf("processing infrastructure binary %q: %w", p, err)
+			}
+			binaries = append(binaries, entry)
+		}
 	}
 
 	parsedEvents, err := parseNetGuardEventsFlag(eventsFlag)
@@ -120,6 +151,10 @@ Continue? [y/N] `)
 	}
 
 	printers.PrintLogo()
+
+	for _, p := range infraPaths {
+		fmt.Printf("infra allowlisted: %s\n", p)
+	}
 
 	if checkErr := common.CheckEBPF(); checkErr != nil {
 		return checkErr

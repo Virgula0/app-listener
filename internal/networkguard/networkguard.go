@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -223,6 +224,68 @@ func statInodeKey(path string) (*GuardNetInodeKey, error) {
 
 func mkdev(major, minor uint32) uint32 {
 	return (major << 20) | minor
+}
+
+var infraBinaries = []string{
+	"/usr/lib/systemd/systemd-resolved",
+	"/usr/bin/NetworkManager",
+	"/usr/sbin/NetworkManager",
+	"/usr/lib/systemd/systemd-networkd",
+}
+
+// DiscoverInfraBinaries returns the paths of essential system networking daemons
+// that are currently running. In whitelist mode (especially with --auto-infra)
+// these must be allowed so that name resolution and connection management keep
+// working on behalf of whitelisted applications.
+func DiscoverInfraBinaries() ([]string, error) {
+	running, err := runningExecutables()
+	if err != nil {
+		return nil, fmt.Errorf("scanning running processes: %w", err)
+	}
+	return infraFromRunning(running), nil
+}
+
+func infraFromRunning(running map[string]bool) []string {
+	var found []string
+	seen := make(map[string]bool)
+	for _, path := range infraBinaries {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			continue
+		}
+		if !running[resolved] || seen[resolved] {
+			continue
+		}
+		seen[resolved] = true
+		found = append(found, path)
+	}
+	return found
+}
+
+func runningExecutables() (map[string]bool, error) {
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	running := make(map[string]bool)
+	for _, dir := range procs {
+		if !dir.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(dir.Name()); err != nil {
+			continue
+		}
+		exe, err := os.Readlink(filepath.Join("/proc", dir.Name(), "exe"))
+		if err != nil {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(exe)
+		if err != nil {
+			continue
+		}
+		running[resolved] = true
+	}
+	return running, nil
 }
 
 func (g *NetGuard) Events() <-chan NetGuardEvent {
