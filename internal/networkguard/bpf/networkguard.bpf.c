@@ -72,6 +72,23 @@ struct {
 	__type(value, __u8);
 } guard_net_exe_actions SEC(".maps");
 
+struct throttle_key {
+	__u32 type;
+	char comm[16];
+};
+
+/* Per-(type, comm) throttle: the LSM hooks are global, so in whitelist mode
+ * every blocked socket op of noisy host processes would otherwise flood the
+ * ring buffer (and drop important events when it overflows). Only one event
+ * per (type, comm) per interval is emitted.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 512);
+	__type(key, struct throttle_key);
+	__type(value, __u64);
+} guard_net_throttle SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 24);
@@ -178,8 +195,25 @@ static __always_inline int is_event_type_allowed(__u32 type)
 	return *val != 0;
 }
 
+#define EVENT_THROTTLE_NS 250000000ULL /* 250ms */
+
 static __always_inline long emit_event(struct net_guard_event *e)
 {
+	/* Rate-limit per (type, comm) so a busy host cannot overflow the ring
+	 * buffer and drop events of interest. */
+	struct throttle_key tk = {
+		.type = e->type,
+	};
+	__builtin_memcpy(tk.comm, e->comm, sizeof(e->comm));
+
+	__u64 now = bpf_ktime_get_ns();
+	__u64 *last = bpf_map_lookup_elem(&guard_net_throttle, &tk);
+	if (last) {
+		if (now - *last < EVENT_THROTTLE_NS)
+			return 0;
+	}
+	bpf_map_update_elem(&guard_net_throttle, &tk, &now, BPF_ANY);
+
 	struct net_guard_event *out;
 	out = bpf_ringbuf_reserve(&guard_net_rb, sizeof(*out), 0);
 	if (!out)

@@ -99,24 +99,13 @@ func tickNetStats() tea.Cmd {
 	})
 }
 
+//nolint:dupl // bubbletea update-loop skeleton shared by the three views
 func (m *netModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		headerHeight := 4
-		footerHeight := 3
 		m.width = msg.Width
 		m.height = msg.Height
-
-		if !m.ready {
-			vp := viewport.New(m.width-4, m.height-headerHeight-footerHeight-1)
-			m.viewport = vp
-			m.ready = true
-		} else {
-			m.viewport.Width = m.width - 4
-			m.viewport.Height = m.height - headerHeight - footerHeight - 1
-		}
-
-		m.renderNetViewport()
+		syncViewport(&m.viewport, &m.ready, m.width, m.height, 4, 3, m.renderNetViewport)
 
 	case netEventMsg:
 		ev := ebpf.NetEvent(msg)
@@ -134,7 +123,7 @@ func (m *netModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case quitKey, "q":
 			return m, tea.Quit
 		}
 
@@ -223,8 +212,8 @@ func formatAddr(addr string) string {
 
 func (m *netModel) renderNetViewport() {
 	lines := make([]string, len(m.lines))
-	for i, el := range m.lines {
-		lines[i] = el.line
+	for i := range m.lines {
+		lines[i] = m.lines[i].line
 	}
 
 	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
@@ -233,7 +222,7 @@ func (m *netModel) renderNetViewport() {
 
 func (m *netModel) View() string {
 	if !m.ready {
-		return "\n  Initializing..."
+		return initializingView
 	}
 
 	binaryNames := make([]string, len(m.binaries))
@@ -272,26 +261,5 @@ func (m *netModel) View() string {
 }
 
 func (m *netModel) renderNetResourceBar() string {
-	if m.lastStats == nil {
-		return ""
-	}
-
-	rssMB := float64(m.lastStats.RSS) / 1024 / 1024
-	cpuTotal := m.lastStats.CPUUser + m.lastStats.CPUSys
-	cpuSec := cpuTotal.Seconds()
-	uptimeSec := time.Since(m.startTime).Seconds()
-	cpuPct := 0.0
-	if uptimeSec > 0 {
-		cpuPct = (cpuSec / uptimeSec) * 100
-	}
-
-	rss := memStyle.Render(fmt.Sprintf("%.1f MB", rssMB))
-	cpu := cpuStyle.Render(fmt.Sprintf("%.1f%%", cpuPct))
-	eps := epsStyle.Render(fmt.Sprintf("%.0f/s", m.eventsPerSec))
-
-	return resourceStyle.Render(
-		resourceLabelStyle.Render(" Mem:")+" "+rss+
-			resourceLabelStyle.Render("  CPU:")+" "+cpu+
-			resourceLabelStyle.Render("  Evt/s:")+" "+eps,
-	)
+	return formatResourceBar(m.lastStats, m.startTime, m.eventsPerSec)
 }

@@ -19,11 +19,11 @@ import (
 )
 
 var (
-	blacklistPaths  []string
-	whitelistPaths  []string
-	eventsFlag      []string
-	guardRecursive  bool
-	guardDepth      int
+	blacklistPaths []string
+	whitelistPaths []string
+	eventsFlag     []string
+	guardRecursive bool
+	guardDepth     int
 )
 
 var GuardCmd = &cobra.Command{

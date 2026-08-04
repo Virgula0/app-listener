@@ -18,6 +18,12 @@ type GuardNetInodeKey struct {
 	Ino uint64
 }
 
+type GuardNetThrottleKey struct {
+	_    structs.HostLayout
+	Type uint32
+	Comm [16]int8
+}
+
 // LoadGuardNet returns the embedded CollectionSpec for GuardNet.
 func LoadGuardNet() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_GuardNetBytes)
@@ -75,6 +81,7 @@ type GuardNetMapSpecs struct {
 	GuardNetEvents     *ebpf.MapSpec `ebpf:"guard_net_events"`
 	GuardNetExeActions *ebpf.MapSpec `ebpf:"guard_net_exe_actions"`
 	GuardNetRb         *ebpf.MapSpec `ebpf:"guard_net_rb"`
+	GuardNetThrottle   *ebpf.MapSpec `ebpf:"guard_net_throttle"`
 }
 
 // GuardNetVariableSpecs contains global variables before they are loaded into the kernel.
@@ -107,6 +114,7 @@ type GuardNetMaps struct {
 	GuardNetEvents     *ebpf.Map `ebpf:"guard_net_events"`
 	GuardNetExeActions *ebpf.Map `ebpf:"guard_net_exe_actions"`
 	GuardNetRb         *ebpf.Map `ebpf:"guard_net_rb"`
+	GuardNetThrottle   *ebpf.Map `ebpf:"guard_net_throttle"`
 }
 
 func (m *GuardNetMaps) Close() error {
@@ -115,6 +123,7 @@ func (m *GuardNetMaps) Close() error {
 		m.GuardNetEvents,
 		m.GuardNetExeActions,
 		m.GuardNetRb,
+		m.GuardNetThrottle,
 	)
 }
 

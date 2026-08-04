@@ -313,9 +313,9 @@ func (s *monitorUnitTest) TestPopulateWatchInodes_Directory() {
 	s.Require().NoError(os.WriteFile(filepath.Join(subDir, "c.txt"), []byte("c"), 0644))
 
 	m := &Monitor{
-		targets:   dirTarget(dir),
-		recursive: true,
-		depth:     0,
+		targets:     dirTarget(dir),
+		recursive:   true,
+		depth:       0,
 		watchInodes: make(map[string]string),
 	}
 	m.populateWatchInodes()

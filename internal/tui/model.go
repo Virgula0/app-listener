@@ -15,6 +15,12 @@ import (
 
 const maxEvents = 500
 
+// quitKey is the keybinding that exits the TUI views.
+const quitKey = "ctrl+c"
+
+// initializingView is shown while the TUI is not ready yet.
+const initializingView = "\n  Initializing..."
+
 type eventMsg ebpf.FileEvent
 type statsMsg struct{}
 
@@ -126,24 +132,13 @@ func tickStats() tea.Cmd {
 	})
 }
 
+//nolint:dupl // bubbletea update-loop skeleton shared by the three views
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		headerHeight := 3
-		footerHeight := 3
 		m.width = msg.Width
 		m.height = msg.Height
-
-		if !m.ready {
-			vp := viewport.New(m.width-4, m.height-headerHeight-footerHeight-1)
-			m.viewport = vp
-			m.ready = true
-		} else {
-			m.viewport.Width = m.width - 4
-			m.viewport.Height = m.height - headerHeight - footerHeight - 1
-		}
-
-		m.renderViewport()
+		syncViewport(&m.viewport, &m.ready, m.width, m.height, 3, 3, m.renderViewport)
 
 	case eventMsg:
 		ev := ebpf.FileEvent(msg)
@@ -161,7 +156,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case quitKey, "q":
 			return m, tea.Quit
 		}
 
@@ -238,7 +233,7 @@ func formatType(t ebpf.EventType) string {
 
 func (m *model) View() string {
 	if !m.ready {
-		return "\n  Initializing..."
+		return initializingView
 	}
 
 	recursiveStr := "no"
@@ -273,14 +268,32 @@ func (m *model) View() string {
 }
 
 func (m *model) renderResourceBar() string {
-	if m.lastStats == nil {
+	return formatResourceBar(m.lastStats, m.startTime, m.eventsPerSec)
+}
+
+// syncViewport sizes the viewport, creating it on first use, then re-renders
+// the viewport content through render.
+func syncViewport(v *viewport.Model, ready *bool, width, height, headerH, footerH int, render func()) {
+	if !*ready {
+		*v = viewport.New(width-4, height-headerH-footerH-1)
+		*ready = true
+	} else {
+		v.Width = width - 4
+		v.Height = height - headerH - footerH - 1
+	}
+	render()
+}
+
+// formatResourceBar renders the shared CPU/RSS/event-rate status line.
+func formatResourceBar(s *procstats.Stats, start time.Time, eventsPerSec float64) string {
+	if s == nil {
 		return ""
 	}
 
-	rssMB := float64(m.lastStats.RSS) / 1024 / 1024
-	cpuTotal := m.lastStats.CPUUser + m.lastStats.CPUSys
+	rssMB := float64(s.RSS) / 1024 / 1024
+	cpuTotal := s.CPUUser + s.CPUSys
 	cpuSec := cpuTotal.Seconds()
-	uptimeSec := time.Since(m.startTime).Seconds()
+	uptimeSec := time.Since(start).Seconds()
 	cpuPct := 0.0
 	if uptimeSec > 0 {
 		cpuPct = (cpuSec / uptimeSec) * 100
@@ -288,7 +301,7 @@ func (m *model) renderResourceBar() string {
 
 	rss := memStyle.Render(fmt.Sprintf("%.1f MB", rssMB))
 	cpu := cpuStyle.Render(fmt.Sprintf("%.1f%%", cpuPct))
-	eps := epsStyle.Render(fmt.Sprintf("%.0f/s", m.eventsPerSec))
+	eps := epsStyle.Render(fmt.Sprintf("%.0f/s", eventsPerSec))
 
 	return resourceStyle.Render(
 		resourceLabelStyle.Render(" Mem:") + " " + rss +

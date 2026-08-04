@@ -2,6 +2,20 @@
 
 Monitor or guard file system operations (open, read, write, delete, rename, symlink, hardlink, mkdir, mmap) and network operations (TCP connect/accept/close, UDP send/recv, DNS) using eBPF.
 
+## Why
+
+This can be seen as a more serious rewrite version of [arch-supply-chain-hardening](https://github.com/Virgula0/arch-app-armor-hardening), switching to `eBPF` and introducing a lot more features.
+
+Tested on :
+
+- `Arch Linux`
+- Filesystem format: `ext4`
+- For `amd64`
+- On the kernel version `7.0.11-hardened2-1-hardened`
+
+Different kernel versions, patches and file systems may produce undesired results, security bypasses or general bugs.
+Before proceeding, it is important to know that this is a vibe-coding-like experiment and should not be used in any way to protect production-ready systems. It was mainly coded using the free `DeepSeek V4 Flash`.
+
 ## How it works
 
 app-listener uses eBPF programs that attach to kernel hooks and emit events into a ring buffer. The userspace process reads the ring buffer, filters events against the watched paths, and either logs them (monitor mode) or denies the operation (guard mode).

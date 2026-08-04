@@ -41,8 +41,6 @@ type NetworkMonitor struct {
 	binaries   []BinaryEntry
 	ownPID     int
 	eventTypes atomic.Value
-
-	watchInodes map[NetMonInodeKey]struct{}
 }
 
 func NewNetworkMonitor(binaries []BinaryEntry) (*NetworkMonitor, error) {

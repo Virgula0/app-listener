@@ -166,37 +166,20 @@ func modeString(mode Mode) string {
 	return "blacklist"
 }
 
-func (g *Guard) populateMaps() error {
-	// Set the operating mode, recursive flag, and depth
-	if err := g.objs.GuardConfig.Put(uint32(0), uint64(g.mode)); err != nil {
-		return fmt.Errorf("setting mode in config: %w", err)
+// guardModeKey converts a Mode to the uint64 value stored in the BPF config
+// map, rejecting unknown or negative modes.
+func guardModeKey(m Mode) (uint64, error) {
+	switch m {
+	case ModeBlacklist, ModeWhitelist:
+		return uint64(m), nil //nolint:gosec // m is validated to one of two small enum values above
+	default:
+		return 0, fmt.Errorf("invalid guard mode %d", m)
 	}
-	recursiveVal := uint64(0)
-	if g.recursive {
-		recursiveVal = 1
-	}
-	if err := g.objs.GuardConfig.Put(uint32(1), recursiveVal); err != nil {
-		return fmt.Errorf("setting recursive in config: %w", err)
-	}
-	if err := g.objs.GuardConfig.Put(uint32(2), uint64(g.depth)); err != nil {
-		return fmt.Errorf("setting depth in config: %w", err)
-	}
+}
 
-	info, err := os.Stat(g.path)
-	if err != nil {
-		return fmt.Errorf("stating guarded path %s: %w", g.path, err)
-	}
-
-	if info.IsDir() {
-		if err := g.scanDirInodes(g.path, 0); err != nil {
-			return err
-		}
-	} else {
-		if err := g.addInode(g.path); err != nil {
-			return err
-		}
-	}
-
+// addBinaryActions stores the per-binary allow/block flags in
+// guard_exe_actions, keyed by the binary's filesystem inode.
+func (g *Guard) addBinaryActions() error {
 	for _, b := range g.binaries {
 		var es syscall.Stat_t
 		if err := syscall.Stat(b.Path, &es); err != nil {
@@ -215,12 +198,57 @@ func (g *Guard) populateMaps() error {
 			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
 		}
 	}
+	return nil
+}
+
+func (g *Guard) populateMaps() error {
+	modeKey, err := guardModeKey(g.mode)
+	if err != nil {
+		return err
+	}
+	if putErr := g.objs.GuardConfig.Put(uint32(0), modeKey); putErr != nil {
+		return fmt.Errorf("setting mode in config: %w", putErr)
+	}
+
+	recursiveVal := uint64(0)
+	if g.recursive {
+		recursiveVal = 1
+	}
+	if putErr := g.objs.GuardConfig.Put(uint32(1), recursiveVal); putErr != nil {
+		return fmt.Errorf("setting recursive in config: %w", putErr)
+	}
+
+	if g.depth < 0 {
+		return fmt.Errorf("invalid depth %d", g.depth)
+	}
+	if putErr := g.objs.GuardConfig.Put(uint32(2), uint64(g.depth)); putErr != nil {
+		return fmt.Errorf("setting depth in config: %w", putErr)
+	}
+
+	info, statErr := os.Stat(g.path)
+	if statErr != nil {
+		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)
+	}
+
+	if info.IsDir() {
+		if scanErr := g.scanDirInodes(g.path, 0); scanErr != nil {
+			return scanErr
+		}
+	} else {
+		if addErr := g.addInode(g.path); addErr != nil {
+			return addErr
+		}
+	}
+
+	if binErr := g.addBinaryActions(); binErr != nil {
+		return binErr
+	}
 
 	// Store the guarded path for symlink target matching
 	var pathBuf [256]byte
 	copy(pathBuf[:], g.path)
-	if err := g.objs.GuardPath.Put(uint32(0), pathBuf); err != nil {
-		return fmt.Errorf("storing guarded path: %w", err)
+	if putErr := g.objs.GuardPath.Put(uint32(0), pathBuf); putErr != nil {
+		return fmt.Errorf("storing guarded path: %w", putErr)
 	}
 
 	// Detect and block the backing block device
@@ -260,7 +288,7 @@ func (g *Guard) addBackingBlockDevice() error {
 	rdev := major<<20 | minor
 
 	var val uint8 = 1
-	if err := g.objs.GuardFsDevices.Put(uint32(rdev), val); err != nil {
+	if err := g.objs.GuardFsDevices.Put(rdev, val); err != nil {
 		return fmt.Errorf("storing backing block device %d:%d in map: %w", major, minor, err)
 	}
 

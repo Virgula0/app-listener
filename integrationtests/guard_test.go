@@ -772,8 +772,8 @@ func (s *IntegrationSuite) TestGuard_Bypass_ForkExecFD() {
 // An attacker may create a symlink to a blacklisted binary and run
 // it under a different name to bypass guard:
 //
-//   ln -s /usr/bin/cat /tmp/myreader
-//   /tmp/myreader /watch/secret.txt
+//	ln -s /usr/bin/cat /tmp/myreader
+//	/tmp/myreader /watch/secret.txt
 //
 // The guard uses exe-inode identity (resolves symlinks), so the
 // symlinked binary is recognized as the same executable and blocked.

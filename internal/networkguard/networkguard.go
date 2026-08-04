@@ -127,9 +127,9 @@ func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType
 	if len(failedRequired) > 0 {
 		g.cleanup()
 		return nil, fmt.Errorf(
-			"required LSM hooks failed to attach: %v — network blocking unavailable. "+
-				"Ensure your kernel supports BPF LSM (CONFIG_BPF_LSM=y) and LSM=bpf is in the "+
-				"boot command line (/sys/kernel/security/lsm).",
+			"required LSM hooks failed to attach: %v — network blocking unavailable; "+
+				"ensure your kernel supports BPF LSM (CONFIG_BPF_LSM=y) and LSM=bpf is in the "+
+				"boot command line (/sys/kernel/security/lsm)",
 			failedRequired)
 	}
 
@@ -165,14 +165,17 @@ const (
 
 func (g *NetGuard) populateMaps() error {
 	for _, et := range g.eventset {
-		key := uint32(et)
+		key, err := eventTypeKey(et)
+		if err != nil {
+			return err
+		}
 		if err := g.objs.GuardNetEvents.Put(key, uint64(1)); err != nil {
 			return fmt.Errorf("setting event type %d in filter: %w", et, err)
 		}
 	}
 
 	// Set default action: whitelist mode → block by default, blacklist → allow by default
-	var defaultAction uint64 = defaultAllow
+	defaultAction := defaultAllow
 	if g.mode == ModeWhitelist {
 		defaultAction = defaultBlock
 	}
@@ -209,6 +212,15 @@ func (g *NetGuard) populateMaps() error {
 	}
 
 	return nil
+}
+
+// eventTypeKey converts a parsed event type to the uint32 key used in the BPF
+// filter map, rejecting out-of-range values.
+func eventTypeKey(et ebpf.NetEventType) (uint32, error) {
+	if et < 0 || et >= 0x100 {
+		return 0, fmt.Errorf("event type %d out of range", et)
+	}
+	return uint32(et), nil //nolint:gosec // et is range-checked to [0, 256) above
 }
 
 func statInodeKey(path string) (*GuardNetInodeKey, error) {
@@ -275,7 +287,7 @@ func runningExecutables() (map[string]bool, error) {
 		if _, err := strconv.Atoi(dir.Name()); err != nil {
 			continue
 		}
-		exe, err := os.Readlink(filepath.Join("/proc", dir.Name(), "exe"))
+		exe, err := os.Readlink(fmt.Sprintf("/proc/%s/exe", dir.Name()))
 		if err != nil {
 			continue
 		}
@@ -433,13 +445,3 @@ func ComputeBinaryEntry(path string) (BinaryEntry, error) {
 		Comm: comm,
 	}, nil
 }
-
-func binarySummary(binaries []BinaryEntry) string {
-	parts := make([]string, len(binaries))
-	for i, b := range binaries {
-		parts[i] = fmt.Sprintf("%s [sha256:%x..%x]", b.Path, b.Hash[:4], b.Hash[28:])
-	}
-	return strings.Join(parts, ", ")
-}
-
-

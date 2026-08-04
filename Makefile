@@ -122,7 +122,7 @@ test:
 
 test-integration:
 	$(MAKE) -C integrationtests/exploits
-	go test ./integrationtests/ -v --count=1 -timeout 15m
+	go test ./integrationtests/ -v --count=1 -timeout 30m
 .PHONY: test-integration
 
 deploy:

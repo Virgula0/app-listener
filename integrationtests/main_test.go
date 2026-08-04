@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -19,9 +20,45 @@ import (
 )
 
 var (
-	amd64Bin string
-	arm64Bin string
+	amd64Bin          string
+	arm64Bin          string
+	netTesterAmd64Bin string
 )
+
+// hostInfraBindPaths are host binaries that the LSM network guard blocks in
+// whitelist mode because its programs attach globally (they affect host
+// processes too, not just the container). Bind-mounting them into the
+// container at a private path lets the guard allowlist them by their real
+// dev/ino, keeping docker and the host resolver functional while a whitelist
+// guard is active.
+var hostInfraBindPaths = []string{
+	"/usr/bin/dockerd",
+	"/usr/bin/containerd",
+	"/usr/bin/containerd-shim-runc-v2",
+	"/usr/bin/docker-proxy",
+	"/usr/bin/docker",
+	"/usr/lib/systemd/systemd-resolved",
+}
+
+// infraContainerPaths returns the container-side path for each bind-mounted
+// host infra binary, used to build the network-guard allowlist/blocklist flag.
+func infraContainerPaths() []string {
+	out := make([]string, 0, len(hostInfraBindPaths))
+	for _, p := range hostInfraBindPaths {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		out = append(out, "/host-infra/"+path.Base(p))
+	}
+	return out
+}
+
+// guardBinaryFlag builds a comma-separated -b/-w value covering the main
+// net_tester plus the mounted host infra binaries.
+func guardBinaryFlag(mainPath string) string {
+	parts := append([]string{mainPath}, infraContainerPaths()...)
+	return strings.Join(parts, ",")
+}
 
 func TestMain(m *testing.M) {
 	if err := os.MkdirAll("../build/test", 0755); err != nil {
@@ -30,12 +67,21 @@ func TestMain(m *testing.M) {
 	}
 
 	amd64Bin = absPath("../build/test/app-listener-amd64")
+	netTesterAmd64Bin = absPath("../build/test/net_tester-amd64")
 
 	cmd := exec.Command("go", "build", "-tags", "ci", "-o", amd64Bin, "..")
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build amd64 binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	cmdNet := exec.Command("go", "build", "-tags", "ci", "-o", netTesterAmd64Bin, "./net_tester")
+	cmdNet.Stderr = os.Stderr
+	cmdNet.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+	if err := cmdNet.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build net_tester amd64 binary: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -100,6 +146,15 @@ func (s *IntegrationSuite) startContainer(
 				Source: testcontainers.GenericBindMountSource{HostPath: "/sys/kernel/btf"},
 				Target: "/sys/kernel/btf",
 			},
+		}
+		for _, hp := range hostInfraBindPaths {
+			if _, err := os.Stat(hp); err != nil {
+				continue
+			}
+			req.Mounts = append(req.Mounts, testcontainers.ContainerMount{
+				Source: testcontainers.GenericBindMountSource{HostPath: hp},
+				Target: testcontainers.ContainerMountTarget("/host-infra/" + path.Base(hp)),
+			})
 		}
 	}
 

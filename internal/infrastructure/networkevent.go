@@ -39,7 +39,7 @@ func (t NetEventType) String() string {
 	case NetListen:
 		return "LISTEN"
 	default:
-		return "UNKNOWN"
+		return unknownLabel
 	}
 }
 
@@ -110,19 +110,19 @@ type NetBpfEvent struct {
 
 func (e *NetBpfEvent) ToNetEvent() NetEvent {
 	return NetEvent{
-		PID:       e.PID,
-		TID:       e.TID,
-		UID:       e.UID,
-		GID:       e.GID,
-		Type:      NetEventType(e.Type),
-		Protocol:  e.Proto,
-		Size:      e.Size,
-		FD:        e.FD,
-		Comm:      Cstr(e.Comm[:]),
-		SrcAddr:   FormatAddr(e.AF, e.Saddr[:], e.Sport),
-		DstAddr:   FormatAddr(e.AF, e.Daddr[:], e.Dport),
-		NetNS:     e.NetNS,
-		CgroupID:  e.CgroupID,
+		PID:      e.PID,
+		TID:      e.TID,
+		UID:      e.UID,
+		GID:      e.GID,
+		Type:     NetEventType(e.Type),
+		Protocol: e.Proto,
+		Size:     e.Size,
+		FD:       e.FD,
+		Comm:     Cstr(e.Comm[:]),
+		SrcAddr:  FormatAddr(e.AF, e.Saddr[:], e.Sport),
+		DstAddr:  FormatAddr(e.AF, e.Daddr[:], e.Dport),
+		NetNS:    e.NetNS,
+		CgroupID: e.CgroupID,
 	}
 }
 
@@ -139,18 +139,19 @@ func FormatAddr(af uint32, ip []uint32, port uint16) string {
 
 	var buf strings.Builder
 
-	if af == 2 {
+	switch {
+	case af == 2:
 		addr := make(net.IP, 4)
 		binary.BigEndian.PutUint32(addr, ip[0])
 		buf.WriteString(addr.String())
-	} else if af == 10 && len(ip) >= 4 {
+	case af == 10 && len(ip) >= 4:
 		addr := make(net.IP, 16)
 		binary.BigEndian.PutUint32(addr[0:4], ip[0])
 		binary.BigEndian.PutUint32(addr[4:8], ip[1])
 		binary.BigEndian.PutUint32(addr[8:12], ip[2])
 		binary.BigEndian.PutUint32(addr[12:16], ip[3])
 		buf.WriteString("[" + addr.String() + "]")
-	} else {
+	default:
 		return ""
 	}
 
@@ -172,6 +173,6 @@ func ProtocolString(proto uint32) string {
 	case 58:
 		return "ICMPv6"
 	default:
-		return "UNKNOWN"
+		return unknownLabel
 	}
 }

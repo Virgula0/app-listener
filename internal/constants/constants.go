@@ -11,5 +11,5 @@ const (
 
 const (
 	AppName = "app-listener"
-	Version = "0.1.0"
+	Version = "v0.1.0"
 )

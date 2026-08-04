@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
@@ -40,16 +41,16 @@ listed binaries. Everything else is allowed. This mode is safe for desktop
 environments since only the listed binaries are affected.
 
 Whitelist mode (-w): block AF_INET/AF_INET6 network operations for all
-binaries except the listed ones. Add --unsafe to also block AF_UNIX
-sockets (used by X11, D-Bus, etc.) — this may break desktop applications.
---unsafe is only available with -w.
+binaries except the listed ones. When neither -b nor -w is given, whitelist
+mode with no allowed binaries is assumed (everything is blocked).
+Add --unsafe to also block AF_UNIX sockets (used by X11, D-Bus, etc.) —
+this may break desktop applications. --unsafe is only available in whitelist
+mode.
 
---auto-infra (only with -w): automatically allowlist the essential system
-network daemons (DNS resolver, network manager, etc.) that must stay online
-for whitelisted applications to function — e.g. systemd-resolved, which
-performs upstream DNS lookups on behalf of every process.
-
-
+--auto-infra (whitelist mode only): automatically allowlist the essential
+system network daemons (DNS resolver, network manager, etc.) that must stay
+online for whitelisted applications to function — e.g. systemd-resolved,
+which performs upstream DNS lookups on behalf of every process.
 
 The two modes are mutually exclusive.
 
@@ -58,7 +59,8 @@ Examples:
   app-listener network-guard -b /usr/bin/curl /usr/bin/wget -e CONNECT,SEND
   app-listener network-guard -w /usr/bin/vim -e CONNECT,LISTEN
   app-listener network-guard -w /usr/bin/python3 --unsafe
-  app-listener network-guard -w /usr/bin/firefox --auto-infra`,
+  app-listener network-guard -w /usr/bin/firefox --auto-infra
+  app-listener network-guard`,
 	Args: cobra.NoArgs,
 	RunE: runNetworkGuard,
 }
@@ -73,60 +75,25 @@ func init() {
 	NetworkGuardCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	NetworkGuardCmd.Flags().BoolVarP(&unsafeFlag, "unsafe", "", false,
-		"Also block AF_UNIX sockets (only valid with -w). May break desktop applications that use X11/D-Bus communication")
+		"Also block AF_UNIX sockets (whitelist mode only). May break desktop applications that use X11/D-Bus communication")
 	NetworkGuardCmd.Flags().BoolVarP(&autoInfraFlag, "auto-infra", "", false,
-		"Automatically allowlist running system network daemons (e.g. the DNS resolver) in -w mode so they keep working")
+		"Automatically allowlist running system network daemons (e.g. the DNS resolver) in whitelist mode so they keep working")
 }
 
 func runNetworkGuard(cmd *cobra.Command, args []string) error {
-	hasBlacklist := len(blacklistPaths) > 0
-	hasWhitelist := len(whitelistPaths) > 0
-
-	if hasBlacklist && hasWhitelist {
-		return errors.New("--blacklist (-b) and --whitelist (-w) are mutually exclusive")
-	}
-	if !hasBlacklist && !hasWhitelist {
-		return errors.New("specify at least one binary with --blacklist (-b) or --whitelist (-w)")
+	mode, binPaths, err := resolveGuardMode()
+	if err != nil {
+		return err
 	}
 
-	if unsafeFlag && hasBlacklist {
-		return errors.New("--unsafe is only available with --whitelist (-w)")
+	binaries, err := computeGuardBinaries(binPaths)
+	if err != nil {
+		return err
 	}
 
-	if autoInfraFlag && !hasWhitelist {
-		return errors.New("--auto-infra is only available with --whitelist (-w)")
-	}
-
-	mode := networkguard.ModeBlacklist
-	binPaths := blacklistPaths
-	if hasWhitelist {
-		mode = networkguard.ModeWhitelist
-		binPaths = whitelistPaths
-	}
-
-	binaries := make([]networkguard.BinaryEntry, 0, len(binPaths))
-	for _, p := range binPaths {
-		entry, err := networkguard.ComputeBinaryEntry(p)
-		if err != nil {
-			return fmt.Errorf("processing binary %q: %w", p, err)
-		}
-		binaries = append(binaries, entry)
-	}
-
-	var infraPaths []string
-	if hasWhitelist && autoInfraFlag {
-		var err error
-		infraPaths, err = networkguard.DiscoverInfraBinaries()
-		if err != nil {
-			return fmt.Errorf("discovering infrastructure binaries: %w", err)
-		}
-		for _, p := range infraPaths {
-			entry, err := networkguard.ComputeBinaryEntry(p)
-			if err != nil {
-				return fmt.Errorf("processing infrastructure binary %q: %w", p, err)
-			}
-			binaries = append(binaries, entry)
-		}
+	infraPaths, binaries, err := discoverInfra(mode, binaries)
+	if err != nil {
+		return err
 	}
 
 	parsedEvents, err := parseNetGuardEventsFlag(eventsFlag)
@@ -135,18 +102,8 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 	}
 
 	if unsafeFlag {
-		fmt.Fprintf(os.Stderr, `
-WARNING: --unsafe also blocks AF_UNIX sockets (used by X11, D-Bus, etc.)
-for all binaries. This may break desktop applications and cause system
-instability. Only proceed if you understand these risks.
-
-Continue? [y/N] `)
-
-		reader := bufio.NewReader(os.Stdin)
-		response, _ := reader.ReadString('\n')
-		response = strings.TrimSpace(strings.ToLower(response))
-		if response != "y" && response != "yes" {
-			return errors.New("aborted by user")
+		if err := confirmUnsafe(); err != nil {
+			return err
 		}
 	}
 
@@ -179,6 +136,73 @@ Continue? [y/N] `)
 	return runTUI(g, mode, binaries)
 }
 
+// resolveGuardMode determines the guard mode from the CLI flags. When neither
+// -b nor -w is given, whitelist mode with no allowed binaries is assumed
+// (every network operation is blocked).
+func resolveGuardMode() (networkguard.Mode, []string, error) {
+	switch {
+	case len(blacklistPaths) > 0 && len(whitelistPaths) > 0:
+		return 0, nil, errors.New("--blacklist (-b) and --whitelist (-w) are mutually exclusive")
+	case len(blacklistPaths) > 0:
+		if unsafeFlag {
+			return 0, nil, errors.New("--unsafe is only available in whitelist mode")
+		}
+		if autoInfraFlag {
+			return 0, nil, errors.New("--auto-infra is only available in whitelist mode")
+		}
+		return networkguard.ModeBlacklist, blacklistPaths, nil
+	default:
+		return networkguard.ModeWhitelist, whitelistPaths, nil
+	}
+}
+
+func computeGuardBinaries(paths []string) ([]networkguard.BinaryEntry, error) {
+	binaries := make([]networkguard.BinaryEntry, 0, len(paths))
+	for _, p := range paths {
+		entry, err := networkguard.ComputeBinaryEntry(p)
+		if err != nil {
+			return nil, fmt.Errorf("processing binary %q: %w", p, err)
+		}
+		binaries = append(binaries, entry)
+	}
+	return binaries, nil
+}
+
+func discoverInfra(mode networkguard.Mode, binaries []networkguard.BinaryEntry) ([]string, []networkguard.BinaryEntry, error) {
+	if mode != networkguard.ModeWhitelist || !autoInfraFlag {
+		return nil, binaries, nil
+	}
+	paths, err := networkguard.DiscoverInfraBinaries()
+	if err != nil {
+		return nil, binaries, fmt.Errorf("discovering infrastructure binaries: %w", err)
+	}
+	for _, p := range paths {
+		entry, err := networkguard.ComputeBinaryEntry(p)
+		if err != nil {
+			return nil, binaries, fmt.Errorf("processing infrastructure binary %q: %w", p, err)
+		}
+		binaries = append(binaries, entry)
+	}
+	return paths, binaries, nil
+}
+
+func confirmUnsafe() error {
+	fmt.Fprintf(os.Stderr, `
+WARNING: --unsafe also blocks AF_UNIX sockets (used by X11, D-Bus, etc.)
+for all binaries. This may break desktop applications and cause system
+instability. Only proceed if you understand these risks.
+
+Continue? [y/N] `)
+
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(strings.ToLower(response))
+	if response != "y" && response != "yes" {
+		return errors.New("aborted by user")
+	}
+	return nil
+}
+
 func parseNetGuardEventsFlag(flag []string) ([]ebpf.NetEventType, error) {
 	if len(flag) == 0 {
 		return ebpf.NetEventTypes(), nil
@@ -199,12 +223,27 @@ func runHeadless(g *networkguard.NetGuard) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
+	// Rate-limit repeated events per (type, comm): the LSM hooks are global,
+	// so in whitelist mode every blocked socket op of noisy host processes
+	// (mDNS, IDE workers, …) would otherwise flood the log.
+	type eventKey struct {
+		typ  string
+		comm string
+	}
+	lastLog := make(map[eventKey]time.Time)
+
 	for {
 		select {
 		case ev, ok := <-g.Events():
 			if !ok {
 				return
 			}
+			k := eventKey{typ: ev.Type.String(), comm: ev.Comm}
+			now := time.Now()
+			if prev, seen := lastLog[k]; seen && now.Sub(prev) < time.Second {
+				continue
+			}
+			lastLog[k] = now
 			log.Infof("NETGUARD|%s|%s|%s|%s|%s|%d|%d|%d|%d|%t",
 				ev.Type.String(), ev.Comm, ebpf.ProtocolString(ev.Protocol),
 				ev.SrcAddr, ev.DstAddr, ev.Size, ev.PID, ev.TID, ev.NetNS, ev.Blocked)

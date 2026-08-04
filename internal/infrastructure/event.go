@@ -2,6 +2,9 @@ package ebpf
 
 import "strings"
 
+// unknownLabel is the display name used when an event type cannot be mapped.
+const unknownLabel = "UNKNOWN"
+
 type EventType int
 
 const (
@@ -37,7 +40,7 @@ func (t EventType) String() string {
 	case EventMmap:
 		return "MMAP"
 	default:
-		return "UNKNOWN"
+		return unknownLabel
 	}
 }
 

@@ -182,9 +182,9 @@ func (s *guardUnitTest) TestBlockedFieldMapping() {
 
 func (s *guardUnitTest) TestBpfEventToGuardEventAllEventTypes() {
 	eventTypes := []struct {
-		name     string
-		bpfType  uint32
-		goType   ebpf.EventType
+		name    string
+		bpfType uint32
+		goType  ebpf.EventType
 	}{
 		{name: "open", bpfType: 0, goType: ebpf.EventOpen},
 		{name: "read", bpfType: 1, goType: ebpf.EventRead},

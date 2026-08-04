@@ -53,12 +53,12 @@ type netGuardModel struct {
 	width    int
 	height   int
 
-	mode     networkguard.Mode
-	binaries []networkguard.BinaryEntry
-	startTime    time.Time
-	eventID      int
-	blocked      int
-	allowed      int
+	mode      networkguard.Mode
+	binaries  []networkguard.BinaryEntry
+	startTime time.Time
+	eventID   int
+	blocked   int
+	allowed   int
 
 	lastStats    *procstats.Stats
 	prevEventID  int
@@ -67,10 +67,10 @@ type netGuardModel struct {
 
 func NewNetGuardModel(events <-chan networkguard.NetGuardEvent, mode networkguard.Mode, binaries []networkguard.BinaryEntry) tea.Model {
 	return &netGuardModel{
-		events:   events,
-		lines:    make([]netGuardEventLine, 0, maxNetGuardEvents),
-		mode:     mode,
-		binaries: binaries,
+		events:    events,
+		lines:     make([]netGuardEventLine, 0, maxNetGuardEvents),
+		mode:      mode,
+		binaries:  binaries,
 		startTime: time.Now(),
 	}
 }
@@ -118,7 +118,7 @@ func (m *netGuardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case quitKey, "q":
 			return m, tea.Quit
 		}
 
@@ -137,7 +137,7 @@ func (m *netGuardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.lines = append(m.lines, netGuardEventLine{
 			event: ev,
-			line:  m.formatEvent(ev),
+			line:  m.formatEvent(&ev),
 		})
 
 		if len(m.lines) > maxNetGuardEvents {
@@ -147,7 +147,8 @@ func (m *netGuardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderContent()
 		m.viewport.GotoBottom()
 
-		return m, m.waitForEvent()
+		cmd := m.waitForEvent()
+		return m, cmd
 
 	case netGuardStatsMsg:
 		s, err := procstats.Read()
@@ -158,13 +159,14 @@ func (m *netGuardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastStats = s
 		}
 
-		return m, m.waitForStats()
+		cmd := m.waitForStats()
+		return m, cmd
 	}
 
 	return m, nil
 }
 
-func (m *netGuardModel) formatEvent(ev networkguard.NetGuardEvent) string {
+func (m *netGuardModel) formatEvent(ev *networkguard.NetGuardEvent) string {
 	style := netTypeStyles[ev.Type]
 	eventName := style.Render(ev.Type.String())
 
@@ -189,7 +191,7 @@ func (m *netGuardModel) formatEvent(ev networkguard.NetGuardEvent) string {
 		details += fmt.Sprintf(" size=%d", ev.Size)
 	}
 
-	return fmt.Sprintf("[%d] %s %s %s %s %s%s",
+	return fmt.Sprintf("[%d] %s %s %s %s %s%s %s",
 		m.eventID,
 		time.Now().Format("15:04:05.000"),
 		eventName,
@@ -197,6 +199,7 @@ func (m *netGuardModel) formatEvent(ev networkguard.NetGuardEvent) string {
 		protocol,
 		addr,
 		status,
+		details,
 	)
 }
 
@@ -218,8 +221,8 @@ func protoString(proto uint32) string {
 func (m *netGuardModel) renderContent() {
 	var b strings.Builder
 
-	for _, l := range m.lines {
-		b.WriteString(l.line)
+	for i := range m.lines {
+		b.WriteString(m.lines[i].line)
 		b.WriteString("\n")
 	}
 
@@ -228,7 +231,7 @@ func (m *netGuardModel) renderContent() {
 
 func (m *netGuardModel) View() string {
 	if !m.ready {
-		return "\n  Initializing..."
+		return initializingView
 	}
 
 	var b strings.Builder
@@ -284,11 +287,11 @@ func (m *netGuardModel) renderResourceBar() string {
 	allowed := netGuardAllowedCountStyle.Render(fmt.Sprintf("%d allowed", m.allowed))
 
 	return resourceStyle.Render(
-		resourceLabelStyle.Render(" Mem:")+" "+rss+
-			resourceLabelStyle.Render("  CPU:")+" "+cpu+
-			resourceLabelStyle.Render("  Evt/s:")+" "+eps+
-			"  "+blocked+
-			"  "+allowed,
+		resourceLabelStyle.Render(" Mem:") + " " + rss +
+			resourceLabelStyle.Render("  CPU:") + " " + cpu +
+			resourceLabelStyle.Render("  Evt/s:") + " " + eps +
+			"  " + blocked +
+			"  " + allowed,
 	)
 }
 
