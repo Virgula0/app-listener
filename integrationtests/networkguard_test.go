@@ -84,6 +84,44 @@ func (s *IntegrationSuite) waitForNetGuardBlockedEvent(c testcontainers.Containe
 		expectedType, expectedComm, netGuardTail(full), s.guardContextFiles(c))
 }
 
+// netGuardBlockedEventCount returns how many blocked (Blocked=true) events of
+// the given type/comm appear in the guard log.
+func netGuardBlockedEventCount(logContent, comm, typ string) int {
+	count := 0
+	for _, line := range strings.Split(logContent, "\n") {
+		idx := strings.Index(line, "NETGUARD|")
+		if idx < 0 {
+			continue
+		}
+		rest := line[idx+len("NETGUARD|"):]
+		parts := strings.SplitN(rest, "|", 10)
+		if len(parts) < 10 {
+			continue
+		}
+		if strings.TrimSpace(parts[0]) == typ && parts[1] == comm && strings.TrimSpace(parts[9]) == "true" {
+			count++
+		}
+	}
+	return count
+}
+
+// waitForNetGuardEventCount polls until at least min blocked events of the
+// given type/comm are logged.
+func (s *IntegrationSuite) waitForNetGuardEventCount(c testcontainers.Container, comm, typ string, min int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if netGuardBlockedEventCount(s.readNetGuardLog(c), comm, typ) >= min {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	full := s.readNetGuardLog(c)
+	found := netGuardBlockedEventCount(full, comm, typ)
+	s.T().Fatalf("timed out waiting for >=%d blocked %s events (comm=%s), found=%d, logBytes=%d; "+
+		"log head/raw:\n%q\ncontext files:\n%s",
+		min, typ, comm, found, len(full), netGuardTail(full), s.guardContextFiles(c))
+}
+
 // guardContextFiles dumps the marker-related net_tester logs so a
 // timing/collision failure shows which phase the test binary reached.
 func (s *IntegrationSuite) guardContextFiles(c testcontainers.Container) string {
@@ -282,6 +320,24 @@ func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedRecv() {
 
 	s.exec(c, []string{"touch", "/tmp/go"})
 	s.waitForNetGuardBlockedEvent(c, "other_tester", "RECV", 8*time.Second)
+	s.stopNetGuard(c)
+}
+
+func (s *IntegrationSuite) TestNetworkGuard_NoThrottle() {
+	c := s.newNetGuardContainer([]string{"/other_tester"})
+	defer c.Terminate(s.ctx)
+
+	// Only SEND events enter the pipeline: host daemons (e.g. avahi) flood
+	// recvmsg, and with --no-throttle that noise would overflow the ring
+	// buffer / scroll the tail window before other_tester's events arrive.
+	s.exec(c, []string{"sh", "-c", "/other_tester udp-send-loop 127.0.0.1 9095 /tmp/go 50 > /tmp/send.log 2>&1 &"})
+	s.startNetworkGuardStd(c, "-w", guardBinaryFlag("/net_tester"), "-e", "SEND", "--no-throttle")
+
+	// The sender dials before the guard attaches, then sends 10 datagrams at
+	// 50ms once the marker appears. With --no-throttle every blocked send is
+	// logged; the default 250ms per-(type, comm) throttle would log ~2.
+	s.exec(c, []string{"touch", "/tmp/go"})
+	s.waitForNetGuardEventCount(c, "other_tester", "SEND", 6, 8*time.Second)
 	s.stopNetGuard(c)
 }
 

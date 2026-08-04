@@ -161,6 +161,7 @@ sudo ./build/linux/app-listener network-guard -b /usr/bin/wget --headless
 | `-w, --whitelist <binary>` | — | Whitelist mode: block AF_INET/AF_INET6 for **all** binaries except the listed ones (default deny). Repeatable, mutually exclusive with `-b`. |
 | `--unsafe` | `false` | Also block AF_UNIX sockets (used by X11, D-Bus, systemd activation). Only valid with `-w`, and may break desktop applications. Requires confirmation. |
 | `--auto-infra` | `false` | Automatically allowlist running essential system network daemons (DNS resolver, network manager, etc.). Only valid with `-w`. |
+| `--no-throttle` | `false` | Emit every network event without rate limiting (default: 1 event per type+process per 250ms, which protects the ring buffer from being flooded by noisy host processes in whitelist mode). |
 | `-e, --events <list>` | all | Event filter: comma-separated (`CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN`) |
 | `--headless` | `false` | No TUI, log NETGUARD\| events to stderr |
 

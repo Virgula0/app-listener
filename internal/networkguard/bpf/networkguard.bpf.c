@@ -56,13 +56,14 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 3);
+	__uint(max_entries, 4);
 	__type(key, __u32);
 	__type(value, __u64);
 } guard_net_config SEC(".maps");
 /* config[0] = default_action (0=allow, 1=block)
  * config[1] = blocking_enabled (0=events only, 1=real blocking)
  * config[2] = unsafe_families (0=AF_INET/AF_INET6 only, 1=all families)
+ * config[3] = throttle_enabled (0=emit every event, 1=rate-limit per (type, comm))
  */
 
 struct {
@@ -200,19 +201,24 @@ static __always_inline int is_event_type_allowed(__u32 type)
 static __always_inline long emit_event(struct net_guard_event *e)
 {
 	/* Rate-limit per (type, comm) so a busy host cannot overflow the ring
-	 * buffer and drop events of interest. */
-	struct throttle_key tk = {
-		.type = e->type,
-	};
-	__builtin_memcpy(tk.comm, e->comm, sizeof(e->comm));
+	 * buffer and drop events of interest. Disabled via config[3] when full
+	 * event fidelity is required (--no-throttle). */
+	__u32 ckey = 3;
+	__u64 *throttle_on = bpf_map_lookup_elem(&guard_net_config, &ckey);
+	if (!throttle_on || *throttle_on != 0) {
+		struct throttle_key tk = {
+			.type = e->type,
+		};
+		__builtin_memcpy(tk.comm, e->comm, sizeof(e->comm));
 
-	__u64 now = bpf_ktime_get_ns();
-	__u64 *last = bpf_map_lookup_elem(&guard_net_throttle, &tk);
-	if (last) {
-		if (now - *last < EVENT_THROTTLE_NS)
-			return 0;
+		__u64 now = bpf_ktime_get_ns();
+		__u64 *last = bpf_map_lookup_elem(&guard_net_throttle, &tk);
+		if (last) {
+			if (now - *last < EVENT_THROTTLE_NS)
+				return 0;
+		}
+		bpf_map_update_elem(&guard_net_throttle, &tk, &now, BPF_ANY);
 	}
-	bpf_map_update_elem(&guard_net_throttle, &tk, &now, BPF_ANY);
 
 	struct net_guard_event *out;
 	out = bpf_ringbuf_reserve(&guard_net_rb, sizeof(*out), 0);

@@ -54,9 +54,10 @@ type NetGuard struct {
 	unsafe   bool
 	eventset []ebpf.NetEventType
 	ownPID   int
+	throttle bool
 }
 
-func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType, unsafe bool) (*NetGuard, error) {
+func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType, unsafe, throttle bool) (*NetGuard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("failed to remove memlock rlimit: %v", err)
 	}
@@ -77,6 +78,7 @@ func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType
 		unsafe:   unsafe,
 		eventset: es,
 		ownPID:   os.Getpid(),
+		throttle: throttle,
 	}
 
 	var objs GuardNetObjects
@@ -195,6 +197,16 @@ func (g *NetGuard) populateMaps() error {
 	}
 	if err := g.objs.GuardNetConfig.Put(uint32(2), unsafeFamilies); err != nil {
 		return fmt.Errorf("setting unsafe families: %w", err)
+	}
+
+	// Config[3]: throttle_enabled — rate-limit events per (type, comm) to
+	// protect the ring buffer from flooding; disabled with --no-throttle.
+	throttleEnabled := uint64(0)
+	if g.throttle {
+		throttleEnabled = 1
+	}
+	if err := g.objs.GuardNetConfig.Put(uint32(3), throttleEnabled); err != nil {
+		return fmt.Errorf("setting throttle enabled: %w", err)
 	}
 
 	bpfVal := bpfBlock

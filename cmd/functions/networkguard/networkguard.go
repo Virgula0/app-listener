@@ -28,6 +28,7 @@ var (
 	eventsFlag     []string
 	unsafeFlag     bool
 	autoInfraFlag  bool
+	noThrottleFlag bool
 )
 
 var NetworkGuardCmd = &cobra.Command{
@@ -60,6 +61,7 @@ Examples:
   app-listener network-guard -w /usr/bin/vim -e CONNECT,LISTEN
   app-listener network-guard -w /usr/bin/python3 --unsafe
   app-listener network-guard -w /usr/bin/firefox --auto-infra
+  app-listener network-guard -w /usr/bin/firefox --auto-infra --no-throttle
   app-listener network-guard`,
 	Args: cobra.NoArgs,
 	RunE: runNetworkGuard,
@@ -78,6 +80,8 @@ func init() {
 		"Also block AF_UNIX sockets (whitelist mode only). May break desktop applications that use X11/D-Bus communication")
 	NetworkGuardCmd.Flags().BoolVarP(&autoInfraFlag, "auto-infra", "", false,
 		"Automatically allowlist running system network daemons (e.g. the DNS resolver) in whitelist mode so they keep working")
+	NetworkGuardCmd.Flags().BoolVarP(&noThrottleFlag, "no-throttle", "", false,
+		"Emit every network event without rate limiting (default: 1 event per type+process per 250ms to protect the ring buffer from flooding)")
 }
 
 func runNetworkGuard(cmd *cobra.Command, args []string) error {
@@ -117,7 +121,7 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 		return checkErr
 	}
 
-	g, guardErr := networkguard.NewNetGuard(mode, binaries, parsedEvents, unsafeFlag)
+	g, guardErr := networkguard.NewNetGuard(mode, binaries, parsedEvents, unsafeFlag, !noThrottleFlag)
 	if guardErr != nil {
 		return fmt.Errorf("creating network guard: %w", guardErr)
 	}
@@ -129,7 +133,7 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 	defer g.Stop()
 
 	if entity.Headless {
-		runHeadless(g)
+		runHeadless(g, !noThrottleFlag)
 		return nil
 	}
 
@@ -219,7 +223,10 @@ func parseNetGuardEventsFlag(flag []string) ([]ebpf.NetEventType, error) {
 	return parsed, nil
 }
 
-func runHeadless(g *networkguard.NetGuard) {
+// runHeadless prints guard events to the log. When throttle is enabled, the
+// BPF layer already rate-limits per (type, comm); this printer additionally
+// deduplicates repeats within 1s. With --no-throttle every event is printed.
+func runHeadless(g *networkguard.NetGuard, throttle bool) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
@@ -238,12 +245,14 @@ func runHeadless(g *networkguard.NetGuard) {
 			if !ok {
 				return
 			}
-			k := eventKey{typ: ev.Type.String(), comm: ev.Comm}
-			now := time.Now()
-			if prev, seen := lastLog[k]; seen && now.Sub(prev) < time.Second {
-				continue
+			if throttle {
+				k := eventKey{typ: ev.Type.String(), comm: ev.Comm}
+				now := time.Now()
+				if prev, seen := lastLog[k]; seen && now.Sub(prev) < time.Second {
+					continue
+				}
+				lastLog[k] = now
 			}
-			lastLog[k] = now
 			log.Infof("NETGUARD|%s|%s|%s|%s|%s|%d|%d|%d|%d|%t",
 				ev.Type.String(), ev.Comm, ebpf.ProtocolString(ev.Protocol),
 				ev.SrcAddr, ev.DstAddr, ev.Size, ev.PID, ev.TID, ev.NetNS, ev.Blocked)
