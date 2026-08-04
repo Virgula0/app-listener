@@ -2,7 +2,6 @@ package networkguard
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,14 +10,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
@@ -30,11 +27,12 @@ const (
 	ModeWhitelist
 )
 
-type BinaryEntry struct {
-	Path string
-	Hash [sha256.Size]byte
-	Comm string
-}
+// BinaryEntry identifies a binary the network guard keys on. It is the
+// shared infrastructure type; this alias keeps the public API unchanged.
+type BinaryEntry = ebpf.BinaryEntry
+
+// ComputeBinaryEntry hashes a binary and derives its comm.
+var ComputeBinaryEntry = ebpf.ComputeBinaryEntry
 
 type NetGuardEvent struct {
 	ebpf.NetEvent
@@ -236,18 +234,14 @@ func eventTypeKey(et ebpf.NetEventType) (uint32, error) {
 }
 
 func statInodeKey(path string) (*GuardNetInodeKey, error) {
-	var es syscall.Stat_t
-	if err := syscall.Stat(path, &es); err != nil {
+	dev, ino, err := ebpf.StatInode(path)
+	if err != nil {
 		return nil, err
 	}
 	return &GuardNetInodeKey{
-		Dev: uint64(mkdev(unix.Major(es.Dev), unix.Minor(es.Dev))),
-		Ino: es.Ino,
+		Dev: dev,
+		Ino: ino,
 	}, nil
-}
-
-func mkdev(major, minor uint32) uint32 {
-	return (major << 20) | minor
 }
 
 var infraBinaries = []string{
@@ -436,24 +430,4 @@ func (g *NetGuard) cleanup() {
 	}
 	g.links = nil
 	g.objs.Close()
-}
-
-func ComputeBinaryEntry(path string) (BinaryEntry, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, err)
-	}
-
-	hash := sha256.Sum256(data)
-	comm := filepath.Base(path)
-
-	if len(comm) > 15 {
-		comm = comm[:15]
-	}
-
-	return BinaryEntry{
-		Path: path,
-		Hash: hash,
-		Comm: comm,
-	}, nil
 }

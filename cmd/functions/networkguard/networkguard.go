@@ -15,11 +15,11 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Virgula0/app-listener/cmd/common"
-	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/printers"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/networkguard"
 	"github.com/Virgula0/app-listener/internal/tui"
+	"github.com/Virgula0/app-listener/internal/usecase"
 )
 
 var (
@@ -29,6 +29,7 @@ var (
 	unsafeFlag     bool
 	autoInfraFlag  bool
 	noThrottleFlag bool
+	headless       bool
 )
 
 var NetworkGuardCmd = &cobra.Command{
@@ -74,7 +75,7 @@ func init() {
 		"Binary paths to whitelist (allow AF_INET/AF_INET6, block everything else)")
 	NetworkGuardCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
 		"Event types to intercept (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all)")
-	NetworkGuardCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
+	NetworkGuardCmd.Flags().BoolVarP(&headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	NetworkGuardCmd.Flags().BoolVarP(&unsafeFlag, "unsafe", "", false,
 		"Also block AF_UNIX sockets (whitelist mode only). May break desktop applications that use X11/D-Bus communication")
@@ -126,18 +127,20 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating network guard: %w", guardErr)
 	}
 
-	if startErr := g.Start(); startErr != nil {
+	ucase := usecase.NewNetworkGuardUseCase(g)
+
+	if startErr := ucase.Start(); startErr != nil {
 		return fmt.Errorf("starting network guard: %w", startErr)
 	}
 
-	defer g.Stop()
+	defer ucase.Stop()
 
-	if entity.Headless {
-		runHeadless(g, !noThrottleFlag)
+	if headless {
+		runHeadless(ucase, !noThrottleFlag)
 		return nil
 	}
 
-	return runTUI(g, mode, binaries)
+	return runTUI(ucase, mode, binaries)
 }
 
 // resolveGuardMode determines the guard mode from the CLI flags. When neither
@@ -172,7 +175,7 @@ func computeGuardBinaries(paths []string) ([]networkguard.BinaryEntry, error) {
 	return binaries, nil
 }
 
-func discoverInfra(mode networkguard.Mode, binaries []networkguard.BinaryEntry) ([]string, []networkguard.BinaryEntry, error) {
+func discoverInfra(mode networkguard.Mode, binaries []networkguard.BinaryEntry) (infraPaths []string, resolved []networkguard.BinaryEntry, err error) {
 	if mode != networkguard.ModeWhitelist || !autoInfraFlag {
 		return nil, binaries, nil
 	}
@@ -226,7 +229,7 @@ func parseNetGuardEventsFlag(flag []string) ([]ebpf.NetEventType, error) {
 // runHeadless prints guard events to the log. When throttle is enabled, the
 // BPF layer already rate-limits per (type, comm); this printer additionally
 // deduplicates repeats within 1s. With --no-throttle every event is printed.
-func runHeadless(g *networkguard.NetGuard, throttle bool) {
+func runHeadless(uc usecase.NetworkGuardUseCase, throttle bool) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
@@ -241,7 +244,7 @@ func runHeadless(g *networkguard.NetGuard, throttle bool) {
 
 	for {
 		select {
-		case ev, ok := <-g.Events():
+		case ev, ok := <-uc.Events():
 			if !ok {
 				return
 			}
@@ -262,12 +265,12 @@ func runHeadless(g *networkguard.NetGuard, throttle bool) {
 	}
 }
 
-func runTUI(g *networkguard.NetGuard, mode networkguard.Mode, binaries []networkguard.BinaryEntry) error {
+func runTUI(uc usecase.NetworkGuardUseCase, mode networkguard.Mode, binaries []networkguard.BinaryEntry) error {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	p := tea.NewProgram(
-		tui.NewNetGuardModel(g.Events(), mode, binaries),
+		tui.NewNetGuardModel(uc.Events(), mode, binaries),
 		tea.WithAltScreen(),
 	)
 

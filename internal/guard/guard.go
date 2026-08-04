@@ -2,7 +2,6 @@ package guard
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -35,11 +34,12 @@ const (
 	GUARD_ALLOW = 2
 )
 
-type BinaryEntry struct {
-	Path string
-	Hash [sha256.Size]byte
-	Comm string
-}
+// BinaryEntry identifies a binary the guard keys on. It is the shared
+// infrastructure type; this alias keeps the guard's public API unchanged.
+type BinaryEntry = ebpf.BinaryEntry
+
+// ComputeBinaryEntry hashes a binary and derives its comm.
+var ComputeBinaryEntry = ebpf.ComputeBinaryEntry
 
 type GuardEvent struct {
 	ebpf.FileEvent
@@ -181,14 +181,14 @@ func guardModeKey(m Mode) (uint64, error) {
 // guard_exe_actions, keyed by the binary's filesystem inode.
 func (g *Guard) addBinaryActions() error {
 	for _, b := range g.binaries {
-		var es syscall.Stat_t
-		if err := syscall.Stat(b.Path, &es); err != nil {
+		dev, ino, err := ebpf.StatInode(b.Path)
+		if err != nil {
 			log.Warnf("cannot stat binary %s for exe inode: %v", b.Path, err)
 			continue
 		}
 		inodeKey := GuardInodeKey{
-			Dev: uint64((unix.Major(es.Dev) << 20) | unix.Minor(es.Dev)),
-			Ino: es.Ino,
+			Dev: dev,
+			Ino: ino,
 		}
 		action := uint8(GUARD_BLOCK)
 		if g.mode == ModeWhitelist {
@@ -298,18 +298,14 @@ func (g *Guard) addBackingBlockDevice() error {
 }
 
 func (g *Guard) addInode(path string) error {
-	var s syscall.Stat_t
-	if err := syscall.Stat(path, &s); err != nil {
+	dev, ino, err := ebpf.StatInode(path)
+	if err != nil {
 		return err
 	}
 
-	major := unix.Major(s.Dev)
-	minor := unix.Minor(s.Dev)
-	kernelDev := uint64((major << 20) | minor)
-
 	key := GuardInodeKey{
-		Dev: kernelDev,
-		Ino: s.Ino,
+		Dev: dev,
+		Ino: ino,
 	}
 
 	var val uint8 = 1
@@ -447,26 +443,6 @@ func (g *Guard) isGuardedBinary(exePath string) bool {
 		}
 	}
 	return false
-}
-
-func ComputeBinaryEntry(path string) (BinaryEntry, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, err)
-	}
-
-	hash := sha256.Sum256(data)
-	comm := filepath.Base(path)
-
-	if len(comm) > 15 {
-		comm = comm[:15]
-	}
-
-	return BinaryEntry{
-		Path: path,
-		Hash: hash,
-		Comm: comm,
-	}, nil
 }
 
 func (g *Guard) Stop() {

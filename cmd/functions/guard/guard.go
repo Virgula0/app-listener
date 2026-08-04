@@ -12,10 +12,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Virgula0/app-listener/cmd/common"
-	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/printers"
 	"github.com/Virgula0/app-listener/internal/guard"
 	"github.com/Virgula0/app-listener/internal/tui"
+	"github.com/Virgula0/app-listener/internal/usecase"
 )
 
 var (
@@ -24,6 +24,7 @@ var (
 	eventsFlag     []string
 	guardRecursive bool
 	guardDepth     int
+	headless       bool
 )
 
 var GuardCmd = &cobra.Command{
@@ -51,7 +52,7 @@ func init() {
 		"Binary paths to whitelist (repeatable, mutually exclusive with -b)")
 	GuardCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
 		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP; default: all)")
-	GuardCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
+	GuardCmd.Flags().BoolVarP(&headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	GuardCmd.Flags().BoolVarP(&guardRecursive, "recursive", "r", true,
 		"Guard directory recursively")
@@ -67,11 +68,11 @@ func runGuard(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	parsedEvents, err := common.ParseEventsFlag(eventsFlag)
-	if err != nil {
+	// The fs guard engine does not consume an event filter; parsing still
+	// validates the -e flag values.
+	if _, err := common.ParseEventsFlag(eventsFlag); err != nil {
 		return err
 	}
-	entity.EventTypes = parsedEvents
 
 	printers.PrintLogo()
 
@@ -84,18 +85,20 @@ func runGuard(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating guard: %w", guardErr)
 	}
 
-	if startErr := g.Start(); startErr != nil {
+	ucase := usecase.NewGuardUseCase(g)
+
+	if startErr := ucase.Start(); startErr != nil {
 		return fmt.Errorf("starting guard: %w", startErr)
 	}
 
-	defer g.Stop()
+	defer ucase.Stop()
 
-	if entity.Headless {
-		runGuardHeadless(g)
+	if headless {
+		runGuardHeadless(ucase)
 		return nil
 	}
 
-	return runGuardTUI(g, guardPath, mode, binaries)
+	return runGuardTUI(ucase, guardPath, mode, binaries)
 }
 
 func resolveGuardConfig() (guard.Mode, []guard.BinaryEntry, error) {
@@ -130,13 +133,13 @@ func resolveGuardConfig() (guard.Mode, []guard.BinaryEntry, error) {
 	return mode, binaries, nil
 }
 
-func runGuardHeadless(g *guard.Guard) {
+func runGuardHeadless(uc usecase.GuardUseCase) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	for {
 		select {
-		case ev, ok := <-g.Events():
+		case ev, ok := <-uc.Events():
 			if !ok {
 				return
 			}
@@ -148,12 +151,12 @@ func runGuardHeadless(g *guard.Guard) {
 	}
 }
 
-func runGuardTUI(g *guard.Guard, guardPath string, mode guard.Mode, binaries []guard.BinaryEntry) error {
+func runGuardTUI(uc usecase.GuardUseCase, guardPath string, mode guard.Mode, binaries []guard.BinaryEntry) error {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	p := tea.NewProgram(
-		tui.NewGuardModel(g.Events(), guardPath, mode, binaries),
+		tui.NewGuardModel(uc.Events(), guardPath, mode, binaries),
 		tea.WithAltScreen(),
 	)
 

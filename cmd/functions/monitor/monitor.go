@@ -12,14 +12,21 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Virgula0/app-listener/cmd/common"
-	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/printers"
 	"github.com/Virgula0/app-listener/internal/gui"
 	"github.com/Virgula0/app-listener/internal/monitor"
 	"github.com/Virgula0/app-listener/internal/tui"
+	"github.com/Virgula0/app-listener/internal/usecase"
 )
 
-var watchPaths []string
+var (
+	watchPaths []string
+	eventsFlag []string
+
+	recursive bool
+	depth     int
+	headless  bool
+)
 
 var MonitorCmd = &cobra.Command{
 	Use:   "monitor",
@@ -40,16 +47,14 @@ Examples:
 	RunE: runMonitor,
 }
 
-var eventsFlag []string
-
 func init() {
 	MonitorCmd.Flags().StringSliceVarP(&watchPaths, "watch", "w", nil,
 		"Path to monitor (repeatable, required)")
-	MonitorCmd.Flags().BoolVarP(&entity.Recursive, "recursive", "r", false,
+	MonitorCmd.Flags().BoolVarP(&recursive, "recursive", "r", false,
 		"Monitor directory recursively (default: false)")
-	MonitorCmd.Flags().IntVarP(&entity.Depth, "depth", "d", 0,
+	MonitorCmd.Flags().IntVarP(&depth, "depth", "d", 0,
 		"Maximum directory depth (requires --recursive) (default: 0)")
-	MonitorCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
+	MonitorCmd.Flags().BoolVarP(&headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	MonitorCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
 		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP; default: all)")
@@ -59,9 +64,6 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 	if len(watchPaths) == 0 {
 		return errors.New("at least one -w/--watch path is required")
 	}
-
-	recursive := entity.Recursive
-	depth := entity.Depth
 
 	if depth > 0 && !recursive {
 		return errors.New("--depth requires --recursive flag")
@@ -83,7 +85,6 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 	if eventsErr != nil {
 		return eventsErr
 	}
-	entity.EventTypes = parsedEvents
 
 	printers.PrintLogo()
 
@@ -95,36 +96,40 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 	if monitorErr != nil {
 		return fmt.Errorf("creating monitor: %w", monitorErr)
 	}
+	mon.SetEventTypes(parsedEvents)
 
-	mon.SetEventTypes(entity.EventTypes)
+	ucase := usecase.NewMonitorUseCase(mon)
 
-	if startErr := mon.Start(); startErr != nil {
+	if startErr := ucase.Start(); startErr != nil {
 		return fmt.Errorf("starting monitor: %w", startErr)
 	}
 
-	defer mon.Stop()
+	defer ucase.Stop()
 
 	displayPaths := common.MakeDisplayPaths(rawTargets)
 
+	// --gui is a root persistent flag, inherited by this command.
+	launchGUI, _ := cmd.Flags().GetBool("gui")
+
 	switch {
-	case entity.Headless:
-		runHeadless(mon)
-	case entity.GUI:
-		gui.Run(mon.Events(), displayPaths, recursive, depth)
+	case headless:
+		runHeadless(ucase)
+	case launchGUI:
+		gui.Run(ucase.Events(), displayPaths, recursive, depth)
 	default:
-		return runTUI(mon, displayPaths, recursive, depth)
+		return runTUI(ucase, displayPaths, recursive, depth)
 	}
 
 	return nil
 }
 
-func runHeadless(mon *monitor.Monitor) {
+func runHeadless(uc usecase.MonitorUseCase) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	for {
 		select {
-		case ev, ok := <-mon.Events():
+		case ev, ok := <-uc.Events():
 			if !ok {
 				return
 			}
@@ -136,9 +141,9 @@ func runHeadless(mon *monitor.Monitor) {
 	}
 }
 
-func runTUI(mon *monitor.Monitor, paths []string, recursive bool, depth int) error {
+func runTUI(uc usecase.MonitorUseCase, paths []string, recursive bool, depth int) error {
 	p := tea.NewProgram(
-		tui.NewModel(mon.Events(), paths, recursive, depth),
+		tui.NewModel(uc.Events(), paths, recursive, depth),
 		tea.WithAltScreen(),
 	)
 

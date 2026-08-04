@@ -163,9 +163,15 @@ func TestStatInodeKey(t *testing.T) {
 	}
 }
 
-func TestMkdev(t *testing.T) {
-	dev := mkdev(8, 1)
+func TestStatInodeDevEncoding(t *testing.T) {
+	dev, ino, err := ebpf.StatInode("/proc/self/exe")
+	if err != nil {
+		t.Fatalf("StatInode: %v", err)
+	}
 	if dev == 0 {
 		t.Error("expected non-zero dev")
+	}
+	if ino == 0 {
+		t.Error("expected non-zero inode")
 	}
 }

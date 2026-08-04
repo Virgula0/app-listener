@@ -3,7 +3,6 @@ package cmd
 import (
 	"os"
 
-	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/functions/guard"
 	"github.com/Virgula0/app-listener/cmd/functions/monitor"
 	"github.com/Virgula0/app-listener/cmd/functions/networkguard"
@@ -27,6 +26,10 @@ Use --gui to launch the graphical interface instead of the terminal TUI
 }
 
 var logLevel string
+
+// guiFlag is a persistent root flag consumed by the monitor subcommand (the
+// only one that currently supports a GUI backend).
+var guiFlag bool
 
 func Execute() error {
 	return rootCmd.Execute()
@@ -52,7 +55,7 @@ func initLogger() {
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "info", "Set log level (debug, info, warn, error)")
-	rootCmd.PersistentFlags().BoolVarP(&entity.GUI, "gui", "", false, "Launch GUI instead of TUI (default: false)")
+	rootCmd.PersistentFlags().BoolVarP(&guiFlag, "gui", "", false, "Launch GUI instead of TUI (default: false)")
 	rootCmd.AddCommand(monitor.MonitorCmd)
 	rootCmd.AddCommand(guard.GuardCmd)
 	rootCmd.AddCommand(networkmonitor.NetworkMonitorCmd)

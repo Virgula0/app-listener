@@ -12,14 +12,17 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Virgula0/app-listener/cmd/common"
-	"github.com/Virgula0/app-listener/cmd/entity"
 	"github.com/Virgula0/app-listener/cmd/printers"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/networkmonitor"
 	"github.com/Virgula0/app-listener/internal/tui"
+	"github.com/Virgula0/app-listener/internal/usecase"
 )
 
-var eventsFlag []string
+var (
+	eventsFlag []string
+	headless   bool
+)
 
 var NetworkMonitorCmd = &cobra.Command{
 	Use:   "network-monitor <binary1> [binary2 ...]",
@@ -42,7 +45,7 @@ Examples:
 func init() {
 	NetworkMonitorCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
 		"Event types to monitor (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all)")
-	NetworkMonitorCmd.Flags().BoolVarP(&entity.Headless, "headless", "", false,
+	NetworkMonitorCmd.Flags().BoolVarP(&headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
 }
 
@@ -72,20 +75,21 @@ func runNetworkMonitor(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating network monitor: %w", netErr)
 	}
 
-	nm.SetEventTypes(parsedEvents)
+	ucase := usecase.NewNetworkMonitorUseCase(nm)
+	ucase.SetEventTypes(parsedEvents)
 
-	if startErr := nm.Start(); startErr != nil {
+	if startErr := ucase.Start(); startErr != nil {
 		return fmt.Errorf("starting network monitor: %w", startErr)
 	}
 
-	defer nm.Stop()
+	defer ucase.Stop()
 
-	if entity.Headless {
-		runHeadless(nm)
+	if headless {
+		runHeadless(ucase)
 		return nil
 	}
 
-	return runTUI(nm, binaries)
+	return runTUI(ucase, binaries)
 }
 
 func parseNetEventsFlag(flag []string) ([]ebpf.NetEventType, error) {
@@ -104,13 +108,13 @@ func parseNetEventsFlag(flag []string) ([]ebpf.NetEventType, error) {
 	return parsed, nil
 }
 
-func runHeadless(nm *networkmonitor.NetworkMonitor) {
+func runHeadless(uc usecase.NetworkMonitorUseCase) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	for {
 		select {
-		case ev, ok := <-nm.Events():
+		case ev, ok := <-uc.Events():
 			if !ok {
 				return
 			}
@@ -123,9 +127,9 @@ func runHeadless(nm *networkmonitor.NetworkMonitor) {
 	}
 }
 
-func runTUI(nm *networkmonitor.NetworkMonitor, binaries []networkmonitor.BinaryEntry) error {
+func runTUI(uc usecase.NetworkMonitorUseCase, binaries []networkmonitor.BinaryEntry) error {
 	p := tea.NewProgram(
-		tui.NewNetModel(nm.Events(), binaries),
+		tui.NewNetModel(uc.Events(), binaries),
 		tea.WithAltScreen(),
 	)
 
