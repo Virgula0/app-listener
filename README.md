@@ -3,6 +3,26 @@
 Monitor or guard file system operations (open, read, write, delete, rename, symlink, hardlink, mkdir, mmap) and network operations (TCP connect/accept/close, UDP send/recv, DNS) using eBPF.
 The Daemon is particularly useful to protect most important directories on the filesystem against credential info-stealers largely used by supply-chain attacks.
 
+## Contents
+
+- [Why](#why)
+- [Quick Start](#quick-start)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Compatibility](#compatibility)
+- [Modes](#modes)
+  - [monitor — observe events](#monitor--observe-events)
+  - [guard — block access](#guard--block-access)
+  - [network-monitor — watch network operations](#network-monitor--watch-network-operations)
+  - [network-guard — block or allow network operations](#network-guard--block-or-allow-network-operations)
+  - [daemon — ssh-guard style multi-directory whitelist with fscrypt lifecycle](#daemon--ssh-guard-style-multi-directory-whitelist-with-fscrypt-lifecycle)
+  - [install — interactive daemon installer (root only)](#install--interactive-daemon-installer-root-only)
+- [Debug](#debug)
+- [Makefile targets](#makefile-targets)
+- [Docker](#docker)
+- [Architecture](#architecture)
+  - [Key design decisions](#key-design-decisions)
+
 ## Why
 
 This can be seen as a more serious rewrite version of [arch-supply-chain-hardening](https://github.com/Virgula0/arch-app-armor-hardening), switching to `eBPF` and introducing a lot more features.
@@ -16,6 +36,53 @@ Tested on :
 
 Different kernel versions, patches and file systems may produce undesired results, security bypasses or general bugs.
 Before proceeding, it is important to know that this is a vibe-coding-like experiment and should not be used in any way to protect production-ready systems. It was mainly coded using the free `DeepSeek V4 Flash`.
+
+## Quick Start
+
+Want to protect your SSH keys, AI agent credentials, browser profiles and VPN
+configs with the daemon? Use the interactive installer:
+
+```bash
+# 1. Build (generates BPF bindings then compiles the Go binary)
+make build
+
+# 2. Run the installer wizard (root only, TUI): it builds the binary if
+#    missing, generates the fscrypt master key, discovers critical
+#    directories, encrypts the selected ones with backups, installs the
+#    systemd unit + pacman reload hook and enables the daemon
+sudo ./build/linux/app-listener install
+```
+
+All other modes:
+
+```bash
+# Monitor mode
+sudo ./build/linux/app-listener monitor -w /tmp
+
+# Guard mode — block everything
+sudo ./build/linux/app-listener guard /tmp
+
+# Guard mode — only cat is allowed
+sudo ./build/linux/app-listener guard /tmp -w /usr/bin/cat
+
+# Network monitor mode — watch bash network ops
+sudo ./build/linux/app-listener network-monitor /usr/bin/bash
+
+# Network-guard mode — block only curl
+sudo ./build/linux/app-listener network-guard -b /usr/bin/curl
+
+# Network-guard mode — whitelist firefox, keep DNS working
+sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
+
+# Generate the daemon's fscrypt master key
+sudo ./build/linux/app-listener daemon --genkey
+
+# Daemon mode — protect encrypted directories, reload after package updates
+sudo ./build/linux/app-listener daemon --headless
+sudo systemctl reload app-listener-daemon   # or: kill -HUP $(cat /run/app-listener-daemon.pid)
+```
+
+Exit the TUI with `q` or `Ctrl+C`.
 
 ## How it works
 
@@ -237,39 +304,216 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-## Quick Start
+### install — interactive daemon installer (root only)
+
+A TUI wizard that installs and configures the whole daemon stack above, in
+the exact order the setup must happen to be safe:
 
 ```bash
-# Build (generates BPF bindings then compiles Go binary)
-make build
-
-# Monitor mode
-sudo ./build/linux/app-listener monitor -w /tmp
-
-# Guard mode — block everything
-sudo ./build/linux/app-listener guard /tmp
-
-# Guard mode — only cat is allowed
-sudo ./build/linux/app-listener guard /tmp -w /usr/bin/cat
-
-# Network monitor mode — watch bash network ops
-sudo ./build/linux/app-listener network-monitor /usr/bin/bash
-
-# Network-guard mode — block only curl
-sudo ./build/linux/app-listener network-guard -b /usr/bin/curl
-
-# Network-guard mode — whitelist firefox, keep DNS working
-sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
-
-# Generate the daemon's fscrypt master key
-sudo ./build/linux/app-listener daemon --genkey
-
-# Daemon mode — protect encrypted directories, reload after package updates
-sudo ./build/linux/app-listener daemon --headless
-sudo systemctl reload app-listener-daemon   # or: kill -HUP $(cat /run/app-listener-daemon.pid)
+sudo ./build/linux/app-listener install
 ```
 
-Exit the TUI with `q` or `Ctrl+C`.
+The wizard (abort any step with `Esc`; completed steps stay completed):
+
+1. **Build** — if `build/linux/app-listener` is missing it runs `go build`
+   in the repository (the repo must be the working directory); fails fast
+   otherwise.
+2. **Master key** — generates `/etc/app-listener/fscrypt.key` if missing;
+   an existing key is kept (regenerating it would invalidate every
+   already-encrypted directory).
+3. **Users** — asks which users to protect: root plus the real users from
+   `/etc/passwd` (UID ≥ 1000, with a home directory), all preselected
+   (space/x toggles one, Ctrl+K toggles all/none, Enter continues). Root
+   is protected like any other user (`/root/.ssh` is the most valuable
+   target for a credential stealer), but no per-user ssh-agent unit is
+   installed for root.
+4. **Directory catalog** — probes the built-in catalog of critical
+   directories (SSH, GPG, AI agents, browsers, VPNs, password stores, ...)
+   **for every selected user** (each user's `.ssh`, `.gnupg`, ... is
+   resolved against that user's home) plus the system-level entries
+   (e.g. `/etc/wireguard`), and asks which discovered ones to protect. The
+   catalog lives in `internal/install/catalog.go` — edit it to add or
+   remove directories without touching the wizard.
+5. **Manual directories** — additional directories can be added by hand;
+   a path that does not exist is a fatal error (typos must not silently
+   protect nothing).
+6. **Editor** — shows the generated `daemon.conf` (whitelists are filtered
+   to the binaries actually present, `need_encryption` mirrors the
+   previous steps) in an embedded editor. Manual edits are preserved in
+   every later step. `Ctrl+S` saves, `Esc` aborts the install.
+7. **Key verification** — checks the encryption state of **every**
+   configured directory, always: an already-encrypted directory whose
+   section declares `need_encryption: false` is a fatal error (an
+   encrypted directory must never be left unmanaged). Every
+   already-encrypted directory is then tested against the master key; a
+   directory that does not unlock is a fatal error (fixing it with the
+   old key is impossible anyway, since the key is regenerated only with
+   confirmation).
+8. **Encryption** — asks per directory whether fscrypt encryption is
+   required, but **only for directories that are not yet encrypted**:
+   already-encrypted ones are never asked, never migrated and never get a
+   backup. Migrated directories are moved to `<dir>.app_listener.backup`,
+   recreated, encrypted in place with the master key, and the contents
+   are copied back with permissions, owners and timestamps preserved.
+9. **Deploy** — installs the systemd unit, the pacman reload hook
+   (`PostTransaction` → `systemctl kill -s HUP`) and a per-user
+   `ssh-agent` user unit (for the selected users) from the embedded
+   `daemon-samples/`; copies the binary to `/usr/local/sbin/app-listener`
+   and the config to `/etc/app-listener/daemon.conf` (0700/0600). Every
+   file that already exists is compared with the bundled version:
+   identical files are skipped, differing ones show the unified diff in
+   the TUI and ask whether to overwrite (same for an existing config).
+   Then the daemon is brought to the enabled-and-running state: a changed
+   config is delivered to an already-running daemon with `systemctl
+   reload` (SIGHUP) instead of a restart, a stopped daemon is started,
+   and `is-enabled`/`is-active` are verified as `enabled`/`active`.
+10. **Backup cleanup** — asks per backup whether to delete the
+    `.app_listener.backup` directories left by the migration (kept by
+    default so nothing is lost after an interrupted migration).
+
+The whole migration can be undone with `sudo app-listener install
+--restore-backups`: the found `.app_listener.backup` directories are shown
+in a TUI list (all preselected) and, after a single confirmation, each
+encrypted directory is deleted and its backup moved back, restoring the
+original unencrypted content. It **aborts** while the daemon is running —
+stop it first with `systemctl stop app-listener-daemon`. The backups can
+also be deleted standalone with `sudo app-listener install
+--delete-post-backups` (same list + confirmation flow). Both options show
+a TUI progress bar while running, and during the encryption step of a
+regular install a TUI progress bar shows the copy progress.
+
+Re-runs are safe: the installer detects a completed or interrupted
+installation and resumes it (existing master key kept, already encrypted
+directories verified, identical files skipped, backups never overwritten,
+config reloaded instead of blindly rewritten).
+
+Safety properties:
+
+- A directory whose `.app_listener.backup` already exists **aborts** the
+  migration: an older backup is never overwritten, and the migration can
+  be resumed manually from the backup.
+- The encryption state of every configured directory is always checked:
+  a directory that is already encrypted but declared
+  `need_encryption: false` is a **fatal error** — the installer exits
+  instead of leaving an encrypted directory unmanaged.
+- Already-encrypted directories are never asked about encryption and are
+  never migrated, so no backup is created for them.
+- If the fscrypt policy cannot be applied (unsupported filesystem, wrong
+  kernel, ...), the migration rolls back: the backup is removed and the
+  original directory restored untouched.
+- Whitelists are filtered against the binaries actually present; a
+  protected directory whose whitelist would end up empty still gets an
+  explicit denial for everything, and the wizard logs a warning telling
+  you to add binaries in the editor.
+- The daemon unit runs with `ProtectSystem=yes`, `PrivateTmp=yes` and
+  `NoNewPrivileges=yes`; the binary itself runs as root like its
+  predecessor (eBPF loading requires it).
+
+## Debug
+
+Everything lives in three places: the binary (`/usr/local/sbin/app-listener`),
+the config (`/etc/app-listener/daemon.conf`) and the master key
+(`/etc/app-listener/fscrypt.key`).
+
+### Daemon status and logs
+
+```bash
+# Is it enabled across reboots and running right now?
+systemctl is-enabled app-listener-daemon     # expect: enabled
+systemctl is-active  app-listener-daemon     # expect: active
+
+# Full status, recent errors and the journal tail
+systemctl status app-listener-daemon
+journalctl -u app-listener-daemon -e         # jump to the end (errors are here)
+journalctl -u app-listener-daemon -b         # current boot only
+journalctl -u app-listener-daemon -f         # follow live
+
+# Only the guard decisions (whitelist hits and denials):
+sudo journalctl -u app-listener-daemon -f | grep -i denied
+```
+
+### Reload after a package upgrade
+
+The whitelist is matched by binary inode, so `pacman -Syu` replacing a
+whitelisted binary locks it out until the config is reloaded:
+
+```bash
+sudo systemctl reload app-listener-daemon   # SIGHUP: recomputes identities atomically
+sudo systemctl kill -s HUP app-listener-daemon   # same, done automatically by the pacman hook
+```
+
+A malformed config keeps the previous one running — the daemon only ever
+rejects a reload, never applies a half-broken one.
+
+### Test the guard manually
+
+Stop the service and run the daemon in the foreground for instant feedback
+(no systemd, events on stderr):
+
+```bash
+sudo systemctl stop app-listener-daemon
+sudo /usr/local/sbin/app-listener daemon --headless -l debug
+
+# In another terminal, this must WORK (whitelisted):
+ssh-add -l
+ssh -T git@github.com
+
+# This must be DENIED (not whitelisted) and logged as DAEMON [DENIED]:
+cat /home/alice/.ssh/id_ed25519
+```
+
+### fscrypt: check, unlock, lock
+
+All watched directories must carry an fscrypt policy unlocked with the
+master key in `/etc/app-listener/fscrypt.key`:
+
+```bash
+# Encryption state of a directory:
+sudo fscrypt status /home/alice/.ssh      # "Encrypted" / "Not encrypted"
+
+# Manually unlock with the daemon's master key:
+sudo fscrypt unlock /home/alice/.ssh --key=/etc/app-listener/fscrypt.key
+
+# Lock again (the daemon does this automatically at shutdown while the
+# guards are still attached, so there is never an unprotected window):
+sudo fscrypt lock /home/alice/.ssh
+
+# Wrong/old key? The unlock fails immediately with an "invalid wrapping
+# key" error — the daemon never silently generates a new key.
+```
+
+The daemon unlocks every `need_encryption: true` resource at startup and
+locks it again on shutdown. A resource without a policy makes the daemon
+refuse to start — check it with `fscrypt status` before complaining.
+
+### Migration backups and master key
+
+```bash
+# Backups left by the installer (safe to delete once the daemon is
+# verified active; kept by default on purpose):
+ls -ld /home/alice/.ssh.app_listener.backup
+sudo rm -rf /home/alice/.ssh.app_listener.backup
+
+# Restore from a backup after a disaster (stop the daemon first):
+sudo systemctl stop app-listener-daemon
+sudo mv /home/alice/.ssh.app_listener.backup /home/alice/.ssh
+
+# Master key location and permissions (must be 0600):
+sudo ls -l /etc/app-listener/fscrypt.key
+
+# Regenerating the key invalidates every provisioned policy — only do it
+# with confirmation, then re-run the installer so directories are
+# re-encrypted:
+sudo /usr/local/sbin/app-listener daemon --genkey
+```
+
+### ssh-agent (per user)
+
+```bash
+systemctl --user status ssh-agent           # run as the user, not root
+journalctl --user -u ssh-agent -b -f
+systemctl --user start ssh-agent            # or just relogin
+```
 
 ## Makefile targets
 

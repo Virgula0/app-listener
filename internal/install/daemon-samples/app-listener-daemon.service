@@ -1,0 +1,26 @@
+[Unit]
+Description=app-listener daemon (eBPF LSM directory guard)
+Documentation=https://github.com/Virgula0/app-listener
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/app-listener daemon --headless
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+User=root
+Group=root
+
+PrivateTmp=yes
+ProtectSystem=yes
+ReadWritePaths=/run /etc/app-listener
+NoNewPrivileges=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=app-listener-daemon
+
+[Install]
+WantedBy=multi-user.target

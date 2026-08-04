@@ -101,3 +101,24 @@ func TestReadKeyFromRoundTrip(t *testing.T) {
 		t.Fatalf("read key = %v, want %v", got, want)
 	}
 }
+
+// TestIsEncryptedRegularFile verifies that a plain file is reported as
+// "not encrypted" (fscrypt policies exist only on directories) and that a
+// missing path still surfaces an error.
+func TestIsEncryptedRegularFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := (&Vault{}).IsEncrypted(file)
+	if err != nil {
+		t.Fatalf("IsEncrypted on a file: %v", err)
+	}
+	if encrypted {
+		t.Error("a regular file must never report as encrypted")
+	}
+
+	if _, err := (&Vault{}).IsEncrypted(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("IsEncrypted on a missing path must error")
+	}
+}

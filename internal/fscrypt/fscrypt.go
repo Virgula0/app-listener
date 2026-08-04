@@ -42,10 +42,14 @@ func New() *Vault {
 }
 
 // hasEncryptionPolicy reports whether the directory at dirPath carries an
-// fscrypt encryption policy (v1 or v2).
+// fscrypt encryption policy (v1 or v2). Regular files can never carry a
+// policy, so a non-directory reports "not encrypted" instead of erroring.
 func hasEncryptionPolicy(dirPath string) (bool, error) {
 	dirFd, err := unix.Open(dirPath, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 	if err != nil {
+		if errors.Is(err, unix.ENOTDIR) {
+			return false, nil
+		}
 		return false, fmt.Errorf("open %s: %w", dirPath, err)
 	}
 	defer unix.Close(dirFd)
@@ -61,7 +65,12 @@ func hasEncryptionPolicy(dirPath string) (bool, error) {
 	if errno == 0 {
 		return true, nil
 	}
-	if errors.Is(errno, unix.ENODATA) || errors.Is(errno, unix.EOPNOTSUPP) {
+	// ENODATA: no policy set. EOPNOTSUPP/ENOTTY: the filesystem does not
+	// support encryption policies at all (tmpfs, FAT, ...), so it can
+	// never carry an encrypted directory.
+	if errors.Is(errno, unix.ENODATA) ||
+		errors.Is(errno, unix.EOPNOTSUPP) ||
+		errors.Is(errno, unix.ENOTTY) {
 		return false, nil
 	}
 	return false, fmt.Errorf("ioctl GET_ENCRYPTION_POLICY_EX on %s: %w", dirPath, errno)
