@@ -86,6 +86,26 @@ func (v *Vault) IsProvisioned(path string) (bool, error) {
 	return policy.IsProvisionedByTargetUser(), nil
 }
 
+// readKey returns the 32-byte master key, failing when the file is
+// missing. The key is never generated implicitly: for an already encrypted
+// directory a freshly generated key can never unlock the policy, so a
+// missing file is always a misconfiguration to surface, not to paper over.
+func readKey() ([]byte, error) {
+	return readKeyFrom(MasterKeyFile)
+}
+
+func readKeyFrom(keyFile string) ([]byte, error) {
+	data, err := os.ReadFile(keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read master key %s: %w", keyFile, err)
+	}
+	if len(data) != FscryptKeySize {
+		return nil, fmt.Errorf("master key %s must be exactly %d bytes, got %d",
+			keyFile, FscryptKeySize, len(data))
+	}
+	return data, nil
+}
+
 // readOrCreateKey returns the 32-byte master key, generating it on first
 // use. Generation is atomic (O_EXCL); a lost race re-reads the winner's key.
 func readOrCreateKey() ([]byte, error) {
@@ -180,6 +200,25 @@ func GenerateMasterKey(force bool) error {
 	return os.Rename(tmpPath, MasterKeyFile)
 }
 
+// newBoundedKeyFn returns the key callback passed to policy.Unlock. The
+// google/fscrypt unwrap loop (actions/callback.go, unwrapProtectorKey)
+// re-invokes the callback with retry=true whenever the returned key fails
+// to unwrap a protector, and only a callback error aborts the loop — a
+// callback that keeps returning the same wrong key spins forever, logging
+// "invalid wrapping key for protector ..." at full speed. Because the
+// daemon has exactly one master key, a retry can never succeed: the first
+// failed unwrap is answered with an error that terminates the loop and
+// names the key file in question.
+func newBoundedKeyFn(masterKey []byte) actions.KeyFunc {
+	return func(info actions.ProtectorInfo, retry bool) (*crypto.Key, error) {
+		if retry {
+			return nil, fmt.Errorf("invalid wrapping key for protector %s: master key %s does not match the policy",
+				info.Descriptor(), MasterKeyFile)
+		}
+		return crypto.NewFixedLengthKeyFromReader(bytes.NewReader(masterKey), FscryptKeySize)
+	}
+}
+
 // Unlock provisions the policy key of path so its contents become
 // readable. It is a no-op when the policy is already provisioned by the
 // target user.
@@ -196,9 +235,9 @@ func (v *Vault) Unlock(path string) error {
 		return nil
 	}
 
-	keyBytes, err := readOrCreateKey()
+	keyBytes, err := readKey()
 	if err != nil {
-		return fmt.Errorf("read master key: %w", err)
+		return fmt.Errorf("unlock %s: %w", path, err)
 	}
 	defer func() {
 		for i := range keyBytes {
@@ -209,10 +248,7 @@ func (v *Vault) Unlock(path string) error {
 	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
 		return 0, nil
 	}
-	keyFn := func(_ actions.ProtectorInfo, _ bool) (*crypto.Key, error) {
-		return crypto.NewFixedLengthKeyFromReader(bytes.NewReader(keyBytes), FscryptKeySize)
-	}
-	if err := policy.Unlock(optionFn, keyFn); err != nil {
+	if err := policy.Unlock(optionFn, newBoundedKeyFn(keyBytes)); err != nil {
 		return fmt.Errorf("unlock policy for %s: %w", path, err)
 	}
 	defer func() { _ = policy.Lock() }()
