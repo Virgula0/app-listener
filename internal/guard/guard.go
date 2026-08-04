@@ -57,11 +57,45 @@ type Guard struct {
 	path      string
 	mode      Mode
 	binaries  []BinaryEntry
+	exeEvents map[string][]ebpf.EventType
 	recursive bool
 	depth     int
 }
 
-func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, depth int) (*Guard, error) {
+// GuardOption customizes a Guard before its BPF maps are populated.
+type GuardOption func(*Guard)
+
+// WithBinaryEvents restricts each listed binary to the given event types
+// (blocking semantics: unlisted events are denied with EPERM). Binaries
+// without an entry keep allowing every event, preserving the plain guard
+// behavior.
+func WithBinaryEvents(events map[string][]ebpf.EventType) GuardOption {
+	return func(g *Guard) {
+		g.exeEvents = events
+	}
+}
+
+// eventMask converts event types into the BPF bitmask stored in
+// guard_exe_events. Listing READ, WRITE or MMAP implicitly allows OPEN: a
+// binary cannot perform those operations without opening the file first.
+// The returned mask never has the OPEN bit cleared when any of those three
+// is present.
+func eventMask(types []ebpf.EventType) (uint32, error) {
+	var mask uint32
+	for _, t := range types {
+		if t < 0 || t >= 32 {
+			return 0, fmt.Errorf("event type %d out of range", t)
+		}
+		mask |= 1 << uint(t) //nolint:gosec // t is range-checked to [0, 32) above
+		switch t {
+		case ebpf.EventRead, ebpf.EventWrite, ebpf.EventMmap:
+			mask |= 1 << uint(ebpf.EventOpen)
+		}
+	}
+	return mask, nil
+}
+
+func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, depth int, opts ...GuardOption) (*Guard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("failed to remove memlock rlimit: %v", err)
 	}
@@ -77,6 +111,9 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		binaries:  entries,
 		recursive: recursive,
 		depth:     depth,
+	}
+	for _, opt := range opts {
+		opt(g)
 	}
 
 	var objs GuardObjects
@@ -201,6 +238,36 @@ func (g *Guard) addBinaryActions() error {
 	return nil
 }
 
+// addBinaryEvents stores the per-binary allowed-event bitmasks in
+// guard_exe_events. Only binaries with an explicit event list are stored;
+// the BPF layer treats a missing entry as "all events allowed".
+func (g *Guard) addBinaryEvents() error {
+	for _, b := range g.binaries {
+		types, ok := g.exeEvents[b.Path]
+		if !ok {
+			continue
+		}
+		if g.mode != ModeWhitelist {
+			return fmt.Errorf("per-binary event restrictions are only supported in whitelist mode (binary %s)", b.Path)
+		}
+		if len(types) == 0 {
+			continue // empty list = all events allowed = no mask entry
+		}
+		mask, err := eventMask(types)
+		if err != nil {
+			return fmt.Errorf("invalid event mask for binary %s: %w", b.Path, err)
+		}
+		dev, ino, err := ebpf.StatInode(b.Path)
+		if err != nil {
+			return fmt.Errorf("cannot stat binary %s for event mask: %w", b.Path, err)
+		}
+		if err := g.objs.GuardExeEvents.Put(GuardInodeKey{Dev: dev, Ino: ino}, mask); err != nil {
+			return fmt.Errorf("storing exe events for %s: %w", b.Path, err)
+		}
+	}
+	return nil
+}
+
 func (g *Guard) populateMaps() error {
 	modeKey, err := guardModeKey(g.mode)
 	if err != nil {
@@ -242,6 +309,10 @@ func (g *Guard) populateMaps() error {
 
 	if binErr := g.addBinaryActions(); binErr != nil {
 		return binErr
+	}
+
+	if eventsErr := g.addBinaryEvents(); eventsErr != nil {
+		return eventsErr
 	}
 
 	// Store the guarded path for symlink target matching

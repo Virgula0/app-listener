@@ -105,7 +105,7 @@ func (m *netModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		syncViewport(&m.viewport, &m.ready, m.width, m.height, 4, 3, m.renderNetViewport)
+		syncViewport(&m.viewport, &m.ready, m.width, m.height, 4, m.renderNetViewport)
 
 	case netEventMsg:
 		ev := ebpf.NetEvent(msg)

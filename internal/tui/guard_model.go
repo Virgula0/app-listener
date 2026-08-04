@@ -110,7 +110,7 @@ func (m *guardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		syncViewport(&m.viewport, &m.ready, m.width, m.height, 4, 3, m.renderGuardViewport)
+		syncViewport(&m.viewport, &m.ready, m.width, m.height, 4, m.renderGuardViewport)
 
 	case guardEventMsg:
 		ev := guard.GuardEvent(msg)
@@ -161,33 +161,7 @@ func (m *guardModel) addGuardEvent(ev *guard.GuardEvent) {
 		m.allowed++
 	}
 
-	ts := time.Unix(0, ev.Timestamp).Format("15:04:05.000")
-	t := formatGuardType(ev.Type)
-	decision := formatDecision(ev.Blocked)
-
-	pathPart := ev.Path
-	extra := ""
-
-	switch ev.Type {
-	case ebpf.EventRead, ebpf.EventWrite:
-		extra = fmt.Sprintf(" fd=%d", ev.FD)
-	case ebpf.EventRename:
-		extra = fmt.Sprintf(" \u2192 %s", ev.Dest)
-	case ebpf.EventSymlink:
-		extra = fmt.Sprintf(" \u2192 %s", ev.Dest)
-	case ebpf.EventHardlink:
-		extra = fmt.Sprintf(" \u2192 %s", ev.Dest)
-	}
-
-	line := fmt.Sprintf("%s %s %s %s[%d] %s%s",
-		timeStyle.Render(ts),
-		t,
-		decision,
-		commStyle.Render(ev.Comm),
-		ev.PID,
-		pathPart,
-		extra,
-	)
+	line := formatGuardEventLine(ev)
 
 	m.lines = append(m.lines, guardEventLine{event: *ev, line: line})
 	if len(m.lines) > maxGuardEvents {

@@ -1,6 +1,7 @@
 # app-listener
 
 Monitor or guard file system operations (open, read, write, delete, rename, symlink, hardlink, mkdir, mmap) and network operations (TCP connect/accept/close, UDP send/recv, DNS) using eBPF.
+The Daemon is particularly useful to protect most important directories on the filesystem against credential info-stealers largely used by supply-chain attacks.
 
 ## Why
 
@@ -95,7 +96,7 @@ sudo ./build/linux/app-listener guard /data --recursive --depth 2 -b /usr/bin/ca
 | `-e, --events <list>` | all | Event type filter (same as monitor) |
 | `--headless` | `false` | No TUI, log GUARD\| events to stderr |
 
-Guard mode uses binary **SHA256 hashes** to identify processes — not path names — so renaming a blacklisted binary does not bypass the policy.
+Guard mode identifies processes by the **exe inode** (read from `current->mm->exe_file->f_inode` in BPF) — not path names — so renaming a blacklisted binary does not bypass the policy.
 
 ### network-monitor — watch network operations
 
@@ -184,6 +185,58 @@ sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto
 
 Note that `readlink -f` resolves symlinks but **not** shell wrappers (a `#!/bin/sh` script is still a script). For wrapper scripts, read the `exec` target inside the file and use that path.
 
+### daemon — ssh-guard style multi-directory whitelist with fscrypt lifecycle
+
+A config-file driven daemon that protects any number of directories with the guard's whitelist engine, and manages their fscrypt encryption lifecycle: encrypted resources are unlocked at startup, locked again on shutdown **while the guards remain attached**, so there is never an unprotected window. A successor of the [ssh-guard](https://github.com/Virgula0/arch-app-armor-hardening) daemon: same philosophy, LSM engine instead of fanotify, and no `chattr`/`exclude_chattr` (the LSM engine provides the same granularity).
+
+```bash
+# Generate the fscrypt master key (asks for confirmation if one already exists)
+sudo ./build/linux/app-listener daemon --genkey
+
+# Run with the default config (/etc/app-listener/daemon.conf, else daemon-samples/daemon.conf)
+sudo ./build/linux/app-listener daemon
+
+# Run with an explicit config, printing events to journald (systemd style)
+sudo ./build/linux/app-listener daemon --config /etc/ssh-guard/config --headless
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config <path>` | — | Config file. Resolved as: `--config` flag → `/etc/app-listener/daemon.conf` → `daemon-samples/daemon.conf` in the working directory |
+| `--headless` | `false` | No TUI, print `DAEMON [DENIED]\|` lines to stderr (captured by journald when run as a systemd service) |
+| `--genkey` | `false` | Generate the fscrypt master key file and exit. If the key already exists, asks `Regenerate? [y/N]` on the terminal first — regenerating invalidates every fscrypt directory provisioned with the old key |
+
+Config file grammar (see `daemon-samples/daemon.conf` for the full template):
+
+```text
+[watch /home/alice/.ssh]          # one section per protected directory
+need_encryption: true             # default true; false skips the fscrypt lifecycle
+/usr/bin/ssh READ,WRITE           # whitelisted binary, restricted to these events
+/usr/bin/ssh-agent                # bare path = all events allowed
+```
+
+- **Whitelist only** (default deny): only the listed binaries may access the watched directory; identity is by binary inode, so renaming a binary to `ssh` does not grant access.
+- **Per-binary event restrictions with blocking semantics**: unlisted events are denied with EPERM. Listing `READ`, `WRITE` or `MMAP` implicitly allows `OPEN` (a binary must open a file before reading it). Valid events: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP`.
+- **Missing paths and binaries are skipped with a warning** (like ssh-guard); the directives of a skipped section are ignored with it. Malformed directives inside a valid section fail fast — a security configuration must not be silently misread.
+- **SIGHUP reloads the configuration** (`systemctl reload`, `kill -HUP <pid>`): every binary's identity is recomputed by inode, so after a package upgrade replaced a whitelisted binary (`pacman -Syu`) a reload restores access for the new binary immediately. The new guards attach before the old ones detach — during the transition the kernel stacks both LSM programs and denies when *any* of them denies — so protection is never weaker than either configuration. A malformed config (or a failed reload) keeps the previous configuration running.
+- **fscrypt lifecycle**: resources with `need_encryption: true` must already carry an fscrypt policy (run the fscrypt migration first) or the daemon refuses to start. On shutdown the keys are deprovisioned in two passes (first pass, then a force-flush pass with an EBUSY retry loop) while the guards still deny access, and only then are the LSM hooks detached — strictly stronger than ssh-guard's teardown, which removed its marks before the final lock pass.
+
+Example systemd unit:
+
+```ini
+[Unit]
+Description=app-listener daemon (fscrypt + eBPF LSM whitelist)
+
+[Service]
+ExecStart=/usr/local/bin/app-listener daemon --headless
+ExecReload=/bin/kill -HUP $MAINPID
+NotifyAccess=all
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
 ## Quick Start
 
 ```bash
@@ -207,6 +260,13 @@ sudo ./build/linux/app-listener network-guard -b /usr/bin/curl
 
 # Network-guard mode — whitelist firefox, keep DNS working
 sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
+
+# Generate the daemon's fscrypt master key
+sudo ./build/linux/app-listener daemon --genkey
+
+# Daemon mode — protect encrypted directories, reload after package updates
+sudo ./build/linux/app-listener daemon --headless
+sudo systemctl reload app-listener-daemon   # or: kill -HUP $(cat /run/app-listener-daemon.pid)
 ```
 
 Exit the TUI with `q` or `Ctrl+C`.
@@ -248,7 +308,9 @@ cmd/
   functions/guard/     — "guard" subcommand, wires eBPF LSM + TUI/headless
   functions/networkmonitor/ — "network-monitor" subcommand, wires eBPF tracepoints + TUI/headless
   functions/networkguard/  — "network-guard" subcommand, wires eBPF LSM hooks + TUI/headless
-  entity/              — shared flag types (Recursive, Depth, Headless, EventTypes)
+  functions/daemon/    — "daemon" subcommand: config file, --genkey, SIGHUP reload, headless/TUI
+  common/              — shared eBPF availability check
+  printers/            — logo printing
 
 internal/
   infrastructure/
@@ -286,10 +348,26 @@ internal/
     guardnet_bpf.go          — bpf2go generated Go bindings
     networkguard.go          — loads BPF, attaches LSM programs, enforces blacklist/whitelist policy, --auto-infra discovery
 
+  daemonconfig/
+    daemonconfig.go      — [watch <dir>] config parser (event lists, need_encryption, skip tolerance)
+
+  fscrypt/
+    fscrypt.go           — fscrypt vault: master key, policy detection, unlock/lock lifecycle
+
+  repository/
+    repository.go        — ports (GuardRepository, MonitorRepository, …)
+    vault.go             — Vault port + ErrKeyBusy/ErrKeyMissing sentinels
+
+  usecase/
+    daemon.go            — daemon orchestration: start/stop, TOC-TOU-safe shutdown, atomic SIGHUP reload
+    monitor.go, guard.go, networkmonitor.go, networkguard.go — other modes' orchestration
+
   tui/
     model.go           — bubbletea TUI with viewport, colored events (monitor)
     guardmodel.go      — bubbletea TUI for guard mode
     network_model.go   — bubbletea TUI for network-monitor mode
+    daemon_model.go    — bubbletea TUI for daemon mode (per-resource status + merged events)
+    eventline.go       — shared guard/daemon event line formatting
 
 integrationtests/
   main_test.go         — suite setup, container helpers, log diff utilities
@@ -306,8 +384,12 @@ integrationtests/
 - **CO-RE**: Compiled against `vmlinux.h` for portability across kernel versions without per-kernel recompilation.
 - **Embedded BPF**: The compiled BPF `.o` is embedded in the Go binary — no runtime compilation or external dependencies.
 - **PID filter**: Events from the monitor's own process are discarded to avoid feedback loops.
-- **Binary identity via SHA256**: Guard identifies processes by cryptographic hash of the executable, not by path — renaming a binary does not bypass policy.
-- **Binary identity via exe inode**: Network-monitor identifies processes by the exe file inode read directly from `current->mm->exe_file->f_inode` in BPF, preventing comm-spoofing.
+- **Binary identity via exe inode**: Guard and network-monitor identify processes by the exe file inode read directly from `current->mm->exe_file->f_inode` in BPF, not by path — renaming a binary does not bypass policy and comm-spoofing via `prctl(PR_SET_NAME)` cannot fool it.
 - **LSM socket hooks for network-guard**: blocking is enforced by returning `-EPERM` from `socket_connect`, `socket_bind`, `socket_listen`, `socket_sendmsg` and `socket_recvmsg` — the only kernel mechanism that can deny a socket operation.
 - **Safety boundary in whitelist mode**: by default whitelist mode only guards AF_INET/AF_INET6, leaving AF_UNIX (D-Bus, X11, systemd activation) untouched so desktop environments keep working. `--unsafe` extends guarding to all address families, at the risk of breaking the desktop.
 - **`--auto-infra` keeps the system resolvable**: whitelist mode denies AF_INET/AF_INET6 for every process not explicitly allowed, including essential system daemons. Without an exception, `systemd-resolved` — which performs upstream DNS lookups on behalf of all processes (via the `resolve` NSS module) — would be blocked, breaking name resolution even for whitelisted apps. `--auto-infra` discovers running infra daemons (`systemd-resolved`, `NetworkManager`, `systemd-networkd`) via `/proc/*/exe` and allowlists them automatically.
+- **Daemon reload without a protection gap (SIGHUP)**: reloading never detaches a guard whose replacement is not attached first. The new LSM programs are attached (and their ringbuf readers started) before the old ones are stopped; during the transition the kernel runs both programs and denies an access when any of them denies, so protection is strictly the intersection — never weaker than either configuration. A failed reload detaches the new guards and keeps the previous configuration running.
+- **TOC-TOU-safe fscrypt teardown in the daemon**: shutdown locks every encrypted resource through a two-pass deprovision (first pass, then a force-flush pass with an EBUSY retry loop) **while the guards still deny access**, and detaches the LSM hooks only after every vault is keyless — no new open can pin an inode while the key is being revoked. Strictly stronger than ssh-guard, which removed its fanotify marks before the final lock pass.
+- **Per-binary event masks in the guard engine**: the daemon's `READ,WRITE`-style restrictions are enforced in BPF via a per-exe-inode bitmask map (`guard_exe_events`); a missing entry means all events allowed, so plain guard mode is unaffected. `OPEN` is implicitly allowed whenever `READ`, `WRITE` or `MMAP` is listed — a binary cannot read without opening first.
+- **No `chattr` in the daemon**: immutable/append flags and `exclude_chattr` were dropped entirely; the LSM whitelist engine replaces that mechanism with finer granularity (per-binary, per-event), avoiding the classic race between marking a file immutable and the attacker opening it.
+- **Master key generation is non-destructive by default**: `daemon --genkey` creates the key with `O_EXCL` and never overwrites; when the key already exists the operator must explicitly confirm a regeneration (which atomically replaces the file) because it invalidates every fscrypt directory provisioned with the old key.

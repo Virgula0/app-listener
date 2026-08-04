@@ -69,9 +69,16 @@ func TestMain(m *testing.M) {
 	amd64Bin = absPath("../build/test/app-listener-amd64")
 	netTesterAmd64Bin = absPath("../build/test/net_tester-amd64")
 
-	cmd := exec.Command("go", "build", "-tags", "ci", "-o", amd64Bin, "..")
+	// The daemon mode links fscrypt, which needs cgo (mlock), so a pure-Go
+	// CGO_ENABLED=0 build no longer compiles. The binary must stay static
+	// anyway: it runs inside ubuntu:latest containers whose glibc (2.39)
+	// is older than the host's, so dynamic linking would be rejected at
+	// load time.
+	cmd := exec.Command("go", "build", "-tags", "ci",
+		"-ldflags", "-linkmode external -extldflags -static",
+		"-o", amd64Bin, "..")
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build amd64 binary: %v\n", err)
 		os.Exit(1)

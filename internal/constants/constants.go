@@ -10,6 +10,6 @@ const (
 )
 
 const (
-	AppName = "app-listener"
+	AppName = "App-Listener"
 	Version = "v0.1.0"
 )

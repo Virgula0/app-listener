@@ -59,6 +59,17 @@ struct {
 	__type(value, __u8);
 } guard_exe_actions SEC(".maps");
 
+// Per-binary allowed-event bitmask (bit i = enum event_type i). Only
+// consulted in whitelist mode; a missing entry means all events are
+// allowed, so the plain guard mode (which never populates this map)
+// behaves exactly as before.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u32);
+} guard_exe_events SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1);
@@ -435,6 +446,15 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 			is_blocked = action != NULL && *action == GUARD_BLOCK;
 		} else {
 			is_blocked = action == NULL || *action != GUARD_ALLOW;
+
+			// Per-binary event restriction: if the binary has an allowed
+			// event mask, only the listed event types are permitted. A
+			// missing mask entry means all events are allowed.
+			if (!is_blocked) {
+				__u32 *mask = bpf_map_lookup_elem(&guard_exe_events, &exe_ik);
+				if (mask && type < 32 && !(*mask & (1U << type)))
+					is_blocked = 1;
+			}
 		}
 	}
 

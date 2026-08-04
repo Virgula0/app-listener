@@ -59,6 +59,9 @@ func (f *fakeGuardRepo) Start() error {
 }
 
 func (f *fakeGuardRepo) Stop() {
+	if f.stopped {
+		return
+	}
 	f.stopped = true
 	close(f.events)
 }

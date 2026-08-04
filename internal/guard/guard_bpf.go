@@ -80,6 +80,7 @@ type GuardProgramSpecs struct {
 type GuardMapSpecs struct {
 	GuardConfig      *ebpf.MapSpec `ebpf:"guard_config"`
 	GuardExeActions  *ebpf.MapSpec `ebpf:"guard_exe_actions"`
+	GuardExeEvents   *ebpf.MapSpec `ebpf:"guard_exe_events"`
 	GuardFsDevices   *ebpf.MapSpec `ebpf:"guard_fs_devices"`
 	GuardInodes      *ebpf.MapSpec `ebpf:"guard_inodes"`
 	GuardPath        *ebpf.MapSpec `ebpf:"guard_path"`
@@ -116,6 +117,7 @@ func (o *GuardObjects) Close() error {
 type GuardMaps struct {
 	GuardConfig      *ebpf.Map `ebpf:"guard_config"`
 	GuardExeActions  *ebpf.Map `ebpf:"guard_exe_actions"`
+	GuardExeEvents   *ebpf.Map `ebpf:"guard_exe_events"`
 	GuardFsDevices   *ebpf.Map `ebpf:"guard_fs_devices"`
 	GuardInodes      *ebpf.Map `ebpf:"guard_inodes"`
 	GuardPath        *ebpf.Map `ebpf:"guard_path"`
@@ -128,6 +130,7 @@ func (m *GuardMaps) Close() error {
 	return _GuardClose(
 		m.GuardConfig,
 		m.GuardExeActions,
+		m.GuardExeEvents,
 		m.GuardFsDevices,
 		m.GuardInodes,
 		m.GuardPath,

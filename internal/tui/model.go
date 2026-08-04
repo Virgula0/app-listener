@@ -138,7 +138,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		syncViewport(&m.viewport, &m.ready, m.width, m.height, 3, 3, m.renderViewport)
+		syncViewport(&m.viewport, &m.ready, m.width, m.height, 3, m.renderViewport)
 
 	case eventMsg:
 		ev := ebpf.FileEvent(msg)
@@ -273,13 +273,13 @@ func (m *model) renderResourceBar() string {
 
 // syncViewport sizes the viewport, creating it on first use, then re-renders
 // the viewport content through render.
-func syncViewport(v *viewport.Model, ready *bool, width, height, headerH, footerH int, render func()) {
+func syncViewport(v *viewport.Model, ready *bool, width, height, headerH int, render func()) {
 	if !*ready {
-		*v = viewport.New(width-4, height-headerH-footerH-1)
+		*v = viewport.New(width-4, height-headerH-3-1)
 		*ready = true
 	} else {
 		v.Width = width - 4
-		v.Height = height - headerH - footerH - 1
+		v.Height = height - headerH - 3 - 1
 	}
 	render()
 }

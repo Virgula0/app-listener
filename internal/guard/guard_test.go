@@ -66,6 +66,48 @@ func (s *guardUnitTest) TestModeString() {
 	s.Require().Equal("blacklist", modeString(ModeBlacklist))
 }
 
+func (s *guardUnitTest) TestEventMaskOpenImplied() {
+	mask, err := eventMask([]ebpf.EventType{ebpf.EventRead})
+	s.Require().NoError(err)
+	// READ bit set, and OPEN implicitly allowed.
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventRead)))
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventOpen)))
+}
+
+func (s *guardUnitTest) TestEventMaskWriteMmap() {
+	mask, err := eventMask([]ebpf.EventType{ebpf.EventWrite, ebpf.EventMmap})
+	s.Require().NoError(err)
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventWrite)))
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventMmap)))
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventOpen)))
+	// Independent events stay unset.
+	s.Require().Equal(uint32(0), mask&(1<<uint(ebpf.EventDelete)))
+	s.Require().Equal(uint32(0), mask&(1<<uint(ebpf.EventMkdir)))
+}
+
+func (s *guardUnitTest) TestEventMaskIndependent() {
+	mask, err := eventMask([]ebpf.EventType{ebpf.EventDelete, ebpf.EventRename})
+	s.Require().NoError(err)
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventDelete)))
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventRename)))
+	// No read/write → OPEN must NOT be implied.
+	s.Require().Equal(uint32(0), mask&(1<<uint(ebpf.EventOpen)))
+}
+
+func (s *guardUnitTest) TestEventMaskAllEvents() {
+	mask, err := eventMask(ebpf.EventTypes())
+	s.Require().NoError(err)
+	for _, t := range ebpf.EventTypes() {
+		s.Require().NotEqual(uint32(0), mask&(1<<uint(t)), "bit for %s should be set", t)
+	}
+}
+
+func (s *guardUnitTest) TestEventMaskEmpty() {
+	mask, err := eventMask(nil)
+	s.Require().NoError(err)
+	s.Require().Equal(uint32(0), mask)
+}
+
 func (s *guardUnitTest) TestBpfEventToGuardEvent() {
 	var comm [16]byte
 	copy(comm[:], "test-proc")

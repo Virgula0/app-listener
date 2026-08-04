@@ -3,6 +3,7 @@ package cmd
 import (
 	"os"
 
+	"github.com/Virgula0/app-listener/cmd/functions/daemon"
 	"github.com/Virgula0/app-listener/cmd/functions/guard"
 	"github.com/Virgula0/app-listener/cmd/functions/monitor"
 	"github.com/Virgula0/app-listener/cmd/functions/networkguard"
@@ -60,4 +61,5 @@ func init() {
 	rootCmd.AddCommand(guard.GuardCmd)
 	rootCmd.AddCommand(networkmonitor.NetworkMonitorCmd)
 	rootCmd.AddCommand(networkguard.NetworkGuardCmd)
+	rootCmd.AddCommand(daemon.DaemonCmd)
 }
