@@ -56,6 +56,10 @@ type daemonUseCase struct {
 	start   sync.Once
 	stop    sync.Once
 	started bool
+	// stopping is set once the lockdown begins. Reload refuses once it is
+	// set: a SIGHUP during shutdown must never attach new guards or
+	// unlock resources that the lockdown sequence will not clean up.
+	stopping bool
 }
 
 func NewDaemonUseCase(resources []daemonconfig.Resource, vault repository.Vault, guards []repository.GuardRepository) (DaemonUseCase, error) {
@@ -189,6 +193,11 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 
 	if !d.started {
 		return fmt.Errorf("daemon: reload before start")
+	}
+
+	if d.stopping {
+		d.rollbackReload(guards, nil)
+		return fmt.Errorf("daemon: reload refused: shutdown in progress — restart the daemon to apply the new configuration")
 	}
 
 	// Phase 0 — refuse to drop any protected resource (see the comment on
@@ -352,12 +361,19 @@ func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards [
 func (d *daemonUseCase) Stop() {
 	d.stop.Do(func() {
 		log.Info("daemon: initiating secure lockdown")
+
+		// Hold the write lock for the entire lockdown: Reload serializes
+		// behind it and refuses once stopping is set, so a SIGHUP can
+		// never attach new guards or unlock new resources while the
+		// shutdown sequence is running.
+		d.mu.Lock()
+		defer d.mu.Unlock()
+
+		d.stopping = true
 		close(d.done)
 
-		d.mu.RLock()
 		resources := d.resources
 		guards := d.guards
-		d.mu.RUnlock()
 
 		// First pass: remove the key where possible.
 		for _, r := range resources {

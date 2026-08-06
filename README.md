@@ -3,6 +3,8 @@
 Monitor or guard file system operations (open, read, write, delete, rename, symlink, hardlink, mkdir, mmap) and network operations (TCP connect/accept/close, UDP send/recv, DNS) using eBPF.
 The Daemon is particularly useful to protect most important directories on the filesystem against credential info-stealers largely used by supply-chain attacks.
 
+![demo.gif](./media/demo.gif)
+
 ## Contents
 
 - [Why](#why)

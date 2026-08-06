@@ -62,6 +62,7 @@ type GuardSpecs struct {
 type GuardProgramSpecs struct {
 	GuardFileOpen          *ebpf.ProgramSpec `ebpf:"guard_file_open"`
 	GuardFilePermission    *ebpf.ProgramSpec `ebpf:"guard_file_permission"`
+	GuardFileTruncate      *ebpf.ProgramSpec `ebpf:"guard_file_truncate"`
 	GuardMmapFile          *ebpf.ProgramSpec `ebpf:"guard_mmap_file"`
 	GuardPathLink          *ebpf.ProgramSpec `ebpf:"guard_path_link"`
 	GuardPathMkdir         *ebpf.ProgramSpec `ebpf:"guard_path_mkdir"`
@@ -155,6 +156,7 @@ type GuardVariables struct {
 type GuardPrograms struct {
 	GuardFileOpen          *ebpf.Program `ebpf:"guard_file_open"`
 	GuardFilePermission    *ebpf.Program `ebpf:"guard_file_permission"`
+	GuardFileTruncate      *ebpf.Program `ebpf:"guard_file_truncate"`
 	GuardMmapFile          *ebpf.Program `ebpf:"guard_mmap_file"`
 	GuardPathLink          *ebpf.Program `ebpf:"guard_path_link"`
 	GuardPathMkdir         *ebpf.Program `ebpf:"guard_path_mkdir"`
@@ -171,6 +173,7 @@ func (p *GuardPrograms) Close() error {
 	return _GuardClose(
 		p.GuardFileOpen,
 		p.GuardFilePermission,
+		p.GuardFileTruncate,
 		p.GuardMmapFile,
 		p.GuardPathLink,
 		p.GuardPathMkdir,

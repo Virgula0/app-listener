@@ -33,6 +33,10 @@ type fakeVault struct {
 
 	unlockErr error
 	checkErr  error
+
+	// lockCalls counts every Lock invocation, for tests that must observe
+	// the lockdown starting.
+	lockCalls int
 }
 
 func newFakeVault(paths ...string) *fakeVault {
@@ -75,6 +79,8 @@ func (f *fakeVault) Lock(path string, forceFlush bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.lockCalls++
+
 	if f.busyForever[path] {
 		return repository.ErrKeyBusy
 	}
@@ -104,6 +110,14 @@ func (f *fakeVault) isUnlocked(path string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.unlocked[path]
+}
+
+// lockCallCount returns the number of Lock invocations observed, for
+// tests that must wait until the lockdown has started.
+func (f *fakeVault) lockCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lockCalls
 }
 
 func resource(path string) daemonconfig.Resource {
@@ -693,5 +707,80 @@ func TestDaemonUseCaseReloadThenStop(t *testing.T) {
 	}
 	if vault.unlocked["/b"] {
 		t.Error("resource unlocked by reload must be locked on shutdown")
+	}
+}
+
+func TestDaemonUseCaseReloadRefusedDuringShutdown(t *testing.T) {
+	vault := newFakeVault("/a")
+	// A process holds files open in /a, so the lockdown blocks in its
+	// force-flush loop. A SIGHUP-driven reload arrives in that window: it
+	// must be refused — attaching new guards or unlocking resources during
+	// shutdown could leave plaintext behind after the daemon exits.
+	vault.busyForever["/a"] = true
+	old := newFakeGuardRepo()
+	d := startDaemon(t, vault, []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	stopDone := make(chan struct{})
+	go func() {
+		d.Stop()
+		close(stopDone)
+	}()
+
+	// Wait until the lockdown has started (it holds the daemon's write
+	// lock for its whole duration).
+	deadline := time.Now().Add(5 * time.Second)
+	for vault.lockCallCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Stop never started the lockdown")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	unlockCallsAfterStart := len(vault.unlockCalls)
+
+	// The reload is serialized behind the lockdown's write lock and must
+	// come back refused once the lockdown completes.
+	next := newFakeGuardRepo()
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{next})
+	}()
+
+	// While the lockdown is still blocked, the reload must not have made
+	// any progress: no unlock, no commit.
+	select {
+	case err := <-reloadDone:
+		t.Fatalf("reload completed while the lockdown was still running: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if len(vault.unlockCalls) != unlockCallsAfterStart {
+		t.Fatalf("reload unlocked resources during shutdown: %v", vault.unlockCalls)
+	}
+
+	// The pinning process closes its files: the lockdown finishes and the
+	// waiting reload is refused.
+	vault.clearLockErrs("/a")
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not complete once the vault could be locked")
+	}
+	select {
+	case err := <-reloadDone:
+		if err == nil {
+			t.Fatal("reload must be refused once shutdown is in progress")
+		}
+		if !strings.Contains(err.Error(), "shutdown") {
+			t.Errorf("refusal should mention the shutdown, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reload never returned after the lockdown completed")
+	}
+
+	if !next.isStopped() {
+		t.Error("the new guard must be detached after a refused reload")
+	}
+	if vault.isUnlocked("/a") {
+		t.Error("the resource must stay locked after the shutdown")
 	}
 }

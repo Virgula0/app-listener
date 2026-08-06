@@ -277,6 +277,44 @@ func (s *IntegrationSuite) TestGuard_Whitelist_Binary() {
 }
 
 // ---------------------------------------------------------------
+// Test: bare `guard <path>` with no -b/-w flags.  The default mode is
+// whitelist with an empty allowlist (block everything).  Regression:
+// the eager inode scan used to run AFTER the LSM hooks attached, so the
+// guard's own startup walk was blocked by its own file_open hook and
+// failed with EPERM ("populating inode map ... operation not
+// permitted").  The scan must run pre-attach (WithEagerPopulate), and
+// every access to the guarded tree must then be blocked.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_NoFlags_Whitelist() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"sh", "-c", "echo 'lockdown' > /watch/data.txt"})
+
+	// No -b/-w flags: whitelist mode, empty allowlist.  Must start
+	// cleanly (the pre-attach scan is never self-blocked).
+	s.startGuardStd(c, "/watch")
+	logBefore := s.readGuardLog(c)
+
+	// 1. cat is NOT allowlisted → blocked
+	code, out := s.exec(c, []string{"/usr/bin/cat", "/watch/data.txt"})
+	s.Require().NotEqualf(0, code, "cat should be blocked with empty whitelist: %s", out)
+
+	// 2. busybox gnumkdir is NOT allowlisted → blocked
+	code, out = s.exec(c, []string{"/usr/bin/gnumkdir", "/watch/newdir"})
+	s.Require().NotEqualf(0, code, "gnumkdir should be blocked with empty whitelist: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireBlockedEvent(deltaEvents, "MKDIR", "gnumkdir")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
 // Test: binary blacklist — only /usr/bin/rm is blocked
 // ---------------------------------------------------------------
 
@@ -891,8 +929,9 @@ func (s *IntegrationSuite) TestGuard_Bypass_RawBlockDevice() {
 // Test: runtime mkdir — new directories under recursive guard are
 // lazily discovered via file_open, so files inside are blocked.
 // Uses blacklist mode: only /usr/bin/cat is blacklisted.  Uses
-// gnumkdir (non-hardlinked) because /usr/bin/mkdir is hardlinked to
-// cat on this Ubuntu image and would be blocked by exe-inode identity.
+// gnumkdir (busybox) because /usr/bin/mkdir shares the Rust coreutils
+// multi-call exe inode with cat on this Ubuntu image and would be
+// blocked by exe-inode identity.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
@@ -902,9 +941,10 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
 	s.exec(c, []string{"touch", "/watch/pre_existing.txt"})
 
 	// Guard uses exe-inode identity (resolves symlinks).  On this Ubuntu image
-	// /usr/bin/cat and /usr/bin/mkdir are hardlinked (same exe inode), so
-	// blacklisting cat also blocks mkdir.  Use gnumkdir (a separate, non-hardlinked
-	// binary) to create the directory.
+	// /usr/bin/cat and /usr/bin/mkdir are both symlinks into the same Rust
+	// coreutils multi-call binary (one exe inode), so blacklisting cat also
+	// blocks mkdir.  Use gnumkdir (a separate busybox binary) to create the
+	// directory.
 	s.startGuardStd(c, "/watch", "--recursive", "-b", "/usr/bin/cat")
 	logBefore := s.readGuardLog(c)
 
@@ -944,9 +984,9 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir_NonRecursive() {
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"touch", "/watch/top.txt"})
 
-	// Guard uses exe-inode identity; cat and mkdir are hardlinked (same exe
-	// inode), so blacklisting cat also blocks mkdir.  Use gnumkdir (separate,
-	// non-hardlinked binary) to create the directory.
+	// Guard uses exe-inode identity; cat and mkdir are the same Rust coreutils
+	// multi-call binary (one exe inode), so blacklisting cat also blocks mkdir.
+	// Use gnumkdir (separate busybox binary) to create the directory.
 	s.startGuardStd(c, "/watch", "--recursive=false", "-b", "/usr/bin/cat")
 
 	// Pre-existing file: cat blocked
@@ -972,13 +1012,17 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir_NonRecursive() {
 // Test: the BPF ancestor walk protects files at any depth even when
 // their parent directory is NOT in guard_inodes.
 //
-// A 20-level-deep directory chain is created AFTER the guard started
-// (all its levels were created at runtime, so none is in the inode
-// map; lazy discovery is capped at 16 levels and cannot reach the
-// guarded root).  Every operation on the deepest level — open, delete,
-// rename, mkdir, hardlink, symlink — must still be blocked for a
-// blacklisted binary thanks to the ancestor walk, and the blocked
-// events must be reported with the correct comm.
+// A 20-level-deep directory chain is created AFTER the guard started.
+// It must be built level-by-level with busybox gnumkdir — a single
+// `mkdir -p` would chdir into each component (open(2)), which triggers
+// the lazy discovery cascade and adds the whole chain to guard_inodes,
+// masking the ancestor walk under test (and /usr/bin/mkdir shares the
+// coreutils multi-call exe inode with the blacklisted cat, so it cannot
+// run against the guard at all).  The per-level form never opens
+// anything, so no level enters guard_inodes and every operation on the
+// deepest level — open, delete, rename, mkdir, hardlink, symlink — must
+// be blocked for a blacklisted binary solely by the ancestor walk, and
+// the blocked events must be reported with the correct comm.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
@@ -987,9 +1031,11 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk() {
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"touch", "/watch/top.txt"})
 
-	// cat and the other coreutils have distinct exe inodes on this image,
-	// so each operation's binary must be blacklisted explicitly.  gnumkdir
-	// stays allowed and is used to build the deep tree at runtime.
+	// cat/mkdir/ln are all symlinks into the same Rust coreutils multi-call
+	// binary (one exe inode); rm/mv are busybox applets (gnurm/gnumv) with
+	// their own inodes.  Listing every path explicitly is harmless — the
+	// multi-call paths resolve to the same inode and dedupe.  gnumkdir
+	// (busybox) stays allowed and builds the deep tree at runtime.
 	s.startGuardStd(c, "/watch", "--recursive",
 		"-b", "/usr/bin/cat",
 		"-b", "/usr/bin/rm",
@@ -1004,11 +1050,12 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk() {
 
 	deep := "/watch/D1/D2/D3/D4/D5/D6/D7/D8/D9/D10/D11/D12/D13/D14/D15/D16/D17/D18/D19/D20"
 
-	// Runtime deep tree via the (allowed) gnumkdir — /usr/bin/mkdir is
-	// hardlinked with cat and would be blocked.  No level is added to
-	// guard_inodes: the mkdir hook does not discover, and the discovery
-	// walk is capped at 16 levels, so the guarded root is unreachable.
-	code, out = s.exec(c, []string{"/usr/bin/gnumkdir", "-p", deep})
+	// Runtime deep tree, one level per gnumkdir call with the full path:
+	// mkdir(2) resolves the components in the kernel without open(2), so
+	// no level is discovered and none enters guard_inodes — only the
+	// ancestor walk can protect the deepest level.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"D=/watch; for i in $(seq 1 20); do D=$D/D$i; /usr/bin/gnumkdir $D || exit 1; done"})
 	s.Require().Equalf(0, code, "deep tree creation via gnumkdir should succeed: %s", out)
 
 	code, out = s.exec(c, []string{"sh", "-c", "echo secret > " + deep + "/data.txt"})
@@ -1063,7 +1110,77 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk() {
 }
 
 // ---------------------------------------------------------------
-// Test: rename a directory from outside into the guarded area.
+// Test: the ancestor walk must work on major-0 (anonymous-device)
+// filesystems like tmpfs.  Regression test for the sbdev perf gate:
+// when the gate map was populated only for major != 0 filesystems it
+// stayed empty on tmpfs, and every ancestor-walk lookup failed —
+// silently disabling deep-runtime-tree protection there.  The walk
+// must still block the blacklisted coreutils at depth 20 on tmpfs.
+//
+// The deep tree is built level-by-level with busybox gnumkdir — a single
+// `mkdir -p` would chdir into each component (open(2)), which triggers
+// the lazy discovery cascade and adds the whole chain to guard_inodes,
+// masking the ancestor walk under test (and /usr/bin/mkdir shares the
+// coreutils multi-call exe inode with the blacklisted cat, so it cannot
+// run against the guard at all).  The per-level form never opens
+// anything, so only the ancestor walk can protect the deepest level, and
+// with the buggy empty gate cat at depth 20 must succeed.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk_Tmpfs() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	code, out := s.exec(c, []string{"mount", "-t", "tmpfs", "tmpfs", "/watch"})
+	s.Require().Equalf(0, code, "mounting tmpfs on /watch: %s", out)
+	s.exec(c, []string{"touch", "/watch/top.txt"})
+
+	s.startGuardStd(c, "/watch", "--recursive",
+		"-b", "/usr/bin/cat",
+		"-b", "/usr/bin/rm",
+		"-b", "/usr/bin/mv",
+		"-b", "/usr/bin/mkdir",
+		"-b", "/usr/bin/ln")
+	logBefore := s.readGuardLog(c)
+
+	// Sanity: the pre-existing shallow file is blocked for cat.
+	code, out = s.exec(c, []string{"/usr/bin/cat", "/watch/top.txt"})
+	s.Require().NotEqualf(0, code, "pre-existing file should be blocked for cat: %s", out)
+
+	deep := "/watch/D1/D2/D3/D4/D5/D6/D7/D8/D9/D10/D11/D12/D13/D14/D15/D16/D17/D18/D19/D20"
+
+	// Runtime deep tree, one level per gnumkdir call with the full path:
+	// mkdir(2) resolves the components in the kernel without open(2), so
+	// no level is discovered and none enters guard_inodes — only the
+	// ancestor walk can protect the deepest level.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"D=/watch; for i in $(seq 1 20); do D=$D/D$i; /usr/bin/gnumkdir $D || exit 1; done"})
+	s.Require().Equalf(0, code, "deep tree creation via gnumkdir should succeed: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c", "echo secret > " + deep + "/data.txt"})
+	s.Require().Equalf(0, code, "file creation via shell should succeed: %s", out)
+
+	// If the sbdev gate was left empty on tmpfs, the ancestor walk is
+	// disabled and cat at depth 20 succeeds — a full deep-tree bypass.
+	code, out = s.exec(c, []string{"/usr/bin/cat", deep + "/data.txt"})
+	s.Require().NotEqualf(0, code, "cat at depth 20 on tmpfs should be blocked (sbdev gate must not disable the walk): %s", out)
+
+	code, out = s.exec(c, []string{"/usr/bin/rm", deep + "/data.txt"})
+	s.Require().NotEqualf(0, code, "rm at depth 20 on tmpfs should be blocked: %s", out)
+
+	code, out = s.exec(c, []string{"/usr/bin/mkdir", deep + "/newdir"})
+	s.Require().NotEqualf(0, code, "mkdir at depth 20 on tmpfs should be blocked: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	s.Require().NotEmpty(deltaEvents, "expected blocked events in guard log")
+	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireBlockedEvent(deltaEvents, "DELETE", "rm")
+	s.requireBlockedEvent(deltaEvents, "MKDIR", "mkdir")
+
+	s.stopGuard(c)
+}
+
 // The rename succeeds (moving into guarded area is allowed), but
 // the moved directory's inode is added to guard_inodes so files
 // inside become guarded.

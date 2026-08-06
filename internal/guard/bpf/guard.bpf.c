@@ -231,9 +231,10 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent)
 
 	// Performance gate: only files on a filesystem that hosts a guarded
 	// root can have a guarded ancestor.  guard_fs_sbdevs holds the
-	// filesystem device of the guarded path (populated only for real
-	// block-backed filesystems); every other filesystem skips the walk
-	// entirely, keeping the per-access cost at a single hash lookup.
+	// filesystem device of the guarded path (populated unconditionally by
+	// the Go side, including anonymous tmpfs/overlayfs devices); every
+	// other filesystem skips the walk entirely, keeping the per-access
+	// cost at a single hash lookup.
 	struct super_block *sb;
 	bpf_probe_read_kernel(&sb, sizeof(sb), &parent_inode->i_sb);
 	if (sb) {
@@ -765,6 +766,36 @@ int guard_file_permission(unsigned long long *ctx)
 	if (ret == 0)
 		mark_tainted();
 	return ret;
+}
+
+// ftruncate(2) on an fd that predates the guard (opened before the hooks
+// attached, or dup'ed into the process) never passes through file_open,
+// and the kernel does not invoke file_permission for it either — without
+// this hook a blacklisted process holding such an fd could truncate
+// guarded files.  path-based truncate(2) is already caught by file_open.
+SEC("lsm/file_truncate")
+int guard_file_truncate(unsigned long long *ctx)
+{
+	struct file *file = (struct file *)ctx[0];
+	if (!file)
+		return 0;
+
+	struct dentry *dentry;
+	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+
+	if (is_guarded_access(dentry, inode)) {
+		int ret = check_and_emit(EVENT_WRITE, dentry, NULL, false, NULL);
+		if (ret == 0)
+			mark_tainted();
+		return ret;
+	}
+
+	return 0;
 }
 
 SEC("lsm/path_unlink")

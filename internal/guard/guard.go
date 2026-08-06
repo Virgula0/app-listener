@@ -61,10 +61,26 @@ type Guard struct {
 	exeEvents map[string][]ebpf.EventType
 	recursive bool
 	depth     int
+	// eagerPopulate scans the whole guarded tree into guard_inodes while
+	// the LSM hooks are not yet attached (see WithEagerPopulate).
+	eagerPopulate bool
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
 type GuardOption func(*Guard)
+
+// WithEagerPopulate registers every file and directory under the guarded
+// path in guard_inodes BEFORE the LSM hooks attach. In whitelist mode the
+// guard blocks every binary that is not allowlisted — including its own
+// process — so a post-attach startup walk (the eager population) would be
+// blocked by the guard's own file_open hook and fail with EPERM. Guards
+// that must scan only after an unlock (the daemon's fscrypt flow) omit
+// this option and call PopulateInodes themselves.
+func WithEagerPopulate() GuardOption {
+	return func(g *Guard) {
+		g.eagerPopulate = true
+	}
+}
 
 // WithBinaryEvents restricts each listed binary to the given event types
 // (blocking semantics: unlisted events are denied with EPERM). Binaries
@@ -131,6 +147,20 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		return nil, fmt.Errorf("populating BPF maps: %w", err)
 	}
 
+	// Eagerly register the whole tree in guard_inodes while the hooks are
+	// still detached. populateMaps only records the guarded path's own
+	// inode; the full recursive scan must run pre-attach, otherwise the
+	// guard's own walk is blocked by its own file_open hook in whitelist
+	// mode (the guard's exe is not allowlisted) and startup fails with
+	// EPERM. Guards that need to scan after an unlock (daemon fscrypt
+	// flow) skip this and call PopulateInodes themselves.
+	if g.eagerPopulate {
+		if err := g.PopulateInodes(); err != nil {
+			g.cleanup()
+			return nil, fmt.Errorf("populating inode map for %s (is the path readable?): %w", g.path, err)
+		}
+	}
+
 	// For each hook, track which hooks are critical (must attach for
 	// the guard to provide meaningful protection):
 	//
@@ -152,6 +182,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	}{
 		{g.objs.GuardFileOpen, "file_open"},
 		{g.objs.GuardFilePermission, "file_permission"},
+		{g.objs.GuardFileTruncate, "file_truncate"},
 		{g.objs.GuardMmapFile, "mmap_file"},
 		{g.objs.GuardPathUnlink, "path_unlink"},
 		{g.objs.GuardPathRename, "path_rename"},
@@ -342,10 +373,16 @@ func (g *Guard) populateMaps() error {
 
 // addFsDeviceGate records the filesystem device of the guarded path in
 // guard_fs_sbdevs so the BPF ancestor walk can skip every access on other
-// filesystems with a single lookup. Only real block-backed filesystems are
-// recorded (major != 0): on pseudo/anonymous devices (tmpfs, overlayfs,
-// btrfs subvolumes) sb->s_dev is not guaranteed to match st_dev, so the
-// walk keeps running unconditionally there.
+// filesystems with a single lookup. st_dev is i_sb->s_dev by construction,
+// so the recorded device matches the superblock the BPF side reads on
+// every filesystem — real block devices, tmpfs and overlayfs (anonymous
+// devices), and btrfs subvolumes (which share one superblock and only
+// widen the gate conservatively). The gate must be populated
+// unconditionally — including major-0 filesystems (tmpfs, overlayfs, anon
+// devices), where st_dev carries the minor device number with a zero
+// major. Leaving the map empty would make every lookup fail and silently
+// disable the ancestor walk there, exposing runtime-created content
+// deeper than the discovery bound.
 func (g *Guard) addFsDeviceGate() error {
 	var s syscall.Stat_t
 	if err := syscall.Stat(g.path, &s); err != nil {
@@ -353,12 +390,6 @@ func (g *Guard) addFsDeviceGate() error {
 	}
 
 	major := unix.Major(s.Dev)
-	if major == 0 {
-		// Pseudo-filesystem (tmpfs, overlay, procfs, ...): no reliable
-		// device identity, keep the walk ungated.
-		return nil
-	}
-
 	dev := uint64(major)<<20 | uint64(unix.Minor(s.Dev))
 	var val uint8 = 1
 	if err := g.objs.GuardFsSbdevs.Put(dev, val); err != nil {

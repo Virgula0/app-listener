@@ -80,22 +80,18 @@ func runGuard(cmd *cobra.Command, args []string) error {
 		return checkErr
 	}
 
-	g, guardErr := guard.NewGuard(guardPath, mode, binaries, guardRecursive, guardDepth)
+	g, guardErr := guard.NewGuard(guardPath, mode, binaries, guardRecursive, guardDepth, guard.WithEagerPopulate())
 	if guardErr != nil {
 		return fmt.Errorf("creating guard: %w", guardErr)
 	}
 
 	ucase := usecase.NewGuardUseCase(g)
 
-	// Eagerly register every file and directory under the guarded path in
-	// the inode map so the whole tree is protected from the start.  The
-	// LSM hooks are already attached (NewGuard), so skipping this would
-	// leave everything below the first level protected only lazily, and
-	// deletion/rename/mkdir/link operations on them unguarded.
-	if populateErr := ucase.PopulateInodes(); populateErr != nil {
-		return fmt.Errorf("populating inode map for %s (is the path readable?): %w", guardPath, populateErr)
-	}
-
+	// Every file and directory under the guarded path was already
+	// registered in guard_inodes inside NewGuard (WithEagerPopulate),
+	// before the LSM hooks attached: the whole tree is protected from the
+	// first instant the hooks are live, and the guard's own startup scan
+	// can never be blocked by its own file_open hook.
 	if startErr := ucase.Start(); startErr != nil {
 		return fmt.Errorf("starting guard: %w", startErr)
 	}
