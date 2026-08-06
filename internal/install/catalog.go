@@ -26,7 +26,8 @@ type CandidateDir struct {
 	// added here is a potential privilege-escalation path if it can be
 	// abused while the directory is unlocked. Identity is verified by
 	// inode, not by name. Whitelist entries that do not exist on the
-	// target system are dropped when the config is generated.
+	// target system are dropped when the config is generated; entries
+	// containing a glob (*, ?, [) are expanded to every existing match.
 	Whitelist []string
 }
 
@@ -53,103 +54,126 @@ var Catalog = []CandidateDir{
 	{Name: "opencode", RelPath: ".config/opencode",
 		Whitelist: []string{
 			"/usr/local/bin/opencode", "/usr/bin/opencode",
-			"/home/%USER%/.local/bin/opencode",
+			"%HOME%/.local/bin/opencode",
 		}},
 	{Name: "code CLI (GitHub)", RelPath: ".config/code-cli",
 		Whitelist: []string{
 			"/usr/bin/code-cli", "/usr/local/bin/code-cli",
-			"/home/%USER%/.local/bin/code-cli",
+			"%HOME%/.local/bin/code-cli",
 		}},
 	{Name: "Claude Code", RelPath: ".claude",
 		Whitelist: []string{
 			"/usr/local/bin/claude", "/usr/bin/claude",
-			"/home/%USER%/.local/bin/claude",
+			"%HOME%/.local/bin/claude",
 		}},
 	{Name: "Claude Code config", RelPath: ".config/claude",
 		Whitelist: []string{
 			"/usr/local/bin/claude", "/usr/bin/claude",
-			"/home/%USER%/.local/bin/claude",
+			"%HOME%/.local/bin/claude",
 		}},
 	{Name: "Codeium", RelPath: ".codeium",
 		Whitelist: []string{
 			"/usr/local/bin/codeium", "/usr/bin/codeium",
-			"/home/%USER%/.local/bin/codeium",
+			"%HOME%/.local/bin/codeium",
 		}},
 	{Name: "Gemini CLI", RelPath: ".gemini",
 		Whitelist: []string{
 			"/usr/local/bin/gemini", "/usr/bin/gemini",
-			"/home/%USER%/.local/bin/gemini",
+			"%HOME%/.local/bin/gemini",
 		}},
 	{Name: "Cursor", RelPath: ".cursor",
 		Whitelist: []string{
 			"/usr/bin/cursor", "/usr/local/bin/cursor",
-			"/home/%USER%/.local/bin/cursor",
+			"%HOME%/.local/bin/cursor",
 		}},
 	{Name: "Cursor agent", RelPath: ".cursor-agent",
 		Whitelist: []string{
 			"/usr/bin/cursor", "/usr/local/bin/cursor",
-			"/home/%USER%/.local/bin/cursor",
+			"%HOME%/.local/bin/cursor",
 		}},
 	{Name: "GitHub Copilot", RelPath: ".config/github-copilot",
 		Whitelist: []string{
 			"/usr/bin/git", "/usr/local/bin/copilot",
-			"/home/%USER%/.local/bin/copilot",
+			"%HOME%/.local/bin/copilot",
 		}},
 
 	// --- IDEs and editors ---------------------------------------------------------
 	// IDE configuration directories commonly hold auth tokens, API keys and
 	// credentials (VS Code globalStorage, JetBrains options/certs, Zed's
 	// auth.json, ...).
+	//
+	// NOTE: /usr/bin/code (Arch/Debian) is a shell wrapper, not the real
+	// binary; the whitelist matches the *executed* ELF, so the actual
+	// Electron binary must be listed. Same for Firefox, Chrome/Chromium
+	// wrappers, etc.
 	{Name: "VS Code config", RelPath: ".config/Code",
 		Whitelist: []string{
 			"/usr/bin/code", "/usr/local/bin/code",
-			"/home/%USER%/.local/bin/code",
+			"%HOME%/.local/bin/code",
+			"/opt/visual-studio-code/code", "/usr/share/code/code", "/opt/visual-studio-code/bin/code",
+			// chrome_crashpad_handler is a separate process Code spawns to
+			// write crash dumps into .config/Code/Crashpad.
+			"/opt/visual-studio-code/chrome_crashpad_handler", "/usr/share/code/chrome_crashpad_handler",
 		}},
 	{Name: "VS Code Insiders config", RelPath: ".config/Code - Insiders",
 		Whitelist: []string{
 			"/usr/bin/code-insiders", "/usr/local/bin/code-insiders",
-			"/home/%USER%/.local/bin/code-insiders",
+			"%HOME%/.local/bin/code-insiders", "/opt/visual-studio-code/bin/code",
 		}},
 	{Name: "VS Code server (remote development)", RelPath: ".vscode-server",
 		Whitelist: []string{
 			"/usr/bin/code", "/usr/local/bin/code",
-			"/home/%USER%/.local/bin/code",
+			"%HOME%/.local/bin/code",
+			"/opt/visual-studio-code/code", "/usr/share/code/code",
+			// chrome_crashpad_handler is a separate process Code spawns to
+			// write crash dumps into .config/Code/Crashpad.
+			"/opt/visual-studio-code/chrome_crashpad_handler", "/usr/share/code/chrome_crashpad_handler",
 		}},
 	{Name: "VSCodium config", RelPath: ".config/VSCodium",
-		Whitelist: []string{"/usr/bin/codium", "/usr/local/bin/codium"}},
+		Whitelist: []string{"/usr/bin/codium", "/usr/local/bin/codium",
+			"/opt/vscodium/chrome_crashpad_handler", "/usr/share/vscodium/chrome_crashpad_handler"}},
 	{Name: "JetBrains IDEs", RelPath: ".config/JetBrains",
 		// Toolbox-installed IDE binaries live under
 		// ~/.local/share/JetBrains/Toolbox/apps/<product>/bin/<product> with
 		// product-specific names: add them manually in the editor step when
 		// the IDE is launched from Toolbox.
+		//
+		// Standalone installs (e.g. ~/.goland for GoLand) run on the
+		// bundled JetBrains Runtime: the process exe is the JBR java, not
+		// the launcher ELF, so the JBR and its fsnotifier helper must be
+		// whitelisted for the IDE to access its own config.
 		Whitelist: []string{
 			"/usr/bin/idea", "/usr/bin/pycharm", "/usr/bin/webstorm",
 			"/usr/bin/clion", "/usr/bin/goland", "/usr/bin/phpstorm",
 			"/usr/bin/rider", "/usr/bin/datagrip", "/usr/bin/rustrover",
 			"/usr/bin/android-studio",
+			"%HOME%/.goland/jbr/bin/java", "%HOME%/.goland/bin/fsnotifier",
 		}},
 	{Name: "JetBrains Toolbox", RelPath: ".local/share/JetBrains/Toolbox",
 		Whitelist: []string{
-			"/home/%USER%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox",
+			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox",
 		}},
 	{Name: "Zed editor", RelPath: ".config/zed",
 		Whitelist: []string{
 			"/usr/bin/zed", "/usr/local/bin/zed",
-			"/home/%USER%/.local/bin/zed",
+			"%HOME%/.local/bin/zed",
 		}},
 	{Name: "Zed editor data", RelPath: ".local/share/zed",
 		Whitelist: []string{
 			"/usr/bin/zed", "/usr/local/bin/zed",
-			"/home/%USER%/.local/bin/zed",
+			"%HOME%/.local/bin/zed",
 		}},
 	{Name: "Sublime Text", RelPath: ".config/sublime-text",
-		Whitelist: []string{"/usr/bin/subl", "/usr/bin/sublime-text", "/usr/bin/sublime_text"}},
+		// /usr/bin/subl is a wrapper; the real binary is under /opt.
+		Whitelist: []string{"/usr/bin/subl", "/usr/bin/sublime-text", "/usr/bin/sublime_text",
+			"/opt/sublime_text/sublime_text"}},
 	{Name: "Insomnia API client", RelPath: ".config/Insomnia",
-		Whitelist: []string{"/usr/bin/insomnia"}},
+		Whitelist: []string{"/usr/bin/insomnia", "/opt/insomnia/insomnia"}},
 	{Name: "Postman API client", RelPath: ".config/Postman",
-		Whitelist: []string{"/usr/bin/postman"}},
+		Whitelist: []string{"/usr/bin/postman", "/opt/postman/postman"}},
 	{Name: "DBeaver database client", RelPath: ".local/share/DBeaverData",
-		Whitelist: []string{"/usr/bin/dbeaver"}},
+		// /usr/bin/dbeaver is a wrapper; the real binary lives in /usr/lib.
+		Whitelist: []string{"/usr/bin/dbeaver", "/usr/lib/dbeaver/dbeaver"}},
 	{Name: "Android adb keys", RelPath: ".android",
 		Whitelist: []string{"/usr/bin/adb"}},
 
@@ -157,6 +181,10 @@ var Catalog = []CandidateDir{
 	{Name: "AWS credentials", RelPath: ".aws",
 		Whitelist: []string{"/usr/bin/aws"}},
 	{Name: "Google Cloud SDK", RelPath: ".config/gcloud",
+		// /usr/bin/gcloud (and gsutil) are Python launchers whose process
+		// exe is the interpreter, which the whitelist deliberately does
+		// not list. The entries are kept for documentation; they are
+		// inert.
 		Whitelist: []string{"/usr/bin/gcloud", "/usr/bin/gsutil"}},
 	{Name: "Kubernetes kubeconfig", RelPath: ".kube",
 		Whitelist: []string{"/usr/bin/kubectl", "/usr/bin/helm", "/usr/bin/oc"}},
@@ -176,6 +204,10 @@ var Catalog = []CandidateDir{
 		Whitelist: []string{"/usr/bin/npm", "/usr/bin/npx", "/usr/bin/node"}},
 	{Name: "npm data", RelPath: ".npm",
 		Whitelist: []string{"/usr/bin/npm", "/usr/bin/npx", "/usr/bin/node"}},
+	// /usr/bin/pip is a #!/usr/bin/python script, so its inode never
+	// matches a running process (the exe is the python interpreter, which
+	// is deliberately NOT whitelisted — too broad). The entries are kept
+	// for documentation; they are inert.
 	{Name: "pip config", RelPath: ".config/pip",
 		Whitelist: []string{"/usr/bin/pip", "/usr/bin/pip3"}},
 	{Name: "Git config", RelPath: ".gitconfig",
@@ -220,16 +252,41 @@ var Catalog = []CandidateDir{
 		Whitelist: []string{"/usr/bin/wg", "/usr/bin/wg-quick"}},
 
 	// --- Browsers and messaging -----------------------------------------------------
+	// /usr/bin/firefox (Arch), /usr/bin/google-chrome*, /usr/bin/brave,
+	// /usr/bin/chromium are shell wrappers; the whitelist matches the
+	// executed ELF, so the real binaries under /usr/lib/<browser> and
+	// /opt are listed as well. Firefox's crash handler (crashhelper,
+	// crashreporter) is a separate binary firefox spawns for the
+	// Crash Reports directory: it must be whitelisted for crashes to be
+	// recorded.
 	{Name: "Firefox profile", RelPath: ".mozilla/firefox",
-		Whitelist: []string{"/usr/bin/firefox"}},
+		Whitelist: []string{
+			"/usr/bin/firefox",
+			"/usr/lib/firefox/firefox",
+			"/usr/lib/firefox/crashhelper", "/usr/lib/firefox/crashreporter",
+		}},
 	{Name: "Google Chrome profile", RelPath: ".config/google-chrome",
-		Whitelist: []string{"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"}},
+		Whitelist: []string{
+			"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+			"/opt/google/chrome/chrome", "/usr/lib/chromium/chrome",
+		}},
 	{Name: "Chromium profile", RelPath: ".config/chromium",
-		Whitelist: []string{"/usr/bin/chromium"}},
+		Whitelist: []string{
+			"/usr/bin/chromium", "/usr/bin/chromium-browser",
+			"/usr/lib/chromium/chrome", "/usr/lib/chromium/chromium",
+		}},
 	{Name: "Brave profile", RelPath: ".config/BraveSoftware",
-		Whitelist: []string{"/usr/bin/brave-browser", "/usr/bin/brave"}},
+		Whitelist: []string{
+			"/usr/bin/brave-browser", "/usr/bin/brave",
+			"/opt/brave/brave", "/opt/brave-bin/brave",
+		}},
 	{Name: "Discord", RelPath: ".config/discord",
-		Whitelist: []string{"/usr/bin/discord"}},
+		// Discord installs into a versioned directory and re-links
+		// .config/discord/Discord on every update. The glob resolves to
+		// every installed version and is re-expanded on each install run,
+		// so an app update does not leave the whitelist pointing at a
+		// stale inode.
+		Whitelist: []string{"%HOME%/.config/discord/*/Discord"}},
 	{Name: "Discord Canary", RelPath: ".config/discord-canary",
 		Whitelist: []string{"/usr/bin/discord-canary"}},
 	{Name: "Telegram", RelPath: ".local/share/TelegramDesktop",
@@ -243,8 +300,8 @@ var Catalog = []CandidateDir{
 	{Name: "Steam data", RelPath: ".local/share/Steam",
 		Whitelist: []string{
 			"/usr/bin/steam", "/usr/bin/steamwebhelper",
-			"/home/%USER%/.local/share/Steam/ubuntu12_32/steam",
-			"/home/%USER%/.local/share/Steam/ubuntu12_32/steamwebhelper",
+			"%HOME%/.local/share/Steam/ubuntu12_32/steam",
+			"%HOME%/.local/share/Steam/ubuntu12_32/steamwebhelper",
 		}},
 	{Name: "Steam (legacy home)", RelPath: ".steam",
 		Whitelist: []string{"/usr/bin/steam", "/usr/bin/steamwebhelper"}},
@@ -349,9 +406,26 @@ func DiscoverForUsers(users []User) []Candidate {
 
 // FilterExistingWhitelist drops whitelist entries that do not exist on
 // this system, so the generated config only references real binaries.
+// Entries containing a glob metacharacter (*, ? or [) are expanded with
+// filepath.Glob and every matching path becomes its own whitelist entry;
+// this covers versioned application directories such as
+// %HOME%/.config/discord/*/Discord and is re-evaluated on every install,
+// so app updates that move to a new directory are picked up.
 func (c *Candidate) FilterExistingWhitelist() []string {
 	var out []string
 	for _, bin := range c.Entry.ExpandWhitelist(c.User.Name, c.User.Home) {
+		if strings.ContainsAny(bin, "*?[") {
+			matches, err := filepath.Glob(bin)
+			if err != nil {
+				continue // malformed pattern: skip the whole entry
+			}
+			for _, m := range matches {
+				if _, err := os.Stat(m); err == nil {
+					out = append(out, m)
+				}
+			}
+			continue
+		}
 		if _, err := os.Stat(bin); err == nil {
 			out = append(out, bin)
 		}

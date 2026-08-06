@@ -218,15 +218,21 @@ func validateConfigText(text string) (*daemonconfig.Config, error) {
 	return daemonconfig.Load(tmpPath)
 }
 
-// askEncryption asks, per directory that is NOT yet encrypted, whether
-// fscrypt encryption is required (default yes) and records the decision
-// back into the config text. Already-encrypted directories are never
-// asked: they keep need_encryption: true and are not migrated (no backup
-// is created for them). Regular files cannot be encrypted, so their
-// need_encryption is forced to false. It returns the updated text and the
-// list of directories that still need to be encrypted.
+// askEncryption asks, per directory that is NOT yet encrypted and that
+// declares need_encryption: true, whether fscrypt encryption is required
+// (default yes) and records the decision back into the config text.
+// Resources declared need_encryption: false are never asked — the config
+// already says no encryption and the installer honors it. Already-encrypted
+// directories are never asked: they keep need_encryption: true and are not
+// migrated (no backup is created for them). Regular files cannot be
+// encrypted, so their need_encryption is forced to false. It returns the
+// updated text and the list of directories that still need to be encrypted.
 func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Config) (text string, toEncrypt []string, err error) {
 	for _, r := range cfg.Resources {
+		if !r.NeedEncryption {
+			log.Infof("%s declares need_encryption: false: skipping the encryption question", r.Path)
+			continue
+		}
 		encrypted, encErr := vault.IsEncrypted(r.Path)
 		if encErr != nil {
 			return "", nil, fmt.Errorf("checking encryption of %s: %w", r.Path, encErr)

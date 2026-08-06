@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +13,8 @@ import (
 )
 
 type fakeVault struct {
+	mu sync.Mutex
+
 	encrypted map[string]bool
 	// unlocked is the fscrypt lock state: Unlock provisions, Lock
 	// deprovisions.
@@ -22,15 +26,21 @@ type fakeVault struct {
 	// calls; the queue is consumed from the front.
 	lockErrs map[string][]error
 
+	// busyForever: Lock on these paths always returns ErrKeyBusy (no
+	// queue consumption) until cleared — simulates a process that keeps
+	// holding files open for an unbounded time.
+	busyForever map[string]bool
+
 	unlockErr error
 	checkErr  error
 }
 
 func newFakeVault(paths ...string) *fakeVault {
 	v := &fakeVault{
-		encrypted: make(map[string]bool),
-		unlocked:  make(map[string]bool),
-		lockErrs:  make(map[string][]error),
+		encrypted:   make(map[string]bool),
+		unlocked:    make(map[string]bool),
+		lockErrs:    make(map[string][]error),
+		busyForever: make(map[string]bool),
 	}
 	for _, p := range paths {
 		v.encrypted[p] = true
@@ -62,6 +72,12 @@ func (f *fakeVault) Unlock(path string) error {
 }
 
 func (f *fakeVault) Lock(path string, forceFlush bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.busyForever[path] {
+		return repository.ErrKeyBusy
+	}
 	queue := f.lockErrs[path]
 	if len(queue) > 0 {
 		err := queue[0]
@@ -72,6 +88,22 @@ func (f *fakeVault) Lock(path string, forceFlush bool) error {
 	}
 	delete(f.unlocked, path)
 	return nil
+}
+
+// clearLockErrs makes subsequent Lock calls for path succeed, unblocking a
+// lockdown that is stuck on a busy key.
+func (f *fakeVault) clearLockErrs(path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.lockErrs, path)
+	delete(f.busyForever, path)
+}
+
+// isUnlocked is the mutex-safe lock-state accessor for concurrent tests.
+func (f *fakeVault) isUnlocked(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.unlocked[path]
 }
 
 func resource(path string) daemonconfig.Resource {
@@ -108,6 +140,9 @@ func TestDaemonUseCaseStartLifecycle(t *testing.T) {
 	}
 	if !repo.started {
 		t.Error("guard repo should be started")
+	}
+	if !repo.populated {
+		t.Error("guard inode map should be populated after unlock and before start")
 	}
 }
 
@@ -282,30 +317,48 @@ func TestDaemonUseCaseStopKeyMissingIsSuccess(t *testing.T) {
 	}
 }
 
-func TestDaemonUseCaseStopRetryExhausted(t *testing.T) {
+func TestDaemonUseCaseStopBlocksUntilAllLocked(t *testing.T) {
 	vault := newFakeVault("/vault")
-	// First pass: nil. Second pass: busy forever.
-	busy := make([]error, maxLockRetries+1)
-	for i := range busy {
-		busy[i] = repository.ErrKeyBusy
-	}
-	vault.lockErrs["/vault"] = busy
+	// A process holds files open in the vault for an unbounded time: every
+	// Lock returns ErrKeyBusy until the test "closes" the files.
+	vault.busyForever["/vault"] = true
 	repo := newFakeGuardRepo()
-	d, err := NewDaemonUseCase(
-		[]daemonconfig.Resource{resource("/vault")},
-		vault,
-		[]repository.GuardRepository{repo},
-	)
-	if err != nil {
-		t.Fatalf("NewDaemonUseCase: %v", err)
+	d := startDaemon(t, vault, []daemonconfig.Resource{resource("/vault")}, []repository.GuardRepository{repo})
+
+	stopDone := make(chan struct{})
+	go func() {
+		d.Stop()
+		close(stopDone)
+	}()
+
+	// Stop has exhausted its retry budget by now; it must NOT give up and
+	// detach the guard while the vault is still unlocked.
+	time.Sleep(lockRetryDelay * time.Duration(maxLockRetries+10))
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned while the vault was still locked: fail-open regression")
+	default:
 	}
-	if err := d.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
+	if repo.isStopped() {
+		t.Error("guard must stay attached while the vault is still unlocked")
+	}
+	if !vault.isUnlocked("/vault") {
+		t.Error("vault should still be provisioned (busy) at this point")
 	}
 
-	d.Stop() // must not hang; logs failure, still stops the guard
-	if !repo.stopped {
-		t.Error("guard must be stopped even when locking is exhausted")
+	// The pinning process finally closes its files: the vault locks and
+	// Stop completes, detaching the guards only afterwards.
+	vault.clearLockErrs("/vault")
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not complete once the vault could be locked")
+	}
+	if vault.isUnlocked("/vault") {
+		t.Error("vault must be locked once Stop returned")
+	}
+	if !repo.isStopped() {
+		t.Error("guard must be stopped after the vault is locked")
 	}
 }
 
@@ -429,6 +482,66 @@ func TestDaemonUseCaseReloadKeptResources(t *testing.T) {
 	}
 }
 
+func TestDaemonUseCaseStartPopulateFailure(t *testing.T) {
+	vault := newFakeVault("/vault")
+	repo := newFakeGuardRepo()
+	repo.populateErr = errBoom
+	d, err := NewDaemonUseCase(
+		[]daemonconfig.Resource{resource("/vault")},
+		vault,
+		[]repository.GuardRepository{repo},
+	)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+
+	if err := d.Start(); !errors.Is(err, errBoom) {
+		t.Fatalf("Start should propagate populate error, got %v", err)
+	}
+	if !vault.unlocked["/vault"] {
+		t.Error("resource should have been unlocked before the populate attempt")
+	}
+
+	// The caller (runDaemon) responds to a failed Start with Stop(): the
+	// already-unlocked resource must be locked back and the guard stopped.
+	d.Stop()
+	if vault.unlocked["/vault"] {
+		t.Error("resource must be locked back after a failed start")
+	}
+	if !repo.stopped {
+		t.Error("guard must be stopped after a failed start")
+	}
+}
+
+func TestDaemonUseCaseReloadPopulateFailure(t *testing.T) {
+	vault := newFakeVault("/a", "/b")
+	old := newFakeGuardRepo()
+	d := startDaemon(t, vault, []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	newA, newB := newFakeGuardRepo(), newFakeGuardRepo()
+	newB.populateErr = errBoom
+	err := d.Reload(
+		[]daemonconfig.Resource{resource("/a"), resource("/b")},
+		[]repository.GuardRepository{newA, newB},
+	)
+	if err == nil {
+		t.Fatal("expected error when a new guard fails to populate")
+	}
+
+	if old.stopped {
+		t.Error("a failed reload must not stop the old guards")
+	}
+	if !newA.stopped || !newB.stopped {
+		t.Error("newly built guards must be detached on failed reload")
+	}
+	if vault.unlocked["/b"] {
+		t.Error("a resource unlocked during the reload must be locked back on rollback")
+	}
+	if got := d.Resources(); len(got) != 1 || got[0].Path != "/a" {
+		t.Fatalf("Resources() must still expose the old configuration: %v", got)
+	}
+}
+
 func TestDaemonUseCaseReloadAddedResourceUnlocked(t *testing.T) {
 	vault := newFakeVault("/a", "/b")
 	old := newFakeGuardRepo()
@@ -527,7 +640,7 @@ func TestDaemonUseCaseReloadRollbackLocksUnlocked(t *testing.T) {
 	}
 }
 
-func TestDaemonUseCaseReloadRemovedResource(t *testing.T) {
+func TestDaemonUseCaseReloadRemovedResourceRefused(t *testing.T) {
 	vault := newFakeVault("/a", "/b")
 	oldA, oldB := newFakeGuardRepo(), newFakeGuardRepo()
 	d := startDaemon(t, vault,
@@ -536,20 +649,28 @@ func TestDaemonUseCaseReloadRemovedResource(t *testing.T) {
 	)
 
 	newA := newFakeGuardRepo()
-	if err := d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{newA}); err != nil {
-		t.Fatalf("Reload: %v", err)
+	err := d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{newA})
+	if err == nil {
+		t.Fatal("reload that removes a protected resource must be refused")
+	}
+	if !strings.Contains(err.Error(), "/b") {
+		t.Errorf("refusal must name the dropped resource, got: %v", err)
 	}
 
-	if !oldB.stopped {
-		t.Error("guard of the removed resource must be stopped")
+	// The old configuration is untouched and keeps running.
+	if oldA.stopped || oldB.stopped {
+		t.Error("the running guards must be kept after a refused reload")
 	}
-	if got := d.Resources(); len(got) != 1 || got[0].Path != "/a" {
-		t.Fatalf("Resources() = %v", got)
+	if !newA.isStopped() {
+		t.Error("the newly built guard must be detached after a refused reload")
 	}
-	// The removed resource stays unlocked, matching ssh-guard: reload
-	// only reconciles protection, never the fscrypt lifecycle.
+	if got := d.Resources(); len(got) != 2 {
+		t.Fatalf("Resources() must still expose the full configuration: %v", got)
+	}
+	// /b stays protected and unlocked (it was unlocked at start) — the
+	// refusal leaves the fscrypt lifecycle untouched.
 	if !vault.unlocked["/b"] {
-		t.Error("removed resource must not be locked by a reload")
+		t.Error("/b must remain untouched by a refused reload")
 	}
 }
 

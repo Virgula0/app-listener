@@ -34,14 +34,22 @@ func TestCatalogSanity(t *testing.T) {
 		}
 		seen[key] = entry.Name
 		for _, bin := range entry.Whitelist {
-			if !strings.HasPrefix(bin, "/") {
-				t.Errorf("entry %q: whitelist path %q is not absolute", entry.Name, bin)
+			if !isAbsoluteCandidate(bin) {
+				t.Errorf("entry %q: whitelist path %q is not absolute (use %%HOME%%/ or %%USER%%/ for home-relative paths)", entry.Name, bin)
 			}
 		}
 	}
 	if len(Catalog) < 30 {
 		t.Errorf("catalog unexpectedly small: %d entries", len(Catalog))
 	}
+}
+
+// isAbsoluteCandidate reports whether a whitelist path is system-absolute
+// or expands to an absolute path via the %HOME%/%USER% placeholders.
+func isAbsoluteCandidate(bin string) bool {
+	return strings.HasPrefix(bin, "/") ||
+		strings.HasPrefix(bin, "%HOME%/") ||
+		strings.HasPrefix(bin, "%USER%/")
 }
 
 // TestCatalogHasWireGuardSystemEntry verifies the /etc/wireguard entry
@@ -203,5 +211,121 @@ func TestFilterExistingWhitelist(t *testing.T) {
 	got := c.FilterExistingWhitelist()
 	if len(got) != 1 || got[0] != existing {
 		t.Errorf("FilterExistingWhitelist = %v, want [%s]", got, existing)
+	}
+}
+
+// TestExpandWhitelistUsesPasswdHome verifies the %HOME% fix: whitelist
+// paths must expand to the real /etc/passwd home directory, never to a
+// path derived from the username (a login name whose home differs, e.g.
+// user "pwn3r" living in /home/angelo, must not produce /home/pwn3r).
+func TestExpandWhitelistUsesPasswdHome(t *testing.T) {
+	home := t.TempDir()
+	c := Candidate{
+		User: User{Name: "pwn3r", Home: home},
+		Entry: CandidateDir{Whitelist: []string{
+			"%HOME%/.local/bin/opencode",
+			"%HOME%/.config/discord/*/Discord",
+		}},
+	}
+	got := c.Entry.ExpandWhitelist(c.User.Name, c.User.Home)
+	if len(got) != 2 {
+		t.Fatalf("ExpandWhitelist returned %d entries, want 2: %v", len(got), got)
+	}
+	for _, p := range got {
+		if strings.HasPrefix(p, "/home/pwn3r") {
+			t.Errorf("whitelist path %q derived from the username instead of the passwd home", p)
+		}
+		if !strings.HasPrefix(p, home) {
+			t.Errorf("whitelist path %q does not live under the passwd home %s", p, home)
+		}
+	}
+}
+
+// TestCatalogWhitelistNoUsernameHomeGuard prevents a regression to the
+// /home/%USER% pattern, which breaks on systems where the login name does
+// not match the home directory basename.
+func TestCatalogWhitelistNoUsernameHomePrefix(t *testing.T) {
+	for _, entry := range Catalog {
+		for _, bin := range entry.Whitelist {
+			if strings.HasPrefix(bin, "/home/%USER%") {
+				t.Errorf("entry %q: whitelist %q must use %%HOME%%/, never /home/%%USER%%/", entry.Name, bin)
+			}
+		}
+	}
+}
+
+// TestFilterExistingWhitelistGlob verifies that glob patterns in the
+// whitelist are expanded to every existing match (versioned app dirs like
+// ~/.config/discord/app-*/Discord) and that non-matching patterns produce
+// no entries.
+func TestFilterExistingWhitelistGlob(t *testing.T) {
+	home := t.TempDir()
+	mk := func(rel ...string) {
+		p := filepath.Join(append([]string{home}, rel...)...)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(".config/discord/app-1.0.150/Discord")
+	mk(".config/discord/app-2.0.0/Discord")
+
+	c := Candidate{
+		User: User{Name: "tester", Home: home},
+		Entry: CandidateDir{Whitelist: []string{
+			"%HOME%/.config/discord/*/Discord",
+			"%HOME%/.config/discord/no-such-version-*/Discord",
+		}},
+	}
+	got := c.FilterExistingWhitelist()
+	want := []string{
+		filepath.Join(home, ".config/discord/app-1.0.150/Discord"),
+		filepath.Join(home, ".config/discord/app-2.0.0/Discord"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("FilterExistingWhitelist = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestFilterExistingWhitelistMixed verifies a whitelist mixing a concrete
+// path and a glob keeps the existing concrete path and every glob match.
+func TestFilterExistingWhitelistMixed(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "real-bin")
+	if err := os.WriteFile(bin, []byte("ELF"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app := filepath.Join(home, "apps", "v1", "tool")
+	if err := os.MkdirAll(filepath.Dir(app), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(app, []byte("ELF"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c := Candidate{
+		User: User{Name: "tester", Home: home},
+		Entry: CandidateDir{Whitelist: []string{
+			bin,
+			"%HOME%/apps/*/tool",
+			"/definitely/missing",
+		}},
+	}
+	got := c.FilterExistingWhitelist()
+	want := []string{bin, app}
+	if len(got) != len(want) {
+		t.Fatalf("FilterExistingWhitelist = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 }

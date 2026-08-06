@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -38,9 +39,10 @@ const (
 )
 
 var (
-	configFlag string
-	genKeyFlag bool
-	headless   bool
+	configFlag  string
+	genKeyFlag  bool
+	headless    bool
+	blockedOnly bool
 )
 
 var DaemonCmd = &cobra.Command{
@@ -62,7 +64,11 @@ The config file is resolved in this order:
   3. daemon-samples/daemon.conf in the working directory
 
 With --headless, events are printed to stderr (captured by journald when
-run as a systemd service), like ssh-guard's syslog output.
+run as a systemd service), like ssh-guard's syslog output. Lines carry a
+syslog priority marker (<4> warning, <6> info), so journald colors denied
+events in yellow exactly like ssh-guard. With --blocked-only, only
+denied (blocked) attempts are printed; allowed events are suppressed.
+The guard itself never changes behavior — filtering is purely presentational.
 
 SIGHUP reloads the configuration: every resource's binary whitelist is
 recomputed (by inode, so pacman/system updates that replace binaries are
@@ -78,6 +84,8 @@ func init() {
 		"Path to the daemon config file (default: /etc/app-listener/daemon.conf, then daemon-samples/daemon.conf)")
 	DaemonCmd.Flags().BoolVarP(&headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
+	DaemonCmd.Flags().BoolVarP(&blockedOnly, "blocked-only", "", false,
+		"Only print blocked (denied) events, skip allowed ones (headless only)")
 	DaemonCmd.Flags().BoolVarP(&genKeyFlag, "genkey", "", false,
 		"Generate the fscrypt master key file and exit")
 }
@@ -297,6 +305,34 @@ func writePidFile() error {
 	return nil
 }
 
+// Syslog priority markers journald parses at the start of a stdout/stderr
+// line and maps to its own priority field: <4> = warning (rendered yellow
+// by journalctl), <6> = info (plain). This reproduces the level-based
+// coloring ssh-guard gets from real syslog logging without touching the
+// guard or the parseable DAEMON|... field layout.
+const (
+	syslogWarning = "<4>"
+	syslogInfo    = "<6>"
+)
+
+// writeEvent prints one guard event to w, prefixed with the syslog
+// priority marker so journald colors denied attempts yellow. When
+// blockedOnly is set, allowed events are dropped. It reports whether the
+// event was written.
+func writeEvent(w io.Writer, blockedOnly bool, ev *usecase.DaemonEvent) bool {
+	if !ev.Event.Blocked && blockedOnly {
+		return false
+	}
+	if ev.Event.Blocked {
+		fmt.Fprintf(w, "%sDAEMON DENIED|%s|%s|%s|%s|%d|%d\n",
+			syslogWarning, ev.Resource, ev.Event.Type.String(), ev.Event.Comm, ev.Event.Path, ev.Event.PID, ev.Event.UID)
+		return true
+	}
+	fmt.Fprintf(w, "%sDAEMON|%s|%s|%s|%s|%d|%d\n",
+		syslogInfo, ev.Resource, ev.Event.Type.String(), ev.Event.Comm, ev.Event.Path, ev.Event.PID, ev.Event.UID)
+	return true
+}
+
 func runHeadless(d usecase.DaemonUseCase, reload func()) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
@@ -307,12 +343,8 @@ func runHeadless(d usecase.DaemonUseCase, reload func()) {
 			if !ok {
 				return
 			}
-			if ev.Event.Blocked {
-				log.Warnf("DAEMON DENIED|%s|%s|%s|%s|%d|%d",
-					ev.Resource, ev.Event.Type.String(), ev.Event.Comm, ev.Event.Path, ev.Event.PID, ev.Event.UID)
-			} else {
-				log.Infof("DAEMON|%s|%s|%s|%s|%d|%d",
-					ev.Resource, ev.Event.Type.String(), ev.Event.Comm, ev.Event.Path, ev.Event.PID, ev.Event.UID)
+			if !writeEvent(os.Stderr, blockedOnly, &ev) {
+				continue
 			}
 		case s := <-sig:
 			switch s {

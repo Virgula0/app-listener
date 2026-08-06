@@ -6,11 +6,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Virgula0/app-listener/internal/install"
 	"github.com/google/fscrypt/actions"
 	"github.com/google/fscrypt/metadata"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
@@ -18,6 +20,15 @@ import (
 // BackupSuffix is appended to a directory to form its migration backup,
 // e.g. /home/alice/.ssh -> /home/alice/.ssh.app_listener.backup.
 const BackupSuffix = ".app_listener.backup"
+
+// Deprovision retry budget, mirroring the daemon teardown loop: a forced
+// deprovision can fail with EBUSY while an inode is still pinned, and the
+// key must be gone before the daemon (or the gap before it starts) is
+// considered safe.
+const (
+	maxDeprovisionRetries = 100
+	deprovisionRetryDelay = 10 * time.Millisecond
+)
 
 // chattr flag values, absent from x/sys/unix.
 const (
@@ -152,12 +163,13 @@ func (v *Vault) EncryptWithProgress(path string, onBytes func(copied, total int6
 
 	// The migration is complete: wipe the in-memory keys and remove the
 	// policy key from the kernel keyring so the directory is locked until
-	// the daemon unlocks it. Both are best-effort by design — the data is
-	// already encrypted at rest, and a fatal error here would abort the
-	// installer after a finished migration (and trip the backup-exists
-	// refusal on retry).
-	_ = policy.Lock()
-	_ = policy.Deprovision(false)
+	// the daemon unlocks it. The deprovision is forced with a bounded
+	// EBUSY retry (same budget as the daemon's teardown): a key left in
+	// the keyring would leave the directory unlocked in the gap between
+	// the installer stopping the daemon and it starting up again.
+	if err := lockAndDeprovision(policy, nil); err != nil {
+		log.Warnf("encrypted %s but could not remove its key from the kernel keyring (the directory stays unlocked until the daemon starts): %v", path, err)
+	}
 	return nil
 }
 
@@ -224,7 +236,7 @@ func unlockForRemoval(path string) error {
 	if err := policy.Unlock(optionFn, newBoundedKeyFn(keyBytes)); err != nil {
 		return err
 	}
-	defer lockAndDeprovision(policy, nil)
+	defer func() { _ = lockAndDeprovision(policy, nil) }()
 	if err := policy.Provision(); err != nil {
 		return err
 	}
@@ -281,7 +293,7 @@ func applyRawKeyPolicy(path string) (*actions.Policy, error) {
 	ok := false
 	defer func() {
 		if !ok {
-			lockAndDeprovision(policy, protector)
+			_ = lockAndDeprovision(policy, protector)
 		}
 	}()
 
@@ -304,13 +316,45 @@ func applyRawKeyPolicy(path string) (*actions.Policy, error) {
 
 // lockAndDeprovision wipes the in-memory keys of policy and protector and
 // removes the policy key from the kernel keyring, leaving the encrypted
-// directory locked. Best-effort: every failure is ignored.
-func lockAndDeprovision(policy *actions.Policy, protector *actions.Protector) {
+// directory locked. The deprovision is forced (all users) with a bounded
+// EBUSY retry loop mirroring the daemon's teardown; a key that is already
+// gone (ENOKEY) counts as success. The returned error is non-nil only when
+// the key could not be removed after the full retry budget.
+func lockAndDeprovision(policy *actions.Policy, protector *actions.Protector) error {
 	_ = policy.Lock()
 	if protector != nil {
 		_ = protector.Lock()
 	}
-	_ = policy.Deprovision(false)
+	for i := 0; i < maxDeprovisionRetries; i++ {
+		err := policy.Deprovision(true)
+		switch {
+		case err == nil:
+			return nil
+		case isDeprovisionBusy(err):
+			time.Sleep(deprovisionRetryDelay)
+		case isDeprovisionMissing(err):
+			return nil
+		default:
+			return err
+		}
+	}
+	return fmt.Errorf("deprovision after %d retries", maxDeprovisionRetries)
+}
+
+// isDeprovisionBusy reports whether a deprovision error means inodes are
+// still pinned by the key (retry), mirroring the daemon's classification.
+func isDeprovisionBusy(err error) bool {
+	errStr := err.Error()
+	return strings.Contains(errStr, "some files using the key are still open") ||
+		strings.Contains(errStr, "in use")
+}
+
+// isDeprovisionMissing reports whether a deprovision error means the key
+// is already gone from the kernel keyring (counts as locked).
+func isDeprovisionMissing(err error) bool {
+	errStr := err.Error()
+	return strings.Contains(errStr, "Required key not available") ||
+		strings.Contains(errStr, "key not present")
 }
 
 // modifiedContextWithSource returns a copy of ctx whose protector source is

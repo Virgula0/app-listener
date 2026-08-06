@@ -78,7 +78,7 @@ sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto
 sudo ./build/linux/app-listener daemon --genkey
 
 # Daemon mode — protect encrypted directories, reload after package updates
-sudo ./build/linux/app-listener daemon --headless
+sudo ./build/linux/app-listener daemon --headless --blocked-only
 sudo systemctl reload app-listener-daemon   # or: kill -HUP $(cat /run/app-listener-daemon.pid)
 ```
 
@@ -264,13 +264,14 @@ sudo ./build/linux/app-listener daemon --genkey
 sudo ./build/linux/app-listener daemon
 
 # Run with an explicit config, printing events to journald (systemd style)
-sudo ./build/linux/app-listener daemon --config /etc/ssh-guard/config --headless
+sudo ./build/linux/app-listener daemon --config /etc/ssh-guard/config --headless --blocked-only
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config <path>` | — | Config file. Resolved as: `--config` flag → `/etc/app-listener/daemon.conf` → `daemon-samples/daemon.conf` in the working directory |
-| `--headless` | `false` | No TUI, print `DAEMON [DENIED]\|` lines to stderr (captured by journald when run as a systemd service) |
+| `--headless` | `false` | No TUI, print `DAEMON [DENIED]\|` lines to stderr (captured by journald when run as a systemd service). Lines carry a syslog priority marker (`<4>` warning / `<6>` info), so journalctl colors denied attempts yellow like ssh-guard's syslog output |
+| `--blocked-only` | `false` | Print only blocked (denied) attempts; allowed events are suppressed. Presentational only — the guard behavior never changes |
 | `--genkey` | `false` | Generate the fscrypt master key file and exit. If the key already exists, asks `Regenerate? [y/N]` on the terminal first — regenerating invalidates every fscrypt directory provisioned with the old key |
 
 Config file grammar (see `daemon-samples/daemon.conf` for the full template):
@@ -315,6 +316,12 @@ sudo ./build/linux/app-listener install
 
 The wizard (abort any step with `Esc`; completed steps stay completed):
 
+0. **Daemon guard** — a running daemon is stopped before anything else: an
+   active systemd unit is stopped (`systemctl stop app-listener-daemon`;
+   the end of the install re-enables and re-starts it), a daemon process
+   running outside systemd (e.g. a manual `app-listener daemon --headless`)
+   is a **fatal error** — stop it manually first — and a daemon that is not
+   running needs no action.
 1. **Build** — if `build/linux/app-listener` is missing it runs `go build`
    in the repository (the repo must be the working directory); fails fast
    otherwise.
@@ -366,8 +373,17 @@ The wizard (abort any step with `Esc`; completed steps stay completed):
    Then the daemon is brought to the enabled-and-running state: a changed
    config is delivered to an already-running daemon with `systemctl
    reload` (SIGHUP) instead of a restart, a stopped daemon is started,
-   and `is-enabled`/`is-active` are verified as `enabled`/`active`.
-10. **Backup cleanup** — asks per backup whether to delete the
+    and `is-enabled`/`is-active` are verified as `enabled`/`active`.
+10. **Orphan cleanup** — removes fscrypt metadata (`/.fscrypt` policy and
+    raw-key protector files) left behind by encrypted directories that no
+    longer exist. The live set is scoped exactly like the catalog: every
+    discoverable watch directory for **every** user, the system entries
+    and the final config's resources — a directory that still exists
+    (including one encrypted outside the config, like a manually protected
+    `~/.ssh`) keeps its metadata; only policy/protector pairs carrying the
+    installer's `app-listener-key-*` signature are ever deleted, so login
+    protectors and other fscrypt setups are untouched.
+11. **Backup cleanup** — asks per backup whether to delete the
     `.app_listener.backup` directories left by the migration (kept by
     default so nothing is lost after an interrupted migration).
 

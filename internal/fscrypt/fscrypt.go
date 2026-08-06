@@ -286,17 +286,26 @@ func (v *Vault) Lock(path string, forceFlush bool) error {
 	}
 
 	if err := policy.Deprovision(true); err != nil {
-		errStr := err.Error()
-		switch {
-		case strings.Contains(errStr, "some files using the key are still open"),
-			strings.Contains(errStr, "in use"):
-			return fmt.Errorf("%w: %v", repository.ErrKeyBusy, err)
-		case strings.Contains(errStr, "Required key not available"),
-			strings.Contains(errStr, "key not present"):
-			return fmt.Errorf("%w: %v", repository.ErrKeyMissing, err)
-		default:
-			return fmt.Errorf("deprovision policy for %s: %w", path, err)
-		}
+		return classifyDeprovisionErr(path, err)
 	}
 	return nil
+}
+
+// classifyDeprovisionErr maps the fscrypt library's deprovision error
+// strings onto the repository sentinels: EBUSY-style messages (inodes
+// still pinned) become repository.ErrKeyBusy for the retry loop, ENOKEY
+// (the key is already gone) becomes repository.ErrKeyMissing, and anything
+// else is wrapped with the path.
+func classifyDeprovisionErr(path string, err error) error {
+	errStr := err.Error()
+	switch {
+	case strings.Contains(errStr, "some files using the key are still open"),
+		strings.Contains(errStr, "in use"):
+		return fmt.Errorf("%w: %v", repository.ErrKeyBusy, err)
+	case strings.Contains(errStr, "Required key not available"),
+		strings.Contains(errStr, "key not present"):
+		return fmt.Errorf("%w: %v", repository.ErrKeyMissing, err)
+	default:
+		return fmt.Errorf("deprovision policy for %s: %w", path, err)
+	}
 }

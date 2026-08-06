@@ -47,14 +47,14 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, 131072);
 	__type(key, struct inode_key);
 	__type(value, __u8);
 } guard_inodes SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 64);
+	__uint(max_entries, 256);
 	__type(key, struct inode_key);
 	__type(value, __u8);
 } guard_exe_actions SEC(".maps");
@@ -76,6 +76,13 @@ struct {
 	__type(key, __u32);
 	__type(value, char[MAX_PATH]);
 } guard_path SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8);
+	__type(key, __u64);  // filesystem device (sb->s_dev) of the guarded path
+	__type(value, __u8);
+} guard_fs_sbdevs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -176,6 +183,115 @@ static __always_inline struct inode *get_inode_from_path(void *ctx_path)
 	return i;
 }
 
+static __always_inline struct dentry *get_dentry_from_path(void *ctx_path)
+{
+	struct path *p = (struct path *)ctx_path;
+	if (!p)
+		return NULL;
+	struct dentry *d;
+	bpf_probe_read_kernel(&d, sizeof(d), &p->dentry);
+	return d;
+}
+
+// Check if a newly created directory should be auto-added to guard_inodes
+// based on the guard's recursive setting.
+static __always_inline int should_add_new_dir(void)
+{
+	__u32 key = 1;
+	__u64 *recursive = bpf_map_lookup_elem(&guard_config, &key);
+	if (!recursive || *recursive == 0)
+		return 0;
+	return 1;
+}
+
+// Walk up from `parent` toward the root and report whether the subtree
+// under it lies inside the guarded region.  The guarded region is the
+// subtree rooted at the farthest (closest-to-root) inode present in
+// guard_inodes, bounded by the configured depth limit; a parent that sits
+// exactly at the limit boundary is not guarded, which mirrors the eager
+// inode scan and discover_guarded_parent exactly.  This makes the guarded
+// root in the map protect the entire subtree at any depth: it closes the
+// window between LSM hook attach and the eager inode scan, keeps deep
+// files (deeper than the discovery bound) protected, and preserves open/
+// read/write enforcement even when the inode map fills up mid-scan.
+static __always_inline int guarded_ancestor_within_limit(struct dentry *parent)
+{
+	if (!parent)
+		return 0;
+
+	// Non-recursive guards only ever add the guarded root and its direct
+	// children to the map; deeper levels are deliberately unprotected.
+	if (!should_add_new_dir())
+		return 0;
+
+	struct inode *parent_inode;
+	bpf_probe_read_kernel(&parent_inode, sizeof(parent_inode), &parent->d_inode);
+	if (!parent_inode)
+		return 0;
+
+	// Performance gate: only files on a filesystem that hosts a guarded
+	// root can have a guarded ancestor.  guard_fs_sbdevs holds the
+	// filesystem device of the guarded path (populated only for real
+	// block-backed filesystems); every other filesystem skips the walk
+	// entirely, keeping the per-access cost at a single hash lookup.
+	struct super_block *sb;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &parent_inode->i_sb);
+	if (sb) {
+		__u64 dev = 0;
+		bpf_probe_read_kernel(&dev, sizeof(dev_t), &sb->s_dev);
+		if (!bpf_map_lookup_elem(&guard_fs_sbdevs, &dev))
+			return 0;
+	}
+
+	__u32 depth_key = 2;
+	__u64 *depth = bpf_map_lookup_elem(&guard_config, &depth_key);
+	bool has_limit = depth != NULL && *depth > 0;
+
+	// Track the farthest guarded ancestor (closest to root) and its
+	// distance from `parent`, like discover_guarded_parent.  The 128-step
+	// bound is far beyond any realistic Linux path depth and is the
+	// largest the verifier accepts for this loop body (a 160-step bound
+	// already exceeds the 1M-instruction complexity budget).  With a
+	// depth limit the result is decided early: a guarded ancestor at or
+	// beyond the limit means the subtree is NOT guarded (a farther one
+	// would only be more distant), and finding none within the limit
+	// decides the same.
+	struct dentry *ancestor = parent;
+	__u64 farthest_steps = 0;
+	bool found_guarded = false;
+
+	for (int i = 0; i < 128; i++) {
+		struct dentry *next;
+		bpf_probe_read_kernel(&next, sizeof(next), &ancestor->d_parent);
+		if (!next || next == ancestor)
+			break;
+		ancestor = next;
+
+		struct inode *anc_inode;
+		bpf_probe_read_kernel(&anc_inode, sizeof(anc_inode), &ancestor->d_inode);
+		if (!anc_inode)
+			break;
+		if (anc_inode == parent_inode)
+			break;
+
+		if (read_inode_guard(anc_inode)) {
+			farthest_steps = i + 1;
+			found_guarded = true;
+			if (has_limit && farthest_steps >= *depth)
+				return 0;  // guarded ancestor at/beyond the limit boundary
+		}
+
+		if (has_limit && !found_guarded && i + 1 >= *depth)
+			return 0;  // nothing guarded within the limit
+	}
+
+	if (!found_guarded)
+		return 0;
+	// With a limit, no early exit fired, so every guarded ancestor is
+	// strictly inside the limit.
+	return 1;
+}
+
 // Check whether the operation targets a guarded path by examining
 // both the file's own inode and its parent directory's inode.
 #define S_IFMT  00170000
@@ -235,17 +351,6 @@ static __always_inline void add_inode_to_guard(struct inode *inode)
 
 	__u8 v = 1;
 	bpf_map_update_elem(&guard_inodes, &ikey, &v, BPF_ANY);
-}
-
-// Check if a newly created directory should be auto-added to guard_inodes
-// based on the guard's recursive setting.
-static __always_inline int should_add_new_dir(void)
-{
-	__u32 key = 1;
-	__u64 *recursive = bpf_map_lookup_elem(&guard_config, &key);
-	if (!recursive || *recursive == 0)
-		return 0;
-	return 1;
 }
 
 // Check if the accessed file is /proc/<pid>/mem for a tainted PID.
@@ -329,7 +434,11 @@ static __always_inline int is_guarded_access(struct dentry *dentry, struct inode
 	if (parent_inode && parent_inode != file_inode && read_inode_guard(parent_inode))
 		return 1;
 
-	return 0;
+	// The file's own inode and its direct parent are not in the map (a
+	// runtime-created directory, a file deeper than the eager-scan depth,
+	// or the inode map filled up mid-scan).  Walk up the dentry chain: if
+	// the subtree lies inside the guarded region, the access is guarded.
+	return guarded_ancestor_within_limit(parent);
 }
 
 static __always_inline long read_path(struct dentry *dentry, char *buf, int buf_size)
@@ -677,6 +786,12 @@ int guard_path_unlink(unsigned long long *ctx)
 		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
 	}
 
+	// Deep-file coverage: the parent is not in the map but the file may
+	// still be inside the guarded region (ancestor walk).
+	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
+	if (parent && guarded_ancestor_within_limit(parent))
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
+
 	return 0;
 }
 
@@ -700,6 +815,12 @@ int guard_path_rename(unsigned long long *ctx)
 		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
 	}
 
+	// Deep-file coverage on the source side: the file may be inside the
+	// guarded region even though its parent is not in the map.
+	struct dentry *old_parent = get_dentry_from_path((void *)ctx[0]);
+	if (old_parent && guarded_ancestor_within_limit(old_parent))
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+
 	// Also check the destination parent directory.  This prevents renaming
 	// files from outside the guarded area INTO a guarded directory, and
 	// blocks renames into depth-boundary directories that were added to
@@ -711,6 +832,22 @@ int guard_path_rename(unsigned long long *ctx)
 			return ret;  // blocked — reject the rename
 		// Allowed — if the source is a directory, add its inode
 		// to guard_inodes so its new location is guarded.
+		if (should_add_new_dir()) {
+			umode_t old_mode;
+			bpf_probe_read_kernel(&old_mode, sizeof(old_mode), &inode->i_mode);
+			if ((old_mode & S_IFMT) == S_IFDIR)
+				add_inode_to_guard(inode);
+		}
+		return 0;
+	}
+
+	// Deep-file coverage on the destination side: moving INTO a guarded
+	// region whose parent is not in the map (runtime-created deep dir).
+	struct dentry *new_parent = get_dentry_from_path((void *)ctx[2]);
+	if (new_parent && guarded_ancestor_within_limit(new_parent)) {
+		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		if (ret != 0)
+			return ret;
 		if (should_add_new_dir()) {
 			umode_t old_mode;
 			bpf_probe_read_kernel(&old_mode, sizeof(old_mode), &inode->i_mode);
@@ -732,6 +869,13 @@ int guard_path_symlink(unsigned long long *ctx)
     // 1. Check if the symlink is being created INSIDE a guarded directory
     struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
     if (read_inode_guard(parent_inode)) {
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+    }
+
+    // Deep-file coverage: the symlink may be created inside a guarded
+    // region whose parent is not in the map.
+    struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
+    if (parent && guarded_ancestor_within_limit(parent)) {
         return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
     }
 
@@ -796,6 +940,12 @@ int guard_path_link(unsigned long long *ctx)
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
 	}
 
+	// Deep-file coverage on the destination side: linking INTO a guarded
+	// region whose parent is not in the map.
+	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
+	if (new_parent && guarded_ancestor_within_limit(new_parent))
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
+
 	return 0;
 }
 
@@ -808,6 +958,12 @@ int guard_path_mkdir(unsigned long long *ctx)
 	if (read_inode_guard(parent_inode)) {
 		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL);
 	}
+
+	// Deep-file coverage: mkdir inside a guarded region whose parent is
+	// not in the map.
+	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
+	if (parent && guarded_ancestor_within_limit(parent))
+		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL);
 
 	return 0;
 }

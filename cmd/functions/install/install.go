@@ -33,6 +33,9 @@ var InstallCmd = &cobra.Command{
 
 The wizard walks through the whole installation:
 
+  0. stops a running daemon before anything else: an active systemd unit is
+     stopped (and re-enabled at the end); a daemon process running outside
+     systemd is a fatal error — stop it manually first
   1. builds the binary when build/linux/app-listener is missing
   2. ensures the fscrypt master key exists in /etc/app-listener/fscrypt.key
   3. asks which users to protect and probes a catalog of critical
@@ -44,10 +47,12 @@ The wizard walks through the whole installation:
      key (a directory encrypted while declared need_encryption: false is
      a fatal error)
   7. asks per-directory whether fscrypt encryption is required, but ONLY
-     for directories that are not yet encrypted — already-encrypted ones
-     are never asked and never migrated — then encrypts the ones that
-     need it (keeping a .app_listener.backup copy) while a progress bar
-     shows the copy progress
+     for directories that are not yet encrypted and declare
+     need_encryption: true — need_encryption: false resources are skipped
+     silently, and already-encrypted ones are never asked and never
+     migrated — then encrypts the ones that need it (keeping a
+     .app_listener.backup copy) while a progress bar shows the copy
+     progress
   8. installs the systemd units and pacman reload hook from the embedded
      daemon-samples, copies the binary to /usr/local/sbin/app-listener and
      the config to /etc/app-listener/daemon.conf. Already-installed files
@@ -57,7 +62,11 @@ The wizard walks through the whole installation:
   9. enables the daemon across reboots and ensures it is running. When the
      config changed on a running daemon it is reloaded with SIGHUP instead
      of restarted
- 10. asks whether to delete the migration backups
+ 10. cleans up orphaned fscrypt metadata: policies and raw-key protectors
+     left behind by directories that were encrypted and no longer exist
+     (only metadata carrying the installer's own app-listener-key-*
+     signature is removed — existing directories keep their metadata)
+ 11. asks whether to delete the migration backups
 
 The installer is safe to re-run: an interrupted or completed installation
 is detected and resumed (existing master key kept, already encrypted
@@ -104,6 +113,14 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return deletePostBackups()
 	}
 
+	// The installer reconfigures files the daemon has open: a daemon left
+	// alive during the migration would keep guarding and unlocking the very
+	// directories being moved. Stop it first, fatally refusing when it runs
+	// outside systemd (where the installer cannot control it).
+	if err := stopDaemonIfRunning(); err != nil {
+		return err
+	}
+
 	if err := prepareInstallation(); err != nil {
 		return err
 	}
@@ -123,6 +140,10 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := deploy(cfgText); err != nil {
+		return err
+	}
+
+	if err := cleanOrphanedFscrypt(cfg); err != nil {
 		return err
 	}
 
@@ -163,9 +184,10 @@ func selectAndEditConfig() (string, *daemonconfig.Config, error) {
 
 // secureResources verifies the encryption state of every directory (fatal
 // on an encrypted directory declared need_encryption: false, and on a key
-// mismatch), asks only for the directories that are NOT yet encrypted
-// whether encryption is required, and migrates the ones that need it. The
-// returned text reflects the final need_encryption decisions.
+// mismatch), asks only for the directories that are NOT yet encrypted AND
+// declare need_encryption: true whether encryption is required, and
+// migrates the ones that need it. The returned text reflects the final
+// need_encryption decisions.
 func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Config) (string, error) {
 	if err := verifyEncryptionState(vault, cfg); err != nil {
 		return "", err

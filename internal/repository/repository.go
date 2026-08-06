@@ -17,6 +17,12 @@ type MonitorRepository interface {
 
 // GuardRepository is the port implemented by the file system guard engine.
 type GuardRepository interface {
+	// PopulateInodes fills the inode map with the guarded tree's contents.
+	// The hooks are already attached (protection is live) when it is
+	// called; it runs after the resource was unlocked. Tolerant scanning:
+	// entries vanishing mid-scan are skipped, a full map degrades coverage
+	// but is not fatal.
+	PopulateInodes() error
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

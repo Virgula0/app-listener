@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -292,19 +293,17 @@ func (g *Guard) populateMaps() error {
 		return fmt.Errorf("setting depth in config: %w", putErr)
 	}
 
-	info, statErr := os.Stat(g.path)
+	_, statErr := os.Stat(g.path)
 	if statErr != nil {
 		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)
 	}
-
-	if info.IsDir() {
-		if scanErr := g.scanDirInodes(g.path, 0); scanErr != nil {
-			return scanErr
-		}
-	} else {
-		if addErr := g.addInode(g.path); addErr != nil {
-			return addErr
-		}
+	// The guarded path's own inode is stored before the LSM hooks are
+	// attached: the BPF ancestor walk then recognizes the whole tree as
+	// guarded from the first instant the hooks are live. The inode is
+	// statable regardless of encryption state — even while an encrypted
+	// tree is locked, its own inode stays visible.
+	if addErr := g.addInode(g.path); addErr != nil {
+		return addErr
 	}
 
 	if binErr := g.addBinaryActions(); binErr != nil {
@@ -334,7 +333,37 @@ func (g *Guard) populateMaps() error {
 	if err := g.addBackingBlockDevice(); err != nil {
 		log.Warnf("backing block device detection: %v", err)
 	}
+	if err := g.addFsDeviceGate(); err != nil {
+		log.Warnf("filesystem device gate: %v", err)
+	}
 
+	return nil
+}
+
+// addFsDeviceGate records the filesystem device of the guarded path in
+// guard_fs_sbdevs so the BPF ancestor walk can skip every access on other
+// filesystems with a single lookup. Only real block-backed filesystems are
+// recorded (major != 0): on pseudo/anonymous devices (tmpfs, overlayfs,
+// btrfs subvolumes) sb->s_dev is not guaranteed to match st_dev, so the
+// walk keeps running unconditionally there.
+func (g *Guard) addFsDeviceGate() error {
+	var s syscall.Stat_t
+	if err := syscall.Stat(g.path, &s); err != nil {
+		return fmt.Errorf("stating guarded path: %w", err)
+	}
+
+	major := unix.Major(s.Dev)
+	if major == 0 {
+		// Pseudo-filesystem (tmpfs, overlay, procfs, ...): no reliable
+		// device identity, keep the walk ungated.
+		return nil
+	}
+
+	dev := uint64(major)<<20 | uint64(unix.Minor(s.Dev))
+	var val uint8 = 1
+	if err := g.objs.GuardFsSbdevs.Put(dev, val); err != nil {
+		return fmt.Errorf("storing filesystem device %d:%d in map: %w", major, unix.Minor(s.Dev), err)
+	}
 	return nil
 }
 
@@ -386,33 +415,137 @@ func (g *Guard) addInode(path string) error {
 	return nil
 }
 
+// PopulateInodes fills guard_inodes with the inodes of every file and
+// directory under the guarded path. It must be called once the path is
+// readable — after the resource was unlocked — but the LSM hooks are
+// already attached by then (NewGuard attaches them before the caller
+// unlocks), and the guarded root inode is already in the map, so the
+// entire subtree is protected from the moment the hooks attach (the BPF
+// ancestor walk). The scan mirrors the original ssh-guard's "marks
+// attached, then unlock, then walk" ordering. Scanning is tolerant:
+// entries that vanish mid-walk (a live application renaming files) and
+// dangling symlinks are skipped with a warning; a full inode map degrades
+// the rename/unlink/mmap precision but keeps open/read enforcement (the
+// BPF ancestor walk) intact. A tree whose entries all fail to stat is
+// almost certainly fscrypt-encrypted and locked, which is reported as an
+// error.
+func (g *Guard) PopulateInodes() error {
+	info, statErr := os.Stat(g.path)
+	if statErr != nil {
+		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)
+	}
+	if info.IsDir() {
+		if scanErr := g.scanDirInodes(g.path, 0); scanErr != nil {
+			return scanErr
+		}
+	} else {
+		if addErr := g.addInode(g.path); addErr != nil {
+			return addErr
+		}
+	}
+	return nil
+}
+
 func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
-	if err := g.addInode(dir); err != nil {
-		return err
+	return walkInodes(dir, g.recursive, g.depth, currentDepth, g.addInode)
+}
+
+// walkInodes walks dir depth-first, invoking add for dir and every entry
+// below it. Semantics:
+//
+//   - an entry that fails to stat with ENOENT/ENOTDIR (it vanished during
+//     the walk, or is a dangling symlink) is skipped with a warning and the
+//     walk continues;
+//   - an entry that fails with E2BIG means the inode map is full: the walk
+//     stops and reports degraded coverage (open/read enforcement survives
+//     through the BPF ancestor walk);
+//   - any other per-entry failure is skipped with a warning;
+//   - when every entry under a directory fails to stat, the tree is almost
+//     certainly encrypted and locked: an error is returned with a hint.
+//
+// addErrKind classifies a failed addInode stat so the walk can decide what
+// the failure means for coverage.
+type addErrKind int
+
+const (
+	addErrOther   addErrKind = iota // unclassified failure: entry skipped
+	addErrMissing                   // ENOENT/ENOTDIR: entry vanished mid-walk
+	addErrFull                      // E2BIG: inode map full
+)
+
+// classifyAddErr maps an add error to its walk semantics. E2BIG degrades
+// coverage (open/read enforcement survives through the BPF ancestor walk),
+// anything else is logged and skipped.
+func classifyAddErr(path string, err error) addErrKind {
+	switch {
+	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENOTDIR):
+		return addErrMissing
+	case errors.Is(err, unix.E2BIG):
+		log.Warnf("guard inode map full while scanning %s: continuing with degraded coverage", path)
+		return addErrFull
+	default:
+		log.Warnf("guard: skipping unreadable entry %s: %v", path, err)
+		return addErrOther
+	}
+}
+
+func walkInodes(dir string, recursive bool, depthLimit, currentDepth int, add func(string) error) error {
+	if err := add(dir); err != nil {
+		switch classifyAddErr(dir, err) {
+		case addErrMissing, addErrFull:
+			// The root vanished mid-walk (nothing left to scan), or the
+			// inode map is already full: stop without failing.
+			return nil
+		default:
+			return fmt.Errorf("adding inode %s: %w", dir, err)
+		}
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return err
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading %s: %w", dir, err)
 	}
 
+	return walkEntries(dir, entries, recursive, depthLimit, currentDepth, add)
+}
+
+// walkEntries visits the entries of one directory level. It reports an
+// error only when a nested recursion fails, or when every entry failed to
+// stat (the locked-encrypted-tree signature).
+func walkEntries(dir string, entries []os.DirEntry, recursive bool, depthLimit, currentDepth int, add func(string) error) error {
+	total := 0
+	missing := 0
 	for _, entry := range entries {
 		fullPath := filepath.Join(dir, entry.Name())
 		if entry.IsDir() {
-			if !g.recursive {
+			if !recursive {
 				continue
 			}
-			if g.depth > 0 && currentDepth+1 >= g.depth {
+			if depthLimit > 0 && currentDepth+1 >= depthLimit {
 				continue
 			}
-			if err := g.scanDirInodes(fullPath, currentDepth+1); err != nil {
+			if err := walkInodes(fullPath, recursive, depthLimit, currentDepth+1, add); err != nil {
 				return err
 			}
-		} else {
-			if err := g.addInode(fullPath); err != nil {
-				return err
+			continue
+		}
+		total++
+		if err := add(fullPath); err != nil {
+			switch classifyAddErr(fullPath, err) {
+			case addErrMissing:
+				missing++
+			case addErrFull:
+				return nil
 			}
 		}
+	}
+
+	if total > 0 && missing == total {
+		return fmt.Errorf("all %d entries under %s failed to stat: the directory is probably fscrypt-encrypted and locked (unlock it before building the guard)",
+			total, dir)
 	}
 	return nil
 }

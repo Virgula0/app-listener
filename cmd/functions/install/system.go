@@ -7,10 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
@@ -46,6 +49,126 @@ func mustCwd() string {
 		return "."
 	}
 	return cwd
+}
+
+// stopDaemonIfRunning makes sure no app-listener daemon is left alive while
+// the installation reconfigures it: an active systemd unit is stopped cleanly
+// (the install re-enables and starts it at the end), a daemon process started
+// outside systemd (e.g. a manual --headless run) is a fatal error because the
+// installer cannot control it, and a daemon that is not running at all needs
+// no action. After a systemd stop, the installed config's resources are
+// verified to be locked: a daemon killed without its lockdown would leave the
+// watched directories unlocked and unguarded for the whole installation.
+func stopDaemonIfRunning() error {
+	if strings.TrimSpace(systemctlOutput("is-active", daemonServiceName)) == daemonActiveState {
+		log.Infof("daemon is running under systemd: stopping it for the installation ...")
+		if err := runCmd("systemctl", "stop", daemonServiceName); err != nil {
+			return fmt.Errorf("stopping %s: %w", daemonServiceName, err)
+		}
+		log.Infof("daemon stopped")
+		if err := verifyInstalledResourcesLocked(); err != nil {
+			return err
+		}
+		return nil
+	}
+	pids, err := findDaemonProcesses("/proc")
+	if err != nil {
+		return fmt.Errorf("scanning for a running daemon process: %w", err)
+	}
+	if len(pids) > 0 {
+		return fmt.Errorf("fatal: the daemon is running outside systemd (pid(s) %v) — stop it first before installing, e.g. kill %d", pids, pids[0])
+	}
+	log.Info("daemon is not running: nothing to stop")
+	return nil
+}
+
+// verifyInstalledResourcesLocked loads the installed daemon config — the one
+// the stopped daemon was running with — and checks that every encrypted
+// resource is keyless. The daemon's own shutdown only returns once all
+// resources are locked, so a violation here means the daemon was killed
+// without running its lockdown (crash, SIGKILL, older binary): continuing
+// would migrate and leave the trees unlocked and unguarded.
+func verifyInstalledResourcesLocked() error {
+	if _, err := os.Stat(systemConfigPath); os.IsNotExist(err) {
+		log.Debug("no installed config yet: nothing to verify")
+		return nil
+	}
+	cfg, err := daemonconfig.Load(systemConfigPath)
+	if err != nil {
+		return fmt.Errorf("cannot verify the stopped daemon's lockdown: parsing %s: %w — stop any stray daemon process and close files in the watched directories first", systemConfigPath, err)
+	}
+	return verifyResourcesLocked(cfg.Resources, fscrypt.New().IsProvisioned)
+}
+
+// verifyResourcesLocked reports an error when any encrypted resource is
+// still provisioned (unlocked).
+func verifyResourcesLocked(resources []daemonconfig.Resource, provisioned func(string) (bool, error)) error {
+	var unlocked []string
+	for _, r := range resources {
+		if !r.NeedEncryption {
+			continue
+		}
+		provisionedNow, err := provisioned(r.Path)
+		if err != nil {
+			return fmt.Errorf("checking lock state of %s: %w", r.Path, err)
+		}
+		if provisionedNow {
+			unlocked = append(unlocked, r.Path)
+		}
+	}
+	if len(unlocked) > 0 {
+		return fmt.Errorf("fatal: the daemon exited with %d directory(ies) still unlocked: %v — its lockdown did not run or could not finish. Close every file in these directories (lsof +D <dir>, fuser -v <dir>) and re-run the installer",
+			len(unlocked), unlocked)
+	}
+	return nil
+}
+
+// findDaemonProcesses scans procRoot for an app-listener daemon process
+// (matching the "app-listener daemon" invocation, i.e. any `--headless` or
+// foreground run) and returns its PIDs. Processes under a PID namespace that
+// have already exited or are unreadable are skipped.
+func findDaemonProcesses(procRoot string) ([]int, error) {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, convErr := strconv.Atoi(e.Name())
+		if convErr != nil {
+			continue
+		}
+		cmdline, readErr := os.ReadFile(filepath.Join(procRoot, e.Name(), "cmdline"))
+		if readErr != nil {
+			continue
+		}
+		if isDaemonCmdline(string(cmdline)) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
+}
+
+// isDaemonCmdline reports whether a NUL-separated /proc cmdline blob belongs
+// to an app-listener daemon process, i.e. the executable is app-listener and
+// the "daemon" subcommand is among its arguments.
+func isDaemonCmdline(cmdline string) bool {
+	args := strings.Split(cmdline, "\x00")
+	if len(args) == 0 || args[0] == "" {
+		return false
+	}
+	if filepath.Base(args[0]) != "app-listener" {
+		return false
+	}
+	for _, a := range args[1:] {
+		if a == "daemon" {
+			return true
+		}
+	}
+	return false
 }
 
 // runCmd runs a command with CGO/GOOS/GOARCH pinned to the Makefile build

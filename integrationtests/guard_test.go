@@ -969,6 +969,100 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir_NonRecursive() {
 }
 
 // ---------------------------------------------------------------
+// Test: the BPF ancestor walk protects files at any depth even when
+// their parent directory is NOT in guard_inodes.
+//
+// A 20-level-deep directory chain is created AFTER the guard started
+// (all its levels were created at runtime, so none is in the inode
+// map; lazy discovery is capped at 16 levels and cannot reach the
+// guarded root).  Every operation on the deepest level — open, delete,
+// rename, mkdir, hardlink, symlink — must still be blocked for a
+// blacklisted binary thanks to the ancestor walk, and the blocked
+// events must be reported with the correct comm.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"touch", "/watch/top.txt"})
+
+	// cat and the other coreutils have distinct exe inodes on this image,
+	// so each operation's binary must be blacklisted explicitly.  gnumkdir
+	// stays allowed and is used to build the deep tree at runtime.
+	s.startGuardStd(c, "/watch", "--recursive",
+		"-b", "/usr/bin/cat",
+		"-b", "/usr/bin/rm",
+		"-b", "/usr/bin/mv",
+		"-b", "/usr/bin/mkdir",
+		"-b", "/usr/bin/ln")
+	logBefore := s.readGuardLog(c)
+
+	// Sanity: the pre-existing shallow file is blocked for cat.
+	code, out := s.exec(c, []string{"/usr/bin/cat", "/watch/top.txt"})
+	s.Require().NotEqualf(0, code, "pre-existing file should be blocked for cat: %s", out)
+
+	deep := "/watch/D1/D2/D3/D4/D5/D6/D7/D8/D9/D10/D11/D12/D13/D14/D15/D16/D17/D18/D19/D20"
+
+	// Runtime deep tree via the (allowed) gnumkdir — /usr/bin/mkdir is
+	// hardlinked with cat and would be blocked.  No level is added to
+	// guard_inodes: the mkdir hook does not discover, and the discovery
+	// walk is capped at 16 levels, so the guarded root is unreachable.
+	code, out = s.exec(c, []string{"/usr/bin/gnumkdir", "-p", deep})
+	s.Require().Equalf(0, code, "deep tree creation via gnumkdir should succeed: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c", "echo secret > " + deep + "/data.txt"})
+	s.Require().Equalf(0, code, "file creation via shell should succeed: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c", "echo other > " + deep + "/other.txt"})
+	s.Require().Equalf(0, code, "file creation via shell should succeed: %s", out)
+
+	// Every operation at the deepest level must be blocked for the
+	// blacklisted coreutils binaries (ancestor walk).
+	code, out = s.exec(c, []string{"/usr/bin/cat", deep + "/data.txt"})
+	s.Require().NotEqualf(0, code, "cat at depth 20 should be blocked: %s", out)
+
+	code, out = s.exec(c, []string{"/usr/bin/rm", deep + "/data.txt"})
+	s.Require().NotEqualf(0, code, "rm at depth 20 should be blocked: %s", out)
+
+	code, out = s.exec(c, []string{"/usr/bin/mv", deep + "/other.txt", deep + "/moved.txt"})
+	s.Require().NotEqualf(0, code, "mv at depth 20 should be blocked: %s", out)
+
+	code, out = s.exec(c, []string{"/usr/bin/mkdir", deep + "/newdir"})
+	s.Require().NotEqualf(0, code, "mkdir at depth 20 should be blocked: %s", out)
+
+	code, out = s.exec(c, []string{"/usr/bin/ln", deep + "/data.txt", deep + "/hardlink"})
+	s.Require().NotEqualf(0, code, "ln (hardlink) at depth 20 should be blocked: %s", out)
+
+	code, out = s.exec(c, []string{"/usr/bin/ln", "-s", "/etc/passwd", deep + "/symlink"})
+	s.Require().NotEqualf(0, code, "ln -s (symlink) at depth 20 should be blocked: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	s.Require().NotEmpty(deltaEvents, "expected blocked events in guard log")
+	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireBlockedEvent(deltaEvents, "DELETE", "rm")
+	s.requireBlockedEvent(deltaEvents, "RENAME", "mv")
+	s.requireBlockedEvent(deltaEvents, "MKDIR", "mkdir")
+	s.requireBlockedEvent(deltaEvents, "HARDLINK", "ln")
+	s.requireBlockedEvent(deltaEvents, "SYMLINK", "ln")
+
+	// The deep-tree creation (gnumkdir) and the file creation (sh, whose
+	// echo redirection opens the files) must NOT be blocked; every
+	// blacklisted coreutils operation must be.
+	for _, e := range deltaEvents {
+		if e.Comm == "gnumkdir" || e.Comm == "sh" {
+			s.Require().Falsef(e.Blocked, "tree/file creation via %s should be allowed: %s|%s", e.Comm, e.Type, e.Comm)
+			continue
+		}
+		s.Require().Truef(e.Blocked, "event %s|%s should be blocked", e.Type, e.Comm)
+	}
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
 // Test: rename a directory from outside into the guarded area.
 // The rename succeeds (moving into guarded area is allowed), but
 // the moved directory's inode is added to guard_inodes so files

@@ -5,10 +5,15 @@ After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/app-listener daemon --headless
+ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
+# The daemon only exits after every watched directory is locked again; a
+# process holding open files in one of them can make that take a while.
+# Never SIGKILL it mid-lockdown — that would leave the trees unlocked and
+# unguarded.
+TimeoutStopSec=infinity
 
 User=root
 Group=root

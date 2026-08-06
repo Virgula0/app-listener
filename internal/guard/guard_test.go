@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/infrastructure"
 )
@@ -255,4 +256,144 @@ func (s *guardUnitTest) TestBpfEventToGuardEventAllEventTypes() {
 			s.Require().Equal("test", fe.Comm)
 		})
 	}
+}
+
+// walkInodes helper: adds every visited path into a slice.
+func addRecorder() (func(string) error, *[]string) {
+	var got []string
+	return func(p string) error {
+		got = append(got, p)
+		return nil
+	}, &got
+}
+
+func (s *guardUnitTest) TestWalkInodesVisitsTree() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.MkdirAll(filepath.Join(dir, "sub"), 0o755))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "sub", "b.txt"), []byte("b"), 0o644))
+
+	add, got := addRecorder()
+	s.Require().NoError(walkInodes(dir, true, 0, 0, add))
+	s.Require().Len(*got, 4)
+}
+
+func (s *guardUnitTest) TestWalkInodesNonRecursive() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.MkdirAll(filepath.Join(dir, "sub"), 0o755))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "sub", "b.txt"), []byte("b"), 0o644))
+
+	add, got := addRecorder()
+	s.Require().NoError(walkInodes(dir, false, 0, 0, add))
+	s.Require().Len(*got, 2) // root dir + a.txt only
+}
+
+func (s *guardUnitTest) TestWalkInodesDepthLimit() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.MkdirAll(filepath.Join(dir, "l1", "l2", "l3"), 0o755))
+
+	add, got := addRecorder()
+	s.Require().NoError(walkInodes(dir, true, 2, 0, add))
+	// depth 2: root, l1, l2 visited; l3 not.
+	for _, p := range *got {
+		s.Require().NotContains(p, "l3", "depth-limited walk must not descend past the limit")
+	}
+}
+
+func (s *guardUnitTest) TestWalkInodesToleratesVanishingEntry() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0o644))
+
+	// Simulate an entry deleted between readdir and stat (a live
+	// application churning its profile): one file fails with ENOENT, the
+	// rest succeed. The walk must not fail.
+	seen := 0
+	s.Require().NoError(walkInodes(dir, false, 0, 0, func(p string) error {
+		seen++
+		if filepath.Base(p) == "a.txt" {
+			return unix.ENOENT
+		}
+		return nil
+	}))
+	s.Require().Equal(3, seen, "the failing entry must not abort the walk")
+}
+
+func (s *guardUnitTest) TestWalkInodesDanglingSymlinkSkipped() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.Symlink(filepath.Join(dir, "nowhere"), filepath.Join(dir, "dangling")))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
+
+	add, _ := addRecorder()
+	s.Require().NoError(walkInodes(dir, false, 0, 0, add))
+}
+
+func (s *guardUnitTest) TestWalkInodesMapFullDegrades() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0o644))
+
+	// A full hash map surfaces as E2BIG: the walk stops without failing.
+	err := walkInodes(dir, false, 0, 0, func(p string) error {
+		return unix.E2BIG
+	})
+	s.Require().NoError(err, "a full map must degrade, not fail the daemon")
+}
+
+func (s *guardUnitTest) TestWalkInodesLockedTreeDetected() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
+
+	// Every entry failing to stat is the signature of an fscrypt-encrypted
+	// directory whose key is not provisioned: report it with a hint. The
+	// root itself stats fine (a locked directory's own inode is visible).
+	err := walkInodes(dir, false, 0, 0, func(p string) error {
+		if p == dir {
+			return nil
+		}
+		return unix.ENOENT
+	})
+	s.Require().Error(err)
+	s.Require().Contains(err.Error(), "fscrypt-encrypted and locked")
+}
+
+// TestPopulateInodesFillsMap verifies the eager inode scan registers every
+// file and directory of the guarded tree in guard_inodes, so kernel-side
+// own/parent inode checks (and not only lazy discovery) protect deep
+// files. Requires root to load the BPF programs; skipped otherwise.
+func (s *guardUnitTest) TestPopulateInodesFillsMap() {
+	if os.Geteuid() != 0 {
+		s.T().Skip("requires root to load BPF programs")
+	}
+
+	dir := s.T().TempDir()
+	s.Require().NoError(os.MkdirAll(filepath.Join(dir, "l1", "l2", "l3"), 0o755))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "l1", "l2", "l3", "deep.txt"), []byte("d"), 0o644))
+
+	g, err := NewGuard(dir, ModeBlacklist, nil, true, 0)
+	if err != nil {
+		s.T().Skipf("cannot load guard BPF programs (requires root + LSM support): %v", err)
+	}
+	defer g.Stop()
+
+	s.Require().NoError(g.PopulateInodes())
+
+	var want []string
+	s.Require().NoError(walkInodes(dir, true, 0, 0, func(p string) error {
+		want = append(want, p)
+		return nil
+	}))
+
+	found := make(map[GuardInodeKey]bool, len(want))
+	var key GuardInodeKey
+	var val uint8
+	it := g.objs.GuardInodes.Iterate()
+	for it.Next(&key, &val) {
+		found[key] = true
+	}
+	s.Require().NoError(it.Err())
+	s.Require().Len(found, len(want),
+		"every inode of the tree (dirs and deep files) must be in guard_inodes after PopulateInodes")
 }

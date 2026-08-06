@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/Virgula0/app-listener/internal/guard"
@@ -43,14 +44,25 @@ func (f *fakeMonitorRepo) SetEventTypes(types []ebpf.EventType) {
 }
 
 type fakeGuardRepo struct {
-	started  bool
-	stopped  bool
-	startErr error
-	events   chan guard.GuardEvent
+	mu          sync.Mutex
+	started     bool
+	stopped     bool
+	populated   bool
+	startErr    error
+	populateErr error
+	events      chan guard.GuardEvent
 }
 
 func newFakeGuardRepo() *fakeGuardRepo {
 	return &fakeGuardRepo{events: make(chan guard.GuardEvent)}
+}
+
+func (f *fakeGuardRepo) PopulateInodes() error {
+	if f.populateErr != nil {
+		return f.populateErr
+	}
+	f.populated = true
+	return nil
 }
 
 func (f *fakeGuardRepo) Start() error {
@@ -59,11 +71,21 @@ func (f *fakeGuardRepo) Start() error {
 }
 
 func (f *fakeGuardRepo) Stop() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.stopped {
 		return
 	}
 	f.stopped = true
 	close(f.events)
+}
+
+// isStopped is the mutex-safe stopped-state accessor for tests that observe
+// Stop concurrently.
+func (f *fakeGuardRepo) isStopped() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopped
 }
 
 func (f *fakeGuardRepo) Events() <-chan guard.GuardEvent {
