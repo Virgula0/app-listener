@@ -149,3 +149,78 @@ func TestRestoreBackupMissingBackup(t *testing.T) {
 		t.Fatal("expected error for missing backup")
 	}
 }
+
+// TestDecryptRefusesExistingTempDir is the safety-critical contract of the
+// permanent decryption: when a previous decryption left its temporary
+// plaintext directory behind, Decrypt must fail fatally BEFORE touching
+// anything, so a half-finished copy is never overwritten or silently
+// discarded.
+func TestDecryptRefusesExistingTempDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "vault")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tmp := dir + DecryptSuffix
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(tmp, "partial")
+	if err := os.WriteFile(marker, []byte("do not touch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := (&Vault{}).Decrypt(dir)
+	if err == nil {
+		t.Fatal("expected fatal error for existing temporary directory")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("error does not explain the conflict: %v", err)
+	}
+
+	// The encrypted directory must be untouched.
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("original directory was modified: %v", err)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "do not touch" {
+		t.Errorf("older temporary copy was modified: %v %q", err, data)
+	}
+}
+
+// TestDecryptRefusesPlainDirectory fails without side effects: the path
+// carries no fscrypt policy, so there is nothing to decrypt.
+func TestDecryptRefusesPlainDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "plain")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "data")
+	if err := os.WriteFile(marker, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := (&Vault{}).Decrypt(dir)
+	if err == nil {
+		t.Fatal("expected error decrypting a non-encrypted directory")
+	}
+	if !strings.Contains(err.Error(), "not encrypted") {
+		t.Errorf("error does not explain the refusal: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("plain directory was touched: %v", err)
+	}
+	if _, err := os.Lstat(dir + DecryptSuffix); !os.IsNotExist(err) {
+		t.Errorf("no temporary directory may be created: %v", err)
+	}
+}
+
+// TestDecryptMissingPath fails fast with a stat error and leaves nothing
+// behind.
+func TestDecryptMissingPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing")
+	if err := (&Vault{}).Decrypt(path); err == nil {
+		t.Fatal("expected error for missing path")
+	}
+	if _, err := os.Lstat(path + DecryptSuffix); !os.IsNotExist(err) {
+		t.Errorf("no temporary directory may be created: %v", err)
+	}
+}

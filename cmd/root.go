@@ -64,4 +64,5 @@ func init() {
 	rootCmd.AddCommand(networkguard.NetworkGuardCmd)
 	rootCmd.AddCommand(daemon.DaemonCmd)
 	rootCmd.AddCommand(install.InstallCmd)
+	rootCmd.AddCommand(install.UninstallCmd)
 }

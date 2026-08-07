@@ -21,6 +21,12 @@ import (
 // e.g. /home/alice/.ssh -> /home/alice/.ssh.app_listener.backup.
 const BackupSuffix = ".app_listener.backup"
 
+// DecryptSuffix is appended to a directory to form the temporary plaintext
+// copy created while a directory is being permanently decrypted, e.g.
+// /home/alice/.ssh -> /home/alice/.ssh.app_listener.decrypt. The directory
+// is renamed back to its original location only after the copy completed.
+const DecryptSuffix = ".app_listener.decrypt"
+
 // Deprovision retry budget, mirroring the daemon teardown loop: a forced
 // deprovision can fail with EBUSY while an inode is still pinned, and the
 // key must be gone before the daemon (or the gap before it starts) is
@@ -169,6 +175,89 @@ func (v *Vault) EncryptWithProgress(path string, onBytes func(copied, total int6
 	// the installer stopping the daemon and it starting up again.
 	if err := lockAndDeprovision(policy, nil); err != nil {
 		log.Warnf("encrypted %s but could not remove its key from the kernel keyring (the directory stays unlocked until the daemon starts): %v", path, err)
+	}
+	return nil
+}
+
+// Decrypt permanently removes the fscrypt policy of path, restoring a
+// plaintext directory in place. The contents are copied into a temporary
+// sibling directory (path+DecryptSuffix) while the policy key is
+// provisioned, and the original encrypted directory is only removed after
+// the copy completed; the plaintext copy is then renamed into place. On
+// any failure the temporary directory is removed and the encrypted
+// directory is left untouched, so a permanent decryption can never lose
+// data. The policy and protector metadata left behind in /.fscrypt become
+// orphaned and are cleaned up by the caller (see CleanOrphans).
+func (v *Vault) Decrypt(path string) error {
+	return v.DecryptWithProgress(path, nil)
+}
+
+// DecryptWithProgress behaves like Decrypt and additionally reports copy
+// progress (bytes copied so far and total) through onBytes while the
+// contents are moved into the plaintext copy.
+func (v *Vault) DecryptWithProgress(path string, onBytes func(copied, total int64)) error {
+	tmp := path + DecryptSuffix
+	if _, err := os.Lstat(tmp); err == nil {
+		return fmt.Errorf("temporary directory %s already exists: a previous decryption was interrupted; remove it manually before retrying", tmp)
+	}
+	if err := requireEncryptedDir(path); err != nil {
+		return err
+	}
+
+	// Fetch the policy BEFORE the directory is removed: the policy object
+	// is needed to drop the key from the kernel keyring after the copy.
+	fsctx, err := actions.NewContextFromPath(path, nil)
+	if err != nil {
+		return fmt.Errorf("fscrypt context for %s: %w", path, err)
+	}
+	policy, err := actions.GetPolicyFromPath(fsctx, path)
+	if err != nil {
+		return fmt.Errorf("get policy for %s: %w", path, err)
+	}
+
+	// The contents must be readable while they are copied out: provision
+	// the policy key first and always drop it again afterwards, whether
+	// the copy succeeded or not.
+	if err := v.Unlock(path); err != nil {
+		return err
+	}
+	defer func() {
+		if err := lockAndDeprovision(policy, nil); err != nil {
+			log.Warnf("decrypted %s but could not remove its key from the kernel keyring: %v", path, err)
+		}
+	}()
+
+	if err := install.CopyTreeWithProgress(path, tmp, onBytes); err != nil {
+		_ = os.RemoveAll(tmp)
+		return fmt.Errorf("copy %s to %s: %w — the encrypted directory was left untouched", path, tmp, err)
+	}
+	if err := os.RemoveAll(path); err != nil {
+		_ = os.RemoveAll(tmp)
+		return fmt.Errorf("remove encrypted directory %s: %w — the plaintext copy at %s was removed as well", path, err, tmp)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("move %s to %s: %w — the plaintext copy still holds the data", tmp, path, err)
+	}
+	return nil
+}
+
+// requireEncryptedDir reports an error unless path is a directory carrying
+// an fscrypt policy. A non-directory or a plain directory can never be
+// decrypted and is refused, mirroring the safety contract of RestoreBackup.
+func requireEncryptedDir(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("decrypt %s: only directories can be decrypted", path)
+	}
+	encrypted, err := hasEncryptionPolicy(path)
+	if err != nil {
+		return fmt.Errorf("checking encryption of %s: %w", path, err)
+	}
+	if !encrypted {
+		return fmt.Errorf("%s is not encrypted with fscrypt: refusing to decrypt it", path)
 	}
 	return nil
 }

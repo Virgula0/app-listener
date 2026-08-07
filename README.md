@@ -19,6 +19,7 @@ The Daemon is particularly useful to protect most important directories on the f
   - [network-guard — block or allow network operations](#network-guard--block-or-allow-network-operations)
   - [daemon — ssh-guard style multi-directory whitelist with fscrypt lifecycle](#daemon--ssh-guard-style-multi-directory-whitelist-with-fscrypt-lifecycle)
   - [install — interactive daemon installer (root only)](#install--interactive-daemon-installer-root-only)
+  - [uninstall — interactive daemon uninstaller (root only)](#uninstall--interactive-daemon-uninstaller-root-only)
 - [Debug](#debug)
 - [Makefile targets](#makefile-targets)
 - [Docker](#docker)
@@ -53,6 +54,14 @@ make build
 #    directories, encrypts the selected ones with backups, installs the
 #    systemd unit + pacman reload hook and enables the daemon
 sudo ./build/linux/app-listener install
+
+# When done, revert it with the uninstaller (root only, TUI): it refuses
+# while the daemon is running, re-scans the catalog, asks which encrypted
+# directories to permanently decrypt (default: no, with progress), removes
+# the installed services/binary/config, and deletes the fscrypt master key
+# ONLY with --delete-key (otherwise every still-encrypted directory can
+# never be unlocked again)
+sudo ./build/linux/app-listener uninstall
 ```
 
 All other modes:
@@ -426,6 +435,64 @@ Safety properties:
 - The daemon unit runs with `ProtectSystem=yes`, `PrivateTmp=yes` and
   `NoNewPrivileges=yes`; the binary itself runs as root like its
   predecessor (eBPF loading requires it).
+
+### uninstall — interactive daemon uninstaller (root only)
+
+A TUI wizard that reverts everything `install` deployed, in the safe order:
+
+```bash
+sudo ./build/linux/app-listener uninstall
+```
+
+The wizard (abort any step with `Esc`; completed steps stay completed):
+
+0. **Daemon guard** — fatally refuses while the daemon is running: an
+   active systemd unit (`systemctl stop app-listener-daemon` first) or a
+   daemon process running outside systemd (`kill <pid>`) both abort the
+   uninstall. The installer stops the daemon because it re-enables it at
+   the end; the uninstaller has nothing to re-enable, so it refuses
+   instead.
+1. **Catalog re-scan** — probes the built-in catalog for every local user
+   (plus the system-level entries), exactly like the installer. The current
+   `/etc/app-listener/daemon.conf` is deliberately **not** consulted: the
+   uninstaller protects whatever is actually encrypted on the system now.
+2. **Key verification** — every encrypted catalog directory is tested
+   against the master key; a directory that does not unlock is a **fatal
+   error**. Removing the daemon (and possibly the key with `--delete-key`)
+   while a directory cannot be unlocked would lock it forever.
+3. **Decryption** — asks per encrypted directory (default: **no**) whether
+   the fscrypt protection must be permanently removed, then decrypts the
+   confirmed ones in place with a TUI progress bar showing the copy
+   progress. The contents are copied into a temporary plaintext sibling
+   (`.app_listener.decrypt`), the encrypted directory is only removed after
+   the copy completed, and the plaintext copy is renamed into place — a
+   failure (or `Esc`) leaves the directory encrypted and untouched, never
+   half-decrypted.
+4. **Orphan cleanup** — removes the fscrypt policy/protector metadata left
+   behind by the decrypted directories (same `app-listener-key-*`
+   signature rule as the installer); still-encrypted directories keep their
+   metadata.
+5. **System revert** — after a confirmation, removes the systemd daemon
+   unit, the pacman reload hook, the binary at `/usr/local/sbin` and the
+   config at `/etc/app-listener/daemon.conf` (`systemctl disable` +
+   `daemon-reload`). The per-user `ssh-agent` units installed by the
+   installer are only reverted after a separate confirmation (default:
+   **no**) and only when their content matches the bundled sample — a
+   user's own modified unit is never touched.
+6. **Master key** — the fscrypt key at `/etc/app-listener/fscrypt.key` is
+   deleted **only** when `--delete-key` is passed:
+
+   ```bash
+   sudo ./build/linux/app-listener uninstall --delete-key
+   ```
+
+   The default keeps it: without the key, every directory that was left
+   encrypted can never be unlocked again.
+
+Migration backups (`.app_listener.backup`) are **not** touched by the
+uninstaller — use `install --restore-backups` / `--delete-post-backups` for
+those. The shared `/etc/fscrypt.conf` created by `fscrypt setup` is also
+left in place.
 
 ## Debug
 
