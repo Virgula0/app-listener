@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -15,6 +14,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/protected"
 )
 
 const (
@@ -71,7 +71,7 @@ func stopDaemonIfRunning() error {
 		}
 		return nil
 	}
-	pids, err := findDaemonProcesses("/proc")
+	pids, err := protected.FindDaemonProcesses("/proc")
 	if err != nil {
 		return fmt.Errorf("scanning for a running daemon process: %w", err)
 	}
@@ -121,54 +121,6 @@ func verifyResourcesLocked(resources []daemonconfig.Resource, provisioned func(s
 			len(unlocked), unlocked)
 	}
 	return nil
-}
-
-// findDaemonProcesses scans procRoot for an app-listener daemon process
-// (matching the "app-listener daemon" invocation, i.e. any `--headless` or
-// foreground run) and returns its PIDs. Processes under a PID namespace that
-// have already exited or are unreadable are skipped.
-func findDaemonProcesses(procRoot string) ([]int, error) {
-	entries, err := os.ReadDir(procRoot)
-	if err != nil {
-		return nil, err
-	}
-	var pids []int
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid, convErr := strconv.Atoi(e.Name())
-		if convErr != nil {
-			continue
-		}
-		cmdline, readErr := os.ReadFile(filepath.Join(procRoot, e.Name(), "cmdline"))
-		if readErr != nil {
-			continue
-		}
-		if isDaemonCmdline(string(cmdline)) {
-			pids = append(pids, pid)
-		}
-	}
-	return pids, nil
-}
-
-// isDaemonCmdline reports whether a NUL-separated /proc cmdline blob belongs
-// to an app-listener daemon process, i.e. the executable is app-listener and
-// the "daemon" subcommand is among its arguments.
-func isDaemonCmdline(cmdline string) bool {
-	args := strings.Split(cmdline, "\x00")
-	if len(args) == 0 || args[0] == "" {
-		return false
-	}
-	if filepath.Base(args[0]) != "app-listener" {
-		return false
-	}
-	for _, a := range args[1:] {
-		if a == "daemon" {
-			return true
-		}
-	}
-	return false
 }
 
 // runCmd runs a command with CGO/GOOS/GOARCH pinned to the Makefile build

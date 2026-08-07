@@ -11,6 +11,7 @@ import (
 type User struct {
 	Name string
 	UID  uint32
+	GID  uint32
 	Home string
 }
 
@@ -46,6 +47,10 @@ func parsePasswd(data []byte) ([]User, error) {
 		if err != nil {
 			return nil, fmt.Errorf("/etc/passwd line %d: bad UID %q: %w", lineno+1, fields[2], err)
 		}
+		gid, err := strconv.ParseUint(fields[3], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("/etc/passwd line %d: bad GID %q: %w", lineno+1, fields[3], err)
+		}
 		home := fields[5]
 		if (uid < minLoginUID && uid != 0) || home == "" || home == "/" || !strings.HasPrefix(home, "/") {
 			continue
@@ -53,7 +58,7 @@ func parsePasswd(data []byte) ([]User, error) {
 		if _, err := os.Stat(home); err != nil {
 			continue
 		}
-		users = append(users, User{Name: fields[0], UID: uint32(uid), Home: home})
+		users = append(users, User{Name: fields[0], UID: uint32(uid), GID: uint32(gid), Home: home})
 	}
 	return users, nil
 }

@@ -4,6 +4,7 @@ import (
 	"os"
 
 	"github.com/Virgula0/app-listener/cmd/functions/daemon"
+	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
 	"github.com/Virgula0/app-listener/cmd/functions/guard"
 	"github.com/Virgula0/app-listener/cmd/functions/install"
 	"github.com/Virgula0/app-listener/cmd/functions/monitor"
@@ -65,4 +66,5 @@ func init() {
 	rootCmd.AddCommand(daemon.DaemonCmd)
 	rootCmd.AddCommand(install.InstallCmd)
 	rootCmd.AddCommand(install.UninstallCmd)
+	rootCmd.AddCommand(editprotected.EditProtectedCmd)
 }

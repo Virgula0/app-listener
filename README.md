@@ -20,6 +20,7 @@ The Daemon is particularly useful to protect most important directories on the f
   - [daemon — ssh-guard style multi-directory whitelist with fscrypt lifecycle](#daemon--ssh-guard-style-multi-directory-whitelist-with-fscrypt-lifecycle)
   - [install — interactive daemon installer (root only)](#install--interactive-daemon-installer-root-only)
   - [uninstall — interactive daemon uninstaller (root only)](#uninstall--interactive-daemon-uninstaller-root-only)
+  - [edit-protected — inspect and edit the encrypted directories (root only)](#edit-protected--inspect-and-edit-the-encrypted-directories-root-only)
 - [Debug](#debug)
 - [Makefile targets](#makefile-targets)
 - [Docker](#docker)
@@ -493,6 +494,59 @@ Migration backups (`.app_listener.backup`) are **not** touched by the
 uninstaller — use `install --restore-backups` / `--delete-post-backups` for
 those. The shared `/etc/fscrypt.conf` created by `fscrypt setup` is also
 left in place.
+
+### edit-protected — inspect and edit the encrypted directories (root only)
+
+Opens one of the fscrypt-encrypted catalog directories in an embedded
+two-pane editor, without touching the installation:
+
+```bash
+sudo ./build/linux/app-listener edit-protected
+```
+
+The flow:
+
+0. **Daemon guard** — fatally refuses while the daemon is running: the
+   edited directory is the very one the daemon guards and unlocks, so
+   editing must never race with it (`systemctl stop app-listener-daemon`
+   first). It refuses instead of stopping the daemon.
+1. **Catalog re-scan** — probes the built-in catalog for every local user
+   (plus the system-level entries) and keeps only the directories that are
+   currently encrypted with fscrypt (the installed `daemon.conf` is
+   deliberately not consulted).
+2. **Key verification** — the chosen directory must unlock with the master
+   key at `/etc/app-listener/fscrypt.key`; a mismatch is a fatal error.
+3. **Pick ONE directory** — only one vault is ever unlocked at a time; the
+   picker explicitly says so.
+4. **Embedded editor** — a vim-style two-pane TUI (a file tree on the left,
+   a directory listing / editor on the right) that:
+   - shows a persistent legend of the keybindings: `j/k` move, `h` collapse,
+     `l`/`e`/`Enter` open a directory or a file, `g`/`G` top/bottom,
+     `a` new file, `A` new directory, `d` delete (confirmed, default no),
+     `m` chmod, `c` chown, `Ctrl+S` save, `Esc`/`q` quit (a dirty buffer
+     asks for confirmation first);
+   - edits files inline with a `Ctrl+S`-save / `Esc`-close buffer, where
+     `Ctrl+←/→` (or `Alt+b/f`) jump between words;
+   - creates new files/directories owned by the invoking user (when run
+     via `sudo`, `SUDO_UID`/`SUDO_GID`) with the conventional `0644`/`0755`
+     modes;
+   - `m` chmod accepts 1–4 octal digits (e.g. `0644`) and only touches the
+     permission bits; `c` chown lists every login user plus a "keep
+     current" entry;
+   - refuses binary files (NUL scan), files larger than 2 MiB and symlinks,
+     so nothing harmful is written through;
+   - preserves file mode and ownership when saving, and writes each file
+     atomically (temp sibling + rename), so a crash never leaves a file
+     half-written.
+5. **Re-lock** — when the editor closes, no matter how, the directory is
+   re-locked with the daemon's own two-pass teardown (plain lock, then a
+   bounded `EBUSY` retry loop). If a process still holds files open it
+   tells you to run `fscrypt lock <dir>` manually: a vault never stays
+   open after this command returns.
+
+The `install --restore-backups` / `--delete-post-backups` maintenance
+modes are mutually exclusive with each other; `edit-protected` is its own
+standalone command.
 
 ## Debug
 

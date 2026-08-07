@@ -34,10 +34,10 @@ func TestParsePasswd(t *testing.T) {
 	if len(users) != 2 {
 		t.Fatalf("got %d users, want 2 (root and alice): %+v", len(users), users)
 	}
-	if users[0].Name != "root" || users[0].UID != 0 || users[0].Home != rootHome {
+	if users[0].Name != "root" || users[0].UID != 0 || users[0].GID != 0 || users[0].Home != rootHome {
 		t.Errorf("unexpected root entry: %+v", users[0])
 	}
-	if users[1].Name != "alice" || users[1].UID != 1000 || users[1].Home != realHome {
+	if users[1].Name != "alice" || users[1].UID != 1000 || users[1].GID != 1000 || users[1].Home != realHome {
 		t.Errorf("unexpected alice entry: %+v", users[1])
 	}
 }
@@ -49,5 +49,8 @@ func TestParsePasswdMalformed(t *testing.T) {
 	}
 	if _, err := parsePasswd([]byte("alice:x:notanumber:1000:Alice:/home/alice:/bin/bash\n")); err == nil {
 		t.Fatal("expected error for malformed UID")
+	}
+	if _, err := parsePasswd([]byte("alice:x:1000:notanumber:Alice:/home/alice:/bin/bash\n")); err == nil {
+		t.Fatal("expected error for malformed GID")
 	}
 }

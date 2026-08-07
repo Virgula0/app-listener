@@ -64,6 +64,8 @@ func newEditorModel(title, initial string) editorModel {
 	ta.KeyMap.LinePrevious.SetKeys("up", "ctrl+p")
 	ta.KeyMap.CharacterBackward.SetKeys("left")
 	ta.KeyMap.CharacterForward.SetKeys("right")
+	ta.KeyMap.WordBackward.SetKeys("ctrl+left", "alt+left", "alt+b")
+	ta.KeyMap.WordForward.SetKeys("ctrl+right", "alt+right", "alt+f")
 	return editorModel{textarea: ta, title: title}
 }
 

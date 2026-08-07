@@ -22,6 +22,7 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/protected"
 )
 
 // deleteKeyFlag controls whether the fscrypt master key is removed at the
@@ -84,20 +85,20 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 	// reverting it while alive would let it keep unlocking and denying
 	// access. Fatally refuse instead of stopping it — there is nothing to
 	// re-enable at the end of an uninstall.
-	if err := requireDaemonStopped(); err != nil {
+	if err := protected.RequireDaemonStopped(); err != nil {
 		return err
 	}
 
 	vault := fscrypt.New()
 
-	encrypted, err := scanEncryptedCatalogDirs(vault)
+	encrypted, err := protected.ScanEncryptedCatalogDirs(vault)
 	if err != nil {
 		return err
 	}
 
 	var decrypted []string
 	if len(encrypted) > 0 {
-		if err := verifyEncryptedKeys(vault, encrypted); err != nil {
+		if err := protected.VerifyEncryptedKeys(vault, encrypted); err != nil {
 			return err
 		}
 		toDecrypt, err := pickDirsToDecrypt(encrypted)
@@ -137,85 +138,6 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Info("uninstall complete")
-	return nil
-}
-
-// requireDaemonStopped fatally refuses the uninstall while an
-// app-listener-daemon is running: an active systemd unit and a daemon
-// process running outside systemd are both fatal, and the operator must
-// stop them manually.
-func requireDaemonStopped() error {
-	if daemonRunning() {
-		return errors.New("fatal: the daemon is running — stop it first: systemctl stop app-listener-daemon")
-	}
-	pids, err := findDaemonProcesses("/proc")
-	if err != nil {
-		return fmt.Errorf("scanning for a running daemon process: %w", err)
-	}
-	if len(pids) > 0 {
-		return fmt.Errorf("fatal: the daemon is running outside systemd (pid(s) %v) — stop it first, e.g. kill %d", pids, pids[0])
-	}
-	log.Info("daemon is not running")
-	return nil
-}
-
-// scanEncryptedCatalogDirs re-scans the catalog for every local user (plus
-// the system-level entries) and returns the directories that are currently
-// encrypted with fscrypt. The installed daemon.conf is deliberately not
-// consulted: the uninstaller protects whatever is actually protected now.
-func scanEncryptedCatalogDirs(vault *fscrypt.Vault) ([]string, error) {
-	users, err := inst.ListUsers()
-	if err != nil {
-		return nil, err
-	}
-	candidates := inst.DiscoverForUsers(users)
-	if len(candidates) == 0 {
-		log.Warn("no catalog directories found for any user")
-		return nil, nil
-	}
-	paths := make([]string, 0, len(candidates))
-	for i := range candidates {
-		paths = append(paths, candidates[i].Path)
-	}
-	encrypted, err := existingEncryptedDirs(vault, paths)
-	if err != nil {
-		return nil, err
-	}
-	if len(encrypted) == 0 {
-		log.Info("no catalog directory is encrypted: nothing to decrypt")
-	}
-	return encrypted, nil
-}
-
-// existingEncryptedDirs returns the paths from the given set that currently
-// carry an fscrypt policy. Regular files and plain directories are skipped
-// (a file can never carry a policy).
-func existingEncryptedDirs(vault *fscrypt.Vault, paths []string) ([]string, error) {
-	var encrypted []string
-	for _, path := range paths {
-		ok, err := vault.IsEncrypted(path)
-		if err != nil {
-			return nil, fmt.Errorf("checking encryption of %s: %w", path, err)
-		}
-		if ok {
-			log.Infof("%s is encrypted", path)
-			encrypted = append(encrypted, path)
-		}
-	}
-	return encrypted, nil
-}
-
-// verifyEncryptedKeys checks the master key against every encrypted
-// directory. A directory that does not unlock with the master key is a
-// fatal error: removing the daemon (and possibly the key with --delete-key)
-// would lock that directory forever since no usable key remains.
-func verifyEncryptedKeys(vault *fscrypt.Vault, encrypted []string) error {
-	for _, path := range encrypted {
-		log.Infof("verifying master key against %s ...", path)
-		if err := vault.VerifyKey(path); err != nil {
-			return fmt.Errorf("fatal: %v — the master key %s does not match the policy of %s; restore the correct key before uninstalling", err, fscrypt.MasterKeyFile, path)
-		}
-	}
 	return nil
 }
 

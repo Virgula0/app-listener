@@ -95,22 +95,12 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return errors.New("install must be run as root: sudo app-listener install")
 	}
 
-	restore, flagErr := cmd.Flags().GetBool("restore-backups")
-	if flagErr != nil {
-		return flagErr
+	done, maintenanceErr := runMaintenanceMode(cmd)
+	if maintenanceErr != nil {
+		return maintenanceErr
 	}
-	deleteBackups, flagErr := cmd.Flags().GetBool("delete-post-backups")
-	if flagErr != nil {
-		return flagErr
-	}
-	if restore && deleteBackups {
-		return errors.New("--restore-backups and --delete-post-backups are mutually exclusive")
-	}
-	if restore {
-		return restoreBackups()
-	}
-	if deleteBackups {
-		return deletePostBackups()
+	if done {
+		return nil
 	}
 
 	// The installer reconfigures files the daemon has open: a daemon left
@@ -148,6 +138,31 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	return cleanupBackups(cfg)
+}
+
+// runMaintenanceMode reads the non-installing switches and runs the
+// requested maintenance mode. It reports whether one was requested (done)
+// so the caller knows the installer body must be skipped. The modes are
+// mutually exclusive.
+func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
+	restore, flagErr := cmd.Flags().GetBool("restore-backups")
+	if flagErr != nil {
+		return false, flagErr
+	}
+	deleteBackups, flagErr := cmd.Flags().GetBool("delete-post-backups")
+	if flagErr != nil {
+		return false, flagErr
+	}
+	if restore && deleteBackups {
+		return false, errors.New("--restore-backups and --delete-post-backups are mutually exclusive")
+	}
+	switch {
+	case restore:
+		return true, restoreBackups()
+	case deleteBackups:
+		return true, deletePostBackups()
+	}
+	return false, nil
 }
 
 // prepareInstallation covers the two steps that precede any user input:

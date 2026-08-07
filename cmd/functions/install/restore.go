@@ -4,20 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/protected"
 )
-
-// daemonRunning reports whether the app-listener-daemon systemd unit is
-// active (empty when systemctl is unavailable).
-func daemonRunning() bool {
-	return strings.TrimSpace(systemctlOutput("is-active", daemonServiceName)) == daemonActiveState
-}
 
 // backupEntry is one discovered migration backup and the directory it
 // belongs to.
@@ -34,7 +28,7 @@ type backupEntry struct {
 // let it keep unlocking and using the very directories being deleted. A
 // TUI progress bar shows the operation progress.
 func restoreBackups() error {
-	if daemonRunning() {
+	if protected.DaemonRunning() {
 		return errors.New("fatal: the daemon is running — stop it before restoring backups: systemctl stop app-listener-daemon")
 	}
 	entries, err := findBackups()
