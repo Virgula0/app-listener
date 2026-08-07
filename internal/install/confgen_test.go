@@ -34,7 +34,10 @@ func TestGenerateConfParses(t *testing.T) {
 		t.Fatal(err)
 	}
 	conf := GenerateConf([]Section{
-		{Path: sshDir, Allow: []string{"/usr/bin/ssh", "/usr/bin/ssh-agent"}, Encrypt: true},
+		{Path: sshDir, Allow: []BinaryRule{
+			{Path: "/usr/bin/ssh", Events: []string{"READ", "WRITE"}},
+			{Path: "/usr/bin/ssh-agent"},
+		}, Encrypt: true},
 		{Path: openDir, Encrypt: false},
 	})
 	cfg := mustParse(t, conf)
@@ -55,6 +58,40 @@ func TestGenerateConfParses(t *testing.T) {
 	}
 }
 
+// TestGenerateConfEmitsEvents verifies whitelisted binaries with event
+// restrictions are emitted as "<path> EV1,EV2" and that the events survive
+// the real daemon parser round-trip. Binaries without restrictions stay a
+// bare path and are parsed back with an empty event list.
+func TestGenerateConfEmitsEvents(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ssh")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	conf := GenerateConf([]Section{
+		{Path: dir, Allow: []BinaryRule{
+			{Path: "/usr/bin/ssh", Events: []string{"READ", "WRITE"}},
+			{Path: "/usr/bin/ssh-agent"},
+		}, Encrypt: true},
+	})
+	if !strings.Contains(conf, "/usr/bin/ssh READ,WRITE\n") {
+		t.Fatalf("config missing READ,WRITE restriction:\n%s", conf)
+	}
+	if !strings.Contains(conf, "/usr/bin/ssh-agent\n") {
+		t.Fatalf("config missing bare ssh-agent line:\n%s", conf)
+	}
+	cfg := mustParse(t, conf)
+	res := cfg.Resources[0]
+	if len(res.Binaries) != 2 {
+		t.Fatalf("binaries = %d, want 2: %+v", len(res.Binaries), res.Binaries)
+	}
+	if res.Binaries[0].Path != "/usr/bin/ssh" || len(res.Binaries[0].Events) != 2 {
+		t.Errorf("ssh rule = %+v, want READ,WRITE", res.Binaries[0])
+	}
+	if len(res.Binaries[1].Events) != 0 {
+		t.Errorf("ssh-agent rule = %+v, want unrestricted (empty events)", res.Binaries[1])
+	}
+}
+
 // TestSetNeedEncryptionReplace flips an existing directive, preserving the
 // whitelist around it.
 func TestSetNeedEncryptionReplace(t *testing.T) {
@@ -63,7 +100,7 @@ func TestSetNeedEncryptionReplace(t *testing.T) {
 		t.Fatal(err)
 	}
 	conf := GenerateConf([]Section{
-		{Path: dir, Allow: []string{"/usr/bin/ssh"}, Encrypt: true},
+		{Path: dir, Allow: []BinaryRule{{Path: "/usr/bin/ssh"}}, Encrypt: true},
 	})
 	updated, err := SetNeedEncryption(conf, dir, false)
 	if err != nil {
@@ -112,7 +149,7 @@ func TestSetNeedEncryptionPreservesManualEdits(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	conf := GenerateConf([]Section{{Path: dir, Allow: []string{"/usr/bin/ssh"}}})
+	conf := GenerateConf([]Section{{Path: dir, Allow: []BinaryRule{{Path: "/usr/bin/ssh"}}}})
 	withComment := strings.Replace(conf,
 		"[watch "+dir+"]\n",
 		"[watch "+dir+"]\n# keep this comment\n",

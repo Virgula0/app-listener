@@ -33,7 +33,7 @@ func TestCatalogSanity(t *testing.T) {
 			t.Errorf("duplicate catalog path %q (%s and %s)", key, prev, entry.Name)
 		}
 		seen[key] = entry.Name
-		for _, bin := range entry.Whitelist {
+		for bin := range entry.Whitelist {
 			if !isAbsoluteCandidate(bin) {
 				t.Errorf("entry %q: whitelist path %q is not absolute (use %%HOME%%/ or %%USER%%/ for home-relative paths)", entry.Name, bin)
 			}
@@ -59,7 +59,7 @@ func TestCatalogHasWireGuardSystemEntry(t *testing.T) {
 	for _, entry := range Catalog {
 		if entry.AbsPath == "/etc/wireguard" {
 			found = true
-			for _, bin := range entry.Whitelist {
+			for bin := range entry.Whitelist {
 				if bin == "/usr/bin/nmcli" {
 					return
 				}
@@ -81,18 +81,57 @@ func TestPathFor(t *testing.T) {
 }
 
 // TestExpandWhitelist verifies %USER% placeholders are replaced and the
-// input slice is not mutated.
+// input whitelist is not mutated, and that events are carried through.
 func TestExpandWhitelist(t *testing.T) {
-	entry := CandidateDir{Whitelist: []string{"/home/%USER%/.local/bin/opencode", "/usr/bin/ssh"}}
+	entry := CandidateDir{Whitelist: map[string][]string{
+		"/home/%USER%/.local/bin/opencode": {"READ", "WRITE"},
+		"/usr/bin/ssh":                     nil,
+	}}
 	got := entry.ExpandWhitelist("bob", "/home/bob")
 	if len(got) != 2 {
 		t.Fatalf("len = %d", len(got))
 	}
-	if got[0] != "/home/bob/.local/bin/opencode" {
-		t.Errorf("got[0] = %q", got[0])
+	if got[0].Path != "/home/bob/.local/bin/opencode" {
+		t.Errorf("got[0].Path = %q", got[0].Path)
 	}
-	if entry.Whitelist[0] != "/home/%USER%/.local/bin/opencode" {
-		t.Errorf("source whitelist mutated: %q", entry.Whitelist[0])
+	if len(got[0].Events) != 2 {
+		t.Errorf("events not preserved: %v", got[0].Events)
+	}
+	if entry.Whitelist["/home/%USER%/.local/bin/opencode"][0] != "READ" {
+		t.Errorf("source whitelist mutated: %v", entry.Whitelist)
+	}
+}
+
+// TestSSHWhitelistIncludesDaemon verifies the .ssh entry whitelists sshd
+// (the OpenSSH server binary), which must be allowed to read a user's
+// authorized_keys to accept public-key logins while the directory is
+// guarded.
+func TestSSHWhitelistIncludesDaemon(t *testing.T) {
+	var entry *CandidateDir
+	for i := range Catalog {
+		if Catalog[i].RelPath == ".ssh" {
+			entry = &Catalog[i]
+			break
+		}
+	}
+	if entry == nil {
+		t.Fatal(".ssh entry not found in catalog")
+	}
+	found := false
+	for bin := range entry.Whitelist {
+		if bin == "/usr/bin/sshd" || bin == "/usr/sbin/sshd" {
+			found = true
+			events := entry.Whitelist[bin]
+			if len(events) != 1 || events[0] != "READ" {
+				t.Errorf("sshd must be READ-only, got %v", events)
+			}
+		}
+	}
+	if !found {
+		t.Fatal(".ssh whitelist does not include sshd: public-key logins would be denied while guarded")
+	}
+	if events := entry.Whitelist["/usr/bin/ssh"]; len(events) != 2 || events[0] != "READ" || events[1] != "WRITE" {
+		t.Errorf("/usr/bin/ssh must be READ,WRITE, got %v", events)
 	}
 }
 
@@ -203,14 +242,17 @@ func TestFilterExistingWhitelist(t *testing.T) {
 	}
 	c := Candidate{
 		User: User{Name: "tester", Home: "/home/tester"},
-		Entry: CandidateDir{Whitelist: []string{
-			existing,
-			"/definitely/not/here/binary",
+		Entry: CandidateDir{Whitelist: map[string][]string{
+			existing:                      nil,
+			"/definitely/not/here/binary": nil,
 		}},
 	}
 	got := c.FilterExistingWhitelist()
-	if len(got) != 1 || got[0] != existing {
+	if len(got) != 1 || got[0].Path != existing {
 		t.Errorf("FilterExistingWhitelist = %v, want [%s]", got, existing)
+	}
+	if len(got[0].Events) != 0 {
+		t.Errorf("existing binary should have no event restriction: %v", got[0].Events)
 	}
 }
 
@@ -222,22 +264,27 @@ func TestExpandWhitelistUsesPasswdHome(t *testing.T) {
 	home := t.TempDir()
 	c := Candidate{
 		User: User{Name: "pwn3r", Home: home},
-		Entry: CandidateDir{Whitelist: []string{
-			"%HOME%/.local/bin/opencode",
-			"%HOME%/.config/discord/*/Discord",
+		Entry: CandidateDir{Whitelist: map[string][]string{
+			"%HOME%/.local/bin/opencode":       nil,
+			"%HOME%/.config/discord/*/Discord": {"READ", "WRITE"},
 		}},
 	}
 	got := c.Entry.ExpandWhitelist(c.User.Name, c.User.Home)
 	if len(got) != 2 {
 		t.Fatalf("ExpandWhitelist returned %d entries, want 2: %v", len(got), got)
 	}
-	for _, p := range got {
-		if strings.HasPrefix(p, "/home/pwn3r") {
-			t.Errorf("whitelist path %q derived from the username instead of the passwd home", p)
+	for _, r := range got {
+		if strings.HasPrefix(r.Path, "/home/pwn3r") {
+			t.Errorf("whitelist path %q derived from the username instead of the passwd home", r.Path)
 		}
-		if !strings.HasPrefix(p, home) {
-			t.Errorf("whitelist path %q does not live under the passwd home %s", p, home)
+		if !strings.HasPrefix(r.Path, home) {
+			t.Errorf("whitelist path %q does not live under the passwd home %s", r.Path, home)
 		}
+	}
+	// Sorted output: "%HOME%/.config/discord/*/Discord" sorts before
+	// "%HOME%/.local/bin/opencode", and it is the entry with events.
+	if len(got[0].Events) != 2 || got[0].Events[0] != "READ" {
+		t.Errorf("glob pattern events not preserved: %v", got[0].Events)
 	}
 }
 
@@ -246,7 +293,7 @@ func TestExpandWhitelistUsesPasswdHome(t *testing.T) {
 // not match the home directory basename.
 func TestCatalogWhitelistNoUsernameHomePrefix(t *testing.T) {
 	for _, entry := range Catalog {
-		for _, bin := range entry.Whitelist {
+		for bin := range entry.Whitelist {
 			if strings.HasPrefix(bin, "/home/%USER%") {
 				t.Errorf("entry %q: whitelist %q must use %%HOME%%/, never /home/%%USER%%/", entry.Name, bin)
 			}
@@ -274,9 +321,9 @@ func TestFilterExistingWhitelistGlob(t *testing.T) {
 
 	c := Candidate{
 		User: User{Name: "tester", Home: home},
-		Entry: CandidateDir{Whitelist: []string{
-			"%HOME%/.config/discord/*/Discord",
-			"%HOME%/.config/discord/no-such-version-*/Discord",
+		Entry: CandidateDir{Whitelist: map[string][]string{
+			"%HOME%/.config/discord/*/Discord":                 {"READ", "WRITE"},
+			"%HOME%/.config/discord/no-such-version-*/Discord": nil,
 		}},
 	}
 	got := c.FilterExistingWhitelist()
@@ -288,8 +335,11 @@ func TestFilterExistingWhitelistGlob(t *testing.T) {
 		t.Fatalf("FilterExistingWhitelist = %v, want %v", got, want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("entry[%d] = %q, want %q", i, got[i], want[i])
+		if got[i].Path != want[i] {
+			t.Errorf("entry[%d] = %q, want %q", i, got[i].Path, want[i])
+		}
+		if len(got[i].Events) != 2 {
+			t.Errorf("entry[%d] events = %v, want the glob pattern's events inherited", i, got[i].Events)
 		}
 	}
 }
@@ -312,20 +362,21 @@ func TestFilterExistingWhitelistMixed(t *testing.T) {
 
 	c := Candidate{
 		User: User{Name: "tester", Home: home},
-		Entry: CandidateDir{Whitelist: []string{
-			bin,
-			"%HOME%/apps/*/tool",
-			"/definitely/missing",
+		Entry: CandidateDir{Whitelist: map[string][]string{
+			bin:                   nil,
+			"%HOME%/apps/*/tool":  {"READ"},
+			"/definitely/missing": nil,
 		}},
 	}
 	got := c.FilterExistingWhitelist()
-	want := []string{bin, app}
-	if len(got) != len(want) {
-		t.Fatalf("FilterExistingWhitelist = %v, want %v", got, want)
+	// Sorted output: the glob match apps/v1/tool sorts before real-bin.
+	if len(got) != 2 {
+		t.Fatalf("FilterExistingWhitelist = %v, want 2 entries", got)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("entry[%d] = %q, want %q", i, got[i], want[i])
-		}
+	if got[0].Path != app || len(got[0].Events) != 1 || got[0].Events[0] != "READ" {
+		t.Errorf("glob match = %+v, want %s with [READ]", got[0], app)
+	}
+	if got[1].Path != bin || len(got[1].Events) != 0 {
+		t.Errorf("concrete binary = %+v, want %s with no events", got[1], bin)
 	}
 }

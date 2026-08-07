@@ -7,6 +7,7 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -21,14 +22,17 @@ type CandidateDir struct {
 	// AbsPath is a system-level path (e.g. "/etc/wireguard") that is
 	// probed once, independent of the selected users.
 	AbsPath string
-	// Whitelist lists the absolute binary paths that are allowed to
-	// access this directory by default. Keep it minimal: every binary
-	// added here is a potential privilege-escalation path if it can be
-	// abused while the directory is unlocked. Identity is verified by
+	// Whitelist maps each whitelisted binary path to the events that
+	// binary may trigger on this directory. An empty (or nil) event list
+	// means every event is allowed and the config line is emitted as a
+	// bare path; a non-empty list restricts the binary to exactly those
+	// events and is emitted as "<path> EV1,EV2". Keep it minimal: every
+	// binary added here is a potential privilege-escalation path if it can
+	// be abused while the directory is unlocked. Identity is verified by
 	// inode, not by name. Whitelist entries that do not exist on the
 	// target system are dropped when the config is generated; entries
 	// containing a glob (*, ?, [) are expanded to every existing match.
-	Whitelist []string
+	Whitelist map[string][]string
 }
 
 // Catalog is the master list of critical directories to search for each
@@ -38,63 +42,75 @@ type CandidateDir struct {
 var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPath: ".ssh",
-		Whitelist: []string{
-			"/usr/bin/ssh", "/usr/bin/ssh-agent", "/usr/bin/ssh-keygen",
-			"/usr/bin/ssh-add", "/usr/bin/scp", "/usr/bin/sftp",
+		// ssh writes into known_hosts, so it gets READ,WRITE; sshd only
+		// reads authorized_keys (READ-only).
+		Whitelist: map[string][]string{
+			"/usr/bin/ssh":        {"READ", "WRITE"},
+			"/usr/bin/ssh-add":    nil,
+			"/usr/bin/ssh-agent":  nil,
+			"/usr/bin/ssh-keygen": nil,
+			"/usr/bin/scp":        nil,
+			"/usr/bin/sftp":       nil,
+			// sshd reads the user's authorized_keys to accept public-key
+			// logins; /usr/sbin/sshd covers Debian-style layouts (the
+			// whitelist keeps whichever exists per machine). READ-only:
+			// the daemon must never write into a user's .ssh.
+			"/usr/bin/sshd":  {"READ"},
+			"/usr/sbin/sshd": {"READ"},
 			// git is deliberately NOT whitelisted (see the original
 			// ssh-guard config): a compromised git can read the keys.
 		}},
 	{Name: "GNU Privacy Guard keyring", RelPath: ".gnupg",
-		Whitelist: []string{
-			"/usr/bin/gpg", "/usr/bin/gpg-agent", "/usr/bin/gpgconf",
-			"/usr/bin/gpg-connect-agent",
+		Whitelist: map[string][]string{
+			"/usr/bin/gpg": nil, "/usr/bin/gpg-agent": nil,
+			"/usr/bin/gpgconf": nil, "/usr/bin/gpg-connect-agent": nil,
 		}},
 
 	// --- AI coding agents and CLI tools ----------------------------------------
 	{Name: "opencode", RelPath: ".config/opencode",
-		Whitelist: []string{
-			"/usr/local/bin/opencode", "/usr/bin/opencode",
-			"%HOME%/.local/bin/opencode",
+		Whitelist: map[string][]string{
+			"/usr/local/bin/opencode": nil, "/usr/bin/opencode": nil,
+			"%HOME%/.local/bin/opencode": nil,
 		}},
 	{Name: "code CLI (GitHub)", RelPath: ".config/code-cli",
-		Whitelist: []string{
-			"/usr/bin/code-cli", "/usr/local/bin/code-cli",
-			"%HOME%/.local/bin/code-cli",
+		Whitelist: map[string][]string{
+			"/usr/bin/code-cli": nil, "/usr/local/bin/code-cli": nil,
+			"%HOME%/.local/bin/code-cli": nil,
 		}},
 	{Name: "Claude Code", RelPath: ".claude",
-		Whitelist: []string{
-			"/usr/local/bin/claude", "/usr/bin/claude",
-			"%HOME%/.local/bin/claude",
+		Whitelist: map[string][]string{
+			"/usr/local/bin/claude": nil, "/usr/bin/claude": nil,
+			"%HOME%/.local/bin/claude": nil,
 		}},
 	{Name: "Claude Code config", RelPath: ".config/claude",
-		Whitelist: []string{
-			"/usr/local/bin/claude", "/usr/bin/claude",
-			"%HOME%/.local/bin/claude",
+		Whitelist: map[string][]string{
+			"/usr/local/bin/claude": nil, "/usr/bin/claude": nil,
+			"%HOME%/.local/bin/claude": nil,
 		}},
 	{Name: "Codeium", RelPath: ".codeium",
-		Whitelist: []string{
-			"/usr/local/bin/codeium", "/usr/bin/codeium",
-			"%HOME%/.local/bin/codeium",
+		Whitelist: map[string][]string{
+			"/usr/local/bin/codeium": nil, "/usr/bin/codeium": nil,
+			"%HOME%/.local/bin/codeium": nil,
 		}},
 	{Name: "Gemini CLI", RelPath: ".gemini",
-		Whitelist: []string{
-			"/usr/local/bin/gemini", "/usr/bin/gemini",
-			"%HOME%/.local/bin/gemini",
+		Whitelist: map[string][]string{
+			"/usr/local/bin/gemini": nil, "/usr/bin/gemini": nil,
+			"%HOME%/.local/bin/gemini": nil,
 		}},
 	{Name: "Cursor", RelPath: ".cursor",
-		Whitelist: []string{
-			"/usr/bin/cursor", "/usr/local/bin/cursor",
-			"%HOME%/.local/bin/cursor",
+		Whitelist: map[string][]string{
+			"/usr/bin/cursor": nil, "/usr/local/bin/cursor": nil,
+			"%HOME%/.local/bin/cursor": nil,
 		}},
 	{Name: "Cursor agent", RelPath: ".cursor-agent",
-		Whitelist: []string{
-			"/usr/bin/cursor", "/usr/local/bin/cursor",
-			"%HOME%/.local/bin/cursor",
+		Whitelist: map[string][]string{
+			"/usr/bin/cursor": nil, "/usr/local/bin/cursor": nil,
+			"%HOME%/.local/bin/cursor": nil,
 		}},
 	{Name: "GitHub Copilot", RelPath: ".config/github-copilot",
-		Whitelist: []string{
-			"/usr/bin/git", "/usr/local/bin/copilot",
-			"%HOME%/.local/bin/copilot",
+		Whitelist: map[string][]string{
+			"/usr/bin/git": nil, "/usr/local/bin/copilot": nil,
+			"%HOME%/.local/bin/copilot": nil,
 		}},
 
 	// --- IDEs and editors ---------------------------------------------------------
@@ -107,31 +123,31 @@ var Catalog = []CandidateDir{
 	// Electron binary must be listed. Same for Firefox, Chrome/Chromium
 	// wrappers, etc.
 	{Name: "VS Code config", RelPath: ".config/Code",
-		Whitelist: []string{
-			"/usr/bin/code", "/usr/local/bin/code",
-			"%HOME%/.local/bin/code",
-			"/opt/visual-studio-code/code", "/usr/share/code/code", "/opt/visual-studio-code/bin/code",
+		Whitelist: map[string][]string{
+			"/usr/bin/code": nil, "/usr/local/bin/code": nil,
+			"%HOME%/.local/bin/code":       nil,
+			"/opt/visual-studio-code/code": nil, "/usr/share/code/code": nil, "/opt/visual-studio-code/bin/code": nil,
 			// chrome_crashpad_handler is a separate process Code spawns to
 			// write crash dumps into .config/Code/Crashpad.
-			"/opt/visual-studio-code/chrome_crashpad_handler", "/usr/share/code/chrome_crashpad_handler",
+			"/opt/visual-studio-code/chrome_crashpad_handler": nil, "/usr/share/code/chrome_crashpad_handler": nil,
 		}},
 	{Name: "VS Code Insiders config", RelPath: ".config/Code - Insiders",
-		Whitelist: []string{
-			"/usr/bin/code-insiders", "/usr/local/bin/code-insiders",
-			"%HOME%/.local/bin/code-insiders", "/opt/visual-studio-code/bin/code",
+		Whitelist: map[string][]string{
+			"/usr/bin/code-insiders": nil, "/usr/local/bin/code-insiders": nil,
+			"%HOME%/.local/bin/code-insiders": nil, "/opt/visual-studio-code/bin/code": nil,
 		}},
 	{Name: "VS Code server (remote development)", RelPath: ".vscode-server",
-		Whitelist: []string{
-			"/usr/bin/code", "/usr/local/bin/code",
-			"%HOME%/.local/bin/code",
-			"/opt/visual-studio-code/code", "/usr/share/code/code",
+		Whitelist: map[string][]string{
+			"/usr/bin/code": nil, "/usr/local/bin/code": nil,
+			"%HOME%/.local/bin/code":       nil,
+			"/opt/visual-studio-code/code": nil, "/usr/share/code/code": nil,
 			// chrome_crashpad_handler is a separate process Code spawns to
 			// write crash dumps into .config/Code/Crashpad.
-			"/opt/visual-studio-code/chrome_crashpad_handler", "/usr/share/code/chrome_crashpad_handler",
+			"/opt/visual-studio-code/chrome_crashpad_handler": nil, "/usr/share/code/chrome_crashpad_handler": nil,
 		}},
 	{Name: "VSCodium config", RelPath: ".config/VSCodium",
-		Whitelist: []string{"/usr/bin/codium", "/usr/local/bin/codium",
-			"/opt/vscodium/chrome_crashpad_handler", "/usr/share/vscodium/chrome_crashpad_handler"}},
+		Whitelist: map[string][]string{"/usr/bin/codium": nil, "/usr/local/bin/codium": nil,
+			"/opt/vscodium/chrome_crashpad_handler": nil, "/usr/share/vscodium/chrome_crashpad_handler": nil}},
 	{Name: "JetBrains IDEs", RelPath: ".config/JetBrains",
 		// Toolbox-installed IDE binaries live under
 		// ~/.local/share/JetBrains/Toolbox/apps/<product>/bin/<product> with
@@ -142,114 +158,114 @@ var Catalog = []CandidateDir{
 		// bundled JetBrains Runtime: the process exe is the JBR java, not
 		// the launcher ELF, so the JBR and its fsnotifier helper must be
 		// whitelisted for the IDE to access its own config.
-		Whitelist: []string{
-			"/usr/bin/idea", "/usr/bin/pycharm", "/usr/bin/webstorm",
-			"/usr/bin/clion", "/usr/bin/goland", "/usr/bin/phpstorm",
-			"/usr/bin/rider", "/usr/bin/datagrip", "/usr/bin/rustrover",
-			"/usr/bin/android-studio",
-			"%HOME%/.goland/jbr/bin/java", "%HOME%/.goland/bin/fsnotifier",
+		Whitelist: map[string][]string{
+			"/usr/bin/idea": nil, "/usr/bin/pycharm": nil, "/usr/bin/webstorm": nil,
+			"/usr/bin/clion": nil, "/usr/bin/goland": nil, "/usr/bin/phpstorm": nil,
+			"/usr/bin/rider": nil, "/usr/bin/datagrip": nil, "/usr/bin/rustrover": nil,
+			"/usr/bin/android-studio":     nil,
+			"%HOME%/.goland/jbr/bin/java": nil, "%HOME%/.goland/bin/fsnotifier": nil,
 		}},
 	{Name: "JetBrains Toolbox", RelPath: ".local/share/JetBrains/Toolbox",
-		Whitelist: []string{
-			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox",
+		Whitelist: map[string][]string{
+			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox": nil,
 		}},
 	{Name: "Zed editor", RelPath: ".config/zed",
-		Whitelist: []string{
-			"/usr/bin/zed", "/usr/local/bin/zed",
-			"%HOME%/.local/bin/zed",
+		Whitelist: map[string][]string{
+			"/usr/bin/zed": nil, "/usr/local/bin/zed": nil,
+			"%HOME%/.local/bin/zed": nil,
 		}},
 	{Name: "Zed editor data", RelPath: ".local/share/zed",
-		Whitelist: []string{
-			"/usr/bin/zed", "/usr/local/bin/zed",
-			"%HOME%/.local/bin/zed",
+		Whitelist: map[string][]string{
+			"/usr/bin/zed": nil, "/usr/local/bin/zed": nil,
+			"%HOME%/.local/bin/zed": nil,
 		}},
 	{Name: "Sublime Text", RelPath: ".config/sublime-text",
 		// /usr/bin/subl is a wrapper; the real binary is under /opt.
-		Whitelist: []string{"/usr/bin/subl", "/usr/bin/sublime-text", "/usr/bin/sublime_text",
-			"/opt/sublime_text/sublime_text"}},
+		Whitelist: map[string][]string{"/usr/bin/subl": nil, "/usr/bin/sublime-text": nil, "/usr/bin/sublime_text": nil,
+			"/opt/sublime_text/sublime_text": nil}},
 	{Name: "Insomnia API client", RelPath: ".config/Insomnia",
-		Whitelist: []string{"/usr/bin/insomnia", "/opt/insomnia/insomnia"}},
+		Whitelist: map[string][]string{"/usr/bin/insomnia": nil, "/opt/insomnia/insomnia": nil}},
 	{Name: "Postman API client", RelPath: ".config/Postman",
-		Whitelist: []string{"/usr/bin/postman", "/opt/postman/postman"}},
+		Whitelist: map[string][]string{"/usr/bin/postman": nil, "/opt/postman/postman": nil}},
 	{Name: "DBeaver database client", RelPath: ".local/share/DBeaverData",
 		// /usr/bin/dbeaver is a wrapper; the real binary lives in /usr/lib.
-		Whitelist: []string{"/usr/bin/dbeaver", "/usr/lib/dbeaver/dbeaver"}},
+		Whitelist: map[string][]string{"/usr/bin/dbeaver": nil, "/usr/lib/dbeaver/dbeaver": nil}},
 	{Name: "Android adb keys", RelPath: ".android",
-		Whitelist: []string{"/usr/bin/adb"}},
+		Whitelist: map[string][]string{"/usr/bin/adb": nil}},
 
 	// --- Cloud, containers and dev tooling --------------------------------------
 	{Name: "AWS credentials", RelPath: ".aws",
-		Whitelist: []string{"/usr/bin/aws"}},
+		Whitelist: map[string][]string{"/usr/bin/aws": nil}},
 	{Name: "Google Cloud SDK", RelPath: ".config/gcloud",
 		// /usr/bin/gcloud (and gsutil) are Python launchers whose process
 		// exe is the interpreter, which the whitelist deliberately does
 		// not list. The entries are kept for documentation; they are
 		// inert.
-		Whitelist: []string{"/usr/bin/gcloud", "/usr/bin/gsutil"}},
+		Whitelist: map[string][]string{"/usr/bin/gcloud": nil, "/usr/bin/gsutil": nil}},
 	{Name: "Kubernetes kubeconfig", RelPath: ".kube",
-		Whitelist: []string{"/usr/bin/kubectl", "/usr/bin/helm", "/usr/bin/oc"}},
+		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil}},
 	{Name: "Docker config and credentials", RelPath: ".docker",
-		Whitelist: []string{"/usr/bin/docker", "/usr/bin/docker-credential-desktop", "/usr/bin/docker-credential-pass"}},
+		Whitelist: map[string][]string{"/usr/bin/docker": nil, "/usr/bin/docker-credential-desktop": nil, "/usr/bin/docker-credential-pass": nil}},
 	{Name: "GitHub CLI", RelPath: ".config/gh",
-		Whitelist: []string{"/usr/bin/gh"}},
+		Whitelist: map[string][]string{"/usr/bin/gh": nil}},
 	{Name: "Azure CLI", RelPath: ".azure",
-		Whitelist: []string{"/usr/bin/az"}},
+		Whitelist: map[string][]string{"/usr/bin/az": nil}},
 	{Name: "Azure CLI config", RelPath: ".config/azure",
-		Whitelist: []string{"/usr/bin/az"}},
+		Whitelist: map[string][]string{"/usr/bin/az": nil}},
 	{Name: "rclone config", RelPath: ".config/rclone",
-		Whitelist: []string{"/usr/bin/rclone"}},
+		Whitelist: map[string][]string{"/usr/bin/rclone": nil}},
 	{Name: "Ollama config", RelPath: ".ollama",
-		Whitelist: []string{"/usr/bin/ollama"}},
+		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
 	{Name: "npm config file", RelPath: ".npmrc",
-		Whitelist: []string{"/usr/bin/npm", "/usr/bin/npx", "/usr/bin/node"}},
+		Whitelist: map[string][]string{"/usr/bin/npm": nil, "/usr/bin/npx": nil, "/usr/bin/node": nil}},
 	{Name: "npm data", RelPath: ".npm",
-		Whitelist: []string{"/usr/bin/npm", "/usr/bin/npx", "/usr/bin/node"}},
+		Whitelist: map[string][]string{"/usr/bin/npm": nil, "/usr/bin/npx": nil, "/usr/bin/node": nil}},
 	// /usr/bin/pip is a #!/usr/bin/python script, so its inode never
 	// matches a running process (the exe is the python interpreter, which
 	// is deliberately NOT whitelisted — too broad). The entries are kept
 	// for documentation; they are inert.
 	{Name: "pip config", RelPath: ".config/pip",
-		Whitelist: []string{"/usr/bin/pip", "/usr/bin/pip3"}},
+		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
 	{Name: "Git config", RelPath: ".gitconfig",
-		Whitelist: []string{"/usr/bin/git"}},
+		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 	{Name: "Git config directory", RelPath: ".config/git",
-		Whitelist: []string{"/usr/bin/git"}},
+		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 
 	// --- Password managers and secrets -------------------------------------------
 	{Name: "password-store (pass)", RelPath: ".password-store",
-		Whitelist: []string{"/usr/bin/pass", "/usr/bin/gpg"}},
+		Whitelist: map[string][]string{"/usr/bin/pass": nil, "/usr/bin/gpg": nil}},
 	{Name: "gopass", RelPath: ".local/share/gopass",
-		Whitelist: []string{"/usr/bin/gopass"}},
+		Whitelist: map[string][]string{"/usr/bin/gopass": nil}},
 	{Name: "Bitwarden", RelPath: ".config/Bitwarden",
-		Whitelist: []string{"/usr/bin/bitwarden", "/usr/local/bin/bitwarden"}},
+		Whitelist: map[string][]string{"/usr/bin/bitwarden": nil, "/usr/local/bin/bitwarden": nil}},
 	{Name: "1Password", RelPath: ".1password",
-		Whitelist: []string{"/usr/bin/1password", "/usr/bin/op", "/usr/local/bin/op"}},
+		Whitelist: map[string][]string{"/usr/bin/1password": nil, "/usr/bin/op": nil, "/usr/local/bin/op": nil}},
 	{Name: "age keys", RelPath: ".config/age",
-		Whitelist: []string{"/usr/bin/age", "/usr/bin/age-keygen"}},
+		Whitelist: map[string][]string{"/usr/bin/age": nil, "/usr/bin/age-keygen": nil}},
 	{Name: "KeePassXC", RelPath: ".local/share/keepassxc",
-		Whitelist: []string{"/usr/bin/keepassxc"}},
+		Whitelist: map[string][]string{"/usr/bin/keepassxc": nil}},
 	{Name: "GNOME keyring", RelPath: ".local/share/keyrings",
-		Whitelist: []string{"/usr/bin/gnome-keyring-daemon", "/usr/bin/gnome-keyring"}},
+		Whitelist: map[string][]string{"/usr/bin/gnome-keyring-daemon": nil, "/usr/bin/gnome-keyring": nil}},
 	{Name: "GNOME keyring (legacy)", RelPath: ".keyring",
-		Whitelist: []string{"/usr/bin/gnome-keyring-daemon", "/usr/bin/gnome-keyring"}},
+		Whitelist: map[string][]string{"/usr/bin/gnome-keyring-daemon": nil, "/usr/bin/gnome-keyring": nil}},
 	{Name: "Chezmoi state", RelPath: ".local/share/chezmoi",
-		Whitelist: []string{"/usr/bin/chezmoi"}},
+		Whitelist: map[string][]string{"/usr/bin/chezmoi": nil}},
 	{Name: "Netrc credentials file", RelPath: ".netrc",
-		Whitelist: []string{"/usr/bin/curl", "/usr/bin/wget", "/usr/bin/git"}},
+		Whitelist: map[string][]string{"/usr/bin/curl": nil, "/usr/bin/wget": nil, "/usr/bin/git": nil}},
 	{Name: "Wget config", RelPath: ".wgetrc",
-		Whitelist: []string{"/usr/bin/wget"}},
+		Whitelist: map[string][]string{"/usr/bin/wget": nil}},
 
 	// --- VPNs ---------------------------------------------------------------------
 	{Name: "NordVPN config", RelPath: ".config/nordvpn",
-		Whitelist: []string{"/usr/bin/nordvpn"}},
+		Whitelist: map[string][]string{"/usr/bin/nordvpn": nil}},
 	{Name: "Mullvad VPN config", RelPath: ".config/mullvad",
-		Whitelist: []string{"/usr/bin/mullvad"}},
+		Whitelist: map[string][]string{"/usr/bin/mullvad": nil}},
 	{Name: "ProtonVPN config", RelPath: ".config/protonvpn",
-		Whitelist: []string{"/usr/bin/protonvpn", "/usr/bin/protonvpn-cli"}},
+		Whitelist: map[string][]string{"/usr/bin/protonvpn": nil, "/usr/bin/protonvpn-cli": nil}},
 	{Name: "OpenVPN config", RelPath: ".config/openvpn",
-		Whitelist: []string{"/usr/bin/openvpn"}},
+		Whitelist: map[string][]string{"/usr/bin/openvpn": nil}},
 	{Name: "WireGuard config (per-user)", RelPath: ".config/wireguard",
-		Whitelist: []string{"/usr/bin/wg", "/usr/bin/wg-quick"}},
+		Whitelist: map[string][]string{"/usr/bin/wg": nil, "/usr/bin/wg-quick": nil}},
 
 	// --- Browsers and messaging -----------------------------------------------------
 	// /usr/bin/firefox (Arch), /usr/bin/google-chrome*, /usr/bin/brave,
@@ -260,25 +276,25 @@ var Catalog = []CandidateDir{
 	// Crash Reports directory: it must be whitelisted for crashes to be
 	// recorded.
 	{Name: "Firefox profile", RelPath: ".mozilla/firefox",
-		Whitelist: []string{
-			"/usr/bin/firefox",
-			"/usr/lib/firefox/firefox",
-			"/usr/lib/firefox/crashhelper", "/usr/lib/firefox/crashreporter",
+		Whitelist: map[string][]string{
+			"/usr/bin/firefox":             nil,
+			"/usr/lib/firefox/firefox":     nil,
+			"/usr/lib/firefox/crashhelper": nil, "/usr/lib/firefox/crashreporter": nil,
 		}},
 	{Name: "Google Chrome profile", RelPath: ".config/google-chrome",
-		Whitelist: []string{
-			"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
-			"/opt/google/chrome/chrome", "/usr/lib/chromium/chrome",
+		Whitelist: map[string][]string{
+			"/usr/bin/google-chrome": nil, "/usr/bin/google-chrome-stable": nil,
+			"/opt/google/chrome/chrome": nil, "/usr/lib/chromium/chrome": nil,
 		}},
 	{Name: "Chromium profile", RelPath: ".config/chromium",
-		Whitelist: []string{
-			"/usr/bin/chromium", "/usr/bin/chromium-browser",
-			"/usr/lib/chromium/chrome", "/usr/lib/chromium/chromium",
+		Whitelist: map[string][]string{
+			"/usr/bin/chromium": nil, "/usr/bin/chromium-browser": nil,
+			"/usr/lib/chromium/chrome": nil, "/usr/lib/chromium/chromium": nil,
 		}},
 	{Name: "Brave profile", RelPath: ".config/BraveSoftware",
-		Whitelist: []string{
-			"/usr/bin/brave-browser", "/usr/bin/brave",
-			"/opt/brave/brave", "/opt/brave-bin/brave",
+		Whitelist: map[string][]string{
+			"/usr/bin/brave-browser": nil, "/usr/bin/brave": nil,
+			"/opt/brave/brave": nil, "/opt/brave-bin/brave": nil,
 		}},
 	{Name: "Discord", RelPath: ".config/discord",
 		// Discord installs into a versioned directory and re-links
@@ -286,30 +302,30 @@ var Catalog = []CandidateDir{
 		// every installed version and is re-expanded on each install run,
 		// so an app update does not leave the whitelist pointing at a
 		// stale inode.
-		Whitelist: []string{"%HOME%/.config/discord/*/Discord"}},
+		Whitelist: map[string][]string{"%HOME%/.config/discord/*/Discord": nil}},
 	{Name: "Discord Canary", RelPath: ".config/discord-canary",
-		Whitelist: []string{"/usr/bin/discord-canary"}},
+		Whitelist: map[string][]string{"/usr/bin/discord-canary": nil}},
 	{Name: "Telegram", RelPath: ".local/share/TelegramDesktop",
-		Whitelist: []string{"/usr/bin/telegram-desktop", "/usr/bin/Telegram"}},
+		Whitelist: map[string][]string{"/usr/bin/telegram-desktop": nil, "/usr/bin/Telegram": nil}},
 	{Name: "Signal", RelPath: ".config/Signal",
-		Whitelist: []string{"/usr/bin/signal-desktop"}},
+		Whitelist: map[string][]string{"/usr/bin/signal-desktop": nil}},
 	{Name: "Element", RelPath: ".config/Element",
-		Whitelist: []string{"/usr/bin/element-desktop"}},
+		Whitelist: map[string][]string{"/usr/bin/element-desktop": nil}},
 
 	// --- Gaming ----------------------------------------------------------------------
 	{Name: "Steam data", RelPath: ".local/share/Steam",
-		Whitelist: []string{
-			"/usr/bin/steam", "/usr/bin/steamwebhelper",
-			"%HOME%/.local/share/Steam/ubuntu12_32/steam",
-			"%HOME%/.local/share/Steam/ubuntu12_32/steamwebhelper",
+		Whitelist: map[string][]string{
+			"/usr/bin/steam": nil, "/usr/bin/steamwebhelper": nil,
+			"%HOME%/.local/share/Steam/ubuntu12_32/steam":          nil,
+			"%HOME%/.local/share/Steam/ubuntu12_32/steamwebhelper": nil,
 		}},
 	{Name: "Steam (legacy home)", RelPath: ".steam",
-		Whitelist: []string{"/usr/bin/steam", "/usr/bin/steamwebhelper"}},
+		Whitelist: map[string][]string{"/usr/bin/steam": nil, "/usr/bin/steamwebhelper": nil}},
 
 	// --- System-level paths (probed once, not per user) --------------------------------
 	// Same whitelist as the original ssh-guard template:
 	{Name: "WireGuard system config", AbsPath: "/etc/wireguard",
-		Whitelist: []string{"/usr/bin/nmcli"}},
+		Whitelist: map[string][]string{"/usr/bin/nmcli": nil}},
 }
 
 // PathFor returns the absolute candidate path for user, expanding the
@@ -323,11 +339,30 @@ func (c CandidateDir) PathFor(home, user string) string {
 	return filepath.Join(home, expandPlaceholders(c.RelPath, user, home))
 }
 
-// ExpandWhitelist returns the whitelist with %USER% placeholders replaced.
-func (c CandidateDir) ExpandWhitelist(user, home string) []string {
-	out := make([]string, 0, len(c.Whitelist))
-	for _, bin := range c.Whitelist {
-		out = append(out, expandPlaceholders(bin, user, home))
+// BinaryRule is one whitelisted binary and the events it may perform on
+// the protected path. An empty Events list means every event is allowed;
+// otherwise only those events are permitted.
+type BinaryRule struct {
+	Path   string
+	Events []string
+}
+
+// ExpandWhitelist returns the whitelist with %USER%/%HOME% placeholders
+// replaced. The result is sorted by path so config generation is
+// deterministic regardless of map iteration order, which Go does not
+// guarantee.
+func (c CandidateDir) ExpandWhitelist(user, home string) []BinaryRule {
+	paths := make([]string, 0, len(c.Whitelist))
+	for bin := range c.Whitelist {
+		paths = append(paths, bin)
+	}
+	sort.Strings(paths)
+	out := make([]BinaryRule, 0, len(paths))
+	for _, bin := range paths {
+		out = append(out, BinaryRule{
+			Path:   expandPlaceholders(bin, user, home),
+			Events: c.Whitelist[bin],
+		})
 	}
 	return out
 }
@@ -410,24 +445,25 @@ func DiscoverForUsers(users []User) []Candidate {
 // filepath.Glob and every matching path becomes its own whitelist entry;
 // this covers versioned application directories such as
 // %HOME%/.config/discord/*/Discord and is re-evaluated on every install,
-// so app updates that move to a new directory are picked up.
-func (c *Candidate) FilterExistingWhitelist() []string {
-	var out []string
-	for _, bin := range c.Entry.ExpandWhitelist(c.User.Name, c.User.Home) {
-		if strings.ContainsAny(bin, "*?[") {
-			matches, err := filepath.Glob(bin)
+// so app updates that move to a new directory are picked up. Every match
+// inherits the events of the glob pattern that produced it.
+func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
+	var out []BinaryRule
+	for _, rule := range c.Entry.ExpandWhitelist(c.User.Name, c.User.Home) {
+		if strings.ContainsAny(rule.Path, "*?[") {
+			matches, err := filepath.Glob(rule.Path)
 			if err != nil {
 				continue // malformed pattern: skip the whole entry
 			}
 			for _, m := range matches {
 				if _, err := os.Stat(m); err == nil {
-					out = append(out, m)
+					out = append(out, BinaryRule{Path: m, Events: rule.Events})
 				}
 			}
 			continue
 		}
-		if _, err := os.Stat(bin); err == nil {
-			out = append(out, bin)
+		if _, err := os.Stat(rule.Path); err == nil {
+			out = append(out, rule)
 		}
 	}
 	return out
