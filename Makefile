@@ -4,6 +4,11 @@ BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
 GEN_DIR     = build/generated
 
+# VERSION is injected into the binary by the release workflow
+# (pre-<date>-<sha>); when empty the embedded constants.Version default
+# (dev marker) is kept.
+VERSION ?=
+
 .PHONY: require-kernel51
 require-kernel51:
 	@kernel_ver=$$(uname -r | cut -d. -f1); \
@@ -15,7 +20,7 @@ require-kernel51:
 build: require-kernel51 generate build-linux
 
 build-linux:
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o $(OUTPUT_DIR)/$(BINARY_NAME) .
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(if $(VERSION),-ldflags "-X github.com/Virgula0/app-listener/internal/constants.Version=$(VERSION)",) -o $(OUTPUT_DIR)/$(BINARY_NAME) .
 .PHONY: build-linux
 
 generate: generate-monitor generate-guard generate-networkmonitor generate-networkguard

@@ -10,6 +10,9 @@ import (
 	"github.com/Virgula0/app-listener/cmd/functions/monitor"
 	"github.com/Virgula0/app-listener/cmd/functions/networkguard"
 	"github.com/Virgula0/app-listener/cmd/functions/networkmonitor"
+	"github.com/Virgula0/app-listener/cmd/functions/uninstall"
+	"github.com/Virgula0/app-listener/cmd/functions/update"
+	"github.com/Virgula0/app-listener/internal/constants"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -22,6 +25,9 @@ file system operations using eBPF.
 
 Use --gui to launch the graphical interface instead of the terminal TUI
 (only available for the monitor subcommand).`,
+	// Enables the built-in --version flag; the value is injected at build
+	// time by the release workflow (see internal/constants.Version).
+	Version: constants.Version,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		initLogger()
 		return nil
@@ -65,6 +71,7 @@ func init() {
 	rootCmd.AddCommand(networkguard.NetworkGuardCmd)
 	rootCmd.AddCommand(daemon.DaemonCmd)
 	rootCmd.AddCommand(install.InstallCmd)
-	rootCmd.AddCommand(install.UninstallCmd)
+	rootCmd.AddCommand(uninstall.UninstallCmd)
+	rootCmd.AddCommand(update.UpdateCmd)
 	rootCmd.AddCommand(editprotected.EditProtectedCmd)
 }

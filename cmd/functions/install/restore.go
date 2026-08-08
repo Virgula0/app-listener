@@ -11,6 +11,8 @@ import (
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/protected"
+	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // backupEntry is one discovered migration backup and the directory it
@@ -49,7 +51,7 @@ func restoreBackups() error {
 		log.Info("no backups selected: nothing to restore")
 		return nil
 	}
-	ok, err := confirmOnce(fmt.Sprintf("Restore %d selected backup(s)? The encrypted directories will be DELETED.", len(entries)), "Restore all")
+	ok, err := wizard.ConfirmOnce(fmt.Sprintf("Restore %d selected backup(s)? The encrypted directories will be DELETED.", len(entries)), "Restore all")
 	if err != nil {
 		return err
 	}
@@ -92,7 +94,7 @@ func deletePostBackups() error {
 		log.Info("no backups selected: nothing to delete")
 		return nil
 	}
-	ok, err := confirmOnce(fmt.Sprintf("Delete %d selected backup(s) permanently?", len(entries)), "Delete all")
+	ok, err := wizard.ConfirmOnce(fmt.Sprintf("Delete %d selected backup(s) permanently?", len(entries)), "Delete all")
 	if err != nil {
 		return err
 	}
@@ -157,34 +159,19 @@ func pickBackups(entries []backupEntry, title, description string) ([]backupEntr
 	return picked, nil
 }
 
-// confirmOnce asks a single yes/no for the whole batch (default: no).
-func confirmOnce(question, affirmative string) (bool, error) {
-	answer := false
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title(question).
-			Affirmative(affirmative).
-			Negative("Cancel").
-			Value(&answer),
-	)).Run(); err != nil {
-		return false, err
-	}
-	return answer, nil
-}
-
 // runWithProgress executes op for every entry while a single-line progress
 // bar at the bottom of the terminal shows the operation progress (one step
 // per directory); the fscrypt logs scroll normally above it.
 func runWithProgress(verb string, entries []backupEntry, op func(path string) error) error {
 	total := len(entries)
-	return withBottomBar(func(bar *bottomBar) error {
+	return wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
 		for i := range entries {
 			label := fmt.Sprintf("%s %d/%d: %s", verb, i+1, total, entries[i].backup)
-			bar.set(label, float64(i)/float64(total))
+			bar.Set(label, float64(i)/float64(total))
 			if err := op(entries[i].path); err != nil {
 				return err
 			}
-			bar.set(label+" (done)", float64(i+1)/float64(total))
+			bar.Set(label+" (done)", float64(i+1)/float64(total))
 		}
 		return nil
 	})
@@ -204,10 +191,10 @@ func restoreCandidates() ([]string, error) {
 		}
 	}
 
-	if data, err := os.ReadFile(systemConfigPath); err == nil {
+	if data, err := os.ReadFile(systemd.SystemConfigPath); err == nil {
 		cfg, loadErr := validateConfigText(string(data))
 		if loadErr != nil {
-			return nil, fmt.Errorf("reading %s: %w", systemConfigPath, loadErr)
+			return nil, fmt.Errorf("reading %s: %w", systemd.SystemConfigPath, loadErr)
 		}
 		for _, r := range cfg.Resources {
 			add(r.Path)

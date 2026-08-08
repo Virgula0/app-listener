@@ -17,6 +17,8 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
+	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 func init() {
@@ -107,7 +109,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	// alive during the migration would keep guarding and unlocking the very
 	// directories being moved. Stop it first, fatally refusing when it runs
 	// outside systemd (where the installer cannot control it).
-	if err := stopDaemonIfRunning(); err != nil {
+	if err := systemd.StopDaemonIfRunning(); err != nil {
 		return err
 	}
 
@@ -231,7 +233,7 @@ func deploy(cfgText string) error {
 	if err != nil {
 		return err
 	}
-	return enableAndVerify(configChanged)
+	return systemd.EnableAndVerify(configChanged)
 }
 
 // buildBinaryIfNeeded compiles the binary with the Makefile build flags
@@ -248,7 +250,7 @@ func buildBinaryIfNeeded() error {
 			mustCwd(), buildBinaryPath)
 	}
 	log.Infof("building %s ...", buildBinaryPath)
-	if err := runCmd("go", "build", "-o", buildBinaryPath, "."); err != nil {
+	if err := systemd.RunCmd("go", "build", "-o", buildBinaryPath, "."); err != nil {
 		return fmt.Errorf("go build failed: %w", err)
 	}
 	log.Infof("built %s", buildBinaryPath)
@@ -311,13 +313,13 @@ func encryptDirectories(vault *fscrypt.Vault, toEncrypt []string) error {
 	}
 	for _, path := range toEncrypt {
 		log.Infof("encrypting %s (backup: %s%s) ...", path, path, fscrypt.BackupSuffix)
-		err := withBottomBar(func(bar *bottomBar) error {
+		err := wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
 			return vault.EncryptWithProgress(path, func(copied, total int64) {
 				fraction := 0.0
 				if total > 0 {
 					fraction = float64(copied) / float64(total)
 				}
-				bar.set(fmt.Sprintf("Encrypting %s", path), fraction)
+				bar.Set(fmt.Sprintf("Encrypting %s", path), fraction)
 			})
 		})
 		if err != nil {

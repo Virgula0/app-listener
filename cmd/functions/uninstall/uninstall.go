@@ -5,11 +5,11 @@
 // verifies the master key against every one, asks per directory whether the
 // fscrypt encryption may be permanently removed (default: no) and decrypts
 // the confirmed ones with a progress bar, then removes the installed
-// systemd units, pacman hook, binary and config. The per-user ssh-agent
-// systemd units are only reverted after a separate confirmation (default:
-// no) and only when their content matches the bundled sample. The fscrypt
-// master key is never deleted unless --delete-key is passed.
-package install
+// systemd units, pacman hook, binary, PATH symlink and config. The per-user
+// ssh-agent systemd units are only reverted after a separate confirmation
+// (default: no) and only when their content matches the bundled sample. The
+// fscrypt master key is never deleted unless --delete-key is passed.
+package uninstall
 
 import (
 	"errors"
@@ -23,6 +23,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/protected"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // deleteKeyFlag controls whether the fscrypt master key is removed at the
@@ -57,10 +58,10 @@ The wizard reverts everything the installer installed:
      plaintext copy completed, so a failure leaves it untouched
   4. cleans the orphaned fscrypt metadata left behind by the decrypted
      directories (still-encrypted directories keep their metadata)
-  5. reverts the installed systemd service, pacman reload hook, binary and
-     config, and — after a final confirmation (default: no) and only for
-     units whose content matches the bundled sample — the per-user
-     ssh-agent systemd units
+  5. reverts the installed systemd service, pacman reload hook, binary,
+     PATH symlink and config, and — after a final confirmation (default:
+     no) and only for units whose content matches the bundled sample — the
+     per-user ssh-agent systemd units
   6. deletes the fscrypt master key ONLY when --delete-key is passed; the
      default keeps it, because without it every still-encrypted directory
      can never be unlocked again
@@ -188,13 +189,13 @@ func decryptDirectories(vault *fscrypt.Vault, toDecrypt []string) error {
 	}
 	for _, path := range toDecrypt {
 		log.Infof("decrypting %s ...", path)
-		err := withBottomBar(func(bar *bottomBar) error {
+		err := wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
 			return vault.DecryptWithProgress(path, func(copied, total int64) {
 				fraction := 0.0
 				if total > 0 {
 					fraction = float64(copied) / float64(total)
 				}
-				bar.set(fmt.Sprintf("Decrypting %s", path), fraction)
+				bar.Set(fmt.Sprintf("Decrypting %s", path), fraction)
 			})
 		})
 		if err != nil {
