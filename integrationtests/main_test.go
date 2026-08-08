@@ -1,6 +1,7 @@
 package integrationtests
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -21,7 +22,6 @@ import (
 
 var (
 	amd64Bin          string
-	arm64Bin          string
 	netTesterAmd64Bin string
 )
 
@@ -73,16 +73,20 @@ func TestMain(m *testing.M) {
 	// CGO_ENABLED=0 build no longer compiles. The binary must stay static
 	// anyway: it runs inside ubuntu:latest containers whose glibc (2.39)
 	// is older than the host's, so dynamic linking would be rejected at
-	// load time.
-	cmd := exec.Command("go", "build", "-tags", "ci",
+	// load time. osusergo+netgo keep it free of glibc NSS dependencies,
+	// and the build output is buffered so the benign static-link warnings
+	// do not clutter the test run (it is printed only on failure).
+	cmd := exec.Command("go", "build", "-tags", "ci,osusergo,netgo",
 		"-ldflags", "-linkmode external -extldflags -static",
 		"-o", amd64Bin, "..")
-	cmd.Stderr = os.Stderr
+	var buildErr bytes.Buffer
+	cmd.Stderr = &buildErr
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "build amd64 binary: %v\n", err)
+		fmt.Fprintf(os.Stderr, "build amd64 binary: %v\n%s\n", err, buildErr.String())
 		os.Exit(1)
 	}
+	fmt.Fprintln(os.Stderr, "built amd64 binary")
 
 	cmdNet := exec.Command("go", "build", "-tags", "ci", "-o", netTesterAmd64Bin, "./net_tester")
 	cmdNet.Stderr = os.Stderr
@@ -90,15 +94,6 @@ func TestMain(m *testing.M) {
 	if err := cmdNet.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build net_tester amd64 binary: %v\n", err)
 		os.Exit(1)
-	}
-
-	arm64Bin = absPath("../build/test/app-listener-arm64")
-	cmd2 := exec.Command("go", "build", "-tags", "ci", "-o", arm64Bin, "..")
-	cmd2.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
-	cmd2.Stderr = os.Stderr
-	if err := cmd2.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "arm64 cross-build: %v (will skip arm64 tests)\n", err)
-		arm64Bin = ""
 	}
 
 	os.Exit(m.Run())

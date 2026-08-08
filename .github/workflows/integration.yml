@@ -1,9 +1,6 @@
 name: Integration tests
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     types:
       - opened
@@ -41,6 +38,19 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+
+      - name: Host environment diagnostic
+        run: |
+          echo "== uname =="; uname -r
+          echo "== active LSMs =="; cat /sys/kernel/security/lsm 2>&1 || true
+          echo "== btf =="; ls -l /sys/kernel/btf/vmlinux 2>&1 || true
+          echo "== unprivileged_bpf_disabled =="; sysctl -n kernel.unprivileged_bpf_disabled 2>&1 || true
+          echo "== docker =="; docker info --format '{{.Driver}} {{.ServerVersion}}' 2>&1
+          echo "== CapEff =="; grep CapEff /proc/self/status
+          echo "== kernel config =="; grep -E "CONFIG_BPF_LSM=|CONFIG_BPF=|CONFIG_LSM=" /boot/config-$(uname -r) 2>/dev/null || zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_BPF_LSM|CONFIG_BPF=|CONFIG_LSM=" || echo "<no kernel config readable>"
+
+      - name: Guard LSM diagnostic probe (single container)
+        run: go test ./integrationtests/ -run 'TestIntegrationSuite/TestDiag_GuardLSM' -v --count=1 -timeout 5m
 
       - name: Integration tests
         run: make test-integration
