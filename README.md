@@ -132,7 +132,7 @@ app-listener uses eBPF programs that attach to kernel hooks and emit events into
 | **Architectures** | `linux/amd64` (primary, CI-tested). `linux/arm64` (cross-compiled, requires QEMU binfmt for testing). Other architectures need BPF regeneration with target-specific clang. |
 | **Cgroups** | Works in privileged containers with `/sys/kernel/btf` bind-mounted + `CAP_BPF`, `CAP_SYS_ADMIN`. |
 
-The embedded BPF `.o` is compiled for `x86_64`. For other architectures, run `make bpftool-headers` on the target kernel, then `make generate` to cross-compile the BPF programs.
+The embedded BPF `.o` is compiled for `x86_64`. For other architectures, run `make bpftool-headers` on the target kernel, then `make generate` to cross-compile the BPF programs. `make build` runs `bpftool-headers` automatically: a single shared `internal/bpf/vmlinux.h` is regenerated from the running kernel's BTF and used by all four BPF modules (`monitor`, `guard`, `network-monitor`, `network-guard`).
 
 ## Compatibility check
 
@@ -728,14 +728,14 @@ systemctl --user start ssh-agent            # or just relogin
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Generate BPF bindings + build Go binary |
+| `make build` | Regenerate BPF bindings (incl. `vmlinux.h` from running kernel BTF) + build Go binary |
 | `make build-linux` | Build Go binary only (Linux amd64) |
 | `make generate` | Regenerate all BPF C → Go bindings |
 | `make generate-monitor` | Regenerate monitor BPF bindings |
 | `make generate-guard` | Regenerate guard BPF bindings |
 | `make generate-networkmonitor` | Regenerate network-monitor BPF bindings |
 | `make generate-networkguard` | Regenerate network-guard BPF bindings |
-| `make bpftool-headers` | Regenerate `vmlinux.h` from running kernel BTF |
+| `make bpftool-headers` | Regenerate shared `internal/bpf/vmlinux.h` from running kernel BTF |
 | `make lint` | Run golangci-lint |
 | `make test` | Run unit tests (non-integration) |
 | `make test-integration` | Build exploit binaries + run Docker integration tests |
