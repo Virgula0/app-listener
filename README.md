@@ -20,6 +20,7 @@ The Daemon is particularly useful to protect most important directories on the f
   - [daemon — ssh-guard style multi-directory whitelist with fscrypt lifecycle](#daemon--ssh-guard-style-multi-directory-whitelist-with-fscrypt-lifecycle)
   - [install — interactive daemon installer (root only)](#install--interactive-daemon-installer-root-only)
   - [uninstall — interactive daemon uninstaller (root only)](#uninstall--interactive-daemon-uninstaller-root-only)
+  - [update — self-update the installed daemon (root only)](#update--self-update-the-installed-daemon-root-only)
   - [edit-protected — inspect and edit the encrypted directories (root only)](#edit-protected--inspect-and-edit-the-encrypted-directories-root-only)
 - [Debug](#debug)
 - [Makefile targets](#makefile-targets)
@@ -92,6 +93,10 @@ sudo ./build/linux/app-listener daemon --genkey
 # Daemon mode — protect encrypted directories, reload after package updates
 sudo ./build/linux/app-listener daemon --headless --blocked-only
 sudo systemctl reload app-listener-daemon   # or: kill -HUP $(cat /run/app-listener-daemon.pid)
+
+# Update the installed daemon from the latest signed GitHub pre-release
+sudo app-listener update            # interactive: changelog viewer + confirmation
+sudo app-listener update --yes      # non-interactive (scripts, cron)
 ```
 
 Exit the TUI with `q` or `Ctrl+C`.
@@ -494,6 +499,55 @@ Migration backups (`.app_listener.backup`) are **not** touched by the
 uninstaller — use `install --restore-backups` / `--delete-post-backups` for
 those. The shared `/etc/fscrypt.conf` created by `fscrypt setup` is also
 left in place.
+
+### update — self-update the installed daemon (root only)
+
+Keeps the installed daemon binary up to date with the latest signed
+pre-release of this repository. It only works against an installed daemon
+(`/usr/local/sbin/app-listener`, i.e. after `install`) and refuses to run
+as a non-root user with a clear message.
+
+```bash
+# Interactive: shows the release changelog, then asks for confirmation
+sudo app-listener update
+
+# Non-interactive, for scripts and cron (skips the viewer and the prompt)
+sudo app-listener update --yes
+```
+
+The flow:
+
+0. **Version check** — reads the version embedded in the installed binary,
+   lists the repository's pre-releases (`pre-YYYYMMDD-<sha>` tags) from
+   the GitHub API and picks the newest one by publication date. When the
+   installed version is not older, it reports "up to date" and exits.
+   The repository is fixed (`Virgula0/app-listener`): only releases of
+   the signing repository are ever accepted.
+1. **Download** — fetches the release binary, its sha256 checksum file
+   and the Ed25519 signature of that checksum; a progress bar is shown in
+   the TUI bottom bar while downloading.
+2. **Verification** — every update must pass all of these, or the command
+   aborts before anything is written:
+   - the Ed25519 signature of the checksum is verified against the public
+     key **embedded in the binary** (the signing private key only exists
+     as a CI secret and never ships in this repository);
+   - the checksum is verified against the downloaded binary;
+   - the digest GitHub reports for the release asset is verified when
+     present.
+3. **Changelog + confirmation** — the release changelog is shown in a TUI
+   viewer (`↑`/`↓` scroll, `q` / `Esc` / `Enter` closes) and it asks for
+   confirmation before any change is made. When stdin is not a terminal
+   the command aborts without updating unless `--yes` is given.
+4. **Apply** — the daemon is stopped (with the same "resources verified
+   locked" contract as `install`), the installed binary is replaced
+   atomically (a temporary sibling file is renamed over it, so the update
+   works even while the running command or daemon is that very binary —
+   no "text file busy" errors), the `/usr/local/bin/app-listener` symlink
+   is ensured, and the systemd daemon is re-enabled and started again.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--yes` | `false` | Skip the changelog viewer and the confirmation prompt (for scripts and cron) |
 
 ### edit-protected — inspect and edit the encrypted directories (root only)
 
