@@ -128,6 +128,12 @@ func (s *IntegrationSuite) startContainer(
 		WaitingFor:    wait.ForLog("").WithPollInterval(100 * time.Millisecond).WithStartupTimeout(60 * time.Second),
 	}
 
+	// Containers have no securityfs mount, so /sys/kernel/security/lsm is
+	// unreadable inside them. The binary's BPF LSM preflight would therefore
+	// (correctly) hard-fail; the host kernel has already been verified by the
+	// suite's own environment before containers start.
+	req.Env = map[string]string{"APPLISTENER_ASSUME_BPF_LSM": "1"}
+
 	if binaryPath != "" {
 		req.Files = []testcontainers.ContainerFile{
 			{
