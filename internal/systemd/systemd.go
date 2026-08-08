@@ -7,6 +7,7 @@ package systemd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -252,4 +253,39 @@ func RemoveBinSymlinkAt(linkPath, targetPath string) {
 		return
 	}
 	log.Infof("removed symlink %s", linkPath)
+}
+
+// ReplaceInstalledBinary swaps the binary at dstPath with srcPath,
+// atomically and with the 0700 mode the installed daemon expects. The new
+// content is staged in a temporary file next to dstPath and renamed over
+// it, so replacing a currently-executing binary (the installer or the
+// daemon itself) never fails with ETXTBSY.
+func ReplaceInstalledBinary(srcPath, dstPath string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(dstPath), ".app-listener-new-*")
+	if err != nil {
+		return fmt.Errorf("staging the new binary: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(tmp, in); err != nil {
+		in.Close()
+		tmp.Close()
+		return err
+	}
+	in.Close()
+	if err := tmp.Chmod(0o700); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), dstPath); err != nil {
+		return fmt.Errorf("replacing %s: %w", dstPath, err)
+	}
+	log.Infof("replaced %s with the new binary", dstPath)
+	return nil
 }

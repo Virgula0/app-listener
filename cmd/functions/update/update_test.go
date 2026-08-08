@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/Virgula0/app-listener/certificates"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // testKeyPair returns a fresh Ed25519 keypair and its PKIX PEM public key.
@@ -265,37 +268,67 @@ func TestNewerThanInstalled(t *testing.T) {
 		{"pre-20251201-ccccccc", true},
 	}
 	for _, c := range cases {
-		got := newerThanInstalled(c.installed, latest, releases)
+		got := newerThanInstalled(c.installed, &latest, releases)
 		if got != c.want {
 			t.Fatalf("newerThanInstalled(%q) = %v, want %v", c.installed, got, c.want)
 		}
 	}
 }
 
-func TestReplaceInstalledBinary(t *testing.T) {
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "app-listener")
-	if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	src := filepath.Join(dir, "new-binary")
-	if err := os.WriteFile(src, []byte("new contents"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestDownloadFileMode0700(t *testing.T) {
+	content := []byte("binary payload")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+		w.Write(content)
+	}))
+	defer srv.Close()
 
-	if err := replaceInstalledBinary(src, dst); err != nil {
-		t.Fatalf("replaceInstalledBinary: %v", err)
-	}
-	got, err := os.ReadFile(dst)
-	if err != nil || string(got) != "new contents" {
-		t.Fatalf("dst content = %q (err %v), want %q", got, err, "new contents")
+	dst := filepath.Join(t.TempDir(), releaseAssetBinary)
+	if err := downloadFile(srv.Client(), srv.URL, dst, nil, "Downloading app-listener"); err != nil {
+		t.Fatalf("downloadFile: %v", err)
 	}
 	info, err := os.Stat(dst)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("dst mode = %o, want 700", perm)
+		t.Fatalf("downloaded file mode = %o, want 700 (hardened kernels refuse to exec 0600 even for root)", perm)
+	}
+}
+
+func TestDownloadFileHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	if err := downloadFile(srv.Client(), srv.URL, filepath.Join(t.TempDir(), "x"), nil, "label"); err == nil {
+		t.Fatal("downloadFile accepted an HTTP 500")
+	}
+}
+
+func TestProgressReader(t *testing.T) {
+	payload := strings.Repeat("0123456789", 10)
+	body := strings.NewReader(payload)
+
+	var read int64
+	err := wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
+		p := &progressReader{reader: body, total: int64(len(payload)), bar: bar, label: "Downloading"}
+		out, err := io.ReadAll(p)
+		if err != nil {
+			return err
+		}
+		read = p.read
+		if string(out) != payload {
+			t.Fatalf("progressReader returned %d bytes, want the full %d-byte payload", len(out), len(payload))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithBottomBar: %v", err)
+	}
+	if read != int64(len(payload)) {
+		t.Fatalf("progressReader counted %d bytes, want %d", read, len(payload))
 	}
 }
 

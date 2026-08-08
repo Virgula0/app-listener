@@ -158,11 +158,8 @@ func installSSHAgent(u inst.User) error {
 // reports whether the installed config differs from what the daemon was
 // running with.
 func installBinaryAndConfig(cfgText string) (configChanged bool, err error) {
-	if err := inst.CopyTree(buildBinaryPath, systemd.InstallBinaryPath); err != nil {
+	if err := systemd.ReplaceInstalledBinary(buildBinaryPath, systemd.InstallBinaryPath); err != nil {
 		return false, fmt.Errorf("installing binary: %w", err)
-	}
-	if err := os.Chmod(systemd.InstallBinaryPath, 0o700); err != nil {
-		return false, err
 	}
 	log.Infof("installed binary at %s", systemd.InstallBinaryPath)
 

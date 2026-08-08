@@ -129,3 +129,30 @@ func TestEnsureBinSymlinkMissingParent(t *testing.T) {
 		t.Fatalf("EnsureBinSymlinkAt with a missing parent directory: %v", err)
 	}
 }
+
+func TestReplaceInstalledBinary(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "app-listener")
+	if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(dir, "new-binary")
+	if err := os.WriteFile(src, []byte("new contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ReplaceInstalledBinary(src, dst); err != nil {
+		t.Fatalf("ReplaceInstalledBinary: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || string(got) != "new contents" {
+		t.Fatalf("dst content = %q (err %v), want %q", got, err, "new contents")
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("dst mode = %o, want 700", perm)
+	}
+}

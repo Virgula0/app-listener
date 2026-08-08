@@ -1,5 +1,5 @@
 // The `app-listener update` command keeps an installed daemon binary up to
-// date with the latest GitHub pre-release. It is fully non-interactive:
+// date with the latest GitHub pre-release:
 //
 //  1. reads the installed binary's embedded version (--version)
 //  2. lists the repository pre-releases from the GitHub API and picks the
@@ -10,7 +10,10 @@
 //  5. verifies the signature against the public key embedded in the binary
 //     (certificates/app-listener-release.pub), the checksum against the
 //     downloaded binary, and the GitHub-provided asset digest when present
-//  6. replaces /usr/local/sbin/app-listener atomically and restarts the
+//  6. shows the release changelog in a TUI viewer and asks for confirmation
+//     before making any change (skipped with --yes, or when a non-terminal
+//     input is detected the command aborts without updating)
+//  7. replaces /usr/local/sbin/app-listener atomically and restarts the
 //     systemd daemon, mirroring the installer's stop/start contract
 //
 // The signing private key never lives in this repository: it is stored as
@@ -41,11 +44,16 @@ import (
 
 	"github.com/Virgula0/app-listener/certificates"
 	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 const (
 	// githubAPIBase is the GitHub REST API endpoint used to list releases.
 	githubAPIBase = "https://api.github.com"
+	// defaultRepo is the only repository the updater knows about: the
+	// release workflow of this project signs its assets with the key
+	// embedded in this binary, so another repository cannot be trusted.
+	defaultRepo = "Virgula0/app-listener"
 	// releaseAssetBinary / Checksum / Signature are the release asset
 	// names produced by .github/workflows/release.yml.
 	releaseAssetBinary    = "app-listener"
@@ -60,18 +68,18 @@ const (
 
 var preVersionRe = regexp.MustCompile(preVersionPattern)
 
-// repoFlag overrides the GitHub repository used by the updater.
-var repoFlag string
+// yesFlag skips the changelog viewer and the confirmation prompt.
+var yesFlag bool
 
 func init() {
-	UpdateCmd.Flags().StringVar(&repoFlag, "repo", "Virgula0/app-listener",
-		"GitHub repository (owner/name) to fetch pre-releases from")
+	UpdateCmd.Flags().BoolVar(&yesFlag, "yes", false,
+		"update without the changelog viewer and confirmation prompt")
 }
 
 var UpdateCmd = &cobra.Command{
 	Use:   "update",
-	Short: "Non-interactive self-update from the latest GitHub pre-release",
-	Long: `Non-interactive, root-only self-updater for the daemon mode.
+	Short: "Self-update from the latest GitHub pre-release",
+	Long: `Root-only self-updater for the daemon mode.
 
 The command checks the latest pre-release of the repository (the
 pre-YYYYMMDD-<sha> builds produced by the release workflow), compares it
@@ -84,12 +92,16 @@ app-listener, and when a newer one exists:
      then the checksum against the downloaded binary, and the
      GitHub-provided asset digest when present — a failed verification
      aborts the update
-  3. replaces the installed binary atomically
-  4. restarts the systemd daemon (it is stopped first so the watch
+  3. shows the release changelog in a TUI viewer and asks for confirmation
+     before anything is changed
+  4. replaces the installed binary atomically
+  5. restarts the systemd daemon (it is stopped first so the watch
      directories are verified locked again before the new binary starts)
 
-The command is fully non-interactive: it logs its decisions and exits.
-Use --repo to point at a different GitHub repository.`,
+When stdin is not a terminal the command aborts without updating; use
+--yes to update without the viewer and the prompt (for scripts and
+cron jobs). The repository is fixed: only releases of the signing
+repository are accepted.`,
 	Args: cobra.NoArgs,
 	RunE: runUpdate,
 }
@@ -98,6 +110,7 @@ Use --repo to point at a different GitHub repository.`,
 // the updater.
 type githubRelease struct {
 	TagName     string `json:"tag_name"`
+	Body        string `json:"body"`
 	Prerelease  bool   `json:"prerelease"`
 	PublishedAt string `json:"published_at"`
 	Assets      []struct {
@@ -107,7 +120,9 @@ type githubRelease struct {
 	} `json:"assets"`
 }
 
-// runUpdate drives the whole update flow. It never prompts.
+// runUpdate drives the whole update flow. All release checks run first;
+// only then is the changelog shown and the user asked to confirm, unless
+// --yes skips the interactive part entirely.
 func runUpdate(cmd *cobra.Command, args []string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("update must be run as root: sudo app-listener update")
@@ -119,7 +134,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	installed := readInstalledVersion(systemd.InstallBinaryPath)
 	log.Infof("installed version: %s", installed)
 
-	releases, err := fetchPreReleases(githubAPIBase, repoFlag, updateHTTPClient())
+	releases, err := fetchPreReleases(githubAPIBase, defaultRepo, updateHTTPClient())
 	if err != nil {
 		return err
 	}
@@ -130,44 +145,108 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 	log.Infof("latest pre-release: %s (published %s)", latest.TagName, latest.PublishedAt)
 
-	if !newerThanInstalled(installed, latest, releases) {
+	if !newerThanInstalled(installed, &latest, releases) {
 		log.Infof("installed version %s is up to date", installed)
 		return nil
 	}
 
-	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(latest)
+	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&latest)
 	if err != nil {
 		return err
 	}
 
+	// The verified download must survive until applyUpdate has replaced
+	// the installed binary, so the staging directory is owned here, not by
+	// downloadAndVerify (whose return would clean it up prematurely).
 	tmp, err := os.MkdirTemp("", "app-listener-update-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmp)
 
-	client := updateHTTPClient()
-	binPath, checksumPath, sigPath, err := downloadReleaseFiles(client, tmp, binURL, checksumURL, sigURL)
+	binPath, err := downloadAndVerify(tmp, &latest, binURL, binDigest, checksumURL, sigURL)
 	if err != nil {
 		return err
 	}
 
-	if err := verifyRelease(binPath, checksumPath, sigPath, binDigest); err != nil {
-		return fmt.Errorf("release verification failed: %w — the download is rejected; fix the release before updating", err)
-	}
-	log.Infof("release %s verified: Ed25519 signature, sha256 checksum and GitHub digest match", latest.TagName)
-
-	if err := sanityCheckBinary(binPath, latest.TagName); err != nil {
+	proceed, err := confirmUpdate(&latest)
+	if err != nil {
 		return err
+	}
+	if !proceed {
+		log.Info("update canceled by the user: nothing was changed")
+		return nil
 	}
 
 	return applyUpdate(binPath)
 }
 
+// downloadAndVerify downloads the three release assets into the caller-owned
+// staging dir and runs every verification (signature, checksum, GitHub
+// digest and binary sanity) before anything is shown to or asked of the
+// user. The download progress is shown in the TUI bottom bar when stderr is
+// a terminal.
+func downloadAndVerify(tmp string, r *githubRelease, binURL, binDigest, checksumURL, sigURL string) (string, error) {
+	var binPath, checksumPath, sigPath string
+	err := wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
+		var dlErr error
+		binPath, checksumPath, sigPath, dlErr = downloadReleaseFiles(updateHTTPClient(), tmp, binURL, checksumURL, sigURL, bar)
+		return dlErr
+	})
+	if err != nil {
+		return "", err
+	}
+
+	err = verifyRelease(binPath, checksumPath, sigPath, binDigest)
+	if err != nil {
+		return "", fmt.Errorf("release verification failed: %w — the download is rejected; fix the release before updating", err)
+	}
+	log.Infof("release %s verified: Ed25519 signature, sha256 checksum and GitHub digest match", r.TagName)
+
+	err = sanityCheckBinary(binPath, r.TagName)
+	if err != nil {
+		return "", err
+	}
+	log.Infof("release %s verified and downloaded to %s", r.TagName, binPath)
+	return binPath, nil
+}
+
+// confirmUpdate decides whether the update should be applied. With --yes
+// the changelog is logged and the update proceeds immediately. Otherwise
+// the release notes are shown in a TUI viewer (aborting with a clear error
+// when the input is not a terminal) and the user is asked to confirm.
+func confirmUpdate(r *githubRelease) (bool, error) {
+	if yesFlag {
+		log.Infof("--yes given: skipping the changelog viewer and the confirmation prompt")
+		log.Infof("changelog of %s:\n%s", r.TagName, changelogText(r))
+		return true, nil
+	}
+	if !isTerminal(os.Stdin) {
+		return false, errors.New("stdin is not a terminal: interactive confirmation is impossible; re-run with --yes to update without prompts")
+	}
+	if err := showChangelog(r.TagName, changelogText(r)); err != nil {
+		return false, fmt.Errorf("showing the changelog: %w", err)
+	}
+	ok, err := wizard.ConfirmOnce(fmt.Sprintf("Update to %s now?", r.TagName), "Update")
+	if err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+// isTerminal reports whether f is a character device (a real terminal).
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
 // resolveAssets finds the binary, checksum and signature assets of a
 // release, returning their download URLs and the GitHub-provided binary
 // digest when present.
-func resolveAssets(r githubRelease) (binURL, binDigest, checksumURL, sigURL string, err error) {
+func resolveAssets(r *githubRelease) (binURL, binDigest, checksumURL, sigURL string, err error) {
 	asset := func(name string) (url, digest string, ok bool) {
 		for i := range r.Assets {
 			if r.Assets[i].Name == name {
@@ -190,18 +269,18 @@ func resolveAssets(r githubRelease) (binURL, binDigest, checksumURL, sigURL stri
 }
 
 // downloadReleaseFiles downloads the three release assets into dir and
-// returns their paths.
-func downloadReleaseFiles(client *http.Client, dir, binURL, checksumURL, sigURL string) (binPath, checksumPath, sigPath string, err error) {
+// returns their paths. Download progress is reported on bar when non-nil.
+func downloadReleaseFiles(client *http.Client, dir, binURL, checksumURL, sigURL string, bar *wizard.BottomBar) (binPath, checksumPath, sigPath string, err error) {
 	binPath = filepath.Join(dir, releaseAssetBinary)
-	if err := downloadFile(client, binURL, binPath); err != nil {
+	if err := downloadFile(client, binURL, binPath, bar, "Downloading app-listener"); err != nil {
 		return "", "", "", err
 	}
 	checksumPath = filepath.Join(dir, releaseAssetChecksum)
-	if err := downloadFile(client, checksumURL, checksumPath); err != nil {
+	if err := downloadFile(client, checksumURL, checksumPath, bar, "Downloading checksum"); err != nil {
 		return "", "", "", err
 	}
 	sigPath = filepath.Join(dir, releaseAssetSignature)
-	if err := downloadFile(client, sigURL, sigPath); err != nil {
+	if err := downloadFile(client, sigURL, sigPath, bar, "Downloading signature"); err != nil {
 		return "", "", "", err
 	}
 	return binPath, checksumPath, sigPath, nil
@@ -268,7 +347,7 @@ func pickLatestPreRelease(releases []githubRelease) (githubRelease, bool) {
 		if err != nil {
 			continue
 		}
-		if !found || ts.After(latestTime(latest)) {
+		if !found || ts.After(latestTime(&latest)) {
 			latest = releases[i]
 			found = true
 		}
@@ -278,7 +357,7 @@ func pickLatestPreRelease(releases []githubRelease) (githubRelease, bool) {
 
 // latestTime parses the published_at of a release (zero time on failure,
 // so malformed timestamps never win the comparison).
-func latestTime(r githubRelease) time.Time {
+func latestTime(r *githubRelease) time.Time {
 	ts, err := time.Parse(time.RFC3339, r.PublishedAt)
 	if err != nil {
 		return time.Time{}
@@ -289,7 +368,7 @@ func latestTime(r githubRelease) time.Time {
 // newerThanInstalled reports whether the latest pre-release is newer than
 // the installed version. The installed version is either a pre-YYYYMMDD-<sha>
 // tag, or anything else (dev builds, unknown) which is always older.
-func newerThanInstalled(installed string, latest githubRelease, releases []githubRelease) bool {
+func newerThanInstalled(installed string, latest *githubRelease, releases []githubRelease) bool {
 	if !preVersionRe.MatchString(installed) {
 		log.Infof("installed version %q is not a pre-release build: the latest pre-release is newer", installed)
 		return true
@@ -299,7 +378,7 @@ func newerThanInstalled(installed string, latest githubRelease, releases []githu
 	}
 	for i := range releases {
 		if releases[i].TagName == installed {
-			return latestTime(latest).After(latestTime(releases[i]))
+			return latestTime(latest).After(latestTime(&releases[i]))
 		}
 	}
 	// The installed tag is no longer among the listed pre-releases: it is
@@ -314,8 +393,11 @@ func updateHTTPClient() *http.Client {
 	return &http.Client{Timeout: updateHTTPTimeout}
 }
 
-// downloadFile downloads url into path (atomically via a temp file).
-func downloadFile(client *http.Client, url, path string) error {
+// downloadFile downloads url into path (atomically via a temp file). The
+// downloaded file is left with 0700 (the installer's binary mode). When
+// bar is non-nil and the server sends a Content-Length, the download
+// progress is reported on it with the given label.
+func downloadFile(client *http.Client, url, path string, bar *wizard.BottomBar, label string) error {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return err
@@ -329,19 +411,49 @@ func downloadFile(client *http.Client, url, path string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("downloading %s: HTTP %d", url, resp.StatusCode)
 	}
+	body := io.Reader(resp.Body)
+	if bar != nil && resp.ContentLength > 0 {
+		body = &progressReader{reader: resp.Body, total: resp.ContentLength, bar: bar, label: label}
+	}
 	f, err := os.CreateTemp(filepath.Dir(path), ".download-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(f.Name())
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	if _, err := io.Copy(f, body); err != nil {
 		f.Close()
 		return fmt.Errorf("downloading %s: %w", url, err)
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(f.Name(), path)
+	if err := os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	// The file is about to be executed during the sanity check; some
+	// hardened kernels refuse to exec a file without execute bits even for
+	// root, and os.CreateTemp leaves 0600. Give it the same 0700 the
+	// installer uses.
+	return os.Chmod(path, 0o700)
+}
+
+// progressReader wraps a download body and reports the fraction received
+// to the TUI bottom bar.
+type progressReader struct {
+	reader io.Reader
+	total  int64
+	read   int64
+	bar    *wizard.BottomBar
+	label  string
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.reader.Read(b)
+	p.read += int64(n)
+	if p.bar != nil && p.total > 0 {
+		p.bar.Set(p.label, float64(p.read)/float64(p.total))
+	}
+	return n, err
 }
 
 // verifyRelease checks, in order: the Ed25519 signature of the checksum
@@ -460,7 +572,7 @@ func applyUpdate(binPath string) error {
 		return err
 	}
 
-	if err := replaceInstalledBinary(binPath, systemd.InstallBinaryPath); err != nil {
+	if err := systemd.ReplaceInstalledBinary(binPath, systemd.InstallBinaryPath); err != nil {
 		return err
 	}
 	if err := systemd.EnsureBinSymlink(); err != nil {
@@ -471,37 +583,5 @@ func applyUpdate(binPath string) error {
 		return err
 	}
 	log.Info("update complete: the daemon is running the new binary")
-	return nil
-}
-
-// replaceInstalledBinary swaps the installed binary with the verified
-// download, atomically and with the same 0700 mode the installer uses.
-func replaceInstalledBinary(binPath, dstPath string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(dstPath), ".app-listener-new-*")
-	if err != nil {
-		return fmt.Errorf("staging the new binary: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-	in, err := os.Open(binPath)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(tmp, in); err != nil {
-		in.Close()
-		tmp.Close()
-		return err
-	}
-	in.Close()
-	if err := tmp.Chmod(0o700); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp.Name(), dstPath); err != nil {
-		return fmt.Errorf("replacing %s: %w", dstPath, err)
-	}
-	log.Infof("replaced %s with the new binary", dstPath)
 	return nil
 }
