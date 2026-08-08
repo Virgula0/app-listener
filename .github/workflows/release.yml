@@ -94,6 +94,7 @@ jobs:
             build/linux/app-listener.sha256
             build/linux/app-listener.sha256.sig
           if-no-files-found: error
+          retention-days: 1
 
   release:
     needs: build
@@ -107,6 +108,18 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: app-listener
+          # Without an explicit path, download-artifact v8 extracts the
+          # artifact contents directly into $GITHUB_WORKSPACE, leaving no
+          # app-listener/ directory for the release-action artifact patterns
+          # to match.
+          path: app-listener
+
+      - name: Verify downloaded assets
+        run: |
+          test -f app-listener/app-listener
+          test -f app-listener/app-listener.sha256
+          test -f app-listener/app-listener.sha256.sig
+          ls -la app-listener
 
       - name: Create pre-release
         uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
