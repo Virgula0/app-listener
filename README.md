@@ -12,6 +12,7 @@ The Daemon is particularly useful to protect most important directories on the f
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Compatibility](#compatibility)
+- [Compatibility check](#compatibility-check)
 - [Modes](#modes)
   - [monitor — observe events](#monitor--observe-events)
   - [guard — block access](#guard--block-access)
@@ -131,6 +132,20 @@ app-listener uses eBPF programs that attach to kernel hooks and emit events into
 | **Cgroups** | Works in privileged containers with `/sys/kernel/btf` bind-mounted + `CAP_BPF`, `CAP_SYS_ADMIN`. |
 
 The embedded BPF `.o` is compiled for `x86_64`. For other architectures, run `make bpftool-headers` on the target kernel, then `make generate` to cross-compile the BPF programs.
+
+## Compatibility check
+
+Run **before** building or installing — it verifies everything above on the machine you are on and tells you exactly what to fix if something is missing:
+
+```bash
+make check-compatibility
+```
+
+It checks: kernel version (5.x+), BTF availability (`/sys/kernel/btf/vmlinux`), securityfs, the **BPF LSM** (`bpf` in `/sys/kernel/security/lsm` — mandatory for guard/network-guard/daemon, and famously absent by default on Ubuntu and cloud-kernel boots), BPF runtime sysctls, root privileges, Go/gcc/make for building, docker for the integration suite, and the optional clang/bpftool/git.
+
+Hard problems make it exit non-zero and print the exact fix (kernel cmdline, `update-grub`, reboot…); warnings never block. In particular:
+
+> **Ubuntu / cloud VMs**: stock Ubuntu kernels build `CONFIG_BPF_LSM=y` but **do not activate it** — add `lsm=landlock,lockdown,yama,integrity,apparmor,bpf` to the kernel command line and reboot, or the guard modes will attach their hooks but never deny anything. On Ubuntu cloud images the cmdline override lives in `/etc/default/grub.d/50-cloudimg-settings.cfg`.
 
 ## Modes
 
@@ -723,6 +738,7 @@ systemctl --user start ssh-agent            # or just relogin
 | `make lint` | Run golangci-lint |
 | `make test` | Run unit tests (non-integration) |
 | `make test-integration` | Build exploit binaries + run Docker integration tests |
+| `make check-compatibility` | Verify the host is compatible BEFORE building or installing (kernel, BPF LSM, tools) |
 | `make clean` | Remove build artifacts and generated BPF files |
 | `make install-deps` | Download Go dependencies |
 | `make run` | Quick run with `go run` |

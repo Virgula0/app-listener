@@ -1,4 +1,4 @@
-.PHONY: build build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration deploy deploy-down tidy clean
+.PHONY: build build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration check-compatibility deploy deploy-down tidy clean
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
@@ -129,6 +129,10 @@ test-integration:
 	$(MAKE) -C integrationtests/exploits
 	go test ./integrationtests/ -v --count=1 -timeout 30m
 .PHONY: test-integration
+
+check-compatibility:
+	@bash scripts/check-compatibility.sh
+.PHONY: check-compatibility
 
 deploy:
 	docker compose up --build -d
