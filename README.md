@@ -50,6 +50,7 @@ configs with the daemon? Use the interactive installer:
 
 ```bash
 # 1. Build (generates BPF bindings then compiles the Go binary)
+make bpftool-headers
 make build
 
 # 2. Run the installer wizard (root only, TUI): it builds the binary if
@@ -141,7 +142,7 @@ Run **before** building or installing — it verifies everything above on the ma
 make check-compatibility
 ```
 
-It checks: kernel version (5.x+), BTF availability (`/sys/kernel/btf/vmlinux`), securityfs, the **BPF LSM** (`bpf` in `/sys/kernel/security/lsm` — mandatory for guard/network-guard/daemon, and famously absent by default on Ubuntu and cloud-kernel boots), BPF runtime sysctls, root privileges, Go/gcc/make for building, docker for the integration suite, and the optional clang/bpftool/git.
+It checks: kernel version (5.x+), BTF availability (`/sys/kernel/btf/vmlinux`), securityfs, the **BPF LSM** (`bpf` in `/sys/kernel/security/lsm` — mandatory for guard/network-guard/daemon, and famously absent by default on Ubuntu and cloud-kernel boots), BPF runtime sysctls, root privileges, Go/gcc/make for building, docker for the integration suite, and the optional clang + LLVM suite (`llvm-objdump`/`llvm-readelf`/`llvm-strip`/`ld.lld`…)/bpftool/git.
 
 Hard problems make it exit non-zero and print the exact fix (kernel cmdline, `update-grub`, reboot…); warnings never block. In particular:
 

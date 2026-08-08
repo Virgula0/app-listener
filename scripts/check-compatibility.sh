@@ -144,7 +144,7 @@ else
 fi
 
 section "Optional tools"
-for tool in clang bpftool; do
+for tool in clang bpftool git; do
 	if command -v "$tool" >/dev/null 2>&1; then
 		pass "$tool found"
 	else
@@ -153,6 +153,16 @@ for tool in clang bpftool; do
 		bpftool) warn "bpftool not found — only needed to regenerate vmlinux.h (make bpftool-headers)" ;;
 		git) warn "git not found — only needed for development workflows" ;;
 		esac
+	fi
+done
+
+section "LLVM suite (needed with clang to regenerate BPF bindings)"
+llvm_tools="llvm-objdump llvm-readelf llvm-strip llvm-link llvm-nm llvm-ar llvm-size ld.lld"
+for tool in $llvm_tools; do
+	if command -v "$tool" >/dev/null 2>&1; then
+		pass "$tool found"
+	else
+		warn "$tool not found — only needed for 'make generate' (Ubuntu: apt install llvm lld; Arch: pacman -S llvm lld)"
 	fi
 done
 
