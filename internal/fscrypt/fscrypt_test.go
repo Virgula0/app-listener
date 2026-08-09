@@ -2,12 +2,14 @@ package fscrypt
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/google/fscrypt/actions"
+	"github.com/google/fscrypt/filesystem"
 )
 
 // TestNewBoundedKeyFnFirstCall verifies that the initial callback call
@@ -120,5 +122,50 @@ func TestIsEncryptedRegularFile(t *testing.T) {
 
 	if _, err := (&Vault{}).IsEncrypted(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Error("IsEncrypted on a missing path must error")
+	}
+}
+
+// TestClassifySetupErrorNotSetup verifies that the library's
+// ErrNotSetup is translated into an error naming the exact remediation
+// (run `fscrypt setup` once) so the installer can fail fast with guidance.
+func TestClassifySetupErrorNotSetup(t *testing.T) {
+	err := classifySetupError("/home/test/.ssh",
+		&filesystem.ErrNotSetup{Mount: &filesystem.Mount{Path: "/"}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"/home/test/.ssh", "fscrypt setup --all-users", "not initialized"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestClassifySetupErrorNotSupported verifies that unsupported filesystem
+// types (tmpfs, FAT/exFAT) get their own distinct explanation.
+func TestClassifySetupErrorNotSupported(t *testing.T) {
+	err := classifySetupError("/tmp/foo",
+		&filesystem.ErrSetupNotSupported{Mount: &filesystem.Mount{Path: "/tmp"}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "does not support fscrypt encryption") {
+		t.Errorf("error %q does not explain the unsupported filesystem", err)
+	}
+}
+
+// TestClassifySetupErrorGeneric verifies that unrelated failures pass
+// through wrapped with context instead of being mislabeled.
+func TestClassifySetupErrorGeneric(t *testing.T) {
+	inner := errors.New("metadata corrupted")
+	err := classifySetupError("/srv/data", inner)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "fscrypt setup check for /srv/data") {
+		t.Errorf("error %q does not carry the check context", err)
+	}
+	if !errors.Is(err, inner) {
+		t.Errorf("error %q must wrap the original error", err)
 	}
 }

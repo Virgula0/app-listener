@@ -347,6 +347,11 @@ the exact order the setup must happen to be safe:
 sudo ./build/linux/app-listener install
 ```
 
+> **Prerequisite**: every filesystem that holds a protected directory must
+> be initialized for fscrypt once — `sudo fscrypt setup --all-users` (or
+> `sudo fscrypt setup /`). The installer verifies this before asking any
+> question and fails with these instructions if it is missing.
+
 The wizard (abort any step with `Esc`; completed steps stay completed):
 
 0. **Daemon guard** — a running daemon is stopped before anything else: an

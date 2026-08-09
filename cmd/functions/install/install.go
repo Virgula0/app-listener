@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
@@ -209,6 +211,9 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 	if err := verifyEncryptionState(vault, cfg); err != nil {
 		return "", err
 	}
+	if err := askFilesystemsReady(vault, cfg); err != nil {
+		return "", err
+	}
 	updated, toEncrypt, err := askEncryption(vault, cfgText, cfg)
 	if err != nil {
 		return "", err
@@ -217,6 +222,33 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 		return "", err
 	}
 	return updated, nil
+}
+
+// askFilesystemsReady fails fast when a target filesystem was never
+// initialized for fscrypt (`fscrypt setup`): without it every migration
+// aborts deep inside the library, after the user already answered the
+// prompts. Filesystems are deduplicated by device so a multi-fs setup is
+// each verified exactly once.
+func askFilesystemsReady(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
+	var checkedDevs []uint64
+	for _, r := range cfg.Resources {
+		if !r.NeedEncryption {
+			continue
+		}
+		info, statErr := os.Stat(r.Path)
+		if statErr != nil {
+			return fmt.Errorf("stat %s: %w", r.Path, statErr)
+		}
+		dev := info.Sys().(*unix.Stat_t).Dev
+		if slices.Contains(checkedDevs, dev) {
+			continue
+		}
+		checkedDevs = append(checkedDevs, dev)
+		if readyErr := vault.CheckFilesystemReady(r.Path); readyErr != nil {
+			return readyErr
+		}
+	}
+	return nil
 }
 
 // deploy installs the services and hook, copies the binary and the config
