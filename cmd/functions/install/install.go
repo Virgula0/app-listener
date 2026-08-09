@@ -11,11 +11,11 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"syscall"
 
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
@@ -239,7 +239,7 @@ func askFilesystemsReady(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
 		if statErr != nil {
 			return fmt.Errorf("stat %s: %w", r.Path, statErr)
 		}
-		dev := info.Sys().(*unix.Stat_t).Dev
+		dev := info.Sys().(*syscall.Stat_t).Dev
 		if slices.Contains(checkedDevs, dev) {
 			continue
 		}
