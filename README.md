@@ -12,6 +12,7 @@ The Daemon is particularly useful to protect most important directories on the f
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Compatibility](#compatibility)
+- [Compatibility check](#compatibility-check)
 - [Modes](#modes)
   - [monitor — observe events](#monitor--observe-events)
   - [guard — block access](#guard--block-access)
@@ -20,6 +21,7 @@ The Daemon is particularly useful to protect most important directories on the f
   - [daemon — ssh-guard style multi-directory whitelist with fscrypt lifecycle](#daemon--ssh-guard-style-multi-directory-whitelist-with-fscrypt-lifecycle)
   - [install — interactive daemon installer (root only)](#install--interactive-daemon-installer-root-only)
   - [uninstall — interactive daemon uninstaller (root only)](#uninstall--interactive-daemon-uninstaller-root-only)
+  - [update — self-update the installed daemon (root only)](#update--self-update-the-installed-daemon-root-only)
   - [edit-protected — inspect and edit the encrypted directories (root only)](#edit-protected--inspect-and-edit-the-encrypted-directories-root-only)
 - [Debug](#debug)
 - [Makefile targets](#makefile-targets)
@@ -48,6 +50,7 @@ configs with the daemon? Use the interactive installer:
 
 ```bash
 # 1. Build (generates BPF bindings then compiles the Go binary)
+make bpftool-headers
 make build
 
 # 2. Run the installer wizard (root only, TUI): it builds the binary if
@@ -92,6 +95,10 @@ sudo ./build/linux/app-listener daemon --genkey
 # Daemon mode — protect encrypted directories, reload after package updates
 sudo ./build/linux/app-listener daemon --headless --blocked-only
 sudo systemctl reload app-listener-daemon   # or: kill -HUP $(cat /run/app-listener-daemon.pid)
+
+# Update the installed daemon from the latest signed GitHub pre-release
+sudo app-listener update            # interactive: changelog viewer + confirmation
+sudo app-listener update --yes      # non-interactive (scripts, cron)
 ```
 
 Exit the TUI with `q` or `Ctrl+C`.
@@ -125,7 +132,21 @@ app-listener uses eBPF programs that attach to kernel hooks and emit events into
 | **Architectures** | `linux/amd64` (primary, CI-tested). `linux/arm64` (cross-compiled, requires QEMU binfmt for testing). Other architectures need BPF regeneration with target-specific clang. |
 | **Cgroups** | Works in privileged containers with `/sys/kernel/btf` bind-mounted + `CAP_BPF`, `CAP_SYS_ADMIN`. |
 
-The embedded BPF `.o` is compiled for `x86_64`. For other architectures, run `make bpftool-headers` on the target kernel, then `make generate` to cross-compile the BPF programs.
+The embedded BPF `.o` is compiled for `x86_64`. For other architectures, run `make bpftool-headers` on the target kernel, then `make generate` to cross-compile the BPF programs. `make build` runs `bpftool-headers` automatically: a single shared `internal/bpf/vmlinux.h` is regenerated from the running kernel's BTF and used by all four BPF modules (`monitor`, `guard`, `network-monitor`, `network-guard`).
+
+## Compatibility check
+
+Run **before** building or installing — it verifies everything above on the machine you are on and tells you exactly what to fix if something is missing:
+
+```bash
+make check-compatibility
+```
+
+It checks: kernel version (5.x+), BTF availability (`/sys/kernel/btf/vmlinux`), securityfs, the **BPF LSM** (`bpf` in `/sys/kernel/security/lsm` — mandatory for guard/network-guard/daemon, and famously absent by default on Ubuntu and cloud-kernel boots), BPF runtime sysctls, root privileges, Go/gcc/make for building, docker for the integration suite, and the optional clang + LLVM suite (`llvm-objdump`/`llvm-readelf`/`llvm-strip`/`ld.lld`…)/bpftool/git.
+
+Hard problems make it exit non-zero and print the exact fix (kernel cmdline, `update-grub`, reboot…); warnings never block. In particular:
+
+> **Ubuntu / cloud VMs**: stock Ubuntu kernels build `CONFIG_BPF_LSM=y` but **do not activate it** — add `lsm=landlock,lockdown,yama,integrity,apparmor,bpf` to the kernel command line and reboot, or the guard modes will attach their hooks but never deny anything. On Ubuntu cloud images the cmdline override lives in `/etc/default/grub.d/50-cloudimg-settings.cfg`.
 
 ## Modes
 
@@ -326,6 +347,14 @@ the exact order the setup must happen to be safe:
 sudo ./build/linux/app-listener install
 ```
 
+> **Prerequisite**: every filesystem that holds a protected directory must
+> be initialized for fscrypt once — `sudo fscrypt setup --all-users` (or
+> `sudo fscrypt setup /`) — and must actually support encryption: ext4
+> needs the `encrypt` feature flag (`sudo tune2fs -O encrypt /dev/sdXN`),
+> f2fs needs `sudo fsck.f2fs -O encrypt /dev/sdXN`. Both can be run on the
+> running filesystem. The installer verifies both before asking any
+> question and fails with these instructions if either is missing.
+
 The wizard (abort any step with `Esc`; completed steps stay completed):
 
 0. **Daemon guard** — a running daemon is stopped before anything else: an
@@ -495,6 +524,55 @@ uninstaller — use `install --restore-backups` / `--delete-post-backups` for
 those. The shared `/etc/fscrypt.conf` created by `fscrypt setup` is also
 left in place.
 
+### update — self-update the installed daemon (root only)
+
+Keeps the installed daemon binary up to date with the latest signed
+pre-release of this repository. It only works against an installed daemon
+(`/usr/local/sbin/app-listener`, i.e. after `install`) and refuses to run
+as a non-root user with a clear message.
+
+```bash
+# Interactive: shows the release changelog, then asks for confirmation
+sudo app-listener update
+
+# Non-interactive, for scripts and cron (skips the viewer and the prompt)
+sudo app-listener update --yes
+```
+
+The flow:
+
+0. **Version check** — reads the version embedded in the installed binary,
+   lists the repository's pre-releases (`pre-YYYYMMDD-<sha>` tags) from
+   the GitHub API and picks the newest one by publication date. When the
+   installed version is not older, it reports "up to date" and exits.
+   The repository is fixed (`Virgula0/app-listener`): only releases of
+   the signing repository are ever accepted.
+1. **Download** — fetches the release binary, its sha256 checksum file
+   and the Ed25519 signature of that checksum; a progress bar is shown in
+   the TUI bottom bar while downloading.
+2. **Verification** — every update must pass all of these, or the command
+   aborts before anything is written:
+   - the Ed25519 signature of the checksum is verified against the public
+     key **embedded in the binary** (the signing private key only exists
+     as a CI secret and never ships in this repository);
+   - the checksum is verified against the downloaded binary;
+   - the digest GitHub reports for the release asset is verified when
+     present.
+3. **Changelog + confirmation** — the release changelog is shown in a TUI
+   viewer (`↑`/`↓` scroll, `q` / `Esc` / `Enter` closes) and it asks for
+   confirmation before any change is made. When stdin is not a terminal
+   the command aborts without updating unless `--yes` is given.
+4. **Apply** — the daemon is stopped (with the same "resources verified
+   locked" contract as `install`), the installed binary is replaced
+   atomically (a temporary sibling file is renamed over it, so the update
+   works even while the running command or daemon is that very binary —
+   no "text file busy" errors), the `/usr/local/bin/app-listener` symlink
+   is ensured, and the systemd daemon is re-enabled and started again.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--yes` | `false` | Skip the changelog viewer and the confirmation prompt (for scripts and cron) |
+
 ### edit-protected — inspect and edit the encrypted directories (root only)
 
 Opens one of the fscrypt-encrypted catalog directories in an embedded
@@ -658,17 +736,18 @@ systemctl --user start ssh-agent            # or just relogin
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Generate BPF bindings + build Go binary |
+| `make build` | Regenerate BPF bindings (incl. `vmlinux.h` from running kernel BTF) + build Go binary |
 | `make build-linux` | Build Go binary only (Linux amd64) |
 | `make generate` | Regenerate all BPF C → Go bindings |
 | `make generate-monitor` | Regenerate monitor BPF bindings |
 | `make generate-guard` | Regenerate guard BPF bindings |
 | `make generate-networkmonitor` | Regenerate network-monitor BPF bindings |
 | `make generate-networkguard` | Regenerate network-guard BPF bindings |
-| `make bpftool-headers` | Regenerate `vmlinux.h` from running kernel BTF |
+| `make bpftool-headers` | Regenerate shared `internal/bpf/vmlinux.h` from running kernel BTF |
 | `make lint` | Run golangci-lint |
 | `make test` | Run unit tests (non-integration) |
 | `make test-integration` | Build exploit binaries + run Docker integration tests |
+| `make check-compatibility` | Verify the host is compatible BEFORE building or installing (kernel, BPF LSM, tools) |
 | `make clean` | Remove build artifacts and generated BPF files |
 | `make install-deps` | Download Go dependencies |
 | `make run` | Quick run with `go run` |

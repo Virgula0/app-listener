@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"syscall"
 
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
@@ -17,6 +19,8 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
+	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 func init() {
@@ -107,7 +111,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	// alive during the migration would keep guarding and unlocking the very
 	// directories being moved. Stop it first, fatally refusing when it runs
 	// outside systemd (where the installer cannot control it).
-	if err := stopDaemonIfRunning(); err != nil {
+	if err := systemd.StopDaemonIfRunning(); err != nil {
 		return err
 	}
 
@@ -207,6 +211,9 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 	if err := verifyEncryptionState(vault, cfg); err != nil {
 		return "", err
 	}
+	if err := askFilesystemsReady(vault, cfg); err != nil {
+		return "", err
+	}
 	updated, toEncrypt, err := askEncryption(vault, cfgText, cfg)
 	if err != nil {
 		return "", err
@@ -215,6 +222,33 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 		return "", err
 	}
 	return updated, nil
+}
+
+// askFilesystemsReady fails fast when a target filesystem was never
+// initialized for fscrypt (`fscrypt setup`): without it every migration
+// aborts deep inside the library, after the user already answered the
+// prompts. Filesystems are deduplicated by device so a multi-fs setup is
+// each verified exactly once.
+func askFilesystemsReady(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
+	var checkedDevs []uint64
+	for _, r := range cfg.Resources {
+		if !r.NeedEncryption {
+			continue
+		}
+		info, statErr := os.Stat(r.Path)
+		if statErr != nil {
+			return fmt.Errorf("stat %s: %w", r.Path, statErr)
+		}
+		dev := info.Sys().(*syscall.Stat_t).Dev
+		if slices.Contains(checkedDevs, dev) {
+			continue
+		}
+		checkedDevs = append(checkedDevs, dev)
+		if readyErr := vault.CheckFilesystemReady(r.Path); readyErr != nil {
+			return readyErr
+		}
+	}
+	return nil
 }
 
 // deploy installs the services and hook, copies the binary and the config
@@ -231,7 +265,7 @@ func deploy(cfgText string) error {
 	if err != nil {
 		return err
 	}
-	return enableAndVerify(configChanged)
+	return systemd.EnableAndVerify(configChanged)
 }
 
 // buildBinaryIfNeeded compiles the binary with the Makefile build flags
@@ -248,7 +282,7 @@ func buildBinaryIfNeeded() error {
 			mustCwd(), buildBinaryPath)
 	}
 	log.Infof("building %s ...", buildBinaryPath)
-	if err := runCmd("go", "build", "-o", buildBinaryPath, "."); err != nil {
+	if err := systemd.RunCmd("go", "build", "-o", buildBinaryPath, "."); err != nil {
 		return fmt.Errorf("go build failed: %w", err)
 	}
 	log.Infof("built %s", buildBinaryPath)
@@ -311,13 +345,13 @@ func encryptDirectories(vault *fscrypt.Vault, toEncrypt []string) error {
 	}
 	for _, path := range toEncrypt {
 		log.Infof("encrypting %s (backup: %s%s) ...", path, path, fscrypt.BackupSuffix)
-		err := withBottomBar(func(bar *bottomBar) error {
+		err := wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
 			return vault.EncryptWithProgress(path, func(copied, total int64) {
 				fraction := 0.0
 				if total > 0 {
 					fraction = float64(copied) / float64(total)
 				}
-				bar.set(fmt.Sprintf("Encrypting %s", path), fraction)
+				bar.Set(fmt.Sprintf("Encrypting %s", path), fraction)
 			})
 		})
 		if err != nil {

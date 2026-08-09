@@ -80,6 +80,13 @@ func runGuard(cmd *cobra.Command, args []string) error {
 		return checkErr
 	}
 
+	// LSM hooks (file_open, file_permission) are the enforcement mechanism
+	// of the fs guard: refuse to run on kernels whose LSM stack lacks bpf
+	// (attach can succeed while the hooks never fire).
+	if checkErr := common.CheckBPFLSM(); checkErr != nil {
+		return checkErr
+	}
+
 	g, guardErr := guard.NewGuard(guardPath, mode, binaries, guardRecursive, guardDepth, guard.WithEagerPopulate())
 	if guardErr != nil {
 		return fmt.Errorf("creating guard: %w", guardErr)

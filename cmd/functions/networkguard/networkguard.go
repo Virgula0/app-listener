@@ -122,6 +122,10 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 		return checkErr
 	}
 
+	if checkErr := common.CheckBPFLSM(); checkErr != nil {
+		return checkErr
+	}
+
 	g, guardErr := networkguard.NewNetGuard(mode, binaries, parsedEvents, unsafeFlag, !noThrottleFlag)
 	if guardErr != nil {
 		return fmt.Errorf("creating network guard: %w", guardErr)

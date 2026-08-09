@@ -110,6 +110,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// The daemon wraps fs guards (and the LSM network guard), which enforce
+	// through BPF LSM hooks: refuse to start without an active bpf LSM.
+	if err := common.CheckBPFLSM(); err != nil {
+		return err
+	}
+
 	configPath, err := resolveConfigPath()
 	if err != nil {
 		return err

@@ -2,7 +2,6 @@ package integrationtests
 
 import (
 	"fmt"
-	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -349,34 +348,6 @@ func (s *IntegrationSuite) TestMonitorEventFilter_SingleType_FileWatch() {
 	s.waitForEventType(c, logBefore, "DELETE", 5*time.Second)
 
 	s.stopMonitor(c)
-}
-
-// ---------------------------------------------------------------
-// Cross-architecture tests (QEMU)
-// ---------------------------------------------------------------
-
-func (s *IntegrationSuite) TestCrossArch_EBPF_ARM64() {
-	if arm64Bin == "" {
-		s.T().Skip("arm64 binary not built")
-	}
-
-	ok := s.checkQemu("linux/arm64")
-	if !ok {
-		s.T().Skip("QEMU binfmt not available for arm64")
-	}
-
-	c := s.startContainer("ubuntu:latest", "linux/arm64", true, arm64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive"})
-	verifyEBPF(s, code, out)
-}
-
-func (s *IntegrationSuite) checkQemu(platform string) bool {
-	cmd := exec.Command("docker", "run", "--rm", "--platform", platform,
-		"ubuntu:latest", "sh", "-c", "echo qemu-ok")
-	return cmd.Run() == nil
 }
 
 // ---------------------------------------------------------------

@@ -1,4 +1,4 @@
-package install
+package uninstall
 
 import (
 	"bytes"
@@ -10,26 +10,31 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // revertSystemFiles removes every file the installer deployed: the systemd
-// daemon unit, the pacman reload hook, the binary at /usr/local/sbin and the
-// config at /etc/app-listener/daemon.conf. The daemon unit is disabled first
-// (best effort — it may already be disabled), and systemd is reloaded so the
-// removal is visible to the manager. The /etc/app-listener directory itself
-// is kept: the fscrypt master key lives there and is removed only by
-// removeMasterKey.
+// daemon unit, the pacman reload hook, the binary at /usr/local/sbin, the
+// PATH symlink and the config at /etc/app-listener/daemon.conf. The daemon
+// unit is disabled first (best effort — it may already be disabled), and
+// systemd is reloaded so the removal is visible to the manager. The
+// /etc/app-listener directory itself is kept: the fscrypt master key lives
+// there and is removed only by removeMasterKey.
 func revertSystemFiles() error {
-	if err := runCmd("systemctl", "disable", daemonServiceName); err != nil {
-		log.Warnf("systemctl disable %s failed: %v", daemonServiceName, err)
+	if err := systemd.RunCmd("systemctl", "disable", systemd.DaemonServiceName); err != nil {
+		log.Warnf("systemctl disable %s failed: %v", systemd.DaemonServiceName, err)
 	}
+
+	// The PATH symlink must go before the binary it points to.
+	systemd.RemoveBinSymlink()
 
 	removed := 0
 	for _, path := range []string{
-		filepath.Join(systemdDir, daemonServiceName+".service"),
-		filepath.Join(pacmanHooksDir, "50-app-listener-reload.hook"),
-		installBinaryPath,
-		systemConfigPath,
+		filepath.Join(systemd.SystemdDir, systemd.DaemonServiceName+".service"),
+		filepath.Join(systemd.PacmanHooksDir, "50-app-listener-reload.hook"),
+		systemd.InstallBinaryPath,
+		systemd.SystemConfigPath,
 	} {
 		if _, err := os.Lstat(path); os.IsNotExist(err) {
 			continue
@@ -46,7 +51,7 @@ func revertSystemFiles() error {
 		log.Info("removed stale /run/app-listener-daemon.pid")
 	}
 
-	if err := runCmd("systemctl", "daemon-reload"); err != nil {
+	if err := systemd.RunCmd("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 	if removed == 0 {
@@ -116,7 +121,7 @@ func revertSSHAgents() error {
 		return nil
 	}
 
-	ok, err := confirmOnce(
+	ok, err := wizard.ConfirmOnce(
 		fmt.Sprintf("Remove the per-user ssh-agent units installed by the installer for %d user(s)?", len(units)),
 		"Remove units")
 	if err != nil {
@@ -155,7 +160,7 @@ func removeSSHAgentUnit(u userSSHAgentUnit) error {
 // deleted after every intended decryption completed and only when
 // --delete-key was passed.
 func removeMasterKey() error {
-	return removeKeyAndEmptyDir(fscrypt.MasterKeyFile, systemConfigDir)
+	return removeKeyAndEmptyDir(fscrypt.MasterKeyFile, systemd.SystemConfigDir)
 }
 
 // removeKeyAndEmptyDir deletes the key file and, when dir becomes empty,

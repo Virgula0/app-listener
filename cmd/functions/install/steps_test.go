@@ -35,3 +35,23 @@ func TestAskEncryptionSkipsNeedEncryptionFalse(t *testing.T) {
 		t.Errorf("config text must keep need_encryption: false, got:\n%s", text)
 	}
 }
+
+// TestAskFilesystemsReadyNoPanic is a regression test for the preflight
+// added with the fscrypt setup check: statting a real directory must not
+// panic (os.Stat returns *syscall.Stat_t, and the preflight must accept
+// exactly that type). The helper must return either nil (host filesystem
+// is already initialized for fscrypt) or the classified setup error.
+func TestAskFilesystemsReadyNoPanic(t *testing.T) {
+	dir := t.TempDir()
+
+	cfgText := "[watch]\npath = " + dir + "\nneed_encryption: true\n"
+	cfg, err := validateConfigText(cfgText)
+	if err != nil {
+		t.Fatalf("parsing config: %v", err)
+	}
+
+	if err := askFilesystemsReady(fscrypt.New(), cfg); err != nil &&
+		!strings.Contains(err.Error(), "fscrypt setup") {
+		t.Errorf("unexpected error from preflight: %v", err)
+	}
+}

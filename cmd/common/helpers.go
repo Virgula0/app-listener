@@ -131,6 +131,19 @@ func CheckEBPF() error {
 	return nil
 }
 
+// CheckBPFLSM verifies that the active kernel LSM stack includes the BPF
+// LSM. Required by every mode that relies on LSM hooks (guard,
+// network-guard, daemon); monitor and network-monitor are kprobe-based and
+// must not call it.
+func CheckBPFLSM() error {
+	if err := ebpf.CheckBPFLSM(); err != nil {
+		log.Errorf("BPF LSM check failed: %v", err)
+		return err
+	}
+	log.Info("BPF LSM available")
+	return nil
+}
+
 func ParseEventsFlag(eventsFlag []string) ([]ebpf.EventType, error) {
 	if len(eventsFlag) == 0 {
 		return ebpf.EventTypes(), nil

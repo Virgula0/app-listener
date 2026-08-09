@@ -1,4 +1,7 @@
-package install
+// Package wizard holds the interactive helpers shared by the installer and
+// uninstaller wizards: single-confirmation prompts and the bottom progress
+// bar used while directories are encrypted or decrypted.
+package wizard
 
 import (
 	"fmt"
@@ -8,9 +11,25 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
+
+// ConfirmOnce asks a single yes/no question (default: no).
+func ConfirmOnce(question, affirmative string) (bool, error) {
+	answer := false
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title(question).
+			Affirmative(affirmative).
+			Negative("Cancel").
+			Value(&answer),
+	)).Run(); err != nil {
+		return false, err
+	}
+	return answer, nil
+}
 
 // bottomBar is a single-line progress bar pinned at the bottom of the
 // terminal. The loggers (logrus and the standard log used by the fscrypt
@@ -104,10 +123,10 @@ func renderBar(label string, fraction float64) string {
 	return text
 }
 
-// withBottomBar runs run with the progress bar active and the loggers
+// WithBottomBar runs run with the progress bar active and the loggers
 // routed through it; the bar and the redirects are cleaned up on return,
 // so the terminal is left exactly as it was.
-func withBottomBar(run func(bar *bottomBar) error) error {
+func WithBottomBar(run func(bar *BottomBar) error) error {
 	bar := newBottomBar(os.Stderr)
 	prevStd := stdlog.Writer()
 	prevLogrus := log.StandardLogger().Out
@@ -118,5 +137,16 @@ func withBottomBar(run func(bar *bottomBar) error) error {
 		stdlog.SetOutput(prevStd)
 		log.SetOutput(prevLogrus)
 	}()
-	return run(bar)
+	return run(&BottomBar{bottomBar: bar})
+}
+
+// BottomBar is the exported view of the progress bar used inside
+// WithBottomBar callbacks.
+type BottomBar struct {
+	*bottomBar
+}
+
+// Set renders (or updates) the bar at the bottom of the terminal.
+func (b *BottomBar) Set(label string, fraction float64) {
+	b.set(label, fraction)
 }

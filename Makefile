@@ -1,8 +1,13 @@
-.PHONY: build build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration deploy deploy-down tidy clean
+.PHONY: build build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration check-compatibility deploy deploy-down tidy clean
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
 GEN_DIR     = build/generated
+
+# VERSION is injected into the binary by the release workflow
+# (pre-<date>-<sha>); when empty the embedded constants.Version default
+# (dev marker) is kept.
+VERSION ?=
 
 .PHONY: require-kernel51
 require-kernel51:
@@ -12,19 +17,20 @@ require-kernel51:
 		exit 1; \
 	fi
 
-build: require-kernel51 generate build-linux
+build: require-kernel51 bpftool-headers generate build-linux
 
 build-linux:
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o $(OUTPUT_DIR)/$(BINARY_NAME) .
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(if $(VERSION),-ldflags "-X github.com/Virgula0/app-listener/internal/constants.Version=$(VERSION)",) -o $(OUTPUT_DIR)/$(BINARY_NAME) .
 .PHONY: build-linux
 
-generate: generate-monitor generate-guard generate-networkmonitor generate-networkguard
+# Ensure the shared vmlinux.h is dumped before any BPF module is compiled
+generate: bpftool-headers generate-monitor generate-guard generate-networkmonitor generate-networkguard
 
-generate-monitor:
+generate-monitor: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/monitor/embeds
 	GOPACKAGE=monitor GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86" \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		Monitor ./internal/monitor/bpf/monitor.bpf.c
@@ -35,11 +41,11 @@ generate-monitor:
 	@echo "Monitor BPF generation complete"
 .PHONY: generate-monitor
 
-generate-guard:
+generate-guard: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/guard/embeds
 	GOPACKAGE=guard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86" \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		Guard ./internal/guard/bpf/guard.bpf.c
@@ -50,11 +56,11 @@ generate-guard:
 	@echo "Guard BPF generation complete"
 .PHONY: generate-guard
 
-generate-networkmonitor:
+generate-networkmonitor: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/networkmonitor/embeds
 	GOPACKAGE=networkmonitor GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86" \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		NetMon ./internal/networkmonitor/bpf/networkmonitor.bpf.c
@@ -65,11 +71,11 @@ generate-networkmonitor:
 	@echo "Network monitor BPF generation complete"
 .PHONY: generate-networkmonitor
 
-generate-networkguard:
+generate-networkguard: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/networkguard/embeds
 	GOPACKAGE=networkguard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86" \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		GuardNet ./internal/networkguard/bpf/networkguard.bpf.c
@@ -81,9 +87,17 @@ generate-networkguard:
 .PHONY: generate-networkguard
 
 bpftool-headers:
-	bpftool btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null \
-		> internal/monitor/bpf/vmlinux.h
-	cp internal/monitor/bpf/vmlinux.h internal/guard/bpf/vmlinux.h
+	@if ! command -v bpftool >/dev/null 2>&1; then \
+		echo "ERROR: bpftool not found — install it (Ubuntu: apt install linux-tools-generic; Arch: pacman -S bpftool)"; \
+		exit 1; \
+	fi
+	@if [ ! -r /sys/kernel/btf/vmlinux ]; then \
+		echo "ERROR: /sys/kernel/btf/vmlinux not readable — run 'make check-compatibility' (kernel needs CONFIG_DEBUG_INFO_BTF)"; \
+		exit 1; \
+	fi
+	@mkdir -p internal/bpf
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c \
+		> internal/bpf/vmlinux.h
 .PHONY: bpftool-headers
 
 install-linter:
@@ -125,6 +139,10 @@ test-integration:
 	go test ./integrationtests/ -v --count=1 -timeout 30m
 .PHONY: test-integration
 
+check-compatibility:
+	@bash scripts/check-compatibility.sh
+.PHONY: check-compatibility
+
 deploy:
 	docker compose up --build -d
 .PHONY: deploy
@@ -139,8 +157,11 @@ tidy:
 
 clean:
 	rm -rf $(OUTPUT_DIR) build/test \
-		internal/monitor/monitor_bpf.go internal/monitor/embeds/ internal/monitor/bpf/vmlinux.h \
-		internal/guard/guard_bpf.go internal/guard/embeds/ internal/guard/bpf/vmlinux.h \
-		internal/networkmonitor/networkmonitor_bpf.go internal/networkmonitor/embeds/ internal/networkmonitor/bpf/vmlinux.h \
-		internal/networkguard/guardnet_bpf.go internal/networkguard/embeds/ internal/networkguard/bpf/vmlinux.h
+		internal/bpf/vmlinux.h \
+		internal/monitor/monitor_bpf.go internal/monitor/embeds/ \
+		internal/guard/guard_bpf.go internal/guard/embeds/ \
+		internal/networkmonitor/networkmonitor_bpf.go internal/networkmonitor/embeds/ \
+		internal/networkguard/guardnet_bpf.go internal/networkguard/embeds/ \
+		internal/monitor/bpf/vmlinux.h internal/guard/bpf/vmlinux.h \
+		internal/networkmonitor/bpf/vmlinux.h internal/networkguard/bpf/vmlinux.h
 .PHONY: clean

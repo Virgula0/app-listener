@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/fscrypt/actions"
 	"github.com/google/fscrypt/crypto"
+	"github.com/google/fscrypt/filesystem"
 	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/repository"
@@ -93,6 +94,76 @@ func (v *Vault) IsProvisioned(path string) (bool, error) {
 		return false, fmt.Errorf("get policy for %s: %w", path, err)
 	}
 	return policy.IsProvisionedByTargetUser(), nil
+}
+
+// CheckFilesystemReady verifies that the filesystem backing path has been
+// initialized for fscrypt (the equivalent of running `fscrypt setup` once
+// on it) and that encryption is actually enabled on it (the ext4 `encrypt`
+// feature flag). Without that, every policy creation fails deep inside the
+// library with a cryptic error — long after the user answered the
+// installer's interactive prompts. This is the same non-destructive check
+// the fscrypt CLI runs before any operation.
+func (v *Vault) CheckFilesystemReady(path string) error {
+	mnt, err := filesystem.FindMount(path)
+	if err != nil {
+		return fmt.Errorf("resolve filesystem of %s: %w", path, err)
+	}
+	if err := mnt.CheckSetup(nil); err != nil {
+		return classifySetupError(path, err)
+	}
+	if err := mnt.CheckSupport(); err != nil {
+		return classifySupportError(path, err)
+	}
+	return nil
+}
+
+// classifySetupError translates the fscrypt library's filesystem setup
+// failures into actionable errors naming the exact remediation.
+func classifySetupError(path string, err error) error {
+	var notSetup *filesystem.ErrNotSetup
+	var notSupported *filesystem.ErrSetupNotSupported
+	switch {
+	case errors.As(err, &notSetup):
+		return fmt.Errorf(
+			"filesystem containing %s is not initialized for fscrypt (%v). "+
+				"Run once as root: 'fscrypt setup --all-users' (or 'fscrypt setup /'), then re-run the installer",
+			path, err)
+	case errors.As(err, &notSupported):
+		return fmt.Errorf(
+			"filesystem containing %s does not support fscrypt encryption (%v). "+
+				"Only ext4/f2fs with encryption enabled can be protected",
+			path, err)
+	default:
+		return fmt.Errorf("fscrypt setup check for %s: %w", path, err)
+	}
+}
+
+// classifySupportError translates the fscrypt library's encryption-support
+// probe failures into actionable errors. This catches filesystems that are
+// "set up" (metadata exists) but whose kernel or superblock cannot actually
+// encrypt — most commonly an ext4 filesystem created without the `encrypt`
+// feature flag.
+func classifySupportError(path string, err error) error {
+	var notEnabled *filesystem.ErrEncryptionNotEnabled
+	var notSupported *filesystem.ErrEncryptionNotSupported
+	switch {
+	case errors.As(err, &notEnabled):
+		enable := "sudo tune2fs -O encrypt " + notEnabled.Mount.Device
+		if notEnabled.Mount.FilesystemType == "f2fs" {
+			enable = "sudo fsck.f2fs -O encrypt " + notEnabled.Mount.Device
+		}
+		return fmt.Errorf(
+			"filesystem %s (%s) containing %s is not marked for fscrypt encryption. "+
+				"Run %q as root, then re-run the installer",
+			notEnabled.Mount.Device, notEnabled.Mount.FilesystemType, path, enable)
+	case errors.As(err, &notSupported):
+		return fmt.Errorf(
+			"filesystem containing %s does not support fscrypt encryption (%v). "+
+				"This kernel lacks support for encryption on %s filesystems",
+			path, err, notSupported.Mount.FilesystemType)
+	default:
+		return fmt.Errorf("fscrypt support check for %s: %w", path, err)
+	}
 }
 
 // readKey returns the 32-byte master key, failing when the file is
