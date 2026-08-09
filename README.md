@@ -349,8 +349,11 @@ sudo ./build/linux/app-listener install
 
 > **Prerequisite**: every filesystem that holds a protected directory must
 > be initialized for fscrypt once — `sudo fscrypt setup --all-users` (or
-> `sudo fscrypt setup /`). The installer verifies this before asking any
-> question and fails with these instructions if it is missing.
+> `sudo fscrypt setup /`) — and must actually support encryption: ext4
+> needs the `encrypt` feature flag (`sudo tune2fs -O encrypt /dev/sdXN`,
+> filesystem unmounted), f2fs needs `sudo fsck.f2fs -O encrypt /dev/sdXN`.
+> The installer verifies both before asking any question and fails with
+> these instructions if either is missing.
 
 The wizard (abort any step with `Esc`; completed steps stay completed):
 

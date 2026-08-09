@@ -98,7 +98,8 @@ func (v *Vault) IsProvisioned(path string) (bool, error) {
 
 // CheckFilesystemReady verifies that the filesystem backing path has been
 // initialized for fscrypt (the equivalent of running `fscrypt setup` once
-// on it). Without that, every policy creation fails deep inside the
+// on it) and that encryption is actually enabled on it (the ext4 `encrypt`
+// feature flag). Without that, every policy creation fails deep inside the
 // library with a cryptic error — long after the user answered the
 // installer's interactive prompts. This is the same non-destructive check
 // the fscrypt CLI runs before any operation.
@@ -109,6 +110,9 @@ func (v *Vault) CheckFilesystemReady(path string) error {
 	}
 	if err := mnt.CheckSetup(nil); err != nil {
 		return classifySetupError(path, err)
+	}
+	if err := mnt.CheckSupport(); err != nil {
+		return classifySupportError(path, err)
 	}
 	return nil
 }
@@ -131,6 +135,35 @@ func classifySetupError(path string, err error) error {
 			path, err)
 	default:
 		return fmt.Errorf("fscrypt setup check for %s: %w", path, err)
+	}
+}
+
+// classifySupportError translates the fscrypt library's encryption-support
+// probe failures into actionable errors. This catches filesystems that are
+// "set up" (metadata exists) but whose kernel or superblock cannot actually
+// encrypt — most commonly an ext4 filesystem created without the `encrypt`
+// feature flag.
+func classifySupportError(path string, err error) error {
+	var notEnabled *filesystem.ErrEncryptionNotEnabled
+	var notSupported *filesystem.ErrEncryptionNotSupported
+	switch {
+	case errors.As(err, &notEnabled):
+		enable := "sudo tune2fs -O encrypt " + notEnabled.Mount.Device
+		if notEnabled.Mount.FilesystemType == "f2fs" {
+			enable = "sudo fsck.f2fs -O encrypt " + notEnabled.Mount.Device
+		}
+		return fmt.Errorf(
+			"filesystem %s (%s) containing %s is not marked for fscrypt encryption. "+
+				"Run %q while the filesystem is unmounted (e.g. from a live ISO for the root filesystem), "+
+				"then re-run the installer",
+			notEnabled.Mount.Device, notEnabled.Mount.FilesystemType, path, enable)
+	case errors.As(err, &notSupported):
+		return fmt.Errorf(
+			"filesystem containing %s does not support fscrypt encryption (%v). "+
+				"This kernel lacks support for encryption on %s filesystems",
+			path, err, notSupported.Mount.FilesystemType)
+	default:
+		return fmt.Errorf("fscrypt support check for %s: %w", path, err)
 	}
 }
 
