@@ -130,8 +130,8 @@ func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	if !found {
 		t.Fatal(".ssh whitelist does not include sshd: public-key logins would be denied while guarded")
 	}
-	if events := entry.Whitelist["/usr/bin/ssh"]; len(events) != 4 || events[0] != "READ" || events[1] != "WRITE" || events[2] != "DELETE" || events[3] != "RENAME" {
-		t.Errorf("/usr/bin/ssh must be READ,WRITE,DELETE,RENAME, got %v", events)
+	if events := entry.Whitelist["/usr/bin/ssh"]; len(events) != 5 || events[0] != "READ" || events[1] != "WRITE" || events[2] != "DELETE" || events[3] != "RENAME" || events[4] != "HARDLINK" {
+		t.Errorf("/usr/bin/ssh must be READ,WRITE,DELETE,RENAME,HARDLINK, got %v", events)
 	}
 }
 
