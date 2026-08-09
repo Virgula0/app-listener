@@ -168,6 +168,35 @@ func TestSSHWhitelistIncludesModularDaemon(t *testing.T) {
 	}
 }
 
+// TestGHWhitelistIncludesCommonPaths verifies the .config/gh entry covers
+// the common gh install layouts, in particular the user-local
+// ~/.local/bin path used by Webi and manual installs (gh would otherwise
+// be denied access to its own config while the directory is guarded).
+func TestGHWhitelistIncludesCommonPaths(t *testing.T) {
+	var entry *CandidateDir
+	for i := range Catalog {
+		if Catalog[i].RelPath == ".config/gh" {
+			entry = &Catalog[i]
+			break
+		}
+	}
+	if entry == nil {
+		t.Fatal(".config/gh entry not found in catalog")
+	}
+	required := []string{
+		"/usr/bin/gh",
+		"/usr/local/bin/gh",
+		"%HOME%/.local/bin/gh",
+		"/home/linuxbrew/.linuxbrew/bin/gh",
+		"/snap/bin/gh",
+	}
+	for _, bin := range required {
+		if _, ok := entry.Whitelist[bin]; !ok {
+			t.Errorf(".config/gh whitelist is missing %s: gh at that path would be denied access to its config while guarded", bin)
+		}
+	}
+}
+
 // TestDiscoverOnlyExisting verifies that only paths that really exist in
 // the user's home are proposed.
 func TestDiscoverOnlyExisting(t *testing.T) {
