@@ -235,15 +235,6 @@ var Catalog = []CandidateDir{
 	{Name: "Docker config and credentials", RelPath: ".docker",
 		Whitelist: map[string][]string{"/usr/bin/docker": nil, "/usr/bin/docker-credential-desktop": nil, "/usr/bin/docker-credential-pass": nil}},
 	{Name: "GitHub CLI", RelPath: ".config/gh",
-		// gh reads and writes config.yml and hosts.yml (the OAuth tokens)
-		// under ~/.config/gh. The whitelist covers the common install
-		// layouts and keeps whichever exists per machine: official
-		// .deb/.rpm/zypper repos and Arch/Alpine/... package gh to
-		// /usr/bin; the tarball and install scripts to /usr/local/bin;
-		// Webi and manual user installs to ~/.local/bin; Homebrew on
-		// Linux to /home/linuxbrew/.linuxbrew/bin; Snap to /snap/bin.
-		// asdf/mise shims are shell scripts (the executed ELF is the
-		// interpreter), so they are inert as whitelist entries.
 		Whitelist: map[string][]string{
 			"/usr/bin/gh":                       nil,
 			"/usr/local/bin/gh":                 nil,
