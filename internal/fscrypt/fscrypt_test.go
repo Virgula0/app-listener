@@ -180,7 +180,7 @@ func TestClassifySupportErrorEncryptionNotEnabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, want := range []string{"/home/test/.ssh", "/dev/sda2", "tune2fs -O encrypt /dev/sda2", "unmounted"} {
+	for _, want := range []string{"/home/test/.ssh", "/dev/sda2", "tune2fs -O encrypt /dev/sda2", "as root"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}

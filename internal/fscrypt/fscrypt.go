@@ -154,8 +154,7 @@ func classifySupportError(path string, err error) error {
 		}
 		return fmt.Errorf(
 			"filesystem %s (%s) containing %s is not marked for fscrypt encryption. "+
-				"Run %q while the filesystem is unmounted (e.g. from a live ISO for the root filesystem), "+
-				"then re-run the installer",
+				"Run %q as root, then re-run the installer",
 			notEnabled.Mount.Device, notEnabled.Mount.FilesystemType, path, enable)
 	case errors.As(err, &notSupported):
 		return fmt.Errorf(
