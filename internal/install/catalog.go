@@ -57,6 +57,31 @@ var Catalog = []CandidateDir{
 			// the daemon must never write into a user's .ssh.
 			"/usr/bin/sshd":  {"READ"},
 			"/usr/sbin/sshd": {"READ"},
+			// OpenSSH >= 9.8 splits sshd into a dispatcher plus modular
+			// helpers: the process that actually opens authorized_keys is
+			// sshd-auth (pubkey authentication) and sshd-session (session
+			// setup), not the dispatcher. Ubuntu/Debian install them under
+			// /usr/lib/openssh/, Arch under /usr/lib/ssh/; the whitelist
+			// keeps whichever exists per machine. sftp-server may fetch
+			// keys via scp/sftp but is READ-only like sshd: pushing a
+			// written authorized_keys into a guarded .ssh over the network
+			// stays denied. ssh-keysign/ssh-pkcs11-helper never touch .ssh
+			// (entries inert); ssh-session-cleanup is a shell script, so
+			// its entry is inert too (the executed ELF is the
+			// interpreter).
+			"/usr/lib/openssh/sshd-auth":           {"READ"},
+			"/usr/lib/ssh/sshd-auth":               {"READ"},
+			"/usr/lib/openssh/sshd-session":        {"READ"},
+			"/usr/lib/ssh/sshd-session":            {"READ"},
+			"/usr/lib/openssh/ssh-sk-helper":       {"READ"},
+			"/usr/lib/ssh/ssh-sk-helper":           {"READ"},
+			"/usr/lib/openssh/sftp-server":         {"READ"},
+			"/usr/lib/ssh/sftp-server":             {"READ"},
+			"/usr/lib/openssh/ssh-keysign":         nil,
+			"/usr/lib/ssh/ssh-keysign":             nil,
+			"/usr/lib/openssh/ssh-pkcs11-helper":   nil,
+			"/usr/lib/ssh/ssh-pkcs11-helper":       nil,
+			"/usr/lib/openssh/ssh-session-cleanup": nil,
 			// git is deliberately NOT whitelisted (see the original
 			// ssh-guard config): a compromised git can read the keys.
 		}},

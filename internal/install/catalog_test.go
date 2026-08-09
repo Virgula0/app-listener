@@ -135,6 +135,39 @@ func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	}
 }
 
+// TestSSHWhitelistIncludesModularDaemon verifies the .ssh entry whitelists
+// the modular OpenSSH server helpers (OpenSSH >= 9.8 splits sshd into a
+// dispatcher plus sshd-auth/sshd-session, the processes that actually open
+// authorized_keys). Both the Debian (/usr/lib/openssh) and Arch
+// (/usr/lib/ssh) layouts must be present and READ-only, like sshd itself.
+func TestSSHWhitelistIncludesModularDaemon(t *testing.T) {
+	var entry *CandidateDir
+	for i := range Catalog {
+		if Catalog[i].RelPath == ".ssh" {
+			entry = &Catalog[i]
+			break
+		}
+	}
+	if entry == nil {
+		t.Fatal(".ssh entry not found in catalog")
+	}
+	required := []string{
+		"/usr/lib/openssh/sshd-auth", "/usr/lib/ssh/sshd-auth",
+		"/usr/lib/openssh/sshd-session", "/usr/lib/ssh/sshd-session",
+		"/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server",
+	}
+	for _, bin := range required {
+		events, ok := entry.Whitelist[bin]
+		if !ok {
+			t.Errorf(".ssh whitelist is missing %s: public-key logins and scp reads would be denied while guarded", bin)
+			continue
+		}
+		if len(events) != 1 || events[0] != "READ" {
+			t.Errorf("%s must be READ-only, got %v", bin, events)
+		}
+	}
+}
+
 // TestDiscoverOnlyExisting verifies that only paths that really exist in
 // the user's home are proposed.
 func TestDiscoverOnlyExisting(t *testing.T) {
