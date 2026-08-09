@@ -42,10 +42,12 @@ type CandidateDir struct {
 var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPath: ".ssh",
-		// ssh writes into known_hosts, so it gets READ,WRITE; sshd only
-		// reads authorized_keys (READ-only).
+		// ssh writes into known_hosts, so it gets READ,WRITE plus the
+		// DELETE/RENAME its rotation needs: the old known_hosts is
+		// renamed to .old and any stale .old/temp file is unlinked.
+		// sshd only reads authorized_keys (READ-only).
 		Whitelist: map[string][]string{
-			"/usr/bin/ssh":        {"READ", "WRITE"},
+			"/usr/bin/ssh":        {"READ", "WRITE", "DELETE", "RENAME"},
 			"/usr/bin/ssh-add":    nil,
 			"/usr/bin/ssh-agent":  nil,
 			"/usr/bin/ssh-keygen": nil,
