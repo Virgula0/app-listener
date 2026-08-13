@@ -155,8 +155,7 @@ func runGuardHeadless(uc usecase.GuardUseCase) {
 			if !ok {
 				return
 			}
-			log.Infof("GUARD|%s|%s|%s|%d|%s|%t|%d",
-				ev.Type.String(), ev.Comm, ev.Path, ev.PID, ev.Dest, ev.Blocked, ev.UID)
+			log.Infof("GUARD|%s|%s|%s|%d|%s|%t|%d", ev.Type.String(), ev.Comm, ev.Path, ev.PID, ev.Dest, ev.Blocked, ev.UID)
 		case <-sig:
 			return
 		}

@@ -331,12 +331,11 @@ var Catalog = []CandidateDir{
 			"/opt/brave/brave": nil, "/opt/brave-bin/brave": nil,
 		}},
 	{Name: "Discord", RelPath: ".config/discord",
-		// Discord installs into a versioned directory and re-links
-		// .config/discord/Discord on every update. The glob resolves to
-		// every installed version and is re-expanded on each install run,
-		// so an app update does not leave the whitelist pointing at a
-		// stale inode.
-		Whitelist: map[string][]string{"%HOME%/.config/discord/*/Discord": nil}},
+		Whitelist: map[string][]string{
+			"%HOME%/.config/discord/*/Discord":                 nil,
+			"%HOME%/.config/discord/*/chrome-sandbox":          nil,
+			"%HOME%/.config/discord/*/chrome_crashpad_handler": nil,
+		}},
 	{Name: "Discord Canary", RelPath: ".config/discord-canary",
 		Whitelist: map[string][]string{"/usr/bin/discord-canary": nil}},
 	{Name: "Telegram", RelPath: ".local/share/TelegramDesktop",

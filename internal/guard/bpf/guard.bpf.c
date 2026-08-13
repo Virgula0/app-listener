@@ -8,6 +8,7 @@
 #define MAY_WRITE 0x00000002
 #define GUARD_BLOCK 1
 #define GUARD_ALLOW 2
+#define __FMODE_EXEC 0x20 // set in file->f_flags by kernel exec opens (do_open_execat)
 
 enum event_type {
 	EVENT_OPEN,
@@ -525,7 +526,7 @@ static void fill_path(struct dentry *dentry, char *out)
     }
 }
 
-static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry)
+static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry, bool is_exec_open)
 {
 	__u32 key = 0;
 	__u64 *mode = bpf_map_lookup_elem(&guard_config, &key);
@@ -556,6 +557,56 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 			is_blocked = action != NULL && *action == GUARD_BLOCK;
 		} else {
 			is_blocked = action == NULL || *action != GUARD_ALLOW;
+
+			// Exec-open attribution (whitelist mode only): executing a
+			// binary is an OPEN of that binary performed by the
+			// *launcher*, not by the binary itself — a shell wrapper
+			// runs through its interpreter (/bin/sh), whose exe inode
+			// the whitelist deliberately does not list. Attribute
+			// exec-opens to the binary being executed: allowlist the
+			// *target*. The exec fd is never exposed to the caller
+			// (execve destroys the caller's address space), so this
+			// grants the launcher no way to read guarded content;
+			// afterwards the process identity IS the target, so every
+			// later access is checked against the whitelist as usual.
+			// Blacklist mode keeps caller attribution (blocking listed
+			// binaries from exec'ing guarded files).
+			//
+			// Two discriminator sources cover the full exec chain:
+			//  - the exec target's own open carries __FMODE_EXEC in
+			//    file->f_flags (task->in_execve is set only afterwards,
+			//    in bprm_execve);
+			//  - the kernel's load-time accesses of the exec file
+			//    (prepare_binprm's kernel_read, binfmt mmap, in-tree
+			//    interpreter opens) happen with task->in_execve set.
+			// Both are attributed by the *accessed file's* inode: only
+			// a file that is itself whitelisted passes.
+			if (is_blocked &&
+			    ((type == EVENT_OPEN && is_exec_open) ||
+			     BPF_CORE_READ_BITFIELD_PROBED(task, in_execve))) {
+				struct inode *target;
+				bpf_probe_read_kernel(&target, sizeof(target), &dentry->d_inode);
+				if (target) {
+					struct inode_key target_ik = {};
+					__u8 *target_action;
+					bpf_probe_read_kernel(&target_ik.ino, sizeof(target_ik.ino),
+							      &target->i_ino);
+					struct super_block *tsb;
+					bpf_probe_read_kernel(&tsb, sizeof(tsb), &target->i_sb);
+					if (tsb) {
+						dev_t tdev;
+						bpf_probe_read_kernel(&tdev, sizeof(tdev), &tsb->s_dev);
+						target_ik.dev = tdev;
+					}
+					target_action = bpf_map_lookup_elem(&guard_exe_actions, &target_ik);
+					if (target_action) {
+						if (*target_action == GUARD_ALLOW) {
+							exe_ik = target_ik;
+							is_blocked = 0;
+						}
+					}
+				}
+			}
 
 			// Per-binary event restriction: if the binary has an allowed
 			// event mask, only the listed event types are permitted. A
@@ -696,7 +747,10 @@ int guard_file_open(unsigned long long *ctx)
 	discover_guarded_parent(dentry);
 
 	if (is_guarded_access(dentry, inode)) {
-		int ret = check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+		__u32 f_flags = 0;
+		bpf_probe_read_kernel(&f_flags, sizeof(f_flags), &file->f_flags);
+		bool is_exec_open = (f_flags & __FMODE_EXEC) != 0;
+		int ret = check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, is_exec_open);
 		if (ret == 0)
 			mark_tainted();
 		return ret;
@@ -707,7 +761,7 @@ int guard_file_open(unsigned long long *ctx)
 	// files by opening the raw block device and interpreting filesystem
 	// metadata directly (bypassing VFS entirely).
 	if (is_guarded_block_device(inode))
-		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false);
 
 	return 0;
 }
@@ -728,7 +782,7 @@ int guard_mmap_file(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
 	if (is_guarded_access(dentry, inode)) {
-		int ret = check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL);
+		int ret = check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL, false);
 		if (ret == 0)
 			mark_tainted();
 		return ret;
@@ -762,7 +816,7 @@ int guard_file_permission(unsigned long long *ctx)
 		return 0;
 
 	__u32 event_type = (mask & MAY_WRITE) ? EVENT_WRITE : EVENT_READ;
-	int ret = check_and_emit(event_type, dentry, NULL, false, NULL);
+	int ret = check_and_emit(event_type, dentry, NULL, false, NULL, false);
 	if (ret == 0)
 		mark_tainted();
 	return ret;
@@ -789,7 +843,7 @@ int guard_file_truncate(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
 	if (is_guarded_access(dentry, inode)) {
-		int ret = check_and_emit(EVENT_WRITE, dentry, NULL, false, NULL);
+		int ret = check_and_emit(EVENT_WRITE, dentry, NULL, false, NULL, false);
 		if (ret == 0)
 			mark_tainted();
 		return ret;
@@ -809,19 +863,19 @@ int guard_path_unlink(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false);
 	}
 
 	// Deep-file coverage: the parent is not in the map but the file may
 	// still be inside the guarded region (ancestor walk).
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
 	if (parent && guarded_ancestor_within_limit(parent))
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false);
 
 	return 0;
 }
@@ -838,19 +892,19 @@ int guard_path_rename(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false);
 	}
 
 	// Deep-file coverage on the source side: the file may be inside the
 	// guarded region even though its parent is not in the map.
 	struct dentry *old_parent = get_dentry_from_path((void *)ctx[0]);
 	if (old_parent && guarded_ancestor_within_limit(old_parent))
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false);
 
 	// Also check the destination parent directory.  This prevents renaming
 	// files from outside the guarded area INTO a guarded directory, and
@@ -858,7 +912,7 @@ int guard_path_rename(unsigned long long *ctx)
 	// the guard_inodes map.
 	struct inode *new_parent_inode = get_inode_from_path((void *)ctx[2]);
 	if (new_parent_inode && new_parent_inode != inode && read_inode_guard(new_parent_inode)) {
-		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false);
 		if (ret != 0)
 			return ret;  // blocked — reject the rename
 		// Allowed — if the source is a directory, add its inode
@@ -876,7 +930,7 @@ int guard_path_rename(unsigned long long *ctx)
 	// region whose parent is not in the map (runtime-created deep dir).
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[2]);
 	if (new_parent && guarded_ancestor_within_limit(new_parent)) {
-		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false);
 		if (ret != 0)
 			return ret;
 		if (should_add_new_dir()) {
@@ -900,14 +954,14 @@ int guard_path_symlink(unsigned long long *ctx)
     // 1. Check if the symlink is being created INSIDE a guarded directory
     struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
     if (read_inode_guard(parent_inode)) {
-        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false);
     }
 
     // Deep-file coverage: the symlink may be created inside a guarded
     // region whose parent is not in the map.
     struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
     if (parent && guarded_ancestor_within_limit(parent)) {
-        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false);
     }
 
     // 2. Check if the symlink TARGET points INTO the guarded path
@@ -945,7 +999,7 @@ int guard_path_symlink(unsigned long long *ctx)
     }
 
     if (match) {
-        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false);
     }
 
     return 0;
@@ -963,19 +1017,19 @@ int guard_path_link(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[1]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false);
 	}
 
 	// Deep-file coverage on the destination side: linking INTO a guarded
 	// region whose parent is not in the map.
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
 	if (new_parent && guarded_ancestor_within_limit(new_parent))
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false);
 
 	return 0;
 }
@@ -987,14 +1041,14 @@ int guard_path_mkdir(unsigned long long *ctx)
 	struct dentry *dentry = (struct dentry *)ctx[1];
 
 	if (read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL, false);
 	}
 
 	// Deep-file coverage: mkdir inside a guarded region whose parent is
 	// not in the map.
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
 	if (parent && guarded_ancestor_within_limit(parent))
-		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL, false);
 
 	return 0;
 }
@@ -1018,7 +1072,7 @@ int guard_sb_mount(unsigned long long *ctx)
 		return 0;
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false);
 	}
 
 	return 0;
