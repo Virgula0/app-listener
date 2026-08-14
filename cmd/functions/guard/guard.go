@@ -51,7 +51,7 @@ func init() {
 	GuardCmd.Flags().StringSliceVarP(&whitelistPaths, "whitelist", "w", nil,
 		"Binary paths to whitelist (repeatable, mutually exclusive with -b)")
 	GuardCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
-		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP; default: all)")
+		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD; default: all)")
 	GuardCmd.Flags().BoolVarP(&headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	GuardCmd.Flags().BoolVarP(&guardRecursive, "recursive", "r", true,

@@ -148,6 +148,57 @@ func (s *IntegrationSuite) TestMonitorAllEvents() {
 	s.stopMonitor(c)
 }
 
+// ---------------------------------------------------------------
+// Metadata-operation coverage: path-based ops that never create a
+// struct file (no vfs_open) must still be observable by monitor:
+//   - truncate(2), chmod(2), chown(2), utimes, setxattr/removexattr
+//     -> ATTR (notify_change / vfs_setxattr / vfs_removexattr)
+//   - mknod(2)                      -> MKNOD (vfs_mknod)
+//   - stat(2), access(2), readlink  -> STAT (vfs_statx,
+//     security_inode_permission [MAY_ACCESS], vfs_readlink)
+//
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestMonitor_MetadataEvents() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"sh", "-c", "echo secret > /watch/file.txt"})
+	s.exec(c, []string{"ln", "-s", "/watch/file.txt", "/watch/link"})
+
+	for _, bin := range []string{"truncate", "chmod", "chown", "utimes", "setxattr", "mknod", "statp"} {
+		hostPath := absPath(fmt.Sprintf("./exploits/%s", bin))
+		err := c.CopyFileToContainer(s.ctx, hostPath, fmt.Sprintf("/exploits/%s", bin), 0755)
+		s.Require().NoError(err, "copy exploit binary %s", bin)
+	}
+
+	s.startMonitorStd(c, "/watch")
+	logBefore := s.readMonitorLog(c)
+
+	ops := []struct {
+		binary string
+		arg    string
+		expect string
+	}{
+		{binary: "truncate", arg: "/watch/file.txt", expect: "ATTR"},
+		{binary: "chmod", arg: "/watch/file.txt", expect: "ATTR"},
+		{binary: "chown", arg: "/watch/file.txt", expect: "ATTR"},
+		{binary: "utimes", arg: "/watch/file.txt", expect: "ATTR"},
+		{binary: "setxattr", arg: "/watch/file.txt", expect: "ATTR"},
+		{binary: "mknod", arg: "/watch/fifo1", expect: "MKNOD"},
+		{binary: "statp", arg: "/watch/link", expect: "STAT"},
+	}
+
+	for _, op := range ops {
+		code, out := s.exec(c, []string{fmt.Sprintf("/exploits/%s", op.binary), op.arg})
+		s.Require().Equalf(0, code, "%s must succeed: %s", op.binary, out)
+		logAfter := s.waitForEventType(c, logBefore, op.expect, 5*time.Second)
+		logBefore = logAfter
+	}
+
+	s.stopMonitor(c)
+}
+
 func (s *IntegrationSuite) TestMonitorSingleFile() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)

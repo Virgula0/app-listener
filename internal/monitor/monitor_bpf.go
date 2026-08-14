@@ -53,21 +53,28 @@ type MonitorSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type MonitorProgramSpecs struct {
+	TraceDoFaccessat      *ebpf.ProgramSpec `ebpf:"trace_do_faccessat"`
 	TraceDoSendfile       *ebpf.ProgramSpec `ebpf:"trace_do_sendfile"`
 	TraceDoSplice         *ebpf.ProgramSpec `ebpf:"trace_do_splice"`
 	TraceDoSpliceDirect   *ebpf.ProgramSpec `ebpf:"trace_do_splice_direct"`
 	TraceMmap             *ebpf.ProgramSpec `ebpf:"trace_mmap"`
+	TraceNotifyChange     *ebpf.ProgramSpec `ebpf:"trace_notify_change"`
 	TraceSecurityMmapFile *ebpf.ProgramSpec `ebpf:"trace_security_mmap_file"`
 	TraceSpliceFileRange  *ebpf.ProgramSpec `ebpf:"trace_splice_file_range"`
 	TraceVfsCopyFileRange *ebpf.ProgramSpec `ebpf:"trace_vfs_copy_file_range"`
+	TraceVfsGetattr       *ebpf.ProgramSpec `ebpf:"trace_vfs_getattr"`
 	TraceVfsIterRead      *ebpf.ProgramSpec `ebpf:"trace_vfs_iter_read"`
 	TraceVfsLink          *ebpf.ProgramSpec `ebpf:"trace_vfs_link"`
 	TraceVfsMkdir         *ebpf.ProgramSpec `ebpf:"trace_vfs_mkdir"`
+	TraceVfsMknod         *ebpf.ProgramSpec `ebpf:"trace_vfs_mknod"`
 	TraceVfsOpen          *ebpf.ProgramSpec `ebpf:"trace_vfs_open"`
 	TraceVfsRead          *ebpf.ProgramSpec `ebpf:"trace_vfs_read"`
+	TraceVfsReadlink      *ebpf.ProgramSpec `ebpf:"trace_vfs_readlink"`
 	TraceVfsReadv         *ebpf.ProgramSpec `ebpf:"trace_vfs_readv"`
+	TraceVfsRemovexattr   *ebpf.ProgramSpec `ebpf:"trace_vfs_removexattr"`
 	TraceVfsRename        *ebpf.ProgramSpec `ebpf:"trace_vfs_rename"`
 	TraceVfsRmdir         *ebpf.ProgramSpec `ebpf:"trace_vfs_rmdir"`
+	TraceVfsSetxattr      *ebpf.ProgramSpec `ebpf:"trace_vfs_setxattr"`
 	TraceVfsSymlink       *ebpf.ProgramSpec `ebpf:"trace_vfs_symlink"`
 	TraceVfsUnlink        *ebpf.ProgramSpec `ebpf:"trace_vfs_unlink"`
 	TraceVfsWrite         *ebpf.ProgramSpec `ebpf:"trace_vfs_write"`
@@ -128,21 +135,28 @@ type MonitorVariables struct {
 //
 // It can be passed to LoadMonitorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type MonitorPrograms struct {
+	TraceDoFaccessat      *ebpf.Program `ebpf:"trace_do_faccessat"`
 	TraceDoSendfile       *ebpf.Program `ebpf:"trace_do_sendfile"`
 	TraceDoSplice         *ebpf.Program `ebpf:"trace_do_splice"`
 	TraceDoSpliceDirect   *ebpf.Program `ebpf:"trace_do_splice_direct"`
 	TraceMmap             *ebpf.Program `ebpf:"trace_mmap"`
+	TraceNotifyChange     *ebpf.Program `ebpf:"trace_notify_change"`
 	TraceSecurityMmapFile *ebpf.Program `ebpf:"trace_security_mmap_file"`
 	TraceSpliceFileRange  *ebpf.Program `ebpf:"trace_splice_file_range"`
 	TraceVfsCopyFileRange *ebpf.Program `ebpf:"trace_vfs_copy_file_range"`
+	TraceVfsGetattr       *ebpf.Program `ebpf:"trace_vfs_getattr"`
 	TraceVfsIterRead      *ebpf.Program `ebpf:"trace_vfs_iter_read"`
 	TraceVfsLink          *ebpf.Program `ebpf:"trace_vfs_link"`
 	TraceVfsMkdir         *ebpf.Program `ebpf:"trace_vfs_mkdir"`
+	TraceVfsMknod         *ebpf.Program `ebpf:"trace_vfs_mknod"`
 	TraceVfsOpen          *ebpf.Program `ebpf:"trace_vfs_open"`
 	TraceVfsRead          *ebpf.Program `ebpf:"trace_vfs_read"`
+	TraceVfsReadlink      *ebpf.Program `ebpf:"trace_vfs_readlink"`
 	TraceVfsReadv         *ebpf.Program `ebpf:"trace_vfs_readv"`
+	TraceVfsRemovexattr   *ebpf.Program `ebpf:"trace_vfs_removexattr"`
 	TraceVfsRename        *ebpf.Program `ebpf:"trace_vfs_rename"`
 	TraceVfsRmdir         *ebpf.Program `ebpf:"trace_vfs_rmdir"`
+	TraceVfsSetxattr      *ebpf.Program `ebpf:"trace_vfs_setxattr"`
 	TraceVfsSymlink       *ebpf.Program `ebpf:"trace_vfs_symlink"`
 	TraceVfsUnlink        *ebpf.Program `ebpf:"trace_vfs_unlink"`
 	TraceVfsWrite         *ebpf.Program `ebpf:"trace_vfs_write"`
@@ -150,21 +164,28 @@ type MonitorPrograms struct {
 
 func (p *MonitorPrograms) Close() error {
 	return _MonitorClose(
+		p.TraceDoFaccessat,
 		p.TraceDoSendfile,
 		p.TraceDoSplice,
 		p.TraceDoSpliceDirect,
 		p.TraceMmap,
+		p.TraceNotifyChange,
 		p.TraceSecurityMmapFile,
 		p.TraceSpliceFileRange,
 		p.TraceVfsCopyFileRange,
+		p.TraceVfsGetattr,
 		p.TraceVfsIterRead,
 		p.TraceVfsLink,
 		p.TraceVfsMkdir,
+		p.TraceVfsMknod,
 		p.TraceVfsOpen,
 		p.TraceVfsRead,
+		p.TraceVfsReadlink,
 		p.TraceVfsReadv,
+		p.TraceVfsRemovexattr,
 		p.TraceVfsRename,
 		p.TraceVfsRmdir,
+		p.TraceVfsSetxattr,
 		p.TraceVfsSymlink,
 		p.TraceVfsUnlink,
 		p.TraceVfsWrite,

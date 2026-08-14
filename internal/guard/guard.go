@@ -176,24 +176,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		"file_permission": true,
 	}
 
-	attachments := []struct {
-		prog *cilium.Program
-		hook string
-	}{
-		{g.objs.GuardFileOpen, "file_open"},
-		{g.objs.GuardFilePermission, "file_permission"},
-		{g.objs.GuardFileTruncate, "file_truncate"},
-		{g.objs.GuardMmapFile, "mmap_file"},
-		{g.objs.GuardPathUnlink, "path_unlink"},
-		{g.objs.GuardPathRename, "path_rename"},
-		{g.objs.GuardPathSymlink, "path_symlink"},
-		{g.objs.GuardPathLink, "path_link"},
-		{g.objs.GuardPathMkdir, "path_mkdir"},
-		{g.objs.GuardSbMount, "sb_mount"},
-		{g.objs.GuardPtraceAccessCheck, "ptrace_access_check"},
-		{g.objs.GuardTaskAlloc, "task_alloc"},
-		{g.objs.GuardTaskFree, "task_free"},
-	}
+	attachments := guardLSMHooks(g)
 
 	var failedRequired []string
 	for _, a := range attachments {
@@ -226,6 +209,39 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	log.Infof("guard created \u2014 %d/%d LSM hooks attached, watching: %s (%s)",
 		len(g.links), len(attachments), path, modeString(mode))
 	return g, nil
+}
+
+func guardLSMHooks(g *Guard) []struct {
+	prog *cilium.Program
+	hook string
+} {
+	return []struct {
+		prog *cilium.Program
+		hook string
+	}{
+		{g.objs.GuardFileOpen, "file_open"},
+		{g.objs.GuardFilePermission, "file_permission"},
+		{g.objs.GuardFileTruncate, "file_truncate"},
+		{g.objs.GuardMmapFile, "mmap_file"},
+		{g.objs.GuardPathUnlink, "path_unlink"},
+		{g.objs.GuardPathRename, "path_rename"},
+		{g.objs.GuardPathSymlink, "path_symlink"},
+		{g.objs.GuardPathLink, "path_link"},
+		{g.objs.GuardPathMkdir, "path_mkdir"},
+		{g.objs.GuardPathTruncate, "path_truncate"},
+		{g.objs.GuardInodeSetattr, "inode_setattr"},
+		{g.objs.GuardInodeSetxattr, "inode_setxattr"},
+		{g.objs.GuardInodeRemovexattr, "inode_removexattr"},
+		{g.objs.GuardPathMknod, "path_mknod"},
+		{g.objs.GuardPathRmdir, "path_rmdir"},
+		{g.objs.GuardInodePermission, "inode_permission"},
+		{g.objs.GuardInodeGetattr, "inode_getattr"},
+		{g.objs.GuardInodeReadlink, "inode_readlink"},
+		{g.objs.GuardSbMount, "sb_mount"},
+		{g.objs.GuardPtraceAccessCheck, "ptrace_access_check"},
+		{g.objs.GuardTaskAlloc, "task_alloc"},
+		{g.objs.GuardTaskFree, "task_free"},
+	}
 }
 
 func modeString(mode Mode) string {

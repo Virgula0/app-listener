@@ -57,7 +57,7 @@ func init() {
 	MonitorCmd.Flags().BoolVarP(&headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	MonitorCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
-		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP; default: all)")
+		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD; default: all)")
 }
 
 func runMonitor(cmd *cobra.Command, args []string) error {

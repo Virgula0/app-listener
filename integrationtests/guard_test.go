@@ -1392,3 +1392,144 @@ func (s *IntegrationSuite) TestGuard_RuntimeRenameFile() {
 
 	s.stopGuard(c)
 }
+
+// ---------------------------------------------------------------
+// Bypass-vector coverage for path-based operations that never
+// create a struct file and therefore never pass through
+// file_open / file_permission:
+//
+//   - truncate(2)                -> path_truncate (ATTR)
+//   - chmod(2)/chown(2)/utimes   -> inode_setattr (ATTR)
+//   - setxattr(2)                -> inode_setxattr (ATTR)
+//   - mknod(2)                   -> path_mknod (MKNOD)
+//   - rmdir(2)                   -> path_rmdir (DELETE)
+//   - stat(2)/access(2)/readlink -> inode_getattr / inode_permission /
+//                                   inode_readlink (STAT)
+//
+// Each case runs twice in the same container:
+//  1. block-all mode — the operation must fail and produce a blocked
+//     event for the exploiting binary (the RED assertion: before the
+//     LSM hooks existed the op succeeded silently).
+//  2. whitelist mode (the exploit binary whitelisted) — the SAME
+//     operation must succeed, while a plain cat stays blocked. This
+//     proves the hook is selective and that the caller identity is
+//     still enforced.
+// ---------------------------------------------------------------
+
+type attrOpCase struct {
+	name     string
+	binary   string
+	expect   string // blocked event type
+	targetFn func(run int) string
+}
+
+func attrSameTarget(run int) string { return "/watch/file.txt" }
+
+func (s *IntegrationSuite) prepareAttrTree(c testcontainers.Container) {
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"sh", "-c", "echo secret > /watch/file.txt"})
+	s.exec(c, []string{"ln", "-s", "/watch/file.txt", "/watch/link"})
+	s.exec(c, []string{"mkdir", "/watch/rmdir1"})
+	s.exec(c, []string{"mkdir", "/watch/rmdir2"})
+}
+
+func (s *IntegrationSuite) requireBlockedEventSilent(events []guardEvent, expectedType string, comms ...string) bool {
+	for _, e := range events {
+		if e.Type == expectedType && e.Blocked {
+			if len(comms) == 0 {
+				return true
+			}
+			if slices.Contains(comms, e.Comm) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *IntegrationSuite) runAttrOp(binary, expect string, targetFn func(run int) string) {
+	exploitHostPath := absPath(fmt.Sprintf("./exploits/%s", binary))
+
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.prepareAttrTree(c)
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, fmt.Sprintf("/exploits/%s", binary), 0755)
+	s.Require().NoError(err, "copy exploit binary")
+
+	// ---- Phase 1: block-all mode (only the exploit binary may not run) ----
+	s.startGuardStd(c, "/watch")
+	logBefore := s.readGuardLog(c)
+
+	// Live-guard control: a plain cat must be blocked before the exploit.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/file.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "control cat should be blocked: %s", out)
+
+	code, out = s.exec(c, []string{fmt.Sprintf("/exploits/%s", binary), targetFn(0)})
+	s.Require().NotEqualf(0, code, "%s must be blocked in block-all mode: %s", binary, out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	if !s.requireBlockedEventSilent(deltaEvents, expect, binary) {
+		s.T().Logf("phase1 raw guard log:\n%s", logAfter)
+		s.requireBlockedEvent(deltaEvents, expect, binary)
+	}
+
+	// ---- Phase 2: whitelist mode (exploit binary whitelisted) ----
+	s.stopGuard(c)
+	s.startGuardStd(c, "/watch", "-w", "/exploits/"+binary)
+
+	// The guard is still alive and restrictive: cat remains blocked.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/file.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "control cat should stay blocked under whitelist: %s", out)
+
+	code, out = s.exec(c, []string{fmt.Sprintf("/exploits/%s", binary), targetFn(1)})
+	s.Require().Equalf(0, code, "whitelisted %s must succeed: %s", binary, out)
+
+	logAfter2 := s.readGuardLog(c)
+	s.requireNoBlockedEvent(guardDeltaEvents(logAfter, logAfter2), expect)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Table of bypass vectors
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_BypassVectors() {
+	cases := []attrOpCase{
+		{name: "Truncate", binary: "truncate", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Chmod", binary: "chmod", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Chown", binary: "chown", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Utimes", binary: "utimes", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Setxattr", binary: "setxattr", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Mknod", binary: "mknod", expect: "MKNOD", targetFn: func(run int) string {
+			if run == 0 {
+				return "/watch/fifo1"
+			}
+			return "/watch/fifo2"
+		}},
+		{name: "Rmdir", binary: "rmdir", expect: "DELETE", targetFn: func(run int) string {
+			if run == 0 {
+				return "/watch/rmdir1"
+			}
+			return "/watch/rmdir2"
+		}},
+		{
+			name:   "Metadata",
+			binary: "statp",
+			expect: "STAT",
+			targetFn: func(run int) string {
+				// A symlink inside the guarded tree: stat follows it,
+				// access() probes it, readlink(2) reads it directly.
+				return "/watch/link"
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		s.Run(tc.name, func() {
+			s.runAttrOp(tc.binary, tc.expect, tc.targetFn)
+		})
+	}
+}

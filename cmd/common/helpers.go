@@ -153,7 +153,7 @@ func ParseEventsFlag(eventsFlag []string) ([]ebpf.EventType, error) {
 	for _, s := range eventsFlag {
 		et, ok := ebpf.ParseEventType(strings.TrimSpace(s))
 		if !ok {
-			return nil, fmt.Errorf("unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP; for network mode: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS)", s)
+			return nil, fmt.Errorf("unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD; for network mode: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS)", s)
 		}
 		parsed = append(parsed, et)
 	}

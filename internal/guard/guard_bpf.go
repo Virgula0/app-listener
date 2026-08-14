@@ -63,11 +63,20 @@ type GuardProgramSpecs struct {
 	GuardFileOpen          *ebpf.ProgramSpec `ebpf:"guard_file_open"`
 	GuardFilePermission    *ebpf.ProgramSpec `ebpf:"guard_file_permission"`
 	GuardFileTruncate      *ebpf.ProgramSpec `ebpf:"guard_file_truncate"`
+	GuardInodeGetattr      *ebpf.ProgramSpec `ebpf:"guard_inode_getattr"`
+	GuardInodePermission   *ebpf.ProgramSpec `ebpf:"guard_inode_permission"`
+	GuardInodeReadlink     *ebpf.ProgramSpec `ebpf:"guard_inode_readlink"`
+	GuardInodeRemovexattr  *ebpf.ProgramSpec `ebpf:"guard_inode_removexattr"`
+	GuardInodeSetattr      *ebpf.ProgramSpec `ebpf:"guard_inode_setattr"`
+	GuardInodeSetxattr     *ebpf.ProgramSpec `ebpf:"guard_inode_setxattr"`
 	GuardMmapFile          *ebpf.ProgramSpec `ebpf:"guard_mmap_file"`
 	GuardPathLink          *ebpf.ProgramSpec `ebpf:"guard_path_link"`
 	GuardPathMkdir         *ebpf.ProgramSpec `ebpf:"guard_path_mkdir"`
+	GuardPathMknod         *ebpf.ProgramSpec `ebpf:"guard_path_mknod"`
 	GuardPathRename        *ebpf.ProgramSpec `ebpf:"guard_path_rename"`
+	GuardPathRmdir         *ebpf.ProgramSpec `ebpf:"guard_path_rmdir"`
 	GuardPathSymlink       *ebpf.ProgramSpec `ebpf:"guard_path_symlink"`
+	GuardPathTruncate      *ebpf.ProgramSpec `ebpf:"guard_path_truncate"`
 	GuardPathUnlink        *ebpf.ProgramSpec `ebpf:"guard_path_unlink"`
 	GuardPtraceAccessCheck *ebpf.ProgramSpec `ebpf:"guard_ptrace_access_check"`
 	GuardSbMount           *ebpf.ProgramSpec `ebpf:"guard_sb_mount"`
@@ -157,11 +166,20 @@ type GuardPrograms struct {
 	GuardFileOpen          *ebpf.Program `ebpf:"guard_file_open"`
 	GuardFilePermission    *ebpf.Program `ebpf:"guard_file_permission"`
 	GuardFileTruncate      *ebpf.Program `ebpf:"guard_file_truncate"`
+	GuardInodeGetattr      *ebpf.Program `ebpf:"guard_inode_getattr"`
+	GuardInodePermission   *ebpf.Program `ebpf:"guard_inode_permission"`
+	GuardInodeReadlink     *ebpf.Program `ebpf:"guard_inode_readlink"`
+	GuardInodeRemovexattr  *ebpf.Program `ebpf:"guard_inode_removexattr"`
+	GuardInodeSetattr      *ebpf.Program `ebpf:"guard_inode_setattr"`
+	GuardInodeSetxattr     *ebpf.Program `ebpf:"guard_inode_setxattr"`
 	GuardMmapFile          *ebpf.Program `ebpf:"guard_mmap_file"`
 	GuardPathLink          *ebpf.Program `ebpf:"guard_path_link"`
 	GuardPathMkdir         *ebpf.Program `ebpf:"guard_path_mkdir"`
+	GuardPathMknod         *ebpf.Program `ebpf:"guard_path_mknod"`
 	GuardPathRename        *ebpf.Program `ebpf:"guard_path_rename"`
+	GuardPathRmdir         *ebpf.Program `ebpf:"guard_path_rmdir"`
 	GuardPathSymlink       *ebpf.Program `ebpf:"guard_path_symlink"`
+	GuardPathTruncate      *ebpf.Program `ebpf:"guard_path_truncate"`
 	GuardPathUnlink        *ebpf.Program `ebpf:"guard_path_unlink"`
 	GuardPtraceAccessCheck *ebpf.Program `ebpf:"guard_ptrace_access_check"`
 	GuardSbMount           *ebpf.Program `ebpf:"guard_sb_mount"`
@@ -174,11 +192,20 @@ func (p *GuardPrograms) Close() error {
 		p.GuardFileOpen,
 		p.GuardFilePermission,
 		p.GuardFileTruncate,
+		p.GuardInodeGetattr,
+		p.GuardInodePermission,
+		p.GuardInodeReadlink,
+		p.GuardInodeRemovexattr,
+		p.GuardInodeSetattr,
+		p.GuardInodeSetxattr,
 		p.GuardMmapFile,
 		p.GuardPathLink,
 		p.GuardPathMkdir,
+		p.GuardPathMknod,
 		p.GuardPathRename,
+		p.GuardPathRmdir,
 		p.GuardPathSymlink,
+		p.GuardPathTruncate,
 		p.GuardPathUnlink,
 		p.GuardPtraceAccessCheck,
 		p.GuardSbMount,
