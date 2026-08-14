@@ -36,6 +36,10 @@ A serious eBPF rewrite of [arch-supply-chain-hardening](https://github.com/Virgu
 
 ```bash
 # 1. Build (regenerates BPF bindings from the running kernel, then compiles)
+#    Requires a ROOTFUL Docker daemon: the build runs in an isolated container
+#    with the host's BTF vmlinux mounted, and outputs build/linux/app-listener
+#    owned by your user. No Docker? Install clang/LLVM, bpftool, Go 1.26+ and
+#    GCC, then run `make build-host` instead.
 make build
 
 # 2. Interactive installer (root): builds the binary, generates the fscrypt
@@ -66,7 +70,7 @@ Exit any TUI with `q` or `Ctrl+C`.
 |--------|-------------|
 | Kernel | 5.4+ (monitor), 5.10+ (guard/daemon, needs `CONFIG_BPF_LSM`). CO-RE BPF — needs BTF (`/sys/kernel/btf/vmlinux`). |
 | Architecture | `linux/amd64` (CI-tested); `linux/arm64` cross-compiled. |
-| Tools | clang/LLVM + bpftool (only to regenerate bindings), Go 1.24+, root. |
+| Tools | `make build` needs a **rootful Docker** daemon. `make build-host` instead needs clang/LLVM + bpftool + Go 1.26+ + GCC installed locally. |
 
 Run `make check-compatibility` **before** building — it verifies kernel, BTF, the **BPF LSM** (`bpf` in `/sys/kernel/security/lsm`, mandatory for guard/daemon, absent by default on stock Ubuntu/cloud kernels), sysctls, root and build tools.
 
@@ -271,7 +275,9 @@ A wrong/old key fails immediately with "invalid wrapping key" — the daemon nev
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Regenerate BPF bindings (+ `vmlinux.h` from running kernel BTF) + build |
+| `make build` | Dockerized build: isolated rootful container (host `/sys/kernel/btf/vmlinux` mounted read-only) regenerates BPF bindings + builds to `build/linux/app-listener`, owned by your user |
+| `make build-host` | On-host build (needs clang/LLVM, bpftool, Go, GCC installed): regenerates BPF bindings + builds |
+| `make build-image` | Build the `app-listener-builder` toolchain image (auto-run by `make build`) |
 | `make build-linux` | Build the Go binary only |
 | `make generate` / `make generate-{monitor,guard,networkmonitor,networkguard}` | Regenerate BPF bindings |
 | `make bpftool-headers` | Regenerate shared `internal/bpf/vmlinux.h` |
@@ -288,6 +294,8 @@ docker compose run --rm app-listener monitor -w /tmp
 ```
 
 Multi-stage build; runner is Debian slim. eBPF needs the host kernel — run privileged or with `/sys/kernel/btf/` + `CAP_BPF`.
+
+`make build` uses a dedicated, separately-built toolchain image (`docker/builder.Dockerfile`, built by `make build-image`); it does **not** touch this runtime multi-stage image.
 
 ## Architecture
 
