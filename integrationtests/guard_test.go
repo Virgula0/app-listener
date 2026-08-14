@@ -548,6 +548,12 @@ func (s *IntegrationSuite) TestGuard_Exploits() {
 	testFilePath := "/watch/exploit_target.txt"
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("echo 'exploit target' > %s", testFilePath)})
 
+	// The execve target must exist before the guard starts: in block-all
+	// mode creating it afterwards would itself be blocked and emit
+	// MKNOD|sh instead of an OPEN event, and the execve would then fail
+	// with ENOENT, masking the guard denial it is supposed to verify.
+	s.exec(c, []string{"sh", "-c", "echo '#!/bin/sh\necho executed' > /watch/.exec_target && chmod +x /watch/.exec_target"})
+
 	s.startGuardStd(c, "/watch")
 	logCursor := s.readGuardLog(c)
 
@@ -566,7 +572,6 @@ func (s *IntegrationSuite) TestGuard_Exploits() {
 
 			targetPath := testFilePath
 			if et.name == "execve" {
-				s.exec(c, []string{"sh", "-c", "echo '#!/bin/sh\necho executed' > /watch/.exec_target && chmod +x /watch/.exec_target"})
 				targetPath = "/watch/.exec_target"
 			}
 

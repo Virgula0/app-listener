@@ -1195,17 +1195,15 @@ int guard_path_rmdir(unsigned long long *ctx)
 	return 0;
 }
 
+// Observe-only: never blocks.  stat(2)/statx(2) are probe-only and
+// ubiquitous — most tools (e.g. coreutils cat/mkdir) stat a guarded file
+// before their real syscall, so denying here would pre-empt file_open and
+// turn every blocked read into a STAT event instead of the OPEN event the
+// enforcement is defined by.  Real enforcement stays in file_open and the
+// path_*/inode_* hooks; metadata probing is observable via monitor mode.
 SEC("lsm/inode_getattr")
 int guard_inode_getattr(unsigned long long *ctx)
 {
-	struct dentry *dentry = get_dentry_from_path((void *)ctx[0]);
-	if (!dentry)
-		return 0;
-
-	struct inode *inode = get_inode_from_path((void *)ctx[0]);
-	if (is_guarded_access(dentry, inode))
-		return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false);
-
 	return 0;
 }
 

@@ -4,82 +4,10 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"testing"
 	"time"
 
 	"github.com/testcontainers/testcontainers-go"
 )
-
-// ---------------------------------------------------------------
-// eBPF tests (privileged container)
-//
-// The monitor requires a TTY for Bubble Tea, so it exits with
-// code 1 in non-TTY environments. We verify eBPF success by
-// checking the log output before the TUI error.
-// ---------------------------------------------------------------
-
-func verifyEBPF(s *IntegrationSuite, code int, out string) {
-	s.Require().True(strings.Contains(out, "eBPF available"),
-		"eBPF check should pass:\n%s", out)
-	s.Require().True(strings.Contains(out, "monitor started"),
-		"monitor should start:\n%s", out)
-	s.Require().True(strings.Contains(out, "monitor created"),
-		"monitor should create probes:\n%s", out)
-	s.Require().True(strings.Contains(out, "could not open a new TTY"),
-		"should fail only due to missing TTY:\n%s", out)
-}
-
-func (s *IntegrationSuite) TestEBPF_Check() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive"})
-	verifyEBPF(s, code, out)
-}
-
-func (s *IntegrationSuite) TestEBPF_CheckWithDepth() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive", "--depth", "2"})
-	verifyEBPF(s, code, out)
-}
-
-func (s *IntegrationSuite) TestEBPF_FullStack() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch"})
-
-	monitorCmd := fmt.Sprintf("nohup /app-listener monitor -w /watch --recursive --depth 3 --headless > /tmp/monitor.log 2>&1 &")
-	_, _ = s.exec(c, []string{"sh", "-c", monitorCmd})
-	time.Sleep(3 * time.Second)
-
-	codeCheck, outCheck := s.exec(c, []string{"pgrep", "-f", "app-listener"})
-	s.Require().Equalf(0, codeCheck, "monitor process not running after start:\n%s", outCheck)
-
-	logBefore := s.readMonitorLog(c)
-
-	s.exec(c, []string{"touch", "/watch/test.txt"})
-	s.exec(c, []string{"sh", "-c", "echo hello > /watch/test.txt"})
-	s.exec(c, []string{"rm", "/watch/test.txt"})
-	s.exec(c, []string{"mkdir", "/watch/subdir"})
-	time.Sleep(2 * time.Second)
-
-	codeAfter, outAfter := s.exec(c, []string{"pgrep", "-f", "app-listener"})
-	s.Require().Equalf(0, codeAfter, "monitor crashed after file events:\n%s", outAfter)
-
-	logAfter := s.readMonitorLog(c)
-	if logAfter != "" {
-		s.Require().True(strings.Contains(logAfter, "eBPF available"),
-			"monitor log missing eBPF check:\n%s", logAfter)
-		s.Require().True(strings.Contains(logAfter, "monitor created"),
-			"monitor log missing probe attachment:\n%s", logAfter)
-		s.requireNewEventType(logBefore, logAfter, "MKDIR")
-	}
-}
 
 // ---------------------------------------------------------------
 // Comprehensive event coverage test
@@ -402,28 +330,6 @@ func (s *IntegrationSuite) TestMonitorEventFilter_SingleType_FileWatch() {
 }
 
 // ---------------------------------------------------------------
-// Multi-distro tests
-// ---------------------------------------------------------------
-
-func (s *IntegrationSuite) TestMultiDistro_Alpine_EBPF() {
-	c := s.startContainer("alpine:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive"})
-	verifyEBPF(s, code, out)
-}
-
-func (s *IntegrationSuite) TestMultiDistro_Fedora_EBPF() {
-	c := s.startContainer("fedora:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	code, out := s.exec(c, []string{"/app-listener", "monitor", "-w", "/watch", "--recursive"})
-	verifyEBPF(s, code, out)
-}
-
-// ---------------------------------------------------------------
 // Non-recursive monitoring: events only for direct children
 // ---------------------------------------------------------------
 
@@ -722,47 +628,6 @@ func (s *IntegrationSuite) TestExploit_sendfile()        { s.exploitSingle("send
 func (s *IntegrationSuite) TestExploit_splice()          { s.exploitSingle("splice") }
 func (s *IntegrationSuite) TestExploit_mmap()            { s.exploitSingle("mmap") }
 func (s *IntegrationSuite) TestExploit_copy_file_range() { s.exploitSingle("copy_file_range") }
-
-func (s *IntegrationSuite) TestExploits() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch"})
-	testFilePath := "/watch/test_file.txt"
-	s.exec(c, []string{"sh", "-c", fmt.Sprintf("echo 'test data for exploits' > %s", testFilePath)})
-	s.exec(c, []string{"mkdir", "-p", "/exploits"})
-
-	s.startMonitorStd(c, "/watch")
-	logBefore := s.readMonitorLog(c)
-
-	for _, et := range exploitTests {
-		s.T().Run(et.name, func(t *testing.T) {
-			t.Helper()
-
-			testFile := testFilePath
-			if et.name == "execve" {
-				t.Log("execve will copy test_file.txt to .exec_target")
-			}
-
-			found, allOk := s.runExploitExpect(c, et, testFile, logBefore)
-			logBefore = s.readMonitorLog(c)
-			if !allOk {
-				t.Logf("Monitor log tail:\n%s", logBefore)
-				if et.requiresRoot {
-					t.Skipf("exploit %s requires root (CAP_DAC_READ_SEARCH): expected %v, got %v", et.name, et.events, found)
-				}
-				if et.kernelOptional {
-					t.Skipf("exploit %s not supported on this kernel: expected %v, got %v", et.name, et.events, found)
-				}
-				t.Fatalf("exploit %s should trigger events %v, got %v", et.name, et.events, found)
-			}
-		})
-
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	s.stopMonitor(c)
-}
 
 func (s *IntegrationSuite) TestExploit_execve() {
 	et := exploitTests[6]

@@ -11,7 +11,7 @@ Monitor or guard file system and network operations with eBPF — the daemon pro
 > make test-integration
 > ```
 >
-> It exercises every mode and bypass vector inside Docker containers. **Rootful Docker is required** — the suite loads real eBPF programs, which rootless or remote Docker daemons cannot run.
+> It exercises every mode and bypass vector inside Docker containers. **Rootful Docker is required** — the suite loads real eBPF programs, which rootless or remote Docker daemons cannot run. All tests must pass.
 
 ## Contents
 
@@ -36,7 +36,6 @@ A serious eBPF rewrite of [arch-supply-chain-hardening](https://github.com/Virgu
 
 ```bash
 # 1. Build (regenerates BPF bindings from the running kernel, then compiles)
-make bpftool-headers
 make build
 
 # 2. Interactive installer (root): builds the binary, generates the fscrypt
@@ -276,7 +275,7 @@ A wrong/old key fails immediately with "invalid wrapping key" — the daemon nev
 | `make build-linux` | Build the Go binary only |
 | `make generate` / `make generate-{monitor,guard,networkmonitor,networkguard}` | Regenerate BPF bindings |
 | `make bpftool-headers` | Regenerate shared `internal/bpf/vmlinux.h` |
-| `make test-integration` | **100%-coverage verification** — builds exploit binaries + Docker integration suite (rootful Docker required) |
+| `make test-integration` | Builds exploit binaries + Docker integration suite (rootful Docker required) |
 | `make check-compatibility` | Verify the host before building/installing |
 | `make lint` / `make test` | golangci-lint / unit tests |
 | `make clean` / `make install-deps` / `make run` | Artifacts / deps / `go run` |
