@@ -548,6 +548,12 @@ func (s *IntegrationSuite) TestGuard_Exploits() {
 	testFilePath := "/watch/exploit_target.txt"
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("echo 'exploit target' > %s", testFilePath)})
 
+	// The execve target must exist before the guard starts: in block-all
+	// mode creating it afterwards would itself be blocked and emit
+	// MKNOD|sh instead of an OPEN event, and the execve would then fail
+	// with ENOENT, masking the guard denial it is supposed to verify.
+	s.exec(c, []string{"sh", "-c", "echo '#!/bin/sh\necho executed' > /watch/.exec_target && chmod +x /watch/.exec_target"})
+
 	s.startGuardStd(c, "/watch")
 	logCursor := s.readGuardLog(c)
 
@@ -566,7 +572,6 @@ func (s *IntegrationSuite) TestGuard_Exploits() {
 
 			targetPath := testFilePath
 			if et.name == "execve" {
-				s.exec(c, []string{"sh", "-c", "echo '#!/bin/sh\necho executed' > /watch/.exec_target && chmod +x /watch/.exec_target"})
 				targetPath = "/watch/.exec_target"
 			}
 
@@ -1216,6 +1221,149 @@ func (s *IntegrationSuite) TestGuard_RuntimeRenameDir() {
 	s.stopGuard(c)
 }
 
+// eventsForPath returns the delta events whose guarded path matches p.
+func eventsForPath(events []guardEvent, p string) []guardEvent {
+	var out []guardEvent
+	for _, e := range events {
+		if e.Path == p {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------
+// Exec-open attribution (whitelist mode) — regression coverage for
+// the "spoofed comm" / launcher-attribution fix.
+//
+// A whitelisted binary living INSIDE the guarded tree (e.g. Electron's
+// versioned Discord binary under ~/.config/discord) is opened by the
+// *launcher* (/bin/sh through a wrapper), not by itself. Without
+// exec-open attribution every such launch is blocked even though the
+// target is whitelisted.
+//
+// The BPF program recognizes the exec chain by two discriminators:
+//   - the target's own open carries __FMODE_EXEC in file->f_flags
+//     (in_execve is set only afterwards, in bprm_execve);
+//   - the kernel's load-time accesses (prepare_binprm's kernel_read,
+//     binfmt mmap) happen while task->in_execve is set.
+//
+// Both are attributed by the *accessed file's* inode: the file itself
+// must be whitelisted to pass. Blacklist mode and non-whitelisted
+// in-tree targets keep caller attribution (see below).
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_ExecAttribution_Whitelist() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch/bin"})
+	// app: a whitelisted executable inside the guarded tree.
+	s.exec(c, []string{"sh", "-c", "cp /bin/true /watch/bin/app && chmod +x /watch/bin/app"})
+	// other: an executable inside the guarded tree that is NOT whitelisted.
+	s.exec(c, []string{"sh", "-c", "cp /bin/false /watch/bin/other && chmod +x /watch/bin/other"})
+
+	// Whitelist mode: only /watch/bin/app may access the guarded tree.
+	s.startGuardStd(c, "/watch", "-w", "/watch/bin/app")
+	logBefore := s.readGuardLog(c)
+
+	// 1. Executing the whitelisted in-tree binary from a non-whitelisted
+	//    launcher (sh) must succeed: the exec open is attributed to the
+	//    target binary, whose inode is whitelisted.
+	code, out := s.exec(c, []string{"sh", "-c", "/watch/bin/app"})
+	s.Require().Equalf(0, code, "exec of whitelisted in-tree binary should succeed: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	// The whole exec chain — OPEN (__FMODE_EXEC), the kernel's load-time
+	// READs, and the binfmt MMAPs (in_execve) — must be allowed: no event
+	// for the exec file may be blocked. At least one OPEN documents that
+	// the launcher-attribution branch actually fired.
+	appEvents := eventsForPath(deltaEvents, "/watch/bin/app")
+	s.Require().NotEmpty(appEvents, "expected guard events for the exec of /watch/bin/app, got: %v", deltaEvents)
+	openCount := 0
+	for _, e := range appEvents {
+		if e.Type == "OPEN" {
+			openCount++
+		}
+		s.Require().Falsef(e.Blocked, "exec chain of whitelisted in-tree binary must not be blocked: %s|%s", e.Type, e.Comm)
+	}
+	s.Require().GreaterOrEqualf(openCount, 1, "expected an exec OPEN event for /watch/bin/app, got: %v", appEvents)
+
+	// 2. Executing a NON-whitelisted binary inside the guarded tree must
+	//    still be blocked at its exec open (target not whitelisted).
+	code, out = s.exec(c, []string{"sh", "-c", "/watch/bin/other"})
+	s.Require().NotEqualf(0, code, "exec of non-whitelisted in-tree binary should be blocked: %s", out)
+
+	logAfter2 := s.readGuardLog(c)
+	deltaEvents2 := guardDeltaEvents(logAfter, logAfter2)
+	blockedOther := eventsForPath(deltaEvents2, "/watch/bin/other")
+	s.Require().NotEmpty(blockedOther, "expected guard events for the blocked exec of /watch/bin/other, got: %v", deltaEvents2)
+	for _, e := range blockedOther {
+		s.Require().Truef(e.Blocked, "exec open of non-whitelisted in-tree binary must be blocked: %s|%s", e.Type, e.Comm)
+	}
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Exec attribution (blacklist mode) — opposite side of the same fix.
+//
+// Blacklist mode deliberately keeps caller attribution: the exec open
+// and the load-time reads of a blacklisted in-tree binary are allowed
+// (they happen under the launcher's identity), but as soon as the exec
+// assigns the new binary its identity (comm switched, mm->exe_file
+// replaced) its very first own access — the load mmap — is attributed
+// to the blacklisted exe inode and blocked. The binary cannot even
+// start, so it certainly cannot read the guarded file. This documents
+// that the exec-open attribution never leaks into blacklist mode.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_ExecAttribution_Blacklist() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch/bin"})
+	// mycat: a blacklisted executable inside the guarded tree.
+	s.exec(c, []string{"sh", "-c", "cp /bin/cat /watch/bin/mycat && chmod +x /watch/bin/mycat"})
+	s.exec(c, []string{"sh", "-c", "echo 'secret' > /watch/secret.txt"})
+
+	s.startGuardStd(c, "/watch", "-b", "/watch/bin/mycat")
+	logBefore := s.readGuardLog(c)
+
+	// Executing the blacklisted in-tree binary must fail completely:
+	// identity switches to mycat during load and its own mmap is
+	// blocked, so it never even runs (and never reaches secret.txt).
+	code, out := s.exec(c, []string{"sh", "-c", "/watch/bin/mycat /watch/secret.txt"})
+	s.Require().NotEqualf(0, code, "blacklisted in-tree binary must be blocked: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	execEvents := eventsForPath(deltaEvents, "/watch/bin/mycat")
+	s.Require().NotEmpty(execEvents, "expected guard events for the exec of /watch/bin/mycat, got: %v", deltaEvents)
+
+	// Launcher attribution: the exec open and the load-time reads pass
+	// under sh's identity (sh is not blacklisted)...
+	for _, e := range execEvents {
+		if e.Type == "OPEN" || e.Type == "READ" {
+			s.Require().Falsef(e.Blocked, "exec open/load reads in blacklist mode keep launcher attribution: %s|%s", e.Type, e.Comm)
+		}
+	}
+
+	// ...but the first access under the blacklisted identity (the load
+	// mmap, comm already switched to mycat) is blocked.
+	blockedAfterSwitch := false
+	for _, e := range execEvents {
+		if e.Blocked {
+			s.Require().Equalf("mycat", e.Comm, "post-exec access must be attributed to the blacklisted binary")
+			blockedAfterSwitch = true
+		}
+	}
+	s.Require().Truef(blockedAfterSwitch, "expected the blacklisted binary to be blocked at its own load, got: %v", execEvents)
+
+	s.stopGuard(c)
+}
+
 // ---------------------------------------------------------------
 // Test: rename a file (not a directory) into the guarded area.
 // Files do not get their own inode added on rename-in, but the
@@ -1248,4 +1396,145 @@ func (s *IntegrationSuite) TestGuard_RuntimeRenameFile() {
 	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
 
 	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass-vector coverage for path-based operations that never
+// create a struct file and therefore never pass through
+// file_open / file_permission:
+//
+//   - truncate(2)                -> path_truncate (ATTR)
+//   - chmod(2)/chown(2)/utimes   -> inode_setattr (ATTR)
+//   - setxattr(2)                -> inode_setxattr (ATTR)
+//   - mknod(2)                   -> path_mknod (MKNOD)
+//   - rmdir(2)                   -> path_rmdir (DELETE)
+//   - stat(2)/access(2)/readlink -> inode_getattr / inode_permission /
+//                                   inode_readlink (STAT)
+//
+// Each case runs twice in the same container:
+//  1. block-all mode — the operation must fail and produce a blocked
+//     event for the exploiting binary (the RED assertion: before the
+//     LSM hooks existed the op succeeded silently).
+//  2. whitelist mode (the exploit binary whitelisted) — the SAME
+//     operation must succeed, while a plain cat stays blocked. This
+//     proves the hook is selective and that the caller identity is
+//     still enforced.
+// ---------------------------------------------------------------
+
+type attrOpCase struct {
+	name     string
+	binary   string
+	expect   string // blocked event type
+	targetFn func(run int) string
+}
+
+func attrSameTarget(run int) string { return "/watch/file.txt" }
+
+func (s *IntegrationSuite) prepareAttrTree(c testcontainers.Container) {
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"sh", "-c", "echo secret > /watch/file.txt"})
+	s.exec(c, []string{"ln", "-s", "/watch/file.txt", "/watch/link"})
+	s.exec(c, []string{"mkdir", "/watch/rmdir1"})
+	s.exec(c, []string{"mkdir", "/watch/rmdir2"})
+}
+
+func (s *IntegrationSuite) requireBlockedEventSilent(events []guardEvent, expectedType string, comms ...string) bool {
+	for _, e := range events {
+		if e.Type == expectedType && e.Blocked {
+			if len(comms) == 0 {
+				return true
+			}
+			if slices.Contains(comms, e.Comm) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *IntegrationSuite) runAttrOp(binary, expect string, targetFn func(run int) string) {
+	exploitHostPath := absPath(fmt.Sprintf("./exploits/%s", binary))
+
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.prepareAttrTree(c)
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, fmt.Sprintf("/exploits/%s", binary), 0755)
+	s.Require().NoError(err, "copy exploit binary")
+
+	// ---- Phase 1: block-all mode (only the exploit binary may not run) ----
+	s.startGuardStd(c, "/watch")
+	logBefore := s.readGuardLog(c)
+
+	// Live-guard control: a plain cat must be blocked before the exploit.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/file.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "control cat should be blocked: %s", out)
+
+	code, out = s.exec(c, []string{fmt.Sprintf("/exploits/%s", binary), targetFn(0)})
+	s.Require().NotEqualf(0, code, "%s must be blocked in block-all mode: %s", binary, out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	if !s.requireBlockedEventSilent(deltaEvents, expect, binary) {
+		s.T().Logf("phase1 raw guard log:\n%s", logAfter)
+		s.requireBlockedEvent(deltaEvents, expect, binary)
+	}
+
+	// ---- Phase 2: whitelist mode (exploit binary whitelisted) ----
+	s.stopGuard(c)
+	s.startGuardStd(c, "/watch", "-w", "/exploits/"+binary)
+
+	// The guard is still alive and restrictive: cat remains blocked.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/file.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "control cat should stay blocked under whitelist: %s", out)
+
+	code, out = s.exec(c, []string{fmt.Sprintf("/exploits/%s", binary), targetFn(1)})
+	s.Require().Equalf(0, code, "whitelisted %s must succeed: %s", binary, out)
+
+	logAfter2 := s.readGuardLog(c)
+	s.requireNoBlockedEvent(guardDeltaEvents(logAfter, logAfter2), expect)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Table of bypass vectors
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_BypassVectors() {
+	cases := []attrOpCase{
+		{name: "Truncate", binary: "truncate", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Chmod", binary: "chmod", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Chown", binary: "chown", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Utimes", binary: "utimes", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Setxattr", binary: "setxattr", expect: "ATTR", targetFn: attrSameTarget},
+		{name: "Mknod", binary: "mknod", expect: "MKNOD", targetFn: func(run int) string {
+			if run == 0 {
+				return "/watch/fifo1"
+			}
+			return "/watch/fifo2"
+		}},
+		{name: "Rmdir", binary: "rmdir", expect: "DELETE", targetFn: func(run int) string {
+			if run == 0 {
+				return "/watch/rmdir1"
+			}
+			return "/watch/rmdir2"
+		}},
+		{
+			name:   "Metadata",
+			binary: "statp",
+			expect: "STAT",
+			targetFn: func(run int) string {
+				// A symlink inside the guarded tree: stat follows it,
+				// access() probes it, readlink(2) reads it directly.
+				return "/watch/link"
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		s.Run(tc.name, func() {
+			s.runAttrOp(tc.binary, tc.expect, tc.targetFn)
+		})
+	}
 }

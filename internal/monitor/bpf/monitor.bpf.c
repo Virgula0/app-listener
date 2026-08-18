@@ -15,6 +15,9 @@ enum event_type {
 	EVENT_HARDLINK,
 	EVENT_MKDIR,
 	EVENT_MMAP,
+	EVENT_ATTR,
+	EVENT_STAT,
+	EVENT_MKNOD,
 };
 
 struct event {
@@ -613,6 +616,134 @@ int trace_vfs_link(struct pt_regs *ctx)
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
+}
+
+/*
+ * Metadata-operation coverage: path-based ops that never create a
+ * struct file and therefore never pass through vfs_open. The enum
+ * values and their order MUST stay in sync with the Go EventType
+ * enum (internal/infrastructure/event.go).
+ *
+ * notify_change                    – chmod/chown/utimes/truncate size
+ *                                   (vfs_truncate -> do_truncate ->
+ *                                   notify_change); also fires for
+ *                                   O_TRUNC opens, which is accurate
+ *                                   (the size does change).
+ * vfs_setxattr / vfs_removexattr   – extended attributes.
+ * vfs_mknod                        – device nodes / FIFOs / sockets.
+ * vfs_getattr                      – stat/lstat/statx/fstat metadata
+ *                                   reads (same chokepoint as the
+ *                                   guard's inode_getattr LSM hook).
+ * vfs_readlink                     – symlink body reads.
+ * do_faccessat                     – access(2)/faccessat(2) probes;
+ *                                   the user-supplied pathname is
+ *                                   emitted directly (arg 2).
+ */
+
+SEC("kprobe/notify_change")
+int trace_notify_change(struct pt_regs *ctx)
+{
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM2(ctx);
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL);
+}
+
+SEC("kprobe/vfs_setxattr")
+int trace_vfs_setxattr(struct pt_regs *ctx)
+{
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM2(ctx);
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL);
+}
+
+SEC("kprobe/vfs_removexattr")
+int trace_vfs_removexattr(struct pt_regs *ctx)
+{
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM2(ctx);
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL);
+}
+
+SEC("kprobe/vfs_mknod")
+int trace_vfs_mknod(struct pt_regs *ctx)
+{
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM3(ctx);
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_MKNOD, 0, buf + off, NULL);
+}
+
+SEC("kprobe/vfs_getattr")
+int trace_vfs_getattr(struct pt_regs *ctx)
+{
+	struct path *path = (struct path *)PT_REGS_PARM1(ctx);
+	if (!path)
+		return 0;
+
+	struct dentry *dentry;
+	if (bpf_probe_read_kernel(&dentry, sizeof(dentry), &path->dentry))
+		return 0;
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_STAT, 0, buf + off, NULL);
+}
+
+SEC("kprobe/vfs_readlink")
+int trace_vfs_readlink(struct pt_regs *ctx)
+{
+	struct dentry *dentry = (struct dentry *)PT_REGS_PARM1(ctx);
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_STAT, 0, buf + off, NULL);
+}
+
+SEC("kprobe/do_faccessat")
+int trace_do_faccessat(struct pt_regs *ctx)
+{
+	const char *pathname = (const char *)PT_REGS_PARM2(ctx);
+	if (!pathname)
+		return 0;
+
+	return emit_event(EVENT_STAT, 0, pathname, NULL);
 }
 
 /*

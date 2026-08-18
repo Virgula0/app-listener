@@ -17,6 +17,9 @@ const (
 	EventHardlink
 	EventMkdir
 	EventMmap
+	EventAttr
+	EventStat
+	EventMknod
 )
 
 func (t EventType) String() string {
@@ -39,6 +42,12 @@ func (t EventType) String() string {
 		return "MKDIR"
 	case EventMmap:
 		return "MMAP"
+	case EventAttr:
+		return "ATTR"
+	case EventStat:
+		return "STAT"
+	case EventMknod:
+		return "MKNOD"
 	default:
 		return unknownLabel
 	}
@@ -109,6 +118,12 @@ func ParseEventType(s string) (EventType, bool) {
 		return EventMkdir, true
 	case "MMAP":
 		return EventMmap, true
+	case "ATTR":
+		return EventAttr, true
+	case "STAT":
+		return EventStat, true
+	case "MKNOD":
+		return EventMknod, true
 	default:
 		return 0, false
 	}
@@ -118,5 +133,6 @@ func EventTypes() []EventType {
 	return []EventType{
 		EventOpen, EventRead, EventWrite, EventDelete,
 		EventRename, EventSymlink, EventHardlink, EventMkdir, EventMmap,
+		EventAttr, EventStat, EventMknod,
 	}
 }

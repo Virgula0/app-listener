@@ -67,6 +67,35 @@ func (s *guardUnitTest) TestModeString() {
 	s.Require().Equal("blacklist", modeString(ModeBlacklist))
 }
 
+func (s *guardUnitTest) TestCommMatchesGuardedBinary() {
+	binaries := []BinaryEntry{
+		{Path: "/home/angelo/.config/discord/app-1.0.151/Discord"},
+		{Path: "/usr/bin/opencode"},
+		{Path: "/home/angelo/.config/discord/app-1.0.151/chrome_crashpad_handler"},
+	}
+
+	// the guarded binary's own comm matches its basename
+	s.Require().True(commMatchesGuardedBinary("Discord", binaries))
+	s.Require().True(commMatchesGuardedBinary("opencode", binaries))
+
+	// worker threads of the guarded binary legitimately rename
+	// themselves (Chromium's "libuv-worker", Bun's "Bun Pool N"):
+	// those comms must never count as a match
+	s.Require().False(commMatchesGuardedBinary("libuv-worker", binaries))
+	s.Require().False(commMatchesGuardedBinary("Bun Pool 1", binaries))
+
+	// an unrelated binary name must not match
+	s.Require().False(commMatchesGuardedBinary("cat", binaries))
+
+	// the kernel truncates comm to 15 bytes (TASK_COMM_LEN): guarded
+	// names longer than that are compared truncated on both sides
+	s.Require().True(commMatchesGuardedBinary("chrome_crashpad", binaries))
+	s.Require().False(commMatchesGuardedBinary("chrome_crashpad_handler", binaries))
+
+	// empty whitelist never matches
+	s.Require().False(commMatchesGuardedBinary("Discord", nil))
+}
+
 func (s *guardUnitTest) TestEventMaskOpenImplied() {
 	mask, err := eventMask([]ebpf.EventType{ebpf.EventRead})
 	s.Require().NoError(err)

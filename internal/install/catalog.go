@@ -42,36 +42,22 @@ type CandidateDir struct {
 var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPath: ".ssh",
-		// ssh writes into known_hosts, so it gets READ,WRITE plus the
-		// DELETE/RENAME/HARDLINK its rotation needs: the old known_hosts
-		// is linked (or renamed) to .old, a temp file is renamed into
-		// place, and stale .old/temp files are unlinked. sshd only reads
-		// authorized_keys (READ-only).
+		// ssh rewrites known_hosts (WRITE plus the DELETE/RENAME/HARDLINK
+		// its rotation needs); sshd and its modular helpers (sshd-auth,
+		// sshd-session, sftp-server) only READ authorized_keys — Debian
+		// installs them under /usr/lib/openssh/, Arch under /usr/lib/ssh/.
+		// ssh-keysign/ssh-pkcs11-helper/ssh-session-cleanup never touch
+		// .ssh (inert). git is deliberately NOT whitelisted: it could read
+		// the keys.
 		Whitelist: map[string][]string{
-			"/usr/bin/ssh":        {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK"},
-			"/usr/bin/ssh-add":    nil,
-			"/usr/bin/ssh-agent":  nil,
-			"/usr/bin/ssh-keygen": nil,
-			"/usr/bin/scp":        nil,
-			"/usr/bin/sftp":       nil,
-			// sshd reads the user's authorized_keys to accept public-key
-			// logins; /usr/sbin/sshd covers Debian-style layouts (the
-			// whitelist keeps whichever exists per machine). READ-only:
-			// the daemon must never write into a user's .ssh.
-			"/usr/bin/sshd":  {"READ"},
-			"/usr/sbin/sshd": {"READ"},
-			// OpenSSH >= 9.8 splits sshd into a dispatcher plus modular
-			// helpers: the process that actually opens authorized_keys is
-			// sshd-auth (pubkey authentication) and sshd-session (session
-			// setup), not the dispatcher. Ubuntu/Debian install them under
-			// /usr/lib/openssh/, Arch under /usr/lib/ssh/; the whitelist
-			// keeps whichever exists per machine. sftp-server may fetch
-			// keys via scp/sftp but is READ-only like sshd: pushing a
-			// written authorized_keys into a guarded .ssh over the network
-			// stays denied. ssh-keysign/ssh-pkcs11-helper never touch .ssh
-			// (entries inert); ssh-session-cleanup is a shell script, so
-			// its entry is inert too (the executed ELF is the
-			// interpreter).
+			"/usr/bin/ssh":                         {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK"},
+			"/usr/bin/ssh-add":                     nil,
+			"/usr/bin/ssh-agent":                   nil,
+			"/usr/bin/ssh-keygen":                  nil,
+			"/usr/bin/scp":                         nil,
+			"/usr/bin/sftp":                        nil,
+			"/usr/bin/sshd":                        {"READ"},
+			"/usr/sbin/sshd":                       {"READ"},
 			"/usr/lib/openssh/sshd-auth":           {"READ"},
 			"/usr/lib/ssh/sshd-auth":               {"READ"},
 			"/usr/lib/openssh/sshd-session":        {"READ"},
@@ -85,8 +71,6 @@ var Catalog = []CandidateDir{
 			"/usr/lib/openssh/ssh-pkcs11-helper":   nil,
 			"/usr/lib/ssh/ssh-pkcs11-helper":       nil,
 			"/usr/lib/openssh/ssh-session-cleanup": nil,
-			// git is deliberately NOT whitelisted (see the original
-			// ssh-guard config): a compromised git can read the keys.
 		}},
 	{Name: "GNU Privacy Guard keyring", RelPath: ".gnupg",
 		Whitelist: map[string][]string{
@@ -130,11 +114,6 @@ var Catalog = []CandidateDir{
 			"/usr/bin/cursor": nil, "/usr/local/bin/cursor": nil,
 			"%HOME%/.local/bin/cursor": nil,
 		}},
-	{Name: "Cursor agent", RelPath: ".cursor-agent",
-		Whitelist: map[string][]string{
-			"/usr/bin/cursor": nil, "/usr/local/bin/cursor": nil,
-			"%HOME%/.local/bin/cursor": nil,
-		}},
 	{Name: "GitHub Copilot", RelPath: ".config/github-copilot",
 		Whitelist: map[string][]string{
 			"/usr/bin/git": nil, "/usr/local/bin/copilot": nil,
@@ -142,14 +121,10 @@ var Catalog = []CandidateDir{
 		}},
 
 	// --- IDEs and editors ---------------------------------------------------------
-	// IDE configuration directories commonly hold auth tokens, API keys and
-	// credentials (VS Code globalStorage, JetBrains options/certs, Zed's
-	// auth.json, ...).
-	//
-	// NOTE: /usr/bin/code (Arch/Debian) is a shell wrapper, not the real
-	// binary; the whitelist matches the *executed* ELF, so the actual
-	// Electron binary must be listed. Same for Firefox, Chrome/Chromium
-	// wrappers, etc.
+	// IDE configs hold auth tokens, API keys and credentials (VS Code
+	// globalStorage, JetBrains certs, Zed auth.json). Wrapper binaries
+	// (/usr/bin/code, firefox, chrome, ...) are shell scripts; the
+	// whitelist matches the executed ELF under /opt and /usr/lib.
 	{Name: "VS Code config", RelPath: ".config/Code",
 		Whitelist: map[string][]string{
 			"/usr/bin/code": nil, "/usr/local/bin/code": nil,
@@ -177,25 +152,21 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/codium": nil, "/usr/local/bin/codium": nil,
 			"/opt/vscodium/chrome_crashpad_handler": nil, "/usr/share/vscodium/chrome_crashpad_handler": nil}},
 	{Name: "JetBrains IDEs", RelPath: ".config/JetBrains",
-		// Toolbox-installed IDE binaries live under
-		// ~/.local/share/JetBrains/Toolbox/apps/<product>/bin/<product> with
-		// product-specific names: add them manually in the editor step when
-		// the IDE is launched from Toolbox.
-		//
-		// Standalone installs (e.g. ~/.goland for GoLand) run on the
-		// bundled JetBrains Runtime: the process exe is the JBR java, not
-		// the launcher ELF, so the JBR and its fsnotifier helper must be
-		// whitelisted for the IDE to access its own config.
+		// IDE processes run as the bundled JetBrains Runtime: the process
+		// exe is the JBR java, so the JBR and its fsnotifier helper must be
+		// whitelisted. The globs cover standalone installs under /opt. IDE
+		// installs via Toolbox (~/.local/share/JetBrains/Toolbox/apps) are
+		// deliberately not guarded: they hold no credentials — the IDE config
+		// and auth state live in this .config/JetBrains directory.
 		Whitelist: map[string][]string{
 			"/usr/bin/idea": nil, "/usr/bin/pycharm": nil, "/usr/bin/webstorm": nil,
 			"/usr/bin/clion": nil, "/usr/bin/goland": nil, "/usr/bin/phpstorm": nil,
 			"/usr/bin/rider": nil, "/usr/bin/datagrip": nil, "/usr/bin/rustrover": nil,
-			"/usr/bin/android-studio":     nil,
-			"%HOME%/.goland/jbr/bin/java": nil, "%HOME%/.goland/bin/fsnotifier": nil,
-		}},
-	{Name: "JetBrains Toolbox", RelPath: ".local/share/JetBrains/Toolbox",
-		Whitelist: map[string][]string{
-			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox": nil,
+			"/usr/bin/android-studio":       nil,
+			"/opt/*/jbr/bin/java":           nil,
+			"/opt/*/bin/fsnotifier":         nil,
+			"%HOME%/.goland/jbr/bin/java":   nil,
+			"%HOME%/.goland/bin/fsnotifier": nil,
 		}},
 	{Name: "Zed editor", RelPath: ".config/zed",
 		Whitelist: map[string][]string{
@@ -225,10 +196,9 @@ var Catalog = []CandidateDir{
 	{Name: "AWS credentials", RelPath: ".aws",
 		Whitelist: map[string][]string{"/usr/bin/aws": nil}},
 	{Name: "Google Cloud SDK", RelPath: ".config/gcloud",
-		// /usr/bin/gcloud (and gsutil) are Python launchers whose process
-		// exe is the interpreter, which the whitelist deliberately does
-		// not list. The entries are kept for documentation; they are
-		// inert.
+		// gcloud/gsutil are Python launchers: the process exe is the
+		// interpreter (deliberately not whitelisted), so the entries are
+		// inert — kept for documentation.
 		Whitelist: map[string][]string{"/usr/bin/gcloud": nil, "/usr/bin/gsutil": nil}},
 	{Name: "Kubernetes kubeconfig", RelPath: ".kube",
 		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil}},
@@ -250,18 +220,12 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/rclone": nil}},
 	{Name: "Ollama config", RelPath: ".ollama",
 		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
-	{Name: "npm config file", RelPath: ".npmrc",
-		Whitelist: map[string][]string{"/usr/bin/npm": nil, "/usr/bin/npx": nil, "/usr/bin/node": nil}},
 	{Name: "npm data", RelPath: ".npm",
 		Whitelist: map[string][]string{"/usr/bin/npm": nil, "/usr/bin/npx": nil, "/usr/bin/node": nil}},
-	// /usr/bin/pip is a #!/usr/bin/python script, so its inode never
-	// matches a running process (the exe is the python interpreter, which
-	// is deliberately NOT whitelisted — too broad). The entries are kept
-	// for documentation; they are inert.
+	// pip is a #!/usr/bin/python script (inert, same reason as gcloud);
+	// kept for documentation.
 	{Name: "pip config", RelPath: ".config/pip",
 		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
-	{Name: "Git config", RelPath: ".gitconfig",
-		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 	{Name: "Git config directory", RelPath: ".config/git",
 		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 
@@ -284,10 +248,50 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/gnome-keyring-daemon": nil, "/usr/bin/gnome-keyring": nil}},
 	{Name: "Chezmoi state", RelPath: ".local/share/chezmoi",
 		Whitelist: map[string][]string{"/usr/bin/chezmoi": nil}},
-	{Name: "Netrc credentials file", RelPath: ".netrc",
-		Whitelist: map[string][]string{"/usr/bin/curl": nil, "/usr/bin/wget": nil, "/usr/bin/git": nil}},
-	{Name: "Wget config", RelPath: ".wgetrc",
-		Whitelist: map[string][]string{"/usr/bin/wget": nil}},
+
+	// --- Legacy dot-config files --------------------------------------------------
+	// No single-file entries here: the daemon guards directories only (the
+	// config loader skips non-directory paths), so a plain file like
+	// ~/.netrc or ~/.wgetrc would be written to the config but silently
+	// dropped at load. The Steam entry below documents the same restriction
+	// for the legacy ssfn sentry files and the required glob semantics.
+
+	// --- Wallets and crypto -------------------------------------------------------
+	// Probed like any other entry: they surface only once the wallet is
+	// installed. Solana keeps its keypair as a plaintext id.json.
+	{Name: "Bitcoin Core", RelPath: ".bitcoin/wallets",
+		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil, "/usr/bin/bitcoin-tx": nil}},
+	{Name: "Litecoin Core", RelPath: ".litecoin/wallets",
+		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil}},
+	{Name: "Monero", RelPath: ".bitmonero/wallets",
+		Whitelist: map[string][]string{"/usr/bin/monero-wallet-gui": nil, "/usr/bin/monero-wallet-cli": nil, "/usr/bin/monerod": nil}},
+	{Name: "Electrum", RelPath: ".electrum",
+		Whitelist: map[string][]string{"/usr/bin/electrum": nil, "/usr/local/bin/electrum": nil}},
+	{Name: "Sparrow", RelPath: ".sparrow",
+		Whitelist: map[string][]string{"/usr/bin/sparrow": nil}},
+	{Name: "Wasabi Wallet", RelPath: ".walletwasabi",
+		Whitelist: map[string][]string{"/usr/bin/wassabee": nil}},
+	{Name: "Ledger Live", RelPath: ".config/Ledger Live",
+		Whitelist: map[string][]string{"/usr/bin/ledger-live": nil, "/opt/Ledger Live/ledger-live": nil}},
+	{Name: "Trezor Suite", RelPath: ".config/@trezor",
+		Whitelist: map[string][]string{"/usr/bin/trezor-suite": nil, "/opt/Trezor Suite/trezor-suite": nil}},
+	{Name: "Exodus", RelPath: ".config/Exodus",
+		Whitelist: map[string][]string{"/usr/bin/exodus": nil, "/opt/Exodus/exodus": nil}},
+	// id.json is a plaintext keypair — the highest-value target of the set.
+	{Name: "Solana CLI", RelPath: ".config/solana",
+		Whitelist: map[string][]string{"/usr/bin/solana": nil, "/usr/bin/solana-keygen": nil}},
+	{Name: "Ethereum (geth)", RelPath: ".ethereum/keystore",
+		Whitelist: map[string][]string{"/usr/bin/geth": nil}},
+	{Name: "LND (Lightning Network Daemon)", RelPath: ".lnd",
+		Whitelist: map[string][]string{"/usr/bin/lnd": nil, "/usr/bin/lncli": nil}},
+	{Name: "Core Lightning", RelPath: ".lightning",
+		Whitelist: map[string][]string{"/usr/bin/lightningd": nil, "/usr/bin/lightning-cli": nil}},
+	// Foundry's binaries live inside the guarded dir next to its keystores,
+	// so they get the Discord treatment via a glob.
+	{Name: "Foundry", RelPath: ".foundry",
+		Whitelist: map[string][]string{"%HOME%/.foundry/bin/*": nil}},
+	{Name: "KDE Wallet", RelPath: ".local/share/kwalletd",
+		Whitelist: map[string][]string{"/usr/bin/kwalletd5": nil, "/usr/bin/kwalletd6": nil, "/usr/bin/kwalletmanager5": nil, "/usr/bin/kwalletmanager6": nil}},
 
 	// --- VPNs ---------------------------------------------------------------------
 	{Name: "NordVPN config", RelPath: ".config/nordvpn",
@@ -302,13 +306,10 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/wg": nil, "/usr/bin/wg-quick": nil}},
 
 	// --- Browsers and messaging -----------------------------------------------------
-	// /usr/bin/firefox (Arch), /usr/bin/google-chrome*, /usr/bin/brave,
-	// /usr/bin/chromium are shell wrappers; the whitelist matches the
-	// executed ELF, so the real binaries under /usr/lib/<browser> and
-	// /opt are listed as well. Firefox's crash handler (crashhelper,
-	// crashreporter) is a separate binary firefox spawns for the
-	// Crash Reports directory: it must be whitelisted for crashes to be
-	// recorded.
+	// Browser binaries are shell wrappers; the whitelist matches the
+	// executed ELF under /usr/lib and /opt. Firefox's crash helper and the
+	// Chrome-family chrome_crashpad_handler are separate processes that
+	// write the Crash Reports directory.
 	{Name: "Firefox profile", RelPath: ".mozilla/firefox",
 		Whitelist: map[string][]string{
 			"/usr/bin/firefox":             nil,
@@ -319,39 +320,64 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{
 			"/usr/bin/google-chrome": nil, "/usr/bin/google-chrome-stable": nil,
 			"/opt/google/chrome/chrome": nil, "/usr/lib/chromium/chrome": nil,
+			"/opt/google/chrome/chrome_crashpad_handler": nil,
 		}},
 	{Name: "Chromium profile", RelPath: ".config/chromium",
 		Whitelist: map[string][]string{
 			"/usr/bin/chromium": nil, "/usr/bin/chromium-browser": nil,
 			"/usr/lib/chromium/chrome": nil, "/usr/lib/chromium/chromium": nil,
+			"/usr/lib/chromium/chrome_crashpad_handler": nil,
 		}},
 	{Name: "Brave profile", RelPath: ".config/BraveSoftware",
 		Whitelist: map[string][]string{
 			"/usr/bin/brave-browser": nil, "/usr/bin/brave": nil,
 			"/opt/brave/brave": nil, "/opt/brave-bin/brave": nil,
+			"/opt/brave-bin/chrome_crashpad_handler":         nil,
+			"/usr/lib/brave-browser/chrome_crashpad_handler": nil,
 		}},
 	{Name: "Discord", RelPath: ".config/discord",
-		// Discord installs into a versioned directory and re-links
-		// .config/discord/Discord on every update. The glob resolves to
-		// every installed version and is re-expanded on each install run,
-		// so an app update does not leave the whitelist pointing at a
-		// stale inode.
-		Whitelist: map[string][]string{"%HOME%/.config/discord/*/Discord": nil}},
+		Whitelist: map[string][]string{
+			"%HOME%/.config/discord/*/Discord":                 nil,
+			"%HOME%/.config/discord/*/chrome-sandbox":          nil,
+			"%HOME%/.config/discord/*/chrome_crashpad_handler": nil,
+		}},
 	{Name: "Discord Canary", RelPath: ".config/discord-canary",
 		Whitelist: map[string][]string{"/usr/bin/discord-canary": nil}},
 	{Name: "Telegram", RelPath: ".local/share/TelegramDesktop",
 		Whitelist: map[string][]string{"/usr/bin/telegram-desktop": nil, "/usr/bin/Telegram": nil}},
 	{Name: "Signal", RelPath: ".config/Signal",
 		Whitelist: map[string][]string{"/usr/bin/signal-desktop": nil}},
+	{Name: "Signal Beta", RelPath: ".config/Signal Beta",
+		Whitelist: map[string][]string{
+			"/usr/bin/signal-desktop-beta":             nil,
+			"/opt/Signal Beta/signal-desktop-beta":     nil,
+			"/opt/Signal Beta/chrome_crashpad_handler": nil,
+		}},
 	{Name: "Element", RelPath: ".config/Element",
 		Whitelist: map[string][]string{"/usr/bin/element-desktop": nil}},
 
 	// --- Gaming ----------------------------------------------------------------------
-	{Name: "Steam data", RelPath: ".local/share/Steam",
+	// Steam stores its login credentials (accounts and auth tokens) in
+	// config/loginusers.vdf and config/config.vdf, so only the small config
+	// directory is guarded: the rest of ~/.local/share/Steam (steamapps/
+	// games, userdata/ screenshots and cloud saves, caches) holds no
+	// credentials and is intentionally left out.
+	//
+	// The legacy Steam Guard sentry files (~/.local/share/Steam/ssfn*) are
+	// deliberately NOT protected: the daemon guards directories only (the
+	// config loader skips non-directory paths), and a sentry alone cannot
+	// compromise an account. Once the daemon supports single files, add a
+	// catalog entry for them — and the glob (ssfn*) must then be resolved
+	// dynamically by the daemon at runtime (on start/reload), never baked
+	// into the static config generated at install time, because sentry
+	// filenames can change after login.
+	{Name: "Steam client config (accounts/credentials)", RelPath: ".local/share/Steam/config",
 		Whitelist: map[string][]string{
 			"/usr/bin/steam": nil, "/usr/bin/steamwebhelper": nil,
-			"%HOME%/.local/share/Steam/ubuntu12_32/steam":          nil,
-			"%HOME%/.local/share/Steam/ubuntu12_32/steamwebhelper": nil,
+			"%HOME%/.local/share/Steam/ubuntu12_32/steam": nil,
+			// steamwebhelper moved from ubuntu12_32/ to ubuntu12_64/ and
+			// steamrt64/ across versions; the glob covers all layouts.
+			"%HOME%/.local/share/Steam/*/steamwebhelper": nil,
 		}},
 	{Name: "Steam (legacy home)", RelPath: ".steam",
 		Whitelist: map[string][]string{"/usr/bin/steam": nil, "/usr/bin/steamwebhelper": nil}},
@@ -473,14 +499,11 @@ func DiscoverForUsers(users []User) []Candidate {
 	return out
 }
 
-// FilterExistingWhitelist drops whitelist entries that do not exist on
-// this system, so the generated config only references real binaries.
-// Entries containing a glob metacharacter (*, ? or [) are expanded with
-// filepath.Glob and every matching path becomes its own whitelist entry;
-// this covers versioned application directories such as
-// %HOME%/.config/discord/*/Discord and is re-evaluated on every install,
-// so app updates that move to a new directory are picked up. Every match
-// inherits the events of the glob pattern that produced it.
+// FilterExistingWhitelist drops entries that do not exist on this system
+// and expands globs (*, ?, [) to every existing match (e.g.
+// %HOME%/.config/discord/*/Discord), re-evaluated on every install so app
+// updates that move to a new directory are picked up; every match inherits
+// the events of the glob pattern that produced it.
 func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
 	var out []BinaryRule
 	for _, rule := range c.Entry.ExpandWhitelist(c.User.Name, c.User.Home) {

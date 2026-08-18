@@ -86,6 +86,13 @@ func NewMonitor(targets []ebpf.Target, recursive bool, depth int) (*Monitor, err
 		{objs.TraceVfsRename, "kprobe", "", "vfs_rename"},
 		{objs.TraceVfsSymlink, "kprobe", "", "vfs_symlink"},
 		{objs.TraceVfsLink, "kprobe", "", "vfs_link"},
+		{objs.TraceNotifyChange, "kprobe", "", "notify_change"},
+		{objs.TraceVfsSetxattr, "kprobe", "", "vfs_setxattr"},
+		{objs.TraceVfsRemovexattr, "kprobe", "", "vfs_removexattr"},
+		{objs.TraceVfsMknod, "kprobe", "", "vfs_mknod"},
+		{objs.TraceVfsGetattr, "kprobe", "", "vfs_getattr"},
+		{objs.TraceVfsReadlink, "kprobe", "", "vfs_readlink"},
+		{objs.TraceDoFaccessat, "kprobe", "", "do_faccessat"},
 		{objs.TraceMmap, "tracepoint", "syscalls", "sys_enter_mmap"},
 	}
 

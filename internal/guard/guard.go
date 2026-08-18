@@ -176,24 +176,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		"file_permission": true,
 	}
 
-	attachments := []struct {
-		prog *cilium.Program
-		hook string
-	}{
-		{g.objs.GuardFileOpen, "file_open"},
-		{g.objs.GuardFilePermission, "file_permission"},
-		{g.objs.GuardFileTruncate, "file_truncate"},
-		{g.objs.GuardMmapFile, "mmap_file"},
-		{g.objs.GuardPathUnlink, "path_unlink"},
-		{g.objs.GuardPathRename, "path_rename"},
-		{g.objs.GuardPathSymlink, "path_symlink"},
-		{g.objs.GuardPathLink, "path_link"},
-		{g.objs.GuardPathMkdir, "path_mkdir"},
-		{g.objs.GuardSbMount, "sb_mount"},
-		{g.objs.GuardPtraceAccessCheck, "ptrace_access_check"},
-		{g.objs.GuardTaskAlloc, "task_alloc"},
-		{g.objs.GuardTaskFree, "task_free"},
-	}
+	attachments := guardLSMHooks(g)
 
 	var failedRequired []string
 	for _, a := range attachments {
@@ -226,6 +209,39 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	log.Infof("guard created \u2014 %d/%d LSM hooks attached, watching: %s (%s)",
 		len(g.links), len(attachments), path, modeString(mode))
 	return g, nil
+}
+
+func guardLSMHooks(g *Guard) []struct {
+	prog *cilium.Program
+	hook string
+} {
+	return []struct {
+		prog *cilium.Program
+		hook string
+	}{
+		{g.objs.GuardFileOpen, "file_open"},
+		{g.objs.GuardFilePermission, "file_permission"},
+		{g.objs.GuardFileTruncate, "file_truncate"},
+		{g.objs.GuardMmapFile, "mmap_file"},
+		{g.objs.GuardPathUnlink, "path_unlink"},
+		{g.objs.GuardPathRename, "path_rename"},
+		{g.objs.GuardPathSymlink, "path_symlink"},
+		{g.objs.GuardPathLink, "path_link"},
+		{g.objs.GuardPathMkdir, "path_mkdir"},
+		{g.objs.GuardPathTruncate, "path_truncate"},
+		{g.objs.GuardInodeSetattr, "inode_setattr"},
+		{g.objs.GuardInodeSetxattr, "inode_setxattr"},
+		{g.objs.GuardInodeRemovexattr, "inode_removexattr"},
+		{g.objs.GuardPathMknod, "path_mknod"},
+		{g.objs.GuardPathRmdir, "path_rmdir"},
+		{g.objs.GuardInodePermission, "inode_permission"},
+		{g.objs.GuardInodeGetattr, "inode_getattr"},
+		{g.objs.GuardInodeReadlink, "inode_readlink"},
+		{g.objs.GuardSbMount, "sb_mount"},
+		{g.objs.GuardPtraceAccessCheck, "ptrace_access_check"},
+		{g.objs.GuardTaskAlloc, "task_alloc"},
+		{g.objs.GuardTaskFree, "task_free"},
+	}
 }
 
 func modeString(mode Mode) string {
@@ -640,31 +656,51 @@ func (g *Guard) readEvent(rd *ringbuf.Reader) (*GuardEvent, bool) {
 		Blocked:   be.Blocked != 0,
 	}
 
-	if !ge.Blocked {
-		g.verifyHash(ge)
-	}
+	// comm is telemetry: the warning is diagnostic only, never
+	// enforcement (access decisions in the BPF program key on the
+	// caller's exe inode).
+	g.checkCommSpoof(ge)
 
 	return ge, true
 }
 
-func (g *Guard) verifyHash(ge *GuardEvent) {
+// checkCommSpoof warns when an event's comm claims the name of a
+// guarded binary while the real binary is something else: blocked
+// events carrying a guarded name would mislead the logs, so running
+// for blocked events too catches that impersonation. A guarded binary
+// whose threads rename themselves (Chromium's "libuv-worker", Bun's
+// "Bun Pool N") is normal and produces no warning.
+func (g *Guard) checkCommSpoof(ge *GuardEvent) {
 	exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", ge.PID))
 	if err != nil {
 		return
 	}
 
-	if !g.isGuardedBinary(exePath) {
+	if g.isGuardedBinary(exePath) {
+		return
+	}
+	if !commMatchesGuardedBinary(ge.Comm, g.binaries) {
 		return
 	}
 
-	exeBase := filepath.Base(exePath)
-	if len(exeBase) > 15 {
-		exeBase = exeBase[:15]
+	log.Warnf("process %d (%s) spoofed comm \u2014 actual binary: %s",
+		ge.PID, ge.Comm, exePath)
+}
+
+// commMatchesGuardedBinary reports whether comm claims the name of one
+// of the guarded binaries. The kernel truncates comm to 15 bytes
+// (TASK_COMM_LEN), so names are compared truncated on both sides.
+func commMatchesGuardedBinary(comm string, binaries []BinaryEntry) bool {
+	for _, b := range binaries {
+		base := filepath.Base(b.Path)
+		if len(base) > 15 {
+			base = base[:15]
+		}
+		if comm == base {
+			return true
+		}
 	}
-	if ge.Comm != exeBase {
-		log.Warnf("process %d (%s) spoofed comm \u2014 actual binary: %s",
-			ge.PID, ge.Comm, exePath)
-	}
+	return false
 }
 
 func (g *Guard) isGuardedBinary(exePath string) bool {

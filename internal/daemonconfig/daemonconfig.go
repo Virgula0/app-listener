@@ -173,7 +173,7 @@ func parseEvents(tokens []string) ([]ebpf.EventType, error) {
 	for _, token := range tokens {
 		et, ok := ebpf.ParseEventType(strings.TrimSpace(token))
 		if !ok {
-			return nil, fmt.Errorf("unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP)", token)
+			return nil, fmt.Errorf("unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD)", token)
 		}
 		if !seen[et] {
 			seen[et] = true

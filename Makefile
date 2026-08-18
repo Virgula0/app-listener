@@ -1,8 +1,9 @@
-.PHONY: build build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration check-compatibility deploy deploy-down tidy clean
+.PHONY: build build-host build-image build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration check-compatibility deploy deploy-down tidy clean
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
 GEN_DIR     = build/generated
+BUILD_IMAGE = app-listener-builder:local
 
 # VERSION is injected into the binary by the release workflow
 # (pre-<date>-<sha>); when empty the embedded constants.Version default
@@ -17,7 +18,53 @@ require-kernel51:
 		exit 1; \
 	fi
 
-build: require-kernel51 bpftool-headers generate build-linux
+# Isolated build: runs the whole pipeline (vmlinux.h dump + BPF bindings +
+# Go build) inside a rootful Docker container. The host's BTF vmlinux is
+# mounted read-only (the CO-RE programs must target the host kernel) and the
+# repo — including the output directory — is mounted read-write. The
+# container runs as the calling host user, so every artifact (binary, embeds,
+# vmlinux.h) ends up owned by the host user. Requires a rootful Docker daemon.
+build:
+	@if ! command -v docker >/dev/null 2>&1; then \
+		echo "ERROR: docker not found — 'make build' needs a rootful Docker daemon"; \
+		echo "       (install Docker, or install clang/LLVM, bpftool, Go and GCC and run 'make build-host')"; \
+		exit 1; \
+	fi
+	@docker info >/dev/null 2>&1 || { \
+		echo "ERROR: docker daemon not reachable — is it running (rootful)?"; \
+		exit 1; \
+	}
+	@if [ ! -r /sys/kernel/btf/vmlinux ]; then \
+		echo "ERROR: /sys/kernel/btf/vmlinux not readable — run 'make check-compatibility' (kernel needs CONFIG_DEBUG_INFO_BTF)"; \
+		exit 1; \
+	fi
+	@if [ -e $(OUTPUT_DIR) ] && [ ! -w $(OUTPUT_DIR) ]; then \
+		echo "ERROR: $(OUTPUT_DIR) is not writable by user $$(id -u) — fix ownership with:"; \
+		echo "       sudo chown -R $$(id -u):$$(id -g) $(OUTPUT_DIR)"; \
+		exit 1; \
+	fi
+	@mkdir -p $(OUTPUT_DIR)
+	$(MAKE) build-image
+	docker run --rm \
+		-v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
+		-v "$$PWD:/app/app-listener:rw" \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-e GOCACHE=/tmp/.gocache \
+		-e GOPATH=/tmp/gopath \
+		-e GOMODCACHE=/tmp/gopath/pkg/mod \
+		-e VERSION="$(VERSION)" \
+		-w /app/app-listener \
+		$(BUILD_IMAGE) \
+		make bpftool-headers generate build-linux
+.PHONY: build
+
+# On-host build: requires clang/LLVM, bpftool, Go and GCC installed locally.
+build-host: require-kernel51 bpftool-headers generate build-linux
+
+build-image:
+	docker build -t $(BUILD_IMAGE) -f docker/builder.Dockerfile .
+.PHONY: build-image
 
 build-linux:
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(if $(VERSION),-ldflags "-X github.com/Virgula0/app-listener/internal/constants.Version=$(VERSION)",) -o $(OUTPUT_DIR)/$(BINARY_NAME) .
@@ -30,7 +77,7 @@ generate-monitor: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/monitor/embeds
 	GOPACKAGE=monitor GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf" \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		Monitor ./internal/monitor/bpf/monitor.bpf.c
@@ -45,7 +92,7 @@ generate-guard: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/guard/embeds
 	GOPACKAGE=guard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf" \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		Guard ./internal/guard/bpf/guard.bpf.c
@@ -60,7 +107,7 @@ generate-networkmonitor: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/networkmonitor/embeds
 	GOPACKAGE=networkmonitor GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf" \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		NetMon ./internal/networkmonitor/bpf/networkmonitor.bpf.c
@@ -75,7 +122,7 @@ generate-networkguard: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/networkguard/embeds
 	GOPACKAGE=networkguard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf" \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		GuardNet ./internal/networkguard/bpf/networkguard.bpf.c

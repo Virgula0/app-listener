@@ -4,10 +4,22 @@
 #include <errno.h>
 
 #define MAX_PATH 256
-#define MAY_READ  0x00000001
-#define MAY_WRITE 0x00000002
+// VFS access-mask bits as passed to bpf_lsm_inode_permission /
+// bpf_lsm_file_permission.  NOTE: this kernel (7.0-hardened) reshuffled
+// the mainline layout — MAY_OPEN is 0x20 here (not 0x40) and MAY_ACCESS
+// is 0x10.  Keep in sync with include/linux/fs.h of the target kernel.
+#define MAY_EXEC   0x00000001
+#define MAY_WRITE  0x00000002
+#define MAY_READ   0x00000004
+#define MAY_APPEND 0x00000008
+#define MAY_ACCESS 0x00000010
+#define MAY_OPEN   0x00000020
+#define MAY_CHDIR  0x00000040
+#define ATTR_SIZE 0x00000008
+#define ATTR_FILE 0x00002000
 #define GUARD_BLOCK 1
 #define GUARD_ALLOW 2
+#define __FMODE_EXEC 0x20 // set in file->f_flags by kernel exec opens (do_open_execat)
 
 enum event_type {
 	EVENT_OPEN,
@@ -19,6 +31,9 @@ enum event_type {
 	EVENT_HARDLINK,
 	EVENT_MKDIR,
 	EVENT_MMAP,
+	EVENT_ATTR,
+	EVENT_STAT,
+	EVENT_MKNOD,
 };
 
 struct guard_event {
@@ -525,7 +540,7 @@ static void fill_path(struct dentry *dentry, char *out)
     }
 }
 
-static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry)
+static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry, bool is_exec_open, bool quiet_allow)
 {
 	__u32 key = 0;
 	__u64 *mode = bpf_map_lookup_elem(&guard_config, &key);
@@ -557,6 +572,56 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 		} else {
 			is_blocked = action == NULL || *action != GUARD_ALLOW;
 
+			// Exec-open attribution (whitelist mode only): executing a
+			// binary is an OPEN of that binary performed by the
+			// *launcher*, not by the binary itself — a shell wrapper
+			// runs through its interpreter (/bin/sh), whose exe inode
+			// the whitelist deliberately does not list. Attribute
+			// exec-opens to the binary being executed: allowlist the
+			// *target*. The exec fd is never exposed to the caller
+			// (execve destroys the caller's address space), so this
+			// grants the launcher no way to read guarded content;
+			// afterwards the process identity IS the target, so every
+			// later access is checked against the whitelist as usual.
+			// Blacklist mode keeps caller attribution (blocking listed
+			// binaries from exec'ing guarded files).
+			//
+			// Two discriminator sources cover the full exec chain:
+			//  - the exec target's own open carries __FMODE_EXEC in
+			//    file->f_flags (task->in_execve is set only afterwards,
+			//    in bprm_execve);
+			//  - the kernel's load-time accesses of the exec file
+			//    (prepare_binprm's kernel_read, binfmt mmap, in-tree
+			//    interpreter opens) happen with task->in_execve set.
+			// Both are attributed by the *accessed file's* inode: only
+			// a file that is itself whitelisted passes.
+			if (is_blocked &&
+			    ((type == EVENT_OPEN && is_exec_open) ||
+			     BPF_CORE_READ_BITFIELD_PROBED(task, in_execve))) {
+				struct inode *target;
+				bpf_probe_read_kernel(&target, sizeof(target), &dentry->d_inode);
+				if (target) {
+					struct inode_key target_ik = {};
+					__u8 *target_action;
+					bpf_probe_read_kernel(&target_ik.ino, sizeof(target_ik.ino),
+							      &target->i_ino);
+					struct super_block *tsb;
+					bpf_probe_read_kernel(&tsb, sizeof(tsb), &target->i_sb);
+					if (tsb) {
+						dev_t tdev;
+						bpf_probe_read_kernel(&tdev, sizeof(tdev), &tsb->s_dev);
+						target_ik.dev = tdev;
+					}
+					target_action = bpf_map_lookup_elem(&guard_exe_actions, &target_ik);
+					if (target_action) {
+						if (*target_action == GUARD_ALLOW) {
+							exe_ik = target_ik;
+							is_blocked = 0;
+						}
+					}
+				}
+			}
+
 			// Per-binary event restriction: if the binary has an allowed
 			// event mask, only the listed event types are permitted. A
 			// missing mask entry means all events are allowed.
@@ -567,6 +632,13 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 			}
 		}
 	}
+
+	// Allowed accesses with quiet_allow set are not reported: this is
+	// used by inode_permission, which fires for every access to a
+	// guarded file and would otherwise flood the log with allowed-STAT
+	// events. Denied accesses are always reported.
+	if (!is_blocked && quiet_allow)
+		return 0;
 
 	struct guard_event *e;
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
@@ -696,7 +768,10 @@ int guard_file_open(unsigned long long *ctx)
 	discover_guarded_parent(dentry);
 
 	if (is_guarded_access(dentry, inode)) {
-		int ret = check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+		__u32 f_flags = 0;
+		bpf_probe_read_kernel(&f_flags, sizeof(f_flags), &file->f_flags);
+		bool is_exec_open = (f_flags & __FMODE_EXEC) != 0;
+		int ret = check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, is_exec_open, false);
 		if (ret == 0)
 			mark_tainted();
 		return ret;
@@ -707,7 +782,7 @@ int guard_file_open(unsigned long long *ctx)
 	// files by opening the raw block device and interpreting filesystem
 	// metadata directly (bypassing VFS entirely).
 	if (is_guarded_block_device(inode))
-		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false, false);
 
 	return 0;
 }
@@ -728,7 +803,7 @@ int guard_mmap_file(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
 	if (is_guarded_access(dentry, inode)) {
-		int ret = check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL);
+		int ret = check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL, false, false);
 		if (ret == 0)
 			mark_tainted();
 		return ret;
@@ -762,7 +837,7 @@ int guard_file_permission(unsigned long long *ctx)
 		return 0;
 
 	__u32 event_type = (mask & MAY_WRITE) ? EVENT_WRITE : EVENT_READ;
-	int ret = check_and_emit(event_type, dentry, NULL, false, NULL);
+	int ret = check_and_emit(event_type, dentry, NULL, false, NULL, false, false);
 	if (ret == 0)
 		mark_tainted();
 	return ret;
@@ -789,7 +864,7 @@ int guard_file_truncate(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
 	if (is_guarded_access(dentry, inode)) {
-		int ret = check_and_emit(EVENT_WRITE, dentry, NULL, false, NULL);
+		int ret = check_and_emit(EVENT_WRITE, dentry, NULL, false, NULL, false, false);
 		if (ret == 0)
 			mark_tainted();
 		return ret;
@@ -809,19 +884,19 @@ int guard_path_unlink(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 	}
 
 	// Deep-file coverage: the parent is not in the map but the file may
 	// still be inside the guarded region (ancestor walk).
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
 	if (parent && guarded_ancestor_within_limit(parent))
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 
 	return 0;
 }
@@ -838,19 +913,19 @@ int guard_path_rename(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 	}
 
 	// Deep-file coverage on the source side: the file may be inside the
 	// guarded region even though its parent is not in the map.
 	struct dentry *old_parent = get_dentry_from_path((void *)ctx[0]);
 	if (old_parent && guarded_ancestor_within_limit(old_parent))
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 
 	// Also check the destination parent directory.  This prevents renaming
 	// files from outside the guarded area INTO a guarded directory, and
@@ -858,7 +933,7 @@ int guard_path_rename(unsigned long long *ctx)
 	// the guard_inodes map.
 	struct inode *new_parent_inode = get_inode_from_path((void *)ctx[2]);
 	if (new_parent_inode && new_parent_inode != inode && read_inode_guard(new_parent_inode)) {
-		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 		if (ret != 0)
 			return ret;  // blocked — reject the rename
 		// Allowed — if the source is a directory, add its inode
@@ -876,7 +951,7 @@ int guard_path_rename(unsigned long long *ctx)
 	// region whose parent is not in the map (runtime-created deep dir).
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[2]);
 	if (new_parent && guarded_ancestor_within_limit(new_parent)) {
-		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry);
+		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 		if (ret != 0)
 			return ret;
 		if (should_add_new_dir()) {
@@ -900,14 +975,14 @@ int guard_path_symlink(unsigned long long *ctx)
     // 1. Check if the symlink is being created INSIDE a guarded directory
     struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
     if (read_inode_guard(parent_inode)) {
-        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false);
     }
 
     // Deep-file coverage: the symlink may be created inside a guarded
     // region whose parent is not in the map.
     struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
     if (parent && guarded_ancestor_within_limit(parent)) {
-        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false);
     }
 
     // 2. Check if the symlink TARGET points INTO the guarded path
@@ -945,7 +1020,7 @@ int guard_path_symlink(unsigned long long *ctx)
     }
 
     if (match) {
-        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL);
+        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false);
     }
 
     return 0;
@@ -963,19 +1038,19 @@ int guard_path_link(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 	}
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[1]);
 	if (parent_inode && parent_inode != inode && read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 	}
 
 	// Deep-file coverage on the destination side: linking INTO a guarded
 	// region whose parent is not in the map.
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
 	if (new_parent && guarded_ancestor_within_limit(new_parent))
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry);
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 
 	return 0;
 }
@@ -987,16 +1062,206 @@ int guard_path_mkdir(unsigned long long *ctx)
 	struct dentry *dentry = (struct dentry *)ctx[1];
 
 	if (read_inode_guard(parent_inode)) {
-		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL, false, false);
 	}
 
 	// Deep-file coverage: mkdir inside a guarded region whose parent is
 	// not in the map.
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
 	if (parent && guarded_ancestor_within_limit(parent))
-		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL, false, false);
 
 	return 0;
+}
+
+// ------------------------------------------------------------------
+// Path/attribute-based bypass coverage.  These operations never
+// create a struct file, so file_open / file_permission never fire:
+//   - truncate(2)            -> security_path_truncate (path_truncate)
+//   - chmod/chown/utimes     -> notify_change -> inode_setattr
+//   - setxattr/removexattr   -> inode_setxattr / inode_removexattr
+//   - mknod(2)               -> security_path_mknod (path_mknod)
+//   - rmdir(2)               -> security_path_rmdir (path_rmdir)
+// ------------------------------------------------------------------
+
+SEC("lsm/path_truncate")
+int guard_path_truncate(unsigned long long *ctx)
+{
+	struct dentry *dentry = get_dentry_from_path((void *)ctx[0]);
+	if (!dentry)
+		return 0;
+
+	struct inode *inode = get_inode_from_path((void *)ctx[0]);
+	if (is_guarded_access(dentry, inode))
+		return check_and_emit(EVENT_ATTR, dentry, NULL, false, NULL, false, false);
+
+	return 0;
+}
+
+SEC("lsm/inode_setattr")
+int guard_inode_setattr(unsigned long long *ctx)
+{
+	// ctx[0] = mnt_idmap, ctx[1] = dentry, ctx[2] = iattr.
+	// Skip size changes: truncate events are owned by path_truncate /
+	// file_truncate, which run before notify_change and already deny;
+	// emitting again would duplicate events (ATTR_FILE follows
+	// ftruncate(2), also covered by file_truncate).
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+
+	if (!is_guarded_access(dentry, inode))
+		return 0;
+
+	struct iattr *attr = (struct iattr *)ctx[2];
+	if (attr) {
+		__u32 ia_valid;
+		bpf_probe_read_kernel(&ia_valid, sizeof(ia_valid), &attr->ia_valid);
+		if (ia_valid & (ATTR_SIZE | ATTR_FILE))
+			return 0;
+	}
+
+	return check_and_emit(EVENT_ATTR, dentry, NULL, false, NULL, false, false);
+}
+
+SEC("lsm/inode_setxattr")
+int guard_inode_setxattr(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+
+	if (is_guarded_access(dentry, inode))
+		return check_and_emit(EVENT_ATTR, dentry, NULL, false, NULL, false, false);
+
+	return 0;
+}
+
+SEC("lsm/inode_removexattr")
+int guard_inode_removexattr(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+
+	if (is_guarded_access(dentry, inode))
+		return check_and_emit(EVENT_ATTR, dentry, NULL, false, NULL, false, false);
+
+	return 0;
+}
+
+SEC("lsm/path_mknod")
+int guard_path_mknod(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (!dentry)
+		return 0;
+
+	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
+	if (parent_inode && read_inode_guard(parent_inode))
+		return check_and_emit(EVENT_MKNOD, dentry, NULL, false, NULL, false, false);
+
+	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
+	if (parent && guarded_ancestor_within_limit(parent))
+		return check_and_emit(EVENT_MKNOD, dentry, NULL, false, NULL, false, false);
+
+	return 0;
+}
+
+SEC("lsm/path_rmdir")
+int guard_path_rmdir(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (!dentry)
+		return 0;
+
+	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
+	if (parent_inode && read_inode_guard(parent_inode))
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
+
+	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
+	if (parent && guarded_ancestor_within_limit(parent))
+		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
+
+	return 0;
+}
+
+// Observe-only: never blocks.  stat(2)/statx(2) are probe-only and
+// ubiquitous — most tools (e.g. coreutils cat/mkdir) stat a guarded file
+// before their real syscall, so denying here would pre-empt file_open and
+// turn every blocked read into a STAT event instead of the OPEN event the
+// enforcement is defined by.  Real enforcement stays in file_open and the
+// path_*/inode_* hooks; metadata probing is observable via monitor mode.
+SEC("lsm/inode_getattr")
+int guard_inode_getattr(unsigned long long *ctx)
+{
+	return 0;
+}
+
+SEC("lsm/inode_readlink")
+int guard_inode_readlink(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[0];
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+
+	if (is_guarded_access(dentry, inode))
+		return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false);
+
+	return 0;
+}
+
+// Block pure inode-level may-checks — access(2), faccessat(2) — against
+// guarded files.  On this kernel every syscall path already carries its
+// MAY_* bits: access(2) passes mode|MAY_ACCESS, open/exec passes
+// MAY_OPEN|acc_mode, truncate passes plain MAY_WRITE (inside
+// vfs_truncate).  Requiring MAY_ACCESS therefore selects exactly the
+// access(2)-style probes: opens, execs, truncate and setxattr fall
+// through to their own dedicated hooks (file_open, path_truncate,
+// inode_setxattr), which keep their event identity.  Directory
+// traversal is never blocked (a directory's MAY_EXEC must stay
+// available for every path walk into the guarded tree).  Allowed
+// accesses emit nothing (quiet_allow): this hook fires for every
+// guarded-file may-check and would otherwise flood the log.  An X_OK
+// probe (MAY_EXEC without MAY_OPEN) leaks no content and is
+// deliberately not denied — it must not shadow open/exec handling.
+SEC("lsm/inode_permission")
+int guard_inode_permission(unsigned long long *ctx)
+{
+	struct inode *inode = (struct inode *)ctx[0];
+	if (!inode)
+		return 0;
+
+	int mask = (int)ctx[1];
+	// Only genuine access(2)/faccessat probes carry MAY_ACCESS.
+	if (!(mask & MAY_ACCESS))
+		return 0;
+	if (!(mask & (MAY_READ | MAY_WRITE)))
+		return 0;
+	if (mask & (MAY_EXEC | MAY_OPEN))
+		return 0;
+
+	umode_t mode;
+	bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode);
+	if ((mode & S_IFMT) == S_IFDIR)
+		return 0;
+
+	if (!read_inode_guard(inode))
+		return 0;
+
+	return check_and_emit(EVENT_STAT, NULL, NULL, false, NULL, false, true);
 }
 
 SEC("lsm/sb_mount")
@@ -1018,7 +1283,7 @@ int guard_sb_mount(unsigned long long *ctx)
 		return 0;
 
 	if (read_inode_guard(inode)) {
-		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL);
+		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false, false);
 	}
 
 	return 0;
