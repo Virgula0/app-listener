@@ -154,8 +154,10 @@ var Catalog = []CandidateDir{
 	{Name: "JetBrains IDEs", RelPath: ".config/JetBrains",
 		// IDE processes run as the bundled JetBrains Runtime: the process
 		// exe is the JBR java, so the JBR and its fsnotifier helper must be
-		// whitelisted. The globs cover standalone installs under /opt;
-		// Toolbox app binaries get globs in the Toolbox entry below.
+		// whitelisted. The globs cover standalone installs under /opt. IDE
+		// installs via Toolbox (~/.local/share/JetBrains/Toolbox/apps) are
+		// deliberately not guarded: they hold no credentials — the IDE config
+		// and auth state live in this .config/JetBrains directory.
 		Whitelist: map[string][]string{
 			"/usr/bin/idea": nil, "/usr/bin/pycharm": nil, "/usr/bin/webstorm": nil,
 			"/usr/bin/clion": nil, "/usr/bin/goland": nil, "/usr/bin/phpstorm": nil,
@@ -165,15 +167,6 @@ var Catalog = []CandidateDir{
 			"/opt/*/bin/fsnotifier":         nil,
 			"%HOME%/.goland/jbr/bin/java":   nil,
 			"%HOME%/.goland/bin/fsnotifier": nil,
-		}},
-	{Name: "JetBrains Toolbox", RelPath: ".local/share/JetBrains/Toolbox",
-		// IDE binaries live inside the guarded directory
-		// (apps/<product>/<version>/), so they get the Discord treatment:
-		// globs for every installed IDE's JBR java and fsnotifier.
-		Whitelist: map[string][]string{
-			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox":   nil,
-			"%HOME%/.local/share/JetBrains/Toolbox/apps/*/*/jbr/bin/java":   nil,
-			"%HOME%/.local/share/JetBrains/Toolbox/apps/*/*/bin/fsnotifier": nil,
 		}},
 	{Name: "Zed editor", RelPath: ".config/zed",
 		Whitelist: map[string][]string{
@@ -227,16 +220,12 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/rclone": nil}},
 	{Name: "Ollama config", RelPath: ".ollama",
 		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
-	{Name: "npm config file", RelPath: ".npmrc",
-		Whitelist: map[string][]string{"/usr/bin/npm": nil, "/usr/bin/npx": nil, "/usr/bin/node": nil}},
 	{Name: "npm data", RelPath: ".npm",
 		Whitelist: map[string][]string{"/usr/bin/npm": nil, "/usr/bin/npx": nil, "/usr/bin/node": nil}},
 	// pip is a #!/usr/bin/python script (inert, same reason as gcloud);
 	// kept for documentation.
 	{Name: "pip config", RelPath: ".config/pip",
 		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
-	{Name: "Git config", RelPath: ".gitconfig",
-		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 	{Name: "Git config directory", RelPath: ".config/git",
 		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 
@@ -259,19 +248,22 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/gnome-keyring-daemon": nil, "/usr/bin/gnome-keyring": nil}},
 	{Name: "Chezmoi state", RelPath: ".local/share/chezmoi",
 		Whitelist: map[string][]string{"/usr/bin/chezmoi": nil}},
-	{Name: "Netrc credentials file", RelPath: ".netrc",
-		Whitelist: map[string][]string{"/usr/bin/curl": nil, "/usr/bin/wget": nil, "/usr/bin/git": nil}},
-	{Name: "Wget config", RelPath: ".wgetrc",
-		Whitelist: map[string][]string{"/usr/bin/wget": nil}},
+
+	// --- Legacy dot-config files --------------------------------------------------
+	// No single-file entries here: the daemon guards directories only (the
+	// config loader skips non-directory paths), so a plain file like
+	// ~/.netrc or ~/.wgetrc would be written to the config but silently
+	// dropped at load. The Steam entry below documents the same restriction
+	// for the legacy ssfn sentry files and the required glob semantics.
 
 	// --- Wallets and crypto -------------------------------------------------------
 	// Probed like any other entry: they surface only once the wallet is
 	// installed. Solana keeps its keypair as a plaintext id.json.
-	{Name: "Bitcoin Core", RelPath: ".bitcoin",
+	{Name: "Bitcoin Core", RelPath: ".bitcoin/wallets",
 		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil, "/usr/bin/bitcoin-tx": nil}},
-	{Name: "Litecoin Core", RelPath: ".litecoin",
+	{Name: "Litecoin Core", RelPath: ".litecoin/wallets",
 		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil}},
-	{Name: "Monero", RelPath: ".bitmonero",
+	{Name: "Monero", RelPath: ".bitmonero/wallets",
 		Whitelist: map[string][]string{"/usr/bin/monero-wallet-gui": nil, "/usr/bin/monero-wallet-cli": nil, "/usr/bin/monerod": nil}},
 	{Name: "Electrum", RelPath: ".electrum",
 		Whitelist: map[string][]string{"/usr/bin/electrum": nil, "/usr/local/bin/electrum": nil}},
@@ -288,7 +280,7 @@ var Catalog = []CandidateDir{
 	// id.json is a plaintext keypair — the highest-value target of the set.
 	{Name: "Solana CLI", RelPath: ".config/solana",
 		Whitelist: map[string][]string{"/usr/bin/solana": nil, "/usr/bin/solana-keygen": nil}},
-	{Name: "Ethereum (geth)", RelPath: ".ethereum",
+	{Name: "Ethereum (geth)", RelPath: ".ethereum/keystore",
 		Whitelist: map[string][]string{"/usr/bin/geth": nil}},
 	{Name: "LND (Lightning Network Daemon)", RelPath: ".lnd",
 		Whitelist: map[string][]string{"/usr/bin/lnd": nil, "/usr/bin/lncli": nil}},
@@ -365,7 +357,21 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/element-desktop": nil}},
 
 	// --- Gaming ----------------------------------------------------------------------
-	{Name: "Steam data", RelPath: ".local/share/Steam",
+	// Steam stores its login credentials (accounts and auth tokens) in
+	// config/loginusers.vdf and config/config.vdf, so only the small config
+	// directory is guarded: the rest of ~/.local/share/Steam (steamapps/
+	// games, userdata/ screenshots and cloud saves, caches) holds no
+	// credentials and is intentionally left out.
+	//
+	// The legacy Steam Guard sentry files (~/.local/share/Steam/ssfn*) are
+	// deliberately NOT protected: the daemon guards directories only (the
+	// config loader skips non-directory paths), and a sentry alone cannot
+	// compromise an account. Once the daemon supports single files, add a
+	// catalog entry for them — and the glob (ssfn*) must then be resolved
+	// dynamically by the daemon at runtime (on start/reload), never baked
+	// into the static config generated at install time, because sentry
+	// filenames can change after login.
+	{Name: "Steam client config (accounts/credentials)", RelPath: ".local/share/Steam/config",
 		Whitelist: map[string][]string{
 			"/usr/bin/steam": nil, "/usr/bin/steamwebhelper": nil,
 			"%HOME%/.local/share/Steam/ubuntu12_32/steam": nil,
