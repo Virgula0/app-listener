@@ -145,6 +145,60 @@ func (s *IntegrationSuite) requireNoBlockedEvent(events []guardEvent, unexpected
 }
 
 // ---------------------------------------------------------------
+// Test: inode-number reuse — stale guard_inodes entries must not
+// deny files that now live outside the guard's own watch root
+// ---------------------------------------------------------------
+
+// TestGuard_InodeReuse_StaleEntryOutsideTree is the regression test for the
+// inode-reuse bug: guard_inodes is keyed by (dev, ino) and entries are never
+// pruned, so when a guarded file is deleted and ext4 reuses its inode number
+// for a file in another tree, the stale entry denied the new file (this is
+// what broke unrelated work like git operations on an unguarded repo). A
+// guard decision must be confined to its own watch root: a matching inode
+// only counts when the file's dentry chain contains the root inode.
+func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"mkdir", "-p", "/outside"})
+	s.exec(c, []string{"sh", "-c", "echo 'inside content' > /watch/inside.txt"})
+	s.exec(c, []string{"sh", "-c", "echo 'victim content' > /watch/victim.txt"})
+
+	// mv is whitelisted so the rename-out succeeds while every other
+	// process stays blocked on the guarded tree.
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/mv")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: files inside the tree stay guarded — the fix must
+	// not weaken protection of the guard's own watch root.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/inside.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "cat on in-tree file should be blocked: %s", out)
+
+	// Simulate inode reuse deterministically: rename(2) preserves (dev,
+	// ino), so the inode scanned into guard_inodes under /watch now lives
+	// in /outside — exactly the state produced by ext4 reusing a freed
+	// inode number for a file in a different tree.
+	code, out = s.exec(c, []string{"mv", "/watch/victim.txt", "/outside/victim.txt"})
+	s.Require().Equalf(0, code, "whitelisted mv should move victim out of the tree: %s", out)
+
+	// Regression capture: with the stale entry still matching its inode,
+	// this cat was denied before the root-confinement fix; it must succeed
+	// now because /outside/victim.txt's ancestor chain contains no node
+	// of the /watch tree.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /outside/victim.txt"})
+	s.Require().Equalf(0, code, "out-of-tree victim must not be denied by its stale map entry: %s", out)
+	s.Require().Contains(out, "victim content")
+
+	// The in-tree positive control must have produced a blocked OPEN event
+	// from cat.
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "OPEN", "cat")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
 // Test: guard blocks all operations on a directory
 // ---------------------------------------------------------------
 

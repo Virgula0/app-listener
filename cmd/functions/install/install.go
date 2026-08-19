@@ -28,6 +28,8 @@ func init() {
 		"Undo the fscrypt migration: list the found .app_listener.backup directories in the TUI and, after one confirmation, delete the encrypted copies and move the backups back (aborts while the daemon is running)")
 	InstallCmd.Flags().Bool("delete-post-backups", false,
 		"Delete the found .app_listener.backup directories (listed in the TUI, confirmed once, with progress)")
+	InstallCmd.Flags().Bool("binary-only", false,
+		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon; no wizard, no config, no fscrypt, no systemd units")
 }
 
 var InstallCmd = &cobra.Command{
@@ -89,7 +91,13 @@ while the daemon is running.
 
 Use --delete-post-backups to delete the found .app_listener.backup
 directories instead of installing (also shown in a TUI list first). Both
-options show a TUI progress bar while running.`,
+options show a TUI progress bar while running.
+
+Use --binary-only for a non-interactive shortcut that only deploys the
+binary: it builds build/linux/app-listener when it does not exist, stops
+a running daemon, replaces /usr/local/sbin/app-listener atomically,
+recreates the /usr/local/bin/app-listener symlink and starts the daemon
+again — nothing else is touched (no config, no fscrypt, no services).`,
 	Args: cobra.NoArgs,
 	RunE: runInstall,
 }
@@ -157,16 +165,61 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 	if flagErr != nil {
 		return false, flagErr
 	}
-	if restore && deleteBackups {
-		return false, errors.New("--restore-backups and --delete-post-backups are mutually exclusive")
+	binaryOnly, flagErr := cmd.Flags().GetBool("binary-only")
+	if flagErr != nil {
+		return false, flagErr
+	}
+	modes := 0
+	for _, on := range []bool{restore, deleteBackups, binaryOnly} {
+		if on {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return false, errors.New("--restore-backups, --delete-post-backups and --binary-only are mutually exclusive")
 	}
 	switch {
 	case restore:
 		return true, restoreBackups()
 	case deleteBackups:
 		return true, deletePostBackups()
+	case binaryOnly:
+		return true, installBinaryOnly()
 	}
 	return false, nil
+}
+
+// installBinaryOnly deploys just the binary: it builds build/linux/app-listener
+// when it does not exist, stops a running daemon, replaces the installed
+// binary atomically, recreates the PATH symlink and brings the daemon back
+// to enabled-and-running. Everything else (config, fscrypt migration,
+// systemd units) is deliberately left untouched.
+func installBinaryOnly() error {
+	if err := buildBinaryIfNeeded(); err != nil {
+		return err
+	}
+
+	// Same contract as the full installer and `update`: replacing the
+	// running binary requires the daemon to be stopped (a daemon outside
+	// systemd is a fatal error).
+	if err := systemd.StopDaemonIfRunning(); err != nil {
+		return err
+	}
+
+	if err := systemd.ReplaceInstalledBinary(buildBinaryPath, systemd.InstallBinaryPath); err != nil {
+		return fmt.Errorf("installing binary: %w", err)
+	}
+	log.Infof("installed binary at %s", systemd.InstallBinaryPath)
+
+	if err := systemd.EnsureBinSymlink(); err != nil {
+		return err
+	}
+
+	if err := systemd.EnableAndVerify(false); err != nil {
+		return err
+	}
+	log.Info("binary-only install complete: the daemon is running the new binary")
+	return nil
 }
 
 // prepareInstallation covers the two steps that precede any user input:

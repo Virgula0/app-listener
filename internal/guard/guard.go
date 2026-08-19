@@ -340,6 +340,22 @@ func (g *Guard) populateMaps() error {
 		return fmt.Errorf("setting depth in config: %w", putErr)
 	}
 
+	// The watch root's (dev, ino) is stored for the BPF root-confinement
+	// check (guard_config[3..4]): an inode map entry only guards an access
+	// when the accessed file's dentry chain reaches this root, so stale
+	// entries whose inode number was reused outside the tree (ext4 inode
+	// reuse) can never deny an unrelated file.
+	rootDev, rootIno, rootStatErr := ebpf.StatInode(g.path)
+	if rootStatErr != nil {
+		return fmt.Errorf("stating guard root %s: %w", g.path, rootStatErr)
+	}
+	if putErr := g.objs.GuardConfig.Put(uint32(3), rootDev); putErr != nil {
+		return fmt.Errorf("setting root dev in config: %w", putErr)
+	}
+	if putErr := g.objs.GuardConfig.Put(uint32(4), rootIno); putErr != nil {
+		return fmt.Errorf("setting root ino in config: %w", putErr)
+	}
+
 	_, statErr := os.Stat(g.path)
 	if statErr != nil {
 		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)

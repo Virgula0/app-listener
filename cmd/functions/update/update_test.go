@@ -176,9 +176,9 @@ func TestVerifyRelease(t *testing.T) {
 	}
 }
 
-func TestFetchPreReleases(t *testing.T) {
-	// The API returns releases newest first; only pre-releases survive the
-	// filter, preserving the server order.
+func TestFetchReleases(t *testing.T) {
+	// The API returns releases newest first; all of them must survive the
+	// fetch untouched, preserving the server order.
 	releases := []githubRelease{
 		{TagName: "pre-20260201-abcdef0", Prerelease: true, PublishedAt: "2026-02-01T10:00:00Z"},
 		{TagName: "v0.1.0", Prerelease: false, PublishedAt: "2025-12-01T10:00:00Z"},
@@ -200,48 +200,67 @@ func TestFetchPreReleases(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	pre, err := fetchPreReleases(srv.URL, "owner/repo", srv.Client())
+	got, err := fetchReleases(srv.URL, "owner/repo", srv.Client())
 	if err != nil {
-		t.Fatalf("fetchPreReleases: %v", err)
+		t.Fatalf("fetchReleases: %v", err)
 	}
-	if len(pre) != 2 {
-		t.Fatalf("fetchPreReleases returned %d releases, want 2", len(pre))
+	if len(got) != 3 {
+		t.Fatalf("fetchReleases returned %d releases, want 3", len(got))
 	}
-	if pre[0].TagName != "pre-20260201-abcdef0" {
-		t.Fatalf("first pre-release is %q, want pre-20260201-abcdef0", pre[0].TagName)
+	if got[0].TagName != "pre-20260201-abcdef0" {
+		t.Fatalf("first release is %q, want pre-20260201-abcdef0", got[0].TagName)
 	}
 }
 
-func TestFetchPreReleasesHTTPError(t *testing.T) {
+func TestFetchReleasesHTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	if _, err := fetchPreReleases(srv.URL, "owner/repo", srv.Client()); err == nil {
-		t.Fatal("fetchPreReleases accepted an HTTP 500")
+	if _, err := fetchReleases(srv.URL, "owner/repo", srv.Client()); err == nil {
+		t.Fatal("fetchReleases accepted an HTTP 500")
 	}
 }
 
-func TestPickLatestPreRelease(t *testing.T) {
+func TestFilterChannel(t *testing.T) {
+	releases := []githubRelease{
+		{TagName: "pre-20260201-abcdef0", Prerelease: true},
+		{TagName: "v0.1.0", Prerelease: false},
+		{TagName: "pre-20260101-abcdef0", Prerelease: true},
+		{TagName: "v1.2.3", Prerelease: false},
+	}
+
+	stable := filterChannel(releases, channelStable)
+	if len(stable) != 2 || stable[0].TagName != "v0.1.0" || stable[1].TagName != "v1.2.3" {
+		t.Fatalf("stable channel = %v, want only non-pre-releases", stable)
+	}
+
+	pre := filterChannel(releases, channelPreRelease)
+	if len(pre) != 2 || pre[0].TagName != "pre-20260201-abcdef0" || pre[1].TagName != "pre-20260101-abcdef0" {
+		t.Fatalf("pre-release channel = %v, want only pre-releases", pre)
+	}
+}
+
+func TestPickLatestRelease(t *testing.T) {
 	releases := []githubRelease{
 		{TagName: "pre-20260101-aaaaaaa", Prerelease: true, PublishedAt: "2026-01-01T10:00:00Z"},
-		{TagName: "pre-20260102-bbbbbbb", Prerelease: true, PublishedAt: "2026-01-02T10:00:00Z"},
+		{TagName: "v0.1.0", Prerelease: false, PublishedAt: "2026-01-02T10:00:00Z"},
 		{TagName: "pre-20260101-ccccccc", Prerelease: true, PublishedAt: "not a timestamp"},
 		{TagName: "pre-20260103-ddddddd", Prerelease: true, PublishedAt: "2026-01-03T10:00:00Z"},
 	}
-	latest, ok := pickLatestPreRelease(releases)
+	latest, ok := pickLatestRelease(releases)
 	if !ok {
-		t.Fatal("pickLatestPreRelease found nothing")
+		t.Fatal("pickLatestRelease found nothing")
 	}
 	if latest.TagName != "pre-20260103-ddddddd" {
-		t.Fatalf("pickLatestPreRelease = %q, want pre-20260103-ddddddd", latest.TagName)
+		t.Fatalf("pickLatestRelease = %q, want pre-20260103-ddddddd", latest.TagName)
 	}
 
-	if _, ok := pickLatestPreRelease(nil); ok {
-		t.Fatal("pickLatestPreRelease found a release in an empty list")
+	if _, ok := pickLatestRelease(nil); ok {
+		t.Fatal("pickLatestRelease found a release in an empty list")
 	}
-	if _, ok := pickLatestPreRelease([]githubRelease{{TagName: "x", PublishedAt: "garbage"}}); ok {
-		t.Fatal("pickLatestPreRelease accepted a release with a malformed timestamp")
+	if _, ok := pickLatestRelease([]githubRelease{{TagName: "x", PublishedAt: "garbage"}}); ok {
+		t.Fatal("pickLatestRelease accepted a release with a malformed timestamp")
 	}
 }
 
@@ -271,6 +290,82 @@ func TestNewerThanInstalled(t *testing.T) {
 		got := newerThanInstalled(c.installed, &latest, releases)
 		if got != c.want {
 			t.Fatalf("newerThanInstalled(%q) = %v, want %v", c.installed, got, c.want)
+		}
+	}
+}
+
+func TestNewerThanStable(t *testing.T) {
+	latest := githubRelease{TagName: "v1.2.0"}
+
+	cases := []struct {
+		installed string
+		want      bool
+	}{
+		// Same tag is never newer.
+		{"v1.2.0", false},
+		// Older stable: update.
+		{"v1.1.0", true},
+		{"v1.2.0-alpha", true},
+		// Newer stable: never downgrade.
+		{"v1.2.1", false},
+		{"v2.0.0", false},
+		// Non-stable versions (pre-release builds, dev, unknown) need the
+		// latest stable — "update if tags differ".
+		{"pre-20260101-aaaaaaa", true},
+		{"pre-test", true},
+		{"unknown", true},
+		{"", true},
+	}
+	for _, c := range cases {
+		got := newerThanStable(c.installed, &latest)
+		if got != c.want {
+			t.Fatalf("newerThanStable(%q) = %v, want %v", c.installed, got, c.want)
+		}
+	}
+}
+
+func TestParseStableVersion(t *testing.T) {
+	cases := []struct {
+		tag   string
+		want  stableVersion
+		valid bool
+	}{
+		{"v0.1.0", stableVersion{0, 1, 0}, true},
+		{"v1.2.3", stableVersion{1, 2, 3}, true},
+		{"1.2.3", stableVersion{1, 2, 3}, true},
+		{"v10.20.30", stableVersion{10, 20, 30}, true},
+		// Non-stable and malformed tags.
+		{"pre-20260101-aaaaaaa", stableVersion{}, false},
+		{"v1.2", stableVersion{}, false},
+		{"v1.2.x", stableVersion{}, false},
+		{"v1.beta.3", stableVersion{}, false},
+		{"v1.2.3.4", stableVersion{}, false},
+		{"", stableVersion{}, false},
+		{"v0.1", stableVersion{}, false},
+		{"v0.1.0-rc1", stableVersion{0, 1, 0}, false},
+	}
+	for _, c := range cases {
+		got, ok := parseStableVersion(c.tag)
+		if ok != c.valid {
+			t.Errorf("parseStableVersion(%q) ok = %v, want %v", c.tag, ok, c.valid)
+			continue
+		}
+		if ok && got != c.want {
+			t.Errorf("parseStableVersion(%q) = %+v, want %+v", c.tag, got, c.want)
+		}
+	}
+}
+
+func TestValidateChannel(t *testing.T) {
+	if err := validateChannel("stable"); err != nil {
+		t.Fatalf("validateChannel(stable) = %v", err)
+	}
+	if err := validateChannel("pre-release"); err != nil {
+		t.Fatalf("validateChannel(pre-release) = %v", err)
+	}
+	for _, ch := range []string{"", "beta", "main", "Prerelease"} {
+		if err := validateChannel(ch); err == nil {
+			t.Errorf("validateChannel(%q) accepted an invalid channel", ch)
 		}
 	}
 }
