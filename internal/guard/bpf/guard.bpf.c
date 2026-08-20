@@ -519,11 +519,15 @@ static __always_inline int root_in_chain(struct dentry *dentry, struct inode *fi
 
 	// Walk up the chain; the file's own inode was checked above.  Every
 	// ancestor is on the file's device (established by on_dev above), so
-	// only the inode number needs probing here.  A short bound fits the
-	// verifier budget of the hook programs that embed this walk; if the
-	// bound is exhausted without hitting the filesystem root, the access
-	// is treated as rooted below, so the bound can never weaken the
-	// guard (a bound shorter than the chain simply fails closed).
+	// only the inode number needs probing here.  The bound is chosen per
+	// hook: single-walk hooks take the full 32 (matching the file_open
+	// root checks), the verifier-tight two-walk hooks (unlink, link,
+	// rename) hold 16.  Both comfortably exceed real path depth — the
+	// deepest sandbox/application leaf sits ~12 levels under / — so a
+	// rooted chain always reaches the root node within the bound.  If the
+	// bound is still exhausted, the final ancestor's parent is probed for
+	// the filesystem root, so a chain at exactly the bound still resolves
+	// correctly; only a chain deeper than the bound fails closed.
 	struct dentry *ancestor = dentry;
 	for (int i = 0; i < bound; i++) {
 		struct dentry *next;
@@ -544,6 +548,16 @@ static __always_inline int root_in_chain(struct dentry *dentry, struct inode *fi
 		if (anc_ino == want_ino)
 			return 1;
 	}
+
+	// A chain exactly `bound` levels deep lands the final ancestor on the
+	// filesystem root at the last iteration; the self-parent probe that
+	// recognizes the root happens on the next hop.  Do that probe once
+	// here: a root whose parent is NULL/itself ends the walk without the
+	// watch root inode, so the access is not rooted.
+	struct dentry *final_next;
+	bpf_probe_read_kernel(&final_next, sizeof(final_next), &ancestor->d_parent);
+	if (!final_next || final_next == ancestor)
+		return 0;
 
 	// Bound exhausted without reaching the filesystem root: fail closed.
 	return 1;
@@ -1038,14 +1052,14 @@ int guard_path_unlink(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
-	if (guarded_map_hit(dentry, inode, 8)) {
+	if (guarded_map_hit(dentry, inode, 16)) {
 		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 	}
 
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
 	if (parent) {
 		struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
-		if (parent_inode && parent_inode != inode && guarded_map_hit(parent, parent_inode, 8)) {
+		if (parent_inode && parent_inode != inode && guarded_map_hit(parent, parent_inode, 12)) {
 			return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 		}
 	}
@@ -1093,7 +1107,7 @@ int guard_path_rename(unsigned long long *ctx)
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[2]);
 	if (new_parent) {
 		struct inode *new_parent_inode = get_inode_from_path((void *)ctx[2]);
-		if (new_parent_inode && new_parent_inode != inode && guarded_map_hit(new_parent, new_parent_inode, 8)) {
+		if (new_parent_inode && new_parent_inode != inode && guarded_map_hit(new_parent, new_parent_inode, 12)) {
 			int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 			if (ret != 0)
 				return ret;  // blocked — reject the rename
@@ -1136,7 +1150,7 @@ int guard_path_symlink(unsigned long long *ctx)
     // 1. Check if the symlink is being created INSIDE a guarded directory
     struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
     struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
-    if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 8)) {
+    if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 32)) {
         return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false);
     }
 
@@ -1198,14 +1212,14 @@ int guard_path_link(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
-	if (guarded_map_hit(old_dentry, inode, 8)) {
+	if (guarded_map_hit(old_dentry, inode, 16)) {
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 	}
 
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
 	if (new_parent) {
 		struct inode *parent_inode = get_inode_from_path((void *)ctx[1]);
-		if (parent_inode && parent_inode != inode && guarded_map_hit(new_parent, parent_inode, 8)) {
+		if (parent_inode && parent_inode != inode && guarded_map_hit(new_parent, parent_inode, 12)) {
 			return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 		}
 	}
@@ -1235,7 +1249,7 @@ int guard_path_mkdir(unsigned long long *ctx)
 
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
 
-	if (parent && guarded_map_hit(parent, parent_inode, 8)) {
+	if (parent && guarded_map_hit(parent, parent_inode, 32)) {
 		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL, false, false);
 	}
 
@@ -1341,7 +1355,7 @@ int guard_path_mknod(unsigned long long *ctx)
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
-	if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 8))
+	if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 32))
 		return check_and_emit(EVENT_MKNOD, dentry, NULL, false, NULL, false, false);
 
 	if (parent && guarded_ancestor_within_limit(parent))
@@ -1359,7 +1373,7 @@ int guard_path_rmdir(unsigned long long *ctx)
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
-	if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 8))
+	if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 32))
 		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 
 	if (parent && guarded_ancestor_within_limit(parent))
@@ -1396,20 +1410,23 @@ int guard_inode_readlink(unsigned long long *ctx)
 	return 0;
 }
 
-// Block pure inode-level may-checks — access(2), faccessat(2) — against
-// guarded files.  On this kernel every syscall path already carries its
-// MAY_* bits: access(2) passes mode|MAY_ACCESS, open/exec passes
-// MAY_OPEN|acc_mode, truncate passes plain MAY_WRITE (inside
-// vfs_truncate).  Requiring MAY_ACCESS therefore selects exactly the
-// access(2)-style probes: opens, execs, truncate and setxattr fall
-// through to their own dedicated hooks (file_open, path_truncate,
-// inode_setxattr), which keep their event identity.  Directory
-// traversal is never blocked (a directory's MAY_EXEC must stay
-// available for every path walk into the guarded tree).  Allowed
-// accesses emit nothing (quiet_allow): this hook fires for every
-// guarded-file may-check and would otherwise flood the log.  An X_OK
-// probe (MAY_EXEC without MAY_OPEN) leaks no content and is
-// deliberately not denied — it must not shadow open/exec handling.
+// inode_permission handles pure inode-level may-checks — access(2),
+// faccessat(2) — which carry MAY_ACCESS.  This hook's context contains
+// only (inode, mask): there is no dentry, so the watch-root chain cannot
+// be walked like every other direct site does.  A raw inode-map hit here
+// therefore cannot be confined, and denying on it produced false
+// positives: an inode number reused by a file in another tree (ext4
+// inode reuse) was denied even though the file was never guarded.  The
+// audit-denial for those probes was a log lie as well — the syscall was
+// never blocked, only reported.  access(2)/faccessat(2) leak no content
+// (they are pure may-checks), so the hook now passes everything through:
+// real reads/writes/execs/deletes are enforced in file_open and the
+// dedicated path_*/inode_* hooks, which do carry a dentry and confine
+// against the watch root.  An X_OK probe (MAY_EXEC without MAY_OPEN)
+// leaks no content and is deliberately not denied — it must not shadow
+// open/exec handling.  The MAY_ACCESS selection below stays as the
+// pass-through gate so this hook never intercepts opens, execs,
+// truncates or setxattr, which have their own event identity.
 SEC("lsm/inode_permission")
 int guard_inode_permission(unsigned long long *ctx)
 {
@@ -1431,16 +1448,7 @@ int guard_inode_permission(unsigned long long *ctx)
 	if ((mode & S_IFMT) == S_IFDIR)
 		return 0;
 
-	if (!read_inode_guard(inode))
-		return 0;
-
-	// Note: this hook's context carries only (inode, mask) — no dentry —
-	// so the chain cannot be walked to confirm the watch root like the
-	// other direct sites do; the inode-map check above is the only
-	// confinement available here.  In practice the impact is limited to
-	// access(2)/faccessat(2) probes for plain files, and whitelisted
-	// binaries pass through check_and_emit below.
-	return check_and_emit(EVENT_STAT, NULL, NULL, false, NULL, false, true);
+	return 0;
 }
 
 SEC("lsm/sb_mount")
@@ -1461,7 +1469,7 @@ int guard_sb_mount(unsigned long long *ctx)
 	if (!inode)
 		return 0;
 
-	if (guarded_map_hit(dentry, inode, 8)) {
+	if (guarded_map_hit(dentry, inode, 32)) {
 		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false, false);
 	}
 

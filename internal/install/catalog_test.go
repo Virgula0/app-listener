@@ -135,6 +135,32 @@ func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	}
 }
 
+// TestBuildxWhitelistedInKubeAndDocker verifies that docker-buildx (the
+// CLI plugin at /usr/lib/docker/cli-plugins) is whitelisted in both the
+// .kube and .docker entries: buildx reads ~/.kube/config for its
+// kubernetes driver and ~/.docker/config.json plus the buildx store
+// (buildx/.lock, instance state) for its own bookkeeping. Without these
+// entries, every docker buildx invocation is denied while the dirs are
+// guarded.
+func TestBuildxWhitelistedInKubeAndDocker(t *testing.T) {
+	const buildx = "/usr/lib/docker/cli-plugins/docker-buildx"
+	seen := map[string]bool{}
+	for i := range Catalog {
+		switch Catalog[i].RelPath {
+		case ".kube", ".docker":
+			if _, ok := Catalog[i].Whitelist[buildx]; !ok {
+				t.Errorf("%s entry does not whitelist docker-buildx", Catalog[i].RelPath)
+			}
+			seen[Catalog[i].RelPath] = true
+		}
+	}
+	for _, rel := range []string{".kube", ".docker"} {
+		if !seen[rel] {
+			t.Errorf("%s entry not found in catalog", rel)
+		}
+	}
+}
+
 // TestSSHWhitelistIncludesModularDaemon verifies the .ssh entry whitelists
 // the modular OpenSSH server helpers (OpenSSH >= 9.8 splits sshd into a
 // dispatcher plus sshd-auth/sshd-session, the processes that actually open

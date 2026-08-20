@@ -198,6 +198,117 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree() {
 	s.stopGuard(c)
 }
 
+// TestGuard_InodeReuse_StaleEntryOutsideTree_Deep is the deep-path variant
+// of the inode-reuse regression.  The shallow /outside/victim.txt case above
+// terminates its root-walk within any bound, but a stale entry used by a file
+// 15 levels below / (typical for real app data trees such as browser profile
+// stores) exhausted the short bound of the path_* map-hit checks: the walk
+// ran out of steps before reaching the filesystem root and failed closed,
+// denying the unguarded file.  Every direct map-hit check must therefore
+// reach the root node (or the filesystem root) before the bound is spent.
+func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree_Deep() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"mkdir", "-p", "/outside"})
+	s.exec(c, []string{"sh", "-c", "echo 'inside content' > /watch/inside.txt"})
+	s.exec(c, []string{"sh", "-c", "echo 'deep victim content' > /watch/deep.txt"})
+
+	// The stale entry must sit 15 levels below / : each rename-out below
+	// preserves (dev, ino), so the inode scanned under /watch lives at a
+	// path deeper than the old 8-step root-walk bound could reach.
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/mv")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: in-tree access stays blocked.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/inside.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "cat on in-tree file should be blocked: %s", out)
+
+	const deep = "/outside/a/b/c/d/e/f/g/h/i/j/k/l/m"
+	s.exec(c, []string{"sh", "-c", "mkdir -p " + deep})
+	code, out = s.exec(c, []string{"mv", "/watch/deep.txt", deep + "/victim.txt"})
+	s.Require().Equalf(0, code, "whitelisted mv should move victim out of the tree: %s", out)
+
+	// Regression capture: unlink of the deep out-of-tree file was denied
+	// by bound-8 fail-closed exhaustion before the bound raise; it must
+	// succeed now.
+	code, out = s.exec(c, []string{"sh", "-c", "cat " + deep + "/victim.txt"})
+	s.Require().Equalf(0, code, "deep out-of-tree victim must not be denied by its stale map entry: %s", out)
+	s.Require().Contains(out, "deep victim content")
+
+	code, out = s.exec(c, []string{"rm", deep + "/victim.txt"})
+	s.Require().Equalf(0, code, "rm on deep out-of-tree victim must not be denied by its stale map entry: %s", out)
+
+	// A pure access(2)-style probe (inode_permission) on the stale inode
+	// must pass too: that hook has no dentry to confine against, so it no
+	// longer denies — it would only ever produce false positives.
+	s.exec(c, []string{"sh", "-c", "echo 'probe content' > " + deep + "/victim.txt"})
+	code, out = s.exec(c, []string{"sh", "-c", "[ -r " + deep + "/victim.txt ]"})
+	s.Require().Equalf(0, code, "access probe on stale out-of-tree inode must succeed: %s", out)
+
+// The in-tree positive control must still have produced a blocked OPEN
+	// event from cat.
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "OPEN", "cat")
+
+	s.stopGuard(c)
+}
+
+// TestGuard_InodeReuse_StaleDir_DeepDestRename is the regression test for the
+// destination-side rename/link leak: a DIRECTORY inode scanned under the watch
+// root and later moved to a path exactly `bound` levels deep under / makes the
+// destination-parent walk land on the filesystem root at the last iteration.
+// The root is only recognized by the self-parent probe on the NEXT hop, so the
+// exhausted loop used to fail closed and deny the unguarded op; the post-loop
+// fs-root probe must resolve the exact-bound chain and allow it.
+func (s *IntegrationSuite) TestGuard_InodeReuse_StaleDir_DeepDestRename() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"mkdir", "-p", "/watch/gone"})
+	s.exec(c, []string{"sh", "-c", "echo 'inside content' > /watch/inside.txt"})
+	s.exec(c, []string{"sh", "-c", "echo 'outside content' > /outside-src.txt"})
+
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/mv")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: the in-tree dir stays guarded.  touch on a missing
+	// file goes through mknod, so the blocked event type is MKNOD.
+	code, out := s.exec(c, []string{"sh", "-c", "touch /watch/gone/x > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "touch in in-tree dir should be blocked: %s", out)
+
+	// /o + 10 nested dirs puts 'gone' at exactly 12 levels under / (the
+	// current second-walk bound); its chain to the filesystem root is
+	// settled only on the hop past the last iteration.
+	const deep = "/o/1/2/3/4/5/6/7/8/9/10"
+	s.exec(c, []string{"sh", "-c", "mkdir -p " + deep})
+	code, out = s.exec(c, []string{"mv", "/watch/gone", deep + "/gone"})
+	s.Require().Equalf(0, code, "whitelisted mv should move dir out of the tree: %s", out)
+
+	// Regression capture: ln sources /outside-src.txt (out-of-tree, clean)
+	// and links INTO the stale deep dir.  The destination-parent walk hits
+	// gone's stale map entry and previously failed closed at the boundary,
+	// denying the link; it must succeed now.
+	code, out = s.exec(c, []string{"ln", "/outside-src.txt", deep + "/gone/link.txt"})
+	s.Require().Equalf(0, code, "link into stale deep dest dir must not be denied by its stale dir entry: %s", out)
+
+	// And a rename into the stale deep dir via a non-whitelisted binary:
+	// /dup-mv is a copy of mv, so path_rename's destination-parent check
+	// really applies (mv itself is whitelisted for the setup moves).
+	s.exec(c, []string{"cp", "/usr/bin/mv", "/dup-mv"})
+	code, out = s.exec(c, []string{"/dup-mv", "/outside-src.txt", deep + "/gone/incoming.txt"})
+	s.Require().Equalf(0, code, "rename into stale deep dest dir must not be denied by its stale dir entry: %s", out)
+
+	// The in-tree positive control must still have produced a blocked MKNOD
+	// event from touch.
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "MKNOD", "touch")
+
+	s.stopGuard(c)
+}
+
 // ---------------------------------------------------------------
 // Test: guard blocks all operations on a directory
 // ---------------------------------------------------------------

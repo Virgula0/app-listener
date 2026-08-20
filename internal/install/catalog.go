@@ -201,9 +201,15 @@ var Catalog = []CandidateDir{
 		// inert — kept for documentation.
 		Whitelist: map[string][]string{"/usr/bin/gcloud": nil, "/usr/bin/gsutil": nil}},
 	{Name: "Kubernetes kubeconfig", RelPath: ".kube",
-		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil}},
+		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil,
+			"/usr/lib/docker/cli-plugins/docker-buildx":     nil,
+			"/usr/libexec/docker/cli-plugins/docker-buildx": nil,
+			"%HOME%/.docker/cli-plugins/docker-buildx":      nil}},
 	{Name: "Docker config and credentials", RelPath: ".docker",
-		Whitelist: map[string][]string{"/usr/bin/docker": nil, "/usr/bin/docker-credential-desktop": nil, "/usr/bin/docker-credential-pass": nil}},
+		Whitelist: map[string][]string{"/usr/bin/docker": nil, "/usr/bin/docker-credential-desktop": nil, "/usr/bin/docker-credential-pass": nil,
+			"/usr/lib/docker/cli-plugins/docker-buildx":     nil,
+			"/usr/libexec/docker/cli-plugins/docker-buildx": nil,
+			"%HOME%/.docker/cli-plugins/docker-buildx":      nil}},
 	{Name: "GitHub CLI", RelPath: ".config/gh",
 		Whitelist: map[string][]string{
 			"/usr/bin/gh":                       nil,

@@ -24,6 +24,22 @@ type GuardNetThrottleKey struct {
 	Comm [16]int8
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	GuardNetMapGuardNetConfig         = "guard_net_config"
+	GuardNetMapGuardNetEvents         = "guard_net_events"
+	GuardNetMapGuardNetExeActions     = "guard_net_exe_actions"
+	GuardNetMapGuardNetRb             = "guard_net_rb"
+	GuardNetMapGuardNetThrottle       = "guard_net_throttle"
+	GuardNetProgGuardNetSocketBind    = "guard_net_socket_bind"
+	GuardNetProgGuardNetSocketConnect = "guard_net_socket_connect"
+	GuardNetProgGuardNetSocketListen  = "guard_net_socket_listen"
+	GuardNetProgGuardNetSocketRecvmsg = "guard_net_socket_recvmsg"
+	GuardNetProgGuardNetSocketSendmsg = "guard_net_socket_sendmsg"
+)
+
 // LoadGuardNet returns the embedded CollectionSpec for GuardNet.
 func LoadGuardNet() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_GuardNetBytes)
@@ -44,7 +60,7 @@ func LoadGuardNet() (*ebpf.CollectionSpec, error) {
 //	*GuardNetMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadGuardNetObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func LoadGuardNetObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := LoadGuardNet()
 	if err != nil {
 		return err
