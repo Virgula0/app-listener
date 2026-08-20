@@ -247,7 +247,7 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree_Deep() {
 	code, out = s.exec(c, []string{"sh", "-c", "[ -r " + deep + "/victim.txt ]"})
 	s.Require().Equalf(0, code, "access probe on stale out-of-tree inode must succeed: %s", out)
 
-// The in-tree positive control must still have produced a blocked OPEN
+	// The in-tree positive control must still have produced a blocked OPEN
 	// event from cat.
 	logAfter := s.readGuardLog(c)
 	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "OPEN", "cat")
@@ -687,15 +687,17 @@ func (s *IntegrationSuite) TestGuard_Whitelist_Events() {
 // ---------------------------------------------------------------
 
 type guardExploitTest struct {
-	name   string
-	binary string
-	events []string
+	name      string
+	binary    string
+	events    []string
+	extraArgs []string
 }
 
 var guardExploitTests = []guardExploitTest{
 	{name: "copy_file_range", binary: "copy_file_range", events: []string{"OPEN"}},
 	{name: "execve", binary: "execve", events: []string{"OPEN"}},
 	{name: "io_uring", binary: "io_uring", events: []string{"OPEN"}},
+	{name: "io_uring_full", binary: "io_uring_full", events: []string{"OPEN"}, extraArgs: []string{"--sqpoll"}},
 	{name: "mmap", binary: "mmap", events: []string{"OPEN"}},
 	{name: "pread64", binary: "pread64", events: []string{"OPEN"}},
 	{name: "readv", binary: "readv", events: []string{"OPEN"}},
@@ -741,9 +743,14 @@ func (s *IntegrationSuite) TestGuard_Exploits() {
 			}
 
 			args := []string{fmt.Sprintf("/exploits/%s", et.binary)}
+			args = append(args, et.extraArgs...)
 			args = append(args, targetPath)
 
 			code, out := s.exec(c, args)
+			if code == 2 && et.name == "io_uring_full" {
+				t.Logf("skipping exploit %s (IORING_SETUP_SQPOLL not supported)", et.name)
+				return
+			}
 			s.Require().NotEqualf(0, code,
 				"exploit %s should be blocked by guard, got exit %d: %s", et.name, code, out)
 
@@ -1070,6 +1077,96 @@ func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
 	s.Require().NotEqualf(0, code,
 		"open_by_handle_at should be blocked by guard: %s", out)
 	s.requireBlockedEvent(deltaEvents, "OPEN")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: bind-mount an unguarded directory over a guarded path
+//
+// The POC creates an unguarded directory with a file inside it and
+// bind-mounts it over a path inside /watch.  If mount() were not
+// intercepted, the guarded path would silently point to the
+// attacker directory.  The guard's sb_mount LSM hook checks the
+// mount point dentry against the inode map and denies mount()
+// with a blocked OPEN event.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_Mount() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits", "/tmp/evildir"})
+
+	// The mount point must exist before the guard starts: in block-all
+	// mode creating it afterwards would itself be blocked and emit
+	// MKDIR|sh instead of the OPEN event from the mount denial.
+	s.exec(c, []string{"mkdir", "-p", "/watch/mountpoint"})
+
+	exploitHostPath := absPath("./exploits/mount_bypass")
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/mount_bypass", 0755)
+	s.Require().NoError(err, "copy mount_bypass binary")
+
+	s.startGuardStd(c, "/watch")
+	logBefore := s.readGuardLog(c)
+
+	code, out := s.exec(c, []string{"/exploits/mount_bypass", "/watch/mountpoint", "/tmp/evildir"})
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	s.Require().NotEqualf(0, code,
+		"bind mount over a guarded path should be blocked: %s", out)
+	s.requireBlockedEvent(deltaEvents, "OPEN")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: process_vm_readv — steal guarded content from memory
+//
+// The POC finds a process that has a guarded file open and dumps
+// its heap via process_vm_readv, which never touches VFS.  The
+// guard blocks it at ptrace_access_check: any process that read a
+// guarded file is marked tainted, and a non-whitelisted caller gets
+// -EPERM on the dump.
+//
+// The victim is a whitelisted bash that opens the guarded file on
+// fd 3 (open(2) without O_CLOEXEC => the open is allowed and bash
+// becomes tainted) and reads it into a shell variable living on the
+// heap.  `sleep 30` runs as a CHILD so bash stays alive and keeps
+// both the taint and its heap, letting the exploit find the victim
+// and attempt a dump.  If the taint/ptrace check is missing, the
+// dump succeeds (root has CAP_SYS_PTRACE) and the test fails.
+//
+// NOTE: on hosts with kernel.yama.ptrace_scope=1 the kernel would
+// block the cross-process read anyway, making this test pass
+// trivially.  On yama=0 hosts only the guard prevents the dump.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
+	// Must exist before the guard starts: files created afterwards are
+	// not in the BPF inode map and would not be protected.
+	s.exec(c, []string{"sh", "-c", "echo 'process_vm_readv target' > /watch/target.txt"})
+
+	exploitHostPath := absPath("./exploits/process_vm_readv")
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/process_vm_readv", 0755)
+	s.Require().NoError(err, "copy process_vm_readv binary")
+
+	// bash is whitelisted so it may open the guarded file.
+	s.startGuardStd(c, "/watch", "-w", "/bin/bash")
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"bash -c 'exec 3< /watch/target.txt; IFS= read -r -u3 line; sleep 30' & " +
+			"pid=$!; sleep 1; " +
+			"/exploits/process_vm_readv /watch/target.txt; code=$?; " +
+			"kill $pid 2>/dev/null; exit $code"})
+	s.Require().NotEqualf(0, code,
+		"process_vm_readv on a whitelisted victim should be blocked: %s", out)
 
 	s.stopGuard(c)
 }

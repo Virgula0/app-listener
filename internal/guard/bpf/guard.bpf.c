@@ -1481,8 +1481,15 @@ int guard_sb_mount(unsigned long long *ctx)
 // Once a process opens/reads a guarded file, no non-whitelisted process
 // can ptrace it or read its memory via process_vm_readv.
 SEC("lsm/ptrace_access_check")
-int guard_ptrace_access_check(struct task_struct *child, unsigned int mode)
+int guard_ptrace_access_check(unsigned long long *ctx)
 {
+	// LSM hooks pass a pointer to the argument struct in r1; the
+	// declared-args form (struct task_struct *child, unsigned int mode)
+	// maps child to r1 and mode to r2, but the kernel only fills r1, so
+	// child->tgid would read far past the tiny argument struct.  Read the
+	// real args through ctx like the other hooks in this file.
+	struct task_struct *child = (struct task_struct *)ctx[0];
+
 	if (!child)
 		return 0;
 
@@ -1509,8 +1516,10 @@ int guard_ptrace_access_check(struct task_struct *child, unsigned int mode)
 // space (including file mappings).  Mark the child as tainted too so that
 // process_vm_readv on the child is also blocked.
 SEC("lsm/task_alloc")
-int guard_task_alloc(struct task_struct *task, unsigned long clone_flags)
+int guard_task_alloc(unsigned long long *ctx)
 {
+	struct task_struct *task = (struct task_struct *)ctx[0];
+
 	if (!task)
 		return 0;
 
@@ -1531,8 +1540,10 @@ int guard_task_alloc(struct task_struct *task, unsigned long clone_flags)
 // Clean up the tainted PID entry when the process exits, preventing
 // stale entries when the PID is reused by a different process.
 SEC("lsm/task_free")
-int guard_task_free(struct task_struct *task)
+int guard_task_free(unsigned long long *ctx)
 {
+	struct task_struct *task = (struct task_struct *)ctx[0];
+
 	if (!task)
 		return 0;
 
