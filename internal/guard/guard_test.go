@@ -217,6 +217,33 @@ func (s *guardUnitTest) TestIsGuardedBinaryNotPresent() {
 	s.Require().False(result)
 }
 
+// TestIsGuardedBinaryConfiguredSymlink is the gh/gcloud/goland regression:
+// the config whitelists a symlink (e.g. /home/angelo/.local/bin/gh) while
+// /proc/PID/exe reports the resolved real path. Guard creation records the
+// canonical target in canonicalPaths, so the real path must match.
+func (s *guardUnitTest) TestIsGuardedBinaryConfiguredSymlink() {
+	tmpDir := s.T().TempDir()
+	targetPath := filepath.Join(tmpDir, "opt", "gh")
+	s.Require().NoError(os.MkdirAll(filepath.Dir(targetPath), 0o755))
+	s.Require().NoError(os.WriteFile(targetPath, []byte("data"), 0755))
+
+	linkPath := filepath.Join(tmpDir, "bin", "gh")
+	s.Require().NoError(os.MkdirAll(filepath.Dir(linkPath), 0o755))
+	s.Require().NoError(os.Symlink(targetPath, linkPath))
+
+	g := &Guard{
+		binaries: []BinaryEntry{
+			{Path: linkPath, Comm: "gh"},
+		},
+		canonicalPaths: map[string]string{linkPath: targetPath},
+	}
+
+	s.Require().True(g.isGuardedBinary(targetPath),
+		"resolved exe path must match a symlinked whitelist entry")
+	s.Require().False(g.isGuardedBinary(filepath.Join(tmpDir, "opt", "other")),
+		"unrelated resolved path must not match")
+}
+
 func (s *guardUnitTest) TestFileEventUnchanged() {
 	var comm [16]byte
 	copy(comm[:], "cat")
@@ -385,44 +412,4 @@ func (s *guardUnitTest) TestWalkInodesLockedTreeDetected() {
 	})
 	s.Require().Error(err)
 	s.Require().Contains(err.Error(), "fscrypt-encrypted and locked")
-}
-
-// TestPopulateInodesFillsMap verifies the eager inode scan registers every
-// file and directory of the guarded tree in guard_inodes, so kernel-side
-// own/parent inode checks (and not only lazy discovery) protect deep
-// files. Requires root to load the BPF programs; skipped otherwise.
-func (s *guardUnitTest) TestPopulateInodesFillsMap() {
-	if os.Geteuid() != 0 {
-		s.T().Skip("requires root to load BPF programs")
-	}
-
-	dir := s.T().TempDir()
-	s.Require().NoError(os.MkdirAll(filepath.Join(dir, "l1", "l2", "l3"), 0o755))
-	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
-	s.Require().NoError(os.WriteFile(filepath.Join(dir, "l1", "l2", "l3", "deep.txt"), []byte("d"), 0o644))
-
-	g, err := NewGuard(dir, ModeBlacklist, nil, true, 0)
-	if err != nil {
-		s.T().Skipf("cannot load guard BPF programs (requires root + LSM support): %v", err)
-	}
-	defer g.Stop()
-
-	s.Require().NoError(g.PopulateInodes())
-
-	var want []string
-	s.Require().NoError(walkInodes(dir, true, 0, 0, func(p string) error {
-		want = append(want, p)
-		return nil
-	}))
-
-	found := make(map[GuardInodeKey]bool, len(want))
-	var key GuardInodeKey
-	var val uint8
-	it := g.objs.GuardInodes.Iterate()
-	for it.Next(&key, &val) {
-		found[key] = true
-	}
-	s.Require().NoError(it.Err())
-	s.Require().Len(found, len(want),
-		"every inode of the tree (dirs and deep files) must be in guard_inodes after PopulateInodes")
 }

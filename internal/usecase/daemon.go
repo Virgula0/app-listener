@@ -133,6 +133,17 @@ func (d *daemonUseCase) startGuards() error {
 		return err
 	}
 
+	// Binary whitelist entries that were deferred while their tree was
+	// still locked are now resolvable. Until this point they were absent
+	// from the BPF whitelist and therefore denied — fail-closed exactly
+	// like any other binary — so the unlock never precedes their
+	// protection: hooks attach, then unlock, then populate, then resolve.
+	for i := range d.guards {
+		if err := d.guards[i].ResolvePendingBinaries(); err != nil {
+			return fmt.Errorf("resolving deferred binaries for %s: %w", d.resources[i].Path, err)
+		}
+	}
+
 	for i := range d.guards {
 		if err := d.guards[i].Start(); err != nil {
 			return fmt.Errorf("starting guard for %s: %w", d.resources[i].Path, err)
@@ -239,10 +250,17 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	// Phase 2 — populate the inode maps of the new guards. Every new
 	// resource is unlocked (or was already readable) and the new hooks are
 	// attached, so the scan sees the plaintext without a protection gap.
+	// Deferred binary whitelist entries are resolved right after: same
+	// fail-closed ordering as at startup (attach → unlock → populate →
+	// resolve).
 	for i := range guards {
 		if err := guards[i].PopulateInodes(); err != nil {
 			d.rollbackReload(guards, unlocked)
 			return fmt.Errorf("reload: populating guard inodes for %s: %w", resources[i].Path, err)
+		}
+		if err := guards[i].ResolvePendingBinaries(); err != nil {
+			d.rollbackReload(guards, unlocked)
+			return fmt.Errorf("reload: resolving deferred binaries for %s: %w", resources[i].Path, err)
 		}
 	}
 

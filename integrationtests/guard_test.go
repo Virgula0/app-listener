@@ -1800,3 +1800,46 @@ func (s *IntegrationSuite) TestGuard_BypassVectors() {
 		})
 	}
 }
+
+// newGuardTestContainer starts a privileged container and copies the
+// compiled guard test binary into it, mirroring newNetGuardContainer. The
+// guard BPF-gated tests need root plus a live BPF LSM, which only the
+// privileged test containers can provide; the suite's startContainer
+// already mounts /sys/kernel/btf and sets APPLISTENER_ASSUME_BPF_LSM=1.
+func (s *IntegrationSuite) newGuardTestContainer() testcontainers.Container {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, "")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, guardTestAmd64Bin, "/guard.test", 0755))
+	return c
+}
+
+// runGuardTest execs the guard test binary inside c, filtered to a single
+// testify suite subtest, and asserts it passes.
+func (s *IntegrationSuite) runGuardTest(c testcontainers.Container, subtest string) {
+	code, out := s.exec(c, []string{
+		"/guard.test", "-test.run", "TestGuardUnitTest/" + subtest, "-test.v",
+	})
+	s.Require().Equalf(0, code, "guard.test %s failed: %s", subtest, out)
+}
+
+// TestGuard_PendingBinaries_Resolved exercises the deferred-whitelist flow
+// that fixed the Discord startup bug: a binary unreadable at guard-build
+// time stays out of the whitelist (denied in whitelist mode) until
+// ResolvePendingBinaries runs after the "unlock", and is then allowed.
+// Fail-closed before, allowed after; the unlock never precedes the
+// binary's whitelist entry.
+func (s *IntegrationSuite) TestGuard_PendingBinaries_Resolved() {
+	c := s.newGuardTestContainer()
+	defer c.Terminate(s.ctx)
+
+	s.runGuardTest(c, "TestResolvePendingBinariesWhitelist")
+}
+
+// TestGuard_PopulateInodes_FillsMap verifies the eager inode scan registers
+// every file and directory of the guarded tree in guard_inodes, so
+// kernel-side own/parent inode checks protect deep files.
+func (s *IntegrationSuite) TestGuard_PopulateInodes_FillsMap() {
+	c := s.newGuardTestContainer()
+	defer c.Terminate(s.ctx)
+
+	s.runGuardTest(c, "TestPopulateInodesFillsMap")
+}

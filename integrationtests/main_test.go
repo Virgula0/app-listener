@@ -23,6 +23,7 @@ import (
 var (
 	amd64Bin          string
 	netTesterAmd64Bin string
+	guardTestAmd64Bin string
 )
 
 // hostInfraBindPaths are host binaries that the LSM network guard blocks in
@@ -68,6 +69,7 @@ func TestMain(m *testing.M) {
 
 	amd64Bin = absPath("../build/test/app-listener-amd64")
 	netTesterAmd64Bin = absPath("../build/test/net_tester-amd64")
+	guardTestAmd64Bin = absPath("../build/test/guard-amd64")
 
 	// The daemon mode links fscrypt, which needs cgo (mlock), so a pure-Go
 	// CGO_ENABLED=0 build no longer compiles. The binary must stay static
@@ -93,6 +95,20 @@ func TestMain(m *testing.M) {
 	cmdNet.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	if err := cmdNet.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build net_tester amd64 binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	// The guard BPF-gated tests (pending-binaries resolution, inode map
+	// population) need root + a live BPF LSM, which only the privileged
+	// test containers can provide. Compile the guard test binary as a
+	// static executable (the guard package needs no cgo) and run it inside
+	// one of those containers.
+	cmdGuardTest := exec.Command("go", "test", "-tags", "ci", "-c",
+		"-o", guardTestAmd64Bin, "../internal/guard/")
+	cmdGuardTest.Stderr = os.Stderr
+	cmdGuardTest.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+	if err := cmdGuardTest.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build guard test binary: %v\n", err)
 		os.Exit(1)
 	}
 

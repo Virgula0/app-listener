@@ -20,6 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
@@ -61,6 +62,17 @@ type Guard struct {
 	exeEvents map[string][]ebpf.EventType
 	recursive bool
 	depth     int
+	// canonicalPaths maps each binary's configured path to its symlink-
+	// resolved real path (computed at NewGuard time, when the binary was
+	// already readable). It is used to attribute events to guarded
+	// binaries whose config entry is a symlink, so that a process
+	// launched through the symlink is not misreported as "spoofed comm".
+	canonicalPaths map[string]string
+	// deferred stores whitelist entries that could not be read while
+	// their resource tree was still fscrypt-locked. They stay unlisted
+	// (denied in whitelist mode) until ResolvePendingBinaries runs after
+	// the unlock.
+	deferred []daemonconfig.BinaryRule
 	// eagerPopulate scans the whole guarded tree into guard_inodes while
 	// the LSM hooks are not yet attached (see WithEagerPopulate).
 	eagerPopulate bool
@@ -92,6 +104,17 @@ func WithBinaryEvents(events map[string][]ebpf.EventType) GuardOption {
 	}
 }
 
+// WithPendingBinaries registers whitelist entries that could not be read
+// while their resource tree was still locked (see daemonconfig.Resource.
+// PendingBinaries). They are left out of the BPF whitelist — denied in
+// whitelist mode — until ResolvePendingBinaries succeeds after the unlock,
+// so the whitelist never admits a binary ahead of its tree being usable.
+func WithPendingBinaries(rules []daemonconfig.BinaryRule) GuardOption {
+	return func(g *Guard) {
+		g.deferred = rules
+	}
+}
+
 // eventMask converts event types into the BPF bitmask stored in
 // guard_exe_events. Listing READ, WRITE or MMAP implicitly allows OPEN: a
 // binary cannot perform those operations without opening the file first.
@@ -120,14 +143,24 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	entries := make([]BinaryEntry, len(binaries))
 	copy(entries, binaries)
 
+	canonical := make(map[string]string, len(entries))
+	for _, b := range entries {
+		resolved, err := filepath.EvalSymlinks(b.Path)
+		if err != nil {
+			resolved = b.Path // unresolvable now (stays equal, fail-closed)
+		}
+		canonical[b.Path] = resolved
+	}
+
 	g := &Guard{
-		events:    make(chan GuardEvent, 1024),
-		done:      make(chan struct{}),
-		path:      path,
-		mode:      mode,
-		binaries:  entries,
-		recursive: recursive,
-		depth:     depth,
+		events:         make(chan GuardEvent, 1024),
+		done:           make(chan struct{}),
+		path:           path,
+		mode:           mode,
+		binaries:       entries,
+		canonicalPaths: canonical,
+		recursive:      recursive,
+		depth:          depth,
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -264,12 +297,11 @@ func guardModeKey(m Mode) (uint64, error) {
 
 // addBinaryActions stores the per-binary allow/block flags in
 // guard_exe_actions, keyed by the binary's filesystem inode.
-func (g *Guard) addBinaryActions() error {
-	for _, b := range g.binaries {
+func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
+	for _, b := range binaries {
 		dev, ino, err := ebpf.StatInode(b.Path)
 		if err != nil {
-			log.Warnf("cannot stat binary %s for exe inode: %v", b.Path, err)
-			continue
+			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
 		}
 		inodeKey := GuardInodeKey{
 			Dev: dev,
@@ -289,9 +321,9 @@ func (g *Guard) addBinaryActions() error {
 // addBinaryEvents stores the per-binary allowed-event bitmasks in
 // guard_exe_events. Only binaries with an explicit event list are stored;
 // the BPF layer treats a missing entry as "all events allowed".
-func (g *Guard) addBinaryEvents() error {
-	for _, b := range g.binaries {
-		types, ok := g.exeEvents[b.Path]
+func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf.EventType) error {
+	for _, b := range binaries {
+		types, ok := events[b.Path]
 		if !ok {
 			continue
 		}
@@ -313,6 +345,68 @@ func (g *Guard) addBinaryEvents() error {
 			return fmt.Errorf("storing exe events for %s: %w", b.Path, err)
 		}
 	}
+	return nil
+}
+
+// ResolvePendingBinaries retries the whitelist entries that were deferred
+// because their resource was still locked. It must run only after the
+// resource is accessible (the daemon calls it post-unlock and post-
+// populateInodes). Each now-readable rule is hashed, canonicalized and
+// written into the whitelist maps; a rule that is still unreadable (or
+// genuinely gone) stays deferred and logged — the whitelist keeps
+// excluding it, so protection is never weakened by a failed resolve.
+func (g *Guard) ResolvePendingBinaries() error {
+	if len(g.deferred) == 0 {
+		return nil
+	}
+
+	resolved := make([]BinaryEntry, 0, len(g.deferred))
+	events := make(map[string][]ebpf.EventType, len(g.deferred))
+	var stillDeferred []daemonconfig.BinaryRule
+	for _, rule := range g.deferred {
+		path := rule.Path
+		if realPath, err := filepath.EvalSymlinks(path); err == nil {
+			path = realPath
+		}
+		entry, err := ComputeBinaryEntry(path)
+		if err != nil {
+			log.Warnf("guard %s: binary still unreadable after unlock, keeping it deferred: %s", g.path, rule.Path)
+			stillDeferred = append(stillDeferred, rule)
+			continue
+		}
+		resolved = append(resolved, entry)
+		if len(rule.Events) > 0 {
+			events[path] = rule.Events
+		}
+	}
+	g.deferred = stillDeferred
+
+	if len(resolved) == 0 {
+		return nil
+	}
+	// The maps are writable while the program is attached. Entries are
+	// keyed by inode, so the write is idempotent by construction.
+	if err := g.addBinaryActions(resolved); err != nil {
+		return err
+	}
+	if err := g.addBinaryEvents(resolved, events); err != nil {
+		return err
+	}
+
+	g.mu.Lock()
+	g.binaries = append(g.binaries, resolved...)
+	for _, b := range resolved {
+		g.canonicalPaths[b.Path] = b.Path
+	}
+	if g.exeEvents == nil {
+		g.exeEvents = make(map[string][]ebpf.EventType)
+	}
+	for path, types := range events {
+		g.exeEvents[path] = types
+	}
+	g.mu.Unlock()
+
+	log.Infof("guard %s: resolved %d deferred binary whitelist entries", g.path, len(resolved))
 	return nil
 }
 
@@ -369,11 +463,11 @@ func (g *Guard) populateMaps() error {
 		return addErr
 	}
 
-	if binErr := g.addBinaryActions(); binErr != nil {
+	if binErr := g.addBinaryActions(g.binaries); binErr != nil {
 		return binErr
 	}
 
-	if eventsErr := g.addBinaryEvents(); eventsErr != nil {
+	if eventsErr := g.addBinaryEvents(g.binaries, g.exeEvents); eventsErr != nil {
 		return eventsErr
 	}
 
@@ -721,11 +815,15 @@ func commMatchesGuardedBinary(comm string, binaries []BinaryEntry) bool {
 
 func (g *Guard) isGuardedBinary(exePath string) bool {
 	for _, b := range g.binaries {
-		if b.Path == exePath {
+		canonical := g.canonicalPaths[b.Path]
+		if canonical == "" {
+			canonical = b.Path // guard created without canonical map
+		}
+		if b.Path == exePath || canonical == exePath {
 			return true
 		}
 		abs, err := filepath.EvalSymlinks(exePath)
-		if err == nil && abs == b.Path {
+		if err == nil && (abs == b.Path || abs == canonical) {
 			return true
 		}
 	}

@@ -48,8 +48,10 @@ type fakeGuardRepo struct {
 	started     bool
 	stopped     bool
 	populated   bool
+	resolved    bool
 	startErr    error
 	populateErr error
+	resolveErr  error
 	events      chan guard.GuardEvent
 }
 
@@ -62,6 +64,14 @@ func (f *fakeGuardRepo) PopulateInodes() error {
 		return f.populateErr
 	}
 	f.populated = true
+	return nil
+}
+
+func (f *fakeGuardRepo) ResolvePendingBinaries() error {
+	if f.resolveErr != nil {
+		return f.resolveErr
+	}
+	f.resolved = true
 	return nil
 }
 

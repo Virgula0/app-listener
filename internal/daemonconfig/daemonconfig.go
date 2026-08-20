@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -31,6 +32,13 @@ type Resource struct {
 	// fscrypt policy aborts the daemon at startup.
 	NeedEncryption bool
 	Binaries       []BinaryRule
+	// PendingBinaries lists whitelisted binaries that could not be read
+	// when the config was parsed (typically because their directory is
+	// still fscrypt-locked). One pass after the resource is unlocked
+	// (see the daemon usecase) moves them into Binaries; until then they
+	// are absent from the BPF whitelist, so in whitelist mode they are
+	// simply denied — fail-closed, never fail-open.
+	PendingBinaries []BinaryRule
 }
 
 // BinaryRule is one whitelisted binary inside a resource section.
@@ -41,12 +49,14 @@ type BinaryRule struct {
 	Events []ebpf.EventType
 }
 
-// Load parses the configuration file at path. Missing watch paths and
-// missing binaries are skipped with a warning (matching ssh-guard's
-// tolerance), and so are the directives of a skipped section — including
-// directives that appear before any [watch] section. Malformed directives
-// inside a valid section fail fast: a security configuration must not be
-// silently misread.
+// Load parses the configuration file at path. Missing watch paths are
+// skipped with a warning (matching ssh-guard's tolerance), and so are the
+// directives of a skipped section — including directives that appear
+// before any [watch] section. A binary that cannot be read yet (its
+// directory is still fscrypt-locked) is parked in Resource.PendingBinaries
+// and resolved by the daemon once the resource is unlocked. Malformed
+// directives inside a valid section fail fast: a security configuration
+// must not be silently misread.
 func Load(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -143,20 +153,30 @@ func applyDirective(current *Resource, line string, lineNo int) error {
 		return nil
 	}
 	binPath := fields[0]
-	if info, statErr := os.Stat(binPath); statErr != nil {
-		log.Warnf("daemon config line %d: skipping missing binary: %s", lineNo, binPath)
-	} else {
-		_ = info
-		rule := BinaryRule{Path: binPath}
-		if len(fields) > 1 {
-			events, parseErr := parseEvents(strings.Split(strings.Join(fields[1:], " "), ","))
-			if parseErr != nil {
-				return fmt.Errorf("daemon config line %d: %w", lineNo, parseErr)
-			}
-			rule.Events = events
+	rule := BinaryRule{Path: binPath}
+	if len(fields) > 1 {
+		events, parseErr := parseEvents(strings.Split(strings.Join(fields[1:], " "), ","))
+		if parseErr != nil {
+			return fmt.Errorf("daemon config line %d: %w", lineNo, parseErr)
 		}
-		current.Binaries = append(current.Binaries, rule)
+		rule.Events = events
 	}
+	if _, statErr := os.Stat(binPath); statErr != nil {
+		// The binary lives inside a still-locked fscrypt tree (or is
+		// genuinely gone). Keep the rule for the post-unlock resolution
+		// pass instead of dropping it: dropping would silently disable
+		// the whitelist entry, and keeping it is fail-closed (the binary
+		// stays unlisted in the BPF whitelist, i.e. denied, until it
+		// becomes resolvable).
+		log.Warnf("daemon config line %d: binary not readable yet, deferring: %s", lineNo, binPath)
+		current.PendingBinaries = append(current.PendingBinaries, rule)
+		return nil
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(binPath); resolveErr == nil && resolved != binPath {
+		log.Infof("daemon config line %d: binary symlink resolved: %s -> %s", lineNo, binPath, resolved)
+		rule.Path = resolved
+	}
+	current.Binaries = append(current.Binaries, rule)
 	return nil
 }
 
