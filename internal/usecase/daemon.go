@@ -111,7 +111,11 @@ func (d *daemonUseCase) Start() error {
 	return startErr
 }
 
-func (d *daemonUseCase) startGuards() error {
+// verifyEncryptionStates checks every resource's encryption state against
+// its need_encryption setting before anything is unlocked or protected:
+// a misconfigured resource aborts the start instead of unlocking (or
+// silently ignoring) the wrong tree.
+func (d *daemonUseCase) verifyEncryptionStates() error {
 	for _, r := range d.resources {
 		encrypted, err := d.vault.IsEncrypted(r.Path)
 		if err != nil {
@@ -123,6 +127,13 @@ func (d *daemonUseCase) startGuards() error {
 		if !r.NeedEncryption && encrypted {
 			log.Warnf("resource %s is encrypted but need_encryption: false \u2014 leaving it locked", r.Path)
 		}
+	}
+	return nil
+}
+
+func (d *daemonUseCase) startGuards() error {
+	if err := d.verifyEncryptionStates(); err != nil {
+		return err
 	}
 
 	for _, r := range d.resources {
@@ -146,18 +157,14 @@ func (d *daemonUseCase) startGuards() error {
 	// from the BPF whitelist and therefore denied — fail-closed exactly
 	// like any other binary — so the unlock never precedes their
 	// protection: hooks attach, then unlock, then populate, then resolve.
+	// The re-sync right after catches binaries that were replaced on disk
+	// while the daemon was down (an application update keyed by a stale
+	// inode): the updated process is usually already running by the time
+	// the daemon comes up.
 	for i := range d.guards {
 		if err := d.guards[i].ResolvePendingBinaries(); err != nil {
 			return fmt.Errorf("resolving deferred binaries for %s: %w", d.resources[i].Path, err)
 		}
-	}
-
-	// A binary that was replaced on disk while the daemon was down (an
-	// application update) is keyed by a stale inode in the whitelist.
-	// Re-sync once before the first event: the updated process is
-	// usually already running the new binary by the time the daemon
-	// comes up.
-	for i := range d.guards {
 		if _, err := d.guards[i].ReSyncBinaries(); err != nil {
 			return fmt.Errorf("re-syncing binary whitelist for %s: %w", d.resources[i].Path, err)
 		}
@@ -292,22 +299,12 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	// Phase 2 — populate the inode maps of the new guards. Every new
 	// resource is unlocked (or was already readable) and the new hooks are
 	// attached, so the scan sees the plaintext without a protection gap.
-	// Deferred binary whitelist entries are resolved right after: same
-	// fail-closed ordering as at startup (attach → unlock → populate →
-	// resolve).
-	for i := range guards {
-		if err := guards[i].PopulateInodes(); err != nil {
-			d.rollbackReload(guards, unlocked)
-			return fmt.Errorf("reload: populating guard inodes for %s: %w", resources[i].Path, err)
-		}
-		if err := guards[i].ResolvePendingBinaries(); err != nil {
-			d.rollbackReload(guards, unlocked)
-			return fmt.Errorf("reload: resolving deferred binaries for %s: %w", resources[i].Path, err)
-		}
-		if _, err := guards[i].ReSyncBinaries(); err != nil {
-			d.rollbackReload(guards, unlocked)
-			return fmt.Errorf("reload: re-syncing binary whitelist for %s: %w", resources[i].Path, err)
-		}
+	// Deferred binary whitelist entries are resolved right after, then the
+	// whitelist re-synced: same fail-closed ordering as at startup
+	// (attach → unlock → populate → resolve → re-sync).
+	if err := d.prepareGuards(resources, guards); err != nil {
+		d.rollbackReload(guards, unlocked)
+		return err
 	}
 
 	// Phase 3 — start the ringbuf readers of all new guards. The old
@@ -369,6 +366,25 @@ func (d *daemonUseCase) startNewGuards(guards []repository.GuardRepository) erro
 	for _, g := range guards {
 		if err := g.Start(); err != nil {
 			return fmt.Errorf("reload: starting new guard: %w", err)
+		}
+	}
+	return nil
+}
+
+// prepareGuards fills the inode maps of the freshly built (and already
+// attached) guards, resolves their deferred whitelist entries and re-syncs
+// binaries that were replaced on disk. It runs after the new resources were
+// unlocked, so every scan sees plaintext while the hooks are live.
+func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards []repository.GuardRepository) error {
+	for i := range guards {
+		if err := guards[i].PopulateInodes(); err != nil {
+			return fmt.Errorf("reload: populating guard inodes for %s: %w", resources[i].Path, err)
+		}
+		if err := guards[i].ResolvePendingBinaries(); err != nil {
+			return fmt.Errorf("reload: resolving deferred binaries for %s: %w", resources[i].Path, err)
+		}
+		if _, err := guards[i].ReSyncBinaries(); err != nil {
+			return fmt.Errorf("reload: re-syncing binary whitelist for %s: %w", resources[i].Path, err)
 		}
 	}
 	return nil

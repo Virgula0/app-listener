@@ -424,7 +424,7 @@ func (g *Guard) ResolvePendingBinaries() error {
 	// The maps are writable while the program is attached. Entries are
 	// keyed by inode, so the write is idempotent by construction.
 	resolved, events, stillDeferred := g.resolveDeferred()
-	
+
 	g.mu.Lock()
 	g.deferred = stillDeferred
 	g.mu.Unlock()
@@ -459,8 +459,8 @@ func (g *Guard) ResolvePendingBinaries() error {
 // canonicalBinaryPath resolves symlinks for whitelist bookkeeping, falling
 // back to the literal path when the link chain is temporarily broken.
 func canonicalBinaryPath(path string) string {
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		return real
+	if target, err := filepath.EvalSymlinks(path); err == nil {
+		return target
 	}
 	return path
 }
@@ -491,6 +491,34 @@ func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][
 	return nil
 }
 
+// retryDeferredBinaries retries the deferred whitelist rules once,
+// admitting every rule that became readable: it writes the map entries
+// and merges the resolved entries into the guard's bookkeeping. It is the
+// shared bookkeeping of ResolvePendingBinaries and ReSyncBinaries.
+func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map[string][]ebpf.EventType, stillDeferred []deferredBinary) error {
+	g.mu.Lock()
+	g.deferred = stillDeferred
+	g.mu.Unlock()
+
+	if len(resolved) == 0 {
+		return nil
+	}
+	if err := g.addBinaryActions(resolved); err != nil {
+		return err
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.binaries = append(g.binaries, resolved...)
+	if g.exeEvents == nil {
+		g.exeEvents = make(map[string][]ebpf.EventType)
+	}
+	for path, types := range resolvedEvents {
+		g.exeEvents[path] = types
+	}
+	return nil
+}
+
 // ReSyncBinaries re-stats every whitelisted binary and rewrites its
 // inode-keyed action when the file was replaced in place — an application
 // update that swaps a binary file (Discord's updater) changes the inode
@@ -504,24 +532,8 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 	// Retry deferred rules first; newly resolved binaries are recorded in
 	// deployed by addBinaryActions and the pass below leaves them alone.
 	resolved, resolvedEvents, stillDeferred := g.resolveDeferred()
-	
-	g.mu.Lock()
-	g.deferred = stillDeferred
-	g.mu.Unlock()
-
-	if len(resolved) > 0 {
-		if err := g.addBinaryActions(resolved); err != nil {
-			return 0, err
-		}
-		g.mu.Lock()
-		g.binaries = append(g.binaries, resolved...)
-		if g.exeEvents == nil {
-			g.exeEvents = make(map[string][]ebpf.EventType)
-		}
-		for path, types := range resolvedEvents {
-			g.exeEvents[path] = types
-		}
-		g.mu.Unlock()
+	if err := g.retryDeferredBinaries(resolved, resolvedEvents, stillDeferred); err != nil {
+		return 0, err
 	}
 
 	g.mu.Lock()
@@ -563,11 +575,9 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 	return changed, nil
 }
 
-func (g *Guard) populateMaps() error {
-	modeKey, err := guardModeKey(g.mode)
-	if err != nil {
-		return err
-	}
+// writeGuardConfig stores the scalar guard configuration in
+// guard_config[0..2]: operating mode, recursion flag, and depth limit.
+func (g *Guard) writeGuardConfig(modeKey uint64) error {
 	if putErr := g.objs.GuardConfig.Put(uint32(0), modeKey); putErr != nil {
 		return fmt.Errorf("setting mode in config: %w", putErr)
 	}
@@ -585,6 +595,17 @@ func (g *Guard) populateMaps() error {
 	}
 	if putErr := g.objs.GuardConfig.Put(uint32(2), uint64(g.depth)); putErr != nil {
 		return fmt.Errorf("setting depth in config: %w", putErr)
+	}
+	return nil
+}
+
+func (g *Guard) populateMaps() error {
+	modeKey, err := guardModeKey(g.mode)
+	if err != nil {
+		return err
+	}
+	if cfgErr := g.writeGuardConfig(modeKey); cfgErr != nil {
+		return cfgErr
 	}
 
 	// The watch root's (dev, ino) is stored for the BPF root-confinement

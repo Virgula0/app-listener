@@ -170,7 +170,7 @@ func applyDirective(current *Resource, line string, lineNo int) error {
 		// becomes resolvable).
 		log.Warnf("daemon config line %d: binary not readable yet, deferring: %s", lineNo, binPath)
 		current.PendingBinaries = append(current.PendingBinaries, rule)
-		return nil
+		return nil //nolint:nilerr // returning nil despite statErr is the point: the unreadable rule is deliberately deferred, not dropped
 	}
 	if resolved, resolveErr := filepath.EvalSymlinks(binPath); resolveErr == nil && resolved != binPath {
 		log.Infof("daemon config line %d: binary symlink resolved: %s -> %s", lineNo, binPath, resolved)
