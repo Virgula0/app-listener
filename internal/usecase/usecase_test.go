@@ -49,6 +49,8 @@ type fakeGuardRepo struct {
 	stopped     bool
 	populated   bool
 	resolved    bool
+	resynced    int
+	resyncErr   error
 	startErr    error
 	populateErr error
 	resolveErr  error
@@ -73,6 +75,14 @@ func (f *fakeGuardRepo) ResolvePendingBinaries() error {
 	}
 	f.resolved = true
 	return nil
+}
+
+func (f *fakeGuardRepo) ReSyncBinaries() (int, error) {
+	if f.resyncErr != nil {
+		return 0, f.resyncErr
+	}
+	f.resynced++
+	return 1, nil
 }
 
 func (f *fakeGuardRepo) Start() error {

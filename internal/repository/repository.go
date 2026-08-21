@@ -31,6 +31,13 @@ type GuardRepository interface {
 	// that stays unreadable is kept deferred and logged — protection
 	// remains fail-closed.
 	ResolvePendingBinaries() error
+	// ReSyncBinaries re-stats every whitelisted binary and rewrites its
+	// inode-keyed entry when the file was replaced in place (an
+	// application update). Stale map keys are never deleted, so
+	// pre-replacement processes keep working. It is safe to call
+	// repeatedly; it also retries binaries still deferred from load. It
+	// returns the number of binaries whose map entries changed.
+	ReSyncBinaries() (int, error)
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

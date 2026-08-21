@@ -1843,3 +1843,14 @@ func (s *IntegrationSuite) TestGuard_PopulateInodes_FillsMap() {
 
 	s.runGuardTest(c, "TestPopulateInodesFillsMap")
 }
+
+// TestGuard_ReSyncBinaries_Replacement verifies the in-place-replacement
+// fix for the Discord updater denials: a whitelisted binary replaced in
+// place (same path, new inode) is denied after relaunch until
+// ReSyncBinaries rewrites its map entry, then allowed again.
+func (s *IntegrationSuite) TestGuard_ReSyncBinaries_Replacement() {
+	c := s.newGuardTestContainer()
+	defer c.Terminate(s.ctx)
+
+	s.runGuardTest(c, "TestReSyncBinariesReplacement")
+}

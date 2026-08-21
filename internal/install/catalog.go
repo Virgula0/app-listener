@@ -343,7 +343,9 @@ var Catalog = []CandidateDir{
 		}},
 	{Name: "Discord", RelPath: ".config/discord",
 		Whitelist: map[string][]string{
-			"%HOME%/.config/discord/*/Discord":                 nil,
+			"%HOME%/.config/discord/*/Discord": nil,
+			// Chrome-sandbox and the crashpad handler live in the
+			// versioned app dir; the wildcard covers every release.
 			"%HOME%/.config/discord/*/chrome-sandbox":          nil,
 			"%HOME%/.config/discord/*/chrome_crashpad_handler": nil,
 		}},

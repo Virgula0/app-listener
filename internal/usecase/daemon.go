@@ -18,6 +18,14 @@ const (
 	// EBUSY/ENOKEY dance when deprovisioning fscrypt keys.
 	maxLockRetries = 100
 	lockRetryDelay = 10 * time.Millisecond
+	// resyncMinInterval throttles re-syncing the binary whitelist after a
+	// denied access: a denial storm must not re-stat every whitelisted
+	// binary on each event.
+	resyncMinInterval = 2 * time.Second
+	// resyncSweepEvery is the interval of the background binary re-sync
+	// sweep, which catches replacements that never produced a denied
+	// access (the replaced binary was still running when it was swapped).
+	resyncSweepEvery = 30 * time.Second
 )
 
 // DaemonEvent is one guard event tagged with the resource it belongs to.
@@ -144,6 +152,17 @@ func (d *daemonUseCase) startGuards() error {
 		}
 	}
 
+	// A binary that was replaced on disk while the daemon was down (an
+	// application update) is keyed by a stale inode in the whitelist.
+	// Re-sync once before the first event: the updated process is
+	// usually already running the new binary by the time the daemon
+	// comes up.
+	for i := range d.guards {
+		if _, err := d.guards[i].ReSyncBinaries(); err != nil {
+			return fmt.Errorf("re-syncing binary whitelist for %s: %w", d.resources[i].Path, err)
+		}
+	}
+
 	for i := range d.guards {
 		if err := d.guards[i].Start(); err != nil {
 			return fmt.Errorf("starting guard for %s: %w", d.resources[i].Path, err)
@@ -160,11 +179,26 @@ func (d *daemonUseCase) startGuards() error {
 }
 
 func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardRepository, stop <-chan struct{}) {
+	sweep := time.NewTicker(resyncSweepEvery)
+	defer sweep.Stop()
+	var lastResync time.Time
 	for {
 		select {
 		case ev, ok := <-g.Events():
 			if !ok {
 				return
+			}
+			// A denied access usually means the accessing binary was
+			// replaced in place (an application update changed its
+			// inode); re-sync the whitelist so the new binary is
+			// admitted — the update retries the write within seconds.
+			// Throttled: a denial storm must not re-stat the whitelist
+			// on every event.
+			if ev.Blocked && time.Since(lastResync) >= resyncMinInterval {
+				if _, err := g.ReSyncBinaries(); err != nil {
+					log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
+				}
+				lastResync = time.Now()
 			}
 			select {
 			case d.events <- DaemonEvent{Resource: resource, Event: ev}:
@@ -173,6 +207,14 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 			case <-stop:
 				return
 			}
+		case <-sweep.C:
+			// Periodic sweep: catches replacements that never produced
+			// a denied access (the old binary was still running when
+			// the update swapped it, so nothing was blocked).
+			if _, err := g.ReSyncBinaries(); err != nil {
+				log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
+			}
+			lastResync = time.Now()
 		case <-d.done:
 			return
 		case <-stop:
@@ -261,6 +303,10 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 		if err := guards[i].ResolvePendingBinaries(); err != nil {
 			d.rollbackReload(guards, unlocked)
 			return fmt.Errorf("reload: resolving deferred binaries for %s: %w", resources[i].Path, err)
+		}
+		if _, err := guards[i].ReSyncBinaries(); err != nil {
+			d.rollbackReload(guards, unlocked)
+			return fmt.Errorf("reload: re-syncing binary whitelist for %s: %w", resources[i].Path, err)
 		}
 	}
 
