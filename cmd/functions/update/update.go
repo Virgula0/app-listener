@@ -1,9 +1,11 @@
 // The `app-listener update` command keeps an installed daemon binary up to
-// date with the latest GitHub pre-release:
+// date with the latest GitHub release of the selected channel (--channel,
+// default "stable"):
 //
 //  1. reads the installed binary's embedded version (--version)
-//  2. lists the repository pre-releases from the GitHub API and picks the
-//     newest one (by published_at)
+//  2. lists the repository releases from the GitHub API, keeps the ones of
+//     the selected channel (stable = non-pre-releases, pre-release =
+//     pre-releases) and picks the newest one (by published_at)
 //  3. skips when the installed tag is not older
 //  4. downloads the release binary, its sha256 checksum and the Ed25519
 //     signature of that checksum
@@ -21,6 +23,7 @@
 package update
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -36,6 +39,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,29 +66,47 @@ const (
 	// preVersionPattern matches the release tag format
 	// pre-YYYYMMDD-<sha7> produced by the release workflow.
 	preVersionPattern = `^pre-(\d{8})-([0-9a-f]{7})$`
+	// stableVersionPattern matches the stable release tag format vX.Y.Z
+	// following the standard Go semver convention.
+	stableVersionPattern = `^v?(\d+)\.(\d+)\.(\d+)$`
 	// updateHTTPTimeout bounds a single GitHub API/download request.
 	updateHTTPTimeout = 60 * time.Second
 )
 
+const (
+	// channelStable and channelPreRelease are the accepted --channel
+	// values. channelStable tracks non-pre-release (stable) releases.
+	channelStable     = "stable"
+	channelPreRelease = "pre-release"
+)
+
 var preVersionRe = regexp.MustCompile(preVersionPattern)
+
+var stableVersionRe = regexp.MustCompile(stableVersionPattern)
 
 // yesFlag skips the changelog viewer and the confirmation prompt.
 var yesFlag bool
 
+// channelFlag selects which GitHub releases to track: channelStable
+// (default) or channelPreRelease.
+var channelFlag string
+
 func init() {
 	UpdateCmd.Flags().BoolVar(&yesFlag, "yes", false,
 		"update without the changelog viewer and confirmation prompt")
+	UpdateCmd.Flags().StringVar(&channelFlag, "channel", channelStable,
+		"release channel to track: stable or pre-release")
 }
 
 var UpdateCmd = &cobra.Command{
 	Use:   "update",
-	Short: "Self-update from the latest GitHub pre-release",
+	Short: "Self-update from the latest GitHub release of the selected channel",
 	Long: `Root-only self-updater for the daemon mode.
 
-The command checks the latest pre-release of the repository (the
-pre-YYYYMMDD-<sha> builds produced by the release workflow), compares it
-with the version embedded in the installed binary at /usr/local/sbin/
-app-listener, and when a newer one exists:
+The command checks the latest release of the selected --channel (stable
+or pre-release, default stable), compares it with the version embedded
+in the installed binary at /usr/local/sbin/app-listener, and when a
+newer one exists:
 
   1. downloads the release binary and its sha256 checksum
   2. verifies the Ed25519 signature of the checksum against the public key
@@ -97,6 +119,10 @@ app-listener, and when a newer one exists:
   4. replaces the installed binary atomically
   5. restarts the systemd daemon (it is stopped first so the watch
      directories are verified locked again before the new binary starts)
+
+The stable channel tracks non-pre-release releases (vX.Y.Z tags); the
+pre-release channel tracks the pre-YYYYMMDD-<sha> builds produced by the
+release workflow.
 
 When stdin is not a terminal the command aborts without updating; use
 --yes to update without the viewer and the prompt (for scripts and
@@ -120,12 +146,24 @@ type githubRelease struct {
 	} `json:"assets"`
 }
 
+// validateChannel rejects --channel values that are neither of the two
+// supported channels.
+func validateChannel(ch string) error {
+	if ch != channelStable && ch != channelPreRelease {
+		return fmt.Errorf("invalid --channel %q: must be %q or %q", ch, channelStable, channelPreRelease)
+	}
+	return nil
+}
+
 // runUpdate drives the whole update flow. All release checks run first;
 // only then is the changelog shown and the user asked to confirm, unless
 // --yes skips the interactive part entirely.
 func runUpdate(cmd *cobra.Command, args []string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("update must be run as root: sudo app-listener update")
+	}
+	if err := validateChannel(channelFlag); err != nil {
+		return err
 	}
 	if _, err := os.Lstat(systemd.InstallBinaryPath); err != nil {
 		return fmt.Errorf("the daemon is not installed (no %s): run `app-listener install` first", systemd.InstallBinaryPath)
@@ -134,18 +172,25 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	installed := readInstalledVersion(systemd.InstallBinaryPath)
 	log.Infof("installed version: %s", installed)
 
-	releases, err := fetchPreReleases(githubAPIBase, defaultRepo, updateHTTPClient())
+	releases, err := fetchReleases(githubAPIBase, defaultRepo, updateHTTPClient())
 	if err != nil {
 		return err
 	}
-	latest, ok := pickLatestPreRelease(releases)
+	channel := filterChannel(releases, channelFlag)
+	latest, ok := pickLatestRelease(channel)
 	if !ok {
-		log.Info("no pre-releases found: nothing to update")
+		log.Infof("no %s releases found: nothing to update", channelFlag)
 		return nil
 	}
-	log.Infof("latest pre-release: %s (published %s)", latest.TagName, latest.PublishedAt)
+	log.Infof("latest %s release: %s (published %s)", channelFlag, latest.TagName, latest.PublishedAt)
 
-	if !newerThanInstalled(installed, &latest, releases) {
+	var newer bool
+	if channelFlag == channelStable {
+		newer = newerThanStable(installed, &latest)
+	} else {
+		newer = newerThanInstalled(installed, &latest, channel)
+	}
+	if !newer {
 		log.Infof("installed version %s is up to date", installed)
 		return nil
 	}
@@ -305,9 +350,9 @@ func readInstalledVersion(installPath string) string {
 	return fields[len(fields)-1]
 }
 
-// fetchPreReleases returns the pre-releases of the repository, newest
-// first, from the GitHub releases API.
-func fetchPreReleases(apiBase, repo string, client *http.Client) ([]githubRelease, error) {
+// fetchReleases returns the repository releases, newest first, from the
+// GitHub releases API, without any channel filtering.
+func fetchReleases(apiBase, repo string, client *http.Client) ([]githubRelease, error) {
 	url := fmt.Sprintf("%s/repos/%s/releases?per_page=100", apiBase, repo)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
 	if err != nil {
@@ -328,18 +373,32 @@ func fetchPreReleases(apiBase, repo string, client *http.Client) ([]githubReleas
 	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
 		return nil, fmt.Errorf("decoding releases of %s: %w", repo, err)
 	}
-	var pre []githubRelease
-	for i := range releases {
-		if releases[i].Prerelease {
-			pre = append(pre, releases[i])
-		}
-	}
-	return pre, nil
+	return releases, nil
 }
 
-// pickLatestPreRelease returns the pre-release with the most recent
-// published_at timestamp.
-func pickLatestPreRelease(releases []githubRelease) (githubRelease, bool) {
+// filterChannel keeps only the releases of the selected channel,
+// preserving the server order. The stable channel is everything that is
+// not marked prerelease; the pre-release channel is exactly the marked
+// prereleases.
+func filterChannel(releases []githubRelease, channel string) []githubRelease {
+	keep := func(r githubRelease) bool {
+		if channel == channelPreRelease {
+			return r.Prerelease
+		}
+		return !r.Prerelease
+	}
+	var out []githubRelease
+	for i := range releases {
+		if keep(releases[i]) {
+			out = append(out, releases[i])
+		}
+	}
+	return out
+}
+
+// pickLatestRelease returns the release with the most recent published_at
+// timestamp.
+func pickLatestRelease(releases []githubRelease) (githubRelease, bool) {
 	var latest githubRelease
 	found := false
 	for i := range releases {
@@ -385,6 +444,75 @@ func newerThanInstalled(installed string, latest *githubRelease, releases []gith
 	// older than the newest page of releases we fetched.
 	log.Infof("installed tag %s not found among the fetched pre-releases: updating", installed)
 	return true
+}
+
+// newerThanStable reports whether the latest stable release is newer than
+// the installed version. An installed version that is not a stable semver
+// (a pre-release build, a dev build or an unknown version) needs the
+// latest stable. When both sides are stable semver tags only a strictly
+// newer release triggers an update.
+func newerThanStable(installed string, latest *githubRelease) bool {
+	if installed == latest.TagName {
+		return false
+	}
+	installMSIP, installOK := parseStableVersion(installed)
+	if !installOK {
+		log.Infof("installed version %q is not a stable release: the latest stable %s is newer", installed, latest.TagName)
+		return true
+	}
+	latestVer, latestOK := parseStableVersion(latest.TagName)
+	if !latestOK {
+		log.Warnf("the latest stable release %q does not follow the vX.Y.Z tag convention: updating", latest.TagName)
+		return true
+	}
+	return compareStableVersions(latestVer, installMSIP) > 0
+}
+
+// stableVersion holds the numeric components of a vX.Y.Z stable version.
+type stableVersion struct {
+	major, minor, patch uint64
+}
+
+// parseStableVersion parses a vX.Y.Z (or X.Y.Z) tag into its numeric
+// components; ok is false for anything else.
+func parseStableVersion(s string) (stableVersion, bool) {
+	m := stableVersionRe.FindStringSubmatch(s)
+	if m == nil {
+		return stableVersion{}, false
+	}
+	v := stableVersion{}
+	var err error
+	if v.major, err = parseVerPart(m[1]); err != nil {
+		return stableVersion{}, false
+	}
+	if v.minor, err = parseVerPart(m[2]); err != nil {
+		return stableVersion{}, false
+	}
+	if v.patch, err = parseVerPart(m[3]); err != nil {
+		return stableVersion{}, false
+	}
+	return v, true
+}
+
+// parseVerPart converts a numeric version component.
+func parseVerPart(s string) (uint64, error) {
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// compareStableVersions compares two stable versions: negative when a < b,
+// zero when equal, positive when a > b.
+func compareStableVersions(a, b stableVersion) int {
+	if a.major != b.major {
+		return cmp.Compare(a.major, b.major)
+	}
+	if a.minor != b.minor {
+		return cmp.Compare(a.minor, b.minor)
+	}
+	return cmp.Compare(a.patch, b.patch)
 }
 
 // updateHTTPClient returns an HTTP client with a bounded per-request

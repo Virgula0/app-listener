@@ -158,6 +158,46 @@ func TestDaemonUseCaseStartLifecycle(t *testing.T) {
 	if !repo.populated {
 		t.Error("guard inode map should be populated after unlock and before start")
 	}
+	if !repo.resolved {
+		t.Error("deferred binaries should be resolved after populate and before start")
+	}
+}
+
+func TestDaemonUseCaseResolveFailureFailsStart(t *testing.T) {
+	// Set after unlock+populate, so a failed resolution must leave the
+	// resource in the pre-unlock state once the caller runs Stop().
+	vault := newFakeVault("/vault")
+	repo := newFakeGuardRepo()
+	repo.resolveErr = errBoom
+	d, err := NewDaemonUseCase(
+		[]daemonconfig.Resource{resource("/vault")},
+		vault,
+		[]repository.GuardRepository{repo},
+	)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+
+	if err := d.Start(); !errors.Is(err, errBoom) {
+		t.Fatalf("Start should propagate resolution error, got %v", err)
+	}
+	if !vault.unlocked["/vault"] {
+		t.Error("resource should have been unlocked before the resolution attempt")
+	}
+	if !repo.populated {
+		t.Error("inode population should precede deferred-binary resolution")
+	}
+	if repo.started {
+		t.Error("guard must not be started after resolution failure")
+	}
+
+	d.Stop()
+	if vault.unlocked["/vault"] {
+		t.Error("resource must be locked back after a failed start")
+	}
+	if !repo.stopped {
+		t.Error("guard must be stopped after a failed start")
+	}
 }
 
 func TestDaemonUseCaseStartNotEncryptedFails(t *testing.T) {

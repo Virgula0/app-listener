@@ -659,9 +659,9 @@ func (m *fileEditModel) findDir(path string) *fileNode {
 	return nil
 }
 
-// beginChmod prepares the octal mode editor for the selected entry. Only
-// the numeric permission bits can be changed (the rest of the file mode
-// bits, e.g. setuid/sticky, stay untouched).
+// beginChmod prepares the octal mode editor for the selected entry. The
+// value is a conventional unix mode: 3-4 octal digits where the optional
+// leading digit carries setuid/setgid/sticky (e.g. 4755).
 func (m *fileEditModel) beginChmod() {
 	n := m.selected()
 	if n == nil {
@@ -681,7 +681,9 @@ func (m *fileEditModel) beginChmod() {
 	m.chmodInput.Width = max(m.paneWidth()-12, 4)
 	m.chmodInput.Prompt = "mode: "
 	m.chmodInput.Placeholder = "0644"
-	m.chmodInput.SetValue(fmt.Sprintf("%04o", info.Mode().Perm()))
+	// Prefill the full mode including setuid/setgid/sticky, so confirming
+	// an untouched input can never silently strip those bits.
+	m.chmodInput.SetValue(fmt.Sprintf("%04o", fileModeToUnixMode(info.Mode())))
 	m.chmodInput.Focus()
 	m.mode = modeChmod
 	m.status = ""
@@ -700,7 +702,10 @@ func (m *fileEditModel) applyChmod() {
 		m.status = "invalid mode: must not exceed 07777"
 		return
 	}
-	if err := os.Chmod(m.chmodPath, os.FileMode(perm)); err != nil {
+	// The typed value is a unix mode; os.FileMode must be derived through
+	// the converter or the setuid/setgid/sticky bits are lost (a raw cast
+	// maps them onto undefined FileMode bits that chmod ignores).
+	if err := os.Chmod(m.chmodPath, unixModeToFileMode(uint32(perm))); err != nil {
 		m.status = err.Error()
 		return
 	}

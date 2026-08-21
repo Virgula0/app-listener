@@ -2,14 +2,17 @@ package guard
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/sys/unix"
 
-	"github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 type guardUnitTest struct {
@@ -217,6 +220,33 @@ func (s *guardUnitTest) TestIsGuardedBinaryNotPresent() {
 	s.Require().False(result)
 }
 
+// TestIsGuardedBinaryConfiguredSymlink is the gh/gcloud/goland regression:
+// the config whitelists a symlink (e.g. /home/angelo/.local/bin/gh) while
+// /proc/PID/exe reports the resolved real path. Guard creation records the
+// canonical target in canonicalPaths, so the real path must match.
+func (s *guardUnitTest) TestIsGuardedBinaryConfiguredSymlink() {
+	tmpDir := s.T().TempDir()
+	targetPath := filepath.Join(tmpDir, "opt", "gh")
+	s.Require().NoError(os.MkdirAll(filepath.Dir(targetPath), 0o755))
+	s.Require().NoError(os.WriteFile(targetPath, []byte("data"), 0755))
+
+	linkPath := filepath.Join(tmpDir, "bin", "gh")
+	s.Require().NoError(os.MkdirAll(filepath.Dir(linkPath), 0o755))
+	s.Require().NoError(os.Symlink(targetPath, linkPath))
+
+	g := &Guard{
+		binaries: []BinaryEntry{
+			{Path: linkPath, Comm: "gh"},
+		},
+		canonicalPaths: map[string]string{linkPath: targetPath},
+	}
+
+	s.Require().True(g.isGuardedBinary(targetPath),
+		"resolved exe path must match a symlinked whitelist entry")
+	s.Require().False(g.isGuardedBinary(filepath.Join(tmpDir, "opt", "other")),
+		"unrelated resolved path must not match")
+}
+
 func (s *guardUnitTest) TestFileEventUnchanged() {
 	var comm [16]byte
 	copy(comm[:], "cat")
@@ -387,42 +417,238 @@ func (s *guardUnitTest) TestWalkInodesLockedTreeDetected() {
 	s.Require().Contains(err.Error(), "fscrypt-encrypted and locked")
 }
 
-// TestPopulateInodesFillsMap verifies the eager inode scan registers every
-// file and directory of the guarded tree in guard_inodes, so kernel-side
-// own/parent inode checks (and not only lazy discovery) protect deep
-// files. Requires root to load the BPF programs; skipped otherwise.
-func (s *guardUnitTest) TestPopulateInodesFillsMap() {
-	if os.Geteuid() != 0 {
-		s.T().Skip("requires root to load BPF programs")
-	}
-
+func (s *guardUnitTest) TestCanonicalBinaryPath() {
 	dir := s.T().TempDir()
-	s.Require().NoError(os.MkdirAll(filepath.Join(dir, "l1", "l2", "l3"), 0o755))
-	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
-	s.Require().NoError(os.WriteFile(filepath.Join(dir, "l1", "l2", "l3", "deep.txt"), []byte("d"), 0o644))
+	real := filepath.Join(dir, "real")
+	s.Require().NoError(os.WriteFile(real, []byte("x"), 0o644))
+	link := filepath.Join(dir, "link")
+	s.Require().NoError(os.Symlink(real, link))
 
-	g, err := NewGuard(dir, ModeBlacklist, nil, true, 0)
-	if err != nil {
-		s.T().Skipf("cannot load guard BPF programs (requires root + LSM support): %v", err)
+	// a symlink resolves to its target for whitelist bookkeeping
+	s.Require().Equal(real, canonicalBinaryPath(link))
+	// a broken symlink falls back to the literal path (fail-closed)
+	broken := filepath.Join(dir, "missing")
+	s.Require().Equal(broken, canonicalBinaryPath(broken))
+	// a plain path is returned unchanged
+	s.Require().Equal(real, canonicalBinaryPath(real))
+}
+
+func (s *guardUnitTest) TestResolveDeferred() {
+	dir := s.T().TempDir()
+	binaryPath := filepath.Join(dir, "tool")
+	s.Require().NoError(os.WriteFile(binaryPath, []byte("#!/bin/sh\nexit 0"), 0o755))
+
+	g := &Guard{
+		path: dir,
+		deferred: []deferredBinary{
+			{rule: daemonconfig.BinaryRule{Path: binaryPath, Events: []ebpf.EventType{ebpf.EventRead}}},
+			{rule: daemonconfig.BinaryRule{Path: filepath.Join(dir, "still-locked"), Events: []ebpf.EventType{ebpf.EventRead}}},
+		},
 	}
+
+	resolved, events, stillDeferred := g.resolveDeferred()
+	s.Require().Len(resolved, 1, "only the readable rule resolves")
+	s.Require().Equal(binaryPath, resolved[0].Path)
+	s.Require().NotEqual([32]byte{}, resolved[0].Hash, "resolved entry carries the binary hash")
+	s.Require().Equal(filepath.Base(binaryPath), resolved[0].Comm, "comm derives from the binary basename")
+	s.Require().Equal([]ebpf.EventType{ebpf.EventRead}, events[resolved[0].Path], "events are keyed by the canonical path")
+	s.Require().Len(events, 1, "only resolved rules contribute events")
+	s.Require().Len(stillDeferred, 1, "the unreadable rule stays deferred")
+	s.Require().Equal(filepath.Join(dir, "still-locked"), stillDeferred[0].rule.Path)
+	s.Require().Equal(1, stillDeferred[0].attempts, "attempt count is incremented")
+}
+
+// ----------------------------------------------------------------------
+// BPF-dependent Integration Tests
+// These tests execute real BPF logic and require root privileges.
+// They are skipped if not running as root.
+// ----------------------------------------------------------------------
+
+// helperChild is the entrypoint taken when the copied test binary is
+// exec'd by a guard test: it reads its seed file, and the guard's BPF
+// whitelist decides whether the open succeeds. Exit 0 means the access
+// was allowed, 1 that it was denied (the binaries are copies of the test
+// binary itself, which is static, so they run inside the container).
+func helperChild(seedPath string) int {
+	data, err := os.ReadFile(seedPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "helper: reading %s: %v\n", seedPath, err)
+		return 1
+	}
+	if len(data) == 0 {
+		fmt.Fprintln(os.Stderr, "helper: empty seed")
+		return 1
+	}
+	return 0
+}
+
+// copySelf copies the running test binary (a static ELF) to dst.
+func copySelf(dst string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o755)
+}
+
+// runTool execs the copied binary against seed; an error means the
+// guard denied its open of the seed file.
+func runTool(tool, seed string) error {
+	return exec.Command(tool, "-helper-child", seed).Run()
+}
+
+// guardedTree creates a whitelist-mode guard over root with the given
+// whitelisted binaries, eagerly populated, and started.
+func (s *guardUnitTest) newGuardedTree(root string, binaries []BinaryEntry, pending []daemonconfig.BinaryRule) *Guard {
+	opts := []GuardOption{WithEagerPopulate()}
+	if len(pending) > 0 {
+		opts = append(opts, WithPendingBinaries(pending))
+	}
+	g, err := NewGuard(root, ModeWhitelist, binaries, true, 0, opts...)
+	s.Require().NoError(err, "building whitelist guard")
+	s.Require().NoError(g.Start(), "starting whitelist guard")
+	return g
+}
+
+// TestResolvePendingBinariesWhitelist exercises the deferred-whitelist
+// flow that fixed the Discord startup bug: a binary unreadable at
+// guard-build time stays out of the whitelist (denied in whitelist mode)
+// until ResolvePendingBinaries runs after the "unlock", and is then
+// allowed. Fail-closed before, allowed after.
+func (s *guardUnitTest) TestResolvePendingBinariesWhitelist() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	root := s.T().TempDir()
+	seed := filepath.Join(root, "seed.txt")
+	s.Require().NoError(os.WriteFile(seed, []byte("data"), 0o644))
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-tool-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+
+	g := s.newGuardedTree(root, nil, []daemonconfig.BinaryRule{{Path: tool}})
 	defer g.Stop()
 
-	s.Require().NoError(g.PopulateInodes())
+	// Before resolve: not whitelisted → the open of seed is denied.
+	s.Require().Error(runTool(tool, seed), "unresolved pending binary must be denied")
 
-	var want []string
-	s.Require().NoError(walkInodes(dir, true, 0, 0, func(p string) error {
-		want = append(want, p)
-		return nil
-	}))
+	s.Require().NoError(g.ResolvePendingBinaries())
 
-	found := make(map[GuardInodeKey]bool, len(want))
-	var key GuardInodeKey
-	var val uint8
-	it := g.objs.GuardInodes.Iterate()
-	for it.Next(&key, &val) {
-		found[key] = true
+	s.Require().NoError(runTool(tool, seed), "resolved binary must be allowed")
+}
+
+// TestPopulateInodesFillsMap verifies the eager inode scan registers
+// every file and directory of the guarded tree in guard_inodes, so
+// kernel-side own/parent inode checks protect deep files.
+func (s *guardUnitTest) TestPopulateInodesFillsMap() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
 	}
-	s.Require().NoError(it.Err())
-	s.Require().Len(found, len(want),
-		"every inode of the tree (dirs and deep files) must be in guard_inodes after PopulateInodes")
+
+	root := s.T().TempDir()
+	s.Require().NoError(os.MkdirAll(filepath.Join(root, "sub", "deep"), 0o755))
+	dirs := []string{
+		root,
+		filepath.Join(root, "sub"),
+		filepath.Join(root, "sub", "deep"),
+	}
+	files := []string{
+		filepath.Join(root, "a.txt"),
+		filepath.Join(root, "sub", "b.txt"),
+		filepath.Join(root, "sub", "deep", "c.txt"),
+	}
+	for _, p := range files {
+		s.Require().NoError(os.WriteFile(p, []byte("x"), 0o644))
+	}
+	nodes := append(append([]string{}, dirs...), files...)
+
+	g := s.newGuardedTree(root, nil, nil)
+	defer g.Stop()
+
+	inMap := func(path string) bool {
+		dev, ino, err := ebpf.StatInode(path)
+		s.Require().NoError(err, "stating %s", path)
+		var v uint8
+		return g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
+	}
+	for _, p := range nodes {
+		s.Require().True(inMap(p), "inode of %s missing from guard_inodes", p)
+	}
+
+	count := 0
+	it := g.objs.GuardInodes.Iterate()
+	var k GuardInodeKey
+	var v uint8
+	for it.Next(&k, &v) {
+		count++
+	}
+	s.Require().Equal(len(nodes), count, "guard_inodes must contain exactly the tree nodes")
+}
+
+// TestReSyncBinariesReplacement verifies the in-place-replacement fix
+// for the Discord updater denials: a whitelisted binary replaced in
+// place (same path, new inode) is denied after relaunch — the whitelist
+// is keyed by inode — until ReSyncBinaries rewrites its map entry, after
+// which the updated binary is allowed again.
+func (s *guardUnitTest) TestReSyncBinariesReplacement() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	root := s.T().TempDir()
+	seed := filepath.Join(root, "seed.txt")
+	s.Require().NoError(os.WriteFile(seed, []byte("data"), 0o644))
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-tool-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+
+	entry, err := ComputeBinaryEntry(tool)
+	s.Require().NoError(err)
+
+	g := s.newGuardedTree(root, []BinaryEntry{entry}, nil)
+	defer g.Stop()
+
+	// Original binary is whitelisted at build: allowed.
+	s.Require().NoError(runTool(tool, seed), "original binary must be allowed")
+
+	// Replace the binary in place: write a new file, rename over the
+	// old one — same path, brand-new inode.
+	replacement := filepath.Join("/tmp", fmt.Sprintf("guard-tool-new-%d", os.Getpid()))
+	s.Require().NoError(copySelf(replacement))
+	defer os.Remove(replacement)
+	s.Require().NoError(os.Rename(replacement, tool))
+
+	// The relaunched binary's inode is not whitelisted: denied.
+	s.Require().Error(runTool(tool, seed), "replaced binary must be denied until re-synced")
+
+	// ReSyncBinaries rewrites the map entry for the new inode.
+	changed, err := g.ReSyncBinaries()
+	s.Require().NoError(err)
+	s.Require().GreaterOrEqual(changed, 1, "the replaced binary must be reported as changed")
+
+	s.Require().NoError(runTool(tool, seed), "re-synced binary must be allowed")
+
+	// Idempotent: a second pass finds nothing to do.
+	again, err := g.ReSyncBinaries()
+	s.Require().NoError(err)
+	s.Require().Zero(again, "second re-sync must be a no-op")
+}
+
+// TestMain intercepts the -helper-child invocation: the copied test
+// binary must not run the test suite when the guard execs it; every
+// other invocation proceeds to the normal test suite.
+func TestMain(m *testing.M) {
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "-helper-child" && i+1 < len(os.Args) {
+			os.Exit(helperChild(os.Args[i+1]))
+		}
+	}
+	os.Exit(m.Run())
 }

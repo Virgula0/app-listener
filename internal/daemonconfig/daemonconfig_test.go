@@ -108,16 +108,55 @@ func TestLoadMissingWatchPathSkipped(t *testing.T) {
 	}
 }
 
-func TestLoadMissingBinarySkipped(t *testing.T) {
+func TestLoadMissingBinaryDeferred(t *testing.T) {
 	dir := t.TempDir()
 	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
-/nonexistent/binary
+/nonexistent/binary READ
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(cfg.Resources[0].Binaries) != 0 {
-		t.Errorf("missing binary should be skipped: %+v", cfg.Resources[0].Binaries)
+	r := cfg.Resources[0]
+	if len(r.Binaries) != 0 {
+		t.Errorf("unreadable binary must not be whitelisted: %+v", r.Binaries)
+	}
+	if len(r.PendingBinaries) != 1 {
+		t.Fatalf("unreadable binary should be deferred, got %+v", r.PendingBinaries)
+	}
+	if r.PendingBinaries[0].Path != "/nonexistent/binary" {
+		t.Errorf("deferred path = %q, want /nonexistent/binary", r.PendingBinaries[0].Path)
+	}
+	if len(r.PendingBinaries[0].Events) != 1 || r.PendingBinaries[0].Events[0] != ebpf.EventRead {
+		t.Errorf("deferred rule must keep its event list: %+v", r.PendingBinaries[0].Events)
+	}
+}
+
+func TestLoadBinarySymlinkResolved(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "real-bin")
+	if err := os.WriteFile(target, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link-bin")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+`+link+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	r := cfg.Resources[0]
+	if len(r.Binaries) != 1 {
+		t.Fatalf("want 1 binary, got %+v", r.Binaries)
+	}
+	if r.Binaries[0].Path != target {
+		t.Errorf("symlink should resolve to real path %q, got %q", target, r.Binaries[0].Path)
+	}
+	if len(r.PendingBinaries) != 0 {
+		t.Errorf("readable symlink must not be deferred: %+v", r.PendingBinaries)
 	}
 }
 

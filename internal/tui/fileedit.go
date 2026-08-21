@@ -60,6 +60,41 @@ func isOctalMode(v string) bool {
 	return true
 }
 
+// unixModeToFileMode converts a conventional unix mode number (0o0000 to
+// 0o7777, as typed in the chmod dialog) into Go's os.FileMode. The two are
+// not interchangeable: os.FileMode keeps only the rwx bits in its low bits
+// and carries setuid, setgid and sticky as separate high flags, so a raw
+// cast drops the special bits (a raw-cast chmod 4755 silently applied 0755).
+func unixModeToFileMode(mode uint32) os.FileMode {
+	m := os.FileMode(mode & 0o777)
+	if mode&0o4000 != 0 {
+		m |= os.ModeSetuid
+	}
+	if mode&0o2000 != 0 {
+		m |= os.ModeSetgid
+	}
+	if mode&0o1000 != 0 {
+		m |= os.ModeSticky
+	}
+	return m
+}
+
+// fileModeToUnixMode is the inverse: it renders an os.FileMode as the
+// conventional octal mode number including the special bits.
+func fileModeToUnixMode(m os.FileMode) uint32 {
+	mode := uint32(m.Perm())
+	if m&os.ModeSetuid != 0 {
+		mode |= 0o4000
+	}
+	if m&os.ModeSetgid != 0 {
+		mode |= 0o2000
+	}
+	if m&os.ModeSticky != 0 {
+		mode |= 0o1000
+	}
+	return mode
+}
+
 // humanSize renders a byte count with a binary unit suffix.
 func humanSize(n int64) string {
 	switch {

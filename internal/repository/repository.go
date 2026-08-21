@@ -23,6 +23,21 @@ type GuardRepository interface {
 	// entries vanishing mid-scan are skipped, a full map degrades coverage
 	// but is not fatal.
 	PopulateInodes() error
+	// ResolvePendingBinaries retries the whitelist entries that were
+	// deferred because their resource tree was still locked when the
+	// guard was built. It must be called only after the resource is
+	// accessible (post-unlock, post-PopulateInodes). On success the
+	// deferred binaries are added to the running whitelist; a binary
+	// that stays unreadable is kept deferred and logged — protection
+	// remains fail-closed.
+	ResolvePendingBinaries() error
+	// ReSyncBinaries re-stats every whitelisted binary and rewrites its
+	// inode-keyed entry when the file was replaced in place (an
+	// application update). Stale map keys are never deleted, so
+	// pre-replacement processes keep working. It is safe to call
+	// repeatedly; it also retries binaries still deferred from load. It
+	// returns the number of binaries whose map entries changed.
+	ReSyncBinaries() (int, error)
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

@@ -11,6 +11,39 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	MonitorMapRb                     = "rb"
+	MonitorMapTmpBuf                 = "tmp_buf"
+	MonitorProgTraceDoFaccessat      = "trace_do_faccessat"
+	MonitorProgTraceDoSendfile       = "trace_do_sendfile"
+	MonitorProgTraceDoSplice         = "trace_do_splice"
+	MonitorProgTraceDoSpliceDirect   = "trace_do_splice_direct"
+	MonitorProgTraceMmap             = "trace_mmap"
+	MonitorProgTraceNotifyChange     = "trace_notify_change"
+	MonitorProgTraceSecurityMmapFile = "trace_security_mmap_file"
+	MonitorProgTraceSpliceFileRange  = "trace_splice_file_range"
+	MonitorProgTraceVfsCopyFileRange = "trace_vfs_copy_file_range"
+	MonitorProgTraceVfsGetattr       = "trace_vfs_getattr"
+	MonitorProgTraceVfsIterRead      = "trace_vfs_iter_read"
+	MonitorProgTraceVfsLink          = "trace_vfs_link"
+	MonitorProgTraceVfsMkdir         = "trace_vfs_mkdir"
+	MonitorProgTraceVfsMknod         = "trace_vfs_mknod"
+	MonitorProgTraceVfsOpen          = "trace_vfs_open"
+	MonitorProgTraceVfsRead          = "trace_vfs_read"
+	MonitorProgTraceVfsReadlink      = "trace_vfs_readlink"
+	MonitorProgTraceVfsReadv         = "trace_vfs_readv"
+	MonitorProgTraceVfsRemovexattr   = "trace_vfs_removexattr"
+	MonitorProgTraceVfsRename        = "trace_vfs_rename"
+	MonitorProgTraceVfsRmdir         = "trace_vfs_rmdir"
+	MonitorProgTraceVfsSetxattr      = "trace_vfs_setxattr"
+	MonitorProgTraceVfsSymlink       = "trace_vfs_symlink"
+	MonitorProgTraceVfsUnlink        = "trace_vfs_unlink"
+	MonitorProgTraceVfsWrite         = "trace_vfs_write"
+)
+
 // LoadMonitor returns the embedded CollectionSpec for Monitor.
 func LoadMonitor() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_MonitorBytes)
@@ -31,7 +64,7 @@ func LoadMonitor() (*ebpf.CollectionSpec, error) {
 //	*MonitorMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadMonitorObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func LoadMonitorObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := LoadMonitor()
 	if err != nil {
 		return err

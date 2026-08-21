@@ -262,13 +262,17 @@ func buildGuards(resources []daemonconfig.Resource) ([]repository.GuardRepositor
 	for _, r := range resources {
 		binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
 		events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
+		var deferred []daemonconfig.BinaryRule
 		for _, b := range r.Binaries {
 			entry, err := ebpf.ComputeBinaryEntry(b.Path)
 			if err != nil {
-				for _, built := range guards {
-					built.Stop()
-				}
-				return nil, fmt.Errorf("processing binary %q for %s: %w", b.Path, r.Path, err)
+				// The binary lives in a tree that is still locked (or is
+				// genuinely gone). Defer it so the guard can resolve it
+				// after its resource is unlocked; until then it is not
+				// whitelisted and therefore denied — fail-closed.
+				log.Warnf("binary %q for %s not readable yet, deferring: %v", b.Path, r.Path, err)
+				deferred = append(deferred, b)
+				continue
 			}
 			binaries = append(binaries, entry)
 			events[b.Path] = b.Events
@@ -277,7 +281,8 @@ func buildGuards(resources []daemonconfig.Resource) ([]repository.GuardRepositor
 		events[self.Path] = nil // the daemon itself: all events
 
 		g, err := guard.NewGuard(r.Path, guard.ModeWhitelist, binaries, true, 0,
-			guard.WithBinaryEvents(events))
+			guard.WithBinaryEvents(events),
+			guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)))
 		if err != nil {
 			for _, built := range guards {
 				built.Stop()

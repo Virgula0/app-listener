@@ -145,6 +145,171 @@ func (s *IntegrationSuite) requireNoBlockedEvent(events []guardEvent, unexpected
 }
 
 // ---------------------------------------------------------------
+// Test: inode-number reuse — stale guard_inodes entries must not
+// deny files that now live outside the guard's own watch root
+// ---------------------------------------------------------------
+
+// TestGuard_InodeReuse_StaleEntryOutsideTree is the regression test for the
+// inode-reuse bug: guard_inodes is keyed by (dev, ino) and entries are never
+// pruned, so when a guarded file is deleted and ext4 reuses its inode number
+// for a file in another tree, the stale entry denied the new file (this is
+// what broke unrelated work like git operations on an unguarded repo). A
+// guard decision must be confined to its own watch root: a matching inode
+// only counts when the file's dentry chain contains the root inode.
+func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"mkdir", "-p", "/outside"})
+	s.exec(c, []string{"sh", "-c", "echo 'inside content' > /watch/inside.txt"})
+	s.exec(c, []string{"sh", "-c", "echo 'victim content' > /watch/victim.txt"})
+
+	// mv is whitelisted so the rename-out succeeds while every other
+	// process stays blocked on the guarded tree.
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/mv")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: files inside the tree stay guarded — the fix must
+	// not weaken protection of the guard's own watch root.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/inside.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "cat on in-tree file should be blocked: %s", out)
+
+	// Simulate inode reuse deterministically: rename(2) preserves (dev,
+	// ino), so the inode scanned into guard_inodes under /watch now lives
+	// in /outside — exactly the state produced by ext4 reusing a freed
+	// inode number for a file in a different tree.
+	code, out = s.exec(c, []string{"mv", "/watch/victim.txt", "/outside/victim.txt"})
+	s.Require().Equalf(0, code, "whitelisted mv should move victim out of the tree: %s", out)
+
+	// Regression capture: with the stale entry still matching its inode,
+	// this cat was denied before the root-confinement fix; it must succeed
+	// now because /outside/victim.txt's ancestor chain contains no node
+	// of the /watch tree.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /outside/victim.txt"})
+	s.Require().Equalf(0, code, "out-of-tree victim must not be denied by its stale map entry: %s", out)
+	s.Require().Contains(out, "victim content")
+
+	// The in-tree positive control must have produced a blocked OPEN event
+	// from cat.
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "OPEN", "cat")
+
+	s.stopGuard(c)
+}
+
+// TestGuard_InodeReuse_StaleEntryOutsideTree_Deep is the deep-path variant
+// of the inode-reuse regression.  The shallow /outside/victim.txt case above
+// terminates its root-walk within any bound, but a stale entry used by a file
+// 15 levels below / (typical for real app data trees such as browser profile
+// stores) exhausted the short bound of the path_* map-hit checks: the walk
+// ran out of steps before reaching the filesystem root and failed closed,
+// denying the unguarded file.  Every direct map-hit check must therefore
+// reach the root node (or the filesystem root) before the bound is spent.
+func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree_Deep() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"mkdir", "-p", "/outside"})
+	s.exec(c, []string{"sh", "-c", "echo 'inside content' > /watch/inside.txt"})
+	s.exec(c, []string{"sh", "-c", "echo 'deep victim content' > /watch/deep.txt"})
+
+	// The stale entry must sit 15 levels below / : each rename-out below
+	// preserves (dev, ino), so the inode scanned under /watch lives at a
+	// path deeper than the old 8-step root-walk bound could reach.
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/mv")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: in-tree access stays blocked.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/inside.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "cat on in-tree file should be blocked: %s", out)
+
+	const deep = "/outside/a/b/c/d/e/f/g/h/i/j/k/l/m"
+	s.exec(c, []string{"sh", "-c", "mkdir -p " + deep})
+	code, out = s.exec(c, []string{"mv", "/watch/deep.txt", deep + "/victim.txt"})
+	s.Require().Equalf(0, code, "whitelisted mv should move victim out of the tree: %s", out)
+
+	// Regression capture: unlink of the deep out-of-tree file was denied
+	// by bound-8 fail-closed exhaustion before the bound raise; it must
+	// succeed now.
+	code, out = s.exec(c, []string{"sh", "-c", "cat " + deep + "/victim.txt"})
+	s.Require().Equalf(0, code, "deep out-of-tree victim must not be denied by its stale map entry: %s", out)
+	s.Require().Contains(out, "deep victim content")
+
+	code, out = s.exec(c, []string{"rm", deep + "/victim.txt"})
+	s.Require().Equalf(0, code, "rm on deep out-of-tree victim must not be denied by its stale map entry: %s", out)
+
+	// A pure access(2)-style probe (inode_permission) on the stale inode
+	// must pass too: that hook has no dentry to confine against, so it no
+	// longer denies — it would only ever produce false positives.
+	s.exec(c, []string{"sh", "-c", "echo 'probe content' > " + deep + "/victim.txt"})
+	code, out = s.exec(c, []string{"sh", "-c", "[ -r " + deep + "/victim.txt ]"})
+	s.Require().Equalf(0, code, "access probe on stale out-of-tree inode must succeed: %s", out)
+
+	// The in-tree positive control must still have produced a blocked OPEN
+	// event from cat.
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "OPEN", "cat")
+
+	s.stopGuard(c)
+}
+
+// TestGuard_InodeReuse_StaleDir_DeepDestRename is the regression test for the
+// destination-side rename/link leak: a DIRECTORY inode scanned under the watch
+// root and later moved to a path exactly `bound` levels deep under / makes the
+// destination-parent walk land on the filesystem root at the last iteration.
+// The root is only recognized by the self-parent probe on the NEXT hop, so the
+// exhausted loop used to fail closed and deny the unguarded op; the post-loop
+// fs-root probe must resolve the exact-bound chain and allow it.
+func (s *IntegrationSuite) TestGuard_InodeReuse_StaleDir_DeepDestRename() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"mkdir", "-p", "/watch/gone"})
+	s.exec(c, []string{"sh", "-c", "echo 'inside content' > /watch/inside.txt"})
+	s.exec(c, []string{"sh", "-c", "echo 'outside content' > /outside-src.txt"})
+
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/mv")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: the in-tree dir stays guarded.  touch on a missing
+	// file goes through mknod, so the blocked event type is MKNOD.
+	code, out := s.exec(c, []string{"sh", "-c", "touch /watch/gone/x > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "touch in in-tree dir should be blocked: %s", out)
+
+	// /o + 10 nested dirs puts 'gone' at exactly 12 levels under / (the
+	// current second-walk bound); its chain to the filesystem root is
+	// settled only on the hop past the last iteration.
+	const deep = "/o/1/2/3/4/5/6/7/8/9/10"
+	s.exec(c, []string{"sh", "-c", "mkdir -p " + deep})
+	code, out = s.exec(c, []string{"mv", "/watch/gone", deep + "/gone"})
+	s.Require().Equalf(0, code, "whitelisted mv should move dir out of the tree: %s", out)
+
+	// Regression capture: ln sources /outside-src.txt (out-of-tree, clean)
+	// and links INTO the stale deep dir.  The destination-parent walk hits
+	// gone's stale map entry and previously failed closed at the boundary,
+	// denying the link; it must succeed now.
+	code, out = s.exec(c, []string{"ln", "/outside-src.txt", deep + "/gone/link.txt"})
+	s.Require().Equalf(0, code, "link into stale deep dest dir must not be denied by its stale dir entry: %s", out)
+
+	// And a rename into the stale deep dir via a non-whitelisted binary:
+	// /dup-mv is a copy of mv, so path_rename's destination-parent check
+	// really applies (mv itself is whitelisted for the setup moves).
+	s.exec(c, []string{"cp", "/usr/bin/mv", "/dup-mv"})
+	code, out = s.exec(c, []string{"/dup-mv", "/outside-src.txt", deep + "/gone/incoming.txt"})
+	s.Require().Equalf(0, code, "rename into stale deep dest dir must not be denied by its stale dir entry: %s", out)
+
+	// The in-tree positive control must still have produced a blocked MKNOD
+	// event from touch.
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "MKNOD", "touch")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
 // Test: guard blocks all operations on a directory
 // ---------------------------------------------------------------
 
@@ -522,15 +687,17 @@ func (s *IntegrationSuite) TestGuard_Whitelist_Events() {
 // ---------------------------------------------------------------
 
 type guardExploitTest struct {
-	name   string
-	binary string
-	events []string
+	name      string
+	binary    string
+	events    []string
+	extraArgs []string
 }
 
 var guardExploitTests = []guardExploitTest{
 	{name: "copy_file_range", binary: "copy_file_range", events: []string{"OPEN"}},
 	{name: "execve", binary: "execve", events: []string{"OPEN"}},
 	{name: "io_uring", binary: "io_uring", events: []string{"OPEN"}},
+	{name: "io_uring_full", binary: "io_uring_full", events: []string{"OPEN"}, extraArgs: []string{"--sqpoll"}},
 	{name: "mmap", binary: "mmap", events: []string{"OPEN"}},
 	{name: "pread64", binary: "pread64", events: []string{"OPEN"}},
 	{name: "readv", binary: "readv", events: []string{"OPEN"}},
@@ -576,9 +743,14 @@ func (s *IntegrationSuite) TestGuard_Exploits() {
 			}
 
 			args := []string{fmt.Sprintf("/exploits/%s", et.binary)}
+			args = append(args, et.extraArgs...)
 			args = append(args, targetPath)
 
 			code, out := s.exec(c, args)
+			if code == 2 && et.name == "io_uring_full" {
+				t.Logf("skipping exploit %s (IORING_SETUP_SQPOLL not supported)", et.name)
+				return
+			}
 			s.Require().NotEqualf(0, code,
 				"exploit %s should be blocked by guard, got exit %d: %s", et.name, code, out)
 
@@ -905,6 +1077,96 @@ func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
 	s.Require().NotEqualf(0, code,
 		"open_by_handle_at should be blocked by guard: %s", out)
 	s.requireBlockedEvent(deltaEvents, "OPEN")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: bind-mount an unguarded directory over a guarded path
+//
+// The POC creates an unguarded directory with a file inside it and
+// bind-mounts it over a path inside /watch.  If mount() were not
+// intercepted, the guarded path would silently point to the
+// attacker directory.  The guard's sb_mount LSM hook checks the
+// mount point dentry against the inode map and denies mount()
+// with a blocked OPEN event.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_Mount() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits", "/tmp/evildir"})
+
+	// The mount point must exist before the guard starts: in block-all
+	// mode creating it afterwards would itself be blocked and emit
+	// MKDIR|sh instead of the OPEN event from the mount denial.
+	s.exec(c, []string{"mkdir", "-p", "/watch/mountpoint"})
+
+	exploitHostPath := absPath("./exploits/mount_bypass")
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/mount_bypass", 0755)
+	s.Require().NoError(err, "copy mount_bypass binary")
+
+	s.startGuardStd(c, "/watch")
+	logBefore := s.readGuardLog(c)
+
+	code, out := s.exec(c, []string{"/exploits/mount_bypass", "/watch/mountpoint", "/tmp/evildir"})
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	s.Require().NotEqualf(0, code,
+		"bind mount over a guarded path should be blocked: %s", out)
+	s.requireBlockedEvent(deltaEvents, "OPEN")
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: process_vm_readv — steal guarded content from memory
+//
+// The POC finds a process that has a guarded file open and dumps
+// its heap via process_vm_readv, which never touches VFS.  The
+// guard blocks it at ptrace_access_check: any process that read a
+// guarded file is marked tainted, and a non-whitelisted caller gets
+// -EPERM on the dump.
+//
+// The victim is a whitelisted bash that opens the guarded file on
+// fd 3 (open(2) without O_CLOEXEC => the open is allowed and bash
+// becomes tainted) and reads it into a shell variable living on the
+// heap.  `sleep 30` runs as a CHILD so bash stays alive and keeps
+// both the taint and its heap, letting the exploit find the victim
+// and attempt a dump.  If the taint/ptrace check is missing, the
+// dump succeeds (root has CAP_SYS_PTRACE) and the test fails.
+//
+// NOTE: on hosts with kernel.yama.ptrace_scope=1 the kernel would
+// block the cross-process read anyway, making this test pass
+// trivially.  On yama=0 hosts only the guard prevents the dump.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
+	// Must exist before the guard starts: files created afterwards are
+	// not in the BPF inode map and would not be protected.
+	s.exec(c, []string{"sh", "-c", "echo 'process_vm_readv target' > /watch/target.txt"})
+
+	exploitHostPath := absPath("./exploits/process_vm_readv")
+	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/process_vm_readv", 0755)
+	s.Require().NoError(err, "copy process_vm_readv binary")
+
+	// bash is whitelisted so it may open the guarded file.
+	s.startGuardStd(c, "/watch", "-w", "/bin/bash")
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"bash -c 'exec 3< /watch/target.txt; IFS= read -r -u3 line; sleep 30' & " +
+			"pid=$!; sleep 1; " +
+			"/exploits/process_vm_readv /watch/target.txt; code=$?; " +
+			"kill $pid 2>/dev/null; exit $code"})
+	s.Require().NotEqualf(0, code,
+		"process_vm_readv on a whitelisted victim should be blocked: %s", out)
 
 	s.stopGuard(c)
 }
@@ -1537,4 +1799,58 @@ func (s *IntegrationSuite) TestGuard_BypassVectors() {
 			s.runAttrOp(tc.binary, tc.expect, tc.targetFn)
 		})
 	}
+}
+
+// newGuardTestContainer starts a privileged container and copies the
+// compiled guard test binary into it, mirroring newNetGuardContainer. The
+// guard BPF-gated tests need root plus a live BPF LSM, which only the
+// privileged test containers can provide; the suite's startContainer
+// already mounts /sys/kernel/btf and sets APPLISTENER_ASSUME_BPF_LSM=1.
+func (s *IntegrationSuite) newGuardTestContainer() testcontainers.Container {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, "")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, guardTestAmd64Bin, "/guard.test", 0755))
+	return c
+}
+
+// runGuardTest execs the guard test binary inside c, filtered to a single
+// testify suite subtest, and asserts it passes.
+func (s *IntegrationSuite) runGuardTest(c testcontainers.Container, subtest string) {
+	code, out := s.exec(c, []string{
+		"/guard.test", "-test.run", "TestGuardUnitTest/" + subtest, "-test.v",
+	})
+	s.Require().Equalf(0, code, "guard.test %s failed: %s", subtest, out)
+}
+
+// TestGuard_PendingBinaries_Resolved exercises the deferred-whitelist flow
+// that fixed the Discord startup bug: a binary unreadable at guard-build
+// time stays out of the whitelist (denied in whitelist mode) until
+// ResolvePendingBinaries runs after the "unlock", and is then allowed.
+// Fail-closed before, allowed after; the unlock never precedes the
+// binary's whitelist entry.
+func (s *IntegrationSuite) TestGuard_PendingBinaries_Resolved() {
+	c := s.newGuardTestContainer()
+	defer c.Terminate(s.ctx)
+
+	s.runGuardTest(c, "TestResolvePendingBinariesWhitelist")
+}
+
+// TestGuard_PopulateInodes_FillsMap verifies the eager inode scan registers
+// every file and directory of the guarded tree in guard_inodes, so
+// kernel-side own/parent inode checks protect deep files.
+func (s *IntegrationSuite) TestGuard_PopulateInodes_FillsMap() {
+	c := s.newGuardTestContainer()
+	defer c.Terminate(s.ctx)
+
+	s.runGuardTest(c, "TestPopulateInodesFillsMap")
+}
+
+// TestGuard_ReSyncBinaries_Replacement verifies the in-place-replacement
+// fix for the Discord updater denials: a whitelisted binary replaced in
+// place (same path, new inode) is denied after relaunch until
+// ReSyncBinaries rewrites its map entry, then allowed again.
+func (s *IntegrationSuite) TestGuard_ReSyncBinaries_Replacement() {
+	c := s.newGuardTestContainer()
+	defer c.Terminate(s.ctx)
+
+	s.runGuardTest(c, "TestReSyncBinariesReplacement")
 }

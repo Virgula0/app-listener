@@ -18,6 +18,14 @@ const (
 	// EBUSY/ENOKEY dance when deprovisioning fscrypt keys.
 	maxLockRetries = 100
 	lockRetryDelay = 10 * time.Millisecond
+	// resyncMinInterval throttles re-syncing the binary whitelist after a
+	// denied access: a denial storm must not re-stat every whitelisted
+	// binary on each event.
+	resyncMinInterval = 2 * time.Second
+	// resyncSweepEvery is the interval of the background binary re-sync
+	// sweep, which catches replacements that never produced a denied
+	// access (the replaced binary was still running when it was swapped).
+	resyncSweepEvery = 30 * time.Second
 )
 
 // DaemonEvent is one guard event tagged with the resource it belongs to.
@@ -103,7 +111,11 @@ func (d *daemonUseCase) Start() error {
 	return startErr
 }
 
-func (d *daemonUseCase) startGuards() error {
+// verifyEncryptionStates checks every resource's encryption state against
+// its need_encryption setting before anything is unlocked or protected:
+// a misconfigured resource aborts the start instead of unlocking (or
+// silently ignoring) the wrong tree.
+func (d *daemonUseCase) verifyEncryptionStates() error {
 	for _, r := range d.resources {
 		encrypted, err := d.vault.IsEncrypted(r.Path)
 		if err != nil {
@@ -115,6 +127,13 @@ func (d *daemonUseCase) startGuards() error {
 		if !r.NeedEncryption && encrypted {
 			log.Warnf("resource %s is encrypted but need_encryption: false \u2014 leaving it locked", r.Path)
 		}
+	}
+	return nil
+}
+
+func (d *daemonUseCase) startGuards() error {
+	if err := d.verifyEncryptionStates(); err != nil {
+		return err
 	}
 
 	for _, r := range d.resources {
@@ -133,6 +152,24 @@ func (d *daemonUseCase) startGuards() error {
 		return err
 	}
 
+	// Binary whitelist entries that were deferred while their tree was
+	// still locked are now resolvable. Until this point they were absent
+	// from the BPF whitelist and therefore denied — fail-closed exactly
+	// like any other binary — so the unlock never precedes their
+	// protection: hooks attach, then unlock, then populate, then resolve.
+	// The re-sync right after catches binaries that were replaced on disk
+	// while the daemon was down (an application update keyed by a stale
+	// inode): the updated process is usually already running by the time
+	// the daemon comes up.
+	for i := range d.guards {
+		if err := d.guards[i].ResolvePendingBinaries(); err != nil {
+			return fmt.Errorf("resolving deferred binaries for %s: %w", d.resources[i].Path, err)
+		}
+		if _, err := d.guards[i].ReSyncBinaries(); err != nil {
+			return fmt.Errorf("re-syncing binary whitelist for %s: %w", d.resources[i].Path, err)
+		}
+	}
+
 	for i := range d.guards {
 		if err := d.guards[i].Start(); err != nil {
 			return fmt.Errorf("starting guard for %s: %w", d.resources[i].Path, err)
@@ -149,11 +186,26 @@ func (d *daemonUseCase) startGuards() error {
 }
 
 func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardRepository, stop <-chan struct{}) {
+	sweep := time.NewTicker(resyncSweepEvery)
+	defer sweep.Stop()
+	var lastResync time.Time
 	for {
 		select {
 		case ev, ok := <-g.Events():
 			if !ok {
 				return
+			}
+			// A denied access usually means the accessing binary was
+			// replaced in place (an application update changed its
+			// inode); re-sync the whitelist so the new binary is
+			// admitted — the update retries the write within seconds.
+			// Throttled: a denial storm must not re-stat the whitelist
+			// on every event.
+			if ev.Blocked && time.Since(lastResync) >= resyncMinInterval {
+				if _, err := g.ReSyncBinaries(); err != nil {
+					log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
+				}
+				lastResync = time.Now()
 			}
 			select {
 			case d.events <- DaemonEvent{Resource: resource, Event: ev}:
@@ -162,6 +214,14 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 			case <-stop:
 				return
 			}
+		case <-sweep.C:
+			// Periodic sweep: catches replacements that never produced
+			// a denied access (the old binary was still running when
+			// the update swapped it, so nothing was blocked).
+			if _, err := g.ReSyncBinaries(); err != nil {
+				log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
+			}
+			lastResync = time.Now()
 		case <-d.done:
 			return
 		case <-stop:
@@ -239,11 +299,12 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	// Phase 2 — populate the inode maps of the new guards. Every new
 	// resource is unlocked (or was already readable) and the new hooks are
 	// attached, so the scan sees the plaintext without a protection gap.
-	for i := range guards {
-		if err := guards[i].PopulateInodes(); err != nil {
-			d.rollbackReload(guards, unlocked)
-			return fmt.Errorf("reload: populating guard inodes for %s: %w", resources[i].Path, err)
-		}
+	// Deferred binary whitelist entries are resolved right after, then the
+	// whitelist re-synced: same fail-closed ordering as at startup
+	// (attach → unlock → populate → resolve → re-sync).
+	if err := d.prepareGuards(resources, guards); err != nil {
+		d.rollbackReload(guards, unlocked)
+		return err
 	}
 
 	// Phase 3 — start the ringbuf readers of all new guards. The old
@@ -305,6 +366,25 @@ func (d *daemonUseCase) startNewGuards(guards []repository.GuardRepository) erro
 	for _, g := range guards {
 		if err := g.Start(); err != nil {
 			return fmt.Errorf("reload: starting new guard: %w", err)
+		}
+	}
+	return nil
+}
+
+// prepareGuards fills the inode maps of the freshly built (and already
+// attached) guards, resolves their deferred whitelist entries and re-syncs
+// binaries that were replaced on disk. It runs after the new resources were
+// unlocked, so every scan sees plaintext while the hooks are live.
+func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards []repository.GuardRepository) error {
+	for i := range guards {
+		if err := guards[i].PopulateInodes(); err != nil {
+			return fmt.Errorf("reload: populating guard inodes for %s: %w", resources[i].Path, err)
+		}
+		if err := guards[i].ResolvePendingBinaries(); err != nil {
+			return fmt.Errorf("reload: resolving deferred binaries for %s: %w", resources[i].Path, err)
+		}
+		if _, err := guards[i].ReSyncBinaries(); err != nil {
+			return fmt.Errorf("reload: re-syncing binary whitelist for %s: %w", resources[i].Path, err)
 		}
 	}
 	return nil

@@ -18,6 +18,44 @@ type GuardInodeKey struct {
 	Ino uint64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	GuardMapGuardConfig             = "guard_config"
+	GuardMapGuardExeActions         = "guard_exe_actions"
+	GuardMapGuardExeEvents          = "guard_exe_events"
+	GuardMapGuardFsDevices          = "guard_fs_devices"
+	GuardMapGuardFsSbdevs           = "guard_fs_sbdevs"
+	GuardMapGuardInodes             = "guard_inodes"
+	GuardMapGuardPath               = "guard_path"
+	GuardMapGuardTaintedPids        = "guard_tainted_pids"
+	GuardMapRb                      = "rb"
+	GuardMapTmpBuf                  = "tmp_buf"
+	GuardProgGuardFileOpen          = "guard_file_open"
+	GuardProgGuardFilePermission    = "guard_file_permission"
+	GuardProgGuardFileTruncate      = "guard_file_truncate"
+	GuardProgGuardInodeGetattr      = "guard_inode_getattr"
+	GuardProgGuardInodePermission   = "guard_inode_permission"
+	GuardProgGuardInodeReadlink     = "guard_inode_readlink"
+	GuardProgGuardInodeRemovexattr  = "guard_inode_removexattr"
+	GuardProgGuardInodeSetattr      = "guard_inode_setattr"
+	GuardProgGuardInodeSetxattr     = "guard_inode_setxattr"
+	GuardProgGuardMmapFile          = "guard_mmap_file"
+	GuardProgGuardPathLink          = "guard_path_link"
+	GuardProgGuardPathMkdir         = "guard_path_mkdir"
+	GuardProgGuardPathMknod         = "guard_path_mknod"
+	GuardProgGuardPathRename        = "guard_path_rename"
+	GuardProgGuardPathRmdir         = "guard_path_rmdir"
+	GuardProgGuardPathSymlink       = "guard_path_symlink"
+	GuardProgGuardPathTruncate      = "guard_path_truncate"
+	GuardProgGuardPathUnlink        = "guard_path_unlink"
+	GuardProgGuardPtraceAccessCheck = "guard_ptrace_access_check"
+	GuardProgGuardSbMount           = "guard_sb_mount"
+	GuardProgGuardTaskAlloc         = "guard_task_alloc"
+	GuardProgGuardTaskFree          = "guard_task_free"
+)
+
 // LoadGuard returns the embedded CollectionSpec for Guard.
 func LoadGuard() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_GuardBytes)
@@ -38,7 +76,7 @@ func LoadGuard() (*ebpf.CollectionSpec, error) {
 //	*GuardMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadGuardObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func LoadGuardObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := LoadGuard()
 	if err != nil {
 		return err

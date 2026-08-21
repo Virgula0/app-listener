@@ -23,6 +23,26 @@ type NetMonInodeKey struct {
 	Ino uint64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	NetMonMapRb                  = "rb"
+	NetMonMapWatchComms          = "watch_comms"
+	NetMonMapWatchExeInodes      = "watch_exe_inodes"
+	NetMonProgTraceAccept        = "trace_accept"
+	NetMonProgTraceAccept4       = "trace_accept4"
+	NetMonProgTraceBind          = "trace_bind"
+	NetMonProgTraceClose         = "trace_close"
+	NetMonProgTraceConnect       = "trace_connect"
+	NetMonProgTraceInetCskAccept = "trace_inet_csk_accept"
+	NetMonProgTraceListen        = "trace_listen"
+	NetMonProgTraceRecvfrom      = "trace_recvfrom"
+	NetMonProgTraceRecvmsg       = "trace_recvmsg"
+	NetMonProgTraceSendmsg       = "trace_sendmsg"
+	NetMonProgTraceSendto        = "trace_sendto"
+)
+
 // LoadNetMon returns the embedded CollectionSpec for NetMon.
 func LoadNetMon() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_NetMonBytes)
@@ -43,7 +63,7 @@ func LoadNetMon() (*ebpf.CollectionSpec, error) {
 //	*NetMonMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func LoadNetMonObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func LoadNetMonObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := LoadNetMon()
 	if err != nil {
 		return err
