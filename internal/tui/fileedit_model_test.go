@@ -387,3 +387,81 @@ func TestDefaultNewFileMode(t *testing.T) {
 		t.Errorf("dir default = %o, want 0755", got)
 	}
 }
+
+// TestUnixModeToFileMode covers the conversion from conventional unix mode
+// numbers (with special bits) to Go's os.FileMode flags. A raw cast is not
+// equivalent: it maps setuid/setgid/sticky onto undefined FileMode bits
+// that chmod(2) ignores, silently reducing 4755 to 0755.
+func TestUnixModeToFileMode(t *testing.T) {
+	cases := []struct {
+		in   uint32
+		want os.FileMode
+	}{
+		{0o644, 0o644},
+		{0o755, 0o755},
+		{0o0000, 0},
+		{0o4000, os.ModeSetuid},
+		{0o2000, os.ModeSetgid},
+		{0o1000, os.ModeSticky},
+		{0o4755, os.ModeSetuid | 0o755},
+		{0o2755, os.ModeSetgid | 0o755},
+		{0o1777, os.ModeSticky | 0o777},
+		{0o7777, os.ModeSetuid | os.ModeSetgid | os.ModeSticky | 0o777},
+	}
+	for _, tc := range cases {
+		if got := unixModeToFileMode(tc.in); got != tc.want {
+			t.Errorf("unixModeToFileMode(%04o) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestFileModeToUnixModeRoundTrip verifies both converters invert each
+// other for every combination that fits in four octal digits.
+func TestFileModeToUnixModeRoundTrip(t *testing.T) {
+	for _, mode := range []uint32{0o0000, 0o0644, 0o755, 0o1777, 0o2755, 0o4755, 0o6755, 0o7755, 0o7777} {
+		if got := fileModeToUnixMode(unixModeToFileMode(mode)); got != mode {
+			t.Errorf("round trip of %04o = %04o", mode, got)
+		}
+		if back := unixModeToFileMode(fileModeToUnixMode(unixModeToFileMode(mode))); back != unixModeToFileMode(mode) {
+			t.Errorf("inverse round trip diverged for %04o", mode)
+		}
+	}
+}
+
+// TestChmodSuidEndToEnd reproduces the reported bug through the editor
+// flow: chmod 4755 must leave a real suid bit on disk, and reopening the
+// chmod dialog must prefill 4755 instead of degrading it to 0755 (which
+// would strip suid on a bare confirm).
+func TestChmodSuidEndToEnd(t *testing.T) {
+	root := testTree(t)
+	m := newFileEditModel(root)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	selectNamed(t, m, "alpha.txt")
+	updateKey(m, "m")
+	m.chmodInput.SetValue("4755")
+	updateKey(m, "enter")
+
+	info, err := os.Lstat(filepath.Join(root, "alpha.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSetuid == 0 || info.Mode().Perm() != 0o755 {
+		t.Errorf("chmod 4755 produced %v, want setuid + 0755", info.Mode())
+	}
+
+	// Reopening prefills the full mode including the special bits.
+	updateKey(m, "m")
+	if got := m.chmodInput.Value(); got != "4755" {
+		t.Errorf("prefilled mode = %q, want 4755", got)
+	}
+	// And confirming the untouched input keeps the file exactly as is.
+	updateKey(m, "enter")
+	info, err = os.Lstat(filepath.Join(root, "alpha.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSetuid == 0 || info.Mode().Perm() != 0o755 {
+		t.Errorf("confirming untouched input changed mode to %v", info.Mode())
+	}
+}
