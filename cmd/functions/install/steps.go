@@ -218,15 +218,16 @@ func validateConfigText(text string) (*daemonconfig.Config, error) {
 	return daemonconfig.Load(tmpPath)
 }
 
-// askEncryption asks, per directory that is NOT yet encrypted and that
+// askEncryption asks, per resource that is NOT yet encrypted and that
 // declares need_encryption: true, whether fscrypt encryption is required
 // (default yes) and records the decision back into the config text.
 // Resources declared need_encryption: false are never asked — the config
 // already says no encryption and the installer honors it. Already-encrypted
-// directories are never asked: they keep need_encryption: true and are not
-// migrated (no backup is created for them). Regular files cannot be
-// encrypted, so their need_encryption is forced to false. It returns the
-// updated text and the list of directories that still need to be encrypted.
+// resources are never asked: they keep need_encryption: true and are not
+// migrated (no backup is created for them). Both directories and single
+// regular files are offered; symlinks, hardlinks and special files never
+// reach this step (the daemon config parser refuses them). It returns the
+// updated text and the list of resources that still need to be encrypted.
 func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Config) (text string, toEncrypt []string, err error) {
 	for _, r := range cfg.Resources {
 		if !r.NeedEncryption {
@@ -241,25 +242,12 @@ func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Confi
 			log.Infof("%s is already encrypted: keeping need_encryption: true (no question, no backup)", r.Path)
 			continue
 		}
-		info, statErr := os.Stat(r.Path)
-		if statErr != nil {
-			return "", nil, fmt.Errorf("stat %s: %w", r.Path, statErr)
-		}
-		if !info.IsDir() {
-			log.Warnf("%s is a regular file: fscrypt cannot encrypt files, forcing need_encryption: false", r.Path)
-			updated, updateErr := inst.SetNeedEncryption(cfgText, r.Path, false)
-			if updateErr != nil {
-				return "", nil, updateErr
-			}
-			cfgText = updated
-			continue
-		}
 
 		answer := true
 		formErr := huh.NewForm(huh.NewGroup(
 			huh.NewConfirm().
 				Title(fmt.Sprintf("Require fscrypt encryption for %s?", r.Path)).
-				Description("The directory is not encrypted yet: the installer will encrypt it in place, keeping a backup.").
+				Description("The resource is not encrypted yet: the installer will encrypt it in place, keeping a backup.").
 				Affirmative("Yes, encrypt").
 				Negative("No encryption").
 				Value(&answer),

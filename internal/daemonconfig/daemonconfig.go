@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	log "github.com/sirupsen/logrus"
 
@@ -24,7 +25,10 @@ type Config struct {
 	Resources []Resource
 }
 
-// Resource is one [watch <dir>] section.
+// Resource is one [watch <path>] section. The path is either a directory
+// (the classic fscrypt-encrypted resource tree) or a single regular file
+// carrying its own fscrypt policy. Symbolic links, hard-linked files and
+// special files are refused at parse time.
 type Resource struct {
 	Path string
 	// NeedEncryption selects the fscrypt lifecycle for this resource.
@@ -115,20 +119,32 @@ func parseWatchSection(line string) (string, bool) {
 	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]")), true
 }
 
-// addResource creates a new resource for dirPath, skipping paths that do
-// not exist or are not directories (matching ssh-guard's tolerance). It
-// returns nil when the path is skipped.
-func addResource(cfg *Config, dirPath string, lineNo int) *Resource {
-	info, err := os.Stat(dirPath)
+// addResource creates a new resource for watchPath, skipping targets that
+// cannot be guarded: missing paths, symbolic links, hard-linked regular
+// files (more than one link would make the guard implicitly cover another
+// path to the same inode) and anything that is neither a directory nor a
+// unique regular file. It returns nil when the path is skipped.
+func addResource(cfg *Config, watchPath string, lineNo int) *Resource {
+	info, err := os.Lstat(watchPath)
 	if err != nil {
-		log.Warnf("daemon config line %d: skipping missing or unreadable path: %s", lineNo, dirPath)
+		log.Warnf("daemon config line %d: skipping missing or unreadable path: %s", lineNo, watchPath)
+		return nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		log.Warnf("daemon config line %d: skipping %s: symbolic links are refused as watch targets (guard identity is inode based)", lineNo, watchPath)
 		return nil
 	}
 	if !info.IsDir() {
-		log.Warnf("daemon config line %d: skipping non-directory watch path: %s", lineNo, dirPath)
-		return nil
+		if !info.Mode().IsRegular() {
+			log.Warnf("daemon config line %d: skipping %s: only directories and regular files can be watched", lineNo, watchPath)
+			return nil
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
+			log.Warnf("daemon config line %d: skipping %s: hard-linked files (%d links) are refused as watch targets", lineNo, watchPath, stat.Nlink)
+			return nil
+		}
 	}
-	cfg.Resources = append(cfg.Resources, Resource{Path: dirPath, NeedEncryption: true})
+	cfg.Resources = append(cfg.Resources, Resource{Path: watchPath, NeedEncryption: true})
 	return &cfg.Resources[len(cfg.Resources)-1]
 }
 
