@@ -3,6 +3,7 @@ package daemonconfig
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -357,19 +358,80 @@ func TestLoadNonexistentFile(t *testing.T) {
 	}
 }
 
-func TestLoadNonDirectoryWatchPathSkipped(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "plainfile")
-	if err := os.WriteFile(file, []byte("x"), 0600); err != nil {
+// TestLoadAcceptsSingleFileWatch verifies the single-file watch support:
+// a regular file is accepted as a [watch] target exactly like a directory.
+func TestLoadAcceptsSingleFileWatch(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "secret.env")
+	if err := os.WriteFile(file, []byte("KEY=value"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
-	cfg, err := Load(writeConfig(t, `[watch `+file+`]
-[watch `+dir+`]
-`))
+
+	cfg, err := Load(writeConfig(t, "[watch "+file+"]\n/usr/bin/cat\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(cfg.Resources) != 1 || cfg.Resources[0].Path != dir {
-		t.Fatalf("non-directory path should be skipped: %+v", cfg.Resources)
+	if len(cfg.Resources) != 1 || cfg.Resources[0].Path != file {
+		t.Fatalf("resources = %+v, want exactly %q", cfg.Resources, file)
+	}
+	if !cfg.Resources[0].NeedEncryption {
+		t.Error("need_encryption should default to true for a file resource too")
+	}
+}
+
+// TestLoadRefusesSymlinkWatch: guard identity is inode based, so a
+// symbolic link as watch target must be skipped, not followed.
+func TestLoadRefusesSymlinkWatch(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(writeConfig(t, "[watch "+link+"]\n/usr/bin/ssh\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 0 {
+		t.Fatalf("symlink watch target was accepted: %+v", cfg.Resources)
+	}
+}
+
+// TestLoadRefusesHardlinkedFileWatch: more than one hard link means another
+// path aliases the same inode; guarding one would implicitly cover both.
+func TestLoadRefusesHardlinkedFileWatch(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	if err := os.WriteFile(a, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	b := filepath.Join(dir, "b")
+	if err := os.Link(a, b); err != nil {
+		t.Skipf("hardlinks unavailable here: %v", err)
+	}
+
+	cfg, err := Load(writeConfig(t, "[watch "+a+"]\n/usr/bin/cat\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 0 {
+		t.Fatalf("hardlinked watch target was accepted: %+v", cfg.Resources)
+	}
+}
+
+// TestLoadRefusesSpecialFileWatch covers FIFOs (the same refusal applies to
+// sockets and devices): only directories and regular files are watchable.
+func TestLoadRefusesSpecialFileWatch(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable here: %v", err)
+	}
+
+	cfg, err := Load(writeConfig(t, "[watch "+fifo+"]\n/usr/bin/cat\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 0 {
+		t.Fatalf("FIFO watch target was accepted: %+v", cfg.Resources)
 	}
 }

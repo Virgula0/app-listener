@@ -19,6 +19,7 @@ import (
 	"github.com/google/fscrypt/actions"
 	"github.com/google/fscrypt/crypto"
 	"github.com/google/fscrypt/filesystem"
+	"github.com/google/fscrypt/metadata"
 	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/repository"
@@ -42,24 +43,45 @@ func New() *Vault {
 	return &Vault{}
 }
 
-// hasEncryptionPolicy reports whether the directory at dirPath carries an
-// fscrypt encryption policy (v1 or v2). Regular files can never carry a
-// policy, so a non-directory reports "not encrypted" instead of erroring.
-func hasEncryptionPolicy(dirPath string) (bool, error) {
-	dirFd, err := unix.Open(dirPath, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+// hasEncryptionPolicy reports whether the file or directory at path
+// carries an fscrypt encryption policy (v1 or v2). Directories are opened
+// with O_DIRECTORY; regular files are opened plainly — the kernel refuses
+// to open a LOCKED encrypted regular file at all (ENOKEY), which itself
+// proves a policy exists. Anything neither a directory nor a regular file
+// can never carry a policy and reports "not encrypted".
+func hasEncryptionPolicy(path string) (bool, error) {
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return false, fmt.Errorf("stat %s: %w", path, statErr)
+	}
+
+	openFlags := unix.O_RDONLY
+	if info.IsDir() {
+		openFlags |= unix.O_DIRECTORY
+	} else if !info.Mode().IsRegular() {
+		// Sockets, FIFOs and devices never carry an fscrypt policy.
+		return false, nil
+	}
+
+	fd, err := unix.Open(path, openFlags, 0)
 	if err != nil {
+		if errors.Is(err, unix.ENOKEY) {
+			// A locked encrypted regular file cannot even be opened:
+			// the policy is there, its key just is not provisioned.
+			return true, nil
+		}
 		if errors.Is(err, unix.ENOTDIR) {
 			return false, nil
 		}
-		return false, fmt.Errorf("open %s: %w", dirPath, err)
+		return false, fmt.Errorf("open %s: %w", path, err)
 	}
-	defer unix.Close(dirFd)
+	defer unix.Close(fd)
 
 	var arg unix.FscryptGetPolicyExArg
 	arg.Size = 24
 	_, _, errno := unix.Syscall(
 		unix.SYS_IOCTL,
-		uintptr(dirFd),
+		uintptr(fd),
 		uintptr(linux_FS_IOC_GET_ENCRYPTION_POLICY_EX),
 		uintptr(unsafe.Pointer(&arg)),
 	)
@@ -74,12 +96,106 @@ func hasEncryptionPolicy(dirPath string) (bool, error) {
 		errors.Is(errno, unix.ENOTTY) {
 		return false, nil
 	}
-	return false, fmt.Errorf("ioctl GET_ENCRYPTION_POLICY_EX on %s: %w", dirPath, errno)
+	return false, fmt.Errorf("ioctl GET_ENCRYPTION_POLICY_EX on %s: %w", path, errno)
 }
 
 // IsEncrypted reports whether path carries an fscrypt policy.
 func (v *Vault) IsEncrypted(path string) (bool, error) {
 	return hasEncryptionPolicy(path)
+}
+
+// isLockedRegularFileErr reports whether err means "this path is an
+// encrypted regular file whose key is not provisioned": the kernel refuses
+// to open such a file at all, so google/fscrypt reports
+// metadata.ErrLockedRegularFile instead of the policy.
+func isLockedRegularFileErr(err error) bool {
+	var locked *metadata.ErrLockedRegularFile
+	return errors.As(err, &locked)
+}
+
+// provisionLockedFile unlocks a locked encrypted REGULAR file. The kernel
+// refuses to open such a file before its key is provisioned, so the policy
+// cannot be identified through the path itself; instead every policy on the
+// same filesystem is tried against the master key. Each one that unwraps is
+// provisioned tentatively and the file open is retried: the matching
+// descriptor makes the file openable, while wrong candidates are
+// deprovisioned again immediately so no other resource stays unlocked as
+// collateral damage.
+func (v *Vault) provisionLockedFile(fsctx *actions.Context, path string) error {
+	keyBytes, err := readKey()
+	if err != nil {
+		return err
+	}
+	defer wipe(keyBytes)
+
+	descriptors, listErr := fsctx.Mount.ListPolicies(nil)
+	if listErr != nil {
+		return fmt.Errorf("listing policies on %s: %w", fsctx.Mount.Path, listErr)
+	}
+
+	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
+		return 0, nil
+	}
+	for _, descriptor := range descriptors {
+		candidate, getErr := actions.GetPolicy(fsctx, descriptor)
+		if getErr != nil {
+			continue // unreadable metadata entry: skip
+		}
+		if candidate.IsProvisionedByTargetUser() {
+			continue // already provisioned: cannot be what blocks the file
+		}
+		if unlockErr := candidate.Unlock(optionFn, newBoundedKeyFn(keyBytes)); unlockErr != nil {
+			continue // wrapped by a different protector: not ours
+		}
+		if provErr := candidate.Provision(); provErr != nil {
+			continue
+		}
+		fd, openErr := unix.Open(path, unix.O_RDONLY, 0)
+		if openErr == nil {
+			unix.Close(fd)
+			return nil // this was the file's own policy: it opens now
+		}
+		// Wrong policy: undo the collateral provisioning immediately.
+		_ = candidate.Deprovision(true)
+	}
+	return fmt.Errorf("no policy on %s could be unlocked with %s to open the locked file %s",
+		fsctx.Mount.Path, MasterKeyFile, path)
+}
+
+// verifyLockedFileKey validates the master key against a locked encrypted
+// regular file. The file's own policy cannot be addressed while it stays
+// locked, so success means at least one policy on this filesystem unwraps
+// with the master key (the single-key model: the file's protector wraps
+// exactly that key). Nothing is provisioned.
+func (v *Vault) verifyLockedFileKey(fsctx *actions.Context, path string) error {
+	keyBytes, err := readKey()
+	if err != nil {
+		return fmt.Errorf("verify key for %s: %w", path, err)
+	}
+	defer wipe(keyBytes)
+
+	descriptors, listErr := fsctx.Mount.ListPolicies(nil)
+	if listErr != nil {
+		return fmt.Errorf("verify key for %s: listing policies on %s: %w", path, fsctx.Mount.Path, listErr)
+	}
+	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
+		return 0, nil
+	}
+	for _, descriptor := range descriptors {
+		candidate, getErr := actions.GetPolicy(fsctx, descriptor)
+		if getErr != nil {
+			continue
+		}
+		if candidate.IsProvisionedByTargetUser() {
+			return nil // provisioned policies belong to this setup
+		}
+		if unlockErr := candidate.Unlock(optionFn, newBoundedKeyFn(keyBytes)); unlockErr == nil {
+			_ = candidate.Lock()
+			return nil
+		}
+	}
+	return fmt.Errorf("no policy on %s unlocks with %s: the locked file %s would stay unreadable",
+		fsctx.Mount.Path, MasterKeyFile, path)
 }
 
 // IsProvisioned reports whether the policy key for path is currently
@@ -91,6 +207,9 @@ func (v *Vault) IsProvisioned(path string) (bool, error) {
 	}
 	policy, err := actions.GetPolicyFromPath(fsctx, path)
 	if err != nil {
+		if isLockedRegularFileErr(err) {
+			return false, nil // locked by definition: not provisioned
+		}
 		return false, fmt.Errorf("get policy for %s: %w", path, err)
 	}
 	return policy.IsProvisionedByTargetUser(), nil
@@ -309,7 +428,16 @@ func (v *Vault) Unlock(path string) error {
 	}
 	policy, err := actions.GetPolicyFromPath(fsctx, path)
 	if err != nil {
-		return fmt.Errorf("get policy for %s: %w", path, err)
+		if !isLockedRegularFileErr(err) {
+			return fmt.Errorf("get policy for %s: %w", path, err)
+		}
+		// A locked encrypted regular file cannot even be opened, so its
+		// policy cannot be fetched through the path: find and provision
+		// its key by trying every filesystem policy against the master key.
+		if provErr := v.provisionLockedFile(fsctx, path); provErr != nil {
+			return fmt.Errorf("unlock %s: %w", path, provErr)
+		}
+		return nil
 	}
 	if policy.IsProvisionedByTargetUser() {
 		return nil
@@ -349,6 +477,10 @@ func (v *Vault) Lock(path string, forceFlush bool) error {
 	}
 	policy, err := actions.GetPolicyFromPath(fsctx, path)
 	if err != nil {
+		if isLockedRegularFileErr(err) {
+			// The file cannot even be opened: its key is already gone.
+			return fmt.Errorf("%w: %s is a locked encrypted regular file", repository.ErrKeyMissing, path)
+		}
 		return fmt.Errorf("get policy for %s: %w", path, err)
 	}
 
