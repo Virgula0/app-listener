@@ -28,8 +28,8 @@ file system operations using eBPF.
 
 Use --gui to launch the graphical interface instead of the terminal TUI
 (only available for the monitor subcommand).`,
-	// Enables the built-in --version flag; the value is injected at build
-	// time by the release workflow (see internal/constants.Version).
+	// Enables the built-in --version flag; value injected at build time
+	// (see internal/constants.Version).
 	Version: constants.Version,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		initLogger()
@@ -53,20 +53,17 @@ Use --gui to launch the graphical interface instead of the terminal TUI
 	},
 }
 
-var logLevel string
-
-// guiFlag is a persistent root flag consumed by the monitor subcommand (the
-// only one that currently supports a GUI backend).
+// guiFlag backs the persistent --gui flag, consumed by the monitor subcommand
+// (the only one that currently supports a GUI backend).
 var guiFlag bool
 
-// verboseFlag backs the global --verbose flag. Zero (or omitted) preserves
-// today's output exactly; values above zero raise verbosity and are only
-// valid together with --headless, since they apply to the headless console
-// stream — TUI/GUI presentation never changes.
+// verboseFlag backs the global --verbose knob (constants.VerboseLevel ladder) governing the
+// headless console stream and --dump-log threshold. Omitted preserves today's display; any
+// explicit value — including 0 — requires --headless. TUI/GUI presentation never changes.
 var verboseFlag int
 
-// dumpLogFile backs the global --dump-log flag: when set, every log line is
-// mirrored into this file in plain text.
+// dumpLogFile backs the global --dump-log flag: every log line is mirrored
+// into this file in plain text.
 var dumpLogFile string
 
 // dumpFileHandle is the open --dump-log file; closed after the command ran.
@@ -75,8 +72,8 @@ var dumpFileHandle *os.File
 // restoreStdLog undoes logging.BridgeStdLog after the command ran.
 var restoreStdLog func()
 
-// overwritePrompt asks whether an existing dump file may be replaced.
-// A package variable so tests can inject an answer without a terminal.
+// overwritePrompt asks whether an existing dump file may be replaced; a package
+// variable so tests can inject an answer without a terminal.
 var overwritePrompt = func(path string) (bool, error) {
 	return wizard.ConfirmOnce(fmt.Sprintf("%s already exists — overwrite it with the new dump?", path), "Overwrite")
 }
@@ -95,22 +92,17 @@ func initLogger() {
 	})
 	log.SetOutput(os.Stderr)
 
-	level, err := log.ParseLevel(logLevel)
-	if err != nil {
-		log.Warnf("invalid log level %q, using info", logLevel)
-		level = log.InfoLevel
-	}
-	log.SetLevel(level)
+	// Baseline is the historical default display; --verbose adjusts it in applyVerbosity.
+	log.SetLevel(log.InfoLevel)
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "info", "Set log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().BoolVarP(&guiFlag, "gui", "", false, "Launch GUI instead of TUI (default: false)")
 	rootCmd.PersistentFlags().IntVarP(&verboseFlag, "verbose", "v", 0,
 		fmt.Sprintf("Verbosity level 0..%d for the headless console stream and --dump-log "+
-			"(0 = default display; %d=essential, %d=current display, %d=+internal details, %d=everything). "+
-			"Requires --headless", int(constants.PrintAdditionalInfoLevelTwo),
-			int(constants.NeededInfo), int(constants.InternalWarningsLevelTwo),
+			"(%d=errors only, %d=essential, %d=current display, %d=+internal details, %d=everything). "+
+			"Any explicit value requires --headless", int(constants.PrintAdditionalInfoLevelTwo),
+			int(constants.ErrorsOnly), int(constants.NeededInfo), int(constants.InternalWarningsLevelTwo),
 			int(constants.PrintAdditionalInfoLevelOne), int(constants.PrintAdditionalInfoLevelTwo)))
 	rootCmd.PersistentFlags().StringVar(&dumpLogFile, "dump-log", "",
 		"Mirror all log lines into this file in plain text (asks before overwriting an existing file)")
@@ -126,13 +118,13 @@ func init() {
 	rootCmd.AddCommand(editprotected.EditProtectedCmd)
 }
 
-// validateVerbose enforces the --verbose contract: values above zero demand
-// --headless on the executed subcommand (verbosity applies to the headless
-// console stream only), and the value must be a defined VerboseLevel.
+// validateVerbose enforces the --verbose contract: any explicit value — including 0, the
+// errors-only quiet mode — demands --headless (verbosity applies only to the headless
+// console stream), and the value must be a defined VerboseLevel.
 func validateVerbose(cmd *cobra.Command) error {
 	flag := cmd.Flags().Lookup("verbose")
-	if flag == nil || !flag.Changed || verboseFlag == 0 {
-		return nil // omitted or explicit no-op: nothing to enforce
+	if flag == nil || !flag.Changed {
+		return nil // omitted: default display everywhere
 	}
 	maxLevel := int(constants.PrintAdditionalInfoLevelTwo)
 	if verboseFlag < 0 || verboseFlag > maxLevel {
@@ -145,23 +137,17 @@ func validateVerbose(cmd *cobra.Command) error {
 	return nil
 }
 
-// headlessRequested reports whether the executed command carries a headless
-// flag and runs with it enabled.
+// headlessRequested reports whether the executed command runs with --headless enabled.
 func headlessRequested(cmd *cobra.Command) bool {
 	flag := cmd.Flags().Lookup("headless")
 	return flag != nil && flag.Value.String() == "true"
 }
 
-// applyVerbosity raises the console log level from --verbose. Omitted or
-// zero keeps today's display untouched; an explicit --log-level always wins
-// for the console stream.
+// applyVerbosity sets the console log level from an explicit --verbose; omitted keeps
+// the initLogger info baseline (today's display).
 func applyVerbosity(cmd *cobra.Command) {
 	flag := cmd.Flags().Lookup("verbose")
-	if flag == nil || !flag.Changed || verboseFlag == 0 {
-		return
-	}
-	if logFlag := cmd.Flags().Lookup("log-level"); logFlag != nil && logFlag.Changed {
-		log.Debugf("--log-level overrides the console side of --verbose")
+	if flag == nil || !flag.Changed {
 		return
 	}
 	level, err := logging.VerboseToLogrus(constants.VerboseLevel(verboseFlag))
@@ -172,20 +158,18 @@ func applyVerbosity(cmd *cobra.Command) {
 	log.SetLevel(level)
 }
 
-// effectiveVerbose returns the verbosity governing the dump file: an
-// explicit positive --verbose when given, otherwise the level that mirrors
-// what is displayed today (--verbose 0 is a full no-op by contract).
+// effectiveVerbose returns the dump-file verbosity: an explicit --verbose when given,
+// otherwise the DefaultVerbose mirror of today's display.
 func effectiveVerbose(cmd *cobra.Command) constants.VerboseLevel {
 	flag := cmd.Flags().Lookup("verbose")
-	if flag != nil && flag.Changed && verboseFlag > 0 {
+	if flag != nil && flag.Changed {
 		return constants.VerboseLevel(verboseFlag)
 	}
 	return logging.DefaultVerbose
 }
 
-// setupDumpLog opens the --dump-log file and installs the mirroring hook.
-// An existing file is never destroyed silently: interactively the user is
-// asked, under --headless (systemd, no terminal) the run refuses so the
+// setupDumpLog opens the --dump-log file and installs the mirroring hook. An existing file is
+// never destroyed silently: interactive runs ask; under --headless the run refuses so the
 // operator can clear the file deliberately.
 func setupDumpLog(cmd *cobra.Command) error {
 	if dumpLogFile == "" {
@@ -221,10 +205,9 @@ func setupDumpLog(cmd *cobra.Command) error {
 	return nil
 }
 
-// closeDumpFile flushes state after the command completed. The hook itself
-// syncs on every write, so abrupt exits never lose emitted lines anyway.
-// The dump hook is the only hook this CLI installs, so replacing the whole
-// hook set is a precise removal.
+// closeDumpFile flushes state after the command completed; the hook itself syncs on every
+// write, so abrupt exits never lose emitted lines anyway. Replacing the whole hook set is a
+// precise removal: it's the only hook this CLI installs.
 func closeDumpFile() {
 	if dumpFileHandle == nil {
 		return

@@ -101,7 +101,7 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	parsedEvents, err := parseNetGuardEventsFlag(eventsFlag)
+	parsedEvents, err := common.ParseNetEventsFlag(eventsFlag)
 	if err != nil {
 		return err
 	}
@@ -212,22 +212,6 @@ Continue? [y/N] `)
 		return errors.New("aborted by user")
 	}
 	return nil
-}
-
-func parseNetGuardEventsFlag(flag []string) ([]ebpf.NetEventType, error) {
-	if len(flag) == 0 {
-		return ebpf.NetEventTypes(), nil
-	}
-
-	var parsed []ebpf.NetEventType
-	for _, s := range flag {
-		et, ok := ebpf.ParseNetEventType(strings.TrimSpace(s))
-		if !ok {
-			return nil, fmt.Errorf("unknown network event type %q (valid: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS, BIND, LISTEN)", s)
-		}
-		parsed = append(parsed, et)
-	}
-	return parsed, nil
 }
 
 // runHeadless prints guard events to the log. When throttle is enabled, the

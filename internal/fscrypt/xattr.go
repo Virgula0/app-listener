@@ -1,8 +1,6 @@
-// Extended-attribute preservation for in-place migrations: moving content
-// into an encrypted (or back into a plaintext) copy would silently drop
-// SELinux labels, file capabilities (e.g. cap_net_raw on ping) and user.*
-// xattrs. The copy is best-effort: each attribute that cannot be read or
-// re-applied is logged and skipped, never fatal to the migration.
+// Xattr preservation for in-place migrations: copying between plaintext and
+// encrypted copies would drop SELinux labels, file capabilities and user.*
+// xattrs. Best-effort: failed reads/writes are logged and skipped, not fatal.
 package fscrypt
 
 import (
@@ -14,8 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// copyXattrs copies every extended attribute of src onto dst. Filesystems
-// without xattr support are treated as "nothing to copy".
+// copyXattrs copies every xattr of src onto dst; ENOTSUP means nothing to copy.
 func copyXattrs(src, dst string) error {
 	names, err := listXattrNames(src)
 	if err != nil {
@@ -43,9 +40,8 @@ func copyXattrs(src, dst string) error {
 	return nil
 }
 
-// listXattrNames returns the extended attribute names of path. The buffer
-// grows on ERANGE so a concurrent attribute addition between the sizing
-// call and the read cannot truncate the list.
+// listXattrNames returns path's xattr names, growing the buffer on ERANGE
+// so concurrent additions cannot truncate the list.
 func listXattrNames(path string) ([]string, error) {
 	size := 256
 	for {
@@ -61,8 +57,7 @@ func listXattrNames(path string) ([]string, error) {
 	}
 }
 
-// splitXattrNames decodes the NUL-separated name list returned by
-// listxattr(2).
+// splitXattrNames decodes the NUL-separated listxattr(2) name list.
 func splitXattrNames(buf []byte) []string {
 	var names []string
 	for len(buf) > 0 {

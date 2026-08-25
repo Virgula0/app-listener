@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -49,4 +50,13 @@ func StatInode(path string) (dev, ino uint64, err error) {
 		return 0, 0, err
 	}
 	return uint64((unix.Major(s.Dev) << 20) | unix.Minor(s.Dev)), s.Ino, nil
+}
+
+// BinariesSummary renders a whitelist as a compact log-friendly list.
+func BinariesSummary(binaries []BinaryEntry) string {
+	parts := make([]string, len(binaries))
+	for i, b := range binaries {
+		parts[i] = fmt.Sprintf("%s [sha256:%x..%x]", b.Path, b.Hash[:4], b.Hash[28:])
+	}
+	return strings.Join(parts, ", ")
 }

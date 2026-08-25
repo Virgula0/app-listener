@@ -10,22 +10,19 @@ import (
 	"github.com/google/fscrypt/actions"
 	"github.com/google/fscrypt/filesystem"
 	"github.com/google/fscrypt/metadata"
+	log "github.com/sirupsen/logrus"
 )
 
-// appProtectorPrefix is the name given to the raw-key protector created for
-// every directory migrated by this installer (see applyRawKeyPolicy). It is
-// the signature that marks fscrypt metadata as ours: only metadata carrying
-// this name (and a raw-key source) is ever touched by the orphan cleanup, so
-// login protectors and policies created by other tools survive it.
+// appProtectorPrefix names the raw-key protectors created for migrated directories
+// (see applyRawKeyPolicy). It is the signature marking fscrypt metadata as ours:
+// only metadata with this prefix and a raw-key source is ever touched by orphan
+// cleanup, so login protectors and foreign setups survive it.
 const appProtectorPrefix = "app-listener-key-"
 
-// LivePolicyDescriptors returns the set of policy descriptors attached to the
-// given paths. Only paths that exist right now can contribute: a directory
-// that was deleted is absent, so its descriptor is not returned and its
-// metadata is treated as orphaned. The paths are the catalog's watch
-// directories for every local user plus the final config resources — the
-// installer encrypts at exactly these levels and never anywhere else, so
-// this set is complete for everything the installer ever created.
+// LivePolicyDescriptors returns the policy descriptors attached to the given paths; only paths that
+// exist right now contribute, so a deleted directory's metadata counts as orphaned. The inputs are
+// every catalog watch directory plus the final config resources — the complete set of levels the
+// installer ever encrypts.
 func LivePolicyDescriptors(paths []string) (map[string]struct{}, error) {
 	live := make(map[string]struct{})
 	for _, p := range paths {
@@ -54,22 +51,17 @@ func LivePolicyDescriptors(paths []string) (map[string]struct{}, error) {
 	return live, nil
 }
 
-// isAppRawRawKeyProtector reports whether a protector belongs to this
-// installer: a raw-key protector (never a login/PAM one) carrying the
-// app-listener-key-* name prefix.
+// isAppProtector reports whether a protector belongs to this installer: a
+// raw-key source (never a login/PAM one) with the app-listener-key-* name prefix.
 func isAppProtector(p *metadata.ProtectorData) bool {
 	return p.GetSource() == metadata.SourceType_raw_key &&
 		strings.HasPrefix(p.GetName(), appProtectorPrefix)
 }
 
-// SelectOrphans partitions the fscrypt metadata of one mount into entries to
-// keep and entries that may be deleted. An orphan protector is one that no
-// policy attached to a still-existing directory references; an orphan policy
-// is one whose directory no longer exists and that only uses protectors
-// created by this installer. Deleted status differs from "not in live": a
-// directory that still exists keeps its metadata even when it is not part of
-// the current configuration (e.g. an independently encrypted ~/.ssh). The two
-// returned slices are sorted and deduplicated.
+// SelectOrphans partitions one mount's fscrypt metadata into entries to keep and entries that may be
+// deleted: an orphan protector is referenced by no policy attached to a still-existing path; an orphan
+// policy's directory is gone and it uses only protectors created by this installer. Existing-but-
+// unconfigured directories (e.g. an independently encrypted ~/.ssh) keep their metadata.
 func SelectOrphans(protectors []*metadata.ProtectorData, policies []*metadata.PolicyData, livePolicies map[string]struct{}) (orphanProtectors, orphanPolicies []string) {
 	refs := make(map[string][]string, len(policies))
 	for _, p := range policies {
@@ -87,8 +79,8 @@ func SelectOrphans(protectors []*metadata.ProtectorData, policies []*metadata.Po
 	return orphanProtectors, orphanPolicies
 }
 
-// appProtectorSet returns the descriptors of every protector belonging to
-// this installer (raw-key source, app-listener-key-* name).
+// appProtectorSet returns the descriptors of every installer-owned protector
+// (raw-key source, app-listener-key-* name).
 func appProtectorSet(protectors []*metadata.ProtectorData) map[string]struct{} {
 	set := make(map[string]struct{})
 	for _, p := range protectors {
@@ -99,9 +91,8 @@ func appProtectorSet(protectors []*metadata.ProtectorData) map[string]struct{} {
 	return set
 }
 
-// orphanedProtectors is the set of app protectors that no live policy
-// references anymore, i.e. every directory that could unlock with them is
-// gone.
+// orphanedProtectors returns the app protectors that no live policy references anymore,
+// i.e. every directory that could unlock with them is gone.
 func orphanedProtectors(protectors []*metadata.ProtectorData, policies []*metadata.PolicyData, refs map[string][]string, livePolicies map[string]struct{}) []string {
 	live := make(map[string]struct{})
 	for _, p := range policies {
@@ -124,8 +115,8 @@ func orphanedProtectors(protectors []*metadata.ProtectorData, policies []*metada
 	return orphan
 }
 
-// orphanedPolicies is the set of policies whose directory no longer exists
-// and that reference only protectors created by this installer.
+// orphanedPolicies returns the policies whose directory no longer exists and
+// that reference only protectors created by this installer.
 func orphanedPolicies(policies []*metadata.PolicyData, refs map[string][]string, appProtectors, livePolicies map[string]struct{}) []string {
 	var orphan []string
 	for _, p := range policies {
@@ -150,12 +141,9 @@ func orphanedPolicies(policies []*metadata.PolicyData, refs map[string][]string,
 	return orphan
 }
 
-// CleanOrphans deletes the fscrypt policy and protector metadata on the mount
-// containing anchor that SelectOrphans declared orphaned. It only ever
-// removes raw-key app-listener-key-* protector metadata and the policy
-// metadata that references only it, never login protectors or foreign
-// setups. A mount that carries no fscrypt metadata at all is a no-op. The
-// returned counts are the protectors and policies actually removed.
+// CleanOrphans deletes the orphaned fscrypt policy/protector metadata on the mount containing anchor —
+// only app-listener-key-* raw-key protectors and the policies referencing solely them, never login
+// protectors or foreign setups. A metadata-free mount is a no-op; returned counts are actual removals.
 func CleanOrphans(anchor string, livePolicies map[string]struct{}) (removedProtectors, removedPolicies int, err error) {
 	ctx, ctxErr := actions.NewContextFromPath(anchor, nil)
 	if ctxErr != nil {
@@ -241,4 +229,31 @@ func listPolicies(ctx *actions.Context) ([]*metadata.PolicyData, error) {
 		policies = append(policies, data)
 	}
 	return policies, nil
+}
+
+// CleanOrphanedMetadata removes the policy/protector metadata of encrypted directories that no longer
+// exist, keeping everything referenced by the given live paths; shared by installer and uninstaller.
+func CleanOrphanedMetadata(livePaths []string) error {
+	live, err := LivePolicyDescriptors(livePaths)
+	if err != nil {
+		return err
+	}
+
+	anchor := "/"
+	for _, p := range livePaths {
+		if _, statErr := os.Stat(p); statErr == nil {
+			anchor = p
+			break
+		}
+	}
+	removedProtectors, removedPolicies, err := CleanOrphans(anchor, live)
+	if err != nil {
+		return fmt.Errorf("cleaning orphaned fscrypt metadata: %w", err)
+	}
+	if removedProtectors == 0 && removedPolicies == 0 {
+		log.Info("no orphaned fscrypt metadata to clean")
+		return nil
+	}
+	log.Infof("cleaned orphaned fscrypt metadata: removed %d protector(s) and %d policy(ies)", removedProtectors, removedPolicies)
+	return nil
 }

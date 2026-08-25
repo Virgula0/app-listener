@@ -1,8 +1,6 @@
-// Package fscrypt ports the fscrypt subsystem of the ssh-guard daemon: a
-// 32-byte raw master key, policy detection, and the unlock/lock lifecycle
-// for encrypted directories. The teardown semantics (EBUSY retry, ENOKEY
-// detection) were designed and tested against TOC-TOU races when tearing
-// up and down encrypted directories, and are preserved verbatim.
+// Package fscrypt ports the fscrypt subsystem of the ssh-guard daemon: a 32-byte
+// raw master key, policy detection, and the unlock/lock lifecycle for encrypted
+// directories, preserving its tested EBUSY-retry/ENOKEY teardown semantics.
 package fscrypt
 
 import (
@@ -43,12 +41,10 @@ func New() *Vault {
 	return &Vault{}
 }
 
-// hasEncryptionPolicy reports whether the file or directory at path
-// carries an fscrypt encryption policy (v1 or v2). Directories are opened
-// with O_DIRECTORY; regular files are opened plainly — the kernel refuses
-// to open a LOCKED encrypted regular file at all (ENOKEY), which itself
-// proves a policy exists. Anything neither a directory nor a regular file
-// can never carry a policy and reports "not encrypted".
+// hasEncryptionPolicy reports whether the file or directory at path carries an
+// fscrypt policy (v1 or v2). A LOCKED encrypted regular file cannot be opened at
+// all — ENOKEY there itself proves a policy exists. Anything neither directory
+// nor regular file never carries one.
 func hasEncryptionPolicy(path string) (bool, error) {
 	info, statErr := os.Stat(path)
 	if statErr != nil {
@@ -59,15 +55,13 @@ func hasEncryptionPolicy(path string) (bool, error) {
 	if info.IsDir() {
 		openFlags |= unix.O_DIRECTORY
 	} else if !info.Mode().IsRegular() {
-		// Sockets, FIFOs and devices never carry an fscrypt policy.
 		return false, nil
 	}
 
 	fd, err := unix.Open(path, openFlags, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOKEY) {
-			// A locked encrypted regular file cannot even be opened:
-			// the policy is there, its key just is not provisioned.
+			// Locked encrypted regular file: policy exists, key absent.
 			return true, nil
 		}
 		if errors.Is(err, unix.ENOTDIR) {
@@ -88,9 +82,8 @@ func hasEncryptionPolicy(path string) (bool, error) {
 	if errno == 0 {
 		return true, nil
 	}
-	// ENODATA: no policy set. EOPNOTSUPP/ENOTTY: the filesystem does not
-	// support encryption policies at all (tmpfs, FAT, ...), so it can
-	// never carry an encrypted directory.
+	// ENODATA: no policy set. EOPNOTSUPP/ENOTTY: the filesystem cannot carry
+	// encryption policies at all.
 	if errors.Is(errno, unix.ENODATA) ||
 		errors.Is(errno, unix.EOPNOTSUPP) ||
 		errors.Is(errno, unix.ENOTTY) {
@@ -104,23 +97,58 @@ func (v *Vault) IsEncrypted(path string) (bool, error) {
 	return hasEncryptionPolicy(path)
 }
 
-// isLockedRegularFileErr reports whether err means "this path is an
-// encrypted regular file whose key is not provisioned": the kernel refuses
-// to open such a file at all, so google/fscrypt reports
-// metadata.ErrLockedRegularFile instead of the policy.
+// isLockedRegularFileErr reports whether err means "encrypted regular file whose
+// key is not provisioned" (metadata.ErrLockedRegularFile): the kernel refuses to
+// open such a file at all.
 func isLockedRegularFileErr(err error) bool {
 	var locked *metadata.ErrLockedRegularFile
 	return errors.As(err, &locked)
 }
 
-// provisionLockedFile unlocks a locked encrypted REGULAR file. The kernel
-// refuses to open such a file before its key is provisioned, so the policy
-// cannot be identified through the path itself; instead every policy on the
-// same filesystem is tried against the master key. Each one that unwraps is
-// provisioned tentatively and the file open is retried: the matching
-// descriptor makes the file openable, while wrong candidates are
-// deprovisioned again immediately so no other resource stays unlocked as
-// collateral damage.
+// acceptFirstProtectorOption is the protector-picker shared by every policy
+// unlock: there is exactly one protector per policy here.
+var acceptFirstProtectorOption = func(_ string, _ []*actions.ProtectorOption) (int, error) {
+	return 0, nil
+}
+
+// checkKeyLen validates the master key length against FscryptKeySize.
+func checkKeyLen(keyFile string, data []byte) error {
+	if len(data) != FscryptKeySize {
+		return fmt.Errorf("master key %s must be exactly %d bytes, got %d",
+			keyFile, FscryptKeySize, len(data))
+	}
+	return nil
+}
+
+// deprovisionKind classifies a failed forced deprovision for the retry
+// loops shared with internal/usecase and internal/protected.
+type deprovisionKind int
+
+const (
+	depOther   deprovisionKind = iota
+	depBusy                    // inodes still pinned: retry after a delay
+	depMissing                 // key already gone: counts as fully locked
+)
+
+// classifyDeprovision maps the fscrypt library's deprovision error strings onto a
+// deprovisionKind (substrings come from the kernel keyring/sysfs errors it surfaces).
+func classifyDeprovision(err error) deprovisionKind {
+	errStr := err.Error()
+	switch {
+	case strings.Contains(errStr, "some files using the key are still open"),
+		strings.Contains(errStr, "in use"):
+		return depBusy
+	case strings.Contains(errStr, "Required key not available"),
+		strings.Contains(errStr, "key not present"):
+		return depMissing
+	default:
+		return depOther
+	}
+}
+
+// provisionLockedFile unlocks a locked encrypted REGULAR file: unopenable before its key is provisioned,
+// so its policy is unaddressable via the path — every policy on the filesystem is tried against the master
+// key, tentatively provisioned until the file opens; wrong candidates are deprovisioned immediately.
 func (v *Vault) provisionLockedFile(fsctx *actions.Context, path string) error {
 	keyBytes, err := readKey()
 	if err != nil {
@@ -133,9 +161,7 @@ func (v *Vault) provisionLockedFile(fsctx *actions.Context, path string) error {
 		return fmt.Errorf("listing policies on %s: %w", fsctx.Mount.Path, listErr)
 	}
 
-	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
-		return 0, nil
-	}
+	optionFn := acceptFirstProtectorOption
 	for _, descriptor := range descriptors {
 		candidate, getErr := actions.GetPolicy(fsctx, descriptor)
 		if getErr != nil {
@@ -162,11 +188,9 @@ func (v *Vault) provisionLockedFile(fsctx *actions.Context, path string) error {
 		fsctx.Mount.Path, MasterKeyFile, path)
 }
 
-// verifyLockedFileKey validates the master key against a locked encrypted
-// regular file. The file's own policy cannot be addressed while it stays
-// locked, so success means at least one policy on this filesystem unwraps
-// with the master key (the single-key model: the file's protector wraps
-// exactly that key). Nothing is provisioned.
+// verifyLockedFileKey validates the master key against a locked encrypted regular file, provisioning
+// nothing: its own policy is unaddressable while locked, so success means some policy on this
+// filesystem unwraps with the master key (the single-key model).
 func (v *Vault) verifyLockedFileKey(fsctx *actions.Context, path string) error {
 	keyBytes, err := readKey()
 	if err != nil {
@@ -178,9 +202,7 @@ func (v *Vault) verifyLockedFileKey(fsctx *actions.Context, path string) error {
 	if listErr != nil {
 		return fmt.Errorf("verify key for %s: listing policies on %s: %w", path, fsctx.Mount.Path, listErr)
 	}
-	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
-		return 0, nil
-	}
+	optionFn := acceptFirstProtectorOption
 	for _, descriptor := range descriptors {
 		candidate, getErr := actions.GetPolicy(fsctx, descriptor)
 		if getErr != nil {
@@ -198,8 +220,7 @@ func (v *Vault) verifyLockedFileKey(fsctx *actions.Context, path string) error {
 		fsctx.Mount.Path, MasterKeyFile, path)
 }
 
-// IsProvisioned reports whether the policy key for path is currently
-// provisioned, i.e. the directory is unlocked.
+// IsProvisioned reports whether the policy key for path is currently provisioned (unlocked).
 func (v *Vault) IsProvisioned(path string) (bool, error) {
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
@@ -215,13 +236,9 @@ func (v *Vault) IsProvisioned(path string) (bool, error) {
 	return policy.IsProvisionedByTargetUser(), nil
 }
 
-// CheckFilesystemReady verifies that the filesystem backing path has been
-// initialized for fscrypt (the equivalent of running `fscrypt setup` once
-// on it) and that encryption is actually enabled on it (the ext4 `encrypt`
-// feature flag). Without that, every policy creation fails deep inside the
-// library with a cryptic error — long after the user answered the
-// installer's interactive prompts. This is the same non-destructive check
-// the fscrypt CLI runs before any operation.
+// CheckFilesystemReady verifies the filesystem backing path is initialized for fscrypt (`fscrypt setup`)
+// and actually has encryption enabled (the ext4 `encrypt` feature flag) — the fscrypt CLI's non-destructive
+// pre-check — so failures surface here instead of deep inside later policy creation.
 func (v *Vault) CheckFilesystemReady(path string) error {
 	mnt, err := filesystem.FindMount(path)
 	if err != nil {
@@ -236,8 +253,7 @@ func (v *Vault) CheckFilesystemReady(path string) error {
 	return nil
 }
 
-// classifySetupError translates the fscrypt library's filesystem setup
-// failures into actionable errors naming the exact remediation.
+// classifySetupError translates fscrypt setup failures into actionable errors naming the remediation.
 func classifySetupError(path string, err error) error {
 	var notSetup *filesystem.ErrNotSetup
 	var notSupported *filesystem.ErrSetupNotSupported
@@ -257,11 +273,9 @@ func classifySetupError(path string, err error) error {
 	}
 }
 
-// classifySupportError translates the fscrypt library's encryption-support
-// probe failures into actionable errors. This catches filesystems that are
-// "set up" (metadata exists) but whose kernel or superblock cannot actually
-// encrypt — most commonly an ext4 filesystem created without the `encrypt`
-// feature flag.
+// classifySupportError translates encryption-support probe failures into actionable errors, catching
+// filesystems that are "set up" but cannot actually encrypt (typically ext4 created without the
+// `encrypt` feature flag).
 func classifySupportError(path string, err error) error {
 	var notEnabled *filesystem.ErrEncryptionNotEnabled
 	var notSupported *filesystem.ErrEncryptionNotSupported
@@ -285,10 +299,9 @@ func classifySupportError(path string, err error) error {
 	}
 }
 
-// readKey returns the 32-byte master key, failing when the file is
-// missing. The key is never generated implicitly: for an already encrypted
-// directory a freshly generated key can never unlock the policy, so a
-// missing file is always a misconfiguration to surface, not to paper over.
+// readKey returns the master key, failing when the file is missing: a freshly
+// generated key can never unlock an existing policy, so absence is always
+// misconfiguration to surface, never paper over.
 func readKey() ([]byte, error) {
 	return readKeyFrom(MasterKeyFile)
 }
@@ -298,20 +311,18 @@ func readKeyFrom(keyFile string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read master key %s: %w", keyFile, err)
 	}
-	if len(data) != FscryptKeySize {
-		return nil, fmt.Errorf("master key %s must be exactly %d bytes, got %d",
-			keyFile, FscryptKeySize, len(data))
+	if err := checkKeyLen(keyFile, data); err != nil {
+		return nil, err
 	}
 	return data, nil
 }
 
-// readOrCreateKey returns the 32-byte master key, generating it on first
-// use. Generation is atomic (O_EXCL); a lost race re-reads the winner's key.
+// readOrCreateKey returns the master key, generating it on first use.
+// Generation is atomic (O_EXCL); a lost race re-reads the winner's key.
 func readOrCreateKey() ([]byte, error) {
 	if data, err := os.ReadFile(MasterKeyFile); err == nil {
-		if len(data) != FscryptKeySize {
-			return nil, fmt.Errorf("master key %s must be exactly %d bytes, got %d",
-				MasterKeyFile, FscryptKeySize, len(data))
+		if err := checkKeyLen(MasterKeyFile, data); err != nil {
+			return nil, err
 		}
 		return data, nil
 	}
@@ -330,9 +341,8 @@ func readOrCreateKey() ([]byte, error) {
 			if readErr != nil {
 				return nil, readErr
 			}
-			if len(data) != FscryptKeySize {
-				return nil, fmt.Errorf("master key %s must be exactly %d bytes, got %d",
-					MasterKeyFile, FscryptKeySize, len(data))
+			if lenErr := checkKeyLen(MasterKeyFile, data); lenErr != nil {
+				return nil, lenErr
 			}
 			return data, nil
 		}
@@ -358,11 +368,9 @@ func MasterKeyExists() (bool, error) {
 	return false, err
 }
 
-// GenerateMasterKey creates the 32-byte master key file. When force is
-// false it is a no-op if the key already exists; when force is true the
-// existing key is atomically replaced (write to a temp file in the same
-// directory, then rename). Replacing the key invalidates every fscrypt
-// directory provisioned with the old one — callers must confirm first.
+// GenerateMasterKey creates the master key file: a no-op when it exists and force is false, otherwise
+// an atomic replacement (temp file + rename). Replacing the key invalidates every directory provisioned
+// with the old one — callers must confirm first.
 func GenerateMasterKey(force bool) error {
 	if !force {
 		if _, err := os.Stat(MasterKeyFile); err == nil {
@@ -399,15 +407,9 @@ func GenerateMasterKey(force bool) error {
 	return os.Rename(tmpPath, MasterKeyFile)
 }
 
-// newBoundedKeyFn returns the key callback passed to policy.Unlock. The
-// google/fscrypt unwrap loop (actions/callback.go, unwrapProtectorKey)
-// re-invokes the callback with retry=true whenever the returned key fails
-// to unwrap a protector, and only a callback error aborts the loop — a
-// callback that keeps returning the same wrong key spins forever, logging
-// "invalid wrapping key for protector ..." at full speed. Because the
-// daemon has exactly one master key, a retry can never succeed: the first
-// failed unwrap is answered with an error that terminates the loop and
-// names the key file in question.
+// newBoundedKeyFn bounds the library's unwrap loop: the callback is re-invoked with retry=true on each
+// failed protector unwrap and only a callback error aborts, so a constant wrong key would spin forever.
+// With one master key retries never succeed — failure ends the loop with an error naming the key file.
 func newBoundedKeyFn(masterKey []byte) actions.KeyFunc {
 	return func(info actions.ProtectorInfo, retry bool) (*crypto.Key, error) {
 		if retry {
@@ -418,9 +420,8 @@ func newBoundedKeyFn(masterKey []byte) actions.KeyFunc {
 	}
 }
 
-// Unlock provisions the policy key of path so its contents become
-// readable. It is a no-op when the policy is already provisioned by the
-// target user.
+// Unlock provisions the policy key of path so its contents become readable;
+// no-op when already provisioned by the target user.
 func (v *Vault) Unlock(path string) error {
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
@@ -431,9 +432,7 @@ func (v *Vault) Unlock(path string) error {
 		if !isLockedRegularFileErr(err) {
 			return fmt.Errorf("get policy for %s: %w", path, err)
 		}
-		// A locked encrypted regular file cannot even be opened, so its
-		// policy cannot be fetched through the path: find and provision
-		// its key by trying every filesystem policy against the master key.
+		// Locked file: unopenable, so fall back to provisionLockedFile.
 		if provErr := v.provisionLockedFile(fsctx, path); provErr != nil {
 			return fmt.Errorf("unlock %s: %w", path, provErr)
 		}
@@ -447,15 +446,9 @@ func (v *Vault) Unlock(path string) error {
 	if err != nil {
 		return fmt.Errorf("unlock %s: %w", path, err)
 	}
-	defer func() {
-		for i := range keyBytes {
-			keyBytes[i] = 0
-		}
-	}()
+	defer wipe(keyBytes)
 
-	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
-		return 0, nil
-	}
+	optionFn := acceptFirstProtectorOption
 	if err := policy.Unlock(optionFn, newBoundedKeyFn(keyBytes)); err != nil {
 		return fmt.Errorf("unlock policy for %s: %w", path, err)
 	}
@@ -466,10 +459,9 @@ func (v *Vault) Unlock(path string) error {
 	return nil
 }
 
-// Lock deprovisions the policy key of path. When forceFlush is false and
-// the policy is not provisioned by the target user, the deprovision is
-// skipped (already locked). Errors are translated into repository.ErrKeyBusy
-// (retry) and repository.ErrKeyMissing (fully locked) sentinels.
+// Lock deprovisions the policy key of path; skipped when not provisioned by
+// the target user and forceFlush is false (already locked). Errors map onto
+// repository.ErrKeyBusy (retry) / repository.ErrKeyMissing (fully locked).
 func (v *Vault) Lock(path string, forceFlush bool) error {
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
@@ -494,19 +486,14 @@ func (v *Vault) Lock(path string, forceFlush bool) error {
 	return nil
 }
 
-// classifyDeprovisionErr maps the fscrypt library's deprovision error
-// strings onto the repository sentinels: EBUSY-style messages (inodes
-// still pinned) become repository.ErrKeyBusy for the retry loop, ENOKEY
-// (the key is already gone) becomes repository.ErrKeyMissing, and anything
-// else is wrapped with the path.
+// classifyDeprovisionErr maps deprovision errors onto the repository sentinels:
+// EBUSY-style (inodes still pinned) → ErrKeyBusy, ENOKEY (key already gone) →
+// ErrKeyMissing, anything else wrapped with the path.
 func classifyDeprovisionErr(path string, err error) error {
-	errStr := err.Error()
-	switch {
-	case strings.Contains(errStr, "some files using the key are still open"),
-		strings.Contains(errStr, "in use"):
+	switch classifyDeprovision(err) {
+	case depBusy:
 		return fmt.Errorf("%w: %v", repository.ErrKeyBusy, err)
-	case strings.Contains(errStr, "Required key not available"),
-		strings.Contains(errStr, "key not present"):
+	case depMissing:
 		return fmt.Errorf("%w: %v", repository.ErrKeyMissing, err)
 	default:
 		return fmt.Errorf("deprovision policy for %s: %w", path, err)

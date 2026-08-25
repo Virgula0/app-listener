@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -19,23 +18,22 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// BackupSuffix is appended to a directory to form its migration backup,
-// e.g. /home/alice/.ssh -> /home/alice/.ssh.app_listener.backup.
+// BackupSuffix forms a migration backup path, e.g. /home/alice/.ssh ->
+// /home/alice/.ssh.app_listener.backup.
 const BackupSuffix = ".app_listener.backup"
 
-// DecryptSuffix is appended to a directory to form the temporary plaintext
-// copy created while a directory is being permanently decrypted, e.g.
-// /home/alice/.ssh -> /home/alice/.ssh.app_listener.decrypt. The directory
-// is renamed back to its original location only after the copy completed.
+// DecryptSuffix forms the temporary plaintext copy created during permanent
+// decryption (/home/alice/.ssh.app_listener.decrypt), renamed into place only
+// after the copy completed.
 const DecryptSuffix = ".app_listener.decrypt"
 
-// encryptTmpSuffix is the empty sibling file an encryption policy is applied
-// to while a single regular file is migrated: fscrypt policies can only be
-// set on EMPTY files, so the content is streamed in afterwards.
+// encryptTmpSuffix is the empty sibling file carrying the encryption policy
+// during single-file migration: policies apply only to EMPTY files, so the
+// content is streamed in afterwards.
 const encryptTmpSuffix = ".app_listener.encrypt"
 
-// migrationTarget classifies what kind of in-place migration applies to a
-// path (see classifyMigrationTarget).
+// migrationTarget classifies which in-place migration applies to a path
+// (see classifyMigrationTarget).
 type migrationTarget int
 
 const (
@@ -43,14 +41,9 @@ const (
 	targetRegularFile
 )
 
-// classifyMigrationTarget inspects path and reports whether an in-place
-// encryption/decryption may operate on it. Symbolic links are refused
-// outright: following them could silently migrate an unrelated target, and
-// a link aliasing the watched content breaks the rename-based swap.
-// Regular files with more than one link (hardlinks) are refused as well:
-// migrating one alias must never implicitly affect another path to the same
-// inode. Everything that is neither a directory nor a unique regular file
-// (sockets, FIFOs, devices) is refused too.
+// classifyMigrationTarget reports whether in-place migration may operate on path: symlinks are refused outright
+// (following one could silently migrate an unrelated target and break the rename-based swap), hard-linked files too
+// (one alias must never implicitly affect another path to the same inode), plus anything not a directory/regular file.
 func classifyMigrationTarget(path string) (migrationTarget, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -71,10 +64,8 @@ func classifyMigrationTarget(path string) (migrationTarget, error) {
 	return targetRegularFile, nil
 }
 
-// Deprovision retry budget, mirroring the daemon teardown loop: a forced
-// deprovision can fail with EBUSY while an inode is still pinned, and the
-// key must be gone before the daemon (or the gap before it starts) is
-// considered safe.
+// Bounded EBUSY-retry budget for forced deprovisions, matching the daemon
+// teardown loop: an inode still pinned by the key is retried, never fatal.
 const (
 	maxDeprovisionRetries = 100
 	deprovisionRetryDelay = 10 * time.Millisecond
@@ -87,10 +78,8 @@ const (
 )
 
 // VerifyKey checks that the master key in MasterKeyFile actually unlocks
-// the fscrypt policy of path, without provisioning anything. It returns an
-// error when the policy is locked and the key does not match — the loop in
-// google/fscrypt's unwrapProtectorKey is bounded by newBoundedKeyFn, so a
-// wrong key fails fast instead of spinning.
+// path's fscrypt policy, without provisioning anything. A locked/mismatched
+// key errors fast (newBoundedKeyFn bounds the library's unwrap loop).
 func (v *Vault) VerifyKey(path string) error {
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
@@ -113,9 +102,7 @@ func (v *Vault) VerifyKey(path string) error {
 	}
 	defer wipe(keyBytes)
 
-	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
-		return 0, nil
-	}
+	optionFn := acceptFirstProtectorOption
 	if err := policy.Unlock(optionFn, newBoundedKeyFn(keyBytes)); err != nil {
 		_ = policy.Lock()
 		return fmt.Errorf("verify key for %s: %w", path, err)
@@ -123,9 +110,8 @@ func (v *Vault) VerifyKey(path string) error {
 	return policy.Lock()
 }
 
-// EnsureSystemSetup creates the global /etc/fscrypt.conf the way `fscrypt
-// setup` does (policy v2 on kernels >= 5.4, otherwise v1). It is a no-op
-// when the config file already exists.
+// EnsureSystemSetup creates the global /etc/fscrypt.conf like `fscrypt setup`
+// (policy v2 on kernels >= 5.4, else v1); no-op when it already exists.
 func EnsureSystemSetup() error {
 	if _, err := os.Stat(actions.ConfigFileLocation); err == nil {
 		return nil
@@ -137,29 +123,16 @@ func EnsureSystemSetup() error {
 	return actions.CreateConfigFile(5*time.Second, policyVersion)
 }
 
-// Encrypt migrates path to an fscrypt-encrypted directory or single file
-// in place, using the master key as a raw-key protector (no shelling out —
-// the google/fscrypt actions API only). The original contents are preserved
-// by renaming path to path+BackupSuffix BEFORE anything is touched; the
-// backup is left in place for the installer to remove after the whole
-// installation succeeded.
-//
-// If path+BackupSuffix already exists, Encrypt refuses to run: a previous
-// migration may have failed midway, and overwriting an older backup would
-// destroy data. The caller must resolve that situation manually.
-//
-// On success the target is encrypted and locked: its key is removed from
-// the kernel keyring, so the daemon must unlock it with the master key at
-// startup.
+// Encrypt migrates path in place to fscrypt encryption via the google/fscrypt actions API (raw-key protector),
+// locking it on success for the daemon to unlock at startup. Backup-first: path is renamed to path+BackupSuffix
+// BEFORE anything is touched and kept until installation fully succeeds; an existing backup aborts the run.
 func (v *Vault) Encrypt(path string) error {
 	return v.EncryptWithProgress(path, nil)
 }
 
 // EncryptWithProgress behaves like Encrypt and additionally reports copy
-// progress (bytes copied so far and total) through onBytes while the
-// contents are moved into the encrypted directory. Directories and single
-// regular files are both supported; symbolic links, hard-linked files and
-// anything else is refused (see classifyMigrationTarget).
+// progress (copied/total bytes) through onBytes; unsupported targets are
+// refused (see classifyMigrationTarget).
 func (v *Vault) EncryptWithProgress(path string, onBytes func(copied, total int64)) error {
 	backup := path + BackupSuffix
 	if _, err := os.Lstat(backup); err == nil {
@@ -176,17 +149,15 @@ func (v *Vault) EncryptWithProgress(path string, onBytes func(copied, total int6
 	return v.encryptDirWithProgress(path, backup, onBytes)
 }
 
-// encryptDirWithProgress migrates a directory in place (the original
-// ssh-guard flow).
+// encryptDirWithProgress migrates a directory in place.
 func (v *Vault) encryptDirWithProgress(path, backup string, onBytes func(copied, total int64)) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", path, err)
 	}
 
-	// The daemon's LSM engine does not set chattr flags, but a system
-	// previously hardened by the original ssh-guard may carry immutable or
-	// append-only flags that would block the rename below.
+	// A system previously hardened by ssh-guard may carry immutable or
+	// append-only chattr flags that would block the rename below.
 	if err = stripImmutableFlags(path); err != nil {
 		return fmt.Errorf("strip immutable flags on %s: %w", path, err)
 	}
@@ -202,11 +173,9 @@ func (v *Vault) encryptDirWithProgress(path, backup string, onBytes func(copied,
 	restore := true
 	defer func() {
 		if restore {
-			// Roll the directory back so a failed migration leaves the
-			// original data in place. RemoveAll runs while the policy key
-			// is still provisioned: deleting entries of an encrypted
-			// directory requires its key, and dropping it first would
-			// leave a partially copied directory unremovable.
+			// Roll back so a failed migration leaves the original data in
+			// place; RemoveAll runs while the policy key is still
+			// provisioned (deleting encrypted entries requires it).
 			_ = os.RemoveAll(path)
 			if policy != nil {
 				_ = policy.Deprovision(false)
@@ -219,20 +188,17 @@ func (v *Vault) encryptDirWithProgress(path, backup string, onBytes func(copied,
 	if err != nil {
 		return fmt.Errorf("apply fscrypt policy to %s: %w", path, err)
 	}
-	// applyRawKeyPolicy leaves the policy key provisioned on purpose: the
-	// contents must be copied back while the key is available, or the
-	// kernel refuses every write with "required key not available".
+	// The key stays provisioned on purpose: contents must be copied back
+	// while it is available, or every write fails with "required key not
+	// available".
 	if err := install.CopyTreeWithProgress(backup, path, onBytes); err != nil {
 		return fmt.Errorf("copy contents back into %s: %w", path, err)
 	}
 	restore = false
 
-	// The migration is complete: wipe the in-memory keys and remove the
-	// policy key from the kernel keyring so the directory is locked until
-	// the daemon unlocks it. The deprovision is forced with a bounded
-	// EBUSY retry (same budget as the daemon's teardown): a key left in
-	// the keyring would leave the directory unlocked in the gap between
-	// the installer stopping the daemon and it starting up again.
+	// Migration complete: lock and remove the key from the kernel keyring
+	// (forced, bounded EBUSY retry) so the directory stays locked until the
+	// daemon starts; failure here only logs.
 	if err := lockAndDeprovision(policy, nil); err != nil {
 		log.Warnf("encrypted %s but could not remove its key from the kernel keyring (the directory stays unlocked until the daemon starts): %v", path, err)
 	}
@@ -257,9 +223,8 @@ func (p *progressWriter) Write(b []byte) (int, error) {
 }
 
 // stampCopyMetadata applies the original file's mode, owner and extended
-// attributes to the freshly written copy. Ownership requires root (the
-// installer runs as root); extended attributes are best-effort: one that
-// cannot be carried over is logged and skipped, never fatal.
+// attributes to the fresh copy (ownership requires root). Xattrs are
+// best-effort: one that cannot be carried over is logged and skipped, never fatal.
 func stampCopyMetadata(out *os.File, src, dst string, info os.FileInfo) error {
 	if err := out.Chmod(info.Mode().Perm()); err != nil {
 		return fmt.Errorf("chmod %s: %w", dst, err)
@@ -277,9 +242,8 @@ func stampCopyMetadata(out *os.File, src, dst string, info os.FileInfo) error {
 	return nil
 }
 
-// copyIntoEncryptedCopy streams srcPath's content through out — whose
-// filesystem-level fscrypt encryption is already active — then syncs it to
-// disk, stamps the original metadata onto it and closes it.
+// copyIntoEncryptedCopy streams srcPath's content through out (its fscrypt
+// encryption is already active), then syncs, stamps the original metadata and closes it.
 func copyIntoEncryptedCopy(out *os.File, srcPath, dst string, info os.FileInfo, onBytes func(copied, total int64)) error {
 	src, err := os.Open(srcPath)
 	if err != nil {
@@ -305,13 +269,9 @@ func copyIntoEncryptedCopy(out *os.File, srcPath, dst string, info os.FileInfo, 
 	return nil
 }
 
-// encryptFileWithProgress migrates a single regular file in place. The
-// kernel only accepts an encryption policy on an EMPTY regular file, so a
-// fresh empty sibling carries the policy and receives the content while its
-// key is provisioned; after the key is removed again (ciphertext at rest)
-// the two are swapped with the same crash-safety contract as the directory
-// migration: original renamed to backup first, temp installed second, and a
-// full rollback of both renames until then.
+// encryptFileWithProgress migrates a single regular file in place: a fresh empty sibling carries the
+// policy (policies apply only to EMPTY files) and receives the content while its key is provisioned;
+// after key removal (ciphertext at rest) both are swapped under the directory migration's crash-safety contract.
 func (v *Vault) encryptFileWithProgress(path, backup string, onBytes func(copied, total int64)) error {
 	tmp := path + encryptTmpSuffix
 	if _, err := os.Lstat(tmp); err == nil {
@@ -335,21 +295,19 @@ func (v *Vault) encryptFileWithProgress(path, backup string, onBytes func(copied
 		}
 	}()
 
-	// The policy must be applied to an empty file: create it first, apply
-	// the policy, only then stream the content through the encrypted fd.
+	// The policy must be applied to an empty file: create it first, apply the
+	// policy, then stream content through the encrypted fd.
 	policy, applyErr := applyRawKeyPolicy(tmp)
 	if applyErr != nil {
 		return fmt.Errorf("apply fscrypt policy to %s: %w", tmp, applyErr)
 	}
-	// applyRawKeyPolicy leaves the policy key provisioned on purpose: the
-	// content can only be written while the key is available.
+	// Key left provisioned on purpose: writing needs it.
 	restore := true
 	defer func() {
 		if restore {
 			_ = lockAndDeprovision(policy, nil)
 			_ = os.Remove(tmp)
-			// Restores the original when it had already been moved to
-			// the backup name; a harmless no-op error otherwise.
+			// No-op unless the original was already moved to backup.
 			_ = os.Rename(backup, path)
 		}
 	}()
@@ -359,10 +317,8 @@ func (v *Vault) encryptFileWithProgress(path, backup string, onBytes func(copied
 	}
 	cleanupTmp = false
 
-	// Content is now encrypted at rest once the key is removed. Swap the
-	// two names: original to backup first, encrypted copy into place
-	// second; until both renames succeeded the rollback above undoes
-	// everything (the backup rename-back is a no-op before the first one).
+	// Content is ciphertext at rest once the key is gone: swap the two names
+	// (rollback above undoes everything until both renames succeeded).
 	if err := lockAndDeprovision(policy, nil); err != nil {
 		log.Warnf("encrypted %s but could not remove its key from the kernel keyring (the file stays unlocked until the daemon starts): %v", path, err)
 	}
@@ -376,23 +332,16 @@ func (v *Vault) encryptFileWithProgress(path, backup string, onBytes func(copied
 	return nil
 }
 
-// Decrypt permanently removes the fscrypt policy of path, restoring a
-// plaintext directory in place. The contents are copied into a temporary
-// sibling directory (path+DecryptSuffix) while the policy key is
-// provisioned, and the original encrypted directory is only removed after
-// the copy completed; the plaintext copy is then renamed into place. On
-// any failure the temporary directory is removed and the encrypted
-// directory is left untouched, so a permanent decryption can never lose
-// data. The policy and protector metadata left behind in /.fscrypt become
-// orphaned and are cleaned up by the caller (see CleanOrphans).
+// Decrypt permanently removes path's fscrypt policy, restoring plaintext in place: contents are copied
+// into path+DecryptSuffix while the key is provisioned and the encrypted original removed only after
+// the copy completes; any failure deletes the temp copy and leaves the encrypted target untouched.
 func (v *Vault) Decrypt(path string) error {
 	return v.DecryptWithProgress(path, nil)
 }
 
 // DecryptWithProgress behaves like Decrypt and additionally reports copy
-// progress (bytes copied so far and total) through onBytes while the
-// contents are moved into the plaintext copy. Directories and single
-// regular files are both supported (see classifyMigrationTarget).
+// progress (copied/total bytes) through onBytes (see classifyMigrationTarget
+// for supported targets).
 func (v *Vault) DecryptWithProgress(path string, onBytes func(copied, total int64)) error {
 	target, err := classifyMigrationTarget(path)
 	if err != nil {
@@ -404,8 +353,7 @@ func (v *Vault) DecryptWithProgress(path string, onBytes func(copied, total int6
 	return v.decryptDirWithProgress(path, onBytes)
 }
 
-// decryptDirWithProgress permanently decrypts a directory in place (the
-// original flow).
+// decryptDirWithProgress permanently decrypts a directory in place.
 func (v *Vault) decryptDirWithProgress(path string, onBytes func(copied, total int64)) error {
 	tmp := path + DecryptSuffix
 	if _, err := os.Lstat(tmp); err == nil {
@@ -415,8 +363,8 @@ func (v *Vault) decryptDirWithProgress(path string, onBytes func(copied, total i
 		return err
 	}
 
-	// Fetch the policy BEFORE the directory is removed: the policy object
-	// is needed to drop the key from the kernel keyring after the copy.
+	// Fetch the policy BEFORE the directory is removed: it is needed to
+	// drop the key after the copy.
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
 		return fmt.Errorf("fscrypt context for %s: %w", path, err)
@@ -426,9 +374,8 @@ func (v *Vault) decryptDirWithProgress(path string, onBytes func(copied, total i
 		return fmt.Errorf("get policy for %s: %w", path, err)
 	}
 
-	// The contents must be readable while they are copied out: provision
-	// the policy key first and always drop it again afterwards, whether
-	// the copy succeeded or not.
+	// Provision the key so contents are readable during copy-out; always
+	// dropped again afterwards.
 	if err := v.Unlock(path); err != nil {
 		return err
 	}
@@ -452,12 +399,9 @@ func (v *Vault) decryptDirWithProgress(path string, onBytes func(copied, total i
 	return nil
 }
 
-// decryptFileWithProgress permanently decrypts a single encrypted regular
-// file in place. The plaintext copy is written to a temporary sibling while
-// the policy key is provisioned; the encrypted original is only removed
-// after the copy completed and fsynced, then the plaintext copy is renamed
-// into place. On any failure the temporary file is removed and the
-// encrypted original is left untouched.
+// decryptFileWithProgress permanently decrypts a single encrypted regular file in place: the plaintext
+// copy is written to a temporary sibling while the key is provisioned and the fsynced encrypted original
+// removed only after the copy completed; any failure removes the temp file, leaving the original untouched.
 func (v *Vault) decryptFileWithProgress(path string, onBytes func(copied, total int64)) error {
 	tmp := path + DecryptSuffix
 	if _, err := os.Lstat(tmp); err == nil {
@@ -467,8 +411,8 @@ func (v *Vault) decryptFileWithProgress(path string, onBytes func(copied, total 
 		return err
 	}
 
-	// Fetch the policy BEFORE the original is removed: the policy object
-	// is needed to drop the key from the kernel keyring after the copy.
+	// Fetch the policy BEFORE the original is removed: it is needed to
+	// drop the key after the copy.
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
 		return fmt.Errorf("fscrypt context for %s: %w", path, err)
@@ -478,9 +422,8 @@ func (v *Vault) decryptFileWithProgress(path string, onBytes func(copied, total 
 		return fmt.Errorf("get policy for %s: %w", path, err)
 	}
 
-	// The contents must be readable while they are copied out: provision
-	// the policy key first (a locked regular file needs the descriptor
-	// fallback inside Unlock) and always drop it again afterwards.
+	// Provision the key for the copy-out; always dropped again afterwards
+	// (a locked regular file needs the descriptor fallback inside Unlock).
 	if unlockErr := v.Unlock(path); unlockErr != nil {
 		return unlockErr
 	}
@@ -521,10 +464,9 @@ func (v *Vault) decryptFileWithProgress(path string, onBytes func(copied, total 
 	return nil
 }
 
-// requireEncryptedPath reports an error unless path is a directory or a
-// unique regular file carrying an fscrypt policy. Anything else — plain
-// files, symlinks, hardlinks, special files — can never be decrypted and is
-// refused, mirroring the safety contract of RestoreBackup.
+// requireEncryptedPath errors unless path is a directory or unique regular file carrying an fscrypt
+// policy; anything else (plain/special files, symlinks, hardlinks) can never be decrypted and is
+// refused, mirroring RestoreBackup's safety contract.
 func requireEncryptedPath(path string) error {
 	if _, err := classifyMigrationTarget(path); err != nil {
 		return err
@@ -539,14 +481,9 @@ func requireEncryptedPath(path string) error {
 	return nil
 }
 
-// RestoreBackup undoes a migration: the encrypted directory or file at
-// path is deleted and path+BackupSuffix is moved back to path, restoring
-// the original unencrypted content. The encrypted target is unlocked with
-// the master key first — deleting a locked encrypted directory (or opening
-// a locked encrypted file for removal) fails with ENOKEY because the
-// kernel needs the key to touch it. It refuses to delete a path that
-// exists but is NOT encrypted (the user may have created new data there
-// since the migration), and it is an error when no backup exists.
+// RestoreBackup undoes a migration: the encrypted target at path is deleted and path+BackupSuffix moved back.
+// The master key unlocks it first (removing a locked encrypted target fails with ENOKEY); an existing but
+// unencrypted path is never deleted (may hold new user data), and a missing backup is an error.
 func (v *Vault) RestoreBackup(path string) error {
 	backup := path + BackupSuffix
 	if _, err := os.Lstat(backup); err != nil {
@@ -576,11 +513,9 @@ func (v *Vault) RestoreBackup(path string) error {
 	return nil
 }
 
-// unlockForRemoval provisions the policy key of an encrypted path so its
-// contents can be deleted, then removes the key from the keyring again
-// (leaving it locked) before returning. A locked encrypted regular file is
-// handled through the descriptor fallback: provision first, then re-read
-// the policy now that the file opens.
+// unlockForRemoval provisions path's policy key so its contents can be deleted, then removes the key
+// again (leaving it locked) before returning. A locked encrypted regular file takes the descriptor
+// fallback: provision first, then re-read the policy now that the file opens.
 func unlockForRemoval(path string) error {
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
@@ -607,9 +542,7 @@ func unlockForRemoval(path string) error {
 		return err
 	}
 	defer wipe(keyBytes)
-	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
-		return 0, nil
-	}
+	optionFn := acceptFirstProtectorOption
 	if err := policy.Unlock(optionFn, newBoundedKeyFn(keyBytes)); err != nil {
 		return err
 	}
@@ -620,12 +553,9 @@ func unlockForRemoval(path string) error {
 	return nil
 }
 
-// applyRawKeyPolicy protects the (empty) directory at path with a fresh
-// policy wrapped by a raw-key protector holding the master key. On success
-// the policy key is left provisioned in the kernel keyring: the caller
-// must copy the directory contents back while the key is available and
-// deprovision afterwards (see Encrypt). On any failure the in-memory keys
-// are wiped and the keyring is cleaned up.
+// applyRawKeyPolicy protects the (empty) path with a fresh policy wrapped by a raw-key protector holding
+// the master key, returning with the policy key provisioned: the caller must copy contents back while the
+// key is available and deprovision afterwards (see Encrypt). On failure keys are wiped and the keyring cleaned.
 func applyRawKeyPolicy(path string) (*actions.Policy, error) {
 	fsctx, ctxErr := actions.NewContextFromPath(path, nil)
 	if ctxErr != nil {
@@ -663,10 +593,8 @@ func applyRawKeyPolicy(path string) (*actions.Policy, error) {
 			_ = policy.Revert()
 		}
 	}()
-	// On failure after the policy exists, wipe the in-memory keys and drop
-	// the policy key from the keyring (a no-op if Provision never ran).
-	// On success both are skipped: the key must stay provisioned for the
-	// copy-back in Encrypt.
+	// On failure wipe in-memory keys and drop the policy key (no-op if
+	// Provision never ran); on success keep the key for Encrypt's copy-back.
 	ok := false
 	defer func() {
 		if !ok {
@@ -674,9 +602,7 @@ func applyRawKeyPolicy(path string) (*actions.Policy, error) {
 		}
 	}()
 
-	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
-		return 0, nil
-	}
+	optionFn := acceptFirstProtectorOption
 	if err := policy.Unlock(optionFn, newBoundedKeyFn(keyBytes)); err != nil {
 		return nil, err
 	}
@@ -691,12 +617,9 @@ func applyRawKeyPolicy(path string) (*actions.Policy, error) {
 	return policy, nil
 }
 
-// lockAndDeprovision wipes the in-memory keys of policy and protector and
-// removes the policy key from the kernel keyring, leaving the encrypted
-// directory locked. The deprovision is forced (all users) with a bounded
-// EBUSY retry loop mirroring the daemon's teardown; a key that is already
-// gone (ENOKEY) counts as success. The returned error is non-nil only when
-// the key could not be removed after the full retry budget.
+// lockAndDeprovision wipes in-memory keys and removes the policy key from the kernel keyring, leaving
+// the encrypted target locked until the daemon unlocks it at startup. The forced deprovision retries
+// EBUSY (inodes still pinned by the key) within the shared budget; ENOKEY counts as success.
 func lockAndDeprovision(policy *actions.Policy, protector *actions.Protector) error {
 	_ = policy.Lock()
 	if protector != nil {
@@ -719,23 +642,18 @@ func lockAndDeprovision(policy *actions.Policy, protector *actions.Protector) er
 }
 
 // isDeprovisionBusy reports whether a deprovision error means inodes are
-// still pinned by the key (retry), mirroring the daemon's classification.
+// still pinned by the key (retry).
 func isDeprovisionBusy(err error) bool {
-	errStr := err.Error()
-	return strings.Contains(errStr, "some files using the key are still open") ||
-		strings.Contains(errStr, "in use")
+	return classifyDeprovision(err) == depBusy
 }
 
-// isDeprovisionMissing reports whether a deprovision error means the key
-// is already gone from the kernel keyring (counts as locked).
+// isDeprovisionMissing reports whether a deprovision error means the key is
+// already gone from the kernel keyring (counts as locked).
 func isDeprovisionMissing(err error) bool {
-	errStr := err.Error()
-	return strings.Contains(errStr, "Required key not available") ||
-		strings.Contains(errStr, "key not present")
+	return classifyDeprovision(err) == depMissing
 }
 
-// modifiedContextWithSource returns a copy of ctx whose protector source is
-// source (mirrors the unexported helper in google/fscrypt's actions).
+// modifiedContextWithSource returns a copy of ctx whose protector source is source.
 func modifiedContextWithSource(ctx *actions.Context, source metadata.SourceType) *actions.Context {
 	modified := *ctx
 	modified.Config = proto.Clone(ctx.Config).(*metadata.Config)
@@ -743,26 +661,22 @@ func modifiedContextWithSource(ctx *actions.Context, source metadata.SourceType)
 	return &modified
 }
 
-// stripImmutableFlags clears the immutable and append-only flags on every
-// file and directory under root, mirroring the original migration script's
-// `chattr -R -i -a`. Symbolic links are skipped (they cannot block the
-// migration and their targets are not followed), and entries that vanish
-// mid-walk (ENOENT) are tolerated: only the root itself is fatal. Errors
-// on other paths always include the failing path.
+// stripImmutableFlags clears the immutable and append-only flags on every file and directory under root
+// (the equivalent of `chattr -R -i -a`). Symlinks are skipped (targets not followed), entries vanishing
+// mid-walk (ENOENT) are tolerated — only the root itself is fatal; other errors always name the path.
 func stripImmutableFlags(root string) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, fs.ErrNotExist) && path != root {
-				// The entry disappeared while walking (a live
-				// application churning its profile): nothing to
-				// strip, nothing to do.
+				// Entry vanished mid-walk (a live app churning
+				// its profile): nothing to strip.
 				return nil
 			}
 			return fmt.Errorf("walk %s: %w", path, walkErr)
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
-			// A dangling symlink (e.g. firefox's lock file) would
-			// fail the open below: never follow links.
+			// Never follow links: a dangling symlink (e.g. a
+			// firefox lock file) would fail the open below.
 			return nil
 		}
 		fd, openErr := unix.Open(path, unix.O_RDONLY, 0)
@@ -773,7 +687,7 @@ func stripImmutableFlags(root string) error {
 			return fmt.Errorf("open %s: %w", path, openErr)
 		}
 		// On error (e.g. tmpfs without chattr support) flags is zeroed,
-		// which compares equal to the cleared value below.
+		// comparing equal to the cleared value below.
 		flags, _, _ := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.FS_IOC_GETFLAGS, 0)
 		unix.Close(fd)
 		cleared := flags &^ (fsImmutableFlag | fsAppendFlag)
@@ -796,9 +710,8 @@ func wipe(b []byte) {
 	}
 }
 
-// isKernelAtLeast54 reports whether the running kernel is 5.4 or newer
-// (used only to decide the default fscrypt policy version, as `fscrypt
-// setup` does).
+// isKernelAtLeast54 reports whether the running kernel is 5.4 or newer; used
+// only to pick the default fscrypt policy version (as `fscrypt setup` does).
 func isKernelAtLeast54() bool {
 	var uts unix.Utsname
 	if err := unix.Uname(&uts); err != nil {

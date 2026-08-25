@@ -9,9 +9,7 @@ import (
 	"time"
 )
 
-// defaultNewFileMode returns the mode a freshly created entry gets when no
-// explicit octal mode was given: the conventional 0666/0777 masked by the
-// caller's umask (022), i.e. 0644 files and 0755 directories.
+// defaultNewFileMode models umask(022) defaults: 0644 files, 0755 dirs.
 func defaultNewFileMode(isDir bool) os.FileMode {
 	mask := os.FileMode(0o022)
 	if isDir {
@@ -20,12 +18,9 @@ func defaultNewFileMode(isDir bool) os.FileMode {
 	return 0o666 &^ mask
 }
 
-// applyNewFileMeta gives a freshly created entry the ownership it would
-// have had if the invoking user had created it directly. When running as
-// root under sudo the real caller (SUDO_UID/SUDO_GID) becomes the owner —
-// natively, with a single chown, no subprocess — and the mode follows the
-// standard umask default modeled by defaultNewFileMode. Non-root callers
-// cannot chown and are only given the default mode.
+// applyNewFileMeta gives fresh entries the ownership/mode the invoking user
+// would have gotten: under sudo it chowns to SUDO_UID/SUDO_GID natively;
+// non-root callers only get the defaultNewFileMode mode.
 func applyNewFileMeta(path string, isDir bool) error {
 	mode := defaultNewFileMode(isDir)
 	if os.Geteuid() == 0 {
@@ -44,10 +39,8 @@ func applyNewFileMeta(path string, isDir bool) error {
 	return os.Chmod(path, mode)
 }
 
-// isOctalMode reports whether v is a 1-4 digit octal permission mode like
-// 0644. Leading zeros are allowed since 3- and 4-digit modes (0644 vs 644)
-// mean the same permission bits; a parser of the value must still reject
-// anything longer than 07777.
+// isOctalMode reports a 1-4 digit octal mode (leading zeros allowed);
+// callers must still reject values above 07777.
 func isOctalMode(v string) bool {
 	if len(v) < 1 || len(v) > 4 {
 		return false
@@ -60,11 +53,8 @@ func isOctalMode(v string) bool {
 	return true
 }
 
-// unixModeToFileMode converts a conventional unix mode number (0o0000 to
-// 0o7777, as typed in the chmod dialog) into Go's os.FileMode. The two are
-// not interchangeable: os.FileMode keeps only the rwx bits in its low bits
-// and carries setuid, setgid and sticky as separate high flags, so a raw
-// cast drops the special bits (a raw-cast chmod 4755 silently applied 0755).
+// unixModeToFileMode converts a unix mode number to os.FileMode; a raw cast
+// would silently drop the setuid/setgid/sticky bits.
 func unixModeToFileMode(mode uint32) os.FileMode {
 	m := os.FileMode(mode & 0o777)
 	if mode&0o4000 != 0 {
@@ -79,8 +69,7 @@ func unixModeToFileMode(mode uint32) os.FileMode {
 	return m
 }
 
-// fileModeToUnixMode is the inverse: it renders an os.FileMode as the
-// conventional octal mode number including the special bits.
+// fileModeToUnixMode is the inverse, restoring the special bits.
 func fileModeToUnixMode(m os.FileMode) uint32 {
 	mode := uint32(m.Perm())
 	if m&os.ModeSetuid != 0 {
@@ -109,8 +98,7 @@ func humanSize(n int64) string {
 	}
 }
 
-// clipLabel truncates s to at most w runes, appending an ellipsis when it
-// was shortened.
+// clipLabel truncates s to w runes, appending an ellipsis when shortened.
 func clipLabel(s string, w int) string {
 	if w <= 0 {
 		return ""
@@ -125,19 +113,15 @@ func clipLabel(s string, w int) string {
 	return string(r[:w-1]) + "…"
 }
 
-// isBinaryContent reports whether data looks like a binary file: any NUL
-// byte inside the first binaryScanBytes bytes classifies it as binary, and
-// such files are never handed to the editor.
+// isBinaryContent spots a NUL byte in the first binaryScanBytes bytes.
 func isBinaryContent(data []byte) bool {
 	n := min(len(data), binaryScanBytes)
 	return bytes.IndexByte(data[:n], 0) >= 0
 }
 
-// writeFileKeepMeta atomically replaces the file at path with data while
-// preserving its mode and owner. The new content is written to a temporary
-// sibling and renamed over the original, so a crash or an error can never
-// leave the file half-written. Only regular files may be replaced: writing
-// through a symlink is refused.
+// writeFileKeepMeta atomically replaces path with data (temp sibling +
+// rename after fsync), preserving mode and owner; symlinks are refused so
+// writes never follow links. Owner restoration requires root.
 func writeFileKeepMeta(path string, data []byte) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -167,9 +151,8 @@ func writeFileKeepMeta(path string, data []byte) error {
 	if cerr := f.Chmod(info.Mode()); cerr != nil {
 		return cerr
 	}
-	// Preserving the owner is only possible as root (the editor is used by
-	// `install --edit-protected`, which runs as root); a non-root user's
-	// temporary file already carries the caller's ownership.
+	// Chown needs root (the editor runs as root via --edit-protected);
+	// non-root temp files already carry the caller's ownership.
 	if os.Geteuid() == 0 {
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 			if cerr := f.Chown(int(stat.Uid), int(stat.Gid)); cerr != nil {
@@ -192,8 +175,7 @@ type dirEntry struct {
 	mtime time.Time
 }
 
-// listEntries stats up to limit children of n for the right-pane listing.
-// Entries that vanish while listing are skipped.
+// listEntries stats up to limit children, skipping vanished entries.
 func listEntries(n *fileNode, limit int) []dirEntry {
 	out := make([]dirEntry, 0, min(limit, len(n.children)))
 	for _, c := range n.children {

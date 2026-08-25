@@ -19,6 +19,7 @@ func TestVerboseToLogrus(t *testing.T) {
 		in   constants.VerboseLevel
 		want log.Level
 	}{
+		{constants.ErrorsOnly, log.ErrorLevel},
 		{constants.NeededInfo, log.WarnLevel},
 		{constants.InternalWarningsLevelTwo, log.InfoLevel},
 		{constants.PrintAdditionalInfoLevelOne, log.DebugLevel},
@@ -33,7 +34,7 @@ func TestVerboseToLogrus(t *testing.T) {
 			t.Errorf("VerboseToLogrus(%d) = %v, want %v", int(tc.in), got, tc.want)
 		}
 	}
-	for _, invalid := range []int{-1, 4, 100} {
+	for _, invalid := range []int{-1, 5, 100} {
 		if _, err := VerboseToLogrus(constants.VerboseLevel(invalid)); err == nil {
 			t.Errorf("VerboseToLogrus(%d) accepted an out-of-range level", invalid)
 		}

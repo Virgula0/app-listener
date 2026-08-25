@@ -1,7 +1,6 @@
-// Package logging centralizes the verbosity model of the CLI: the mapping
-// from the user-facing --verbose levels (constants.VerboseLevel) onto logrus
-// levels, the --dump-log file hook and the bridge that routes Go's standard
-// library logger (used by google/fscrypt during migrations) into logrus.
+// Package logging centralizes the CLI verbosity model: mapping constants.VerboseLevel onto
+// logrus levels, the --dump-log file hook, and routing Go's stdlib logger (used by google/fscrypt
+// during migrations) into logrus.
 package logging
 
 import (
@@ -18,21 +17,16 @@ import (
 	"github.com/Virgula0/app-listener/internal/constants"
 )
 
-// DefaultVerbose is the verbosity applied when --verbose is not given: it
-// maps onto the logrus info level, i.e. exactly what the tools display
-// today. A dump taken with only --dump-log therefore records precisely the
-// displayed stream unless the operator raises --verbose explicitly.
+// DefaultVerbose is the verbosity applied when --verbose is omitted (logrus info): a dump taken
+// with only --dump-log records exactly the displayed stream unless the operator raises --verbose.
 const DefaultVerbose = constants.InternalWarningsLevelTwo
 
-// VerboseToLogrus maps a VerboseLevel onto the logrus level that governs
-// both the console stream and the --dump-log file:
-//
-//	NeededInfo                    -> warn  (essential lines only)
-//	InternalWarningsLevelTwo      -> info  (what is printed today)
-//	PrintAdditionalInfoLevelOne   -> debug (+ internal details)
-//	PrintAdditionalInfoLevelTwo   -> trace (everything)
+// VerboseToLogrus maps a VerboseLevel onto the logrus level governing both the console
+// stream and the --dump-log file; see the ladder documented on constants.VerboseLevel.
 func VerboseToLogrus(v constants.VerboseLevel) (log.Level, error) {
 	switch v {
+	case constants.ErrorsOnly:
+		return log.ErrorLevel, nil
 	case constants.NeededInfo:
 		return log.WarnLevel, nil
 	case constants.InternalWarningsLevelTwo:
@@ -47,12 +41,9 @@ func VerboseToLogrus(v constants.VerboseLevel) (log.Level, error) {
 	}
 }
 
-// DumpHook mirrors selected logrus entries into the --dump-log writer in a
-// plain, color-free format. It applies its own threshold derived from the
-// verbose level, independent of the console logger level, so an interactive
-// TUI run keeps its usual console output while the dump captures everything
-// the verbose setting allows. Every write is flushed: an abrupt process exit
-// (a signal-terminated daemon) never loses already-emitted lines.
+// DumpHook mirrors selected logrus entries into the --dump-log writer as plain, color-free text,
+// applying its own verbose-derived threshold independent of the console logger level. Every write
+// is flushed (sync-per-write): an abrupt process exit never loses already-emitted lines.
 type DumpHook struct {
 	mu  sync.Mutex
 	w   io.Writer
@@ -78,8 +69,7 @@ func (h *DumpHook) Levels() []log.Level {
 
 // Fire writes one formatted line per entry below-or-equal the threshold.
 func (h *DumpHook) Fire(e *log.Entry) error {
-	// logrus orders levels by severity (panic=0 .. trace=6): an entry is
-	// within the threshold when it is at least as severe as min.
+	// Levels are severity-ordered (panic=0 .. trace=6): within-threshold = at least as severe.
 	if e.Level > h.min {
 		return nil
 	}
@@ -95,9 +85,8 @@ func (h *DumpHook) Fire(e *log.Entry) error {
 	return nil
 }
 
-// formatEntry renders one plain-text line: "timestamp [LEVEL] message
-// key=value ...". The console formatter force-enables ANSI colors; the dump
-// must stay clean text.
+// formatEntry renders one plain-text line: "timestamp [LEVEL] message key=value ...";
+// unlike the ANSI-colored console formatter, the dump stays clean text.
 func formatEntry(e *log.Entry) string {
 	var b strings.Builder
 	b.WriteString(e.Time.Format("2006-01-02 15:04:05"))
@@ -110,8 +99,7 @@ func formatEntry(e *log.Entry) string {
 	return b.String()
 }
 
-// sortedKeys returns the entry's field keys in deterministic order so dumps
-// are diff-friendly.
+// sortedKeys returns entry field keys in deterministic, diff-friendly order.
 func sortedKeys(data map[string]any) []string {
 	keys := make([]string, 0, len(data))
 	for k := range data {
@@ -129,11 +117,9 @@ func sortStrings(s []string) {
 	}
 }
 
-// BridgeStdLog routes the default Go standard library logger — google/fscrypt
-// logs its migration progress through it — into logrus at info level. Those
-// lines keep appearing exactly like today on the console AND become part of
-// --dump-log, closing the hole where encryption-phase output was invisible
-// to the dump. The returned restore puts back the previous writer/flags.
+// BridgeStdLog routes the default Go stdlib logger (google/fscrypt logs its migration
+// progress through it) into logrus at info level, so those lines reach both the console and
+// --dump-log. The returned restore reinstates the previous writer/flags.
 func BridgeStdLog() (restore func()) {
 	prevWriter := stdlog.Writer()
 	prevFlags := stdlog.Flags()

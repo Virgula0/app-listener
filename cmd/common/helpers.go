@@ -160,6 +160,24 @@ func ParseEventsFlag(eventsFlag []string) ([]ebpf.EventType, error) {
 	return parsed, nil
 }
 
+// ParseNetEventsFlag parses the network --events flag; an empty list means
+// every network event type.
+func ParseNetEventsFlag(netEventsFlag []string) ([]ebpf.NetEventType, error) {
+	if len(netEventsFlag) == 0 {
+		return ebpf.NetEventTypes(), nil
+	}
+
+	var parsed []ebpf.NetEventType
+	for _, s := range netEventsFlag {
+		et, ok := ebpf.ParseNetEventType(strings.TrimSpace(s))
+		if !ok {
+			return nil, fmt.Errorf("unknown network event type %q (valid: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS, BIND, LISTEN)", s)
+		}
+		parsed = append(parsed, et)
+	}
+	return parsed, nil
+}
+
 func WarnIgnoredFlags(rawTargets []RawTarget, recursive bool, depth int) {
 	for _, rt := range rawTargets {
 		if !rt.IsDir && recursive {
