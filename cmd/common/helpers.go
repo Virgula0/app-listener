@@ -4,8 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 
@@ -187,4 +190,33 @@ func WarnIgnoredFlags(rawTargets []RawTarget, recursive bool, depth int) {
 			log.Warnf("--depth is ignored when monitoring a single file (%s)", rt.AbsPath)
 		}
 	}
+}
+
+// UIDResolver caches UID → username lookups to avoid per-event syscalls.
+// Create once at startup and reuse for every event.
+type UIDResolver struct {
+	mu    sync.Mutex
+	cache map[uint32]string
+}
+
+// NewUIDResolver returns a resolver ready for use.
+func NewUIDResolver() *UIDResolver {
+	return &UIDResolver{cache: make(map[uint32]string)}
+}
+
+// Resolve returns the username for uid, falling back to the numeric string.
+func (r *UIDResolver) Resolve(uid uint32) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if name, ok := r.cache[uid]; ok {
+		return name
+	}
+
+	name := strconv.FormatUint(uint64(uid), 10)
+	if u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10)); err == nil {
+		name = u.Username
+	}
+	r.cache[uid] = name
+	return name
 }

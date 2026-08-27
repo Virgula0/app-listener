@@ -330,21 +330,23 @@ const (
 // priority marker so journald colors denied attempts yellow. When
 // blockedOnly is set, allowed events are dropped. It reports whether the
 // event was written.
-func writeEvent(w io.Writer, blockedOnly bool, ev *usecase.DaemonEvent) bool {
+func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *usecase.DaemonEvent) bool {
 	if !ev.Event.Blocked && blockedOnly {
 		return false
 	}
+	who := uidr.Resolve(ev.Event.UID)
 	if ev.Event.Blocked {
-		fmt.Fprintf(w, "%sDAEMON DENIED|%s|%s|%s|%s|%d|%d\n",
-			syslogWarning, ev.Resource, ev.Event.Type.String(), ev.Event.Comm, ev.Event.Path, ev.Event.PID, ev.Event.UID)
+		fmt.Fprintf(w, "%sDAEMON DENIED  op=%s  comm=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
+			syslogWarning, ev.Event.Type.String(), ev.Event.Comm, ev.Event.PID, who, ev.Resource, ev.Event.Path)
 		return true
 	}
-	fmt.Fprintf(w, "%sDAEMON|%s|%s|%s|%s|%d|%d\n",
-		syslogInfo, ev.Resource, ev.Event.Type.String(), ev.Event.Comm, ev.Event.Path, ev.Event.PID, ev.Event.UID)
+	fmt.Fprintf(w, "%sDAEMON ALLOWED  op=%s  comm=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
+		syslogInfo, ev.Event.Type.String(), ev.Event.Comm, ev.Event.PID, who, ev.Resource, ev.Event.Path)
 	return true
 }
 
 func runHeadless(d usecase.DaemonUseCase, reload func()) {
+	uidr := common.NewUIDResolver()
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
@@ -354,7 +356,7 @@ func runHeadless(d usecase.DaemonUseCase, reload func()) {
 			if !ok {
 				return
 			}
-			if !writeEvent(os.Stderr, blockedOnly, &ev) {
+			if !writeEvent(os.Stderr, blockedOnly, uidr, &ev) {
 				continue
 			}
 		case s := <-sig:
