@@ -1,9 +1,6 @@
-// Package install implements the `app-listener install` wizard: it builds
-// the binary if needed, generates the fscrypt master key, lets the user
-// pick which users and critical directories to protect (with curated
-// whitelisted binaries), migrates directories to fscrypt encryption with a
-// non-destructive backup, installs the systemd services and pacman hook,
-// and finally enables and verifies the daemon.
+// Package install implements the `app-listener install` wizard: builds the
+// binary, ensures the fscrypt master key, picks users and critical dirs,
+// migrates to fscrypt with backups, installs units/hook, enables the daemon.
 package install
 
 import (
@@ -30,6 +27,10 @@ func init() {
 		"Delete the found .app_listener.backup directories (listed in the TUI, confirmed once, with progress)")
 	InstallCmd.Flags().Bool("binary-only", false,
 		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon; no wizard, no config, no fscrypt, no systemd units")
+	InstallCmd.Flags().Bool("update-catalog-only", false,
+		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
+	InstallCmd.Flags().BoolP("yes", "y", false,
+		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. pacman hooks)")
 }
 
 var InstallCmd = &cobra.Command{
@@ -97,7 +98,13 @@ Use --binary-only for a non-interactive shortcut that only deploys the
 binary: it builds build/linux/app-listener when it does not exist, stops
 a running daemon, replaces /usr/local/sbin/app-listener atomically,
 recreates the /usr/local/bin/app-listener symlink and starts the daemon
-again — nothing else is touched (no config, no fscrypt, no services).`,
+again — nothing else is touched (no config, no fscrypt, no services).
+
+Use --update-catalog-only to refresh the whitelist of every guarded
+directory from the catalog: encrypted vaults are unlocked, glob patterns
+are re-expanded (picking up new binaries and dropping deleted ones),
+and the diff is shown before overwriting. User-added sections (not in
+the catalog) are preserved as-is. Requires a previous installation.`,
 	Args: cobra.NoArgs,
 	RunE: runInstall,
 }
@@ -115,10 +122,9 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// The installer reconfigures files the daemon has open: a daemon left
-	// alive during the migration would keep guarding and unlocking the very
-	// directories being moved. Stop it first, fatally refusing when it runs
-	// outside systemd (where the installer cannot control it).
+	// The daemon holds open the files being reconfigured and would keep
+	// guarding the dirs being moved: stop it first; outside-systemd daemons
+	// are fatally refused (the installer cannot control them).
 	if err := systemd.StopDaemonIfRunning(); err != nil {
 		return err
 	}
@@ -152,79 +158,99 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	return cleanupBackups(cfg)
 }
 
-// runMaintenanceMode reads the non-installing switches and runs the
-// requested maintenance mode. It reports whether one was requested (done)
-// so the caller knows the installer body must be skipped. The modes are
-// mutually exclusive.
+// runMaintenanceMode dispatches the mutually exclusive maintenance flags,
+// reporting whether one ran so the caller skips the installer body.
+// maintenanceFlags holds the parsed CLI flags for the install command's
+// mutually exclusive maintenance modes.
+type maintenanceFlags struct {
+	restore       bool
+	deleteBackup  bool
+	binaryOnly    bool
+	updateCatalog bool
+	autoConfirm   bool
+}
+
+func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
+	var f maintenanceFlags
+	var err error
+	if f.restore, err = cmd.Flags().GetBool("restore-backups"); err != nil {
+		return f, err
+	}
+	if f.deleteBackup, err = cmd.Flags().GetBool("delete-post-backups"); err != nil {
+		return f, err
+	}
+	if f.binaryOnly, err = cmd.Flags().GetBool("binary-only"); err != nil {
+		return f, err
+	}
+	if f.updateCatalog, err = cmd.Flags().GetBool("update-catalog-only"); err != nil {
+		return f, err
+	}
+	if f.autoConfirm, err = cmd.Flags().GetBool("yes"); err != nil {
+		return f, err
+	}
+	return f, nil
+}
+
 func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
-	restore, flagErr := cmd.Flags().GetBool("restore-backups")
-	if flagErr != nil {
-		return false, flagErr
+	f, err := parseMaintenanceFlags(cmd)
+	if err != nil {
+		return false, err
 	}
-	deleteBackups, flagErr := cmd.Flags().GetBool("delete-post-backups")
-	if flagErr != nil {
-		return false, flagErr
-	}
-	binaryOnly, flagErr := cmd.Flags().GetBool("binary-only")
-	if flagErr != nil {
-		return false, flagErr
+	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
+		return false, errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
 	}
 	modes := 0
-	for _, on := range []bool{restore, deleteBackups, binaryOnly} {
+	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.updateCatalog} {
 		if on {
 			modes++
 		}
 	}
 	if modes > 1 {
-		return false, errors.New("--restore-backups, --delete-post-backups and --binary-only are mutually exclusive")
+		return false, errors.New("--restore-backups, --delete-post-backups, --binary-only and --update-catalog-only are mutually exclusive")
 	}
 	switch {
-	case restore:
+	case f.restore:
 		return true, restoreBackups()
-	case deleteBackups:
+	case f.deleteBackup:
 		return true, deletePostBackups()
-	case binaryOnly:
+	case f.binaryOnly:
 		return true, installBinaryOnly()
+	case f.updateCatalog:
+		return true, runUpdateCatalogOnly(f.autoConfirm)
 	}
 	return false, nil
 }
 
-// installBinaryOnly deploys just the binary: it builds build/linux/app-listener
-// when it does not exist, stops a running daemon, replaces the installed
-// binary atomically, recreates the PATH symlink and brings the daemon back
-// to enabled-and-running. Everything else (config, fscrypt migration,
-// systemd units) is deliberately left untouched.
+// installBinaryOnly deploys only the freshly built binary (see
+// systemd.DeployInstalledBinary); config, fscrypt and units stay untouched.
 func installBinaryOnly() error {
 	if err := buildBinaryIfNeeded(); err != nil {
 		return err
 	}
 
-	// Same contract as the full installer and `update`: replacing the
-	// running binary requires the daemon to be stopped (a daemon outside
-	// systemd is a fatal error).
-	if err := systemd.StopDaemonIfRunning(); err != nil {
-		return err
-	}
-
-	if err := systemd.ReplaceInstalledBinary(buildBinaryPath, systemd.InstallBinaryPath); err != nil {
+	if err := systemd.DeployInstalledBinary(buildBinaryPath); err != nil {
 		return fmt.Errorf("installing binary: %w", err)
-	}
-	log.Infof("installed binary at %s", systemd.InstallBinaryPath)
-
-	if err := systemd.EnsureBinSymlink(); err != nil {
-		return err
-	}
-
-	if err := systemd.EnableAndVerify(false); err != nil {
-		return err
 	}
 	log.Info("binary-only install complete: the daemon is running the new binary")
 	return nil
 }
 
-// prepareInstallation covers the two steps that precede any user input:
-// building the binary (unless it already exists) and ensuring the master
-// key file exists.
+// runUpdateCatalogOnly re-scans the catalog whitelist for every guarded
+// directory in the existing daemon.conf. Encrypted vaults are unlocked
+// for stat access, glob patterns are re-expanded, and the diff is shown
+// for confirmation. User-added sections are preserved verbatim.
+func runUpdateCatalogOnly(autoConfirm bool) error {
+	if err := systemd.StopDaemonIfRunning(); err != nil {
+		return err
+	}
+	vault := fscrypt.New()
+	if err := updateCatalogConfig(vault, autoConfirm); err != nil {
+		return err
+	}
+	return systemd.EnableAndVerify(true)
+}
+
+// prepareInstallation builds the binary and ensures the master key exists.
 func prepareInstallation() error {
 	if err := buildBinaryIfNeeded(); err != nil {
 		return err
@@ -232,9 +258,7 @@ func prepareInstallation() error {
 	return ensureMasterKey()
 }
 
-// selectAndEditConfig runs the interactive selection flow: users, catalog
-// discovery, manual additions, then the embedded editor with strict
-// validation of the result.
+// selectAndEditConfig runs users, catalog, manual additions, then the editor.
 func selectAndEditConfig() (string, *daemonconfig.Config, error) {
 	users, err := pickUsers()
 	if err != nil {
@@ -254,12 +278,9 @@ func selectAndEditConfig() (string, *daemonconfig.Config, error) {
 	return editConfig(candidates)
 }
 
-// secureResources verifies the encryption state of every directory (fatal
-// on an encrypted directory declared need_encryption: false, and on a key
-// mismatch), asks only for the directories that are NOT yet encrypted AND
-// declare need_encryption: true whether encryption is required, and
-// migrates the ones that need it. The returned text reflects the final
-// need_encryption decisions.
+// secureResources verifies encryption state (fatal: encrypted dir declared
+// need_encryption: false, or master-key mismatch), asks only unencrypted
+// dirs with need_encryption: true and migrates them; text reflects decisions.
 func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Config) (string, error) {
 	if err := verifyEncryptionState(vault, cfg); err != nil {
 		return "", err
@@ -277,11 +298,8 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 	return updated, nil
 }
 
-// askFilesystemsReady fails fast when a target filesystem was never
-// initialized for fscrypt (`fscrypt setup`): without it every migration
-// aborts deep inside the library, after the user already answered the
-// prompts. Filesystems are deduplicated by device so a multi-fs setup is
-// each verified exactly once.
+// askFilesystemsReady fails fast on filesystems lacking `fscrypt setup`,
+// before any prompting; dedup by device verifies each fs exactly once.
 func askFilesystemsReady(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
 	var checkedDevs []uint64
 	for _, r := range cfg.Resources {
@@ -304,12 +322,9 @@ func askFilesystemsReady(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
 	return nil
 }
 
-// deploy installs the services and hook, copies the binary and the config
-// into place, then brings the daemon to the enabled-and-running state.
-// Existing files (config and services) are diffed against the bundled
-// versions: identical files are left alone, differing ones show the diff
-// and ask whether to overwrite. A changed config is delivered to a running
-// daemon with SIGHUP.
+// deploy installs services/hook, copies binary+config, enables the daemon.
+// Existing files are diffed: identical ones stay, differing ones show the
+// diff and ask; a changed config reaches a running daemon via SIGHUP.
 func deploy(cfgText string) error {
 	if err := installServices(); err != nil {
 		return err
@@ -321,10 +336,8 @@ func deploy(cfgText string) error {
 	return systemd.EnableAndVerify(configChanged)
 }
 
-// buildBinaryIfNeeded compiles the binary with the Makefile build flags
-// (CGO_ENABLED=1 GOOS=linux GOARCH=amd64) when build/linux/app-listener
-// does not exist yet. Without a source tree in the current directory the
-// installer refuses: the binary must exist beforehand in that case.
+// buildBinaryIfNeeded compiles with the Makefile flags when
+// build/linux/app-listener is missing; without a source tree it refuses.
 func buildBinaryIfNeeded() error {
 	if _, err := os.Stat(buildBinaryPath); err == nil {
 		log.Infof("binary already built: %s", buildBinaryPath)
@@ -360,11 +373,9 @@ func ensureMasterKey() error {
 	return nil
 }
 
-// verifyEncryptionState checks every resource's encryption state, always:
-// a directory that is encrypted while the config explicitly declares
-// need_encryption: false is a fatal error (the daemon would leave an
-// encrypted directory unmanaged), and every already-encrypted directory
-// must unlock with the current master key (fatal on the first mismatch).
+// verifyEncryptionState checks every resource: encrypted while declared
+// need_encryption: false is fatal (unmanaged encryption), and encrypted
+// dirs must unlock with the current master key (fatal on mismatch).
 func verifyEncryptionState(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
 	for _, r := range cfg.Resources {
 		encrypted, err := vault.IsEncrypted(r.Path)
@@ -385,10 +396,8 @@ func verifyEncryptionState(vault *fscrypt.Vault, cfg *daemonconfig.Config) error
 	return nil
 }
 
-// encryptDirectories migrates every not-yet-encrypted directory that was
-// selected for encryption. It fails fatally on the first error: backups
-// created before the failure are deliberately left in place. While a
-// directory is being migrated a TUI progress bar shows the copy progress.
+// encryptDirectories migrates the selected dirs behind a progress bar,
+// failing fatally on the first error (prior backups deliberately kept).
 func encryptDirectories(vault *fscrypt.Vault, toEncrypt []string) error {
 	if len(toEncrypt) == 0 {
 		return nil
@@ -415,8 +424,7 @@ func encryptDirectories(vault *fscrypt.Vault, toEncrypt []string) error {
 	return nil
 }
 
-// cleanupBackups asks for each remaining migration backup whether it may
-// be deleted. This is the very last step, after the daemon is verified.
+// cleanupBackups asks per backup whether to delete it (final step, post-verify).
 func cleanupBackups(cfg *daemonconfig.Config) error {
 	for _, r := range cfg.Resources {
 		backup := r.Path + fscrypt.BackupSuffix

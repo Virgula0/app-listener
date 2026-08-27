@@ -1,25 +1,11 @@
-// The `app-listener update` command keeps an installed daemon binary up to
-// date with the latest GitHub release of the selected channel (--channel,
-// default "stable"):
-//
-//  1. reads the installed binary's embedded version (--version)
-//  2. lists the repository releases from the GitHub API, keeps the ones of
-//     the selected channel (stable = non-pre-releases, pre-release =
-//     pre-releases) and picks the newest one (by published_at)
-//  3. skips when the installed tag is not older
-//  4. downloads the release binary, its sha256 checksum and the Ed25519
-//     signature of that checksum
-//  5. verifies the signature against the public key embedded in the binary
-//     (certificates/app-listener-release.pub), the checksum against the
-//     downloaded binary, and the GitHub-provided asset digest when present
-//  6. shows the release changelog in a TUI viewer and asks for confirmation
-//     before making any change (skipped with --yes, or when a non-terminal
-//     input is detected the command aborts without updating)
-//  7. replaces /usr/local/sbin/app-listener atomically and restarts the
-//     systemd daemon, mirroring the installer's stop/start contract
-//
-// The signing private key never lives in this repository: it is stored as
-// the RELEASE_SIGNING_KEY GitHub Actions secret only.
+// The `app-listener update` command self-updates the daemon from the latest
+// GitHub release of --channel (default stable): read the embedded version,
+// pick the newest release of the channel (skip when not older); download
+// binary + sha256 + Ed25519 signature and verify them (embedded public key,
+// checksum, GitHub asset digest); show the changelog and confirm (--yes
+// skips, non-terminal stdin aborts); atomically replace the installed binary
+// and restart the daemon mirroring the installer's stop/start contract. The
+// signing private key lives only in a GitHub Actions secret.
 package update
 
 import (
@@ -54,28 +40,23 @@ import (
 const (
 	// githubAPIBase is the GitHub REST API endpoint used to list releases.
 	githubAPIBase = "https://api.github.com"
-	// defaultRepo is the only repository the updater knows about: the
-	// release workflow of this project signs its assets with the key
-	// embedded in this binary, so another repository cannot be trusted.
+	// Only repo the updater trusts: its workflow signs assets with the key
+	// embedded in this binary, so others cannot be trusted.
 	defaultRepo = "Virgula0/app-listener"
-	// releaseAssetBinary / Checksum / Signature are the release asset
-	// names produced by .github/workflows/release.yml.
+	// Release asset names produced by .github/workflows/release.yml.
 	releaseAssetBinary    = "app-listener"
 	releaseAssetChecksum  = "app-listener.sha256"
 	releaseAssetSignature = "app-listener.sha256.sig"
-	// preVersionPattern matches the release tag format
-	// pre-YYYYMMDD-<sha7> produced by the release workflow.
+	// Matches pre-YYYYMMDD-<sha7> tags from the release workflow.
 	preVersionPattern = `^pre-(\d{8})-([0-9a-f]{7})$`
-	// stableVersionPattern matches the stable release tag format vX.Y.Z
-	// following the standard Go semver convention.
+	// Matches vX.Y.Z semver stable tags.
 	stableVersionPattern = `^v?(\d+)\.(\d+)\.(\d+)$`
 	// updateHTTPTimeout bounds a single GitHub API/download request.
 	updateHTTPTimeout = 60 * time.Second
 )
 
 const (
-	// channelStable and channelPreRelease are the accepted --channel
-	// values. channelStable tracks non-pre-release (stable) releases.
+	// The accepted --channel values (stable tracks non-prereleases).
 	channelStable     = "stable"
 	channelPreRelease = "pre-release"
 )
@@ -87,8 +68,7 @@ var stableVersionRe = regexp.MustCompile(stableVersionPattern)
 // yesFlag skips the changelog viewer and the confirmation prompt.
 var yesFlag bool
 
-// channelFlag selects which GitHub releases to track: channelStable
-// (default) or channelPreRelease.
+// channelFlag selects the tracked release channel (default channelStable).
 var channelFlag string
 
 func init() {
@@ -132,8 +112,7 @@ repository are accepted.`,
 	RunE: runUpdate,
 }
 
-// githubRelease mirrors the fields of the GitHub releases API relevant to
-// the updater.
+// githubRelease mirrors the updater-relevant fields of the releases API.
 type githubRelease struct {
 	TagName     string `json:"tag_name"`
 	Body        string `json:"body"`
@@ -146,8 +125,7 @@ type githubRelease struct {
 	} `json:"assets"`
 }
 
-// validateChannel rejects --channel values that are neither of the two
-// supported channels.
+// validateChannel rejects unsupported --channel values.
 func validateChannel(ch string) error {
 	if ch != channelStable && ch != channelPreRelease {
 		return fmt.Errorf("invalid --channel %q: must be %q or %q", ch, channelStable, channelPreRelease)
@@ -155,9 +133,8 @@ func validateChannel(ch string) error {
 	return nil
 }
 
-// runUpdate drives the whole update flow. All release checks run first;
-// only then is the changelog shown and the user asked to confirm, unless
-// --yes skips the interactive part entirely.
+// runUpdate drives the update flow: every check runs first; changelog and
+// confirmation come last unless --yes skips them.
 func runUpdate(cmd *cobra.Command, args []string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("update must be run as root: sudo app-listener update")
@@ -200,9 +177,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// The verified download must survive until applyUpdate has replaced
-	// the installed binary, so the staging directory is owned here, not by
-	// downloadAndVerify (whose return would clean it up prematurely).
+	// Staging dir owned here: the verified download must survive until
+	// applyUpdate swaps the binary (downloadAndVerify's return would clean
+	// it up prematurely).
 	tmp, err := os.MkdirTemp("", "app-listener-update-*")
 	if err != nil {
 		return err
@@ -226,11 +203,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	return applyUpdate(binPath)
 }
 
-// downloadAndVerify downloads the three release assets into the caller-owned
-// staging dir and runs every verification (signature, checksum, GitHub
-// digest and binary sanity) before anything is shown to or asked of the
-// user. The download progress is shown in the TUI bottom bar when stderr is
-// a terminal.
+// downloadAndVerify downloads the three assets into the caller-owned staging
+// dir and runs every verification (signature, checksum, digest, binary
+// sanity) before anything reaches the user; progress shows on the TUI bar.
 func downloadAndVerify(tmp string, r *githubRelease, binURL, binDigest, checksumURL, sigURL string) (string, error) {
 	var binPath, checksumPath, sigPath string
 	err := wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
@@ -256,10 +231,9 @@ func downloadAndVerify(tmp string, r *githubRelease, binURL, binDigest, checksum
 	return binPath, nil
 }
 
-// confirmUpdate decides whether the update should be applied. With --yes
-// the changelog is logged and the update proceeds immediately. Otherwise
-// the release notes are shown in a TUI viewer (aborting with a clear error
-// when the input is not a terminal) and the user is asked to confirm.
+// confirmUpdate decides whether to apply: --yes logs the changelog and
+// proceeds; otherwise the notes open in a TUI viewer (non-tty aborts) and
+// the user confirms.
 func confirmUpdate(r *githubRelease) (bool, error) {
 	if yesFlag {
 		log.Infof("--yes given: skipping the changelog viewer and the confirmation prompt")
@@ -288,9 +262,8 @@ func isTerminal(f *os.File) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-// resolveAssets finds the binary, checksum and signature assets of a
-// release, returning their download URLs and the GitHub-provided binary
-// digest when present.
+// resolveAssets returns the binary/checksum/signature URLs and the
+// GitHub-provided binary digest when present.
 func resolveAssets(r *githubRelease) (binURL, binDigest, checksumURL, sigURL string, err error) {
 	asset := func(name string) (url, digest string, ok bool) {
 		for i := range r.Assets {
@@ -313,8 +286,8 @@ func resolveAssets(r *githubRelease) (binURL, binDigest, checksumURL, sigURL str
 	return binURL, binDigest, checksumURL, sigURL, nil
 }
 
-// downloadReleaseFiles downloads the three release assets into dir and
-// returns their paths. Download progress is reported on bar when non-nil.
+// downloadReleaseFiles downloads the three assets into dir, reporting
+// progress on bar when non-nil.
 func downloadReleaseFiles(client *http.Client, dir, binURL, checksumURL, sigURL string, bar *wizard.BottomBar) (binPath, checksumPath, sigPath string, err error) {
 	binPath = filepath.Join(dir, releaseAssetBinary)
 	if err := downloadFile(client, binURL, binPath, bar, "Downloading app-listener"); err != nil {
@@ -331,10 +304,8 @@ func downloadReleaseFiles(client *http.Client, dir, binURL, checksumURL, sigURL 
 	return binPath, checksumPath, sigPath, nil
 }
 
-// readInstalledVersion runs the installed binary with --version and returns
-// the reported version. A binary too old to know --version is treated as an
-// unknown version, which the comparer maps to "older than any
-// pre-release".
+// readInstalledVersion runs the installed binary with --version; failures or
+// unknown output map to "unknown", treated as older than any release.
 func readInstalledVersion(installPath string) string {
 	cmd := exec.CommandContext(context.Background(), installPath, "--version")
 	out, err := cmd.CombinedOutput()
@@ -350,8 +321,7 @@ func readInstalledVersion(installPath string) string {
 	return fields[len(fields)-1]
 }
 
-// fetchReleases returns the repository releases, newest first, from the
-// GitHub releases API, without any channel filtering.
+// fetchReleases returns the repository releases, newest first, unfiltered.
 func fetchReleases(apiBase, repo string, client *http.Client) ([]githubRelease, error) {
 	url := fmt.Sprintf("%s/repos/%s/releases?per_page=100", apiBase, repo)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
@@ -376,10 +346,8 @@ func fetchReleases(apiBase, repo string, client *http.Client) ([]githubRelease, 
 	return releases, nil
 }
 
-// filterChannel keeps only the releases of the selected channel,
-// preserving the server order. The stable channel is everything that is
-// not marked prerelease; the pre-release channel is exactly the marked
-// prereleases.
+// filterChannel keeps the selected channel's releases in server order:
+// stable = non-prereleases, pre-release = prereleases.
 func filterChannel(releases []githubRelease, channel string) []githubRelease {
 	keep := func(r githubRelease) bool {
 		if channel == channelPreRelease {
@@ -414,8 +382,7 @@ func pickLatestRelease(releases []githubRelease) (githubRelease, bool) {
 	return latest, found
 }
 
-// latestTime parses the published_at of a release (zero time on failure,
-// so malformed timestamps never win the comparison).
+// latestTime parses published_at (zero on failure, so bad timestamps lose).
 func latestTime(r *githubRelease) time.Time {
 	ts, err := time.Parse(time.RFC3339, r.PublishedAt)
 	if err != nil {
@@ -424,9 +391,8 @@ func latestTime(r *githubRelease) time.Time {
 	return ts
 }
 
-// newerThanInstalled reports whether the latest pre-release is newer than
-// the installed version. The installed version is either a pre-YYYYMMDD-<sha>
-// tag, or anything else (dev builds, unknown) which is always older.
+// newerThanInstalled reports whether the latest pre-release beats the
+// installed tag; non-pre-release installed versions always update.
 func newerThanInstalled(installed string, latest *githubRelease, releases []githubRelease) bool {
 	if !preVersionRe.MatchString(installed) {
 		log.Infof("installed version %q is not a pre-release build: the latest pre-release is newer", installed)
@@ -440,17 +406,13 @@ func newerThanInstalled(installed string, latest *githubRelease, releases []gith
 			return latestTime(latest).After(latestTime(&releases[i]))
 		}
 	}
-	// The installed tag is no longer among the listed pre-releases: it is
-	// older than the newest page of releases we fetched.
+	// Installed tag fell off the fetched page: treat as older, update.
 	log.Infof("installed tag %s not found among the fetched pre-releases: updating", installed)
 	return true
 }
 
-// newerThanStable reports whether the latest stable release is newer than
-// the installed version. An installed version that is not a stable semver
-// (a pre-release build, a dev build or an unknown version) needs the
-// latest stable. When both sides are stable semver tags only a strictly
-// newer release triggers an update.
+// newerThanStable reports whether the latest stable beats the installed
+// version; non-semver installed versions always update, equal/older do not.
 func newerThanStable(installed string, latest *githubRelease) bool {
 	if installed == latest.TagName {
 		return false
@@ -473,8 +435,7 @@ type stableVersion struct {
 	major, minor, patch uint64
 }
 
-// parseStableVersion parses a vX.Y.Z (or X.Y.Z) tag into its numeric
-// components; ok is false for anything else.
+// parseStableVersion parses a vX.Y.Z (or X.Y.Z) tag; ok is false otherwise.
 func parseStableVersion(s string) (stableVersion, bool) {
 	m := stableVersionRe.FindStringSubmatch(s)
 	if m == nil {
@@ -503,8 +464,7 @@ func parseVerPart(s string) (uint64, error) {
 	return n, nil
 }
 
-// compareStableVersions compares two stable versions: negative when a < b,
-// zero when equal, positive when a > b.
+// compareStableVersions returns <0/0/>0 for a<b/a==b/a>b.
 func compareStableVersions(a, b stableVersion) int {
 	if a.major != b.major {
 		return cmp.Compare(a.major, b.major)
@@ -515,16 +475,14 @@ func compareStableVersions(a, b stableVersion) int {
 	return cmp.Compare(a.patch, b.patch)
 }
 
-// updateHTTPClient returns an HTTP client with a bounded per-request
-// timeout, shared by API calls and asset downloads.
+// updateHTTPClient returns a client bounded by updateHTTPTimeout.
 func updateHTTPClient() *http.Client {
 	return &http.Client{Timeout: updateHTTPTimeout}
 }
 
-// downloadFile downloads url into path (atomically via a temp file). The
-// downloaded file is left with 0700 (the installer's binary mode). When
-// bar is non-nil and the server sends a Content-Length, the download
-// progress is reported on it with the given label.
+// downloadFile downloads url into path atomically (temp file + rename),
+// leaving mode 0700: hardened kernels refuse to exec without x bits and
+// os.CreateTemp makes 0600; progress reports on bar when non-nil.
 func downloadFile(client *http.Client, url, path string, bar *wizard.BottomBar, label string) error {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
 	if err != nil {
@@ -558,10 +516,8 @@ func downloadFile(client *http.Client, url, path string, bar *wizard.BottomBar, 
 	if err := os.Rename(f.Name(), path); err != nil {
 		return err
 	}
-	// The file is about to be executed during the sanity check; some
-	// hardened kernels refuse to exec a file without execute bits even for
-	// root, and os.CreateTemp leaves 0600. Give it the same 0700 the
-	// installer uses.
+	// Executed during the sanity check; CreateTemp leaves 0600, and some
+	// hardened kernels refuse to exec that even as root.
 	return os.Chmod(path, 0o700)
 }
 
@@ -584,9 +540,8 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// verifyRelease checks, in order: the Ed25519 signature of the checksum
-// file against the embedded public key, the sha256 checksum against the
-// downloaded binary, and — when GitHub provides one — the asset digest.
+// verifyRelease checks the checksum's Ed25519 signature against the embedded
+// key, then the checksum against the binary, then the GitHub asset digest.
 func verifyRelease(binPath, checksumPath, sigPath, assetDigest string) error {
 	pub, err := parsePublicKey(certificates.ReleasePublicKeyPEM)
 	if err != nil {
@@ -595,8 +550,7 @@ func verifyRelease(binPath, checksumPath, sigPath, assetDigest string) error {
 	return verifyReleaseWithKey(binPath, checksumPath, sigPath, assetDigest, pub)
 }
 
-// verifyReleaseWithKey is the verification core of verifyRelease with an
-// explicit public key.
+// verifyReleaseWithKey is verifyRelease with an explicit public key.
 func verifyReleaseWithKey(binPath, checksumPath, sigPath, assetDigest string, pub ed25519.PublicKey) error {
 	bin, err := os.ReadFile(binPath)
 	if err != nil {
@@ -632,8 +586,7 @@ func verifyReleaseWithKey(binPath, checksumPath, sigPath, assetDigest string, pu
 	return nil
 }
 
-// parsePublicKey parses the PEM-encoded SPKI Ed25519 public key embedded
-// in the binary.
+// parsePublicKey parses the embedded PEM SPKI Ed25519 public key.
 func parsePublicKey(pemBytes []byte) (ed25519.PublicKey, error) {
 	block, _ := pem.Decode(pemBytes)
 	if block == nil {
@@ -650,8 +603,7 @@ func parsePublicKey(pemBytes []byte) (ed25519.PublicKey, error) {
 	return ed, nil
 }
 
-// parseChecksum extracts the first hex token of the sha256sum-style
-// checksum file.
+// parseChecksum extracts the validated sha256 hex token of a checksum file.
 func parseChecksum(data []byte) (string, error) {
 	fields := strings.Fields(string(data))
 	if len(fields) == 0 {
@@ -666,8 +618,7 @@ func parseChecksum(data []byte) (string, error) {
 	return fields[0], nil
 }
 
-// sanityCheckBinary refuses to deploy a file that is not an ELF executable
-// and whose own --version does not report the release tag being installed.
+// sanityCheckBinary refuses non-ELF files whose --version misses the wanted tag.
 func sanityCheckBinary(path, wantVersion string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -692,22 +643,11 @@ func sanityCheckBinary(path, wantVersion string) error {
 	return nil
 }
 
-// applyUpdate stops the daemon (verifying the resources lock), replaces
-// the installed binary atomically, recreates the PATH symlink if needed and
-// brings the daemon back to enabled-and-running.
+// applyUpdate stops the daemon (verifying the lock state), atomically
+// replaces the installed binary and brings the unit back to
+// enabled-and-running.
 func applyUpdate(binPath string) error {
-	if err := systemd.StopDaemonIfRunning(); err != nil {
-		return err
-	}
-
-	if err := systemd.ReplaceInstalledBinary(binPath, systemd.InstallBinaryPath); err != nil {
-		return err
-	}
-	if err := systemd.EnsureBinSymlink(); err != nil {
-		return err
-	}
-
-	if err := systemd.EnableAndVerify(false); err != nil {
+	if err := systemd.DeployInstalledBinary(binPath); err != nil {
 		return err
 	}
 	log.Info("update complete: the daemon is running the new binary")

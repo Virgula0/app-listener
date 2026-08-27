@@ -1,10 +1,6 @@
-// Package daemonconfig parses the daemon mode configuration file.
-//
-// The grammar follows ssh-guard.conf: each [watch <dir>] section protects
-// one resource and lists the binaries allowed to access it, optionally
-// restricted to a set of event types. chattr/exclude_chattr directives are
-// intentionally NOT supported — the LSM guard engine replaces that
-// mechanism entirely.
+// Package daemonconfig parses the daemon mode configuration file, following ssh-guard.conf
+// grammar: each [watch <dir>] section protects one resource and lists allowed binaries with
+// optional event types; chattr/exclude_chattr are deliberately unsupported (the LSM guard engine replaces them).
 package daemonconfig
 
 import (
@@ -25,42 +21,30 @@ type Config struct {
 	Resources []Resource
 }
 
-// Resource is one [watch <path>] section. The path is either a directory
-// (the classic fscrypt-encrypted resource tree) or a single regular file
-// carrying its own fscrypt policy. Symbolic links, hard-linked files and
-// special files are refused at parse time.
+// Resource is one [watch <path>] section: a directory tree or a single regular file with
+// its own fscrypt policy. Symlinks, hard-linked files and special files are refused at parse time.
 type Resource struct {
 	Path string
-	// NeedEncryption selects the fscrypt lifecycle for this resource.
-	// It defaults to true; a resource marked as encrypted that carries no
-	// fscrypt policy aborts the daemon at startup.
+	// NeedEncryption selects the fscrypt lifecycle; defaults to true. An encrypted-marked
+	// resource without an fscrypt policy aborts the daemon at startup.
 	NeedEncryption bool
 	Binaries       []BinaryRule
-	// PendingBinaries lists whitelisted binaries that could not be read
-	// when the config was parsed (typically because their directory is
-	// still fscrypt-locked). One pass after the resource is unlocked
-	// (see the daemon usecase) moves them into Binaries; until then they
-	// are absent from the BPF whitelist, so in whitelist mode they are
-	// simply denied — fail-closed, never fail-open.
+	// PendingBinaries parks whitelisted binaries unreadable at parse time (typically an
+	// fscrypt-locked directory). Until a post-unlock pass moves them into Binaries they stay
+	// absent from the BPF whitelist — denied: fail-closed, never fail-open.
 	PendingBinaries []BinaryRule
 }
 
 // BinaryRule is one whitelisted binary inside a resource section.
 type BinaryRule struct {
 	Path string
-	// Events restricts the operations this binary may perform; an empty
-	// list means every event type is allowed.
+	// Events restricts the operations this binary may perform; empty means every type.
 	Events []ebpf.EventType
 }
 
-// Load parses the configuration file at path. Missing watch paths are
-// skipped with a warning (matching ssh-guard's tolerance), and so are the
-// directives of a skipped section — including directives that appear
-// before any [watch] section. A binary that cannot be read yet (its
-// directory is still fscrypt-locked) is parked in Resource.PendingBinaries
-// and resolved by the daemon once the resource is unlocked. Malformed
-// directives inside a valid section fail fast: a security configuration
-// must not be silently misread.
+// Load parses the configuration file at path. Missing watch paths are skipped with a warning,
+// as are directives outside any [watch] section; unreadable binaries are parked in
+// PendingBinaries for post-unlock resolution. Malformed directives in valid sections fail fast.
 func Load(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -86,10 +70,8 @@ func Load(path string) (*Config, error) {
 		}
 
 		if current == nil {
-			// ssh-guard ignores directives outside a watch section (its
-			// currentIdx < 0 branch). Keep that tolerance, but say so: a
-			// silently dropped security directive is a misconfiguration
-			// the operator must be able to spot.
+			// Tolerated like ssh-guard, but warned: a silently dropped
+			// security directive must be spottable.
 			log.Warnf("daemon config line %d: ignoring directive outside any [watch] section: %q", lineNo, line)
 			continue
 		}
@@ -119,11 +101,9 @@ func parseWatchSection(line string) (string, bool) {
 	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]")), true
 }
 
-// addResource creates a new resource for watchPath, skipping targets that
-// cannot be guarded: missing paths, symbolic links, hard-linked regular
-// files (more than one link would make the guard implicitly cover another
-// path to the same inode) and anything that is neither a directory nor a
-// unique regular file. It returns nil when the path is skipped.
+// addResource creates a resource for watchPath, returning nil for unguardable targets:
+// missing paths, symlinks, hard-linked regular files (the inode-based guard would
+// implicitly cover another path) and anything not a directory or unique regular file.
 func addResource(cfg *Config, watchPath string, lineNo int) *Resource {
 	info, err := os.Lstat(watchPath)
 	if err != nil {
@@ -148,9 +128,8 @@ func addResource(cfg *Config, watchPath string, lineNo int) *Resource {
 	return &cfg.Resources[len(cfg.Resources)-1]
 }
 
-// applyDirective handles one directive inside a [watch] section:
-// need_encryption lines, binary lines and (deliberately unsupported)
-// chattr lines.
+// applyDirective handles one [watch]-section directive: need_encryption, binary rules
+// and (deliberately unsupported) chattr lines.
 func applyDirective(current *Resource, line string, lineNo int) error {
 	if value, ok := parseNeedEncryption(line); ok {
 		switch value {
@@ -178,12 +157,9 @@ func applyDirective(current *Resource, line string, lineNo int) error {
 		rule.Events = events
 	}
 	if _, statErr := os.Stat(binPath); statErr != nil {
-		// The binary lives inside a still-locked fscrypt tree (or is
-		// genuinely gone). Keep the rule for the post-unlock resolution
-		// pass instead of dropping it: dropping would silently disable
-		// the whitelist entry, and keeping it is fail-closed (the binary
-		// stays unlisted in the BPF whitelist, i.e. denied, until it
-		// becomes resolvable).
+		// Binary unreadable (locked tree or genuinely gone): defer to the post-unlock
+		// pass rather than drop — dropping would silently disable the entry; deferred
+		// stays unlisted in BPF, i.e. denied, until resolvable (fail-closed).
 		log.Warnf("daemon config line %d: binary not readable yet, deferring: %s", lineNo, binPath)
 		current.PendingBinaries = append(current.PendingBinaries, rule)
 		return nil //nolint:nilerr // returning nil despite statErr is the point: the unreadable rule is deliberately deferred, not dropped

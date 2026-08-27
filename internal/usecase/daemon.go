@@ -14,17 +14,16 @@ import (
 )
 
 const (
-	// maxLockRetries mirrors ssh-guard's teardown retry budget for the
-	// EBUSY/ENOKEY dance when deprovisioning fscrypt keys.
+	// maxLockRetries bounds the EBUSY retry loop when force-flushing an
+	// fscrypt lock during key deprovisioning.
 	maxLockRetries = 100
 	lockRetryDelay = 10 * time.Millisecond
-	// resyncMinInterval throttles re-syncing the binary whitelist after a
-	// denied access: a denial storm must not re-stat every whitelisted
-	// binary on each event.
+	// resyncMinInterval throttles post-denial re-syncs: a denial storm must
+	// not re-stat every whitelisted binary on each event.
 	resyncMinInterval = 2 * time.Second
-	// resyncSweepEvery is the interval of the background binary re-sync
-	// sweep, which catches replacements that never produced a denied
-	// access (the replaced binary was still running when it was swapped).
+	// resyncSweepEvery is the background re-sync interval, catching
+	// replacements that never produced a denied access (swapped while the
+	// old binary was still running).
 	resyncSweepEvery = 30 * time.Second
 )
 
@@ -34,12 +33,9 @@ type DaemonEvent struct {
 	Event    guard.GuardEvent
 }
 
-// DaemonUseCase orchestrates the daemon lifecycle: verify encryption,
-// unlock (decrypt) resources, start the per-resource whitelist guards,
-// atomically apply configuration reloads (SIGHUP), and — on shutdown —
-// lock everything back up while the guards are still attached, so there
-// is never an unprotected window (the TOC-TOU concern that ssh-guard's
-// teardown sequence was designed against).
+// DaemonUseCase orchestrates the daemon lifecycle: verify encryption, unlock, run guards,
+// apply atomic SIGHUP reloads and a secure lockdown. Ordering is attach → unlock → populate
+// → resolve → re-sync, so resources are never readable without live protection (no TOCTOU window).
 type DaemonUseCase interface {
 	Start() error
 	Reload(resources []daemonconfig.Resource, guards []repository.GuardRepository) error
@@ -53,9 +49,8 @@ type daemonUseCase struct {
 	resources []daemonconfig.Resource
 	vault     repository.Vault
 	guards    []repository.GuardRepository
-	// stops holds one channel per guard; closing it detaches that guard's
-	// event forwarder. Guard event channels are never closed, so reloads
-	// need these to retire the forwarders of replaced guards.
+	// stops holds one close-channel per guard to retire its event forwarder
+	// on reload (guard event channels themselves are never closed).
 	stops []chan struct{}
 
 	events chan DaemonEvent
@@ -64,9 +59,8 @@ type daemonUseCase struct {
 	start   sync.Once
 	stop    sync.Once
 	started bool
-	// stopping is set once the lockdown begins. Reload refuses once it is
-	// set: a SIGHUP during shutdown must never attach new guards or
-	// unlock resources that the lockdown sequence will not clean up.
+	// stopping is set once lockdown begins; Reload refuses when set, so a
+	// SIGHUP mid-shutdown can never attach guards or unlock resources.
 	stopping bool
 }
 
@@ -83,17 +77,9 @@ func NewDaemonUseCase(resources []daemonconfig.Resource, vault repository.Vault,
 	}, nil
 }
 
-// Start brings the daemon up in ssh-guard's order: verify every resource's
-// encryption state first (nothing is unlocked or protected on partial
-// failure), then unlock what needs unlocking, then populate the inode maps
-// of the already-attached guards, then start the event readers. The guards
-// are built (LSM hooks attached) by the caller BEFORE Start is invoked, so
-// a resource is never unlocked while its hooks are not yet live — the
-// window the original ssh-guard closed by attaching fanotify marks before
-// injecting keys.
-// populateInodes scans the already-attached guards' resource trees into
-// their inode maps. It must run only after the resources are unlocked: a
-// locked fscrypt tree cannot be stat'ed.
+// populateInodes scans the already-attached guards' resource trees into their inode maps.
+// It runs after the resources are unlocked (a locked fscrypt tree cannot be stat'ed); guards
+// are attached by the caller before Start, preserving attach → unlock → populate ordering.
 func (d *daemonUseCase) populateInodes() error {
 	for i := range d.guards {
 		if err := d.guards[i].PopulateInodes(); err != nil {
@@ -111,10 +97,9 @@ func (d *daemonUseCase) Start() error {
 	return startErr
 }
 
-// verifyEncryptionStates checks every resource's encryption state against
-// its need_encryption setting before anything is unlocked or protected:
-// a misconfigured resource aborts the start instead of unlocking (or
-// silently ignoring) the wrong tree.
+// verifyEncryptionStates checks every resource's encryption state against its
+// need_encryption setting before anything is unlocked or protected: a misconfigured
+// resource aborts the start.
 func (d *daemonUseCase) verifyEncryptionStates() error {
 	for _, r := range d.resources {
 		encrypted, err := d.vault.IsEncrypted(r.Path)
@@ -145,22 +130,16 @@ func (d *daemonUseCase) startGuards() error {
 		}
 	}
 
-	// The guards are already attached (the builder ran before Start), so
-	// the inode scan below happens with protection live and the resources
-	// readable: no unlocked-and-unprotected window.
+	// Guards are already attached (built before Start): the scan runs with
+	// protection live and resources readable — no unlocked-and-unprotected window.
 	if err := d.populateInodes(); err != nil {
 		return err
 	}
 
-	// Binary whitelist entries that were deferred while their tree was
-	// still locked are now resolvable. Until this point they were absent
-	// from the BPF whitelist and therefore denied — fail-closed exactly
-	// like any other binary — so the unlock never precedes their
-	// protection: hooks attach, then unlock, then populate, then resolve.
-	// The re-sync right after catches binaries that were replaced on disk
-	// while the daemon was down (an application update keyed by a stale
-	// inode): the updated process is usually already running by the time
-	// the daemon comes up.
+	// Fail-closed contract: deferred whitelist entries stay absent from the BPF
+	// whitelist — denied — until resolved here, so unlock never precedes protection
+	// (attach → unlock → populate → resolve). The re-sync right after admits binaries
+	// replaced on disk while the daemon was down.
 	for i := range d.guards {
 		if err := d.guards[i].ResolvePendingBinaries(); err != nil {
 			return fmt.Errorf("resolving deferred binaries for %s: %w", d.resources[i].Path, err)
@@ -195,12 +174,9 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 			if !ok {
 				return
 			}
-			// A denied access usually means the accessing binary was
-			// replaced in place (an application update changed its
-			// inode); re-sync the whitelist so the new binary is
-			// admitted — the update retries the write within seconds.
-			// Throttled: a denial storm must not re-stat the whitelist
-			// on every event.
+			// A denial usually means the binary was replaced in place;
+			// re-sync (throttled by resyncMinInterval) to admit the new
+			// inode instead of re-statting the whitelist per event.
 			if ev.Blocked && time.Since(lastResync) >= resyncMinInterval {
 				if _, err := g.ReSyncBinaries(); err != nil {
 					log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
@@ -215,9 +191,7 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 				return
 			}
 		case <-sweep.C:
-			// Periodic sweep: catches replacements that never produced
-			// a denied access (the old binary was still running when
-			// the update swapped it, so nothing was blocked).
+			// Periodic sweep: catches replacements that never produced a denial.
 			if _, err := g.ReSyncBinaries(); err != nil {
 				log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
 			}
@@ -230,19 +204,10 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 	}
 }
 
-// Reload atomically applies a new configuration, mirroring ssh-guard's
-// SIGHUP handling. The guards passed in are ALREADY attached (built by
-// the caller) before this call returns; the kernel runs the old and new
-// LSM programs together during the transition and denies an access when
-// ANY of them denies, so protection is never weaker than either
-// configuration — there is no instant where a whitelisted-only change
-// opens a window. On any error the previous configuration keeps running
-// untouched and the newly built guards are detached.
-//
-// Removing a resource from the configuration is refused: its directory
-// would be left unlocked (the key is only deprovisioned at shutdown) with
-// no guard attached. Dropping protection requires a stop/edit/start
-// cycle, so the operator deliberately accepts the exposure.
+// Reload atomically applies a new configuration: old and new LSM programs run concurrently
+// and ANY deny wins, so protection is never weaker than either configuration; on error the
+// old config keeps running and the new guards are detached. Removing a resource is refused —
+// it would be left unlocked and unguarded; dropping protection requires stop/edit/start.
 func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repository.GuardRepository) error {
 	if len(resources) != len(guards) {
 		return fmt.Errorf("daemon: %d resources but %d guard engines", len(resources), len(guards))
@@ -260,9 +225,9 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 		return fmt.Errorf("daemon: reload refused: shutdown in progress — restart the daemon to apply the new configuration")
 	}
 
-	// Phase 0 — refuse to drop any protected resource (see the comment on
-	// Reload). Nothing has been committed yet, so the newly built guards
-	// are detached and the old configuration keeps running.
+	// Phase 0 — refuse to drop any protected resource (see Reload). Nothing
+	// is committed yet, so the new guards are detached and the old config
+	// keeps running.
 	newByPath := make(map[string]bool, len(resources))
 	for _, r := range resources {
 		newByPath[r.Path] = true
@@ -283,51 +248,41 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 		oldByPath[r.Path] = i
 	}
 
-	// Phase 1 — validate and unlock resources that are new to the
-	// configuration. Nothing is committed yet: on any error the newly
-	// built (and attached) guards are detached again, anything we just
-	// unlocked is locked back, and the old configuration keeps running.
-	// The guards passed in were built (hooks attached) by the caller
-	// before this call, so the unlocks below never happen without live
-	// protection — the same ordering ssh-guard guarantees at startup.
+	// Phase 1 — validate and unlock resources new to the config; nothing is
+	// committed yet, so errors roll back (detach new guards, re-lock unlocks).
+	// Guards were attached by the caller: unlocks always have live protection.
 	var unlocked []string
 	if err := d.prepareNewResources(resources, oldByPath, &unlocked); err != nil {
 		d.rollbackReload(guards, unlocked)
 		return err
 	}
 
-	// Phase 2 — populate the inode maps of the new guards. Every new
-	// resource is unlocked (or was already readable) and the new hooks are
-	// attached, so the scan sees the plaintext without a protection gap.
-	// Deferred binary whitelist entries are resolved right after, then the
-	// whitelist re-synced: same fail-closed ordering as at startup
-	// (attach → unlock → populate → resolve → re-sync).
+	// Phase 2 — populate the new guards' inode maps (hooks live, plaintext
+	// readable — no protection gap), then resolve deferred entries and
+	// re-sync: same fail-closed ordering as startup.
 	if err := d.prepareGuards(resources, guards); err != nil {
 		d.rollbackReload(guards, unlocked)
 		return err
 	}
 
-	// Phase 3 — start the ringbuf readers of all new guards. The old
-	// guards remain attached; no protection is dropped at any point.
+	// Phase 3 — start new guards' ringbuf readers; old guards stay attached.
 	if err := d.startNewGuards(guards); err != nil {
 		d.rollbackReload(guards, unlocked)
 		return err
 	}
 
-	// Phase 4 — commit: swap the references, retire the old forwarders,
-	// then detach the old LSM programs.
+	// Phase 4 — commit: swap references, retire old forwarders, detach old LSM programs.
 	d.commitReload(resources, guards)
 	log.Info("daemon: configuration reloaded without dropping protection")
 	return nil
 }
 
-// prepareNewResources validates and unlocks the resources that are new to
-// the configuration; kept resources keep their lifecycle untouched. Every
-// unlock performed here is recorded so a rollback can lock it back.
+// prepareNewResources validates and unlocks resources new to the configuration; kept
+// resources are untouched. Each unlock is recorded so rollback can lock it back.
 func (d *daemonUseCase) prepareNewResources(resources []daemonconfig.Resource, oldByPath map[string]int, unlocked *[]string) error {
 	for _, r := range resources {
 		if _, existed := oldByPath[r.Path]; existed {
-			continue // lifecycle unchanged for kept resources
+			continue
 		}
 		if err := d.prepareAddedResource(r, unlocked); err != nil {
 			return err
@@ -371,10 +326,9 @@ func (d *daemonUseCase) startNewGuards(guards []repository.GuardRepository) erro
 	return nil
 }
 
-// prepareGuards fills the inode maps of the freshly built (and already
-// attached) guards, resolves their deferred whitelist entries and re-syncs
-// binaries that were replaced on disk. It runs after the new resources were
-// unlocked, so every scan sees plaintext while the hooks are live.
+// prepareGuards fills the freshly attached guards' inode maps, resolves deferred
+// whitelist entries and re-syncs replaced binaries; it runs post-unlock, so scans
+// see plaintext while hooks are live.
 func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards []repository.GuardRepository) error {
 	for i := range guards {
 		if err := guards[i].PopulateInodes(); err != nil {
@@ -390,8 +344,8 @@ func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards 
 	return nil
 }
 
-// rollbackReload detaches the newly built (not yet committed) guards and
-// locks back any resource the aborted reload unlocked.
+// rollbackReload detaches the not-yet-committed new guards and locks back
+// any resource the aborted reload unlocked.
 func (d *daemonUseCase) rollbackReload(guards []repository.GuardRepository, unlocked []string) {
 	for _, g := range guards {
 		g.Stop()
@@ -403,9 +357,8 @@ func (d *daemonUseCase) rollbackReload(guards []repository.GuardRepository, unlo
 	}
 }
 
-// commitReload swaps the running configuration for the new one. The new
-// forwarders are spawned before the old ones are retired and the old LSM
-// programs detached, so the event stream never goes silent either.
+// commitReload swaps in the new configuration; new forwarders spawn before old ones
+// retire and old LSM programs detach, so the event stream never goes silent either.
 func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards []repository.GuardRepository) {
 	newStops := make([]chan struct{}, len(guards))
 	for i := range guards {
@@ -426,26 +379,16 @@ func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards [
 	d.stops = newStops
 }
 
-// Stop performs the secure lockdown. The guards stay attached — denying
-// every non-whitelisted access — for the whole lock sequence, so no new
-// open can pin an inode while the keys are being deprovisioned. Only when
-// every resource is keyless are the LSM hooks detached. This is strictly
-// stronger than ssh-guard's teardown, which removed its marks before the
-// final lock pass.
-//
-// A resource whose key cannot be deprovisioned (a process still holding
-// open files in it) BLOCKS the shutdown: the guards remain attached and
-// deny every non-whitelisted access, so the tree is never left unlocked
-// and unguarded. Shutdown only completes when every resource is keyless —
-// the daemon keeps retrying and logs how to find the pinning process.
+// Stop performs the secure lockdown: guards stay attached (denying all non-whitelisted
+// access) until every resource is keyless; only then are LSM hooks detached. A resource
+// whose key cannot be deprovisioned blocks shutdown indefinitely — the tree is never
+// left unlocked and unguarded, and the daemon logs how to find the pinning process.
 func (d *daemonUseCase) Stop() {
 	d.stop.Do(func() {
 		log.Info("daemon: initiating secure lockdown")
 
-		// Hold the write lock for the entire lockdown: Reload serializes
-		// behind it and refuses once stopping is set, so a SIGHUP can
-		// never attach new guards or unlock new resources while the
-		// shutdown sequence is running.
+		// Hold the write lock through lockdown: Reload serializes behind it and
+		// refuses once stopping is set — no SIGHUP attaches/unlocks mid-shutdown.
 		d.mu.Lock()
 		defer d.mu.Unlock()
 
@@ -465,11 +408,9 @@ func (d *daemonUseCase) Stop() {
 			}
 		}
 
-		// Second pass: force-flush with the EBUSY retry loop; ENOKEY
-		// (ErrKeyMissing) confirms the key is gone and counts as success.
-		// Resources that stay busy are retried indefinitely — detaching the
-		// guards here would leave the tree unlocked and unguarded, so
-		// shutdown never gives up.
+		// Second pass: force-flush with EBUSY retries; ENOKEY (ErrKeyMissing) counts
+		// as success. Busy resources retry forever — detaching guards here would leave
+		// the tree unlocked and unguarded, so shutdown never gives up.
 		pending := make([]string, 0, len(resources))
 		for _, r := range resources {
 			if r.NeedEncryption {
@@ -485,11 +426,9 @@ func (d *daemonUseCase) Stop() {
 	})
 }
 
-// lockUntilAllKeyless keeps retrying the force-flush lock on every resource
-// until each one is keyless. It never returns while a resource is still
-// unlocked: the guards are still attached at that point and deny all access,
-// so the tree is never unprotected, and shutdown simply waits for whoever
-// pins the files to close them.
+// lockUntilAllKeyless retries the force-flush lock until every resource is keyless; it
+// never returns while one is unlocked — guards stay attached denying all access, so the
+// tree is never unprotected and shutdown just waits for file pins to close.
 func (d *daemonUseCase) lockUntilAllKeyless(pending []string) {
 	for len(pending) > 0 {
 		var still []string

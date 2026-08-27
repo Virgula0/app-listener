@@ -276,10 +276,5 @@ func (m *NetworkMonitor) cleanup() {
 	m.objs.Close()
 }
 
-func binariesSummary(binaries []BinaryEntry) string {
-	parts := make([]string, len(binaries))
-	for i, b := range binaries {
-		parts[i] = fmt.Sprintf("%s [sha256:%x..%x]", b.Path, b.Hash[:4], b.Hash[28:])
-	}
-	return strings.Join(parts, ", ")
-}
+// binariesSummary delegates to the shared implementation in infrastructure.
+var binariesSummary = ebpf.BinariesSummary

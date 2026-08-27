@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -59,7 +58,7 @@ func runNetworkMonitor(cmd *cobra.Command, args []string) error {
 		binaries = append(binaries, entry)
 	}
 
-	parsedEvents, err := parseNetEventsFlag(eventsFlag)
+	parsedEvents, err := common.ParseNetEventsFlag(eventsFlag)
 	if err != nil {
 		return err
 	}
@@ -90,22 +89,6 @@ func runNetworkMonitor(cmd *cobra.Command, args []string) error {
 	}
 
 	return runTUI(ucase, binaries)
-}
-
-func parseNetEventsFlag(flag []string) ([]ebpf.NetEventType, error) {
-	if len(flag) == 0 {
-		return ebpf.NetEventTypes(), nil
-	}
-
-	var parsed []ebpf.NetEventType
-	for _, s := range flag {
-		et, ok := ebpf.ParseNetEventType(strings.TrimSpace(s))
-		if !ok {
-			return nil, fmt.Errorf("unknown network event type %q (valid: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS, BIND, LISTEN)", s)
-		}
-		parsed = append(parsed, et)
-	}
-	return parsed, nil
 }
 
 func runHeadless(uc usecase.NetworkMonitorUseCase) {

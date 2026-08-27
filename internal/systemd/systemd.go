@@ -1,7 +1,6 @@
-// Package systemd centralizes the systemd integration and the installed
-// binary lifecycle shared by the install, uninstall and update commands:
-// where the daemon files live, how the daemon service is stopped, enabled,
-// started and verified, and how the /usr/local/bin PATH symlink is managed.
+// Package systemd centralizes the systemd integration and installed-binary
+// lifecycle shared by install/uninstall/update: file locations, unit
+// stop/enable/start/verify and /usr/local/bin PATH symlink management.
 package systemd
 
 import (
@@ -23,9 +22,8 @@ import (
 const (
 	// InstallBinaryPath is where the service unit expects the binary.
 	InstallBinaryPath = "/usr/local/sbin/app-listener"
-	// BinSymlinkPath makes the installed binary reachable as `app-listener`
-	// from any terminal: /usr/local/bin is in the default PATH of every
-	// user, while /usr/local/sbin normally is not.
+	// BinSymlinkPath exposes the binary as app-listener: /usr/local/bin is
+	// in every user's default PATH, /usr/local/sbin normally is not.
 	BinSymlinkPath = "/usr/local/bin/app-listener"
 	// SystemConfigDir and SystemConfigPath hold the installed daemon config.
 	SystemConfigDir  = "/etc/app-listener"
@@ -43,14 +41,9 @@ const (
 	daemonActiveState  = "active"
 )
 
-// StopDaemonIfRunning makes sure no app-listener daemon is left alive while
-// the installation reconfigures it: an active systemd unit is stopped
-// cleanly (the caller re-enables and starts it at the end), a daemon process
-// started outside systemd (e.g. a manual --headless run) is a fatal error
-// because it cannot be controlled, and a daemon that is not running at all
-// needs no action. After a systemd stop, the installed config's resources
-// are verified to be locked: a daemon killed without its lockdown would
-// leave the watched directories unlocked and unguarded.
+// StopDaemonIfRunning cleanly stops an active unit (the caller re-enables it
+// later) and fatally refuses daemons running outside systemd; after a stop
+// the installed config's resources are verified locked.
 func StopDaemonIfRunning() error {
 	if strings.TrimSpace(SystemctlOutput("is-active", DaemonServiceName)) == daemonActiveState {
 		log.Infof("daemon is running under systemd: stopping it ...")
@@ -74,12 +67,9 @@ func StopDaemonIfRunning() error {
 	return nil
 }
 
-// VerifyInstalledResourcesLocked loads the installed daemon config — the one
-// the stopped daemon was running with — and checks that every encrypted
-// resource is keyless. The daemon's own shutdown only returns once all
-// resources are locked, so a violation here means the daemon was killed
-// without running its lockdown (crash, SIGKILL, older binary): continuing
-// would leave the trees unlocked and unguarded.
+// VerifyInstalledResourcesLocked loads the installed config and checks every
+// encrypted resource is keyless: the daemon only exits after its lockdown, so
+// a violation means it was killed and continuing would leave trees unguarded.
 func VerifyInstalledResourcesLocked() error {
 	if _, err := os.Stat(SystemConfigPath); os.IsNotExist(err) {
 		log.Debug("no installed config yet: nothing to verify")
@@ -115,8 +105,7 @@ func VerifyResourcesLocked(resources []daemonconfig.Resource, provisioned func(s
 	return nil
 }
 
-// RunCmd runs a command and returns a wrapped error including the combined
-// output.
+// RunCmd runs a command, wrapping errors with the combined output.
 func RunCmd(prog string, args ...string) error {
 	cmd := exec.CommandContext(context.Background(), prog, args...)
 	out, err := cmd.CombinedOutput()
@@ -126,8 +115,7 @@ func RunCmd(prog string, args ...string) error {
 	return nil
 }
 
-// SystemctlOutput runs a read-only systemctl query, returning its trimmed
-// output (empty on failure).
+// SystemctlOutput runs a read-only systemctl query (trimmed, "" on failure).
 func SystemctlOutput(args ...string) string {
 	cmd := exec.CommandContext(context.Background(), "systemctl", args...)
 	out, err := cmd.Output()
@@ -137,11 +125,9 @@ func SystemctlOutput(args ...string) string {
 	return string(out)
 }
 
-// EnableAndVerify brings the daemon to the desired state no matter how a
-// previous or interrupted installation left it: when the config changed
-// and the daemon is already running, it is reloaded with SIGHUP instead of
-// restarted; when it is not running it is started; when it is not enabled
-// across reboots it is enabled. Both states are verified before success.
+// EnableAndVerify brings the daemon to enabled-and-running regardless of
+// prior state: a changed config on a running daemon is delivered via SIGHUP
+// reload (restart fallback); both states are verified.
 func EnableAndVerify(configChanged bool) error {
 	if err := RunCmd("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
@@ -186,18 +172,14 @@ func EnableAndVerify(configChanged bool) error {
 	return nil
 }
 
-// EnsureBinSymlink makes the installed binary reachable as `app-listener`
-// from any terminal by symlinking /usr/local/bin/app-listener to the
-// installed binary.
+// EnsureBinSymlink symlinks the PATH entry to the installed binary.
 func EnsureBinSymlink() error {
 	return EnsureBinSymlinkAt(BinSymlinkPath, InstallBinaryPath)
 }
 
-// EnsureBinSymlinkAt creates linkPath -> targetPath. It is idempotent: an
-// existing symlink already pointing at targetPath is left alone, a regular
-// file or a foreign symlink is never touched (a warning is logged instead),
-// and a missing parent directory is only a warning — the daemon itself does
-// not need the symlink.
+// EnsureBinSymlinkAt creates linkPath -> targetPath idempotently: a correct
+// symlink is kept, regular files and foreign symlinks are refused with a
+// warning, and a missing parent directory is only a warning.
 func EnsureBinSymlinkAt(linkPath, targetPath string) error {
 	info, err := os.Lstat(linkPath)
 	switch {
@@ -229,16 +211,13 @@ func EnsureBinSymlinkAt(linkPath, targetPath string) error {
 	return nil
 }
 
-// RemoveBinSymlink deletes the PATH symlink when it points at the installed
-// binary. A missing symlink, a regular file or a foreign symlink are left
-// untouched.
+// RemoveBinSymlink deletes the PATH symlink when it targets our binary.
 func RemoveBinSymlink() {
 	RemoveBinSymlinkAt(BinSymlinkPath, InstallBinaryPath)
 }
 
 // RemoveBinSymlinkAt removes linkPath only when it is a symlink pointing at
-// targetPath. A missing symlink, a regular file or a foreign symlink are
-// left untouched.
+// targetPath; anything else is left untouched.
 func RemoveBinSymlinkAt(linkPath, targetPath string) {
 	target, err := os.Readlink(linkPath)
 	if err != nil {
@@ -255,11 +234,9 @@ func RemoveBinSymlinkAt(linkPath, targetPath string) {
 	log.Infof("removed symlink %s", linkPath)
 }
 
-// ReplaceInstalledBinary swaps the binary at dstPath with srcPath,
-// atomically and with the 0700 mode the installed daemon expects. The new
-// content is staged in a temporary file next to dstPath and renamed over
-// it, so replacing a currently-executing binary (the installer or the
-// daemon itself) never fails with ETXTBSY.
+// ReplaceInstalledBinary swaps srcPath into dstPath atomically with mode
+// 0700: content is staged in a sibling temp file renamed over the
+// destination, so replacing a running binary never fails with ETXTBSY.
 func ReplaceInstalledBinary(srcPath, dstPath string) error {
 	tmp, err := os.CreateTemp(filepath.Dir(dstPath), ".app-listener-new-*")
 	if err != nil {
@@ -288,4 +265,24 @@ func ReplaceInstalledBinary(srcPath, dstPath string) error {
 	}
 	log.Infof("replaced %s with the new binary", dstPath)
 	return nil
+}
+
+// DeployInstalledBinary installs srcPath as the service binary: stops the
+// daemon first (outside-systemd is fatal), replaces it atomically, recreates
+// the PATH symlink and restores enabled-and-running. Shared by update/install.
+func DeployInstalledBinary(srcPath string) error {
+	if err := StopDaemonIfRunning(); err != nil {
+		return err
+	}
+
+	if err := ReplaceInstalledBinary(srcPath, InstallBinaryPath); err != nil {
+		return err
+	}
+	log.Infof("installed binary at %s", InstallBinaryPath)
+
+	if err := EnsureBinSymlink(); err != nil {
+		return err
+	}
+
+	return EnableAndVerify(false)
 }

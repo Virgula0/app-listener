@@ -256,7 +256,7 @@ Manual guard check:
 
 ```bash
 sudo systemctl stop app-listener-daemon
-sudo /usr/local/sbin/app-listener daemon --headless -l debug
+sudo /usr/local/sbin/app-listener daemon --headless --verbose 3
 # another terminal: ssh-add -l / ssh -T git@github.com → must WORK
 #                   cat /home/alice/.ssh/id_ed25519 → must be DENIED
 ```

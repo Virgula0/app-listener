@@ -1,14 +1,9 @@
-// The `app-listener uninstall` wizard is the counterpart of the installer:
-// it reverts everything `app-listener install` deployed. It fatally refuses
-// while the daemon is running, re-scans the catalog (NOT the installed
-// daemon.conf) to find which guarded directories are currently encrypted,
-// verifies the master key against every one, asks per directory whether the
-// fscrypt encryption may be permanently removed (default: no) and decrypts
-// the confirmed ones with a progress bar, then removes the installed
-// systemd units, pacman hook, binary, PATH symlink and config. The per-user
-// ssh-agent systemd units are only reverted after a separate confirmation
-// (default: no) and only when their content matches the bundled sample. The
-// fscrypt master key is never deleted unless --delete-key is passed.
+// The `app-listener uninstall` command reverts the installer: refuses while
+// the daemon runs, re-scans the catalog (not daemon.conf) for encrypted dirs,
+// verifies the master key, asks per dir to decrypt permanently (default: no),
+// removes units/hook/binary/symlink/config, reverts sample-matching ssh-agent
+// units after a separate confirmation, and deletes the key only with
+// --delete-key.
 package uninstall
 
 import (
@@ -26,9 +21,8 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// deleteKeyFlag controls whether the fscrypt master key is removed at the
-// end of the uninstall. It defaults to false: without the key, every
-// still-encrypted directory can never be unlocked again.
+// deleteKeyFlag removes the master key at the end; default false, since
+// without it still-encrypted directories can never be unlocked again.
 var deleteKeyFlag bool
 
 func init() {
@@ -82,10 +76,8 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 		return errors.New("uninstall must be run as root: sudo app-listener uninstall")
 	}
 
-	// The daemon guards the very directories being decrypted and deleted:
-	// reverting it while alive would let it keep unlocking and denying
-	// access. Fatally refuse instead of stopping it — there is nothing to
-	// re-enable at the end of an uninstall.
+	// The daemon guards the very dirs being decrypted/deleted; refuse while
+	// it lives instead of stopping it — nothing gets re-enabled afterwards.
 	if err := protected.RequireDaemonStopped(); err != nil {
 		return err
 	}
@@ -113,9 +105,8 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 		log.Infof("permanently decrypted %d directory(ies)", len(decrypted))
 	}
 
-	// The decrypted directories left their policy/protector metadata
-	// behind in /.fscrypt: remove the orphaned metadata while keeping the
-	// still-encrypted directories' metadata.
+	// Decrypted dirs left orphaned /.fscrypt metadata behind; remove it
+	// while keeping the still-encrypted directories' metadata.
 	if len(decrypted) > 0 {
 		if err := cleanOrphanedMetadata(); err != nil {
 			return err
@@ -142,9 +133,7 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// pickDirsToDecrypt shows, per encrypted directory, the confirmation
-// (default: no) whether its fscrypt encryption must be permanently removed
-// with the master key. Only the confirmed directories are returned.
+// pickDirsToDecrypt confirms permanent decryption per encrypted dir (default: no).
 func pickDirsToDecrypt(encrypted []string) ([]string, error) {
 	var toDecrypt []string
 	for _, path := range encrypted {
@@ -161,9 +150,7 @@ func pickDirsToDecrypt(encrypted []string) ([]string, error) {
 	return toDecrypt, nil
 }
 
-// askDecrypt shows the per-directory confirmation (default: no) whether the
-// fscrypt encryption of path must be permanently removed using the master
-// key.
+// askDecrypt shows path's permanent-decryption confirmation (default: no).
 func askDecrypt(path string) (bool, error) {
 	answer := false
 	if err := huh.NewForm(huh.NewGroup(
@@ -179,10 +166,8 @@ func askDecrypt(path string) (bool, error) {
 	return answer, nil
 }
 
-// decryptDirectories permanently decrypts every directory in the given
-// list. While a directory is being decrypted a TUI progress bar shows the
-// copy progress. It fails fatally and leaves the directory encrypted on the
-// first error: the plaintext copy is discarded, never silently swapped in.
+// decryptDirectories decrypts each dir behind a progress bar, failing
+// fatally on the first error (dir stays encrypted; plaintext copy discarded).
 func decryptDirectories(vault *fscrypt.Vault, toDecrypt []string) error {
 	if len(toDecrypt) == 0 {
 		return nil
@@ -206,13 +191,9 @@ func decryptDirectories(vault *fscrypt.Vault, toDecrypt []string) error {
 	return nil
 }
 
-// cleanOrphanedMetadata removes the fscrypt policy and protector metadata
-// left behind by directories that were decrypted moments ago. The live set
-// is derived from the catalog exactly like the installer scopes itself:
-// every discoverable watch directory for every local user plus the
-// system-level entries. Metadata of directories that still exist and are
-// still encrypted is kept; only orphaned app-listener-key-* raw-key
-// protector/policy pairs are deleted.
+// cleanOrphanedMetadata removes policy/protector metadata orphaned by the
+// just-decrypted dirs, scoped like the installer (catalog watch dirs for all
+// local users plus system entries); only app-listener-key-* pairs are deleted.
 func cleanOrphanedMetadata() error {
 	users, err := inst.ListUsers()
 	if err != nil {
@@ -224,26 +205,5 @@ func cleanOrphanedMetadata() error {
 		paths = append(paths, catalog[i].Path)
 	}
 
-	live, err := fscrypt.LivePolicyDescriptors(paths)
-	if err != nil {
-		return err
-	}
-
-	anchor := "/"
-	for _, p := range paths {
-		if _, statErr := os.Stat(p); statErr == nil {
-			anchor = p
-			break
-		}
-	}
-	removedProtectors, removedPolicies, err := fscrypt.CleanOrphans(anchor, live)
-	if err != nil {
-		return fmt.Errorf("cleaning orphaned fscrypt metadata: %w", err)
-	}
-	if removedProtectors == 0 && removedPolicies == 0 {
-		log.Info("no orphaned fscrypt metadata to clean")
-		return nil
-	}
-	log.Infof("cleaned orphaned fscrypt metadata: removed %d protector(s) and %d policy(ies)", removedProtectors, removedPolicies)
-	return nil
+	return fscrypt.CleanOrphanedMetadata(paths)
 }

@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,8 +35,7 @@ const (
 	GUARD_ALLOW = 2
 )
 
-// BinaryEntry identifies a binary the guard keys on. It is the shared
-// infrastructure type; this alias keeps the guard's public API unchanged.
+// BinaryEntry aliases the shared infrastructure type, keeping the guard's public API unchanged.
 type BinaryEntry = ebpf.BinaryEntry
 
 // ComputeBinaryEntry hashes a binary and derives its comm.
@@ -69,38 +67,27 @@ type Guard struct {
 	exeEvents map[string][]ebpf.EventType
 	recursive bool
 	depth     int
-	// canonicalPaths maps each binary's configured path to its symlink-
-	// resolved real path (computed at NewGuard time, when the binary was
-	// already readable). It is used to attribute events to guarded
-	// binaries whose config entry is a symlink, so that a process
-	// launched through the symlink is not misreported as "spoofed comm".
+	// canonicalPaths maps each configured binary path to its symlink-resolved real path (computed at
+	// NewGuard time, when the binary was readable), attributing events to binaries launched via a
+	// symlinked config entry so they are not misreported as spoofed comm.
 	canonicalPaths map[string]string
-	// deferred stores whitelist entries that could not be read while
-	// their resource tree was still fscrypt-locked. They stay unlisted
-	// (denied in whitelist mode) until ResolvePendingBinaries runs after
-	// the unlock.
+	// deferred holds whitelist entries unreadable while their resource tree was fscrypt-locked; they
+	// stay unlisted (denied in whitelist mode) until ResolvePendingBinaries runs after the unlock.
 	deferred []deferredBinary
-	// deployed tracks, per whitelisted binary path (symlink-canonicalized),
-	// the (dev, ino) currently written into the BPF maps. An application
-	// update that replaces a binary in place leaves the map keyed by a stale
-	// inode, denying the replaced binary; ReSyncBinaries re-stats the path
-	// and rewrites changed keys. Keys are never deleted from the maps, so a
-	// pre-replacement process that still runs keeps being admitted.
+	// deployed tracks, per symlink-canonicalized whitelisted path, the (dev, ino) currently in the BPF
+	// maps. In-place replacements leave a stale inode key denying the binary until ReSyncBinaries
+	// rewrites it; keys are never deleted, so a still-running pre-replacement process keeps admission.
 	deployed map[string]GuardInodeKey
-	// eagerPopulate scans the whole guarded tree into guard_inodes while
-	// the LSM hooks are not yet attached (see WithEagerPopulate).
+	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
 	eagerPopulate bool
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
 type GuardOption func(*Guard)
 
-// WithEagerPopulate registers every file and directory under the guarded
-// path in guard_inodes BEFORE the LSM hooks attach. In whitelist mode the
-// guard blocks every binary that is not allowlisted — including its own
-// process — so a post-attach startup walk (the eager population) would be
-// blocked by the guard's own file_open hook and fail with EPERM. Guards
-// that must scan only after an unlock (the daemon's fscrypt flow) omit
+// WithEagerPopulate registers every file and directory under the guarded path in guard_inodes BEFORE the
+// LSM hooks attach: in whitelist mode the guard denies any non-allowlisted binary — including its own
+// process — so a post-attach startup walk fails EPERM via its own file_open hook. Unlock-time guards omit
 // this option and call PopulateInodes themselves.
 func WithEagerPopulate() GuardOption {
 	return func(g *Guard) {
@@ -108,21 +95,17 @@ func WithEagerPopulate() GuardOption {
 	}
 }
 
-// WithBinaryEvents restricts each listed binary to the given event types
-// (blocking semantics: unlisted events are denied with EPERM). Binaries
-// without an entry keep allowing every event, preserving the plain guard
-// behavior.
+// WithBinaryEvents restricts each listed binary to the given event types (unlisted events are denied with
+// EPERM); binaries without an entry keep allowing every event, preserving plain guard behavior.
 func WithBinaryEvents(events map[string][]ebpf.EventType) GuardOption {
 	return func(g *Guard) {
 		g.exeEvents = events
 	}
 }
 
-// WithPendingBinaries registers whitelist entries that could not be read
-// while their resource tree was still locked (see daemonconfig.Resource.
-// PendingBinaries). They are left out of the BPF whitelist — denied in
-// whitelist mode — until ResolvePendingBinaries succeeds after the unlock,
-// so the whitelist never admits a binary ahead of its tree being usable.
+// WithPendingBinaries registers whitelist entries unreadable while their resource tree was still locked
+// (see daemonconfig.Resource.PendingBinaries); they stay out of the BPF whitelist — denied in whitelist
+// mode — until ResolvePendingBinaries succeeds post-unlock, never admitting a binary ahead of usability.
 func WithPendingBinaries(rules []daemonconfig.BinaryRule) GuardOption {
 	return func(g *Guard) {
 		g.deferred = make([]deferredBinary, len(rules))
@@ -132,11 +115,9 @@ func WithPendingBinaries(rules []daemonconfig.BinaryRule) GuardOption {
 	}
 }
 
-// eventMask converts event types into the BPF bitmask stored in
-// guard_exe_events. Listing READ, WRITE or MMAP implicitly allows OPEN: a
-// binary cannot perform those operations without opening the file first.
-// The returned mask never has the OPEN bit cleared when any of those three
-// is present.
+// eventMask converts event types into the BPF bitmask stored in guard_exe_events. Listing READ, WRITE or
+// MMAP implicitly allows OPEN (those operations require opening the file first); the OPEN bit is never
+// cleared when any of the three is present.
 func eventMask(types []ebpf.EventType) (uint32, error) {
 	var mask uint32
 	for _, t := range types {
@@ -190,21 +171,16 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	}
 	g.objs = objs
 
-	// Populate BPF maps first (sets operating mode and inode map), then
-	// attach LSM hooks. This avoids the guard blocking its own filesystem
-	// operations during startup (readdir, stat, etc.).
+	// Populate BPF maps first (mode + inode map), then attach LSM hooks, so the guard does not block
+	// its own filesystem operations during startup (readdir, stat).
 	if err := g.populateMaps(); err != nil {
 		g.cleanup()
 		return nil, fmt.Errorf("populating BPF maps: %w", err)
 	}
 
-	// Eagerly register the whole tree in guard_inodes while the hooks are
-	// still detached. populateMaps only records the guarded path's own
-	// inode; the full recursive scan must run pre-attach, otherwise the
-	// guard's own walk is blocked by its own file_open hook in whitelist
-	// mode (the guard's exe is not allowlisted) and startup fails with
-	// EPERM. Guards that need to scan after an unlock (daemon fscrypt
-	// flow) skip this and call PopulateInodes themselves.
+	// Register the whole tree in guard_inodes while hooks are still detached: populateMaps records only
+	// the root's inode, and a post-attach walk would be blocked by the guard's own file_open hook in
+	// whitelist mode (EPERM). Unlock-time guards skip this and call PopulateInodes themselves.
 	if g.eagerPopulate {
 		if err := g.PopulateInodes(); err != nil {
 			g.cleanup()
@@ -212,16 +188,9 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		}
 	}
 
-	// For each hook, track which hooks are critical (must attach for
-	// the guard to provide meaningful protection):
-	//
-	//   file_open, file_permission – required.  Without these, files
-	//   can be opened and read without restriction.  The guard will
-	//   fail if they cannot attach.
-	//
-	//   All other hooks – optional.  If they fail, a reduced set of
-	//   protection is available (e.g. no mmap, rename, or unlink
-	//   blocking).
+	// Required hooks: without file_open and file_permission files can be opened and read without
+	// restriction, so the guard refuses to start if they cannot attach. All other hooks are optional —
+	// failure yields reduced protection (no mmap, rename, or unlink blocking).
 	required := map[string]bool{
 		"file_open":       true,
 		"file_permission": true,
@@ -302,8 +271,7 @@ func modeString(mode Mode) string {
 	return "blacklist"
 }
 
-// guardModeKey converts a Mode to the uint64 value stored in the BPF config
-// map, rejecting unknown or negative modes.
+// guardModeKey converts a Mode to the uint64 value stored in the BPF config map, rejecting unknown modes.
 func guardModeKey(m Mode) (uint64, error) {
 	switch m {
 	case ModeBlacklist, ModeWhitelist:
@@ -313,8 +281,7 @@ func guardModeKey(m Mode) (uint64, error) {
 	}
 }
 
-// addBinaryActions stores the per-binary allow/block flags in
-// guard_exe_actions, keyed by the binary's filesystem inode.
+// addBinaryActions stores per-binary allow/block flags in guard_exe_actions, keyed by filesystem inode.
 func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 	for _, b := range binaries {
 		dev, ino, err := ebpf.StatInode(b.Path)
@@ -339,9 +306,8 @@ func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 	return nil
 }
 
-// addBinaryEvents stores the per-binary allowed-event bitmasks in
-// guard_exe_events. Only binaries with an explicit event list are stored;
-// the BPF layer treats a missing entry as "all events allowed".
+// addBinaryEvents stores per-binary allowed-event bitmasks in guard_exe_events for binaries with an explicit
+// list only; the BPF layer treats a missing entry as "all events allowed".
 func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf.EventType) error {
 	for _, b := range binaries {
 		types, ok := events[b.Path]
@@ -369,10 +335,8 @@ func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf
 	return nil
 }
 
-// resolveDeferred computes a BinaryEntry for every deferred rule that is
-// currently readable, returning the resolved entries, their event lists
-// (keyed by the binary's canonical path) and the rules that remain
-// unreadable. It never mutates the guard.
+// resolveDeferred computes a BinaryEntry for every deferred rule currently readable, returning the entries,
+// their event lists (keyed by canonical path), and rules still unreadable. It never mutates the guard.
 func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]ebpf.EventType, stillDeferred []deferredBinary) {
 	g.mu.Lock()
 	deferredList := append([]deferredBinary(nil), g.deferred...)
@@ -405,13 +369,9 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 	return resolved, events, stillDeferred
 }
 
-// ResolvePendingBinaries retries the whitelist entries that were deferred
-// because their resource was still locked. It must run only after the
-// resource is accessible (the daemon calls it post-unlock and post-
-// populateInodes). Each now-readable rule is hashed, canonicalized and
-// written into the whitelist maps; a rule that is still unreadable (or
-// genuinely gone) stays deferred and logged — the whitelist keeps
-// excluding it, so protection is never weakened by a failed resolve.
+// ResolvePendingBinaries retries whitelist entries deferred because their resource was still locked; it must run
+// only after the unlock (the daemon calls it post-unlock, post-populateInodes). Readable rules are hashed,
+// canonicalized and written to the whitelist maps; unreadable ones stay deferred and logged, never weakening protection.
 func (g *Guard) ResolvePendingBinaries() error {
 	g.mu.Lock()
 	hasDeferred := len(g.deferred) > 0
@@ -421,34 +381,21 @@ func (g *Guard) ResolvePendingBinaries() error {
 		return nil
 	}
 
-	// The maps are writable while the program is attached. Entries are
-	// keyed by inode, so the write is idempotent by construction.
+	// Maps stay writable while attached; inode-keyed entries make the write idempotent by construction.
 	resolved, events, stillDeferred := g.resolveDeferred()
-
-	g.mu.Lock()
-	g.deferred = stillDeferred
-	g.mu.Unlock()
-
+	if err := g.retryDeferredBinaries(resolved, events, stillDeferred); err != nil {
+		return err
+	}
 	if len(resolved) == 0 {
 		return nil
-	}
-	if err := g.addBinaryActions(resolved); err != nil {
-		return err
 	}
 	if err := g.addBinaryEvents(resolved, events); err != nil {
 		return err
 	}
 
 	g.mu.Lock()
-	g.binaries = append(g.binaries, resolved...)
 	for _, b := range resolved {
 		g.canonicalPaths[b.Path] = b.Path
-	}
-	if g.exeEvents == nil {
-		g.exeEvents = make(map[string][]ebpf.EventType)
-	}
-	for path, types := range events {
-		g.exeEvents[path] = types
 	}
 	g.mu.Unlock()
 
@@ -456,8 +403,7 @@ func (g *Guard) ResolvePendingBinaries() error {
 	return nil
 }
 
-// canonicalBinaryPath resolves symlinks for whitelist bookkeeping, falling
-// back to the literal path when the link chain is temporarily broken.
+// canonicalBinaryPath resolves symlinks for whitelist bookkeeping; falls back to the literal path if broken.
 func canonicalBinaryPath(path string) string {
 	if target, err := filepath.EvalSymlinks(path); err == nil {
 		return target
@@ -465,10 +411,8 @@ func canonicalBinaryPath(path string) string {
 	return path
 }
 
-// putBinaryKey writes the allow/block action for one binary into
-// guard_exe_actions and, in whitelist mode, any event mask into
-// guard_exe_events. Event masks are skipped in blacklist mode, where a
-// blocklisted binary is denied outright.
+// putBinaryKey writes one binary's allow/block action into guard_exe_actions and, in whitelist mode, its event
+// mask into guard_exe_events; masks are skipped in blacklist mode, where blocklisted binaries are denied outright.
 func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][]ebpf.EventType) error {
 	action := uint8(GUARD_BLOCK)
 	if g.mode == ModeWhitelist {
@@ -491,10 +435,8 @@ func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][
 	return nil
 }
 
-// retryDeferredBinaries retries the deferred whitelist rules once,
-// admitting every rule that became readable: it writes the map entries
-// and merges the resolved entries into the guard's bookkeeping. It is the
-// shared bookkeeping of ResolvePendingBinaries and ReSyncBinaries.
+// retryDeferredBinaries admits deferred rules that became readable: writes their map entries and merges them
+// into the guard's bookkeeping. Shared by ResolvePendingBinaries and ReSyncBinaries.
 func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map[string][]ebpf.EventType, stillDeferred []deferredBinary) error {
 	g.mu.Lock()
 	g.deferred = stillDeferred
@@ -519,18 +461,11 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 	return nil
 }
 
-// ReSyncBinaries re-stats every whitelisted binary and rewrites its
-// inode-keyed action when the file was replaced in place — an application
-// update that swaps a binary file (Discord's updater) changes the inode
-// while the path stays the same, denying the replaced binary. Old map
-// keys are never deleted: a pre-replacement process still running keeps
-// being admitted, and a path that vanished in the middle of an update
-// (rename over, then deletion) keeps its previous key until it appears
-// again. Rules still deferred because they were unreadable are retried
-// here too. It returns the number of binaries whose map entries changed.
+// ReSyncBinaries re-stats whitelisted binaries and rewrites inode-keyed map entries after an in-place replacement;
+// stale keys are never deleted, so still-running pre-replacement processes keep being admitted and paths vanished
+// mid-update keep their prior key until they reappear. Still-deferred unreadable rules are retried here too.
 func (g *Guard) ReSyncBinaries() (int, error) {
-	// Retry deferred rules first; newly resolved binaries are recorded in
-	// deployed by addBinaryActions and the pass below leaves them alone.
+	// Retry deferred rules first; addBinaryActions records newly resolved binaries in deployed, so the pass below skips them.
 	resolved, resolvedEvents, stillDeferred := g.resolveDeferred()
 	if err := g.retryDeferredBinaries(resolved, resolvedEvents, stillDeferred); err != nil {
 		return 0, err
@@ -549,8 +484,7 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 		path := canonicalBinaryPath(b.Path)
 		dev, ino, err := ebpf.StatInode(path)
 		if err != nil {
-			// The binary vanished mid-update (rename, then removal); the
-			// previously deployed key stays valid in the maps.
+			// Vanished mid-update (rename, then removal); the previously deployed key stays valid.
 			continue
 		}
 		key := GuardInodeKey{Dev: dev, Ino: ino}
@@ -575,8 +509,7 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 	return changed, nil
 }
 
-// writeGuardConfig stores the scalar guard configuration in
-// guard_config[0..2]: operating mode, recursion flag, and depth limit.
+// writeGuardConfig stores mode, recursion flag and depth limit in guard_config[0..2].
 func (g *Guard) writeGuardConfig(modeKey uint64) error {
 	if putErr := g.objs.GuardConfig.Put(uint32(0), modeKey); putErr != nil {
 		return fmt.Errorf("setting mode in config: %w", putErr)
@@ -608,11 +541,9 @@ func (g *Guard) populateMaps() error {
 		return cfgErr
 	}
 
-	// The watch root's (dev, ino) is stored for the BPF root-confinement
-	// check (guard_config[3..4]): an inode map entry only guards an access
-	// when the accessed file's dentry chain reaches this root, so stale
-	// entries whose inode number was reused outside the tree (ext4 inode
-	// reuse) can never deny an unrelated file.
+	// The watch root's (dev, ino) feeds the BPF root-confinement check (guard_config[3..4]): an inode
+	// entry only guards an access whose dentry chain reaches this root, so inode reuse outside the tree
+	// can never deny an unrelated file.
 	rootDev, rootIno, rootStatErr := ebpf.StatInode(g.path)
 	if rootStatErr != nil {
 		return fmt.Errorf("stating guard root %s: %w", g.path, rootStatErr)
@@ -628,11 +559,9 @@ func (g *Guard) populateMaps() error {
 	if statErr != nil {
 		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)
 	}
-	// The guarded path's own inode is stored before the LSM hooks are
-	// attached: the BPF ancestor walk then recognizes the whole tree as
-	// guarded from the first instant the hooks are live. The inode is
-	// statable regardless of encryption state — even while an encrypted
-	// tree is locked, its own inode stays visible.
+	// The guarded path's own inode is stored before the hooks attach, so the BPF ancestor walk recognizes
+	// the whole tree from the instant hooks go live; the root inode stays statable even while an encrypted
+	// tree is locked.
 	if addErr := g.addInode(g.path); addErr != nil {
 		return addErr
 	}
@@ -652,15 +581,9 @@ func (g *Guard) populateMaps() error {
 		return fmt.Errorf("storing guarded path: %w", putErr)
 	}
 
-	// Detect and block the backing block device
-	//
-	// When a guarded path is on a real block device (e.g. /dev/sda1,
-	// /dev/mapper/cryptlvm), tools like debugfs(8) can open the block
-	// device directly and read the file contents without ever calling
-	// open() on the guarded file path — bypassing VFS access control.
-	//
-	// We automatically detect the backing device and add it to a BPF
-	// map so that any open() on that block device is blocked.
+	// Detect and block the backing block device: tools like debugfs(8) can open a real block device
+	// (e.g. /dev/sda1, /dev/mapper/cryptlvm) directly and read contents without ever open()ing the guarded
+	// path — bypassing VFS access control; the detected device goes into a BPF map so any open() on it is blocked.
 	if err := g.addBackingBlockDevice(); err != nil {
 		log.Warnf("backing block device detection: %v", err)
 	}
@@ -671,18 +594,9 @@ func (g *Guard) populateMaps() error {
 	return nil
 }
 
-// addFsDeviceGate records the filesystem device of the guarded path in
-// guard_fs_sbdevs so the BPF ancestor walk can skip every access on other
-// filesystems with a single lookup. st_dev is i_sb->s_dev by construction,
-// so the recorded device matches the superblock the BPF side reads on
-// every filesystem — real block devices, tmpfs and overlayfs (anonymous
-// devices), and btrfs subvolumes (which share one superblock and only
-// widen the gate conservatively). The gate must be populated
-// unconditionally — including major-0 filesystems (tmpfs, overlayfs, anon
-// devices), where st_dev carries the minor device number with a zero
-// major. Leaving the map empty would make every lookup fail and silently
-// disable the ancestor walk there, exposing runtime-created content
-// deeper than the discovery bound.
+// addFsDeviceGate records the guarded path's fs device in guard_fs_sbdevs so the BPF ancestor walk skips other
+// filesystems with one lookup; st_dev equals i_sb->s_dev on all fs types (major-0 tmpfs/overlayfs anon devices,
+// shared-superblock btrfs). Must be unconditional: an empty map silently disables the walk there, exposing deeper content.
 func (g *Guard) addFsDeviceGate() error {
 	var s syscall.Stat_t
 	if err := syscall.Stat(g.path, &s); err != nil {
@@ -698,9 +612,7 @@ func (g *Guard) addFsDeviceGate() error {
 	return nil
 }
 
-// addBackingBlockDevice resolves the block device that backs the guarded
-// path and adds it to guard_fs_devices so that raw opens of that block
-// device are blocked.
+// addBackingBlockDevice adds the block device backing the guarded path to guard_fs_devices so raw opens of it are blocked.
 func (g *Guard) addBackingBlockDevice() error {
 	var s syscall.Stat_t
 	if err := syscall.Stat(g.path, &s); err != nil {
@@ -709,8 +621,7 @@ func (g *Guard) addBackingBlockDevice() error {
 
 	major := unix.Major(s.Dev)
 	if major == 0 {
-		// Pseudo-filesystem (tmpfs, overlay, procfs, etc.) — no backing
-		// block device to block.
+		// Pseudo-filesystem (tmpfs, overlay, procfs, etc.) — no backing block device.
 		return nil
 	}
 
@@ -746,20 +657,10 @@ func (g *Guard) addInode(path string) error {
 	return nil
 }
 
-// PopulateInodes fills guard_inodes with the inodes of every file and
-// directory under the guarded path. It must be called once the path is
-// readable — after the resource was unlocked — but the LSM hooks are
-// already attached by then (NewGuard attaches them before the caller
-// unlocks), and the guarded root inode is already in the map, so the
-// entire subtree is protected from the moment the hooks attach (the BPF
-// ancestor walk). The scan mirrors the original ssh-guard's "marks
-// attached, then unlock, then walk" ordering. Scanning is tolerant:
-// entries that vanish mid-walk (a live application renaming files) and
-// dangling symlinks are skipped with a warning; a full inode map degrades
-// the rename/unlink/mmap precision but keeps open/read enforcement (the
-// BPF ancestor walk) intact. A tree whose entries all fail to stat is
-// almost certainly fscrypt-encrypted and locked, which is reported as an
-// error.
+// PopulateInodes fills guard_inodes with the inodes of every file and directory under the guarded path; it must run
+// once the path is readable (after the unlock — NewGuard attaches the hooks before the caller unlocks, and the root
+// inode is already mapped, so the whole subtree is protected via the BPF ancestor walk from hook attach). The scan is
+// tolerant (see walkInodes); degraded coverage weakens rename/unlink/mmap precision but keeps open/read enforcement.
 func (g *Guard) PopulateInodes() error {
 	info, statErr := os.Stat(g.path)
 	if statErr != nil {
@@ -781,21 +682,12 @@ func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
 	return walkInodes(dir, g.recursive, g.depth, currentDepth, g.addInode)
 }
 
-// walkInodes walks dir depth-first, invoking add for dir and every entry
-// below it. Semantics:
+// walkInodes walks dir depth-first, invoking add for dir and every entry below it: ENOENT/ENOTDIR failures
+// (vanished mid-walk, dangling symlinks) and any other per-entry stat error are skipped with a warning;
+// E2BIG stops the walk with degraded coverage (open/read enforcement survives via the BPF ancestor walk);
+// a directory whose every entry fails to stat is almost certainly fscrypt-encrypted and locked (error).
 //
-//   - an entry that fails to stat with ENOENT/ENOTDIR (it vanished during
-//     the walk, or is a dangling symlink) is skipped with a warning and the
-//     walk continues;
-//   - an entry that fails with E2BIG means the inode map is full: the walk
-//     stops and reports degraded coverage (open/read enforcement survives
-//     through the BPF ancestor walk);
-//   - any other per-entry failure is skipped with a warning;
-//   - when every entry under a directory fails to stat, the tree is almost
-//     certainly encrypted and locked: an error is returned with a hint.
-//
-// addErrKind classifies a failed addInode stat so the walk can decide what
-// the failure means for coverage.
+// addErrKind classifies a failed addInode stat so the walk can decide what the failure means for coverage.
 type addErrKind int
 
 const (
@@ -804,9 +696,8 @@ const (
 	addErrFull                      // E2BIG: inode map full
 )
 
-// classifyAddErr maps an add error to its walk semantics. E2BIG degrades
-// coverage (open/read enforcement survives through the BPF ancestor walk),
-// anything else is logged and skipped.
+// classifyAddErr maps an add error to its walk semantics: E2BIG degrades coverage (open/read enforcement
+// survives via the BPF ancestor walk), anything else is logged and skipped.
 func classifyAddErr(path string, err error) addErrKind {
 	switch {
 	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENOTDIR):
@@ -824,8 +715,7 @@ func walkInodes(dir string, recursive bool, depthLimit, currentDepth int, add fu
 	if err := add(dir); err != nil {
 		switch classifyAddErr(dir, err) {
 		case addErrMissing, addErrFull:
-			// The root vanished mid-walk (nothing left to scan), or the
-			// inode map is already full: stop without failing.
+			// Root vanished mid-walk (nothing left to scan) or map already full: stop without failing.
 			return nil
 		default:
 			return fmt.Errorf("adding inode %s: %w", dir, err)
@@ -843,9 +733,8 @@ func walkInodes(dir string, recursive bool, depthLimit, currentDepth int, add fu
 	return walkEntries(dir, entries, recursive, depthLimit, currentDepth, add)
 }
 
-// walkEntries visits the entries of one directory level. It reports an
-// error only when a nested recursion fails, or when every entry failed to
-// stat (the locked-encrypted-tree signature).
+// walkEntries visits one directory level, erroring only when a nested recursion fails or every entry failed
+// to stat (the locked-encrypted-tree signature).
 func walkEntries(dir string, entries []os.DirEntry, recursive bool, depthLimit, currentDepth int, add func(string) error) error {
 	total := 0
 	missing := 0
@@ -940,20 +829,15 @@ func (g *Guard) readEvent(rd *ringbuf.Reader) (*GuardEvent, bool) {
 		Blocked:   be.Blocked != 0,
 	}
 
-	// comm is telemetry: the warning is diagnostic only, never
-	// enforcement (access decisions in the BPF program key on the
-	// caller's exe inode).
+	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions key on exe inode).
 	g.checkCommSpoof(ge)
 
 	return ge, true
 }
 
-// checkCommSpoof warns when an event's comm claims the name of a
-// guarded binary while the real binary is something else: blocked
-// events carrying a guarded name would mislead the logs, so running
-// for blocked events too catches that impersonation. A guarded binary
-// whose threads rename themselves (Chromium's "libuv-worker", Bun's
-// "Bun Pool N") is normal and produces no warning.
+// checkCommSpoof warns when an event's comm claims a guarded binary's name while the real binary differs;
+// running for blocked events too catches impersonation that would mislead logs. Guarded binaries whose threads
+// rename themselves (Chromium's "libuv-worker", Bun's "Bun Pool N") are normal and produce no warning.
 func (g *Guard) checkCommSpoof(ge *GuardEvent) {
 	exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", ge.PID))
 	if err != nil {
@@ -971,9 +855,8 @@ func (g *Guard) checkCommSpoof(ge *GuardEvent) {
 		ge.PID, ge.Comm, exePath)
 }
 
-// commMatchesGuardedBinary reports whether comm claims the name of one
-// of the guarded binaries. The kernel truncates comm to 15 bytes
-// (TASK_COMM_LEN), so names are compared truncated on both sides.
+// commMatchesGuardedBinary reports whether comm claims a guarded binary's name; the kernel truncates comm to
+// 15 bytes (TASK_COMM_LEN), so both sides are compared truncated.
 func commMatchesGuardedBinary(comm string, binaries []BinaryEntry) bool {
 	for _, b := range binaries {
 		base := filepath.Base(b.Path)
@@ -1049,10 +932,7 @@ func (e *bpfGuardEvent) toFileEvent() ebpf.FileEvent {
 	}
 }
 
+// BinariesSummary formats the whitelist entries for log lines.
 func BinariesSummary(binaries []BinaryEntry) string {
-	parts := make([]string, len(binaries))
-	for i, b := range binaries {
-		parts[i] = fmt.Sprintf("%s [sha256:%x..%x]", b.Path, b.Hash[:4], b.Hash[28:])
-	}
-	return strings.Join(parts, ", ")
+	return ebpf.BinariesSummary(binaries)
 }

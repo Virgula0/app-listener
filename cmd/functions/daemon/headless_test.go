@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Virgula0/app-listener/cmd/common"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/usecase"
@@ -31,46 +32,51 @@ func allowedEvent() usecase.DaemonEvent {
 }
 
 func TestWriteEventBlocked(t *testing.T) {
+	uidr := common.NewUIDResolver()
 	for _, only := range []bool{false, true} {
 		var buf bytes.Buffer
 		ev := deniedEvent()
-		if !writeEvent(&buf, only, &ev) {
+		if !writeEvent(&buf, only, uidr, &ev) {
 			t.Fatalf("denied event must always be written (blockedOnly=%v)", only)
 		}
 		line := buf.String()
-		if !strings.HasPrefix(line, "<4>DAEMON DENIED|") {
+		if !strings.HasPrefix(line, "<4>DAEMON DENIED") {
 			t.Errorf("line %q: missing syslog warning marker", line)
 		}
 		for _, want := range []string{
-			"/home/alice/.ssh",
-			"OPEN",
-			"ssh",
-			"/home/alice/.ssh/authorized_keys",
-			"1234",
-			"1000",
+			"resource=/home/alice/.ssh",
+			"op=OPEN",
+			"comm=ssh",
+			"path=/home/alice/.ssh/authorized_keys",
+			"pid=1234",
 		} {
 			if !strings.Contains(line, want) {
 				t.Errorf("line %q: missing field %q", line, want)
 			}
 		}
+		if !strings.Contains(line, "uid="+uidr.Resolve(1000)) {
+			t.Errorf("line %q: missing resolved uid field", line)
+		}
 	}
 }
 
 func TestWriteEventAllowed(t *testing.T) {
+	uidr := common.NewUIDResolver()
 	var buf bytes.Buffer
 	ev := allowedEvent()
-	if !writeEvent(&buf, false, &ev) {
+	if !writeEvent(&buf, false, uidr, &ev) {
 		t.Fatal("allowed event must be written when blockedOnly is false")
 	}
-	if line := buf.String(); !strings.HasPrefix(line, "<6>DAEMON|") {
+	if line := buf.String(); !strings.HasPrefix(line, "<6>DAEMON ALLOWED") {
 		t.Errorf("line %q: missing syslog info prefix", line)
 	}
 }
 
 func TestWriteEventAllowedSuppressed(t *testing.T) {
+	uidr := common.NewUIDResolver()
 	var buf bytes.Buffer
 	ev := allowedEvent()
-	if writeEvent(&buf, true, &ev) {
+	if writeEvent(&buf, true, uidr, &ev) {
 		t.Fatal("allowed event must be dropped under --blocked-only")
 	}
 	if buf.Len() != 0 {

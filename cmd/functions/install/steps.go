@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
 // pickUsers asks which local users the installation should protect. Every
@@ -265,4 +267,138 @@ func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Confi
 		}
 	}
 	return cfgText, toEncrypt, nil
+}
+
+// resolveCatalogEntry performs a reverse lookup: given an absolute path from
+// the existing daemon.conf, finds which Catalog entry it originated from.
+// System-level entries (AbsPath) are matched by exact path. User-level
+// entries (RelPath) are matched by computing PathFor for each known user.
+// Returns nil when the section was user-added and has no catalog origin.
+func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
+	for i := range inst.Catalog {
+		entry := &inst.Catalog[i]
+		if entry.AbsPath != "" {
+			if entry.AbsPath == resourcePath {
+				return entry, &inst.User{}
+			}
+			continue
+		}
+		for j := range users {
+			u := &users[j]
+			if entry.PathFor(u.Home, u.Name) == resourcePath {
+				return entry, u
+			}
+		}
+	}
+	return nil, nil
+}
+
+// updateCatalogConfig reads the installed daemon.conf, re-expands the
+// catalog whitelist for every matched section (unlocking encrypted vaults
+// for stat access), and shows a diff for confirmation. Unmatched
+// (user-added) sections are preserved verbatim. When autoConfirm is true
+// the diff is logged and the config is overwritten without prompting.
+func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm bool) error {
+	oldText, err := os.ReadFile(systemd.SystemConfigPath)
+	if err != nil {
+		return fmt.Errorf("no previous installation found — run `app-listener install` first: %w", err)
+	}
+
+	cfg, err := daemonconfig.Load(systemd.SystemConfigPath)
+	if err != nil {
+		return fmt.Errorf("parsing existing configuration: %w", err)
+	}
+	if len(cfg.Resources) == 0 {
+		return fmt.Errorf("existing configuration contains no [watch] sections")
+	}
+
+	users, err := inst.ListUsers()
+	if err != nil {
+		return fmt.Errorf("listing users: %w", err)
+	}
+
+	confText := string(oldText)
+	patched := 0
+	for _, r := range cfg.Resources {
+		text, ok, patchErr := patchCatalogSection(vault, confText, r, users)
+		if patchErr != nil {
+			return patchErr
+		}
+		if ok {
+			confText = text
+			patched++
+		}
+	}
+
+	if patched == 0 {
+		return fmt.Errorf("no catalog entries match any configured directory")
+	}
+
+	newBytes := []byte(confText)
+	if bytes.Equal(oldText, newBytes) {
+		log.Info("configuration is already up to date")
+		return nil
+	}
+	if !autoConfirm {
+		overwrite, overErr := inst.ConfirmOverwrite(systemd.SystemConfigPath, oldText, newBytes)
+		if overErr != nil {
+			return overErr
+		}
+		if !overwrite {
+			log.Info("configuration update aborted by user")
+			return nil
+		}
+	} else {
+		log.Infof("catalog refresh: %d sections re-scanned, diff below", patched)
+		log.Info(inst.UnifiedDiff(string(oldText), string(newBytes)))
+	}
+
+	if err := os.WriteFile(systemd.SystemConfigPath, newBytes, 0o600); err != nil {
+		return fmt.Errorf("writing updated configuration: %w", err)
+	}
+	log.Infof("daemon.conf updated (%d sections re-scanned)", patched)
+	return nil
+}
+
+// patchCatalogSection re-expands the whitelist for one config resource
+// if it matches a catalog entry. Returns the updated text and true when
+// patched, or the original text and false when the section is user-added.
+func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.Resource, users []inst.User) (updated string, patched bool, err error) {
+	entry, user := resolveCatalogEntry(r.Path, users)
+	if entry == nil {
+		log.Infof("keeping user section as-is: %s", r.Path)
+		return confText, false, nil
+	}
+
+	wasEncrypted := false
+	if r.NeedEncryption {
+		encrypted, encErr := vault.IsEncrypted(r.Path)
+		if encErr != nil {
+			return "", false, fmt.Errorf("checking encryption of %s: %w", r.Path, encErr)
+		}
+		if encrypted {
+			wasEncrypted = true
+			log.Infof("unlocking %s for whitelist re-expansion ...", r.Path)
+			if unlockErr := vault.Unlock(r.Path); unlockErr != nil {
+				return "", false, fmt.Errorf("unlocking %s: %w", r.Path, unlockErr)
+			}
+		}
+	}
+
+	candidate := inst.Candidate{User: *user, Entry: *entry, Path: r.Path}
+	freshWhitelist := candidate.FilterExistingWhitelist()
+	log.Infof("re-scanned %s (%s) — %d whitelisted binaries", r.Path, entry.Name, len(freshWhitelist))
+
+	if wasEncrypted {
+		log.Infof("re-locking %s ...", r.Path)
+		if lockErr := vault.Lock(r.Path, true); lockErr != nil {
+			log.Warnf("re-locking %s: %v", r.Path, lockErr)
+		}
+	}
+
+	updated, patchErr := inst.SetSectionWhitelist(confText, r.Path, freshWhitelist)
+	if patchErr != nil {
+		return "", false, fmt.Errorf("patching section %s: %w", r.Path, patchErr)
+	}
+	return updated, true, nil
 }

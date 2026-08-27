@@ -1,7 +1,6 @@
 // Package install implements the building blocks of the `app-listener
-// install` wizard: the catalog of critical directories, user enumeration,
-// the recursive tree copy used during fscrypt migrations, and the daemon
-// config generation.
+// install` wizard: the critical-directory catalog, user enumeration,
+// fscrypt tree migration and daemon config generation.
 package install
 
 import (
@@ -15,40 +14,28 @@ import (
 type CandidateDir struct {
 	// Name is a short human-readable label shown in the TUI.
 	Name string
-	// RelPath is the path relative to the user's home directory, e.g.
-	// ".ssh" or ".config/opencode". Exactly one of RelPath and AbsPath
-	// must be set.
+	// RelPath is the path relative to the user's home directory (e.g.
+	// ".ssh"). Exactly one of RelPath and AbsPath must be set.
 	RelPath string
-	// AbsPath is a system-level path (e.g. "/etc/wireguard") that is
-	// probed once, independent of the selected users.
+	// AbsPath is a system-level path (e.g. "/etc/wireguard") probed once,
+	// independent of the selected users.
 	AbsPath string
-	// Whitelist maps each whitelisted binary path to the events that
-	// binary may trigger on this directory. An empty (or nil) event list
-	// means every event is allowed and the config line is emitted as a
-	// bare path; a non-empty list restricts the binary to exactly those
-	// events and is emitted as "<path> EV1,EV2". Keep it minimal: every
-	// binary added here is a potential privilege-escalation path if it can
-	// be abused while the directory is unlocked. Identity is verified by
-	// inode, not by name. Whitelist entries that do not exist on the
-	// target system are dropped when the config is generated; entries
-	// containing a glob (*, ?, [) are expanded to every existing match.
+	// Whitelist maps binary paths to allowed events (nil = all events,
+	// emitted bare; otherwise "<path> EV1,EV2"); matching is by inode.
+	// Keep it minimal: each entry is a potential privilege-escalation path
+	// if abused while the directory is unlocked.
 	Whitelist map[string][]string
 }
 
-// Catalog is the master list of critical directories to search for each
-// selected user. Add, remove or tweak entries here — this is the single
-// place that drives discovery. Paths that do not exist for a user are
+// Catalog is the master list of critical directories probed for each selected
+// user — tweak entries here to drive discovery. Non-existent paths are
 // simply not proposed.
 var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPath: ".ssh",
-		// ssh rewrites known_hosts (WRITE plus the DELETE/RENAME/HARDLINK
-		// its rotation needs); sshd and its modular helpers (sshd-auth,
-		// sshd-session, sftp-server) only READ authorized_keys — Debian
-		// installs them under /usr/lib/openssh/, Arch under /usr/lib/ssh/.
-		// ssh-keysign/ssh-pkcs11-helper/ssh-session-cleanup never touch
-		// .ssh (inert). git is deliberately NOT whitelisted: it could read
-		// the keys.
+		// ssh needs WRITE (known_hosts rotation); sshd and its helpers
+		// (sshd-auth/-session, sftp-server) only READ authorized_keys; the
+		// keysign/pkcs11/cleanup helpers are inert. git excluded: reads keys.
 		Whitelist: map[string][]string{
 			"/usr/bin/ssh":                         {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK"},
 			"/usr/bin/ssh-add":                     nil,
@@ -121,17 +108,15 @@ var Catalog = []CandidateDir{
 		}},
 
 	// --- IDEs and editors ---------------------------------------------------------
-	// IDE configs hold auth tokens, API keys and credentials (VS Code
-	// globalStorage, JetBrains certs, Zed auth.json). Wrapper binaries
-	// (/usr/bin/code, firefox, chrome, ...) are shell scripts; the
-	// whitelist matches the executed ELF under /opt and /usr/lib.
+	// IDE configs hold auth tokens and credentials; wrapper binaries
+	// (/usr/bin/code, firefox, ...) are shell scripts, so the whitelist
+	// matches the executed ELF under /opt and /usr/lib.
 	{Name: "VS Code config", RelPath: ".config/Code",
 		Whitelist: map[string][]string{
 			"/usr/bin/code": nil, "/usr/local/bin/code": nil,
 			"%HOME%/.local/bin/code":       nil,
 			"/opt/visual-studio-code/code": nil, "/usr/share/code/code": nil, "/opt/visual-studio-code/bin/code": nil,
-			// chrome_crashpad_handler is a separate process Code spawns to
-			// write crash dumps into .config/Code/Crashpad.
+			// Code's separate crash-dump writer process.
 			"/opt/visual-studio-code/chrome_crashpad_handler": nil, "/usr/share/code/chrome_crashpad_handler": nil,
 		}},
 	{Name: "VS Code Insiders config", RelPath: ".config/Code - Insiders",
@@ -144,20 +129,16 @@ var Catalog = []CandidateDir{
 			"/usr/bin/code": nil, "/usr/local/bin/code": nil,
 			"%HOME%/.local/bin/code":       nil,
 			"/opt/visual-studio-code/code": nil, "/usr/share/code/code": nil,
-			// chrome_crashpad_handler is a separate process Code spawns to
-			// write crash dumps into .config/Code/Crashpad.
+			// Code's separate crash-dump writer process.
 			"/opt/visual-studio-code/chrome_crashpad_handler": nil, "/usr/share/code/chrome_crashpad_handler": nil,
 		}},
 	{Name: "VSCodium config", RelPath: ".config/VSCodium",
 		Whitelist: map[string][]string{"/usr/bin/codium": nil, "/usr/local/bin/codium": nil,
 			"/opt/vscodium/chrome_crashpad_handler": nil, "/usr/share/vscodium/chrome_crashpad_handler": nil}},
 	{Name: "JetBrains IDEs", RelPath: ".config/JetBrains",
-		// IDE processes run as the bundled JetBrains Runtime: the process
-		// exe is the JBR java, so the JBR and its fsnotifier helper must be
-		// whitelisted. The globs cover standalone installs under /opt. IDE
-		// installs via Toolbox (~/.local/share/JetBrains/Toolbox/apps) are
-		// deliberately not guarded: they hold no credentials — the IDE config
-		// and auth state live in this .config/JetBrains directory.
+		// IDEs run as the bundled JBR java, so the JBR and its fsnotifier
+		// helper are whitelisted (globs cover /opt installs). Toolbox apps
+		// stay unguarded: no credentials — those live in .config/JetBrains.
 		Whitelist: map[string][]string{
 			"/usr/bin/idea": nil, "/usr/bin/pycharm": nil, "/usr/bin/webstorm": nil,
 			"/usr/bin/clion": nil, "/usr/bin/goland": nil, "/usr/bin/phpstorm": nil,
@@ -196,9 +177,8 @@ var Catalog = []CandidateDir{
 	{Name: "AWS credentials", RelPath: ".aws",
 		Whitelist: map[string][]string{"/usr/bin/aws": nil}},
 	{Name: "Google Cloud SDK", RelPath: ".config/gcloud",
-		// gcloud/gsutil are Python launchers: the process exe is the
-		// interpreter (deliberately not whitelisted), so the entries are
-		// inert — kept for documentation.
+		// Python launchers: the exe is the interpreter (not whitelisted),
+		// so both entries are inert — kept for documentation.
 		Whitelist: map[string][]string{"/usr/bin/gcloud": nil, "/usr/bin/gsutil": nil}},
 	{Name: "Kubernetes kubeconfig", RelPath: ".kube",
 		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil,
@@ -228,8 +208,7 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
 	{Name: "npm data", RelPath: ".npm",
 		Whitelist: map[string][]string{"/usr/bin/npm": nil, "/usr/bin/npx": nil, "/usr/bin/node": nil}},
-	// pip is a #!/usr/bin/python script (inert, same reason as gcloud);
-	// kept for documentation.
+	// pip is a #!/usr/bin/python script (inert like gcloud); documentation only.
 	{Name: "pip config", RelPath: ".config/pip",
 		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
 	{Name: "Git config directory", RelPath: ".config/git",
@@ -256,11 +235,9 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/chezmoi": nil}},
 
 	// --- Legacy dot-config files --------------------------------------------------
-	// No single-file entries here: the daemon guards directories only (the
-	// config loader skips non-directory paths), so a plain file like
-	// ~/.netrc or ~/.wgetrc would be written to the config but silently
-	// dropped at load. The Steam entry below documents the same restriction
-	// for the legacy ssfn sentry files and the required glob semantics.
+	// No single-file entries: the daemon guards directories only (non-dir
+	// paths are skipped at load), so files like ~/.netrc would be silently
+	// dropped. Steam below documents the same restriction for its ssfn files.
 
 	// --- Wallets and crypto -------------------------------------------------------
 	// Probed like any other entry: they surface only once the wallet is
@@ -292,8 +269,7 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/lnd": nil, "/usr/bin/lncli": nil}},
 	{Name: "Core Lightning", RelPath: ".lightning",
 		Whitelist: map[string][]string{"/usr/bin/lightningd": nil, "/usr/bin/lightning-cli": nil}},
-	// Foundry's binaries live inside the guarded dir next to its keystores,
-	// so they get the Discord treatment via a glob.
+	// Binaries live inside the guarded dir next to the keystores: glob needed.
 	{Name: "Foundry", RelPath: ".foundry",
 		Whitelist: map[string][]string{"%HOME%/.foundry/bin/*": nil}},
 	{Name: "KDE Wallet", RelPath: ".local/share/kwalletd",
@@ -313,9 +289,8 @@ var Catalog = []CandidateDir{
 
 	// --- Browsers and messaging -----------------------------------------------------
 	// Browser binaries are shell wrappers; the whitelist matches the
-	// executed ELF under /usr/lib and /opt. Firefox's crash helper and the
-	// Chrome-family chrome_crashpad_handler are separate processes that
-	// write the Crash Reports directory.
+	// executed ELF under /usr/lib and /opt. Firefox's crashhelper and the
+	// chrome_crashpad_handler family write the Crash Reports dirs separately.
 	{Name: "Firefox profile", RelPath: ".mozilla/firefox",
 		Whitelist: map[string][]string{
 			"/usr/bin/firefox":             nil,
@@ -344,8 +319,7 @@ var Catalog = []CandidateDir{
 	{Name: "Discord", RelPath: ".config/discord",
 		Whitelist: map[string][]string{
 			"%HOME%/.config/discord/*/Discord": nil,
-			// Chrome-sandbox and the crashpad handler live in the
-			// versioned app dir; the wildcard covers every release.
+			// Versioned app dir; the wildcard covers every release.
 			"%HOME%/.config/discord/*/chrome-sandbox":          nil,
 			"%HOME%/.config/discord/*/chrome_crashpad_handler": nil,
 		}},
@@ -365,41 +339,26 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/element-desktop": nil}},
 
 	// --- Gaming ----------------------------------------------------------------------
-	// Steam stores its login credentials (accounts and auth tokens) in
-	// config/loginusers.vdf and config/config.vdf, so only the small config
-	// directory is guarded: the rest of ~/.local/share/Steam (steamapps/
-	// games, userdata/ screenshots and cloud saves, caches) holds no
-	// credentials and is intentionally left out.
-	//
-	// The legacy Steam Guard sentry files (~/.local/share/Steam/ssfn*) are
-	// deliberately NOT protected: the daemon guards directories only (the
-	// config loader skips non-directory paths), and a sentry alone cannot
-	// compromise an account. Once the daemon supports single files, add a
-	// catalog entry for them — and the glob (ssfn*) must then be resolved
-	// dynamically by the daemon at runtime (on start/reload), never baked
-	// into the static config generated at install time, because sentry
-	// filenames can change after login.
+	// Only the small config dir is guarded: Steam keeps login credentials
+	// (accounts, auth tokens) in config/*.vdf; the rest holds none. Legacy
+	// ssfn* sentries stay unprotected (dirs-only guarding, low value alone).
 	{Name: "Steam client config (accounts/credentials)", RelPath: ".local/share/Steam/config",
 		Whitelist: map[string][]string{
 			"/usr/bin/steam": nil, "/usr/bin/steamwebhelper": nil,
 			"%HOME%/.local/share/Steam/ubuntu12_32/steam": nil,
-			// steamwebhelper moved from ubuntu12_32/ to ubuntu12_64/ and
-			// steamrt64/ across versions; the glob covers all layouts.
+			// Webhelper moved across versioned dirs; the glob covers all layouts.
 			"%HOME%/.local/share/Steam/*/steamwebhelper": nil,
 		}},
 	{Name: "Steam (legacy home)", RelPath: ".steam",
 		Whitelist: map[string][]string{"/usr/bin/steam": nil, "/usr/bin/steamwebhelper": nil}},
 
-	// --- System-level paths (probed once, not per user) --------------------------------
-	// Same whitelist as the original ssh-guard template:
+	// --- System-level paths (probed once, not per user; ssh-guard template) ---
 	{Name: "WireGuard system config", AbsPath: "/etc/wireguard",
 		Whitelist: map[string][]string{"/usr/bin/nmcli": nil}},
 }
 
-// PathFor returns the absolute candidate path for user, expanding the
-// %USER%/%HOME% placeholders used by whitelist entries. System-level
-// entries (AbsPath) ignore the user; per-user entries are joined with the
-// user's home directory.
+// PathFor returns the absolute candidate path for user, expanding
+// %USER%/%HOME%; AbsPath entries ignore the user entirely.
 func (c CandidateDir) PathFor(home, user string) string {
 	if c.AbsPath != "" {
 		return expandPlaceholders(c.AbsPath, user, home)
@@ -407,18 +366,15 @@ func (c CandidateDir) PathFor(home, user string) string {
 	return filepath.Join(home, expandPlaceholders(c.RelPath, user, home))
 }
 
-// BinaryRule is one whitelisted binary and the events it may perform on
-// the protected path. An empty Events list means every event is allowed;
-// otherwise only those events are permitted.
+// BinaryRule is one whitelisted binary and its allowed events (empty list
+// means every event).
 type BinaryRule struct {
 	Path   string
 	Events []string
 }
 
-// ExpandWhitelist returns the whitelist with %USER%/%HOME% placeholders
-// replaced. The result is sorted by path so config generation is
-// deterministic regardless of map iteration order, which Go does not
-// guarantee.
+// ExpandWhitelist expands %USER%/%HOME% and returns rules sorted by path so
+// config generation is deterministic despite map ordering.
 func (c CandidateDir) ExpandWhitelist(user, home string) []BinaryRule {
 	paths := make([]string, 0, len(c.Whitelist))
 	for bin := range c.Whitelist {
@@ -447,9 +403,8 @@ type Candidate struct {
 	Path  string
 }
 
-// Discover probes the catalog for a user and returns every per-user path
-// that actually exists (files or directories). System-level entries
-// (AbsPath) are NOT probed here — use DiscoverSystem/DiscoverForUsers.
+// Discover probes the catalog for a user, returning existing per-user paths.
+// AbsPath entries are skipped (use DiscoverSystem/DiscoverForUsers).
 func Discover(user User) []Candidate {
 	home := user.Home
 	var out []Candidate
@@ -465,8 +420,7 @@ func Discover(user User) []Candidate {
 	return out
 }
 
-// DiscoverSystem probes the system-level (absolute path) catalog entries
-// once; the result is independent of any user.
+// DiscoverSystem probes the system-level (AbsPath) entries, user-independent.
 func DiscoverSystem() []Candidate {
 	var out []Candidate
 	for i := range Catalog {
@@ -507,11 +461,9 @@ func DiscoverForUsers(users []User) []Candidate {
 	return out
 }
 
-// FilterExistingWhitelist drops entries that do not exist on this system
-// and expands globs (*, ?, [) to every existing match (e.g.
-// %HOME%/.config/discord/*/Discord), re-evaluated on every install so app
-// updates that move to a new directory are picked up; every match inherits
-// the events of the glob pattern that produced it.
+// FilterExistingWhitelist drops missing entries and expands globs (*, ?, [)
+// to existing matches, re-evaluated every install so relocated apps are
+// picked up; matches inherit the pattern's events.
 func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
 	var out []BinaryRule
 	for _, rule := range c.Entry.ExpandWhitelist(c.User.Name, c.User.Home) {
