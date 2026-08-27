@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AppListener Shared Session</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+
+<style>
+  :root {
+    --bg: #0a0b0d;
+    --chrome: #101317;
+    --terminal-bg: #0a0c0f;
+    --border: rgba(255,255,255,0.07);
+    --border-strong: rgba(255,255,255,0.12);
+    --text: #d7dade;
+    --text-dim: #767c86;
+    --text-dimmer: #454b54;
+    --amber: #ffb454;
+    --amber-soft: rgba(255,180,84,0.16);
+    --green: #7ec699;
+    --red: #ea6262;
+    --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    --radius: 10px;
+    --dur: 0.42s;
+    --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: var(--bg);
+    font-family: var(--mono);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  .stage {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background:
+      radial-gradient(ellipse 70% 55% at 50% 28%, #15181d 0%, transparent 70%),
+      var(--bg);
+  }
+
+  .ambient-glow {
+    position: absolute;
+    width: 620px;
+    height: 620px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255,180,84,0.10) 0%, rgba(255,180,84,0) 70%);
+    pointer-events: none;
+    filter: blur(10px);
+  }
+
+  .window {
+    position: relative;
+    width: 94vw;
+    height: 84dvh;
+    display: flex;
+    flex-direction: column;
+    background: var(--terminal-bg);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    box-shadow: 0 30px 80px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,0,0,0.4);
+    overflow: hidden;
+    transform-origin: center bottom;
+    transition:
+      width var(--dur) var(--ease),
+      height var(--dur) var(--ease),
+      border-radius var(--dur) var(--ease),
+      border-color var(--dur) var(--ease),
+      transform var(--dur) var(--ease),
+      opacity var(--dur) var(--ease);
+  }
+
+  .window.is-maximized {
+    width: 100vw;
+    height: 100dvh;
+    border-radius: 0;
+    border-color: transparent;
+  }
+
+  .window.is-minimizing {
+    transform: scale(0.1) translateY(60%);
+    opacity: 0;
+    border-radius: 16px;
+    pointer-events: none;
+  }
+
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    20% { transform: translateX(-6px); }
+    40% { transform: translateX(5px); }
+    60% { transform: translateX(-3px); }
+    80% { transform: translateX(2px); }
+  }
+  .window.shake { animation: shake 0.4s var(--ease); }
+
+  /* ---- title bar ---- */
+  .titlebar {
+    flex: 0 0 auto;
+    height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 14px;
+    background: var(--chrome);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    color: var(--text-dim);
+    user-select: none;
+  }
+
+  .titlebar-left, .titlebar-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  /* ---- traffic lights ---- */
+  .traffic-lights {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+  }
+
+  .traffic-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: none;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: transform 0.15s ease, filter 0.15s ease;
+  }
+  .traffic-dot:active { transform: scale(0.88); }
+  .traffic-dot:hover { filter: brightness(1.12); }
+  .traffic-dot.close { background: #ff5f57; }
+  .traffic-dot.minimize { background: #ffbd2e; }
+  .traffic-dot.maximize { background: #28c840; }
+
+  .traffic-dot svg {
+    width: 7px;
+    height: 7px;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+  .traffic-lights:hover .traffic-dot svg,
+  .traffic-dot:focus-visible svg { opacity: 1; }
+
+  .traffic-dot.maximize .icon-restore,
+  .traffic-dot.maximize.is-active .icon-expand { display: none; }
+  .traffic-dot.maximize.is-active .icon-restore { display: block; }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--amber);
+    flex: none;
+    box-shadow: 0 0 0 3px var(--amber-soft);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  .status-dot.connected {
+    background: var(--green);
+    box-shadow: 0 0 0 3px rgba(126,198,153,0.16);
+    animation: none;
+  }
+  .status-dot.closed {
+    background: var(--red);
+    box-shadow: 0 0 0 3px rgba(234,98,98,0.16);
+    animation: none;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.85); }
+  }
+
+  .status-text {
+    color: var(--text);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    flex: none;
+  }
+
+  .divider {
+    width: 1px;
+    height: 14px;
+    background: var(--border-strong);
+    flex: none;
+  }
+
+  .host {
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .badge {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    padding: 2px 6px;
+    flex: none;
+  }
+
+  .duration {
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    flex: none;
+  }
+
+  /* ---- terminal ---- */
+  .terminal-wrap {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    background: var(--terminal-bg);
+  }
+
+  #terminal {
+    position: absolute;
+    inset: 0;
+    padding: 10px 4px 0 12px;
+  }
+
+  .scanlines {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(255,255,255,0.025) 0px,
+      rgba(255,255,255,0.025) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+    mix-blend-mode: overlay;
+    opacity: 0.5;
+  }
+
+  /* ---- status bar ---- */
+  .statusbar {
+    flex: 0 0 auto;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 14px;
+    background: var(--chrome);
+    border-top: 1px solid var(--border);
+    font-size: 10.5px;
+    color: var(--text-dimmer);
+    letter-spacing: 0.03em;
+    user-select: none;
+  }
+
+  #stats { font-variant-numeric: tabular-nums; }
+
+  /* ---- xterm overrides ---- */
+  .xterm { height: 100%; }
+  .xterm .xterm-viewport { background: transparent !important; }
+
+  /* ---- dock pill (minimized state) ---- */
+  .dock-pill {
+    position: fixed;
+    left: 50%;
+    bottom: 26px;
+    transform: translate(-50%, 16px) scale(0.92);
+    opacity: 0;
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    background: var(--chrome);
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    padding: 9px 16px 9px 12px;
+    font: 12px var(--mono);
+    color: var(--text-dim);
+    box-shadow: 0 14px 34px rgba(0,0,0,0.5);
+    cursor: pointer;
+    appearance: none;
+    transition: opacity 0.3s var(--ease), transform 0.3s var(--ease), border-color 0.15s ease, color 0.15s ease;
+    z-index: 20;
+  }
+  .dock-pill.visible {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+    pointer-events: auto;
+  }
+  .dock-pill:hover, .dock-pill:focus-visible {
+    border-color: var(--amber);
+    color: var(--text);
+  }
+  .dock-pill .status-dot { flex: none; }
+  .dock-pill .chevron {
+    opacity: 0.5;
+    transition: transform 0.15s ease;
+  }
+  .dock-pill:hover .chevron { transform: translateY(-1px); }
+
+  /* ---- responsive ---- */
+  @media (max-width: 640px) {
+    .window { width: 100vw; height: 100dvh; border-radius: 0; border: none; }
+    .badge { display: none; }
+    .titlebar { padding: 0 10px; }
+    .statusbar { padding: 0 10px; }
+  }
+
+  @media (max-width: 480px) {
+    .host-group { display: none; }
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--amber);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .status-dot { animation: none; }
+    .window, .dock-pill { transition: none !important; }
+    .window.shake { animation: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="stage">
+  <div class="ambient-glow" aria-hidden="true"></div>
+
+  <div class="window" id="window">
+    <div class="titlebar">
+      <div class="titlebar-left">
+        <div class="traffic-lights">
+          <button class="traffic-dot close" id="btnClose" type="button" aria-label="Close (disabled)">
+            <svg viewBox="0 0 8 8"><path d="M1.4 1.4L6.6 6.6M6.6 1.4L1.4 6.6" stroke="rgba(0,0,0,0.55)" stroke-width="1.2" stroke-linecap="round"/></svg>
+          </button>
+          <button class="traffic-dot minimize" id="btnMin" type="button" aria-label="Minimize">
+            <svg viewBox="0 0 8 8"><path d="M1.4 4H6.6" stroke="rgba(0,0,0,0.55)" stroke-width="1.2" stroke-linecap="round"/></svg>
+          </button>
+          <button class="traffic-dot maximize" id="btnMax" type="button" aria-label="Maximize">
+            <svg class="icon-expand" viewBox="0 0 8 8"><path d="M1.4 3V1.4H3M6.6 5V6.6H5" stroke="rgba(0,0,0,0.55)" stroke-width="1.2" stroke-linecap="round" fill="none"/></svg>
+            <svg class="icon-restore" viewBox="0 0 8 8"><path d="M2.6 1.4V3H1M5.4 6.6V5H7" stroke="rgba(0,0,0,0.55)" stroke-width="1.2" stroke-linecap="round" fill="none"/></svg>
+          </button>
+        </div>
+        <span class="divider" aria-hidden="true"></span>
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-text" id="statusText">Connecting</span>
+        <span class="host-group">
+          <span class="divider" aria-hidden="true"></span>
+          <span class="host" id="hostLabel">—</span>
+        </span>
+      </div>
+      <div class="titlebar-right">
+        <span class="badge" id="protoBadge">—</span>
+        <span class="duration" id="duration">--:--</span>
+      </div>
+    </div>
+
+    <div class="terminal-wrap">
+      <div id="terminal"></div>
+      <div class="scanlines" aria-hidden="true"></div>
+    </div>
+
+    <div class="statusbar">
+      <span id="hint">Read-only viewer</span>
+      <span id="stats">0 updates</span>
+    </div>
+  </div>
+
+  <button class="dock-pill" id="dockPill" type="button">
+    <span class="status-dot" id="dockDot"></span>
+    <span>Shared Session — minimized</span>
+    <span class="chevron" aria-hidden="true">▲</span>
+  </button>
+</div>
+
+<script>
+  const statusDot = document.getElementById('statusDot');
+  const dockDot = document.getElementById('dockDot');
+  const statusText = document.getElementById('statusText');
+  const hostLabel = document.getElementById('hostLabel');
+  const protoBadge = document.getElementById('protoBadge');
+  const durationEl = document.getElementById('duration');
+  const statsEl = document.getElementById('stats');
+
+  const winEl = document.getElementById('window');
+  const btnClose = document.getElementById('btnClose');
+  const btnMin = document.getElementById('btnMin');
+  const btnMax = document.getElementById('btnMax');
+  const dockPill = document.getElementById('dockPill');
+
+  hostLabel.textContent = location.host;
+
+  const term = new Terminal({
+    cursorBlink: true,
+    fontFamily: "'JetBrains Mono', Menlo, Consolas, monospace",
+    fontSize: 14,
+    lineHeight: 1.1,
+    letterSpacing: 0,
+    scrollback: 0,
+    // The server sends full snapshots whose lines are separated by bare LF.
+    // Without convertEol the cursor keeps its column after every LF, so each
+    // line renders at a shifting offset and wraps into phantom rows.
+    convertEol: true,
+    theme: {
+      background: '#0a0c0f',
+      foreground: '#d7dade',
+      cursor: '#ffb454',
+      cursorAccent: '#0a0c0f',
+      selectionBackground: 'rgba(255,180,84,0.25)',
+      black: '#1c1f24',
+      red: '#ea6262',
+      green: '#7ec699',
+      yellow: '#ffb454',
+      blue: '#7aa2f7',
+      magenta: '#c98adb',
+      cyan: '#6fc2c0',
+      white: '#d7dade',
+      brightBlack: '#4b5158',
+      brightRed: '#f28b8b',
+      brightGreen: '#a3d9b8',
+      brightYellow: '#ffcb85',
+      brightBlue: '#9cb8fa',
+      brightMagenta: '#dba9e8',
+      brightCyan: '#92d6d4',
+      brightWhite: '#f2f3f5'
+    }
+  });
+
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal'));
+  try { fitAddon.fit(); } catch (e) { /* zero-size container, ignore */ }
+
+  // Window-control state is declared before the fit wiring so every geometry
+  // source below can consult it.
+  let maximized = false;
+  let minimized = false;
+
+  // One coalesced hook for every geometry change: window resize, browser
+  // zoom (visualViewport), maximize/restore transitions and font loading all
+  // end in exactly one fit() plus one size report per frame.
+  let fitFrame = 0;
+  function scheduleFit() {
+    if (minimized) return;
+    cancelAnimationFrame(fitFrame);
+    fitFrame = requestAnimationFrame(() => {
+      try { fitAddon.fit(); } catch (e) { /* zero-size container, ignore */ }
+      reportSize();
+    });
+  }
+
+  term.onResize(() => reportSize());
+
+  // ResizeObserver covers the animated .window transitions (maximize,
+  // restore, responsive breakpoints) that never fire a window resize event,
+  // including environments where transitionend is suppressed.
+  new ResizeObserver(() => scheduleFit()).observe(document.querySelector('.terminal-wrap'));
+  window.addEventListener('resize', scheduleFit);
+  window.visualViewport?.addEventListener('resize', scheduleFit);
+  document.fonts.ready.then(() => scheduleFit());
+
+  term.writeln('\x1b[38;5;245mconnecting to shared session…\x1b[0m');
+
+  // ---- connection ----
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  protoBadge.textContent = proto.replace(':', '').toUpperCase();
+
+  const ws = new WebSocket(proto + '//' + location.host + '/ws');
+
+  let connectedAt = null;
+  let timerId = null;
+  let updates = 0;
+  let bytes = 0;
+
+  function setStatus(state) {
+    const cls = 'status-dot ' + (state === 'connected' ? 'connected' : state === 'closed' ? 'closed' : '');
+    statusDot.className = cls;
+    dockDot.className = cls;
+    statusText.textContent = state === 'connected' ? 'Live' : state === 'closed' ? 'Disconnected' : 'Connecting';
+  }
+
+  function formatDuration(ms) {
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+  }
+
+  function formatBytes(n) {
+    if (n < 1024) return n + ' B';
+    return (n / 1024).toFixed(1) + ' KB';
+  }
+
+  function tick() {
+    if (connectedAt) durationEl.textContent = formatDuration(Date.now() - connectedAt);
+  }
+
+  // Tell the server our actual terminal geometry. The server is
+  // responsible for using cols/rows to size whatever it renders — e.g.
+  // resizing the backing PTY (ptyProcess.resize(cols, rows) with
+  // node-pty) or reformatting/truncating its output to fit — otherwise
+  // frames keep overflowing the visible viewport no matter how big the
+  // window is, since the client and server never agreed on a size.
+  function reportSize() {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+    }
+  }
+
+  // Fires on every fitAddon.fit() that actually changes the dimensions:
+  // initial load, window resize, maximize/restore, minimize/restore.
+  // One hook covers all of them instead of duplicating calls at each site.
+  term.onResize(() => reportSize());
+
+  ws.onopen = () => {
+    setStatus('connected');
+    connectedAt = Date.now();
+    timerId = setInterval(tick, 1000);
+    reportSize(); // in case the socket connects after the initial fit
+  };
+
+  ws.onmessage = (event) => {
+    // Each message from the server is a full snapshot of the remote TUI
+    // (a poll-and-redraw model), not an incremental diff of a real PTY
+    // stream. Without a clear + cursor-home before each frame, xterm has
+    // no way to know a message is a redraw rather than new output, so it
+    // just appends it below the previous frame and grows the scrollback
+    // forever. Prepending "\x1b[H\x1b[2J\x1b[3J" (cursor home, clear
+    // viewport, clear saved/scrollback lines) to the frame — as part of
+    // the SAME write call — makes every frame replace the last one in
+    // place, and keeps the clear in order with the frame data inside
+    // xterm's internal write queue (a separate term.clear() call could
+    // race ahead of or behind queued writes under load).
+    term.write('\x1b[H\x1b[2J\x1b[3J' + event.data);
+    updates += 1;
+    bytes += (event.data && event.data.length) ? event.data.length : 0;
+    statsEl.textContent = updates + ' update' + (updates === 1 ? '' : 's') + ' · ' + formatBytes(bytes);
+  };
+
+  ws.onclose = () => {
+    setStatus('closed');
+    if (timerId) clearInterval(timerId);
+    term.write('\r\n\x1b[31m[connection closed]\x1b[0m\r\n');
+  };
+
+  ws.onerror = () => {
+    setStatus('closed');
+  };
+
+  // ---- window controls ----
+  function refit() {
+    scheduleFit();
+  }
+
+  btnMax.addEventListener('click', () => {
+    if (minimized) return;
+    maximized = !maximized;
+    winEl.classList.toggle('is-maximized', maximized);
+    btnMax.classList.toggle('is-active', maximized);
+    btnMax.setAttribute('aria-label', maximized ? 'Restore' : 'Maximize');
+    // ResizeObserver refits during the size transition; the immediate call
+    // also covers the reduced-motion case where the class applies instantly.
+    scheduleFit();
+  });
+
+  btnMin.addEventListener('click', () => {
+    if (minimized) return;
+    minimized = true;
+    winEl.classList.add('is-minimizing');
+    dockPill.classList.add('visible');
+    setTimeout(() => { winEl.style.visibility = 'hidden'; }, 420);
+  });
+
+  function restoreWindow() {
+    if (!minimized) return;
+    minimized = false;
+    winEl.style.visibility = 'visible';
+    void winEl.offsetWidth; // force reflow so the un-minimize transition plays
+    winEl.classList.remove('is-minimizing');
+    dockPill.classList.remove('visible');
+    setTimeout(refit, 420);
+  }
+  dockPill.addEventListener('click', restoreWindow);
+
+  // close is intentionally inert — just a tactile "nope" shake for feedback
+  btnClose.addEventListener('click', () => {
+    winEl.classList.remove('shake');
+    void winEl.offsetWidth;
+    winEl.classList.add('shake');
+    setTimeout(() => winEl.classList.remove('shake'), 400);
+  });
+</script>
+
+</body>
+</html>

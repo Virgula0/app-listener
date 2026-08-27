@@ -3,6 +3,7 @@ package common
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -11,9 +12,127 @@ import (
 	"sync"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+
+	"github.com/charmbracelet/x/term"
 
 	"github.com/Virgula0/app-listener/internal/infrastructure"
 )
+
+const defaultServeAddress = "127.0.0.1:9999"
+
+// ServeConfig is the validated CLI configuration for the browser TUI.
+type ServeConfig struct {
+	Enabled  bool
+	Address  string
+	Username string
+	Password string
+}
+
+// AddServeFlags adds the browser TUI flags to commands that expose a TUI.
+func AddServeFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+	flags.String("serve", "", "Serve the TUI in a browser at host:port (default when omitted: 127.0.0.1:9999)")
+	flags.Lookup("serve").NoOptDefVal = defaultServeAddress
+	flags.String("user", "", "HTTP Basic Auth username (requires --serve and --password)")
+	flags.String("password", "", "HTTP Basic Auth password (requires --serve and --user)")
+}
+
+// ParseServeFlags validates flags shared by the five monitoring and guarding modes.
+func ParseServeFlags(cmd *cobra.Command) (ServeConfig, error) {
+	serveFlag := cmd.Flags().Lookup("serve")
+	if serveFlag == nil {
+		return ServeConfig{}, nil
+	}
+
+	config := ServeConfig{Enabled: serveFlag.Changed}
+	config.Address, _ = cmd.Flags().GetString("serve")
+	config.Username, _ = cmd.Flags().GetString("user")
+	config.Password, _ = cmd.Flags().GetString("password")
+
+	credentialsSet, _ := credentialFlagState(cmd)
+	if !config.Enabled {
+		if credentialsSet {
+			return ServeConfig{}, errors.New("--user and --password require --serve")
+		}
+		return config, nil
+	}
+
+	if err := validateEnabledServe(cmd, config); err != nil {
+		return ServeConfig{}, err
+	}
+
+	host, _, _ := net.SplitHostPort(config.Address)
+	if !isLoopbackHost(host) {
+		log.Warn("browser TUI is bound outside loopback; HTTP traffic and Basic Auth credentials are not encrypted, use a TLS reverse proxy")
+	}
+	return config, nil
+}
+
+// validateEnabledServe enforces every rule that only applies when --serve was
+// actually given: presentation conflicts, credential pairing, address syntax
+// and the interactive-terminal requirement of the dual local+browser TUI.
+func validateEnabledServe(cmd *cobra.Command, config ServeConfig) error {
+	if requestedBoolFlag(cmd, "headless") {
+		return errors.New("--serve and --headless are mutually exclusive")
+	}
+	if requestedBoolFlag(cmd, "gui") {
+		return errors.New("--serve and --gui are mutually exclusive")
+	}
+	if requestedBoolFlag(cmd, "genkey") {
+		return errors.New("--serve is not available with --genkey")
+	}
+	if requestedBoolFlag(cmd, "blocked-only") {
+		return errors.New("--blocked-only is only available with --headless")
+	}
+	credentialsSet, mixedCredentials := credentialFlagState(cmd)
+	if credentialsSet && (mixedCredentials || config.Username == "" || config.Password == "") {
+		return errors.New("--user and --password must be non-empty and specified together")
+	}
+	if err := validateServeAddress(config.Address); err != nil {
+		return err
+	}
+	if !term.IsTerminal(os.Stdin.Fd()) {
+		return errors.New("--serve needs an interactive terminal for the local TUI; use --headless without --serve for services")
+	}
+	return nil
+}
+
+// credentialFlagState reports whether any credential flag was set explicitly
+// and whether the two flags disagree (one given without the other).
+func credentialFlagState(cmd *cobra.Command) (set, mixed bool) {
+	userFlag := cmd.Flags().Lookup("user")
+	passwordFlag := cmd.Flags().Lookup("password")
+	if userFlag == nil || passwordFlag == nil {
+		return false, false
+	}
+	return userFlag.Changed || passwordFlag.Changed, userFlag.Changed != passwordFlag.Changed
+}
+
+func requestedBoolFlag(cmd *cobra.Command, name string) bool {
+	flag := cmd.Flags().Lookup(name)
+	return flag != nil && flag.Value.String() == "true"
+}
+
+func validateServeAddress(address string) error {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return fmt.Errorf("invalid --serve address %q: expected host:port", address)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid --serve address %q: port must be between 1 and 65535", address)
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 type RawTarget struct {
 	AbsPath string

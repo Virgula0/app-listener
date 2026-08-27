@@ -70,8 +70,14 @@ func NewDaemonModel(events <-chan usecase.DaemonEvent, resources []DaemonResourc
 func (m *daemonModel) Init() tea.Cmd {
 	return tea.Batch(
 		listenForDaemonEvents(m.events),
-		tickGuardStats(),
+		tickDaemonStats(),
 	)
+}
+
+func tickDaemonStats() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return daemonStatsMsg{}
+	})
 }
 
 func listenForDaemonEvents(ch <-chan usecase.DaemonEvent) tea.Cmd {
@@ -84,13 +90,15 @@ func listenForDaemonEvents(ch <-chan usecase.DaemonEvent) tea.Cmd {
 	}
 }
 
-//nolint:dupl // bubbletea update-loop skeleton shared by the daemon view
 func (m *daemonModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		syncViewport(&m.viewport, &m.ready, m.width, m.height, 5, m.renderDaemonViewport)
+		// One rendered row per watched resource sits between the header
+		// block and the stats line; reserve it in the viewport budget.
+		syncViewport(&m.viewport, &m.ready, m.width, m.height,
+			daemonViewFixedRows+len(m.resources), m.renderDaemonViewport)
 
 	case daemonEventMsg:
 		ev := usecase.DaemonEvent(msg)
@@ -104,7 +112,7 @@ func (m *daemonModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateDaemonStats()
 		m.renderDaemonViewport()
 
-		return m, tickGuardStats()
+		return m, tickDaemonStats()
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -142,7 +150,7 @@ func (m *daemonModel) addDaemonEvent(ev *usecase.DaemonEvent) {
 	}
 
 	line := fmt.Sprintf("%s %s",
-		daemonPathStyle.Render(ev.Resource),
+		daemonPathStyle.Render(sanitizeTerminalText(ev.Resource)),
 		formatGuardEventLine(&ev.Event))
 
 	m.lines = append(m.lines, daemonEventLine{event: *ev, line: line})
@@ -176,7 +184,7 @@ func (m *daemonModel) View() string {
 		}
 		resourceLines = append(resourceLines, infoStyle.Render(fmt.Sprintf(
 			"  %s  |  %s  |  whitelist: %d",
-			daemonPathStyle.Render(r.Path),
+			daemonPathStyle.Render(sanitizeTerminalText(r.Path)),
 			daemonStateStyle.Render(state),
 			r.Binaries,
 		)))
@@ -196,7 +204,7 @@ func (m *daemonModel) View() string {
 
 	footer := footerStyle.Render("Press q or ctrl+c to exit")
 
-	return appStyle.Render(lipgloss.JoinVertical(
+	return clipToWidth(appStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
 		header,
 		"",
@@ -207,5 +215,5 @@ func (m *daemonModel) View() string {
 		resLine,
 		"",
 		footer,
-	))
+	)), m.width)
 }

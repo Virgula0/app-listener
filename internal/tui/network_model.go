@@ -105,7 +105,7 @@ func (m *netModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		syncViewport(&m.viewport, &m.ready, m.width, m.height, 4, m.renderNetViewport)
+		syncViewport(&m.viewport, &m.ready, m.width, m.height, networkViewFixedRows, m.renderNetViewport)
 
 	case netEventMsg:
 		ev := ebpf.NetEvent(msg)
@@ -171,9 +171,9 @@ func (m *netModel) addNetEvent(ev *ebpf.NetEvent) {
 		timeStyle.Render(ts),
 		t,
 		proto,
-		commStyle.Render(ev.Comm),
-		formatAddr(src),
-		formatAddr(dst),
+		commStyle.Render(sanitizeTerminalText(ev.Comm)),
+		formatAddr(sanitizeTerminalText(src)),
+		formatAddr(sanitizeTerminalText(dst)),
 		ev.PID,
 		sizeStr,
 	)
@@ -227,7 +227,7 @@ func (m *netModel) View() string {
 
 	binaryNames := make([]string, len(m.binaries))
 	for i, b := range m.binaries {
-		binaryNames[i] = b.Path
+		binaryNames[i] = sanitizeTerminalText(b.Path)
 	}
 
 	header := headerStyle.Render("app-listener \u2014 Network Monitor (eBPF)")
@@ -247,7 +247,7 @@ func (m *netModel) View() string {
 
 	footer := footerStyle.Render("Press q or ctrl+c to exit")
 
-	return appStyle.Render(lipgloss.JoinVertical(
+	return clipToWidth(appStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
 		header,
 		"",
@@ -257,7 +257,7 @@ func (m *netModel) View() string {
 		resLine,
 		"",
 		footer,
-	))
+	)), m.width)
 }
 
 func (m *netModel) renderNetResourceBar() string {

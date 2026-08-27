@@ -2,7 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -11,11 +13,14 @@ import (
 // formatGuardEventLine renders one guard event line, shared by the guard
 // and daemon views.
 func formatGuardEventLine(ev *guard.GuardEvent) string {
+	safeEvent := *ev
+	safeEvent.Dest = sanitizeTerminalText(safeEvent.Dest)
+	ev = &safeEvent
 	ts := time.Unix(0, ev.Timestamp).Format("15:04:05.000")
 	t := formatGuardType(ev.Type)
 	decision := formatDecision(ev.Blocked)
 
-	pathPart := ev.Path
+	pathPart := sanitizeTerminalText(ev.Path)
 	extra := ""
 
 	switch ev.Type {
@@ -29,9 +34,26 @@ func formatGuardEventLine(ev *guard.GuardEvent) string {
 		timeStyle.Render(ts),
 		t,
 		decision,
-		commStyle.Render(ev.Comm),
+		commStyle.Render(sanitizeTerminalText(ev.Comm)),
 		ev.PID,
 		pathPart,
 		extra,
 	)
+}
+
+func sanitizeTerminalText(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, value)
+}
+
+func sanitizeTerminalTexts(values []string) []string {
+	result := make([]string, len(values))
+	for i, value := range values {
+		result[i] = sanitizeTerminalText(value)
+	}
+	return result
 }

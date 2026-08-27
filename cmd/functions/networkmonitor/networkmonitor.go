@@ -42,6 +42,7 @@ Examples:
 }
 
 func init() {
+	common.AddServeFlags(NetworkMonitorCmd)
 	NetworkMonitorCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
 		"Event types to monitor (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all)")
 	NetworkMonitorCmd.Flags().BoolVarP(&headless, "headless", "", false,
@@ -49,11 +50,15 @@ func init() {
 }
 
 func runNetworkMonitor(cmd *cobra.Command, args []string) error {
+	serve, err := common.ParseServeFlags(cmd)
+	if err != nil {
+		return err
+	}
 	binaries := make([]networkmonitor.BinaryEntry, 0, len(args))
 	for _, p := range args {
-		entry, err := networkmonitor.ComputeBinaryEntry(p)
-		if err != nil {
-			return fmt.Errorf("processing binary %q: %w", p, err)
+		entry, entryErr := networkmonitor.ComputeBinaryEntry(p)
+		if entryErr != nil {
+			return fmt.Errorf("processing binary %q: %w", p, entryErr)
 		}
 		binaries = append(binaries, entry)
 	}
@@ -86,6 +91,16 @@ func runNetworkMonitor(cmd *cobra.Command, args []string) error {
 	if headless {
 		runHeadless(ucase)
 		return nil
+	}
+	if serve.Enabled {
+		fan := tui.NewEventFanout(ucase.Events())
+		defer fan.Stop()
+		return tui.Serve(
+			tui.NewNetModel(fan.Local(), binaries),
+			tui.NewNetModel(fan.Browser(), binaries),
+			tui.ServeOptions{
+				Address: serve.Address, Username: serve.Username, Password: serve.Password,
+			})
 	}
 
 	return runTUI(ucase, binaries)

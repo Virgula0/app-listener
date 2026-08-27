@@ -69,6 +69,7 @@ Examples:
 }
 
 func init() {
+	common.AddServeFlags(NetworkGuardCmd)
 	NetworkGuardCmd.Flags().StringSliceVarP(&blacklistPaths, "blacklist", "b", nil,
 		"Binary paths to blacklist (block AF_INET/AF_INET6 network operations)")
 	NetworkGuardCmd.Flags().StringSliceVarP(&whitelistPaths, "whitelist", "w", nil,
@@ -86,6 +87,10 @@ func init() {
 }
 
 func runNetworkGuard(cmd *cobra.Command, args []string) error {
+	serve, err := common.ParseServeFlags(cmd)
+	if err != nil {
+		return err
+	}
 	mode, binPaths, err := resolveGuardMode()
 	if err != nil {
 		return err
@@ -142,6 +147,16 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 	if headless {
 		runHeadless(ucase, !noThrottleFlag)
 		return nil
+	}
+	if serve.Enabled {
+		fan := tui.NewEventFanout(ucase.Events())
+		defer fan.Stop()
+		return tui.Serve(
+			tui.NewNetGuardModel(fan.Local(), mode, binaries),
+			tui.NewNetGuardModel(fan.Browser(), mode, binaries),
+			tui.ServeOptions{
+				Address: serve.Address, Username: serve.Username, Password: serve.Password,
+			})
 	}
 
 	return runTUI(ucase, mode, binaries)

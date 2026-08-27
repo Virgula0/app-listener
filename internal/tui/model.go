@@ -21,6 +21,17 @@ const quitKey = "ctrl+c"
 // initializingView is shown while the TUI is not ready yet.
 const initializingView = "\n  Initializing..."
 
+// Rows each view spends outside the viewport: header/info/footer blocks,
+// blank separators and the two appStyle vertical margins. The viewport must
+// be sized as height minus these rows, otherwise the bottom of the view
+// (resource bar, footer) overflows the reported terminal height.
+const (
+	fileViewFixedRows    = 8 // header, blank, info | resource, blank, footer | margins
+	networkViewFixedRows = 9 // header, blank, info, stats | resource, blank, footer | margins
+	guardViewFixedRows   = 9 // header, blank, info, stats | resource, blank, footer | margins
+	daemonViewFixedRows  = 9 // header, blank, resources label, stats | resource, blank, footer | margins
+)
+
 type eventMsg ebpf.FileEvent
 type statsMsg struct{}
 
@@ -138,7 +149,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		syncViewport(&m.viewport, &m.ready, m.width, m.height, 3, m.renderViewport)
+		syncViewport(&m.viewport, &m.ready, m.width, m.height, fileViewFixedRows, m.renderViewport)
 
 	case eventMsg:
 		ev := ebpf.FileEvent(msg)
@@ -185,24 +196,24 @@ func (m *model) addEvent(ev *ebpf.FileEvent) {
 
 	ts := time.Unix(0, ev.Timestamp).Format("15:04:05.000")
 	t := formatType(ev.Type)
-	pathPart := ev.Path
+	pathPart := sanitizeTerminalText(ev.Path)
 	extra := ""
 
 	switch ev.Type {
 	case ebpf.EventRead, ebpf.EventWrite:
 		extra = fmt.Sprintf(" fd=%d", ev.FD)
 	case ebpf.EventRename:
-		extra = fmt.Sprintf(" → %s", ev.Dest)
+		extra = fmt.Sprintf(" → %s", sanitizeTerminalText(ev.Dest))
 	case ebpf.EventSymlink:
-		extra = fmt.Sprintf(" → %s", ev.Dest)
+		extra = fmt.Sprintf(" → %s", sanitizeTerminalText(ev.Dest))
 	case ebpf.EventHardlink:
-		extra = fmt.Sprintf(" → %s", ev.Dest)
+		extra = fmt.Sprintf(" → %s", sanitizeTerminalText(ev.Dest))
 	}
 
 	line := fmt.Sprintf("%s %s %s[%d] %s%s",
 		timeStyle.Render(ts),
 		t,
-		commStyle.Render(ev.Comm),
+		commStyle.Render(sanitizeTerminalText(ev.Comm)),
 		ev.PID,
 		pathPart,
 		extra,
@@ -245,7 +256,7 @@ func (m *model) View() string {
 
 	info := infoStyle.Render(fmt.Sprintf(
 		"Watching: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
-		strings.Join(m.paths, ", "),
+		strings.Join(sanitizeTerminalTexts(m.paths), ", "),
 		recursiveStr,
 		m.eventID,
 		time.Since(m.startTime).Round(time.Second),
@@ -255,7 +266,7 @@ func (m *model) View() string {
 
 	footer := footerStyle.Render("Press q or ctrl+c to exit")
 
-	return appStyle.Render(lipgloss.JoinVertical(
+	return clipToWidth(appStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
 		header,
 		"",
@@ -264,7 +275,17 @@ func (m *model) View() string {
 		resLine,
 		"",
 		footer,
-	))
+	)), m.width)
+}
+
+// clipToWidth truncates every rendered line to width. Chrome lines and event
+// lines wider than the terminal would otherwise wrap in xterm and silently
+// consume extra rows, pushing the resource bar and footer out of the window.
+func clipToWidth(view string, width int) string {
+	if width <= 0 {
+		return view
+	}
+	return lipgloss.NewStyle().MaxWidth(width).Render(view)
 }
 
 func (m *model) renderResourceBar() string {
@@ -272,14 +293,19 @@ func (m *model) renderResourceBar() string {
 }
 
 // syncViewport sizes the viewport, creating it on first use, then re-renders
-// the viewport content through render.
-func syncViewport(v *viewport.Model, ready *bool, width, height, headerH int, render func()) {
+// the viewport content through render. fixedRows is every row the view spends
+// outside the viewport (headers, footers, separators and margins); the
+// viewport gets exactly the remaining height so the whole view fits the
+// reported terminal size.
+func syncViewport(v *viewport.Model, ready *bool, width, height, fixedRows int, render func()) {
+	viewportWidth := max(1, width-appStyle.GetHorizontalMargins())
+	viewportHeight := max(1, height-fixedRows)
 	if !*ready {
-		*v = viewport.New(width-4, height-headerH-3-1)
+		*v = viewport.New(viewportWidth, viewportHeight)
 		*ready = true
 	} else {
-		v.Width = width - 4
-		v.Height = height - headerH - 3 - 1
+		v.Width = viewportWidth
+		v.Height = viewportHeight
 	}
 	render()
 }

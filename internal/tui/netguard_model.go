@@ -103,14 +103,15 @@ func (m *netGuardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		viewportHeight := max(1, msg.Height-headerHeight-footerHeight)
 
 		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-headerHeight-footerHeight)
+			m.viewport = viewport.New(max(1, msg.Width), viewportHeight)
 			m.viewport.YPosition = headerHeight
 			m.ready = true
 		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - headerHeight - footerHeight
+			m.viewport.Width = max(1, msg.Width)
+			m.viewport.Height = viewportHeight
 		}
 
 		m.renderContent()
@@ -177,13 +178,14 @@ func (m *netGuardModel) formatEvent(ev *networkguard.NetGuardEvent) string {
 		status = netGuardAllowedStyle.Render(" ALLOWED")
 	}
 
-	comm := ev.Comm
+	comm := sanitizeTerminalText(ev.Comm)
 	protocol := protoString(ev.Protocol)
 
 	addr := ev.DstAddr
 	if addr == "" {
 		addr = ev.SrcAddr
 	}
+	addr = sanitizeTerminalText(addr)
 
 	details := fmt.Sprintf("pid=%d tid=%d", ev.PID, ev.TID)
 
@@ -193,7 +195,7 @@ func (m *netGuardModel) formatEvent(ev *networkguard.NetGuardEvent) string {
 
 	return fmt.Sprintf("[%d] %s %s %s %s %s%s %s",
 		m.eventID,
-		time.Now().Format("15:04:05.000"),
+		time.Unix(0, ev.Timestamp).Format("15:04:05.000"),
 		eventName,
 		comm,
 		protocol,
@@ -252,13 +254,13 @@ func (m *netGuardModel) View() string {
 	fmt.Fprint(&b, " "+m.renderResourceBar()+"\n\n")
 	fmt.Fprint(&b, m.viewport.View())
 
-	return b.String()
+	return clipToWidth(b.String(), m.width)
 }
 
 func (m *netGuardModel) listSummary(entries []networkguard.BinaryEntry) string {
 	parts := make([]string, len(entries))
 	for i, b := range entries {
-		parts[i] = b.Path
+		parts[i] = sanitizeTerminalText(b.Path)
 	}
 	if len(parts) == 0 {
 		return "-"
@@ -296,6 +298,6 @@ func (m *netGuardModel) renderResourceBar() string {
 }
 
 const (
-	headerHeight = 5
+	headerHeight = 4 // title, mode/binaries line, resource bar, blank separator
 	footerHeight = 0
 )
