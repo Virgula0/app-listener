@@ -28,7 +28,9 @@ func init() {
 	InstallCmd.Flags().Bool("binary-only", false,
 		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon; no wizard, no config, no fscrypt, no systemd units")
 	InstallCmd.Flags().Bool("update-catalog-only", false,
-		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, shows the diff and overwrites on confirmation (requires a previous installation)")
+		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
+	InstallCmd.Flags().BoolP("yes", "y", false,
+		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. pacman hooks)")
 }
 
 var InstallCmd = &cobra.Command{
@@ -158,25 +160,47 @@ func runInstall(cmd *cobra.Command, args []string) error {
 
 // runMaintenanceMode dispatches the mutually exclusive maintenance flags,
 // reporting whether one ran so the caller skips the installer body.
+// maintenanceFlags holds the parsed CLI flags for the install command's
+// mutually exclusive maintenance modes.
+type maintenanceFlags struct {
+	restore       bool
+	deleteBackup  bool
+	binaryOnly    bool
+	updateCatalog bool
+	autoConfirm   bool
+}
+
+func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
+	var f maintenanceFlags
+	var err error
+	if f.restore, err = cmd.Flags().GetBool("restore-backups"); err != nil {
+		return f, err
+	}
+	if f.deleteBackup, err = cmd.Flags().GetBool("delete-post-backups"); err != nil {
+		return f, err
+	}
+	if f.binaryOnly, err = cmd.Flags().GetBool("binary-only"); err != nil {
+		return f, err
+	}
+	if f.updateCatalog, err = cmd.Flags().GetBool("update-catalog-only"); err != nil {
+		return f, err
+	}
+	if f.autoConfirm, err = cmd.Flags().GetBool("yes"); err != nil {
+		return f, err
+	}
+	return f, nil
+}
+
 func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
-	restore, flagErr := cmd.Flags().GetBool("restore-backups")
-	if flagErr != nil {
-		return false, flagErr
+	f, err := parseMaintenanceFlags(cmd)
+	if err != nil {
+		return false, err
 	}
-	deleteBackups, flagErr := cmd.Flags().GetBool("delete-post-backups")
-	if flagErr != nil {
-		return false, flagErr
-	}
-	binaryOnly, flagErr := cmd.Flags().GetBool("binary-only")
-	if flagErr != nil {
-		return false, flagErr
-	}
-	updateCatalog, flagErr := cmd.Flags().GetBool("update-catalog-only")
-	if flagErr != nil {
-		return false, flagErr
+	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
+		return false, errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
 	}
 	modes := 0
-	for _, on := range []bool{restore, deleteBackups, binaryOnly, updateCatalog} {
+	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.updateCatalog} {
 		if on {
 			modes++
 		}
@@ -185,14 +209,14 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 		return false, errors.New("--restore-backups, --delete-post-backups, --binary-only and --update-catalog-only are mutually exclusive")
 	}
 	switch {
-	case restore:
+	case f.restore:
 		return true, restoreBackups()
-	case deleteBackups:
+	case f.deleteBackup:
 		return true, deletePostBackups()
-	case binaryOnly:
+	case f.binaryOnly:
 		return true, installBinaryOnly()
-	case updateCatalog:
-		return true, runUpdateCatalogOnly()
+	case f.updateCatalog:
+		return true, runUpdateCatalogOnly(f.autoConfirm)
 	}
 	return false, nil
 }
@@ -215,12 +239,12 @@ func installBinaryOnly() error {
 // directory in the existing daemon.conf. Encrypted vaults are unlocked
 // for stat access, glob patterns are re-expanded, and the diff is shown
 // for confirmation. User-added sections are preserved verbatim.
-func runUpdateCatalogOnly() error {
+func runUpdateCatalogOnly(autoConfirm bool) error {
 	if err := systemd.StopDaemonIfRunning(); err != nil {
 		return err
 	}
 	vault := fscrypt.New()
-	if err := updateCatalogConfig(vault); err != nil {
+	if err := updateCatalogConfig(vault, autoConfirm); err != nil {
 		return err
 	}
 	return systemd.EnableAndVerify(true)

@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"strings"
@@ -295,8 +296,9 @@ func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.Candidat
 // updateCatalogConfig reads the installed daemon.conf, re-expands the
 // catalog whitelist for every matched section (unlocking encrypted vaults
 // for stat access), and shows a diff for confirmation. Unmatched
-// (user-added) sections are preserved verbatim.
-func updateCatalogConfig(vault *fscrypt.Vault) error {
+// (user-added) sections are preserved verbatim. When autoConfirm is true
+// the diff is logged and the config is overwritten without prompting.
+func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm bool) error {
 	oldText, err := os.ReadFile(systemd.SystemConfigPath)
 	if err != nil {
 		return fmt.Errorf("no previous installation found — run `app-listener install` first: %w", err)
@@ -333,13 +335,22 @@ func updateCatalogConfig(vault *fscrypt.Vault) error {
 	}
 
 	newBytes := []byte(confText)
-	overwrite, overErr := inst.ConfirmOverwrite(systemd.SystemConfigPath, oldText, newBytes)
-	if overErr != nil {
-		return overErr
-	}
-	if !overwrite {
-		log.Info("configuration update aborted by user")
+	if bytes.Equal(oldText, newBytes) {
+		log.Info("configuration is already up to date")
 		return nil
+	}
+	if !autoConfirm {
+		overwrite, overErr := inst.ConfirmOverwrite(systemd.SystemConfigPath, oldText, newBytes)
+		if overErr != nil {
+			return overErr
+		}
+		if !overwrite {
+			log.Info("configuration update aborted by user")
+			return nil
+		}
+	} else {
+		log.Infof("catalog refresh: %d sections re-scanned, diff below", patched)
+		log.Info(inst.UnifiedDiff(string(oldText), string(newBytes)))
 	}
 
 	if err := os.WriteFile(systemd.SystemConfigPath, newBytes, 0o600); err != nil {

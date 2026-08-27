@@ -1,25 +1,20 @@
 # /etc/pacman.d/hooks/50-app-listener-reload.hook
 #
-# After pacman installs or upgrades any package that replaces a whitelisted
-# binary, send SIGHUP to the app-listener daemon so it re-reads the new
-# inodes. Without this, the daemon keeps the old inodes in memory and newly
-# installed binaries get denied until the daemon is manually reloaded.
+# After every pacman install/upgrade, re-scan the app-listener catalog
+# whitelist: deleted binaries are dropped, new ones are picked up, and
+# glob patterns are re-expanded. The daemon is restarted automatically.
 #
-# Extend this list when you add binaries to the whitelist of
-# /etc/app-listener/daemon.conf.
+# The previous approach only sent SIGHUP to re-read inodes; the full
+# catalog rescan subsumes that — the daemon is reloaded by
+# EnableAndVerify after writing the refreshed config.
 
 [Trigger]
 Operation = Install
 Operation = Upgrade
 Type = Package
-
-# ssh utilities
-Target = openssh
-
-# network managers (nmcli)
-Target = networkmanager
+Target = *
 
 [Action]
-Description = Refreshing app-listener inode whitelist
+Description = Refreshing app-listener whitelist from catalog
 When = PostTransaction
-Exec = /usr/bin/systemctl kill -s HUP app-listener-daemon.service
+Exec = /usr/local/bin/app-listener install --update-catalog-only --yes
