@@ -88,6 +88,63 @@ func SetNeedEncryption(confText, path string, value bool) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
+// SetSectionWhitelist replaces the binary rule lines within the [watch path]
+// section of confText with newRules. It preserves the section header,
+// blank lines, comments (#), need_encryption: directives, and leading
+// whitespace on every preserved line. Binary rule lines are any non-empty,
+// non-comment, non-directive lines in the section body.
+func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, error) {
+	lines := strings.Split(confText, "\n")
+	header := "[watch " + path + "]"
+	start := findSectionStart(lines, header)
+	if start == -1 {
+		return "", fmt.Errorf("section %q not found in configuration", header)
+	}
+	end := findSectionEnd(lines, start)
+
+	var binaryIndices []int
+	for i := start + 1; i < end; i++ {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "need_encryption:") {
+			continue
+		}
+		binaryIndices = append(binaryIndices, i)
+	}
+
+	newLines := make([]string, 0, len(newRules))
+	for _, rule := range newRules {
+		line := rule.Path
+		if len(rule.Events) > 0 {
+			line += " " + strings.Join(rule.Events, ",")
+		}
+		newLines = append(newLines, line)
+	}
+
+	indent := ""
+	if len(binaryIndices) > 0 {
+		indent = keepIndent(lines[binaryIndices[0]], "")
+	}
+	for i := range newLines {
+		newLines[i] = indent + newLines[i]
+	}
+
+	var prefix, suffix []string
+	if len(binaryIndices) > 0 {
+		prefix = lines[:binaryIndices[0]]
+		suffix = lines[binaryIndices[len(binaryIndices)-1]+1:]
+	} else {
+		insertAt := firstContentLine(lines, start+1, end)
+		prefix = lines[:insertAt]
+		suffix = lines[insertAt:]
+	}
+
+	result := make([]string, 0, len(prefix)+len(newLines)+len(suffix))
+	result = append(result, prefix...)
+	result = append(result, newLines...)
+	result = append(result, suffix...)
+	return strings.Join(result, "\n"), nil
+}
+
 // findSectionStart returns the index of the exact [watch ...] header line,
 // or -1.
 func findSectionStart(lines []string, header string) int {

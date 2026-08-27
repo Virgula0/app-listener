@@ -27,6 +27,8 @@ func init() {
 		"Delete the found .app_listener.backup directories (listed in the TUI, confirmed once, with progress)")
 	InstallCmd.Flags().Bool("binary-only", false,
 		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon; no wizard, no config, no fscrypt, no systemd units")
+	InstallCmd.Flags().Bool("update-catalog-only", false,
+		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, shows the diff and overwrites on confirmation (requires a previous installation)")
 }
 
 var InstallCmd = &cobra.Command{
@@ -94,7 +96,13 @@ Use --binary-only for a non-interactive shortcut that only deploys the
 binary: it builds build/linux/app-listener when it does not exist, stops
 a running daemon, replaces /usr/local/sbin/app-listener atomically,
 recreates the /usr/local/bin/app-listener symlink and starts the daemon
-again — nothing else is touched (no config, no fscrypt, no services).`,
+again — nothing else is touched (no config, no fscrypt, no services).
+
+Use --update-catalog-only to refresh the whitelist of every guarded
+directory from the catalog: encrypted vaults are unlocked, glob patterns
+are re-expanded (picking up new binaries and dropping deleted ones),
+and the diff is shown before overwriting. User-added sections (not in
+the catalog) are preserved as-is. Requires a previous installation.`,
 	Args: cobra.NoArgs,
 	RunE: runInstall,
 }
@@ -163,14 +171,18 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 	if flagErr != nil {
 		return false, flagErr
 	}
+	updateCatalog, flagErr := cmd.Flags().GetBool("update-catalog-only")
+	if flagErr != nil {
+		return false, flagErr
+	}
 	modes := 0
-	for _, on := range []bool{restore, deleteBackups, binaryOnly} {
+	for _, on := range []bool{restore, deleteBackups, binaryOnly, updateCatalog} {
 		if on {
 			modes++
 		}
 	}
 	if modes > 1 {
-		return false, errors.New("--restore-backups, --delete-post-backups and --binary-only are mutually exclusive")
+		return false, errors.New("--restore-backups, --delete-post-backups, --binary-only and --update-catalog-only are mutually exclusive")
 	}
 	switch {
 	case restore:
@@ -179,6 +191,8 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 		return true, deletePostBackups()
 	case binaryOnly:
 		return true, installBinaryOnly()
+	case updateCatalog:
+		return true, runUpdateCatalogOnly()
 	}
 	return false, nil
 }
@@ -195,6 +209,21 @@ func installBinaryOnly() error {
 	}
 	log.Info("binary-only install complete: the daemon is running the new binary")
 	return nil
+}
+
+// runUpdateCatalogOnly re-scans the catalog whitelist for every guarded
+// directory in the existing daemon.conf. Encrypted vaults are unlocked
+// for stat access, glob patterns are re-expanded, and the diff is shown
+// for confirmation. User-added sections are preserved verbatim.
+func runUpdateCatalogOnly() error {
+	if err := systemd.StopDaemonIfRunning(); err != nil {
+		return err
+	}
+	vault := fscrypt.New()
+	if err := updateCatalogConfig(vault); err != nil {
+		return err
+	}
+	return systemd.EnableAndVerify(true)
 }
 
 // prepareInstallation builds the binary and ensures the master key exists.
