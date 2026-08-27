@@ -46,6 +46,7 @@ Examples:
 }
 
 func init() {
+	common.AddServeFlags(GuardCmd)
 	GuardCmd.Flags().StringSliceVarP(&blacklistPaths, "blacklist", "b", nil,
 		"Binary paths to blacklist (repeatable, mutually exclusive with -w)")
 	GuardCmd.Flags().StringSliceVarP(&whitelistPaths, "whitelist", "w", nil,
@@ -61,6 +62,10 @@ func init() {
 }
 
 func runGuard(cmd *cobra.Command, args []string) error {
+	serve, err := common.ParseServeFlags(cmd)
+	if err != nil {
+		return err
+	}
 	guardPath := args[0]
 
 	mode, binaries, err := resolveGuardConfig()
@@ -108,6 +113,16 @@ func runGuard(cmd *cobra.Command, args []string) error {
 	if headless {
 		runGuardHeadless(ucase)
 		return nil
+	}
+	if serve.Enabled {
+		fan := tui.NewEventFanout(ucase.Events())
+		defer fan.Stop()
+		return tui.Serve(
+			tui.NewGuardModel(fan.Local(), guardPath, mode, binaries),
+			tui.NewGuardModel(fan.Browser(), guardPath, mode, binaries),
+			tui.ServeOptions{
+				Address: serve.Address, Username: serve.Username, Password: serve.Password,
+			})
 	}
 
 	return runGuardTUI(ucase, guardPath, mode, binaries)

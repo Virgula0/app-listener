@@ -110,7 +110,7 @@ func (m *guardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		syncViewport(&m.viewport, &m.ready, m.width, m.height, 4, m.renderGuardViewport)
+		syncViewport(&m.viewport, &m.ready, m.width, m.height, guardViewFixedRows, m.renderGuardViewport)
 
 	case guardEventMsg:
 		ev := guard.GuardEvent(msg)
@@ -207,14 +207,14 @@ func (m *guardModel) View() string {
 
 	binaryNames := make([]string, len(m.binaries))
 	for i, b := range m.binaries {
-		binaryNames[i] = b.Path
+		binaryNames[i] = sanitizeTerminalText(b.Path)
 	}
 
 	header := headerStyle.Render("app-listener \u2014 Guard (eBPF LSM)")
 
 	info := infoStyle.Render(fmt.Sprintf(
 		"Guarding: %s  |  Mode: %s %s  |  Binaries: %s",
-		m.guardPath,
+		sanitizeTerminalText(m.guardPath),
 		guardModeStyle.Render(modeStr),
 		modeLabel,
 		guardBinaryStyle.Render(strings.Join(binaryNames, ", ")),
@@ -234,7 +234,7 @@ func (m *guardModel) View() string {
 
 	footer := footerStyle.Render("Press q or ctrl+c to exit")
 
-	return appStyle.Render(lipgloss.JoinVertical(
+	return clipToWidth(appStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
 		header,
 		"",
@@ -244,7 +244,7 @@ func (m *guardModel) View() string {
 		resLine,
 		"",
 		footer,
-	))
+	)), m.width)
 }
 
 func (m *guardModel) renderGuardResourceBar() string {

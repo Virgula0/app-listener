@@ -88,6 +88,20 @@ eBPF programs, compiled and embedded in the binary, attach at three levels:
 
 ## Modes
 
+### Browser TUI
+
+`monitor`, `guard`, `network-monitor`, `network-guard`, and `daemon` can mirror their TUI into a browser. With `--serve` the normal local TUI keeps running on the terminal **and** the same event stream is shared, read-only, over WebSockets; quitting the local TUI (`q`, `ctrl+c` or SIGINT/SIGTERM) also stops the browser endpoint. A served TUI accepts one browser viewer at a time so browser dimensions map deterministically to its Bubble Tea viewport — the terminal and the browser size independently.
+
+```bash
+sudo ./build/linux/app-listener monitor -w /tmp --serve
+sudo ./build/linux/app-listener guard /secret --serve=192.168.1.10:8080
+sudo ./build/linux/app-listener daemon --serve --user admin --password secret
+```
+
+`--serve` binds to `127.0.0.1:9999`; use `--serve=host:port` to choose another address. `--user` and `--password` must be supplied together and protect both the page and WebSocket with HTTP Basic Auth. They cannot be used without `--serve`. Serving is mutually exclusive with `--headless` and `--gui`, and requires an interactive terminal (systemd-style services should stay on `--headless`).
+
+The built-in server does not provide TLS. When binding outside loopback, place it behind a TLS reverse proxy because TUI data and Basic Auth credentials otherwise cross the network unencrypted.
+
 ### monitor — observe
 
 Traces file operations under watched paths; nothing is blocked. In addition to data I/O (`OPEN/READ/WRITE/MMAP`) and tree changes it observes **metadata operations**: `ATTR` (chmod/chown/utimes/truncate/setxattr), `STAT` (stat/access/readlink) and `MKNOD` — the same path-based operations the guard denies.
@@ -103,6 +117,9 @@ sudo ./build/linux/app-listener monitor -w /path/to/file.txt
 | `-r, --recursive` | `false` | Recurse into subdirectories |
 | `-d, --depth <n>` | `0` | Max depth (needs `--recursive`; `0` = unlimited) |
 | `-e, --events <list>` | all | `OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD` |
+| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
+| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
+| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
 | `--headless` | `false` | No TUI; log to stderr |
 
 ### guard — block file access
@@ -123,6 +140,9 @@ sudo ./build/linux/app-listener guard /secret -b /usr/bin/rm  # block only rm
 | `-r, --recursive` | `true` | Recurse into subdirectories |
 | `-d, --depth <n>` | `0` | Max depth (`0` = unlimited) |
 | `-e, --events <list>` | all | Event type filter (`OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD`) |
+| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
+| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
+| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
 | `--headless` | `false` | No TUI; log `GUARD\|` events to stderr |
 
 **Exec-open attribution (whitelist mode)**: executing a binary is an OPEN performed by the *launcher* — a shell wrapper runs through its interpreter, which the whitelist deliberately excludes. Opens are attributed to the **binary being executed** instead, so whitelisted binaries *inside* the guarded tree (e.g. Discord under `~/.config/discord`) work from any shell or wrapper, and their in-tree helpers resolve under the same attribution. The exec fd is never exposed to the launcher, so this grants no way to read guarded content; separate helper binaries an app spawns must be whitelisted explicitly. Blacklist mode always attributes to the launcher.
@@ -140,6 +160,9 @@ sudo ./build/linux/app-listener network-monitor /usr/bin/tcpdump --headless
 |------|---------|-------------|
 | `<binary>` | required | Binaries to watch (positional, repeatable) |
 | `-e, --events <list>` | all | `CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS` |
+| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
+| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
+| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
 | `--headless` | `false` | No TUI; log `NETEVENT\|` events to stderr |
 
 | Event | Meaning | Hook |
@@ -167,6 +190,9 @@ sudo ./build/linux/app-listener network-guard -w /usr/bin/vim --auto-infra   # o
 | `--unsafe` | `false` | Also block AF_UNIX (X11, D-Bus, systemd) — may break the desktop |
 | `--no-throttle` | `false` | Disable rate limiting (1 event/type/process per 250 ms default) |
 | `-e, --events <list>` | all | `CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN` |
+| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
+| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
+| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
 | `--headless` | `false` | No TUI; log `NETGUARD\|` events to stderr |
 
 **Pick the real executable, not a wrapper**: identity is the exe inode, so whitelisting a `#!/bin/sh` wrapper (many distros ship `/usr/bin/firefox` as one) matches nothing. Resolve first:
@@ -190,6 +216,9 @@ sudo ./build/linux/app-listener daemon --config /etc/ssh-guard/config --headless
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config <path>` | — | Config resolution: flag → `/etc/app-listener/daemon.conf` → `daemon-samples/daemon.conf` |
+| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
+| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
+| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
 | `--headless` | `false` | Log `DAEMON [DENIED]\|` to stderr (journald when a systemd service) |
 | `--blocked-only` | `false` | Print only denied attempts (presentational) |
 | `--genkey` | `false` | Generate `/etc/app-listener/fscrypt.key` and exit; regeneration asks for confirmation (it invalidates every encrypted directory) |

@@ -80,6 +80,7 @@ keeps the previous one running.`,
 }
 
 func init() {
+	common.AddServeFlags(DaemonCmd)
 	DaemonCmd.Flags().StringVarP(&configFlag, "config", "", "",
 		"Path to the daemon config file (default: /etc/app-listener/daemon.conf, then daemon-samples/daemon.conf)")
 	DaemonCmd.Flags().BoolVarP(&headless, "headless", "", false,
@@ -91,41 +92,30 @@ func init() {
 }
 
 func runDaemon(cmd *cobra.Command, args []string) error {
+	serve, err := common.ParseServeFlags(cmd)
+	if err != nil {
+		return err
+	}
 	if genKeyFlag {
 		return runGenKey()
 	}
 
 	printers.PrintLogo()
+	configureDaemonLogging()
 
-	// Daemon logs land in journald; keep them plain (no ANSI colors).
-	log.SetFormatter(&log.TextFormatter{
-		FullTimestamp:          true,
-		TimestampFormat:        "2006-01-02 15:04:05",
-		DisableLevelTruncation: true,
-		PadLevelText:           true,
-	})
-	log.SetOutput(os.Stderr)
-
-	if err := common.CheckEBPF(); err != nil {
-		return err
+	if ebpfErr := common.CheckEBPF(); ebpfErr != nil {
+		return ebpfErr
 	}
 
 	// The daemon wraps fs guards (and the LSM network guard), which enforce
 	// through BPF LSM hooks: refuse to start without an active bpf LSM.
-	if err := common.CheckBPFLSM(); err != nil {
-		return err
+	if lsmErr := common.CheckBPFLSM(); lsmErr != nil {
+		return lsmErr
 	}
 
-	configPath, err := resolveConfigPath()
+	configPath, cfg, err := loadDaemonConfig()
 	if err != nil {
 		return err
-	}
-	cfg, err := daemonconfig.Load(configPath)
-	if err != nil {
-		return fmt.Errorf("loading config %s: %w", configPath, err)
-	}
-	if len(cfg.Resources) == 0 {
-		return fmt.Errorf("config %s contains no [watch] sections", configPath)
 	}
 	log.Infof("daemon starting \u2014 config: %s, resources: %d", configPath, len(cfg.Resources))
 
@@ -161,8 +151,39 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		runHeadless(d, reload)
 		return nil
 	}
+	if serve.Enabled {
+		return runServedTUI(d, cfg, reload, serve)
+	}
 
 	return runTUI(d, cfg, reload)
+}
+
+// configureDaemonLogging keeps daemon log lines plain (no ANSI colors) so
+// journald renders them cleanly.
+func configureDaemonLogging() {
+	log.SetFormatter(&log.TextFormatter{
+		FullTimestamp:          true,
+		TimestampFormat:        "2006-01-02 15:04:05",
+		DisableLevelTruncation: true,
+		PadLevelText:           true,
+	})
+	log.SetOutput(os.Stderr)
+}
+
+// loadDaemonConfig resolves, loads and sanity-checks the daemon configuration.
+func loadDaemonConfig() (string, *daemonconfig.Config, error) {
+	configPath, err := resolveConfigPath()
+	if err != nil {
+		return "", nil, err
+	}
+	cfg, err := daemonconfig.Load(configPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("loading config %s: %w", configPath, err)
+	}
+	if len(cfg.Resources) == 0 {
+		return "", nil, fmt.Errorf("config %s contains no [watch] sections", configPath)
+	}
+	return configPath, cfg, nil
 }
 
 // makeReloadHandler returns the SIGHUP handler: re-parse the config file,
@@ -373,18 +394,7 @@ func runHeadless(d usecase.DaemonUseCase, reload func()) {
 }
 
 func runTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func()) error {
-	resources := make([]tui.DaemonResourceInfo, 0, len(cfg.Resources))
-	for _, r := range cfg.Resources {
-		resources = append(resources, tui.DaemonResourceInfo{
-			Path:           r.Path,
-			NeedEncryption: r.NeedEncryption,
-			Binaries:       len(r.Binaries),
-		})
-	}
-	p := tea.NewProgram(
-		tui.NewDaemonModel(d.Events(), resources),
-		tea.WithAltScreen(),
-	)
+	p := tea.NewProgram(newDaemonModel(d.Events(), cfg), tea.WithAltScreen())
 
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
@@ -411,4 +421,33 @@ func runTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func()) er
 	close(quit)
 	signal.Stop(sig)
 	return runErr
+}
+
+func runServedTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func(), serve common.ServeConfig) error {
+	// Two independent daemon models: one renders on the local terminal, one
+	// is mirrored to the browser. Both consume their own fanout stream so
+	// events, counters and dimensions never interfere.
+	fan := tui.NewEventFanout(d.Events())
+	defer fan.Stop()
+	return tui.Serve(
+		newDaemonModel(fan.Local(), cfg),
+		newDaemonModel(fan.Browser(), cfg),
+		tui.ServeOptions{
+			Address:  serve.Address,
+			Username: serve.Username,
+			Password: serve.Password,
+			Reload:   reload,
+		})
+}
+
+func newDaemonModel(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config) tea.Model {
+	resources := make([]tui.DaemonResourceInfo, 0, len(cfg.Resources))
+	for _, r := range cfg.Resources {
+		resources = append(resources, tui.DaemonResourceInfo{
+			Path:           r.Path,
+			NeedEncryption: r.NeedEncryption,
+			Binaries:       len(r.Binaries),
+		})
+	}
+	return tui.NewDaemonModel(events, resources)
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -390,18 +391,20 @@ func (g *NetGuard) readEvent(rd *ringbuf.Reader) (*NetGuardEvent, bool) {
 
 	ev := NetGuardEvent{
 		NetEvent: ebpf.NetEvent{
-			PID:       be.PID,
-			TID:       be.TID,
-			UID:       be.UID,
-			GID:       be.GID,
-			Type:      ebpf.NetEventType(be.Type),
-			Protocol:  be.Proto,
-			Size:      be.Size,
-			FD:        be.FD,
-			Comm:      ebpf.Cstr(be.Comm[:]),
-			NetNS:     be.NetNS,
-			CgroupID:  be.CgroupID,
-			Timestamp: 0,
+			PID:      be.PID,
+			TID:      be.TID,
+			UID:      be.UID,
+			GID:      be.GID,
+			Type:     ebpf.NetEventType(be.Type),
+			Protocol: be.Proto,
+			Size:     be.Size,
+			FD:       be.FD,
+			Comm:     ebpf.Cstr(be.Comm[:]),
+			NetNS:    be.NetNS,
+			CgroupID: be.CgroupID,
+			// Stamp once at ingestion: dual TUI consumers (local and
+			// browser) must display the same time for the same event.
+			Timestamp: time.Now().UnixNano(),
 		},
 		Blocked: be.Blocked != 0,
 	}

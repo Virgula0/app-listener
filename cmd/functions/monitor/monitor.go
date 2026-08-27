@@ -14,6 +14,7 @@ import (
 	"github.com/Virgula0/app-listener/cmd/common"
 	"github.com/Virgula0/app-listener/cmd/printers"
 	"github.com/Virgula0/app-listener/internal/gui"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/monitor"
 	"github.com/Virgula0/app-listener/internal/tui"
 	"github.com/Virgula0/app-listener/internal/usecase"
@@ -48,6 +49,7 @@ Examples:
 }
 
 func init() {
+	common.AddServeFlags(MonitorCmd)
 	MonitorCmd.Flags().StringSliceVarP(&watchPaths, "watch", "w", nil,
 		"Path to monitor (repeatable, required)")
 	MonitorCmd.Flags().BoolVarP(&recursive, "recursive", "r", false,
@@ -61,29 +63,19 @@ func init() {
 }
 
 func runMonitor(cmd *cobra.Command, args []string) error {
-	if len(watchPaths) == 0 {
-		return errors.New("at least one -w/--watch path is required")
-	}
-
-	if depth > 0 && !recursive {
-		return errors.New("--depth requires --recursive flag")
-	}
-
-	rawTargets, targetErr := common.ResolveTargets(watchPaths)
-	if targetErr != nil {
-		return targetErr
-	}
-
-	if err := common.ValidateTargets(rawTargets); err != nil {
+	serve, err := common.ParseServeFlags(cmd)
+	if err != nil {
 		return err
 	}
 
-	ebpfTargets := common.BuildEBPFTargets(rawTargets)
-	common.WarnIgnoredFlags(rawTargets, recursive, depth)
+	rawTargets, ebpfTargets, err := prepareMonitorTargets()
+	if err != nil {
+		return err
+	}
 
-	parsedEvents, eventsErr := common.ParseEventsFlag(eventsFlag)
-	if eventsErr != nil {
-		return eventsErr
+	parsedEvents, err := common.ParseEventsFlag(eventsFlag)
+	if err != nil {
+		return err
 	}
 
 	printers.PrintLogo()
@@ -116,11 +108,44 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 		runHeadless(ucase)
 	case launchGUI:
 		gui.Run(ucase.Events(), displayPaths, recursive, depth)
+	case serve.Enabled:
+		fan := tui.NewEventFanout(ucase.Events())
+		defer fan.Stop()
+		return tui.Serve(
+			tui.NewModel(fan.Local(), displayPaths, recursive, depth),
+			tui.NewModel(fan.Browser(), displayPaths, recursive, depth),
+			tui.ServeOptions{
+				Address: serve.Address, Username: serve.Username, Password: serve.Password,
+			})
 	default:
 		return runTUI(ucase, displayPaths, recursive, depth)
 	}
 
 	return nil
+}
+
+// prepareMonitorTargets validates and resolves the --watch paths into eBPF
+// targets, warning about flags that single files silently ignore.
+func prepareMonitorTargets() ([]common.RawTarget, []ebpf.Target, error) {
+	if len(watchPaths) == 0 {
+		return nil, nil, errors.New("at least one -w/--watch path is required")
+	}
+
+	if depth > 0 && !recursive {
+		return nil, nil, errors.New("--depth requires --recursive flag")
+	}
+
+	rawTargets, err := common.ResolveTargets(watchPaths)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := common.ValidateTargets(rawTargets); err != nil {
+		return nil, nil, err
+	}
+
+	common.WarnIgnoredFlags(rawTargets, recursive, depth)
+	return rawTargets, common.BuildEBPFTargets(rawTargets), nil
 }
 
 func runHeadless(uc usecase.MonitorUseCase) {
