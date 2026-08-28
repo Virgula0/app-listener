@@ -17,6 +17,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
+	tcexec "github.com/testcontainers/testcontainers-go/exec"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
@@ -131,6 +132,11 @@ func (s *IntegrationSuite) SetupSuite() {
 	s.ctx = context.Background()
 }
 
+// TearDownSuite terminates the per-file pooled containers (see pool_test.go).
+func (s *IntegrationSuite) TearDownSuite() {
+	s.teardownPools()
+}
+
 func (s *IntegrationSuite) startContainer(
 	image string,
 	platform string,
@@ -164,6 +170,12 @@ func (s *IntegrationSuite) startContainer(
 		req.HostConfigModifier = func(hc *container.HostConfig) {
 			hc.Privileged = true
 			hc.CapAdd = []string{"BPF", "SYS_ADMIN"}
+			// docker-init (tini) reaps adopted orphans: backgrounded
+			// guards/monitors killed between pooled tests would otherwise
+			// stay as <defunct> children of the container init (a plain
+			// `sleep` never wait()s), breaking liveness checks.
+			init := true
+			hc.Init = &init
 		}
 		req.Mounts = testcontainers.ContainerMounts{
 			{
@@ -191,7 +203,12 @@ func (s *IntegrationSuite) startContainer(
 }
 
 func (s *IntegrationSuite) exec(c testcontainers.Container, cmd []string) (int, string) {
-	exitCode, reader, err := c.Exec(s.ctx, cmd)
+	// Multiplexed() demuxes docker's raw stdcopy stream into a memory
+	// buffer before Exec returns: without it the reader is the raw
+	// hijacked stream, whose frame headers leak into the captured text and
+	// which can deliver empty reads under load (the transport races the
+	// exec-inspect polling loop). The buffer makes output deterministic.
+	exitCode, reader, err := c.Exec(s.ctx, cmd, tcexec.Multiplexed())
 	s.Require().NoError(err, "exec: %v", cmd)
 
 	b, err := io.ReadAll(reader)
@@ -220,7 +237,7 @@ func absPath(p string) string {
 
 // readMonitorLog returns the raw content of the monitor log file.
 func (s *IntegrationSuite) readMonitorLog(c testcontainers.Container) string {
-	_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/monitor.log 2>/dev/null || true"})
+	_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat %s 2>/dev/null || true", monitorLogPath)})
 	return out
 }
 
@@ -293,6 +310,15 @@ func (s *IntegrationSuite) waitForEventType(c testcontainers.Container, oldLog s
 	}
 	newLog := s.readMonitorLog(c)
 	s.Require().Failf("timeout waiting for event",
-		"expected EVENT|%s within %v, got events: %v", expected, timeout, newEventTypes(oldLog, newLog))
+		"expected EVENT|%s within %v, got events: %v\nraw log tail:\n%s", expected, timeout, newEventTypes(oldLog, newLog), tailLast(newLog, 20))
 	return newLog
+}
+
+// tailLast returns the last n lines of s for failure diagnostics.
+func tailLast(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }

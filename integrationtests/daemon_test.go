@@ -94,7 +94,16 @@ func (s *IntegrationSuite) startDaemon(c testcontainers.Container, config string
 	if !ready {
 		s.Require().Failf("daemon did not attach its guards", "pid file missing after 20s, daemon log:\n%s", log)
 	}
-	time.Sleep(1 * time.Second)
+	// Guards are attached and readers running before the pid file appears;
+	// poll for the guard-started marker instead of a fixed settle sleep.
+	deadline2 := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline2) {
+		if strings.Contains(log, "guard started") || strings.Contains(s.readDaemonLog(c), "guard started") {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+		log = s.readDaemonLog(c)
+	}
 }
 
 func (s *IntegrationSuite) readDaemonLog(c testcontainers.Container) string {
