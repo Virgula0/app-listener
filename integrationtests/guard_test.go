@@ -2,6 +2,7 @@ package integrationtests
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,6 +25,11 @@ type guardEvent struct {
 	Blocked bool
 	UID     int
 }
+
+// Guard-process state for the pooled container: one guard at a time, with a
+// per-start log file so line-delta assertions never see a previous test's
+// events. stopGuard kills the captured PID (pkill sweep as fallback) and
+// polls until it is gone.
 
 func parseGuardEvents(logContent string) []guardEvent {
 	var events []guardEvent
@@ -77,43 +83,86 @@ func guardEventTypes(events []guardEvent) []string {
 	return types
 }
 
+// Guard-process state for the pooled container: one guard at a time, with a
+// per-start log file so line-delta assertions never see a previous test's
+// events. stopGuard kills the captured PID (pkill sweep as fallback) and
+// polls until it is gone.
+var (
+	guardPID     int
+	guardLogPath string
+)
+
 func (s *IntegrationSuite) startGuardStd(c testcontainers.Container, guardPath string, extraFlags ...string) {
 	flags := strings.Join(extraFlags, " ")
-	cmd := fmt.Sprintf("nohup /app-listener guard %s --headless %s > /tmp/guard.log 2>&1 &", guardPath, flags)
-	code, out := s.exec(c, []string{"sh", "-c", cmd})
-	s.Require().Equalf(0, code, "starting guard: %s", out)
+	guardLogPath = fmt.Sprintf("/tmp/guard-%d.log", time.Now().UnixNano())
+	cmd := fmt.Sprintf("nohup /app-listener guard %s --headless %s > %s 2>&1 &", guardPath, flags, guardLogPath)
+	guardPID = s.capturePID(c, cmd)
 
-	_, ok := s.waitForGuardStd(c, "guard started", 10*time.Second)
-	s.Require().True(ok, "guard should become ready")
+	logContent, ok := s.waitForGuardStd(c, "guard started", 10*time.Second)
+	if !ok {
+		// Transient host-level flake: docker exec can fail at the runc
+		// layer ("setns process: exit status 1") on hardened kernels after
+		// heavy container churn. The guard never ran — retry once.
+		if strings.Contains(logContent, "OCI runtime exec failed") {
+			guardPID = s.capturePID(c, cmd)
+			logContent, ok = s.waitForGuardStd(c, "guard started", 10*time.Second)
+		}
+	}
+	if !ok {
+		s.Require().Failf("guard should become ready", "guard log:\n%s", logContent)
+	}
 
-	// Verify the process is alive
-	codeCheck, outCheck := s.exec(c, []string{"pgrep", "-f", "app-listener"})
-	s.Require().Equalf(0, codeCheck, "guard process not running after start: %s", outCheck)
-
-	time.Sleep(2 * time.Second)
+	// Readiness = the polled log markers (hooks attached + readers started)
+	// plus the captured PID being alive. No fixed settle sleep: the markers
+	// are printed after the kernel attachments complete.
+	code, out := s.exec(c, []string{"sh", "-c",
+		fmt.Sprintf("kill -0 %d 2>/dev/null && echo alive || echo dead", guardPID)})
+	s.Require().Equalf(0, code, "guard process not running after start: %s", out)
 }
 
 func (s *IntegrationSuite) waitForGuardStd(c testcontainers.Container, needle string, timeout time.Duration) (string, bool) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/guard.log 2>/dev/null || true"})
+		_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat %s 2>/dev/null || true", guardLogPath)})
 		if strings.Contains(out, needle) {
 			return out, true
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
-	_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/guard.log 2>/dev/null || true"})
+	_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat %s 2>/dev/null || true", guardLogPath)})
 	return out, false
 }
 
 func (s *IntegrationSuite) readGuardLog(c testcontainers.Container) string {
-	_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/guard.log 2>/dev/null || true"})
+	_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat %s 2>/dev/null || true", guardLogPath)})
 	return out
 }
 
 func (s *IntegrationSuite) stopGuard(c testcontainers.Container) {
-	s.exec(c, []string{"pkill", "-f", "app-listener"})
-	time.Sleep(500 * time.Millisecond)
+	if guardPID != 0 {
+		s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null || true", guardPID)})
+		if !s.awaitGone(c, guardPID, 3*time.Second) {
+			// Fallback sweep, then keep polling.
+			s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener guard' || true"})
+			s.awaitGone(c, guardPID, 3*time.Second)
+		}
+		guardPID = 0
+	} else {
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener' || true"})
+	}
+	// Invariant for the pooled container: no LIVE stray app-listener process
+	// may survive into the next test (zombies reaped by docker-init are
+	// harmless — see noLiveAppListenerProcs).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		code, _ := s.exec(c, []string{"sh", "-c", noLiveAppListenerProcs})
+		if code == 0 {
+			return
+		}
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener' || true"})
+		time.Sleep(200 * time.Millisecond)
+	}
+	s.Require().Fail("guard cleanup", "stray app-listener processes survived stopGuard")
 }
 
 func (s *IntegrationSuite) requireBlockedEvent(events []guardEvent, expectedType string, comms ...string) {
@@ -157,8 +206,8 @@ func (s *IntegrationSuite) requireNoBlockedEvent(events []guardEvent, unexpected
 // guard decision must be confined to its own watch root: a matching inode
 // only counts when the file's dentry chain contains the root inode.
 func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"mkdir", "-p", "/outside"})
@@ -207,8 +256,8 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree() {
 // denying the unguarded file.  Every direct map-hit check must therefore
 // reach the root node (or the filesystem root) before the bound is spent.
 func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree_Deep() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"mkdir", "-p", "/outside"})
@@ -263,8 +312,8 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree_Deep() {
 // exhausted loop used to fail closed and deny the unguarded op; the post-loop
 // fs-root probe must resolve the exact-bound chain and allow it.
 func (s *IntegrationSuite) TestGuard_InodeReuse_StaleDir_DeepDestRename() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"mkdir", "-p", "/watch/gone"})
@@ -314,8 +363,8 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleDir_DeepDestRename() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_BlocksAll_Directory() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	// Pre-create files so their inodes are in the guard map
@@ -369,8 +418,8 @@ func (s *IntegrationSuite) TestGuard_BlocksAll_Directory() {
 }
 
 func (s *IntegrationSuite) TestGuard_BlocksAll_File() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	// Pre-create the guarded file
@@ -420,8 +469,8 @@ func (s *IntegrationSuite) TestGuard_BlocksAll_File() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Whitelist_Binary() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'whitelist test' > /watch/data.txt"})
@@ -452,8 +501,8 @@ func (s *IntegrationSuite) TestGuard_Whitelist_Binary() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_NoFlags_Whitelist() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'lockdown' > /watch/data.txt"})
@@ -484,8 +533,8 @@ func (s *IntegrationSuite) TestGuard_NoFlags_Whitelist() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Blacklist_Binary() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'blacklist test' > /watch/data.txt"})
@@ -512,8 +561,8 @@ func (s *IntegrationSuite) TestGuard_Blacklist_Binary() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Whitelist_Binary_File() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'file whitelist' > /watch/target.txt"})
@@ -537,8 +586,8 @@ func (s *IntegrationSuite) TestGuard_Whitelist_Binary_File() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Blacklist_Binary_File() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'file blacklist' > /watch/target.txt"})
@@ -564,8 +613,8 @@ func (s *IntegrationSuite) TestGuard_Blacklist_Binary_File() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_BlocksNewFiles() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	// Pre-create a subdirectory so its inode is in the guard map
@@ -597,8 +646,8 @@ func (s *IntegrationSuite) TestGuard_BlocksNewFiles() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Blacklist_Events() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'events test' > /watch/data.txt"})
@@ -640,8 +689,8 @@ func (s *IntegrationSuite) TestGuard_Blacklist_Events() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Whitelist_Events() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'events whitelist' > /watch/data.txt"})
@@ -706,8 +755,8 @@ var guardExploitTests = []guardExploitTest{
 }
 
 func (s *IntegrationSuite) TestGuard_Exploits() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"mkdir", "-p", "/exploits"})
@@ -778,8 +827,8 @@ func (s *IntegrationSuite) checkKernelSupport(c testcontainers.Container) bool {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_NonRecursive() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	// Set up a 3-level hierarchy:
 	//   /watch/
@@ -828,8 +877,8 @@ func (s *IntegrationSuite) TestGuard_NonRecursive() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_DepthLimit() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	// Set up a 4-level hierarchy:
 	//   /watch/                   (level 0)
@@ -874,8 +923,8 @@ func (s *IntegrationSuite) TestGuard_DepthLimit() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Whitelist_Recursive() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch/subdir"})
 	s.exec(c, []string{"sh", "-c", "echo 'recursive whitelist' > /watch/target.txt"})
@@ -906,8 +955,8 @@ func (s *IntegrationSuite) TestGuard_Whitelist_Recursive() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Blacklist_Depth() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	// Hierarchy:
 	//   /watch/
@@ -962,8 +1011,8 @@ func (s *IntegrationSuite) TestGuard_Blacklist_Depth() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Bypass_ForkExecFD() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	s.exec(c, []string{"sh", "-c", "echo 'fork+exec bypass target' > /watch/target.txt"})
@@ -994,8 +1043,8 @@ func (s *IntegrationSuite) TestGuard_Bypass_ForkExecFD() {
 // symlinked binary is recognized as the same executable and blocked.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_Bypass_SymlinkBinary() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'secret' > /watch/target.txt"})
@@ -1022,8 +1071,8 @@ func (s *IntegrationSuite) TestGuard_Bypass_SymlinkBinary() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Bypass_SCMRights() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	s.exec(c, []string{"sh", "-c", "echo 'SCM_RIGHTS bypass target' > /watch/target.txt"})
@@ -1052,8 +1101,8 @@ func (s *IntegrationSuite) TestGuard_Bypass_SCMRights() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	s.exec(c, []string{"sh", "-c", "echo 'handle bypass target' > /watch/target.txt"})
@@ -1093,8 +1142,8 @@ func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Bypass_Mount() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits", "/tmp/evildir"})
 
@@ -1145,8 +1194,8 @@ func (s *IntegrationSuite) TestGuard_Bypass_Mount() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	// Must exist before the guard starts: files created afterwards are
@@ -1167,6 +1216,143 @@ func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv() {
 			"kill $pid 2>/dev/null; exit $code"})
 	s.Require().NotEqualf(0, code,
 		"process_vm_readv on a whitelisted victim should be blocked: %s", out)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: ptrace pre-taint race
+//
+// The guard denies ptrace/process_vm_readv against a TAINTED pid, but the
+// taint is only stamped when the process performs its first ALLOWED guarded
+// access, and ptrace_access_check runs only at ATTACH time. A tracer that
+// attaches BEFORE the victim ever touches the guarded tree is never
+// re-checked, so it can PTRACE_PEEKDATA the guarded content straight out of
+// the victim's heap afterwards.
+//
+// ptrace_race ships one binary in two modes; two copies with different
+// inodes separate the identities:
+//   - /exploits/race_victim is whitelisted (-w): on a go signal it reads
+//     the guarded file into a heap buffer and publishes the buffer address.
+//   - /exploits/race_tracer (plain copy, NOT whitelisted) forks the victim
+//     (ancestor tracing keeps yama ptrace_scope=1 out of the way), attaches
+//     before the first guarded access, triggers the read, then dumps the
+//     buffer with PTRACE_PEEKDATA.
+//
+// Before the fix: the attach is allowed (victim not yet tainted) and the
+//   dump succeeds (SECRET_DUMP|SUCCESS, exit 0).
+// After the fix: ptrace_access_check also protects processes whose exe is
+//   whitelisted, so the attach itself is denied (exit 3) and no dump occurs.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_PtraceRace() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/protected", "/exploits"})
+	// Must exist before the guard starts: files created afterwards are
+	// not in the BPF inode map and would not be protected.
+	s.exec(c, []string{"sh", "-c", "echo 'TOP-SECRET-CONTENT' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+
+	victimHostPath := absPath("./exploits/ptrace_race")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, victimHostPath, "/exploits/race_victim", 0755), "copy race_victim")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, victimHostPath, "/exploits/race_tracer", 0755), "copy race_tracer")
+
+	// Only the victim copy is whitelisted; the tracer copy keeps a distinct
+	// inode and must never gain allow rights.
+	s.startGuardStd(c, "/protected", "-w", "/exploits/race_victim")
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"rm -f /tmp/race_addr* /tmp/race_go /tmp/race_done; " +
+			"timeout 60 /exploits/race_tracer tracer /exploits/race_victim " +
+			"/protected/secret /tmp/race_addr /tmp/race_go /tmp/race_done"})
+	s.T().Logf("tracer exit=%d out=%q", code, out)
+
+	s.Require().NotEqualf(0, code, "ptrace race against a whitelisted victim must be blocked")
+	s.Require().NotContains(out, "SECRET_DUMP|SUCCESS",
+		"tracer exfiltrated guarded content from the victim heap: %s", out)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: in-place whitelisted binary replacement
+//
+// The whitelist is keyed by exe inode; the SHA-256 computed at admission is
+// never enforced. An attacker who can write to a whitelisted binary OUTSIDE
+// the guarded tree overwrites it in place (same inode, new content — e.g.
+// `cat payload > /tmp/app`), and the malicious payload inherits the
+// whitelist entry: it execs and reads the guarded tree.
+//
+// swap_benign is the whitelisted placeholder; swap_reader is the payload.
+//
+// Before the fix: the replaced binary executes and reads the secret
+//   (STOLEN|TOP-SECRET-...).
+// After the fix: the guard pins each admitted binary's hash and re-verifies
+//   it periodically; a same-inode hash change demotes the map entry to
+//   BLOCK, so the payload exec is denied (eventually — within the verify
+//   interval — and never again afterwards).
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_InPlaceBinarySwap() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/protected", "/exploits"})
+	s.exec(c, []string{"sh", "-c",
+		"echo 'TOP-SECRET-CONTENT' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/swap_benign"), "/exploits/swap_benign", 0755), "copy swap_benign")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/swap_reader"), "/exploits/swap_reader", 0755), "copy swap_reader")
+
+	s.exec(c, []string{"sh", "-c", "cp /exploits/swap_benign /tmp/app && chmod 755 /tmp/app"})
+	s.startGuardStd(c, "/protected", "-w", "/tmp/app")
+
+	// Baseline: the admitted benign binary runs.
+	code, out := s.exec(c, []string{"/tmp/app"})
+	s.Require().Equalf(0, code, "baseline whitelisted binary should run: %s", out)
+	s.Require().Contains(out, "BENIGN-APP-OK")
+
+	// Attack: overwrite in place; the inode must survive (that is the
+	// bypass premise — a fresh inode is a different story and re-syncs).
+	_, inodeOut := s.exec(c, []string{"sh", "-c",
+		"i1=$(stat -c %i /tmp/app); cat /exploits/swap_reader > /tmp/app; chmod 755 /tmp/app; i2=$(stat -c %i /tmp/app); echo $i1 $i2"})
+	// Docker exec multiplexes stdout/stderr with 8-byte frame headers that
+	// can leak into captured output under load, so extract the two inode
+	// numbers with a digit pattern instead of comparing raw fields.
+	inodeRe := regexp.MustCompile(`(\d+)[^0-9]+(\d+)`)
+	m := inodeRe.FindStringSubmatch(inodeOut)
+	s.Require().NotNil(m, "inode probe output: %q", inodeOut)
+	s.Require().Equalf(m[1], m[2], "replacement must be same-inode for this vector (before=%s after=%s)", m[1], m[2])
+	s.T().Logf("in-place swap kept inode %s", m[1])
+
+	// The payload must EVENTUALLY be denied: detection is periodic (the
+	// guard re-verifies pinned hashes every 10s), so execs during the first
+	// interval may still succeed — the invariant is that the entry gets
+	// demoted and never admits the payload again. Red on vulnerable
+	// builds: the payload keeps succeeding forever.
+	denied := false
+	var lastOut string
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		code, out = s.exec(c, []string{"sh", "-c", "timeout 10 /tmp/app /protected/secret 2>&1"})
+		lastOut = out
+		if code != 0 {
+			denied = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	s.Require().Truef(denied, "replaced binary was never denied within the verify window, last output: %q", lastOut)
+
+	// Once demoted, the whitelist entry stays blocked.
+	time.Sleep(2 * time.Second)
+	code, out = s.exec(c, []string{"sh", "-c", "timeout 10 /tmp/app /protected/secret 2>&1"})
+	s.Require().NotEqualf(0, code, "demoted whitelist entry must stay blocked: %s", out)
+	s.Require().NotContains(out, "STOLEN|")
+
+	log := s.readGuardLog(c)
+	s.Require().Contains(log, "modified in place", "guard must log the in-place tampering detection")
 
 	s.stopGuard(c)
 }
@@ -1201,8 +1387,8 @@ func (s *IntegrationSuite) TestGuard_Bypass_RawBlockDevice() {
 // blocked by exe-inode identity.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"touch", "/watch/pre_existing.txt"})
@@ -1245,8 +1431,8 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
 // are NOT blocked even for blacklisted binaries.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_RuntimeNewDir_NonRecursive() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"touch", "/watch/top.txt"})
@@ -1276,6 +1462,138 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir_NonRecursive() {
 }
 
 // ---------------------------------------------------------------
+// Exec-open attribution (whitelist mode) — regression coverage for
+// the "spoofed comm" / launcher-attribution fix.
+//
+// A whitelisted binary living INSIDE the guarded tree (e.g. Electron's
+// versioned Discord binary under ~/.config/discord) is opened by the
+// *launcher* (/bin/sh through a wrapper), not by itself. Without
+// exec-open attribution every such launch is blocked even though the
+// target is whitelisted.
+//
+// The BPF program recognizes the exec chain by two discriminators:
+//   - the target's own open carries __FMODE_EXEC in file->f_flags
+//     (in_execve is set only afterwards, in bprm_execve);
+//   - the kernel's load-time accesses (prepare_binprm's kernel_read,
+//     binfmt mmap) happen while task->in_execve is set.
+//
+// Both are attributed by the *accessed file's* inode: the file itself
+// must be whitelisted to pass. Blacklist mode and non-whitelisted
+// in-tree targets keep caller attribution (see below).
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_ExecAttribution_Whitelist() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/watch/bin"})
+	// app: a whitelisted executable inside the guarded tree.
+	s.exec(c, []string{"sh", "-c", "cp /bin/true /watch/bin/app && chmod +x /watch/bin/app"})
+	// other: an executable inside the guarded tree that is NOT whitelisted.
+	s.exec(c, []string{"sh", "-c", "cp /bin/false /watch/bin/other && chmod +x /watch/bin/other"})
+
+	// Whitelist mode: only /watch/bin/app may access the guarded tree.
+	s.startGuardStd(c, "/watch", "-w", "/watch/bin/app")
+	logBefore := s.readGuardLog(c)
+
+	// 1. Executing the whitelisted in-tree binary from a non-whitelisted
+	//    launcher (sh) must succeed: the exec open is attributed to the
+	//    target binary, whose inode is whitelisted.
+	code, out := s.exec(c, []string{"sh", "-c", "/watch/bin/app"})
+	s.Require().Equalf(0, code, "exec of whitelisted in-tree binary should succeed: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	// The whole exec chain — OPEN (__FMODE_EXEC), the kernel's load-time
+	// READs, and the binfmt MMAPs (in_execve) — must be allowed: no event
+	// for the exec file may be blocked. At least one OPEN documents that
+	// the launcher-attribution branch actually fired.
+	appEvents := eventsForPath(deltaEvents, "/watch/bin/app")
+	s.Require().NotEmpty(appEvents, "expected guard events for the exec of /watch/bin/app, got: %v", deltaEvents)
+	openCount := 0
+	for _, e := range appEvents {
+		if e.Type == "OPEN" {
+			openCount++
+		}
+		s.Require().Falsef(e.Blocked, "exec chain of whitelisted in-tree binary must not be blocked: %s|%s", e.Type, e.Comm)
+	}
+	s.Require().GreaterOrEqualf(openCount, 1, "expected an exec OPEN event for /watch/bin/app, got: %v", appEvents)
+
+	// 2. Executing a NON-whitelisted binary inside the guarded tree must
+	//    still be blocked at its exec open (target not whitelisted).
+	code, out = s.exec(c, []string{"sh", "-c", "/watch/bin/other"})
+	s.Require().NotEqualf(0, code, "exec of non-whitelisted in-tree binary should be blocked: %s", out)
+
+	logAfter2 := s.readGuardLog(c)
+	deltaEvents2 := guardDeltaEvents(logAfter, logAfter2)
+	blockedOther := eventsForPath(deltaEvents2, "/watch/bin/other")
+	s.Require().NotEmpty(blockedOther, "expected guard events for the blocked exec of /watch/bin/other, got: %v", deltaEvents2)
+	for _, e := range blockedOther {
+		s.Require().Truef(e.Blocked, "exec open of non-whitelisted in-tree binary must be blocked: %s|%s", e.Type, e.Comm)
+	}
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Exec attribution (blacklist mode) — opposite side of the same fix.
+//
+// Blacklist mode deliberately keeps caller attribution: the exec open
+// and the load-time reads of a blacklisted in-tree binary are allowed
+// (they happen under the launcher's identity), but as soon as the exec
+// assigns the new binary its identity (comm switched, mm->exe_file
+// replaced) its very first own access — the load mmap — is attributed
+// to the blacklisted exe inode and blocked. The binary cannot even
+// start, so it certainly cannot read the guarded file. This documents
+// that the exec-open attribution never leaks into blacklist mode.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestGuard_ExecAttribution_Blacklist() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/watch/bin"})
+	// mycat: a blacklisted executable inside the guarded tree.
+	s.exec(c, []string{"sh", "-c", "cp /bin/cat /watch/bin/mycat && chmod +x /watch/bin/mycat"})
+	s.exec(c, []string{"sh", "-c", "echo 'secret' > /watch/secret.txt"})
+
+	s.startGuardStd(c, "/watch", "-b", "/watch/bin/mycat")
+	logBefore := s.readGuardLog(c)
+
+	// Executing the blacklisted in-tree binary must fail completely:
+	// identity switches to mycat during load and its own mmap is
+	// blocked, so it never even runs (and never reaches secret.txt).
+	code, out := s.exec(c, []string{"sh", "-c", "/watch/bin/mycat /watch/secret.txt"})
+	s.Require().NotEqualf(0, code, "blacklisted in-tree binary must be blocked: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+
+	execEvents := eventsForPath(deltaEvents, "/watch/bin/mycat")
+	s.Require().NotEmpty(execEvents, "expected guard events for the exec of /watch/bin/mycat, got: %v", deltaEvents)
+
+	// Launcher attribution: the exec open and the load-time reads pass
+	// under sh's identity (sh is not blacklisted)...
+	for _, e := range execEvents {
+		if e.Type == "OPEN" || e.Type == "READ" {
+			s.Require().Falsef(e.Blocked, "exec open/load reads in blacklist mode keep launcher attribution: %s|%s", e.Type, e.Comm)
+		}
+	}
+
+	// ...but the first access under the blacklisted identity (the load
+	// mmap, comm already switched to mycat) is blocked.
+	blockedAfterSwitch := false
+	for _, e := range execEvents {
+		if e.Blocked {
+			s.Require().Equalf("mycat", e.Comm, "post-exec access must be attributed to the blacklisted binary")
+			blockedAfterSwitch = true
+		}
+	}
+	s.Require().Truef(blockedAfterSwitch, "expected the blacklisted binary to be blocked at its own load, got: %v", execEvents)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
 // Test: the BPF ancestor walk protects files at any depth even when
 // their parent directory is NOT in guard_inodes.
 //
@@ -1292,8 +1610,8 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir_NonRecursive() {
 // the blocked events must be reported with the correct comm.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"touch", "/watch/top.txt"})
@@ -1394,8 +1712,8 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk() {
 // with the buggy empty gate cat at depth 20 must succeed.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk_Tmpfs() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	code, out := s.exec(c, []string{"mount", "-t", "tmpfs", "tmpfs", "/watch"})
@@ -1446,6 +1764,13 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk_Tmpfs() {
 	s.requireBlockedEvent(deltaEvents, "MKDIR", "mkdir")
 
 	s.stopGuard(c)
+
+	// Test hygiene: unmount the tmpfs. In the pooled container a leftover
+	// mount makes every later /watch file live on the tmpfs, whose root
+	// dentry terminates the guard's d_parent path walk at the mount
+	// boundary — the next tests would then report mount-relative paths
+	// (e.g. /bin/mycat instead of /watch/bin/mycat).
+	s.exec(c, []string{"umount", "/watch"})
 }
 
 // The rename succeeds (moving into guarded area is allowed), but
@@ -1453,8 +1778,8 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk_Tmpfs() {
 // inside become guarded.
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_RuntimeRenameDir() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"mkdir", "-p", "/outside"})
@@ -1495,146 +1820,14 @@ func eventsForPath(events []guardEvent, p string) []guardEvent {
 }
 
 // ---------------------------------------------------------------
-// Exec-open attribution (whitelist mode) — regression coverage for
-// the "spoofed comm" / launcher-attribution fix.
-//
-// A whitelisted binary living INSIDE the guarded tree (e.g. Electron's
-// versioned Discord binary under ~/.config/discord) is opened by the
-// *launcher* (/bin/sh through a wrapper), not by itself. Without
-// exec-open attribution every such launch is blocked even though the
-// target is whitelisted.
-//
-// The BPF program recognizes the exec chain by two discriminators:
-//   - the target's own open carries __FMODE_EXEC in file->f_flags
-//     (in_execve is set only afterwards, in bprm_execve);
-//   - the kernel's load-time accesses (prepare_binprm's kernel_read,
-//     binfmt mmap) happen while task->in_execve is set.
-//
-// Both are attributed by the *accessed file's* inode: the file itself
-// must be whitelisted to pass. Blacklist mode and non-whitelisted
-// in-tree targets keep caller attribution (see below).
-// ---------------------------------------------------------------
-func (s *IntegrationSuite) TestGuard_ExecAttribution_Whitelist() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch/bin"})
-	// app: a whitelisted executable inside the guarded tree.
-	s.exec(c, []string{"sh", "-c", "cp /bin/true /watch/bin/app && chmod +x /watch/bin/app"})
-	// other: an executable inside the guarded tree that is NOT whitelisted.
-	s.exec(c, []string{"sh", "-c", "cp /bin/false /watch/bin/other && chmod +x /watch/bin/other"})
-
-	// Whitelist mode: only /watch/bin/app may access the guarded tree.
-	s.startGuardStd(c, "/watch", "-w", "/watch/bin/app")
-	logBefore := s.readGuardLog(c)
-
-	// 1. Executing the whitelisted in-tree binary from a non-whitelisted
-	//    launcher (sh) must succeed: the exec open is attributed to the
-	//    target binary, whose inode is whitelisted.
-	code, out := s.exec(c, []string{"sh", "-c", "/watch/bin/app"})
-	s.Require().Equalf(0, code, "exec of whitelisted in-tree binary should succeed: %s", out)
-
-	logAfter := s.readGuardLog(c)
-	deltaEvents := guardDeltaEvents(logBefore, logAfter)
-
-	// The whole exec chain — OPEN (__FMODE_EXEC), the kernel's load-time
-	// READs, and the binfmt MMAPs (in_execve) — must be allowed: no event
-	// for the exec file may be blocked. At least one OPEN documents that
-	// the launcher-attribution branch actually fired.
-	appEvents := eventsForPath(deltaEvents, "/watch/bin/app")
-	s.Require().NotEmpty(appEvents, "expected guard events for the exec of /watch/bin/app, got: %v", deltaEvents)
-	openCount := 0
-	for _, e := range appEvents {
-		if e.Type == "OPEN" {
-			openCount++
-		}
-		s.Require().Falsef(e.Blocked, "exec chain of whitelisted in-tree binary must not be blocked: %s|%s", e.Type, e.Comm)
-	}
-	s.Require().GreaterOrEqualf(openCount, 1, "expected an exec OPEN event for /watch/bin/app, got: %v", appEvents)
-
-	// 2. Executing a NON-whitelisted binary inside the guarded tree must
-	//    still be blocked at its exec open (target not whitelisted).
-	code, out = s.exec(c, []string{"sh", "-c", "/watch/bin/other"})
-	s.Require().NotEqualf(0, code, "exec of non-whitelisted in-tree binary should be blocked: %s", out)
-
-	logAfter2 := s.readGuardLog(c)
-	deltaEvents2 := guardDeltaEvents(logAfter, logAfter2)
-	blockedOther := eventsForPath(deltaEvents2, "/watch/bin/other")
-	s.Require().NotEmpty(blockedOther, "expected guard events for the blocked exec of /watch/bin/other, got: %v", deltaEvents2)
-	for _, e := range blockedOther {
-		s.Require().Truef(e.Blocked, "exec open of non-whitelisted in-tree binary must be blocked: %s|%s", e.Type, e.Comm)
-	}
-
-	s.stopGuard(c)
-}
-
-// ---------------------------------------------------------------
-// Exec attribution (blacklist mode) — opposite side of the same fix.
-//
-// Blacklist mode deliberately keeps caller attribution: the exec open
-// and the load-time reads of a blacklisted in-tree binary are allowed
-// (they happen under the launcher's identity), but as soon as the exec
-// assigns the new binary its identity (comm switched, mm->exe_file
-// replaced) its very first own access — the load mmap — is attributed
-// to the blacklisted exe inode and blocked. The binary cannot even
-// start, so it certainly cannot read the guarded file. This documents
-// that the exec-open attribution never leaks into blacklist mode.
-// ---------------------------------------------------------------
-func (s *IntegrationSuite) TestGuard_ExecAttribution_Blacklist() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"mkdir", "-p", "/watch/bin"})
-	// mycat: a blacklisted executable inside the guarded tree.
-	s.exec(c, []string{"sh", "-c", "cp /bin/cat /watch/bin/mycat && chmod +x /watch/bin/mycat"})
-	s.exec(c, []string{"sh", "-c", "echo 'secret' > /watch/secret.txt"})
-
-	s.startGuardStd(c, "/watch", "-b", "/watch/bin/mycat")
-	logBefore := s.readGuardLog(c)
-
-	// Executing the blacklisted in-tree binary must fail completely:
-	// identity switches to mycat during load and its own mmap is
-	// blocked, so it never even runs (and never reaches secret.txt).
-	code, out := s.exec(c, []string{"sh", "-c", "/watch/bin/mycat /watch/secret.txt"})
-	s.Require().NotEqualf(0, code, "blacklisted in-tree binary must be blocked: %s", out)
-
-	logAfter := s.readGuardLog(c)
-	deltaEvents := guardDeltaEvents(logBefore, logAfter)
-
-	execEvents := eventsForPath(deltaEvents, "/watch/bin/mycat")
-	s.Require().NotEmpty(execEvents, "expected guard events for the exec of /watch/bin/mycat, got: %v", deltaEvents)
-
-	// Launcher attribution: the exec open and the load-time reads pass
-	// under sh's identity (sh is not blacklisted)...
-	for _, e := range execEvents {
-		if e.Type == "OPEN" || e.Type == "READ" {
-			s.Require().Falsef(e.Blocked, "exec open/load reads in blacklist mode keep launcher attribution: %s|%s", e.Type, e.Comm)
-		}
-	}
-
-	// ...but the first access under the blacklisted identity (the load
-	// mmap, comm already switched to mycat) is blocked.
-	blockedAfterSwitch := false
-	for _, e := range execEvents {
-		if e.Blocked {
-			s.Require().Equalf("mycat", e.Comm, "post-exec access must be attributed to the blacklisted binary")
-			blockedAfterSwitch = true
-		}
-	}
-	s.Require().Truef(blockedAfterSwitch, "expected the blacklisted binary to be blocked at its own load, got: %v", execEvents)
-
-	s.stopGuard(c)
-}
-
-// ---------------------------------------------------------------
 // Test: rename a file (not a directory) into the guarded area.
 // Files do not get their own inode added on rename-in, but the
 // file is now under a guarded parent so it IS blocked (by parent
 // inode check).
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestGuard_RuntimeRenameFile() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"mkdir", "-p", "/outside"})
@@ -1717,8 +1910,8 @@ func (s *IntegrationSuite) requireBlockedEventSilent(events []guardEvent, expect
 func (s *IntegrationSuite) runAttrOp(binary, expect string, targetFn func(run int) string) {
 	exploitHostPath := absPath(fmt.Sprintf("./exploits/%s", binary))
 
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.guardContainer()
+	// pooled: terminated at suite end
 
 	s.prepareAttrTree(c)
 	err := c.CopyFileToContainer(s.ctx, exploitHostPath, fmt.Sprintf("/exploits/%s", binary), 0755)
@@ -1807,7 +2000,7 @@ func (s *IntegrationSuite) TestGuard_BypassVectors() {
 // privileged test containers can provide; the suite's startContainer
 // already mounts /sys/kernel/btf and sets APPLISTENER_ASSUME_BPF_LSM=1.
 func (s *IntegrationSuite) newGuardTestContainer() testcontainers.Container {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, "")
+	c := s.guardContainer()
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, guardTestAmd64Bin, "/guard.test", 0755))
 	return c
 }
@@ -1829,7 +2022,7 @@ func (s *IntegrationSuite) runGuardTest(c testcontainers.Container, subtest stri
 // binary's whitelist entry.
 func (s *IntegrationSuite) TestGuard_PendingBinaries_Resolved() {
 	c := s.newGuardTestContainer()
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.runGuardTest(c, "TestResolvePendingBinariesWhitelist")
 }
@@ -1839,7 +2032,7 @@ func (s *IntegrationSuite) TestGuard_PendingBinaries_Resolved() {
 // kernel-side own/parent inode checks protect deep files.
 func (s *IntegrationSuite) TestGuard_PopulateInodes_FillsMap() {
 	c := s.newGuardTestContainer()
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.runGuardTest(c, "TestPopulateInodesFillsMap")
 }
@@ -1850,7 +2043,7 @@ func (s *IntegrationSuite) TestGuard_PopulateInodes_FillsMap() {
 // ReSyncBinaries rewrites its map entry, then allowed again.
 func (s *IntegrationSuite) TestGuard_ReSyncBinaries_Replacement() {
 	c := s.newGuardTestContainer()
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.runGuardTest(c, "TestReSyncBinariesReplacement")
 }

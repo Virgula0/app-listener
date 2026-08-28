@@ -3,6 +3,7 @@ package daemonconfig
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -305,16 +306,20 @@ need_encryption: false
 	}
 }
 
-func TestLoadMalformedSectionHeaderTreatedAsBinary(t *testing.T) {
+// TestLoadMalformedSectionHeaderFailsEarly is the fail-closed replacement
+// of the old "treated as binary" behavior: `[watch /missing/bracket` (no
+// closing bracket) used to be swallowed as a stray directive of the NEXT
+// section's predecessor, silently merging sections. It is now a hard error.
+func TestLoadMalformedSectionHeaderFailsEarly(t *testing.T) {
 	dir := t.TempDir()
-	cfg, err := Load(writeConfig(t, `[watch /missing/bracket
+	_, err := Load(writeConfig(t, `[watch /missing/bracket
 [watch `+dir+`]
 `))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	if err == nil {
+		t.Fatal("expected error for the malformed header")
 	}
-	if len(cfg.Resources) != 1 || cfg.Resources[0].Path != dir {
-		t.Fatalf("malformed header must be treated as a stray directive: %+v", cfg.Resources)
+	if !strings.Contains(err.Error(), "malformed section header") {
+		t.Errorf("error should mention the malformed header, got: %v", err)
 	}
 }
 
@@ -433,5 +438,28 @@ func TestLoadRefusesSpecialFileWatch(t *testing.T) {
 	}
 	if len(cfg.Resources) != 0 {
 		t.Fatalf("FIFO watch target was accepted: %+v", cfg.Resources)
+	}
+}
+
+// TestLoadMalformedSectionHeaderFails is the regression test for the
+// cross-resource whitelist contamination: a bracketed line that is not a
+// valid [watch <path>] header used to be parsed as a directive of the
+// PREVIOUS section, silently moving every following binary into the wrong
+// whitelist. Malformed headers are now hard parse errors.
+func TestLoadMalformedSectionHeaderFails(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(writeConfig(t, `[watch `+dir+`]
+`+sshPath+`
+[watch /tmp/other # comment breaks the header
+`))
+	if err == nil {
+		t.Fatal("expected error for a malformed section header")
+	}
+	if !strings.Contains(err.Error(), "malformed section header") {
+		t.Errorf("error should mention the malformed header, got: %v", err)
 	}
 }

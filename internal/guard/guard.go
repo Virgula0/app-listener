@@ -33,6 +33,11 @@ const (
 const (
 	GUARD_BLOCK = 1
 	GUARD_ALLOW = 2
+	// GUARD_ALLOW_ROOT is honored by the BPF layer only for uid 0: the
+	// guard owner's own binary must keep working (fscrypt ioctls, inode
+	// scans) without other local users executing the same file inheriting
+	// the allow. See WithSelfAllowBinary.
+	GUARD_ALLOW_ROOT = 3
 )
 
 // BinaryEntry aliases the shared infrastructure type, keeping the guard's public API unchanged.
@@ -74,6 +79,18 @@ type Guard struct {
 	// deferred holds whitelist entries unreadable while their resource tree was fscrypt-locked; they
 	// stay unlisted (denied in whitelist mode) until ResolvePendingBinaries runs after the unlock.
 	deferred []deferredBinary
+	// selfBinary is the guard owner's own executable (the daemon), registered as GUARD_ALLOW_ROOT —
+	// honored only for uid 0 — with a minimal event mask, so the binary is not a universal key for
+	// other local users (WithSelfAllowBinary).
+	selfBinary *BinaryEntry
+	selfEvents []ebpf.EventType
+	// binaryVerifyStates pins the admitted binaries' inode keys and content
+	// hashes for the in-place replacement detector; verifyStop shuts the
+	// verifier goroutine down (see startBinaryHashVerifier).
+	binaryVerifyStates map[string]*binaryVerifyState
+	verifyStop         chan struct{}
+	// degradeStop shuts the BPF degradation watcher down (startDegradeWatch).
+	degradeStop chan struct{}
 	// deployed tracks, per symlink-canonicalized whitelisted path, the (dev, ino) currently in the BPF
 	// maps. In-place replacements leave a stale inode key denying the binary until ReSyncBinaries
 	// rewrites it; keys are never deleted, so a still-running pre-replacement process keeps admission.
@@ -112,6 +129,20 @@ func WithPendingBinaries(rules []daemonconfig.BinaryRule) GuardOption {
 		for i, r := range rules {
 			g.deferred[i] = deferredBinary{rule: r}
 		}
+	}
+}
+
+// WithSelfAllowBinary registers the guard owner's own executable with a root-gated allow action
+// (GUARD_ALLOW_ROOT): the BPF layer honors it only when the caller's uid is 0, and the event mask
+// restricts it to the listed event types. The daemon needs to open and read its guarded resources
+// for the fscrypt lifecycle; without the uid gate any local user executing the same binary file
+// would inherit that allow — a universal key over every guarded tree. Whitelist mode only; the
+// entry is kept out of the plain whitelist so re-sync/deferred resolution can never re-register
+// it as an unconditional GUARD_ALLOW.
+func WithSelfAllowBinary(entry BinaryEntry, events []ebpf.EventType) GuardOption {
+	return func(g *Guard) {
+		g.selfBinary = &entry
+		g.selfEvents = events
 	}
 }
 
@@ -259,6 +290,7 @@ func guardLSMHooks(g *Guard) []struct {
 		{g.objs.GuardInodeReadlink, "inode_readlink"},
 		{g.objs.GuardSbMount, "sb_mount"},
 		{g.objs.GuardPtraceAccessCheck, "ptrace_access_check"},
+		{g.objs.GuardBprmCheckSecurity, "bprm_check_security"},
 		{g.objs.GuardTaskAlloc, "task_alloc"},
 		{g.objs.GuardTaskFree, "task_free"},
 	}
@@ -302,6 +334,35 @@ func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 		g.mu.Lock()
 		g.deployed[canonicalBinaryPath(b.Path)] = inodeKey
 		g.mu.Unlock()
+	}
+	return nil
+}
+
+// addAllowRootBinary stores the guard owner's own executable as GUARD_ALLOW_ROOT (uid-0 gated in
+// the BPF layer) with an optional event mask. It never touches g.binaries, so re-sync and deferred
+// resolution cannot re-register it as a plain GUARD_ALLOW.
+func (g *Guard) addAllowRootBinary(b BinaryEntry, events []ebpf.EventType) error {
+	if g.mode != ModeWhitelist {
+		return fmt.Errorf("self allow is only supported in whitelist mode")
+	}
+
+	dev, ino, err := ebpf.StatInode(b.Path)
+	if err != nil {
+		return fmt.Errorf("storing self exe action for %s: %w", b.Path, err)
+	}
+	key := GuardInodeKey{Dev: dev, Ino: ino}
+
+	if err := g.objs.GuardExeActions.Put(key, uint8(GUARD_ALLOW_ROOT)); err != nil {
+		return fmt.Errorf("storing self exe action for %s: %w", b.Path, err)
+	}
+	if len(events) > 0 {
+		mask, err := eventMask(events)
+		if err != nil {
+			return fmt.Errorf("invalid self event mask for %s: %w", b.Path, err)
+		}
+		if err := g.objs.GuardExeEvents.Put(key, mask); err != nil {
+			return fmt.Errorf("storing self exe events for %s: %w", b.Path, err)
+		}
 	}
 	return nil
 }
@@ -458,6 +519,17 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 	for path, types := range resolvedEvents {
 		g.exeEvents[path] = types
 	}
+	// Pin the freshly resolved binaries so in-place replacement detection
+	// covers them too (their hash was computed from the unlocked content).
+	if g.binaryVerifyStates != nil {
+		for i := range resolved {
+			entry := resolved[i]
+			canonical := canonicalBinaryPath(entry.Path)
+			if key, ok := g.deployed[canonical]; ok {
+				g.binaryVerifyStates[canonical] = &binaryVerifyState{key: key, hash: entry.Hash}
+			}
+		}
+	}
 	return nil
 }
 
@@ -572,6 +644,12 @@ func (g *Guard) populateMaps() error {
 
 	if eventsErr := g.addBinaryEvents(g.binaries, g.exeEvents); eventsErr != nil {
 		return eventsErr
+	}
+
+	if g.selfBinary != nil {
+		if selfErr := g.addAllowRootBinary(*g.selfBinary, g.selfEvents); selfErr != nil {
+			return selfErr
+		}
 	}
 
 	// Store the guarded path for symlink target matching
@@ -782,7 +860,154 @@ func (g *Guard) Start() error {
 
 	log.Infof("guard started \u2014 guarding: %s", g.path)
 	go g.readLoop(rd)
+
+	g.startDegradeWatch()
+
+	if g.mode == ModeWhitelist && len(g.binaries) > 0 {
+		g.startBinaryHashVerifier()
+	}
 	return nil
+}
+
+// BPF degradation counter slots (guard_degrade).
+const (
+	degradeInodesFull = 0 // guard_inodes map full: discovery adds dropped
+	degradeTaintFull  = 1 // guard_tainted_pids map full: taint stamps lost
+)
+
+const degradeWatchInterval = 30 * time.Second
+
+// startDegradeWatch logs BPF-side degradation that is otherwise silent: map
+// allocations failing inside the kernel reduce coverage (inode discovery
+// falls back to the ancestor walk) or disable per-process ptrace protection
+// without any Go-side error. Purely observability.
+func (g *Guard) startDegradeWatch() {
+	g.degradeStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(degradeWatchInterval)
+		defer ticker.Stop()
+		seen := map[uint32]uint64{
+			degradeInodesFull: 0,
+			degradeTaintFull:  0,
+		}
+		labels := map[uint32]string{
+			degradeInodesFull: "guard_inodes map full: runtime inode discovery dropped entries, coverage degrades to the ancestor walk",
+			degradeTaintFull:  "tainted-pids map full: ptrace/process_vm_readv protection was not stamped for some processes",
+		}
+		for {
+			select {
+			case <-g.degradeStop:
+				return
+			case <-ticker.C:
+				for slot, label := range labels {
+					var count uint64
+					if err := g.objs.GuardDegrade.Lookup(slot, &count); err != nil {
+						continue
+					}
+					if count > seen[slot] {
+						log.Warnf("guard %s: degraded coverage: %s (%d time(s) so far)", g.path, label, count)
+						seen[slot] = count
+					}
+				}
+			}
+		}
+	}()
+}
+
+// binaryVerifyState is the verifier's pinned identity of one admitted
+// whitelist binary: the inode key it was admitted under and the content
+// hash at admission time.
+type binaryVerifyState struct {
+	key     GuardInodeKey
+	hash    [32]byte
+	demoted bool
+}
+
+const binaryHashVerifyInterval = 10 * time.Second
+
+// startBinaryHashVerifier pins every admitted whitelist binary's content
+// hash and periodically re-verifies it: whitelist identity is the exe inode
+// alone, so anyone who can write to an admitted binary OUTSIDE the guarded
+// tree can replace its content in place (same inode) and inherit the allow.
+// A same-inode hash change demotes the BPF map entry to GUARD_BLOCK —
+// permanently, until the inode itself changes: a legitimate package-style
+// replacement is re-admitted by ReSyncBinaries/reload and the verifier
+// re-pins the new identity on its next tick.
+func (g *Guard) startBinaryHashVerifier() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.binaryVerifyStates = make(map[string]*binaryVerifyState, len(g.binaries))
+	for _, b := range g.binaries {
+		canonical := canonicalBinaryPath(b.Path)
+		key, ok := g.deployed[canonical]
+		if !ok {
+			continue // deferred and not yet resolved: nothing admitted yet
+		}
+		g.binaryVerifyStates[canonical] = &binaryVerifyState{key: key, hash: b.Hash}
+	}
+	g.verifyStop = make(chan struct{})
+	go g.verifyBinaryHashLoop()
+}
+
+func (g *Guard) verifyBinaryHashLoop() {
+	ticker := time.NewTicker(binaryHashVerifyInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-g.verifyStop:
+			return
+		case <-ticker.C:
+			g.verifyBinaryHashesOnce()
+		}
+	}
+}
+
+// verifyBinaryHashesOnce re-hashes every admitted binary and demotes
+// same-inode replacements. States are owned by this goroutine (created in
+// startBinaryHashVerifier, extended by ReSyncBinaries under g.mu), so field
+// access needs no extra locking.
+func (g *Guard) verifyBinaryHashesOnce() {
+	g.mu.Lock()
+	states := make(map[string]*binaryVerifyState, len(g.binaryVerifyStates))
+	for canonical, st := range g.binaryVerifyStates {
+		states[canonical] = st
+	}
+	g.mu.Unlock()
+
+	for canonical, st := range states {
+		dev, ino, err := ebpf.StatInode(canonical)
+		if err != nil {
+			continue // vanished mid-update: ReSyncBinaries handles it
+		}
+		entry, err := ComputeBinaryEntry(canonical)
+		if err != nil {
+			continue // unreadable right now: keep the current decision
+		}
+		freshKey := GuardInodeKey{Dev: dev, Ino: ino}
+
+		if freshKey != st.key {
+			// Inode changed: a replacement flow (ReSyncBinaries, SIGHUP
+			// reload) owns re-admission — adopt the new identity so a
+			// legitimate upgrade is never mistaken for tampering.
+			st.key = freshKey
+			st.hash = entry.Hash
+			st.demoted = false
+			continue
+		}
+		if st.demoted {
+			continue // once tampering is detected the entry stays blocked
+		}
+		if entry.Hash != st.hash {
+			// Same inode, different content: the admitted binary was
+			// replaced in place. Demote to GUARD_BLOCK — fail-closed.
+			if putErr := g.objs.GuardExeActions.Put(st.key, uint8(GUARD_BLOCK)); putErr != nil {
+				log.Errorf("guard %s: demoting in-place replaced binary %s: %v", g.path, canonical, putErr)
+				continue
+			}
+			st.demoted = true
+			log.Errorf("guard %s: whitelisted binary %s was modified in place (inode unchanged, hash changed) \u2014 whitelist entry demoted to BLOCK", g.path, canonical)
+		}
+	}
 }
 
 func (g *Guard) readLoop(rd *ringbuf.Reader) {
@@ -895,6 +1120,14 @@ func (g *Guard) Stop() {
 		return
 	}
 	g.stopped = true
+	if g.verifyStop != nil {
+		close(g.verifyStop)
+		g.verifyStop = nil
+	}
+	if g.degradeStop != nil {
+		close(g.degradeStop)
+		g.degradeStop = nil
+	}
 	close(g.done)
 	g.cleanup()
 }

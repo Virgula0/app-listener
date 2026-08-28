@@ -114,40 +114,81 @@ func (s *IntegrationSuite) waitForNetMonitorTypes(c testcontainers.Container, lo
 	return nil
 }
 
+// Network-monitor state for the pooled container (see the guard helpers for
+// the PID-scoped lifecycle rationale).
+var (
+	netMonPID     int
+	netMonLogPath string
+)
+
 func (s *IntegrationSuite) startNetworkMonitorStd(c testcontainers.Container, binaries string, extraFlags ...string) {
 	// Tracepoints require tracefs to be mounted inside the container.
 	_, _ = s.exec(c, []string{"sh", "-c", "mkdir -p /sys/kernel/tracing && mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null; true"})
 
 	flags := strings.Join(extraFlags, " ")
-	cmd := fmt.Sprintf("nohup /app-listener network-monitor %s --headless %s > /tmp/monitor.log 2>&1 &", binaries, flags)
-	s.exec(c, []string{"sh", "-c", cmd})
+	netMonLogPath = fmt.Sprintf("/tmp/netmon-%d.log", time.Now().UnixNano())
+	cmd := fmt.Sprintf("nohup /app-listener network-monitor %s --headless %s > %s 2>&1 &", binaries, flags, netMonLogPath)
+	netMonPID = s.capturePID(c, cmd)
 
-	time.Sleep(3 * time.Second)
-
-	codeCheck, outCheck := s.exec(c, []string{"pgrep", "-f", "app-listener"})
+	codeCheck, outCheck := s.exec(c, []string{"sh", "-c",
+		fmt.Sprintf("kill -0 %d 2>/dev/null && echo alive || echo dead", netMonPID)})
 	s.Require().Equalf(0, codeCheck, "network-monitor process not running after start: %s", outCheck)
 
 	// All 11 probes/tracepoints must attach (the kretprobe attaches even without
 	// tracefs, so a lower count means tracepoints were silently skipped).
-	startup := s.readNetMonitorLog(c)
+	// Attachment is the readiness condition: poll for the marker instead of
+	// sleeping a fixed 3s.
+	startup, _ := s.waitForNetMonLog(c, "11/11 probes/tracepoints attached", 15*time.Second)
 	s.Require().Containsf(startup, "11/11 probes/tracepoints attached",
 		"not all network-monitor probes attached:\n%s", startup)
 }
 
+func (s *IntegrationSuite) waitForNetMonLog(c testcontainers.Container, needle string, timeout time.Duration) (string, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat %s 2>/dev/null || true", netMonLogPath)})
+		if strings.Contains(out, needle) {
+			return out, true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat %s 2>/dev/null || true", netMonLogPath)})
+	return out, false
+}
+
 func (s *IntegrationSuite) readNetMonitorLog(c testcontainers.Container) string {
-	_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/monitor.log 2>/dev/null || true"})
+	_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat %s 2>/dev/null || true", netMonLogPath)})
 	return out
 }
 
 func (s *IntegrationSuite) stopNetMonitor(c testcontainers.Container) {
-	s.exec(c, []string{"pkill", "-f", "app-listener"})
-	time.Sleep(500 * time.Millisecond)
+	if netMonPID != 0 {
+		s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null || true", netMonPID)})
+		if !s.awaitGone(c, netMonPID, 3*time.Second) {
+			s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener network-monitor' || true"})
+			s.awaitGone(c, netMonPID, 3*time.Second)
+		}
+		netMonPID = 0
+	} else {
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener' || true"})
+	}
+	// Pooled-container invariant: no LIVE stray app-listener may survive.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		code, _ := s.exec(c, []string{"sh", "-c", noLiveAppListenerProcs})
+		if code == 0 {
+			return
+		}
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener' || true"})
+		time.Sleep(200 * time.Millisecond)
+	}
+	s.Require().Fail("netmon cleanup", "stray app-listener processes survived stopNetMonitor")
 }
 
 // newNetMonitorContainer starts a privileged container with the monitor
 // binary, copies net_tester into it and starts the monitor watching it.
 func (s *IntegrationSuite) newNetMonitorContainer(extraBinaries []string, extraFlags ...string) (testcontainers.Container, string) {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	c := s.netmonContainer()
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, "/net_tester", 0755))
 	for _, b := range extraBinaries {
 		s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, b, 0755))
@@ -158,11 +199,11 @@ func (s *IntegrationSuite) newNetMonitorContainer(extraBinaries []string, extraF
 
 func (s *IntegrationSuite) TestNetworkMonitor_BindListen_TCP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-server 8080 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8080, "tcp")
 
 	events := s.waitForNetMonitorTypes(c, logBefore, []string{"BIND", "LISTEN"}, 8*time.Second)
 	s.requireNetMonitorTypes(events, "BIND", "LISTEN")
@@ -170,11 +211,11 @@ func (s *IntegrationSuite) TestNetworkMonitor_BindListen_TCP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_Accept_TCP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-server 8080 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8080, "tcp")
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-client 127.0.0.1 8080"})
 
 	events := s.waitForNetMonitorTypes(c, logBefore, []string{"ACCEPT"}, 8*time.Second)
@@ -183,7 +224,7 @@ func (s *IntegrationSuite) TestNetworkMonitor_Accept_TCP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_Connect_TCP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	// Connect to a closed port: connect(2) still fires the tracepoint.
@@ -195,11 +236,11 @@ func (s *IntegrationSuite) TestNetworkMonitor_Connect_TCP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_SendRecv_TCP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-server 8080 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8080, "tcp")
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-client 127.0.0.1 8080"})
 
 	events := s.waitForNetMonitorTypes(c, logBefore, []string{"SEND", "RECV"}, 8*time.Second)
@@ -208,11 +249,11 @@ func (s *IntegrationSuite) TestNetworkMonitor_SendRecv_TCP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_Close_TCP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-server 8080 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8080, "tcp")
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-client 127.0.0.1 8080"})
 
 	events := s.waitForNetMonitorTypes(c, logBefore, []string{"CLOSE"}, 8*time.Second)
@@ -221,11 +262,11 @@ func (s *IntegrationSuite) TestNetworkMonitor_Close_TCP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_Bind_UDP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester udp-server 8081 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8081, "udp")
 
 	events := s.waitForNetMonitorTypes(c, logBefore, []string{"BIND"}, 8*time.Second)
 	s.requireNetMonitorTypes(events, "BIND")
@@ -233,7 +274,7 @@ func (s *IntegrationSuite) TestNetworkMonitor_Bind_UDP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_Connect_UDP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	// UDP connect(2) always succeeds, even without a listener.
@@ -245,11 +286,11 @@ func (s *IntegrationSuite) TestNetworkMonitor_Connect_UDP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_SendRecv_UDP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester udp-server 8081 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8081, "udp")
 	s.exec(c, []string{"sh", "-c", "/net_tester udp-client 127.0.0.1 8081"})
 
 	events := s.waitForNetMonitorTypes(c, logBefore, []string{"SEND", "RECV"}, 8*time.Second)
@@ -258,11 +299,11 @@ func (s *IntegrationSuite) TestNetworkMonitor_SendRecv_UDP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_Close_UDP() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester udp-server 8081 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8081, "udp")
 	s.exec(c, []string{"sh", "-c", "/net_tester udp-client 127.0.0.1 8081"})
 
 	events := s.waitForNetMonitorTypes(c, logBefore, []string{"CLOSE"}, 8*time.Second)
@@ -271,7 +312,7 @@ func (s *IntegrationSuite) TestNetworkMonitor_Close_UDP() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_DNS() {
 	c, logBefore := s.newNetMonitorContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester dns example.com; true"})
@@ -282,11 +323,11 @@ func (s *IntegrationSuite) TestNetworkMonitor_DNS() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_EventFilter() {
 	c, logBefore := s.newNetMonitorContainer(nil, "-e", "CONNECT,SEND")
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-server 8082 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8082, "tcp")
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-client 127.0.0.1 8082"})
 
 	events := s.waitForNetMonitorTypes(c, logBefore, []string{"CONNECT", "SEND"}, 8*time.Second)
@@ -296,12 +337,12 @@ func (s *IntegrationSuite) TestNetworkMonitor_EventFilter() {
 
 func (s *IntegrationSuite) TestNetworkMonitor_Identity() {
 	c, logBefore := s.newNetMonitorContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 	defer s.stopNetMonitor(c)
 
 	// Watch only /net_tester: a different binary must not produce events.
 	s.exec(c, []string{"sh", "-c", "/other_tester tcp-server 8083 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8083, "tcp")
 	s.exec(c, []string{"sh", "-c", "/other_tester tcp-client 127.0.0.1 8083"})
 	time.Sleep(2 * time.Second)
 
@@ -310,8 +351,8 @@ func (s *IntegrationSuite) TestNetworkMonitor_Identity() {
 }
 
 func (s *IntegrationSuite) TestNetworkMonitor_InvalidEventType() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.netmonContainer()
+	// pooled: terminated at suite end
 
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, "/net_tester", 0755))
 

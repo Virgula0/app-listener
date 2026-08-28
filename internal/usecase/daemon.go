@@ -25,6 +25,12 @@ const (
 	// replacements that never produced a denied access (swapped while the
 	// old binary was still running).
 	resyncSweepEvery = 30 * time.Second
+
+	// Rollback lock-back budget: bounded (unlike Stop's infinite wait)
+	// because rollback runs on the SIGHUP handler, which must keep serving
+	// signals.
+	maxRollbackLockRounds  = 3
+	rollbackLockRetryDelay = 500 * time.Millisecond
 )
 
 // DaemonEvent is one guard event tagged with the resource it belongs to.
@@ -62,6 +68,11 @@ type daemonUseCase struct {
 	// stopping is set once lockdown begins; Reload refuses when set, so a
 	// SIGHUP mid-shutdown can never attach guards or unlock resources.
 	stopping bool
+	// orphans holds not-yet-committed guards from an aborted reload whose
+	// freshly unlocked resources could not be locked back within the
+	// bounded rollback budget: they stay attached denying access and are
+	// retired by Stop after its own lockdown (see rollbackReload).
+	orphans []repository.GuardRepository
 }
 
 func NewDaemonUseCase(resources []daemonconfig.Resource, vault repository.Vault, guards []repository.GuardRepository) (DaemonUseCase, error) {
@@ -344,16 +355,43 @@ func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards 
 	return nil
 }
 
-// rollbackReload detaches the not-yet-committed new guards and locks back
-// any resource the aborted reload unlocked.
+// rollbackReload aborts a reload without ever leaving a resource unlocked
+// and unguarded: while the not-yet-committed guards are still attached
+// (denying every non-whitelisted access), the freshly unlocked resources
+// are locked back with bounded retries, and the guards detach only once
+// every vault is keyless — the same ordering discipline as Stop. If a pin
+// outlasts the retry budget, the new guards are kept attached as orphans
+// (registered for the daemon's Stop) so the resource remains guarded;
+// an unlocked-and-unguarded state is unreachable by construction.
+//
+// Called only from Reload while holding d.mu, so the orphan registration
+// needs no extra locking. The retry budget is bounded — unlike Stop —
+// because rollback runs on the SIGHUP handler, which must keep serving
+// signals.
 func (d *daemonUseCase) rollbackReload(guards []repository.GuardRepository, unlocked []string) {
+	if len(unlocked) > 0 {
+		pending := append([]string(nil), unlocked...)
+		for round := 0; round < maxRollbackLockRounds && len(pending) > 0; round++ {
+			var still []string
+			for _, path := range pending {
+				if err := d.lockWithRetry(path); err != nil {
+					log.Errorf("daemon: rollback: %s is still unlocked: %v", path, err)
+					still = append(still, path)
+				}
+			}
+			pending = still
+			if len(pending) > 0 {
+				time.Sleep(rollbackLockRetryDelay)
+			}
+		}
+		if len(pending) > 0 {
+			log.Errorf("daemon: rollback gave up locking %v \u2014 the new guards STAY ATTACHED and deny access until the daemon stops", pending)
+			d.orphans = append(d.orphans, guards...)
+			return
+		}
+	}
 	for _, g := range guards {
 		g.Stop()
-	}
-	for _, path := range unlocked {
-		if err := d.lockWithRetry(path); err != nil {
-			log.Errorf("daemon: rollback: failed to re-lock %s: %v", path, err)
-		}
 	}
 }
 
@@ -422,6 +460,14 @@ func (d *daemonUseCase) Stop() {
 		for _, g := range guards {
 			g.Stop()
 		}
+		// Guards orphaned by an aborted reload (their resource could not
+		// be locked back in time) kept denying access throughout this
+		// lockdown; retire them last, after every configured vault is
+		// keyless.
+		for _, g := range d.orphans {
+			g.Stop()
+		}
+		d.orphans = nil
 		log.Info("daemon: shutdown complete, all vaults locked")
 	})
 }

@@ -2,12 +2,11 @@ package tui
 
 import (
 	"fmt"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/logging"
 )
 
 // formatGuardEventLine renders one guard event line, shared by the guard
@@ -41,13 +40,11 @@ func formatGuardEventLine(ev *guard.GuardEvent) string {
 	)
 }
 
+// sanitizeTerminalText strips control characters (including terminal escape
+// sequences and forged newlines) from attacker-controlled event fields
+// before they reach xterm or any rendered view. Shared implementation.
 func sanitizeTerminalText(value string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return '?'
-		}
-		return r
-	}, value)
+	return logging.SanitizeText(value)
 }
 
 func sanitizeTerminalTexts(values []string) []string {

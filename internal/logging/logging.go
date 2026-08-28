@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"unicode"
 
 	log "github.com/sirupsen/logrus"
 
@@ -91,12 +92,26 @@ func formatEntry(e *log.Entry) string {
 	var b strings.Builder
 	b.WriteString(e.Time.Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(&b, " [%-5s] ", strings.ToUpper(e.Level.String()))
-	b.WriteString(strings.TrimRight(e.Message, "\n"))
+	b.WriteString(strings.TrimRight(SanitizeText(e.Message), "\n"))
 	for _, k := range sortedKeys(e.Data) {
-		fmt.Fprintf(&b, " %s=%v", k, e.Data[k])
+		fmt.Fprintf(&b, " %s=%v", k, SanitizeText(fmt.Sprint(e.Data[k])))
 	}
 	b.WriteByte('\n')
 	return b.String()
+}
+
+// SanitizeText replaces control characters (which includes terminal escape
+// sequences such as ESC/OSC and forged newlines) with '?'. Event fields
+// originate from the kernel ring buffer — attacker-controlled filenames,
+// process names and destinations — and would otherwise forge audit lines in
+// journald or the --dump-log file.
+func SanitizeText(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, value)
 }
 
 // sortedKeys returns entry field keys in deterministic, diff-friendly order.

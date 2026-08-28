@@ -64,7 +64,11 @@ func Load(path string) (*Config, error) {
 			continue
 		}
 
-		if dirPath, ok := parseWatchSection(line); ok {
+		dirPath, isSection, headerErr := parseWatchSection(line)
+		if headerErr != nil {
+			return nil, fmt.Errorf("daemon config line %d: %w", lineNo, headerErr)
+		}
+		if isSection {
 			current = addResource(cfg, dirPath, lineNo)
 			continue
 		}
@@ -94,11 +98,24 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func parseWatchSection(line string) (string, bool) {
-	if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
-		return "", false
+func parseWatchSection(line string) (path string, isSection bool, err error) {
+	if !strings.HasPrefix(line, "[") {
+		return "", false, nil
 	}
-	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]")), true
+	// Bare "[watch]" is the installer's placeholder header (path filled in
+	// later); accept it with an empty path — the empty resource is skipped
+	// as unguardable by addResource.
+	if line == "[watch]" {
+		return "", true, nil
+	}
+	// Any other bracketed line is a section header: accepting malformed
+	// ones as "directives" silently merged the following binaries into the
+	// PREVIOUS section (a cross-resource whitelist contamination on manual
+	// edits).
+	if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
+		return "", false, fmt.Errorf("malformed section header %q: expected \"[watch <path>]\"", line)
+	}
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]")), true, nil
 }
 
 // addResource creates a resource for watchPath, returning nil for unguardable targets:

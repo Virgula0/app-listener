@@ -2,9 +2,11 @@ package install
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/huh"
@@ -12,7 +14,10 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
+	"github.com/Virgula0/app-listener/internal/guard"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/repository"
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
@@ -363,6 +368,15 @@ func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm bool) error {
 // patchCatalogSection re-expands the whitelist for one config resource
 // if it matches a catalog entry. Returns the updated text and true when
 // patched, or the original text and false when the section is user-added.
+//
+// Encrypted resources are unlocked for the re-scan under an EPHEMERAL
+// self-only guard attached BEFORE the key is provisioned: the unlock window
+// then denies every reader except the root installer process — the same
+// protection discipline as the running daemon — instead of leaving the tree
+// readable with no LSM attached. The guard stays attached through the
+// re-lock and is dropped only once the vault is keyless; a vault that
+// cannot be re-locked is a hard error, so the hook fails visibly and the
+// config write / daemon restart never proceed on an unresolved vault.
 func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.Resource, users []inst.User) (updated string, patched bool, err error) {
 	entry, user := resolveCatalogEntry(r.Path, users)
 	if entry == nil {
@@ -378,10 +392,12 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.R
 		}
 		if encrypted {
 			wasEncrypted = true
-			log.Infof("unlocking %s for whitelist re-expansion ...", r.Path)
-			if unlockErr := vault.Unlock(r.Path); unlockErr != nil {
-				return "", false, fmt.Errorf("unlocking %s: %w", r.Path, unlockErr)
+			log.Infof("unlocking %s for whitelist re-expansion (under an ephemeral guard) ...", r.Path)
+			release, unlockErr := unlockUnderGuard(vault, r.Path)
+			if unlockErr != nil {
+				return "", false, unlockErr
 			}
+			defer release()
 		}
 	}
 
@@ -391,9 +407,11 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.R
 
 	if wasEncrypted {
 		log.Infof("re-locking %s ...", r.Path)
-		if lockErr := vault.Lock(r.Path, true); lockErr != nil {
-			log.Warnf("re-locking %s: %v", r.Path, lockErr)
-		}
+		// The ephemeral guard is still attached: until the key is gone the
+		// tree keeps denying every non-root reader. Retry unbounded, like
+		// the daemon's lockdown — a pinned fd must not downgrade this to a
+		// warning that leaves the vault unlocked once the process exits.
+		lockVaultFully(vault, r.Path)
 	}
 
 	updated, patchErr := inst.SetSectionWhitelist(confText, r.Path, freshWhitelist)
@@ -401,4 +419,48 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.R
 		return "", false, fmt.Errorf("patching section %s: %w", r.Path, patchErr)
 	}
 	return updated, true, nil
+}
+
+// unlockUnderGuard attaches an ephemeral self-only whitelist guard on path
+// BEFORE provisioning the key, so the unlock window denies every reader
+// except the root installer process (GUARD_ALLOW_ROOT — the same uid-gated
+// mechanism the daemon uses for itself). The returned release func stops the
+// guard and must run only after the vault is confirmed locked back.
+func unlockUnderGuard(vault *fscrypt.Vault, path string) (release func(), err error) {
+	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
+	if err != nil {
+		return nil, fmt.Errorf("resolving installer executable: %w", err)
+	}
+	ephemeral, guardErr := guard.NewGuard(path, guard.ModeWhitelist, nil, true, 0,
+		guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}))
+	if guardErr != nil {
+		// Fail-closed: without the guard there is no unlock at all.
+		return nil, fmt.Errorf("attaching ephemeral guard for %s: %w (vault left locked)", path, guardErr)
+	}
+	if unlockErr := vault.Unlock(path); unlockErr != nil {
+		ephemeral.Stop()
+		return nil, fmt.Errorf("unlocking %s: %w", path, unlockErr)
+	}
+	return ephemeral.Stop, nil
+}
+
+// lockVaultFully force-flushes the vault key until it is gone, with the same
+// never-give-up discipline as the daemon's lockdown: the caller keeps the
+// ephemeral guard attached, so the tree stays guarded for as long as this
+// retry loop runs. A persistent pin blocks the pacman hook with a loud log
+// instead of silently leaving the vault unlocked.
+func lockVaultFully(vault *fscrypt.Vault, path string) {
+	for {
+		err := vault.Lock(path, true)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, repository.ErrKeyMissing) {
+			return // fully locked
+		}
+		log.Errorf("install: %s is still unlocked: a process holds open files in it "+
+			"(investigate with: lsof +D %s, fuser -v %s): %v — retrying while the ephemeral guard keeps it protected",
+			path, path, path, err)
+		time.Sleep(time.Second)
+	}
 }
