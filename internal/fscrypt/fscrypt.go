@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/google/fscrypt/actions"
@@ -35,7 +37,16 @@ const (
 const linux_FS_IOC_GET_ENCRYPTION_POLICY_EX = 0xc0096616
 
 // Vault implements repository.Vault on top of the google/fscrypt actions API.
-type Vault struct{}
+type Vault struct {
+	mu sync.Mutex
+	// collateral holds policies this Vault provisioned speculatively
+	// (single-file unlock shotgun, see provisionLockedFile) whose cleanup
+	// deprovision failed with a pin (EBUSY): their directories are readable
+	// until the key is removed and they are NOT daemon resources, so nobody
+	// else locks them back. LockCollateral drains the registry on force
+	// flushes.
+	collateral map[string]*actions.Policy
+}
 
 // New returns a Vault rooted at the default master key file.
 func New() *Vault {
@@ -182,11 +193,63 @@ func (v *Vault) provisionLockedFile(fsctx *actions.Context, path string) error {
 			unix.Close(fd)
 			return nil // this was the file's own policy: it opens now
 		}
-		// Wrong policy: undo the collateral provisioning immediately.
-		_ = candidate.Deprovision(true)
+		// Wrong policy: undo the collateral provisioning immediately. A pin
+		// inside the candidate directory (EBUSY) would leave the key
+		// provisioned — the directory readable by anyone with DAC rights —
+		// and it is not a daemon resource, so nobody else locks it back.
+		v.deprovisionCollateral(descriptor, candidate)
 	}
 	return fmt.Errorf("no policy on %s could be unlocked with %s to open the locked file %s",
 		fsctx.Mount.Path, MasterKeyFile, path)
+}
+
+const (
+	collateralDeprovisionRetries = 3
+	collateralRetryDelay         = 100 * time.Millisecond
+)
+
+// deprovisionCollateral removes a speculatively provisioned policy again,
+// retrying briefly on EBUSY. A pin that outlives the retries registers the
+// policy for LockCollateral, which keeps attempting removal on every force
+// flush instead of silently leaving the directory readable.
+func (v *Vault) deprovisionCollateral(descriptor string, candidate *actions.Policy) {
+	for attempt := 1; ; attempt++ {
+		err := candidate.Deprovision(true)
+		if err == nil {
+			return
+		}
+		if attempt < collateralDeprovisionRetries && classifyDeprovision(err) == depBusy {
+			time.Sleep(collateralRetryDelay)
+			continue
+		}
+		log.Errorf("fscrypt: collateral policy %s could not be deprovisioned (%v) — "+
+			"its directory stays READABLE; registered for cleanup on the next force flush", descriptor, err)
+		v.mu.Lock()
+		if v.collateral == nil {
+			v.collateral = make(map[string]*actions.Policy)
+		}
+		v.collateral[descriptor] = candidate
+		v.mu.Unlock()
+		return
+	}
+}
+
+// LockCollateral deprovisions every speculatively provisioned policy whose
+// earlier cleanup failed (see provisionLockedFile). It runs on force
+// flushes — notably the daemon's two-pass lockdown — so a leaked collateral
+// key does not outlive the process. Persistent failures stay registered and
+// are re-attempted on the next call.
+func (v *Vault) LockCollateral() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for descriptor, policy := range v.collateral {
+		if err := policy.Deprovision(true); err != nil {
+			log.Errorf("fscrypt: collateral policy %s is still provisioned (%v) — its directory remains readable", descriptor, err)
+			continue
+		}
+		log.Infof("fscrypt: deprovisioned collateral policy %s", descriptor)
+		delete(v.collateral, descriptor)
+	}
 }
 
 // verifyLockedFileKey validates the master key against a locked encrypted regular file, provisioning
@@ -494,6 +557,12 @@ func (v *Vault) Lock(path string, forceFlush bool) error {
 
 	if err := policy.Deprovision(true); err != nil {
 		return classifyDeprovisionErr(path, err)
+	}
+	// Force flushes are the natural cleanup point for collateral keys leaked
+	// by earlier single-file unlocks (see deprovisionCollateral): the daemon
+	// lockdown and the installer re-lock both pass forceFlush.
+	if forceFlush {
+		v.LockCollateral()
 	}
 	return nil
 }

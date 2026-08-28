@@ -235,8 +235,8 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 - **Whitelist only, default deny**; identity by inode — renaming a binary does not grant access.
 - **Per-binary event masks**: unlisted events are denied (EPERM); `READ`/`WRITE`/`MMAP` implicitly allow `OPEN`. Valid: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD`. Masks are a per-binary least-privilege hint, **not a confinement boundary**: whitelist mode re-attributes an `execve` to the executed binary, so a masked binary that execs another whitelisted (unmasked) binary escapes its own mask. Do not rely on masks to contain a binary that may launch other whitelisted programs.
 - **Tolerance**: missing paths/binaries are skipped with a warning; malformed directives in a valid section fail fast.
-- **SIGHUP reload** (`systemctl reload`, or the pacman `PostTransaction` hook): recomputes every binary's inode identity atomically — new guards attach before old ones detach, protection is never weaker; a malformed config keeps the previous one running.
-- **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy or the daemon refuses to start. Shutdown deprovisions keys in two passes (plain, then force-flush with an EBUSY retry loop) while guards still deny access; hooks detach only after every vault is keyless.
+- **SIGHUP reload** (`systemctl reload`): recomputes every binary's inode identity atomically — new guards attach before old ones detach, protection is never weaker; a malformed config keeps the previous one running.
+- **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy or the daemon refuses to start. Shutdown deprovisions keys in two passes (plain, then force-flush with an EBUSY retry loop) while guards still deny access; hooks detach only after every vault is keyless. Keys speculatively provisioned by single-file unlocks whose cleanup hit a pin are retried and removed on every force flush (collateral cleanup) — an unconfigured directory is never left readable.
 
 Minimal systemd unit:
 
@@ -256,6 +256,8 @@ WantedBy=multi-user.target
 ### install / uninstall / update / edit-protected
 
 **install** — TUI wizard, in safe order: stops a running daemon → builds the binary → generates the fscrypt key (existing keys kept) → picks users to protect → probes a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypts selected directories (backup first, then verified against the master key) → deploys systemd unit, pacman reload hook, per-user ssh-agent unit, binary and config. An existing backup **aborts** the migration; a failed policy application rolls back; empty whitelists still deny everything; the unit runs with `ProtectSystem=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`.
+
+**install --update-catalog-only** (the pacman `PostTransaction` hook, fires on every package transaction): stops the daemon, re-expands every catalog-matched whitelist, rewrites the config and restarts the daemon. Encrypted resources are unlocked for the re-scan **under an ephemeral self-only guard attached before the unlock** — the window denies every reader except the root installer process, exactly like the running daemon — and re-locking retries unbounded while that guard stays attached: a vault that cannot be locked back is a hard error, so the hook fails visibly and the config write / daemon restart never proceed on an unlocked vault.
 
 > **Prerequisite**: each filesystem must be fscrypt-initialized (`sudo fscrypt setup --all-users`) and support encryption (ext4: `sudo tune2fs -O encrypt <dev>`; f2fs: `sudo fsck.f2fs -O encrypt <dev>`). The installer verifies both before asking anything.
 

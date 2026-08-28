@@ -7,6 +7,12 @@
 # The previous approach only sent SIGHUP to re-read inodes; the full
 # catalog rescan subsumes that — the daemon is reloaded by
 # EnableAndVerify after writing the refreshed config.
+#
+# Encrypted resources are unlocked for the re-scan under an ephemeral
+# self-only guard (attached before the unlock, dropped after the vault is
+# confirmed locked back): the window denies every reader except the root
+# installer process, and a vault that cannot be re-locked fails the hook
+# instead of staying unlocked.
 
 [Trigger]
 Operation = Install
