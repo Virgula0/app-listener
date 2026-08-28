@@ -18,6 +18,7 @@ import (
 	"github.com/google/fscrypt/crypto"
 	"github.com/google/fscrypt/filesystem"
 	"github.com/google/fscrypt/metadata"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/repository"
@@ -310,6 +311,17 @@ func readKeyFrom(keyFile string) ([]byte, error) {
 	data, err := os.ReadFile(keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read master key %s: %w", keyFile, err)
+	}
+	// Defense in depth: a key left readable by group/other (legacy file,
+	// manual copy, restored backup) is tightened on sight — the master key
+	// unlocks every protected tree.
+	if info, statErr := os.Stat(keyFile); statErr == nil {
+		if perm := info.Mode().Perm(); perm != 0o400 {
+			log.Warnf("master key %s has mode %04o (expected 0400): tightening", keyFile, perm)
+			if chmodErr := os.Chmod(keyFile, 0o400); chmodErr != nil {
+				return nil, fmt.Errorf("tightening master key %s permissions: %w", keyFile, chmodErr)
+			}
+		}
 	}
 	if err := checkKeyLen(keyFile, data); err != nil {
 		return nil, err

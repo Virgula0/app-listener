@@ -2,6 +2,7 @@ package integrationtests
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -83,8 +84,19 @@ func (s *IntegrationSuite) startGuardStd(c testcontainers.Container, guardPath s
 	code, out := s.exec(c, []string{"sh", "-c", cmd})
 	s.Require().Equalf(0, code, "starting guard: %s", out)
 
-	_, ok := s.waitForGuardStd(c, "guard started", 10*time.Second)
-	s.Require().True(ok, "guard should become ready")
+	logContent, ok := s.waitForGuardStd(c, "guard started", 10*time.Second)
+	if !ok {
+		// Transient host-level flake: docker exec can fail at the runc
+		// layer ("setns process: exit status 1") on hardened kernels after
+		// heavy container churn. The guard never ran — retry once.
+		if strings.Contains(logContent, "OCI runtime exec failed") {
+			s.exec(c, []string{"sh", "-c", cmd})
+			logContent, ok = s.waitForGuardStd(c, "guard started", 10*time.Second)
+		}
+	}
+	if !ok {
+		s.Require().Failf("guard should become ready", "guard log:\n%s", logContent)
+	}
 
 	// Verify the process is alive
 	codeCheck, outCheck := s.exec(c, []string{"pgrep", "-f", "app-listener"})
@@ -1167,6 +1179,143 @@ func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv() {
 			"kill $pid 2>/dev/null; exit $code"})
 	s.Require().NotEqualf(0, code,
 		"process_vm_readv on a whitelisted victim should be blocked: %s", out)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: ptrace pre-taint race
+//
+// The guard denies ptrace/process_vm_readv against a TAINTED pid, but the
+// taint is only stamped when the process performs its first ALLOWED guarded
+// access, and ptrace_access_check runs only at ATTACH time. A tracer that
+// attaches BEFORE the victim ever touches the guarded tree is never
+// re-checked, so it can PTRACE_PEEKDATA the guarded content straight out of
+// the victim's heap afterwards.
+//
+// ptrace_race ships one binary in two modes; two copies with different
+// inodes separate the identities:
+//   - /exploits/race_victim is whitelisted (-w): on a go signal it reads
+//     the guarded file into a heap buffer and publishes the buffer address.
+//   - /exploits/race_tracer (plain copy, NOT whitelisted) forks the victim
+//     (ancestor tracing keeps yama ptrace_scope=1 out of the way), attaches
+//     before the first guarded access, triggers the read, then dumps the
+//     buffer with PTRACE_PEEKDATA.
+//
+// Before the fix: the attach is allowed (victim not yet tainted) and the
+//   dump succeeds (SECRET_DUMP|SUCCESS, exit 0).
+// After the fix: ptrace_access_check also protects processes whose exe is
+//   whitelisted, so the attach itself is denied (exit 3) and no dump occurs.
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_PtraceRace() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/protected", "/exploits"})
+	// Must exist before the guard starts: files created afterwards are
+	// not in the BPF inode map and would not be protected.
+	s.exec(c, []string{"sh", "-c", "echo 'TOP-SECRET-CONTENT' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+
+	victimHostPath := absPath("./exploits/ptrace_race")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, victimHostPath, "/exploits/race_victim", 0755), "copy race_victim")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, victimHostPath, "/exploits/race_tracer", 0755), "copy race_tracer")
+
+	// Only the victim copy is whitelisted; the tracer copy keeps a distinct
+	// inode and must never gain allow rights.
+	s.startGuardStd(c, "/protected", "-w", "/exploits/race_victim")
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"rm -f /tmp/race_addr* /tmp/race_go /tmp/race_done; " +
+			"timeout 60 /exploits/race_tracer tracer /exploits/race_victim " +
+			"/protected/secret /tmp/race_addr /tmp/race_go /tmp/race_done"})
+	s.T().Logf("tracer exit=%d out=%q", code, out)
+
+	s.Require().NotEqualf(0, code, "ptrace race against a whitelisted victim must be blocked")
+	s.Require().NotContains(out, "SECRET_DUMP|SUCCESS",
+		"tracer exfiltrated guarded content from the victim heap: %s", out)
+
+	s.stopGuard(c)
+}
+
+// ---------------------------------------------------------------
+// Bypass: in-place whitelisted binary replacement
+//
+// The whitelist is keyed by exe inode; the SHA-256 computed at admission is
+// never enforced. An attacker who can write to a whitelisted binary OUTSIDE
+// the guarded tree overwrites it in place (same inode, new content — e.g.
+// `cat payload > /tmp/app`), and the malicious payload inherits the
+// whitelist entry: it execs and reads the guarded tree.
+//
+// swap_benign is the whitelisted placeholder; swap_reader is the payload.
+//
+// Before the fix: the replaced binary executes and reads the secret
+//   (STOLEN|TOP-SECRET-...).
+// After the fix: the guard pins each admitted binary's hash and re-verifies
+//   it periodically; a same-inode hash change demotes the map entry to
+//   BLOCK, so the payload exec is denied (eventually — within the verify
+//   interval — and never again afterwards).
+// ---------------------------------------------------------------
+
+func (s *IntegrationSuite) TestGuard_Bypass_InPlaceBinarySwap() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/protected", "/exploits"})
+	s.exec(c, []string{"sh", "-c",
+		"echo 'TOP-SECRET-CONTENT' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/swap_benign"), "/exploits/swap_benign", 0755), "copy swap_benign")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/swap_reader"), "/exploits/swap_reader", 0755), "copy swap_reader")
+
+	s.exec(c, []string{"sh", "-c", "cp /exploits/swap_benign /tmp/app && chmod 755 /tmp/app"})
+	s.startGuardStd(c, "/protected", "-w", "/tmp/app")
+
+	// Baseline: the admitted benign binary runs.
+	code, out := s.exec(c, []string{"/tmp/app"})
+	s.Require().Equalf(0, code, "baseline whitelisted binary should run: %s", out)
+	s.Require().Contains(out, "BENIGN-APP-OK")
+
+	// Attack: overwrite in place; the inode must survive (that is the
+	// bypass premise — a fresh inode is a different story and re-syncs).
+	_, inodeOut := s.exec(c, []string{"sh", "-c",
+		"i1=$(stat -c %i /tmp/app); cat /exploits/swap_reader > /tmp/app; chmod 755 /tmp/app; i2=$(stat -c %i /tmp/app); echo $i1 $i2"})
+	// Docker exec multiplexes stdout/stderr with 8-byte frame headers that
+	// can leak into captured output under load, so extract the two inode
+	// numbers with a digit pattern instead of comparing raw fields.
+	inodeRe := regexp.MustCompile(`(\d+)[^0-9]+(\d+)`)
+	m := inodeRe.FindStringSubmatch(inodeOut)
+	s.Require().NotNil(m, "inode probe output: %q", inodeOut)
+	s.Require().Equalf(m[1], m[2], "replacement must be same-inode for this vector (before=%s after=%s)", m[1], m[2])
+	s.T().Logf("in-place swap kept inode %s", m[1])
+
+	// The payload must EVENTUALLY be denied: detection is periodic (the
+	// guard re-verifies pinned hashes every 10s), so execs during the first
+	// interval may still succeed — the invariant is that the entry gets
+	// demoted and never admits the payload again. Red on vulnerable
+	// builds: the payload keeps succeeding forever.
+	denied := false
+	var lastOut string
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		code, out = s.exec(c, []string{"sh", "-c", "timeout 10 /tmp/app /protected/secret 2>&1"})
+		lastOut = out
+		if code != 0 {
+			denied = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	s.Require().Truef(denied, "replaced binary was never denied within the verify window, last output: %q", lastOut)
+
+	// Once demoted, the whitelist entry stays blocked.
+	time.Sleep(2 * time.Second)
+	code, out = s.exec(c, []string{"sh", "-c", "timeout 10 /tmp/app /protected/secret 2>&1"})
+	s.Require().NotEqualf(0, code, "demoted whitelist entry must stay blocked: %s", out)
+	s.Require().NotContains(out, "STOLEN|")
+
+	log := s.readGuardLog(c)
+	s.Require().Contains(log, "modified in place", "guard must log the in-place tampering detection")
 
 	s.stopGuard(c)
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/repository"
 	"github.com/Virgula0/app-listener/internal/tui"
 	"github.com/Virgula0/app-listener/internal/usecase"
@@ -269,10 +270,13 @@ func resolveConfigPath() (string, error) {
 }
 
 // buildGuards creates one whitelist guard engine per resource. The daemon's
-// own executable is appended to every whitelist so the fscrypt ioctls (which
-// open the watched directories by path) keep working while the guards are
-// attached during shutdown locking. On failure the partially built guards
-// (which are already attached to the kernel) are detached before returning.
+// own executable is registered with a root-gated allow action and a minimal
+// event mask (OPEN, READ) so the fscrypt ioctls (which open the watched
+// directories by path) keep working while the guards are attached — without
+// turning the binary into a universal key that any local user could execute
+// to inherit full access to every guarded tree. On failure the partially
+// built guards (which are already attached to the kernel) are detached
+// before returning.
 func buildGuards(resources []daemonconfig.Resource) ([]repository.GuardRepository, error) {
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {
@@ -298,12 +302,14 @@ func buildGuards(resources []daemonconfig.Resource) ([]repository.GuardRepositor
 			binaries = append(binaries, entry)
 			events[b.Path] = b.Events
 		}
-		binaries = append(binaries, self)
-		events[self.Path] = nil // the daemon itself: all events
 
 		g, err := guard.NewGuard(r.Path, guard.ModeWhitelist, binaries, true, 0,
 			guard.WithBinaryEvents(events),
-			guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)))
+			guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
+			// Root-gated self access with the minimal event set the fscrypt
+			// lifecycle needs; guarded content reads by non-root executors of
+			// this binary stay denied (see the self-key bypass regression test).
+			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}))
 		if err != nil {
 			for _, built := range guards {
 				built.Stop()
@@ -356,13 +362,19 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 		return false
 	}
 	who := uidr.Resolve(ev.Event.UID)
+	// Event-controlled fields (path, comm, resource) are sanitized: a
+	// filename containing newlines or terminal escapes must not forge
+	// audit lines in journald.
+	resource := logging.SanitizeText(ev.Resource)
+	path := logging.SanitizeText(ev.Event.Path)
+	comm := logging.SanitizeText(ev.Event.Comm)
 	if ev.Event.Blocked {
 		fmt.Fprintf(w, "%sDAEMON DENIED  op=%s  comm=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
-			syslogWarning, ev.Event.Type.String(), ev.Event.Comm, ev.Event.PID, who, ev.Resource, ev.Event.Path)
+			syslogWarning, ev.Event.Type.String(), comm, ev.Event.PID, who, resource, path)
 		return true
 	}
 	fmt.Fprintf(w, "%sDAEMON ALLOWED  op=%s  comm=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
-		syslogInfo, ev.Event.Type.String(), ev.Event.Comm, ev.Event.PID, who, ev.Resource, ev.Event.Path)
+		syslogInfo, ev.Event.Type.String(), comm, ev.Event.PID, who, resource, path)
 	return true
 }
 

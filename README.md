@@ -233,7 +233,7 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 ```
 
 - **Whitelist only, default deny**; identity by inode — renaming a binary does not grant access.
-- **Per-binary event masks**: unlisted events are denied (EPERM); `READ`/`WRITE`/`MMAP` implicitly allow `OPEN`. Valid: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD`.
+- **Per-binary event masks**: unlisted events are denied (EPERM); `READ`/`WRITE`/`MMAP` implicitly allow `OPEN`. Valid: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD`. Masks are a per-binary least-privilege hint, **not a confinement boundary**: whitelist mode re-attributes an `execve` to the executed binary, so a masked binary that execs another whitelisted (unmasked) binary escapes its own mask. Do not rely on masks to contain a binary that may launch other whitelisted programs.
 - **Tolerance**: missing paths/binaries are skipped with a warning; malformed directives in a valid section fail fast.
 - **SIGHUP reload** (`systemctl reload`, or the pacman `PostTransaction` hook): recomputes every binary's inode identity atomically — new guards attach before old ones detach, protection is never weaker; a malformed config keeps the previous one running.
 - **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy or the daemon refuses to start. Shutdown deprovisions keys in two passes (plain, then force-flush with an EBUSY retry loop) while guards still deny access; hooks detach only after every vault is keyless.

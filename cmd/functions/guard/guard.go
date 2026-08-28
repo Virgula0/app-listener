@@ -14,6 +14,7 @@ import (
 	"github.com/Virgula0/app-listener/cmd/common"
 	"github.com/Virgula0/app-listener/cmd/printers"
 	"github.com/Virgula0/app-listener/internal/guard"
+	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/tui"
 	"github.com/Virgula0/app-listener/internal/usecase"
 )
@@ -170,7 +171,8 @@ func runGuardHeadless(uc usecase.GuardUseCase) {
 			if !ok {
 				return
 			}
-			log.Infof("GUARD|%s|%s|%s|%d|%s|%t|%d", ev.Type.String(), ev.Comm, ev.Path, ev.PID, ev.Dest, ev.Blocked, ev.UID)
+			log.Infof("GUARD|%s|%s|%s|%d|%s|%t|%d",
+				ev.Type.String(), logging.SanitizeText(ev.Comm), logging.SanitizeText(ev.Path), ev.PID, logging.SanitizeText(ev.Dest), ev.Blocked, ev.UID)
 		case <-sig:
 			return
 		}

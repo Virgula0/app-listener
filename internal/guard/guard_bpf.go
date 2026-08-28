@@ -23,6 +23,7 @@ type GuardInodeKey struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	GuardMapGuardConfig             = "guard_config"
+	GuardMapGuardDegrade            = "guard_degrade"
 	GuardMapGuardExeActions         = "guard_exe_actions"
 	GuardMapGuardExeEvents          = "guard_exe_events"
 	GuardMapGuardFsDevices          = "guard_fs_devices"
@@ -32,6 +33,7 @@ const (
 	GuardMapGuardTaintedPids        = "guard_tainted_pids"
 	GuardMapRb                      = "rb"
 	GuardMapTmpBuf                  = "tmp_buf"
+	GuardProgGuardBprmCheckSecurity = "guard_bprm_check_security"
 	GuardProgGuardFileOpen          = "guard_file_open"
 	GuardProgGuardFilePermission    = "guard_file_permission"
 	GuardProgGuardFileTruncate      = "guard_file_truncate"
@@ -98,6 +100,7 @@ type GuardSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type GuardProgramSpecs struct {
+	GuardBprmCheckSecurity *ebpf.ProgramSpec `ebpf:"guard_bprm_check_security"`
 	GuardFileOpen          *ebpf.ProgramSpec `ebpf:"guard_file_open"`
 	GuardFilePermission    *ebpf.ProgramSpec `ebpf:"guard_file_permission"`
 	GuardFileTruncate      *ebpf.ProgramSpec `ebpf:"guard_file_truncate"`
@@ -127,6 +130,7 @@ type GuardProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type GuardMapSpecs struct {
 	GuardConfig      *ebpf.MapSpec `ebpf:"guard_config"`
+	GuardDegrade     *ebpf.MapSpec `ebpf:"guard_degrade"`
 	GuardExeActions  *ebpf.MapSpec `ebpf:"guard_exe_actions"`
 	GuardExeEvents   *ebpf.MapSpec `ebpf:"guard_exe_events"`
 	GuardFsDevices   *ebpf.MapSpec `ebpf:"guard_fs_devices"`
@@ -165,6 +169,7 @@ func (o *GuardObjects) Close() error {
 // It can be passed to LoadGuardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type GuardMaps struct {
 	GuardConfig      *ebpf.Map `ebpf:"guard_config"`
+	GuardDegrade     *ebpf.Map `ebpf:"guard_degrade"`
 	GuardExeActions  *ebpf.Map `ebpf:"guard_exe_actions"`
 	GuardExeEvents   *ebpf.Map `ebpf:"guard_exe_events"`
 	GuardFsDevices   *ebpf.Map `ebpf:"guard_fs_devices"`
@@ -179,6 +184,7 @@ type GuardMaps struct {
 func (m *GuardMaps) Close() error {
 	return _GuardClose(
 		m.GuardConfig,
+		m.GuardDegrade,
 		m.GuardExeActions,
 		m.GuardExeEvents,
 		m.GuardFsDevices,
@@ -201,6 +207,7 @@ type GuardVariables struct {
 //
 // It can be passed to LoadGuardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type GuardPrograms struct {
+	GuardBprmCheckSecurity *ebpf.Program `ebpf:"guard_bprm_check_security"`
 	GuardFileOpen          *ebpf.Program `ebpf:"guard_file_open"`
 	GuardFilePermission    *ebpf.Program `ebpf:"guard_file_permission"`
 	GuardFileTruncate      *ebpf.Program `ebpf:"guard_file_truncate"`
@@ -227,6 +234,7 @@ type GuardPrograms struct {
 
 func (p *GuardPrograms) Close() error {
 	return _GuardClose(
+		p.GuardBprmCheckSecurity,
 		p.GuardFileOpen,
 		p.GuardFilePermission,
 		p.GuardFileTruncate,

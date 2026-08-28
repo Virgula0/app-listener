@@ -17,6 +17,7 @@ import (
 	"github.com/Virgula0/app-listener/cmd/common"
 	"github.com/Virgula0/app-listener/cmd/printers"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/networkguard"
 	"github.com/Virgula0/app-listener/internal/tui"
 	"github.com/Virgula0/app-listener/internal/usecase"
@@ -260,8 +261,8 @@ func runHeadless(uc usecase.NetworkGuardUseCase, throttle bool) {
 				lastLog[k] = now
 			}
 			log.Infof("NETGUARD|%s|%s|%s|%s|%s|%d|%d|%d|%d|%t",
-				ev.Type.String(), ev.Comm, ebpf.ProtocolString(ev.Protocol),
-				ev.SrcAddr, ev.DstAddr, ev.Size, ev.PID, ev.TID, ev.NetNS, ev.Blocked)
+				ev.Type.String(), logging.SanitizeText(ev.Comm), ebpf.ProtocolString(ev.Protocol),
+				logging.SanitizeText(ev.SrcAddr), logging.SanitizeText(ev.DstAddr), ev.Size, ev.PID, ev.TID, ev.NetNS, ev.Blocked)
 		case <-sig:
 			return
 		}
