@@ -29,6 +29,8 @@ func init() {
 		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon; no wizard, no config, no fscrypt, no systemd units")
 	InstallCmd.Flags().Bool("update-catalog-only", false,
 		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
+	InstallCmd.Flags().Bool("live", false,
+		"With --update-catalog-only: refresh the whitelists WITHOUT stopping the daemon (vaults are already unlocked and guarded by the running daemon; the config change is applied via SIGHUP reload). Requires the daemon to be running")
 	InstallCmd.Flags().BoolP("yes", "y", false,
 		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. pacman hooks)")
 }
@@ -167,6 +169,7 @@ type maintenanceFlags struct {
 	deleteBackup  bool
 	binaryOnly    bool
 	updateCatalog bool
+	live          bool
 	autoConfirm   bool
 }
 
@@ -185,6 +188,9 @@ func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
 	if f.updateCatalog, err = cmd.Flags().GetBool("update-catalog-only"); err != nil {
 		return f, err
 	}
+	if f.live, err = cmd.Flags().GetBool("live"); err != nil {
+		return f, err
+	}
 	if f.autoConfirm, err = cmd.Flags().GetBool("yes"); err != nil {
 		return f, err
 	}
@@ -198,6 +204,9 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 	}
 	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
 		return false, errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
+	}
+	if f.live && !f.updateCatalog {
+		return false, errors.New("--live can only be used with --update-catalog-only")
 	}
 	modes := 0
 	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.updateCatalog} {
@@ -216,7 +225,7 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 	case f.binaryOnly:
 		return true, installBinaryOnly()
 	case f.updateCatalog:
-		return true, runUpdateCatalogOnly(f.autoConfirm)
+		return true, runUpdateCatalogOnly(f.autoConfirm, f.live)
 	}
 	return false, nil
 }
@@ -235,19 +244,61 @@ func installBinaryOnly() error {
 	return nil
 }
 
+// deliverReload applies a patched config to the daemon: SIGHUP reload
+// (atomic — new guards attach before old detach) with a restart fallback
+// when running, or a start after the stopped flow. Package-level
+// indirection so tests can observe the delivery.
+var deliverReload = systemd.EnableAndVerify
+
 // runUpdateCatalogOnly re-scans the catalog whitelist for every guarded
 // directory in the existing daemon.conf. Encrypted vaults are unlocked
 // for stat access, glob patterns are re-expanded, and the diff is shown
 // for confirmation. User-added sections are preserved verbatim.
-func runUpdateCatalogOnly(autoConfirm bool) error {
+//
+// In live mode the daemon keeps running: its vaults are already unlocked
+// and its guards attached, so the re-scan needs no unlock/lock cycle and
+// no daemon stop — a changed config is delivered via SIGHUP reload. A
+// stopped daemon cannot support live mode (locked vaults hide plaintext
+// names), so the caller is told to use the stopped flow instead.
+func runUpdateCatalogOnly(autoConfirm, live bool) error {
+	if live {
+		if !systemd.IsDaemonActive() {
+			return errors.New("live catalog refresh requires the daemon to be running: " +
+				"locked vaults hide plaintext names — use --update-catalog-only without --live, or start the daemon first")
+		}
+		vault := fscrypt.New()
+		changed, err := updateCatalogConfig(vault, autoConfirm, true)
+		if err != nil {
+			return err
+		}
+		return applyLiveRefresh(changed)
+	}
 	if err := systemd.StopDaemonIfRunning(); err != nil {
 		return err
 	}
 	vault := fscrypt.New()
-	if err := updateCatalogConfig(vault, autoConfirm); err != nil {
+	if _, err := updateCatalogConfig(vault, autoConfirm, false); err != nil {
 		return err
 	}
-	return systemd.EnableAndVerify(true)
+	// The daemon was stopped by this flow: it must run again regardless of
+	// whether the config changed.
+	return deliverReload(true)
+}
+
+// applyLiveRefresh delivers a patched config to the running daemon: SIGHUP
+// reload (atomic — new guards attach before old detach), restart fallback.
+// A refresh whose result matches the running config is a no-op.
+//
+// Regression guard for the first live implementation: the config was
+// patched on disk but never delivered to the running daemon, which kept
+// enforcing the old whitelist while journalctl stayed silent — the
+// delivery is the mandatory last step of live mode.
+func applyLiveRefresh(changed bool) error {
+	if !changed {
+		log.Info("nothing to reload: the refreshed config matches the running daemon")
+		return nil
+	}
+	return deliverReload(true)
 }
 
 // prepareInstallation builds the binary and ensures the master key exists.

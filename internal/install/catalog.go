@@ -118,6 +118,10 @@ var Catalog = []CandidateDir{
 			"/opt/visual-studio-code/code": nil, "/usr/share/code/code": nil, "/opt/visual-studio-code/bin/code": nil,
 			// Code's separate crash-dump writer process.
 			"/opt/visual-studio-code/chrome_crashpad_handler": nil, "/usr/share/code/chrome_crashpad_handler": nil,
+			// Code's extension-signature verifier, spawned per extension
+			// install/update to check CachedExtensionVSIXs/*.sigzip files.
+			"/opt/visual-studio-code/resources/app/node_modules/@vscode/vsce-sign/bin/vsce-sign": nil,
+			"/usr/share/code/resources/app/node_modules/@vscode/vsce-sign/bin/vsce-sign":         nil,
 		}},
 	{Name: "VS Code Insiders config", RelPath: ".config/Code - Insiders",
 		Whitelist: map[string][]string{

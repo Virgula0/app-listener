@@ -299,35 +299,39 @@ func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.Candidat
 }
 
 // updateCatalogConfig reads the installed daemon.conf, re-expands the
-// catalog whitelist for every matched section (unlocking encrypted vaults
-// for stat access), and shows a diff for confirmation. Unmatched
-// (user-added) sections are preserved verbatim. When autoConfirm is true
-// the diff is logged and the config is overwritten without prompting.
-func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm bool) error {
+// catalog whitelist for every matched section and shows a diff for
+// confirmation. Unmatched (user-added) sections are preserved verbatim.
+// When autoConfirm is true the diff is logged and the config is overwritten
+// without prompting. In live mode the daemon keeps running: its vaults are
+// already unlocked and guarded, so sections are re-scanned without touching
+// lock state, and the caller applies the patched config via SIGHUP reload.
+// Returns whether the config file was actually written (the caller must
+// deliver the change to the daemon only then).
+func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm, live bool) (changed bool, err error) {
 	oldText, err := os.ReadFile(systemd.SystemConfigPath)
 	if err != nil {
-		return fmt.Errorf("no previous installation found — run `app-listener install` first: %w", err)
+		return false, fmt.Errorf("no previous installation found — run `app-listener install` first: %w", err)
 	}
 
 	cfg, err := daemonconfig.Load(systemd.SystemConfigPath)
 	if err != nil {
-		return fmt.Errorf("parsing existing configuration: %w", err)
+		return false, fmt.Errorf("parsing existing configuration: %w", err)
 	}
 	if len(cfg.Resources) == 0 {
-		return fmt.Errorf("existing configuration contains no [watch] sections")
+		return false, fmt.Errorf("existing configuration contains no [watch] sections")
 	}
 
 	users, err := inst.ListUsers()
 	if err != nil {
-		return fmt.Errorf("listing users: %w", err)
+		return false, fmt.Errorf("listing users: %w", err)
 	}
 
 	confText := string(oldText)
 	patched := 0
 	for _, r := range cfg.Resources {
-		text, ok, patchErr := patchCatalogSection(vault, confText, r, users)
+		text, ok, patchErr := patchCatalogSection(vault, confText, r, users, live)
 		if patchErr != nil {
-			return patchErr
+			return false, patchErr
 		}
 		if ok {
 			confText = text
@@ -336,22 +340,22 @@ func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm bool) error {
 	}
 
 	if patched == 0 {
-		return fmt.Errorf("no catalog entries match any configured directory")
+		return false, fmt.Errorf("no catalog entries match any configured directory")
 	}
 
 	newBytes := []byte(confText)
 	if bytes.Equal(oldText, newBytes) {
 		log.Info("configuration is already up to date")
-		return nil
+		return false, nil
 	}
 	if !autoConfirm {
 		overwrite, overErr := inst.ConfirmOverwrite(systemd.SystemConfigPath, oldText, newBytes)
 		if overErr != nil {
-			return overErr
+			return false, overErr
 		}
 		if !overwrite {
 			log.Info("configuration update aborted by user")
-			return nil
+			return false, nil
 		}
 	} else {
 		log.Infof("catalog refresh: %d sections re-scanned, diff below", patched)
@@ -359,10 +363,10 @@ func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm bool) error {
 	}
 
 	if err := os.WriteFile(systemd.SystemConfigPath, newBytes, 0o600); err != nil {
-		return fmt.Errorf("writing updated configuration: %w", err)
+		return false, fmt.Errorf("writing updated configuration: %w", err)
 	}
 	log.Infof("daemon.conf updated (%d sections re-scanned)", patched)
-	return nil
+	return true, nil
 }
 
 // patchCatalogSection re-expands the whitelist for one config resource
@@ -377,7 +381,16 @@ func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm bool) error {
 // re-lock and is dropped only once the vault is keyless; a vault that
 // cannot be re-locked is a hard error, so the hook fails visibly and the
 // config write / daemon restart never proceed on an unresolved vault.
-func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.Resource, users []inst.User) (updated string, patched bool, err error) {
+//
+// In live mode (live=true) the daemon keeps running: its vaults are already
+// unlocked and guarded, so the re-scan touches no lock state at all and no
+// ephemeral guard is needed (the running guards + the installer's
+// GUARD_ALLOW_ROOT identity already protect the tree). A resource whose
+// fresh whitelist comes back EMPTY while the section previously had entries
+// is a hard error: that state means the vault is locked or this installer
+// is not the running daemon's binary — persisting it would silently shrink
+// the whitelist.
+func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.Resource, users []inst.User, live bool) (updated string, patched bool, err error) {
 	entry, user := resolveCatalogEntry(r.Path, users)
 	if entry == nil {
 		log.Infof("keeping user section as-is: %s", r.Path)
@@ -392,12 +405,16 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.R
 		}
 		if encrypted {
 			wasEncrypted = true
-			log.Infof("unlocking %s for whitelist re-expansion (under an ephemeral guard) ...", r.Path)
-			release, unlockErr := unlockUnderGuard(vault, r.Path)
-			if unlockErr != nil {
-				return "", false, unlockErr
+			if live {
+				log.Infof("re-scanning %s (daemon running: vault already unlocked and guarded) ...", r.Path)
+			} else {
+				log.Infof("unlocking %s for whitelist re-expansion (under an ephemeral guard) ...", r.Path)
+				release, unlockErr := unlockUnderGuard(vault, r.Path)
+				if unlockErr != nil {
+					return "", false, unlockErr
+				}
+				defer release()
 			}
-			defer release()
 		}
 	}
 
@@ -405,7 +422,12 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.R
 	freshWhitelist := candidate.FilterExistingWhitelist()
 	log.Infof("re-scanned %s (%s) — %d whitelisted binaries", r.Path, entry.Name, len(freshWhitelist))
 
-	if wasEncrypted {
+	if liveEmptyWhitelistRejected(wasEncrypted, live, len(freshWhitelist), len(parseSectionWhitelist(confText, r.Path))) {
+		return "", false, fmt.Errorf("live re-scan of %s produced an empty whitelist while the config lists binaries for it: "+
+			"the vault appears locked or this installer is not the running daemon's binary — refusing to shrink the whitelist", r.Path)
+	}
+
+	if wasEncrypted && !live {
 		log.Infof("re-locking %s ...", r.Path)
 		// The ephemeral guard is still attached: until the key is gone the
 		// tree keeps denying every non-root reader. Retry unbounded, like
@@ -419,6 +441,32 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r daemonconfig.R
 		return "", false, fmt.Errorf("patching section %s: %w", r.Path, patchErr)
 	}
 	return updated, true, nil
+}
+
+// parseSectionWhitelist extracts the binary paths currently listed in the
+// [watch <path>] section of confText, for the live empty-whitelist safety
+// check. Returns nil when the section is absent.
+func parseSectionWhitelist(confText, resourcePath string) []string {
+	needle := "[watch " + resourcePath + "]"
+	var out []string
+	inSection := false
+	for _, line := range strings.Split(confText, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[watch") {
+			inSection = trimmed == needle
+			continue
+		}
+		if !inSection || trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if trimmed == "need_encryption: true" || trimmed == "need_encryption: false" {
+			continue
+		}
+		if fields := strings.Fields(trimmed); len(fields) > 0 {
+			out = append(out, fields[0])
+		}
+	}
+	return out
 }
 
 // unlockUnderGuard attaches an ephemeral self-only whitelist guard on path
@@ -449,6 +497,18 @@ func unlockUnderGuard(vault *fscrypt.Vault, path string) (release func(), err er
 // ephemeral guard attached, so the tree stays guarded for as long as this
 // retry loop runs. A persistent pin blocks the pacman hook with a loud log
 // instead of silently leaving the vault unlocked.
+// liveEmptyWhitelistRejected is the live refresh's fail-closed contract: a
+// re-scan that comes back empty for a previously-populated encrypted
+// resource must be refused. That state means the vault is locked (stat on
+// plaintext names fails) or this installer binary is not the running
+// daemon's (reads denied) — persisting it would silently shrink the
+// whitelist. Non-encrypted resources are exempt: an empty re-scan there is
+// a legitimately uninstalled binary ("empty whitelists still deny
+// everything").
+func liveEmptyWhitelistRejected(encrypted, live bool, fresh, old int) bool {
+	return live && encrypted && fresh == 0 && old > 0
+}
+
 func lockVaultFully(vault *fscrypt.Vault, path string) {
 	for {
 		err := vault.Lock(path, true)

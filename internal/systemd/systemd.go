@@ -125,6 +125,13 @@ func SystemctlOutput(args ...string) string {
 	return string(out)
 }
 
+// IsDaemonActive reports whether the daemon service unit is currently
+// active, for callers that must distinguish a running daemon (vaults
+// unlocked, guards attached) from a stopped one.
+func IsDaemonActive() bool {
+	return strings.TrimSpace(SystemctlOutput("is-active", DaemonServiceName)) == daemonActiveState
+}
+
 // EnableAndVerify brings the daemon to enabled-and-running regardless of
 // prior state: a changed config on a running daemon is delivered via SIGHUP
 // reload (restart fallback); both states are verified.
