@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -45,6 +47,10 @@ func CheckBPFLSM() error {
 // CheckBPFLSMAt is CheckBPFLSM with an injectable lsm file path (for tests).
 func CheckBPFLSMAt(file string) error {
 	if os.Getenv(assumeBpfLsmEnv) == "1" {
+		// The escape hatch is intentional (privileged containers cannot
+		// read securityfs), but it silently disables the enforcement
+		// preflight — make the degraded check visible in the logs.
+		log.Warnf("%s=1: skipping the BPF LSM availability preflight — guards may silently not enforce if the host kernel lacks BPF LSM", assumeBpfLsmEnv)
 		return nil
 	}
 

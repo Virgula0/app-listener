@@ -2,11 +2,21 @@
 Description=app-listener daemon (eBPF LSM directory guard)
 Documentation=https://github.com/Virgula0/app-listener
 After=local-fs.target
+# The guard pins its LSM links into /sys/fs/bpf so they keep enforcing across
+# a SIGKILL; that mount must be up first.
+Wants=sys-fs-bpf.mount
+After=sys-fs-bpf.mount
 
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only
 ExecReload=/bin/kill -HUP $MAINPID
+# Safety net for a SIGKILL / crash / startup timeout: the guard's LSM links
+# are pinned to /sys/fs/bpf, so the guarded trees stay ENFORCED even after
+# the process dies; this then force-locks every encryption root, so the vault
+# key is gone too. systemd runs ExecStopPost after EVERY exit. The next start
+# retires the stale pins once its own guards are attached.
+ExecStopPost=-/usr/local/sbin/app-listener daemon --lockdown
 Restart=on-failure
 RestartSec=2s
 # The daemon only exits after every watched directory is locked again; a
@@ -14,6 +24,11 @@ RestartSec=2s
 # Never SIGKILL it mid-lockdown — that would leave the trees unlocked and
 # unguarded.
 TimeoutStopSec=infinity
+# Startup unlocks vaults and attaches guards; it now catches SIGTERM/SIGINT
+# and locks back on abort, but a hard SIGKILL from a startup timeout would
+# still leave vaults unlocked until ExecStopPost runs. Give startup room to
+# finish (a large tree scan is slow) rather than race that timeout.
+TimeoutStartSec=900
 
 User=root
 Group=root

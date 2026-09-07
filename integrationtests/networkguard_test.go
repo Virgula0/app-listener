@@ -8,12 +8,18 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 )
 
+// Network-guard state for the pooled container (see the guard helpers for
+// the PID-scoped lifecycle rationale).
+var (
+	netGuardPID     int
+	netGuardLogPath string
+)
+
 func (s *IntegrationSuite) startNetworkGuardStd(c testcontainers.Container, extraFlags ...string) {
 	flags := strings.Join(extraFlags, " ")
-	cmd := fmt.Sprintf("nohup /app-listener network-guard %s --headless > /tmp/guard.log 2>&1 &", flags)
-
-	code, out := s.exec(c, []string{"sh", "-c", cmd})
-	s.Require().Equalf(0, code, "starting network-guard: %s", out)
+	netGuardLogPath = fmt.Sprintf("/tmp/netguard-%d.log", time.Now().UnixNano())
+	cmd := fmt.Sprintf("nohup /app-listener network-guard %s --headless > %s 2>&1 &", flags, netGuardLogPath)
+	netGuardPID = s.capturePID(c, cmd)
 
 	// Wait until the guard finished attaching its LSM hooks (not just a fixed
 	// sleep: under host load attach can take a few seconds, and tests that
@@ -31,7 +37,8 @@ func (s *IntegrationSuite) startNetworkGuardStd(c testcontainers.Container, extr
 		time.Sleep(250 * time.Millisecond)
 	}
 
-	codeCheck, outCheck := s.exec(c, []string{"pgrep", "-f", "app-listener"})
+	codeCheck, outCheck := s.exec(c, []string{"sh", "-c",
+		fmt.Sprintf("kill -0 %d 2>/dev/null && echo alive || echo dead", netGuardPID)})
 	s.Require().Equalf(0, codeCheck, "network-guard process not running after start: %s", outCheck)
 }
 
@@ -40,13 +47,32 @@ func (s *IntegrationSuite) readNetGuardLog(c testcontainers.Container) string {
 	// the guard log very large, and streaming the whole file through a docker
 	// exec deadlocks the exec (docker's relay buffers while the exec command
 	// is still running).
-	_, out := s.exec(c, []string{"sh", "-c", "tail -c 262144 /tmp/guard.log"})
+	_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("tail -c 262144 %s", netGuardLogPath)})
 	return out
 }
 
 func (s *IntegrationSuite) stopNetGuard(c testcontainers.Container) {
-	s.exec(c, []string{"pkill", "-f", "app-listener"})
-	time.Sleep(500 * time.Millisecond)
+	if netGuardPID != 0 {
+		s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null || true", netGuardPID)})
+		if !s.awaitGone(c, netGuardPID, 3*time.Second) {
+			s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener network-guard' || true"})
+			s.awaitGone(c, netGuardPID, 3*time.Second)
+		}
+		netGuardPID = 0
+	} else {
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener' || true"})
+	}
+	// Pooled-container invariant: no LIVE stray app-listener may survive.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		code, _ := s.exec(c, []string{"sh", "-c", noLiveAppListenerProcs})
+		if code == 0 {
+			return
+		}
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener' || true"})
+		time.Sleep(200 * time.Millisecond)
+	}
+	s.Require().Fail("netguard cleanup", "stray app-listener processes survived stopNetGuard")
 }
 
 // netGuardBlockedEvent extracts a blocked (Blocked=true) event of the given
@@ -169,7 +195,7 @@ func guardNetTypesForComm(logContent, comm string) []string {
 // newNetGuardContainer starts a privileged container with the guard binary
 // and copies net_tester (+ optional extra binaries) into it.
 func (s *IntegrationSuite) newNetGuardContainer(extraBinaries []string) testcontainers.Container {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	c := s.netguardContainer()
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, "/net_tester", 0755))
 	for _, b := range extraBinaries {
 		s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, b, 0755))
@@ -179,12 +205,12 @@ func (s *IntegrationSuite) newNetGuardContainer(extraBinaries []string) testcont
 
 func (s *IntegrationSuite) TestNetworkGuard_Blacklist_Allowed() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.startNetworkGuardStd(c, "-b", "/net_tester")
 
 	s.exec(c, []string{"sh", "-c", "/other_tester tcp-server 8080 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8080, "tcp")
 
 	code, out := s.exec(c, []string{"sh", "-c", "/other_tester tcp-client 127.0.0.1 8080"})
 	s.Require().Equalf(0, code, "non-blacklisted binary should be allowed, but failed: %s", out)
@@ -194,7 +220,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Blacklist_Allowed() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Blacklist_BlockedBind() {
 	c := s.newNetGuardContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.startNetworkGuardStd(c, "-b", "/net_tester")
 
@@ -207,7 +233,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Blacklist_BlockedBind() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Blacklist_BlockedConnect() {
 	c := s.newNetGuardContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.startNetworkGuardStd(c, "-b", "/net_tester")
 
@@ -220,12 +246,12 @@ func (s *IntegrationSuite) TestNetworkGuard_Blacklist_BlockedConnect() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Whitelist_Allowed() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.startNetworkGuardStd(c, "-w", guardBinaryFlag("/net_tester"))
 
 	s.exec(c, []string{"sh", "-c", "/net_tester tcp-server 8081 > /tmp/server.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 8081, "tcp")
 
 	code, out := s.exec(c, []string{"sh", "-c", "/net_tester tcp-client 127.0.0.1 8081"})
 	s.Require().Equalf(0, code, "whitelisted binary should be allowed, but failed: %s", out)
@@ -239,7 +265,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Whitelist_Allowed() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedConnect() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.startNetworkGuardStd(c, "-w", guardBinaryFlag("/net_tester"))
 
@@ -252,7 +278,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedConnect() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedDns() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	s.startNetworkGuardStd(c, "-w", guardBinaryFlag("/net_tester"))
 
@@ -265,7 +291,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedDns() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Whitelist_NoFlags() {
 	c := s.newNetGuardContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	// No -w/-b: whitelist mode with no allowed binaries -> everything blocked.
 	s.startNetworkGuardStd(c)
@@ -283,7 +309,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Whitelist_NoFlags() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedListen() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	// Bind a socket before the guard attaches; it sleeps until the marker file
 	// appears and then calls listen(), which must be denied.
@@ -297,7 +323,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedListen() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedSend() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	// Start a sender that dials before the guard attaches and then waits for
 	// the marker; its later sendmsg calls must be denied once the guard is up.
@@ -311,7 +337,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedSend() {
 
 func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedRecv() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	// Bind + recv loop starts before the guard attaches and waits for the
 	// marker; its later recvmsg calls must be denied.
@@ -325,7 +351,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Whitelist_BlockedRecv() {
 
 func (s *IntegrationSuite) TestNetworkGuard_NoThrottle() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	// Only SEND events enter the pipeline: host daemons (e.g. avahi) flood
 	// recvmsg, and with --no-throttle that noise would overflow the ring
@@ -343,7 +369,7 @@ func (s *IntegrationSuite) TestNetworkGuard_NoThrottle() {
 
 func (s *IntegrationSuite) TestNetworkGuard_EventFilter() {
 	c := s.newNetGuardContainer([]string{"/other_tester"})
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	// Only CONNECT events may be reported/blocked.
 	s.startNetworkGuardStd(c, "-w", guardBinaryFlag("/net_tester"), "-e", "CONNECT")
@@ -360,7 +386,7 @@ func (s *IntegrationSuite) TestNetworkGuard_EventFilter() {
 
 func (s *IntegrationSuite) TestNetworkGuard_AutoInfra() {
 	c := s.newNetGuardContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	// Create fake systemd-resolved paths
 	s.exec(c, []string{"mkdir", "-p", "/usr/lib/systemd", "/run/systemd/resolve"})
@@ -369,7 +395,7 @@ func (s *IntegrationSuite) TestNetworkGuard_AutoInfra() {
 
 	// Start systemd-resolved so it is detected as running
 	s.exec(c, []string{"sh", "-c", "/usr/lib/systemd/systemd-resolved tcp-server 9000 > /tmp/resolved.log 2>&1 &"})
-	time.Sleep(1 * time.Second)
+	s.awaitNetTesterServer(c, 9000, "tcp")
 
 	s.startNetworkGuardStd(c, "-w", guardBinaryFlag("/net_tester"), "--auto-infra")
 
@@ -388,7 +414,7 @@ func (s *IntegrationSuite) TestNetworkGuard_AutoInfra() {
 
 func (s *IntegrationSuite) TestNetworkGuard_CLI_Errors() {
 	c := s.newNetGuardContainer(nil)
-	defer c.Terminate(s.ctx)
+	// pooled: terminated at suite end
 
 	cases := []struct {
 		name string

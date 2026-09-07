@@ -14,8 +14,8 @@ import (
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestMonitorAllEvents() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 
@@ -87,8 +87,8 @@ func (s *IntegrationSuite) TestMonitorAllEvents() {
 //
 // ---------------------------------------------------------------
 func (s *IntegrationSuite) TestMonitor_MetadataEvents() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo secret > /watch/file.txt"})
@@ -128,8 +128,8 @@ func (s *IntegrationSuite) TestMonitor_MetadataEvents() {
 }
 
 func (s *IntegrationSuite) TestMonitorSingleFile() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 
@@ -197,8 +197,8 @@ func (s *IntegrationSuite) TestMonitorSingleFile() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestMonitorEventFilter_Selective() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 
@@ -235,8 +235,8 @@ func (s *IntegrationSuite) TestMonitorEventFilter_Selective() {
 }
 
 func (s *IntegrationSuite) TestMonitorEventFilter_SingleType() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 
@@ -272,8 +272,8 @@ func (s *IntegrationSuite) TestMonitorEventFilter_SingleType() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestMonitorEventFilter_Selective_FileWatch() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	// Watched file must exist before starting the monitor (inode resolution)
@@ -303,8 +303,8 @@ func (s *IntegrationSuite) TestMonitorEventFilter_Selective_FileWatch() {
 }
 
 func (s *IntegrationSuite) TestMonitorEventFilter_SingleType_FileWatch() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	// Watched file must exist before starting the monitor (inode resolution)
@@ -334,8 +334,8 @@ func (s *IntegrationSuite) TestMonitorEventFilter_SingleType_FileWatch() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestMonitor_NonRecursive() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch/subdir"})
 	s.exec(c, []string{"sh", "-c", "echo top > /watch/top.txt"})
@@ -367,8 +367,8 @@ func (s *IntegrationSuite) TestMonitor_NonRecursive() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestMonitor_DepthLimit() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch/subdir/inner"})
 	s.exec(c, []string{"sh", "-c", "echo top > /watch/top.txt"})
@@ -415,8 +415,8 @@ func (s *IntegrationSuite) TestMonitor_DepthLimit() {
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestMonitor_Recursive() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch/subdir"})
 	s.exec(c, []string{"sh", "-c", "echo top > /watch/top.txt"})
@@ -453,33 +453,61 @@ func (s *IntegrationSuite) TestMonitor_Recursive() {
 func (s *IntegrationSuite) waitForMonitorStd(c testcontainers.Container, needle string, timeout time.Duration) (string, bool) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/monitor.log 2>/dev/null || true"})
+		_, out := s.exec(c, []string{"sh", "-c", "cat " + monitorLogPath + " 2>/dev/null || true"})
 		if strings.Contains(out, needle) {
 			return out, true
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/monitor.log 2>/dev/null || true"})
+	_, out := s.exec(c, []string{"sh", "-c", "cat " + monitorLogPath + " 2>/dev/null || true"})
 	return out, false
 }
 
+// Monitor-process state for the pooled container (see guard helpers for the
+// PID-scoped lifecycle rationale).
+var (
+	monitorPID     int
+	monitorLogPath string
+)
+
 func (s *IntegrationSuite) startMonitorStd(c testcontainers.Container, watchDir string, extraFlags ...string) {
 	flags := strings.Join(extraFlags, " ")
-	cmd := fmt.Sprintf("nohup /app-listener monitor -w %s --headless %s > /tmp/monitor.log 2>&1 &", watchDir, flags)
-	s.exec(c, []string{"sh", "-c", cmd})
+	monitorLogPath = fmt.Sprintf("/tmp/monitor-%d.log", time.Now().UnixNano())
+	cmd := fmt.Sprintf("nohup /app-listener monitor -w %s --headless %s > %s 2>&1 &", watchDir, flags, monitorLogPath)
+	monitorPID = s.capturePID(c, cmd)
 
 	_, ok := s.waitForMonitorStd(c, "monitor started", 15*time.Second)
 	s.Require().True(ok, "monitor should become ready (waiting for 'monitor started')")
 
-	codeCheck, outCheck := s.exec(c, []string{"pgrep", "-f", "app-listener"})
-	s.Require().Equalf(0, codeCheck, "monitor process not running after start: %s", outCheck)
-
-	time.Sleep(1 * time.Second)
+	// Readiness = the polled "monitor started" marker + the captured PID
+	// being alive; probes attach before the marker is printed.
+	code, out := s.exec(c, []string{"sh", "-c",
+		fmt.Sprintf("kill -0 %d 2>/dev/null && echo alive || echo dead", monitorPID)})
+	s.Require().Equalf(0, code, "monitor process not running after start: %s", out)
 }
 
 func (s *IntegrationSuite) stopMonitor(c testcontainers.Container) {
-	s.exec(c, []string{"pkill", "-f", "app-listener"})
-	time.Sleep(500 * time.Millisecond)
+	if monitorPID != 0 {
+		s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null || true", monitorPID)})
+		if !s.awaitGone(c, monitorPID, 3*time.Second) {
+			s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener monitor' || true"})
+			s.awaitGone(c, monitorPID, 3*time.Second)
+		}
+		monitorPID = 0
+	} else {
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener' || true"})
+	}
+	// Pooled-container invariant: no LIVE stray app-listener may survive.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		code, _ := s.exec(c, []string{"sh", "-c", noLiveAppListenerProcs})
+		if code == 0 {
+			return
+		}
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener' || true"})
+		time.Sleep(200 * time.Millisecond)
+	}
+	s.Require().Fail("monitor cleanup", "stray app-listener processes survived stopMonitor")
 }
 
 // ---------------------------------------------------------------
@@ -604,8 +632,8 @@ func (s *IntegrationSuite) exploitSingle(name string) {
 	}
 	s.Require().NotNil(et, "unknown exploit %s", name)
 
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	testFilePath := "/watch/test_file.txt"
@@ -632,8 +660,8 @@ func (s *IntegrationSuite) TestExploit_copy_file_range() { s.exploitSingle("copy
 func (s *IntegrationSuite) TestExploit_execve() {
 	et := exploitTests[6]
 
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	s.exec(c, []string{"sh", "-c", "echo '#!/bin/sh\necho executed' > /watch/.exec_target"})
@@ -650,8 +678,8 @@ func (s *IntegrationSuite) TestExploit_execve() {
 func (s *IntegrationSuite) TestExploit_io_uring() {
 	et := exploitTests[7]
 
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	testFilePath := "/watch/test_file.txt"
@@ -669,8 +697,8 @@ func (s *IntegrationSuite) TestExploit_io_uring() {
 func (s *IntegrationSuite) TestExploit_open_by_handle_at() {
 	et := exploitTests[8]
 
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	testFilePath := "/watch/test_file.txt"

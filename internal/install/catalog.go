@@ -25,6 +25,15 @@ type CandidateDir struct {
 	// Keep it minimal: each entry is a potential privilege-escalation path
 	// if abused while the directory is unlocked.
 	Whitelist map[string][]string
+	// WatchRelPaths optionally replaces the single [watch <RelPath>] section
+	// with MULTIPLE guarded subtrees inside RelPath, all sharing this entry's
+	// whitelist and fscrypt lifecycle (the section path stays the encryption
+	// root). Used for self-updating applications whose update workspace must
+	// stay outside the guarded set while the user data remains protected.
+	// Empty means the single RelPath watch (historical behavior). The paths
+	// are relative to the user's home, supporting the same %HOME% expansion
+	// as whitelist entries.
+	WatchRelPaths []string
 }
 
 // Catalog is the master list of critical directories probed for each selected
@@ -78,7 +87,8 @@ var Catalog = []CandidateDir{
 		}},
 	{Name: "Claude Code", RelPath: ".claude",
 		Whitelist: map[string][]string{
-			"/usr/local/bin/claude": nil, "/usr/bin/claude": nil,
+			"/usr/local/bin/claude":    nil,
+			"/usr/bin/claude":          nil,
 			"%HOME%/.local/bin/claude": nil,
 		}},
 	{Name: "Claude Code config", RelPath: ".config/claude",
@@ -118,6 +128,10 @@ var Catalog = []CandidateDir{
 			"/opt/visual-studio-code/code": nil, "/usr/share/code/code": nil, "/opt/visual-studio-code/bin/code": nil,
 			// Code's separate crash-dump writer process.
 			"/opt/visual-studio-code/chrome_crashpad_handler": nil, "/usr/share/code/chrome_crashpad_handler": nil,
+			// Code's extension-signature verifier, spawned per extension
+			// install/update to check CachedExtensionVSIXs/*.sigzip files.
+			"/opt/visual-studio-code/resources/app/node_modules/@vscode/vsce-sign/bin/vsce-sign": nil,
+			"/usr/share/code/resources/app/node_modules/@vscode/vsce-sign/bin/vsce-sign":         nil,
 		}},
 	{Name: "VS Code Insiders config", RelPath: ".config/Code - Insiders",
 		Whitelist: map[string][]string{
@@ -317,6 +331,22 @@ var Catalog = []CandidateDir{
 			"/usr/lib/brave-browser/chrome_crashpad_handler": nil,
 		}},
 	{Name: "Discord", RelPath: ".config/discord",
+		// The Arch package is a launcher stub: the app self-updates into
+		// versioned app-<ver> dirs and its wrapper/updater writes the vault
+		// root (installer.db, downloads) — so only the SENSIBLE subtrees are
+		// guarded and the update workspace stays out of the guarded set.
+		WatchRelPaths: []string{
+			".config/discord/Local Storage",
+			".config/discord/Session Storage",
+			".config/discord/IndexedDB",
+			".config/discord/WebStorage",
+			".config/discord/Service Worker",
+			".config/discord/Cookies",
+			".config/discord/Local State",
+			".config/discord/Crashpad",
+			".config/discord/blob_storage",
+			".config/discord/sentry",
+		},
 		Whitelist: map[string][]string{
 			"%HOME%/.config/discord/*/Discord": nil,
 			// Versioned app dir; the wildcard covers every release.
@@ -359,11 +389,24 @@ var Catalog = []CandidateDir{
 
 // PathFor returns the absolute candidate path for user, expanding
 // %USER%/%HOME%; AbsPath entries ignore the user entirely.
-func (c CandidateDir) PathFor(home, user string) string {
+func (c *CandidateDir) PathFor(home, user string) string {
 	if c.AbsPath != "" {
 		return expandPlaceholders(c.AbsPath, user, home)
 	}
 	return filepath.Join(home, expandPlaceholders(c.RelPath, user, home))
+}
+
+// ExtraWatchPathsFor expands the entry's WatchRelPaths into absolute paths
+// for the given user (placeholders resolved, same as PathFor).
+func (c *CandidateDir) ExtraWatchPathsFor(home, user string) []string {
+	if len(c.WatchRelPaths) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.WatchRelPaths))
+	for _, rel := range c.WatchRelPaths {
+		out = append(out, filepath.Join(home, expandPlaceholders(rel, user, home)))
+	}
+	return out
 }
 
 // BinaryRule is one whitelisted binary and its allowed events (empty list
@@ -375,7 +418,7 @@ type BinaryRule struct {
 
 // ExpandWhitelist expands %USER%/%HOME% and returns rules sorted by path so
 // config generation is deterministic despite map ordering.
-func (c CandidateDir) ExpandWhitelist(user, home string) []BinaryRule {
+func (c *CandidateDir) ExpandWhitelist(user, home string) []BinaryRule {
 	paths := make([]string, 0, len(c.Whitelist))
 	for bin := range c.Whitelist {
 		paths = append(paths, bin)

@@ -25,6 +25,12 @@ const (
 	// replacements that never produced a denied access (swapped while the
 	// old binary was still running).
 	resyncSweepEvery = 30 * time.Second
+
+	// Rollback lock-back budget: bounded (unlike Stop's infinite wait)
+	// because rollback runs on the SIGHUP handler, which must keep serving
+	// signals.
+	maxRollbackLockRounds  = 3
+	rollbackLockRetryDelay = 500 * time.Millisecond
 )
 
 // DaemonEvent is one guard event tagged with the resource it belongs to.
@@ -62,6 +68,11 @@ type daemonUseCase struct {
 	// stopping is set once lockdown begins; Reload refuses when set, so a
 	// SIGHUP mid-shutdown can never attach guards or unlock resources.
 	stopping bool
+	// orphans holds not-yet-committed guards from an aborted reload whose
+	// freshly unlocked resources could not be locked back within the
+	// bounded rollback budget: they stay attached denying access and are
+	// retired by Stop after its own lockdown (see rollbackReload).
+	orphans []repository.GuardRepository
 }
 
 func NewDaemonUseCase(resources []daemonconfig.Resource, vault repository.Vault, guards []repository.GuardRepository) (DaemonUseCase, error) {
@@ -97,12 +108,43 @@ func (d *daemonUseCase) Start() error {
 	return startErr
 }
 
+// encryptionRootOf returns the vault root whose fscrypt key lifecycle governs
+// resource r: the `watch:`-group's section path when set, the resource path
+// itself otherwise (ungrouped resources are their own encryption root).
+func encryptionRootOf(r *daemonconfig.Resource) string {
+	if r.EncryptionRoot != "" {
+		return r.EncryptionRoot
+	}
+	return r.Path
+}
+
+// uniqueEncryptionRoots deduplicates the encryption roots of the encrypted
+// resources: grouped watch paths share one vault root, and the fscrypt key
+// lifecycle must run exactly once per root.
+func uniqueEncryptionRoots(resources []daemonconfig.Resource) []string {
+	seen := make(map[string]bool)
+	var roots []string
+	for i := range resources {
+		r := &resources[i]
+		if !r.NeedEncryption {
+			continue
+		}
+		root := encryptionRootOf(r)
+		if !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	return roots
+}
+
 // verifyEncryptionStates checks every resource's encryption state against its
 // need_encryption setting before anything is unlocked or protected: a misconfigured
 // resource aborts the start.
 func (d *daemonUseCase) verifyEncryptionStates() error {
-	for _, r := range d.resources {
-		encrypted, err := d.vault.IsEncrypted(r.Path)
+	for i := range d.resources {
+		r := &d.resources[i]
+		encrypted, err := d.vault.IsEncrypted(encryptionRootOf(r))
 		if err != nil {
 			return fmt.Errorf("checking encryption on %s: %w", r.Path, err)
 		}
@@ -121,12 +163,11 @@ func (d *daemonUseCase) startGuards() error {
 		return err
 	}
 
-	for _, r := range d.resources {
-		if !r.NeedEncryption {
-			continue
-		}
-		if err := d.vault.Unlock(r.Path); err != nil {
-			return fmt.Errorf("unlocking %s: %w", r.Path, err)
+	// Grouped watch paths share one encryption root: the key is provisioned
+	// exactly once per vault (unlock is vault-wide by fscrypt semantics).
+	for _, root := range uniqueEncryptionRoots(d.resources) {
+		if err := d.vault.Unlock(root); err != nil {
+			return fmt.Errorf("unlocking %s: %w", root, err)
 		}
 	}
 
@@ -191,16 +232,27 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 				return
 			}
 		case <-sweep.C:
-			// Periodic sweep: catches replacements that never produced a denial.
-			if _, err := g.ReSyncBinaries(); err != nil {
-				log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
-			}
+			d.periodicSweep(resource, g)
 			lastResync = time.Now()
 		case <-d.done:
 			return
 		case <-stop:
 			return
 		}
+	}
+}
+
+// periodicSweep re-syncs the binary whitelist (catching replacements that
+// never produced a denial) and re-populates the inode map: single-file watch
+// roots recreated by their application (sqlite journaling/migrations) get a
+// new inode that runtime discovery cannot cover — without the re-scan the
+// recreated file would silently leave the guarded set.
+func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardRepository) {
+	if _, err := g.ReSyncBinaries(); err != nil {
+		log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
+	}
+	if err := g.PopulateInodes(); err != nil {
+		log.Errorf("daemon: periodic inode re-scan for %s: %v", resource, err)
 	}
 }
 
@@ -280,40 +332,43 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 // prepareNewResources validates and unlocks resources new to the configuration; kept
 // resources are untouched. Each unlock is recorded so rollback can lock it back.
 func (d *daemonUseCase) prepareNewResources(resources []daemonconfig.Resource, oldByPath map[string]int, unlocked *[]string) error {
-	for _, r := range resources {
-		if _, existed := oldByPath[r.Path]; existed {
+	for i := range resources {
+		if _, existed := oldByPath[resources[i].Path]; existed {
 			continue
 		}
-		if err := d.prepareAddedResource(r, unlocked); err != nil {
+		if err := d.prepareAddedResource(&resources[i], unlocked); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (d *daemonUseCase) prepareAddedResource(r daemonconfig.Resource, unlocked *[]string) error {
-	encrypted, err := d.vault.IsEncrypted(r.Path)
+func (d *daemonUseCase) prepareAddedResource(r *daemonconfig.Resource, unlocked *[]string) error {
+	// Grouped watch paths share the group's encryption root: the vault-level
+	// checks and the unlock target the root, and the rollback re-locks roots.
+	root := encryptionRootOf(r)
+	encrypted, err := d.vault.IsEncrypted(root)
 	if err != nil {
-		return fmt.Errorf("reload: checking encryption on %s: %w", r.Path, err)
+		return fmt.Errorf("reload: checking encryption on %s: %w", root, err)
 	}
 	if r.NeedEncryption && !encrypted {
-		return fmt.Errorf("reload: directory %s is NOT encrypted: run the fscrypt migration first or set need_encryption: false", r.Path)
+		return fmt.Errorf("reload: directory %s is NOT encrypted: run the fscrypt migration first or set need_encryption: false", root)
 	}
 	if !r.NeedEncryption && encrypted {
-		log.Warnf("daemon: reload: resource %s is encrypted but need_encryption: false \u2014 leaving it locked", r.Path)
+		log.Warnf("daemon: reload: resource %s is encrypted but need_encryption: false \u2014 leaving it locked", root)
 		return nil
 	}
-	provisioned, err := d.vault.IsProvisioned(r.Path)
+	provisioned, err := d.vault.IsProvisioned(root)
 	if err != nil {
-		return fmt.Errorf("reload: checking lock state of %s: %w", r.Path, err)
+		return fmt.Errorf("reload: checking lock state of %s: %w", root, err)
 	}
 	if provisioned {
 		return nil
 	}
-	if err := d.vault.Unlock(r.Path); err != nil {
-		return fmt.Errorf("reload: unlocking %s: %w", r.Path, err)
+	if err := d.vault.Unlock(root); err != nil {
+		return fmt.Errorf("reload: unlocking %s: %w", root, err)
 	}
-	*unlocked = append(*unlocked, r.Path)
+	*unlocked = append(*unlocked, root)
 	return nil
 }
 
@@ -344,16 +399,43 @@ func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards 
 	return nil
 }
 
-// rollbackReload detaches the not-yet-committed new guards and locks back
-// any resource the aborted reload unlocked.
+// rollbackReload aborts a reload without ever leaving a resource unlocked
+// and unguarded: while the not-yet-committed guards are still attached
+// (denying every non-whitelisted access), the freshly unlocked resources
+// are locked back with bounded retries, and the guards detach only once
+// every vault is keyless — the same ordering discipline as Stop. If a pin
+// outlasts the retry budget, the new guards are kept attached as orphans
+// (registered for the daemon's Stop) so the resource remains guarded;
+// an unlocked-and-unguarded state is unreachable by construction.
+//
+// Called only from Reload while holding d.mu, so the orphan registration
+// needs no extra locking. The retry budget is bounded — unlike Stop —
+// because rollback runs on the SIGHUP handler, which must keep serving
+// signals.
 func (d *daemonUseCase) rollbackReload(guards []repository.GuardRepository, unlocked []string) {
+	if len(unlocked) > 0 {
+		pending := append([]string(nil), unlocked...)
+		for round := 0; round < maxRollbackLockRounds && len(pending) > 0; round++ {
+			var still []string
+			for _, path := range pending {
+				if err := d.lockWithRetry(path); err != nil {
+					log.Errorf("daemon: rollback: %s is still unlocked: %v", path, err)
+					still = append(still, path)
+				}
+			}
+			pending = still
+			if len(pending) > 0 {
+				time.Sleep(rollbackLockRetryDelay)
+			}
+		}
+		if len(pending) > 0 {
+			log.Errorf("daemon: rollback gave up locking %v \u2014 the new guards STAY ATTACHED and deny access until the daemon stops", pending)
+			d.orphans = append(d.orphans, guards...)
+			return
+		}
+	}
 	for _, g := range guards {
 		g.Stop()
-	}
-	for _, path := range unlocked {
-		if err := d.lockWithRetry(path); err != nil {
-			log.Errorf("daemon: rollback: failed to re-lock %s: %v", path, err)
-		}
 	}
 }
 
@@ -397,31 +479,33 @@ func (d *daemonUseCase) Stop() {
 
 		resources := d.resources
 		guards := d.guards
+		// Grouped watch paths share one encryption root: lock each unique
+		// vault once (the lock is vault-wide by fscrypt semantics).
+		roots := uniqueEncryptionRoots(resources)
 
 		// First pass: remove the key where possible.
-		for _, r := range resources {
-			if !r.NeedEncryption {
-				continue
-			}
-			if err := d.vault.Lock(r.Path, false); err != nil && !errors.Is(err, repository.ErrKeyMissing) {
-				log.Warnf("daemon: first-pass lock of %s: %v", r.Path, err)
+		for _, root := range roots {
+			if err := d.vault.Lock(root, false); err != nil && !errors.Is(err, repository.ErrKeyMissing) {
+				log.Warnf("daemon: first-pass lock of %s: %v", root, err)
 			}
 		}
 
 		// Second pass: force-flush with EBUSY retries; ENOKEY (ErrKeyMissing) counts
 		// as success. Busy resources retry forever — detaching guards here would leave
 		// the tree unlocked and unguarded, so shutdown never gives up.
-		pending := make([]string, 0, len(resources))
-		for _, r := range resources {
-			if r.NeedEncryption {
-				pending = append(pending, r.Path)
-			}
-		}
-		d.lockUntilAllKeyless(pending)
+		d.lockUntilAllKeyless(roots)
 
 		for _, g := range guards {
 			g.Stop()
 		}
+		// Guards orphaned by an aborted reload (their resource could not
+		// be locked back in time) kept denying access throughout this
+		// lockdown; retire them last, after every configured vault is
+		// keyless.
+		for _, g := range d.orphans {
+			g.Stop()
+		}
+		d.orphans = nil
 		log.Info("daemon: shutdown complete, all vaults locked")
 	})
 }

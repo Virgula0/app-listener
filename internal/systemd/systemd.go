@@ -83,19 +83,28 @@ func VerifyInstalledResourcesLocked() error {
 }
 
 // VerifyResourcesLocked reports an error when any encrypted resource is
-// still provisioned (unlocked).
+// still provisioned (unlocked). Grouped resources share one fscrypt vault
+// keyed on the encryption root, so the lock state is checked there (and once
+// per root), not on each watch sub-path.
 func VerifyResourcesLocked(resources []daemonconfig.Resource, provisioned func(string) (bool, error)) error {
 	var unlocked []string
-	for _, r := range resources {
+	seen := make(map[string]bool)
+	for i := range resources {
+		r := &resources[i]
 		if !r.NeedEncryption {
 			continue
 		}
-		provisionedNow, err := provisioned(r.Path)
+		root := r.EncryptionRootOrPath()
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		provisionedNow, err := provisioned(root)
 		if err != nil {
-			return fmt.Errorf("checking lock state of %s: %w", r.Path, err)
+			return fmt.Errorf("checking lock state of %s: %w", root, err)
 		}
 		if provisionedNow {
-			unlocked = append(unlocked, r.Path)
+			unlocked = append(unlocked, root)
 		}
 	}
 	if len(unlocked) > 0 {
@@ -123,6 +132,13 @@ func SystemctlOutput(args ...string) string {
 		return ""
 	}
 	return string(out)
+}
+
+// IsDaemonActive reports whether the daemon service unit is currently
+// active, for callers that must distinguish a running daemon (vaults
+// unlocked, guards attached) from a stopped one.
+func IsDaemonActive() bool {
+	return strings.TrimSpace(SystemctlOutput("is-active", DaemonServiceName)) == daemonActiveState
 }
 
 // EnableAndVerify brings the daemon to enabled-and-running regardless of

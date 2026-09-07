@@ -15,6 +15,7 @@ import (
 	"github.com/Virgula0/app-listener/cmd/printers"
 	"github.com/Virgula0/app-listener/internal/gui"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/monitor"
 	"github.com/Virgula0/app-listener/internal/tui"
 	"github.com/Virgula0/app-listener/internal/usecase"
@@ -159,7 +160,7 @@ func runHeadless(uc usecase.MonitorUseCase) {
 				return
 			}
 			log.Infof("EVENT|%s|%s|%s|%d|%s|%d",
-				ev.Type.String(), ev.Comm, ev.Path, ev.PID, ev.Dest, ev.FD)
+				ev.Type.String(), logging.SanitizeText(ev.Comm), logging.SanitizeText(ev.Path), ev.PID, logging.SanitizeText(ev.Dest), ev.FD)
 		case <-sig:
 			return
 		}

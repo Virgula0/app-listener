@@ -233,29 +233,26 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 ```
 
 - **Whitelist only, default deny**; identity by inode — renaming a binary does not grant access.
-- **Per-binary event masks**: unlisted events are denied (EPERM); `READ`/`WRITE`/`MMAP` implicitly allow `OPEN`. Valid: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD`.
+- **Per-binary event masks**: unlisted events are denied (EPERM); `READ`/`WRITE`/`MMAP` implicitly allow `OPEN`. Valid: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD`. Masks are a per-binary least-privilege hint, **not a confinement boundary**: whitelist mode re-attributes an `execve` to the executed binary, so a masked binary that execs another whitelisted (unmasked) binary escapes its own mask. Do not rely on masks to contain a binary that may launch other whitelisted programs.
 - **Tolerance**: missing paths/binaries are skipped with a warning; malformed directives in a valid section fail fast.
-- **SIGHUP reload** (`systemctl reload`, or the pacman `PostTransaction` hook): recomputes every binary's inode identity atomically — new guards attach before old ones detach, protection is never weaker; a malformed config keeps the previous one running.
-- **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy or the daemon refuses to start. Shutdown deprovisions keys in two passes (plain, then force-flush with an EBUSY retry loop) while guards still deny access; hooks detach only after every vault is keyless.
-
-Minimal systemd unit:
-
-```ini
-[Unit]
-Description=app-listener daemon (fscrypt + eBPF LSM whitelist)
-
-[Service]
-ExecStart=/usr/local/bin/app-listener daemon --headless
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
+- **SIGHUP reload** (`systemctl reload`): recomputes every binary's inode identity atomically — new guards attach before old ones detach, protection is never weaker; a malformed config keeps the previous one running.
+- **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy or the daemon refuses to start. Shutdown deprovisions keys in two passes (plain, then force-flush with an EBUSY retry loop) while guards still deny access; hooks detach only after every vault is keyless. Keys speculatively provisioned by single-file unlocks whose cleanup hit a pin are retried and removed on every force flush (collateral cleanup) — an unconfigured directory is never left readable. The installed systemd unit (`daemon-samples/app-listener-daemon.service`) ships with `ProtectSystem=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `TimeoutStopSec=infinity`.
 
 ### install / uninstall / update / edit-protected
 
-**install** — TUI wizard, in safe order: stops a running daemon → builds the binary → generates the fscrypt key (existing keys kept) → picks users to protect → probes a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypts selected directories (backup first, then verified against the master key) → deploys systemd unit, pacman reload hook, per-user ssh-agent unit, binary and config. An existing backup **aborts** the migration; a failed policy application rolls back; empty whitelists still deny everything; the unit runs with `ProtectSystem=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`.
+**install** — TUI wizard, in safe order: stops a running daemon → builds the binary → generates the fscrypt key (existing keys kept) → picks users to protect → probes a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypts selected directories (backup first, then verified against the master key) → deploys systemd unit, pacman reload hook, per-user ssh-agent unit, binary and config. An existing backup **aborts** the migration; a failed policy application rolls back; empty whitelists still deny everything.
+
+**install --update-catalog-only** (the pacman `PostTransaction` hook, fires on every package transaction): re-expands every catalog-matched whitelist and rewrites the config. Two modes:
+- **stopped mode** (default): stops the daemon; encrypted vaults are unlocked per-resource **under an ephemeral self-only guard attached before the unlock**, re-locking retries unbounded while that guard stays attached — a vault that cannot be locked back is a hard error, so the hook never proceeds on an unlocked vault.
+- **`--live`** (requires the daemon running): no daemon stop, no lock churn — the vaults are already unlocked and guarded by the running daemon, the re-scan runs under the installer's own `GUARD_ALLOW_ROOT` identity, and the patched config is applied via SIGHUP (atomic reload). A resource whose re-scan comes back **empty** while the config lists binaries is refused (vault locked, or a different installer binary) — the whitelist is never silently shrunk.
+
+> **⚠ Self-updating applications (Discord, VS Code helpers, …)**: the whitelist is pinned to concrete binary inodes at config load. Apps that update **themselves** — outside pacman — change those binaries and paths (Discord's updater renames `app-<old>` away, downloads `app-<new>`, and its `updater-client` bootstrap is denied on `installer.db`), so the app breaks until the whitelist is refreshed. The pacman hook does **not** fire for these updates. Remedy (Discord, real case):
+> ```bash
+> sudo app-listener install --update-catalog-only --live --yes   # daemon running, no downtime
+> ```
+> Extension-signature denials (`comm=vsce-sign` in the journal) are the same class: the helper is whitelisted by the catalog since this fix. Encrypted resources make planting whitelisted binaries practically impossible: while the daemon runs the guards deny every non-whitelisted write into the vault, and when it is stopped the vault is locked.
+>
+> For self-updating apps the catalog now generates **narrowed watches**: instead of guarding the whole vault (whose root the updater must write to), only the sensitive subtrees are guarded — Discord's config, for example, becomes one group section with `watch:` directives for `Local Storage/`, `Cookies`, `Local State`, `Crashpad/`, etc. The vault root stays unguarded (the updater writes there freely), while the token stores remain protected against every non-whitelisted reader. Only the app binary itself still needs the refresh after each self-update.
 
 > **Prerequisite**: each filesystem must be fscrypt-initialized (`sudo fscrypt setup --all-users`) and support encryption (ext4: `sudo tune2fs -O encrypt <dev>`; f2fs: `sudo fsck.f2fs -O encrypt <dev>`). The installer verifies both before asking anything.
 

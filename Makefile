@@ -183,7 +183,7 @@ test:
 
 test-integration:
 	$(MAKE) -C integrationtests/exploits
-	go test ./integrationtests/ -v --count=1 -timeout 30m
+	go test ./integrationtests/ -v --count=1 -timeout 60m
 .PHONY: test-integration
 
 check-compatibility:

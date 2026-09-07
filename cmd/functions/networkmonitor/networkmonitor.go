@@ -13,6 +13,7 @@ import (
 	"github.com/Virgula0/app-listener/cmd/common"
 	"github.com/Virgula0/app-listener/cmd/printers"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/networkmonitor"
 	"github.com/Virgula0/app-listener/internal/tui"
 	"github.com/Virgula0/app-listener/internal/usecase"
@@ -117,8 +118,8 @@ func runHeadless(uc usecase.NetworkMonitorUseCase) {
 				return
 			}
 			log.Infof("NETEVENT|%s|%s|%s|%s|%s|%d|%d|%d|%d|%d",
-				ev.Type.String(), ev.Comm, ebpf.ProtocolString(ev.Protocol),
-				ev.SrcAddr, ev.DstAddr, ev.Size, ev.PID, ev.TID, ev.NetNS, ev.CgroupID)
+				ev.Type.String(), logging.SanitizeText(ev.Comm), ebpf.ProtocolString(ev.Protocol),
+				logging.SanitizeText(ev.SrcAddr), logging.SanitizeText(ev.DstAddr), ev.Size, ev.PID, ev.TID, ev.NetNS, ev.CgroupID)
 		case <-sig:
 			return
 		}

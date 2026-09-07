@@ -19,6 +19,11 @@
 #define ATTR_FILE 0x00002000
 #define GUARD_BLOCK 1
 #define GUARD_ALLOW 2
+// Root-gated allow: honored only when the current user is root (uid 0).
+// Used for the guard owner's own binary (the daemon), so its fscrypt
+// ioctls keep working without making the binary a universal key that any
+// local user can execute to inherit full access to guarded trees.
+#define GUARD_ALLOW_ROOT 3
 #define __FMODE_EXEC 0x20 // set in file->f_flags by kernel exec opens (do_open_execat)
 
 enum event_type {
@@ -107,6 +112,31 @@ struct {
 	__type(value, __u8);
 } guard_fs_devices SEC(".maps"); // block devices hosting guarded filesystems
 
+// Degradation counters — pure observability, read and logged by userspace,
+// never consulted by any decision path:
+//   [0] guard_inodes map full: runtime inode discovery dropped an add
+//       (coverage degrades to the ancestor walk beyond this point)
+//   [1] guard_tainted_pids map full: a taint stamp was lost (the process
+//       keeps working; its future ptrace/process_vm_readv is not denied)
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, __u32);
+	__type(value, __u64);
+} guard_degrade SEC(".maps");
+
+static __always_inline void count_degrade(__u32 slot)
+{
+	__u64 one = 1;
+	__u64 zero = 0;
+	__u64 *cell = bpf_map_lookup_elem(&guard_degrade, &slot);
+	if (!cell) {
+		bpf_map_update_elem(&guard_degrade, &slot, &zero, BPF_NOEXIST);
+		return;
+	}
+	__sync_fetch_and_add(cell, one);
+}
+
 // Tracks processes that have guarded file content in their address space.
 // Once tainted, process_vm_readv, ptrace, and /proc/<pid>/mem access
 // against this PID are blocked unless the caller is whitelisted.
@@ -135,6 +165,43 @@ char LICENSE[] SEC("license") = "GPL";
 static __always_inline int get_current_exe_inode(struct inode_key *ik)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (!task)
+		return 0;
+
+	struct mm_struct *mm;
+	bpf_probe_read_kernel(&mm, sizeof(mm), &task->mm);
+	if (!mm)
+		return 0;
+
+	struct file *exe_file;
+	bpf_probe_read_kernel(&exe_file, sizeof(exe_file), &mm->exe_file);
+	if (!exe_file)
+		return 0;
+	struct inode *exe_inode;
+	bpf_probe_read_kernel(&exe_inode, sizeof(exe_inode), &exe_file->f_inode);
+	if (!exe_inode)
+		return 0;
+
+	bpf_probe_read_kernel(&ik->ino, sizeof(ik->ino), &exe_inode->i_ino);
+
+	struct super_block *sb;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &exe_inode->i_sb);
+	if (!sb)
+		return 0;
+
+	dev_t dev;
+	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+	ik->dev = dev;
+
+	return 1;
+}
+
+// get_task_exe_inode resolves the executable identity of an ARBITRARY task
+// (not just current), used to protect whitelisted victims in
+// ptrace_access_check. Returns 0 for tasks without a userspace mm (kernel
+// threads), which carry no enforceable exe identity.
+static __always_inline int get_task_exe_inode(struct task_struct *task, struct inode_key *ik)
+{
 	if (!task)
 		return 0;
 
@@ -376,7 +443,8 @@ static __always_inline void mark_tainted(void)
 {
 	__u32 pid = bpf_get_current_pid_tgid() >> 32;
 	__u8 val = 1;
-	bpf_map_update_elem(&guard_tainted_pids, &pid, &val, BPF_ANY);
+	if (bpf_map_update_elem(&guard_tainted_pids, &pid, &val, BPF_ANY))
+		count_degrade(1);
 }
 
 // Add an inode to guard_inodes.  Used by inode_mkdir and path_rename
@@ -399,7 +467,8 @@ static __always_inline void add_inode_to_guard(struct inode *inode)
 	ikey.dev = dev;
 
 	__u8 v = 1;
-	bpf_map_update_elem(&guard_inodes, &ikey, &v, BPF_ANY);
+	if (bpf_map_update_elem(&guard_inodes, &ikey, &v, BPF_ANY))
+		count_degrade(0);
 }
 
 // Check if the accessed file is /proc/<pid>/mem for a tainted PID.
@@ -701,6 +770,20 @@ static void fill_path(struct dentry *dentry, char *out)
     }
 }
 
+// is_allow_action evaluates an exe-action entry under the current user:
+// GUARD_ALLOW always allows; GUARD_ALLOW_ROOT allows only for uid 0 (the
+// guard owner). NULL denies in whitelist mode.
+static __always_inline int is_allow_action(const __u8 *action)
+{
+	if (!action)
+		return 0;
+	if (*action == GUARD_ALLOW)
+		return 1;
+	if (*action == GUARD_ALLOW_ROOT)
+		return (bpf_get_current_uid_gid() & 0xffffffff) == 0;
+	return 0;
+}
+
 static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry, bool is_exec_open, bool quiet_allow)
 {
 	__u32 key = 0;
@@ -731,7 +814,7 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 		if (mode_val == 0) {
 			is_blocked = action != NULL && *action == GUARD_BLOCK;
 		} else {
-			is_blocked = action == NULL || *action != GUARD_ALLOW;
+			is_blocked = !is_allow_action(action);
 
 			// Exec-open attribution (whitelist mode only): executing a
 			// binary is an OPEN of that binary performed by the
@@ -775,7 +858,7 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 					}
 					target_action = bpf_map_lookup_elem(&guard_exe_actions, &target_ik);
 					if (target_action) {
-						if (*target_action == GUARD_ALLOW) {
+						if (is_allow_action(target_action)) {
 							exe_ik = target_ik;
 							is_blocked = 0;
 						}
@@ -1506,7 +1589,90 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 		return -EPERM;
 
 	__u8 *action = bpf_map_lookup_elem(&guard_exe_actions, &exe_ik);
-	if (!action || *action != GUARD_ALLOW)
+	if (!is_allow_action(action))
+		return -EPERM;
+
+	return 0;
+}
+
+// When a tainted process forks, the child inherits the parent's address
+// space (including file mappings).  Mark the child as tainted too so that
+// process_vm_readv on the child is also blocked.
+SEC("lsm/bprm_check_security")
+int guard_bprm_check_security(unsigned long long *ctx)
+{
+	// Executing a whitelisted binary while ptraced hands the tracer the
+	// victim's entire memory: the tracer may have attached BEFORE the
+	// victim ever ran (when its exe identity was not yet whitelisted and
+	// the attach-time check could not deny it), and PEEKDATA never fires
+	// another hook. Allow the exec only when the tracer itself is
+	// whitelisted; otherwise the whitelisted image must not run traced.
+	struct linux_binprm *bprm = (struct linux_binprm *)ctx[0];
+	if (!bprm)
+		return 0;
+
+	struct file *file = NULL;
+	bpf_probe_read_kernel(&file, sizeof(file), &bprm->file);
+	if (!file)
+		return 0;
+
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+	if (!inode)
+		return 0;
+
+	struct inode_key target_ik = {};
+	bpf_probe_read_kernel(&target_ik.ino, sizeof(target_ik.ino), &inode->i_ino);
+
+	struct super_block *sb = NULL;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return 0;
+
+	dev_t dev = 0;
+	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+	target_ik.dev = dev;
+
+	__u8 *taction = bpf_map_lookup_elem(&guard_exe_actions, &target_ik);
+	if (!is_allow_action(taction))
+		return 0;  // target is not whitelisted: not our concern
+
+	// Executing a whitelisted image taints the process IMMEDIATELY: from
+	// this instant the existing tainted-pid ptrace protection applies, so
+	// a tracer attaching after the exec is denied even though the victim
+	// has not touched the guarded tree yet. (The exec-open attribution in
+	// check_and_emit handles the open itself.)
+	mark_tainted();
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (!task)
+		return 0;
+
+	// Only TRACED processes are the race: an untraced exec is the normal
+	// exec-open attribution path (a non-whitelisted launcher executing a
+	// whitelisted in-tree binary must keep working — the exec fd is never
+	// exposed to the launcher).
+	__u32 ptrace_flags = 0;
+	bpf_probe_read_kernel(&ptrace_flags, sizeof(ptrace_flags), &task->ptrace);
+	if (!ptrace_flags)
+		return 0;
+
+	// For a traced task, ->parent points at the tracer (real_parent keeps
+	// the biological parent). If the tracer is not itself whitelisted, it
+	// must not gain a whitelisted image's memory through exec: it attached
+	// before the victim's identity existed and can PEEKDATA the guarded
+	// content out of the victim's memory once it reads.
+	struct task_struct *tracer = NULL;
+	bpf_probe_read_kernel(&tracer, sizeof(tracer), &task->parent);
+	if (!tracer)
+		return -EPERM;
+
+	struct inode_key tracer_ik = {};
+	if (!get_task_exe_inode(tracer, &tracer_ik))
+		return -EPERM;  // tracer has no resolvable identity: fail closed
+
+	__u8 *tracer_action = bpf_map_lookup_elem(&guard_exe_actions, &tracer_ik);
+	if (!is_allow_action(tracer_action))
 		return -EPERM;
 
 	return 0;

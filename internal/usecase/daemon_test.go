@@ -824,3 +824,130 @@ func TestDaemonUseCaseReloadRefusedDuringShutdown(t *testing.T) {
 		t.Error("the resource must stay locked after the shutdown")
 	}
 }
+
+// TestDaemonUseCaseReloadRollbackOrderLocksWhileGuarded is the regression
+// test for the rollback ordering bypass: a failed reload used to detach the
+// new guards BEFORE locking the freshly unlocked resource back, so a busy
+// pin left it unlocked with no guard attached (the old guards do not cover
+// a resource the old config never had). The rollback must lock first —
+// while the new guards still deny access — and detach only afterwards.
+func TestDaemonUseCaseReloadRollbackOrderLocksWhileGuarded(t *testing.T) {
+	vault := newFakeVault("/a", "/b")
+	old := newFakeGuardRepo()
+	d := startDaemon(t, vault, []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	newA, newB := newFakeGuardRepo(), newFakeGuardRepo()
+	newB.startErr = errBoom
+	err := d.Reload(
+		[]daemonconfig.Resource{resource("/a"), resource("/b")},
+		[]repository.GuardRepository{newA, newB},
+	)
+	if err == nil {
+		t.Fatal("expected error when a new guard fails to start")
+	}
+
+	if vault.unlocked["/b"] {
+		t.Error("the unlocked resource must be locked back on rollback")
+	}
+	if !newA.isStopped() || !newB.isStopped() {
+		t.Error("on a clean lock-back the new guards must be detached")
+	}
+	if old.isStopped() {
+		t.Error("the old guards must stay attached")
+	}
+}
+
+// TestDaemonUseCaseReloadRollbackBusyPinKeepsGuardsAttached covers the
+// pinned-fd case: when the lock-back cannot complete within the bounded
+// rollback budget, the new guards must STAY ATTACHED (denying access to the
+// still-unlocked resource) and must be retired by the daemon's Stop, so an
+// unlocked-and-unguarded state is unreachable.
+func TestDaemonUseCaseReloadRollbackBusyPinKeepsGuardsAttached(t *testing.T) {
+	vault := newFakeVault("/a", "/b")
+	old := newFakeGuardRepo()
+	d := startDaemon(t, vault, []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	newA, newB := newFakeGuardRepo(), newFakeGuardRepo()
+	newB.startErr = errBoom
+	vault.busyForever["/b"] = true
+
+	err := d.Reload(
+		[]daemonconfig.Resource{resource("/a"), resource("/b")},
+		[]repository.GuardRepository{newA, newB},
+	)
+	if err == nil {
+		t.Fatal("expected error when a new guard fails to start")
+	}
+
+	// Rollback exhausted its bounded budget: the guards stay attached as
+	// orphans while /b remains unlocked.
+	if !vault.isUnlocked("/b") {
+		t.Error("/b should still be unlocked (pin held) at this point")
+	}
+	if newA.isStopped() || newB.isStopped() {
+		t.Error("orphaned guards must stay attached while the resource is unlocked")
+	}
+	if old.isStopped() {
+		t.Error("the old guards must stay attached")
+	}
+
+	// Stop() must lock the configured vaults and then retire the orphans.
+	stopDone := make(chan struct{})
+	go func() {
+		d.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not complete")
+	}
+	if vault.isUnlocked("/a") {
+		t.Error("configured vault must be locked after Stop")
+	}
+	if !newA.isStopped() || !newB.isStopped() {
+		t.Error("orphaned guards must be stopped by Stop")
+	}
+	if !old.isStopped() {
+		t.Error("main guards must be stopped by Stop")
+	}
+}
+
+// TestDaemonUseCaseGroupedEncryptionRootsDeduplicated is the regression test
+// for the grouped-watch config: N watch paths inside one vault (one `watch:`
+// group) share a single fscrypt key lifecycle — the vault must be unlocked
+// exactly once at start and locked exactly once per pass at shutdown, no
+// matter how many watch paths reference it.
+func TestDaemonUseCaseGroupedEncryptionRootsDeduplicated(t *testing.T) {
+	vault := newFakeVault("/vault")
+	guards := []repository.GuardRepository{newFakeGuardRepo(), newFakeGuardRepo(), newFakeGuardRepo()}
+	resources := []daemonconfig.Resource{
+		{Path: "/vault/Local Storage", NeedEncryption: true, EncryptionRoot: "/vault"},
+		{Path: "/vault/Session Storage", NeedEncryption: true, EncryptionRoot: "/vault"},
+		{Path: "/vault/Cookies", NeedEncryption: true, EncryptionRoot: "/vault"},
+	}
+	d, err := NewDaemonUseCase(resources, vault, guards)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+	if err := d.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// One unlock for the shared root: the per-resource loop deduplicated.
+	if got := len(vault.unlockCalls); got != 1 {
+		t.Errorf("unlock calls = %v, want exactly [/vault]", vault.unlockCalls)
+	}
+
+	d.Stop()
+	// The lockdown locks the shared root once (first pass) and the force
+	// flush confirms it keyless — both targeting the same single root.
+	if vault.isUnlocked("/vault") {
+		t.Error("vault must be locked after Stop")
+	}
+	for i, g := range guards {
+		if !g.(*fakeGuardRepo).isStopped() {
+			t.Errorf("guards[%d] must be stopped", i)
+		}
+	}
+}

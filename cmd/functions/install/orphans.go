@@ -25,8 +25,12 @@ func cleanOrphanedFscrypt(cfg *daemonconfig.Config) error {
 	for i := range system {
 		paths = append(paths, system[i].Path)
 	}
-	for _, r := range cfg.Resources {
-		paths = append(paths, r.Path)
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
+		// Keep both the guarded watch path and its encryption root: grouped
+		// sections carry the fscrypt policy on the root, which must not be
+		// classified as orphaned metadata.
+		paths = append(paths, r.Path, r.EncryptionRootOrPath())
 	}
 
 	if err := fscrypt.CleanOrphanedMetadata(paths); err != nil {
