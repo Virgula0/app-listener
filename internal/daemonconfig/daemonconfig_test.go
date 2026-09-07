@@ -699,3 +699,67 @@ need_encryption: false
 		t.Error("an unencrypted group's resource must never be PathPending")
 	}
 }
+
+// TestLoadGroupedWatchPathRejectsSymlinkedIntermediate: a grouped watch
+// sub-path whose intermediate component is a symlink is dropped at parse time
+// — validateWatchTarget only Lstats the leaf, so without the component walk an
+// intermediate symlink pointing outside the vault would redirect the
+// inode-based guard onto an unrelated tree that would inherit the group's
+// whitelist and fscrypt lifecycle.
+func TestLoadGroupedWatchPathRejectsSymlinkedIntermediate(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "child"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "evil")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	sshPath := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(writeConfig(t, `[watch `+root+`]
+watch: `+filepath.Join(root, "evil", "child")+`
+`+sshPath+`
+need_encryption: true
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 0 {
+		t.Fatalf("a watch path via a symlinked intermediate must be dropped, got %+v", cfg.Resources)
+	}
+}
+
+// TestResolvePendingPathsRejectsSymlinkedIntermediate: the same protection at
+// unlock time — an intermediate component that appears as a symlink after the
+// vault is unlocked is a hard error, not a silently redirected guard.
+func TestResolvePendingPathsRejectsSymlinkedIntermediate(t *testing.T) {
+	root := t.TempDir()
+	sshPath := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(writeConfig(t, `[watch `+root+`]
+watch: `+filepath.Join(root, "mid", "data")+`
+`+sshPath+`
+need_encryption: true
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 1 || !cfg.Resources[0].PathPending {
+		t.Fatalf("want 1 pending resource, got %+v", cfg.Resources)
+	}
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "data"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "mid")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := ResolvePendingPaths(cfg); err == nil {
+		t.Error("a pending path reached through a symlinked intermediate must be a hard error")
+	}
+}

@@ -101,3 +101,42 @@ func TestCleanupStalePinsMissingBase(t *testing.T) {
 		t.Errorf("missing base: got (%d, %v), want (0, nil)", n, err)
 	}
 }
+
+func TestDirIsRootOwnedSafe(t *testing.T) {
+	base := t.TempDir()
+
+	// A directory the test process owns with 0700 is "root-owned safe" only
+	// when the test runs as root; otherwise the uid check is what rejects it.
+	// Either way a world-writable dir and a symlink must always be rejected.
+	ok := filepath.Join(base, "ok")
+	if err := os.Mkdir(ok, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		if err := dirIsRootOwnedSafe(ok); err != nil {
+			t.Errorf("root-owned 0700 dir rejected: %v", err)
+		}
+	}
+
+	ww := filepath.Join(base, "ww")
+	if err := os.Mkdir(ww, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ww, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := dirIsRootOwnedSafe(ww); err == nil {
+		t.Error("world-writable dir must be rejected")
+	}
+
+	if err := os.Symlink(ok, filepath.Join(base, "lnk")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := dirIsRootOwnedSafe(filepath.Join(base, "lnk")); err == nil {
+		t.Error("a symlink must be rejected as the pin base")
+	}
+
+	if err := dirIsRootOwnedSafe(filepath.Join(base, "missing")); err == nil {
+		t.Error("a missing path must be rejected")
+	}
+}

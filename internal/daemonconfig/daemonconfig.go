@@ -275,7 +275,11 @@ func materializeWatchGroup(cfg *Config, g *watchGroup) {
 	}
 	grouped := len(g.watchPaths) > 0
 	for _, watchPath := range paths {
-		res := addResource(cfg, watchPath, g.lineNo)
+		encRoot := ""
+		if grouped {
+			encRoot = g.root
+		}
+		res := addResource(cfg, watchPath, encRoot, g.lineNo)
 		if res == nil {
 			if grouped {
 				res = deferPendingWatchPath(cfg, g, watchPath)
@@ -332,7 +336,7 @@ func ResolvePendingPaths(cfg *Config) error {
 		if !r.PathPending {
 			continue
 		}
-		if err := validateWatchTarget(r.Path); err != nil {
+		if err := validateWatchTarget(r.Path, r.EncryptionRoot); err != nil {
 			return fmt.Errorf("grouped watch path %s (encryption root %s): %w", r.Path, r.EncryptionRoot, err)
 		}
 		r.PathPending = false
@@ -375,8 +379,10 @@ func parseWatchSection(line string) (path string, isSection bool, err error) {
 // addResource creates a resource for watchPath, returning nil for unguardable targets:
 // missing paths, symlinks, hard-linked regular files (the inode-based guard would
 // implicitly cover another path) and anything not a directory or unique regular file.
-func addResource(cfg *Config, watchPath string, lineNo int) *Resource {
-	if err := validateWatchTarget(watchPath); err != nil {
+// encRoot is the encryption root for a grouped watch sub-path ("" when ungrouped),
+// used to reject a symlinked intermediate component between the two.
+func addResource(cfg *Config, watchPath, encRoot string, lineNo int) *Resource {
+	if err := validateWatchTarget(watchPath, encRoot); err != nil {
 		log.Warnf("daemon config line %d: skipping %s: %v", lineNo, watchPath, err)
 		return nil
 	}
@@ -387,8 +393,17 @@ func addResource(cfg *Config, watchPath string, lineNo int) *Resource {
 // validateWatchTarget refuses a watch target that would make the inode-based
 // guard ambiguous or meaningless: an unreadable/missing path, a symlink, a
 // hard-linked regular file (the inode also names another path) and anything
-// that is not a directory or a unique regular file.
-func validateWatchTarget(watchPath string) error {
+// that is not a directory or a unique regular file. When encRoot is set (a
+// grouped watch sub-path), an existing symlinked path component between the
+// encryption root and watchPath is refused too — it could otherwise redirect
+// the guard onto a tree outside the vault that would silently share the
+// group's whitelist and fscrypt lifecycle.
+func validateWatchTarget(watchPath, encRoot string) error {
+	if encRoot != "" {
+		if err := rejectSymlinkedComponents(encRoot, watchPath); err != nil {
+			return err
+		}
+	}
 	info, err := os.Lstat(watchPath)
 	if err != nil {
 		return fmt.Errorf("missing or unreadable path")
@@ -402,6 +417,37 @@ func validateWatchTarget(watchPath string) error {
 		}
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
 			return fmt.Errorf("hard-linked files (%d links) are refused as watch targets", stat.Nlink)
+		}
+	}
+	return nil
+}
+
+// rejectSymlinkedComponents refuses any existing path component strictly
+// between encRoot and target that is a symbolic link. validateWatchTarget
+// only Lstats the final component, so without this an intermediate symlink
+// (e.g. a `watch: <root>/link/sub` where <root>/link points outside the
+// vault) would redirect the inode-based guard onto a tree the group never
+// meant to protect. Components that do not exist yet are left to the leaf
+// validation and the deferred-resolution pass — a locked fscrypt vault hides
+// its sub-path names until the daemon unlocks it.
+func rejectSymlinkedComponents(encRoot, target string) error {
+	rel, relErr := filepath.Rel(encRoot, target)
+	if relErr != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
+		return nil //nolint:nilerr // a non-sub-path (relErr, or ".."/".") is not this check's concern — isInsidePath already rejected it
+	}
+	segs := strings.Split(rel, string(filepath.Separator))
+	cur := encRoot
+	for _, seg := range segs[:len(segs)-1] { // intermediates only; the leaf is validateWatchTarget's job
+		if seg == "" || seg == "." {
+			continue
+		}
+		cur = filepath.Join(cur, seg)
+		info, statErr := os.Lstat(cur)
+		if statErr != nil {
+			return nil //nolint:nilerr // a component not present yet is deliberately deferred to the leaf validation / ResolvePendingPaths pass, not an error here
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("intermediate path component %q is a symbolic link (guard identity is inode based)", cur)
 		}
 	}
 	return nil

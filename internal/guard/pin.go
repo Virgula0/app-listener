@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
+	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -17,6 +19,10 @@ import (
 // pinFilePrefix tags every pin file this daemon creates so CleanupStalePins
 // never touches another tool's pins sharing the bpffs mount.
 const pinFilePrefix = "al-"
+
+// pinSubdir is the one directory this guard creates under the bpffs mount to
+// keep its pins tidy; a pre-existing one is reused only when dirIsRootOwnedSafe.
+const pinSubdir = "app-listener"
 
 // ResolvePinBase makes link pinning usable and returns the directory pin
 // files go in — or "" when this host cannot support pinning, in which case
@@ -43,14 +49,51 @@ func ResolvePinBase(mountpoint string) string {
 			return ""
 		}
 	}
-	// Prefer one tidy subdirectory; fall back to the mount root if the kernel
-	// refuses even a single mkdir on bpffs.
-	sub := filepath.Join(mountpoint, "app-listener")
-	if mkErr := os.Mkdir(sub, 0o700); mkErr == nil || errors.Is(mkErr, os.ErrExist) {
+	// Prefer one tidy subdirectory; fall back to the mount root (kernel-created,
+	// not adoptable by a local user) if the kernel refuses even a single mkdir
+	// on bpffs, or if a subdirectory is already there but is not a plain
+	// root-owned, non-world-writable directory — a local user who reached the
+	// bpffs mount must not be able to seed or observe our pins.
+	sub := filepath.Join(mountpoint, pinSubdir)
+	switch mkErr := os.Mkdir(sub, 0o700); {
+	case mkErr == nil:
 		return sub
+	case errors.Is(mkErr, os.ErrExist):
+		if safeErr := dirIsRootOwnedSafe(sub); safeErr != nil {
+			log.Warnf("guard: not reusing %s (%v) — pinning LSM links directly under %s", sub, safeErr, mountpoint)
+			return mountpoint
+		}
+		return sub
+	default:
+		log.Warnf("guard: cannot create %s (%v) — pinning LSM links directly under %s", sub, mkErr, mountpoint)
+		return mountpoint
 	}
-	log.Warnf("guard: cannot create %s — pinning LSM links directly under %s", sub, mountpoint)
-	return mountpoint
+}
+
+// dirIsRootOwnedSafe returns why path is unsafe to reuse as the pin base, or
+// nil when it is a real directory owned by uid 0 with no group/other write.
+func dirIsRootOwnedSafe(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("it is a symlink")
+	}
+	if !info.IsDir() {
+		return errors.New("it is not a directory")
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("ownership is unreadable")
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("owned by uid %d, not root", st.Uid)
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("mode %04o is group/other-writable", perm)
+	}
+	return nil
 }
 
 func mountBpffs(mountpoint string) error {
@@ -143,6 +186,11 @@ func CleanupStalePins(base string, keep map[string]bool) (removed int, err error
 		}
 		path := filepath.Join(base, e.Name())
 		if l, loadErr := link.LoadPinnedLink(path, nil); loadErr == nil {
+			if reason := foreignPinnedLink(l); reason != "" {
+				log.Warnf("guard: pin file %s holds a %s, not one of our LSM links — leaving it in place", path, reason)
+				_ = l.Close()
+				continue
+			}
 			if unpinErr := l.Unpin(); unpinErr != nil {
 				log.Warnf("guard: unpinning stale link %s failed: %v", path, unpinErr)
 			}
@@ -157,4 +205,34 @@ func CleanupStalePins(base string, keep map[string]bool) (removed int, err error
 		log.Warnf("guard: retired %d stale LSM link pin(s) from a previous daemon instance", removed)
 	}
 	return removed, nil
+}
+
+// foreignPinnedLink returns a short description when l is demonstrably NOT one
+// of this guard's LSM links — a non-LSM program, or an LSM program outside our
+// guard_* namespace — so CleanupStalePins leaves it untouched even though its
+// file name matched the al- pattern. It is deliberately conservative: when the
+// link or its program cannot be introspected (older kernel, missing
+// capability) it returns "" and the caller falls back to the file-name match,
+// which is already app-listener specific.
+func foreignPinnedLink(l link.Link) string {
+	info, err := l.Info()
+	if err != nil {
+		return ""
+	}
+	prog, err := cilium.NewProgramFromID(info.Program)
+	if err != nil {
+		return ""
+	}
+	defer prog.Close()
+	pInfo, err := prog.Info()
+	if err != nil {
+		return ""
+	}
+	if pInfo.Type != cilium.LSM {
+		return fmt.Sprintf("%s program", pInfo.Type)
+	}
+	if !strings.HasPrefix(pInfo.Name, "guard_") {
+		return fmt.Sprintf("foreign LSM program %q", pInfo.Name)
+	}
+	return ""
 }
