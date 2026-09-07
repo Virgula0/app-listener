@@ -4,22 +4,27 @@ Monitor or guard file system and network operations with eBPF — the daemon pro
 
 ![demo.gif](./media/demo.gif)
 
-> Vibe-coding experiment, coded mainly with the free DeepSeek V4 Flash and Claude Code. Not for production systems.
-
 ## Contents
 
 - [Compatibility](#compatibility)
 - [Quick Start](#quick-start)
 - [How it works](#how-it-works)
 - [Modes](#modes)
-  - [monitor](#monitor--observe) · [guard](#guard--block-file-access) · [network-monitor](#network-monitor--watch-network) · [network-guard](#network-guard--block-network) · [daemon](#daemon--fscrypt--whitelist-lifecycle) · [install / uninstall / update / edit-protected](#install--uninstall--update--edit-protected)
+  - [monitor](#monitor--observe)
+  - [guard](#guard--block-file-access)
+  - [network-monitor](#network-monitor--watch-network)
+  - [network-guard](#network-guard--block-network)
+  - [daemon](#daemon--fscrypt--whitelist-lifecycle)
+  - [install.sh / install / uninstall / update / edit-protected](#installsh--install--uninstall--update--edit-protected)
 - [Debug](#debug)
 - [Makefile targets](#makefile-targets)
 - [Docker](#docker)
 
+> Vibe-coding experiment, coded mainly with the free DeepSeek V4 Flash and Claude Code. Not for production systems.
+
 ## Compatibility
 
-Run `make check-compatibility` first — it performs every static check (kernel version, kernel `.config`, BTF, BPF-LSM activation, fscrypt prerequisites, BPF sysctls) and tells you plainly whether the host can run app-listener. (`make build` runs the toolchain in Docker, so nothing has to be installed on the host to build it.)
+Run `make check-compatibility` first — it performs every static check (kernel version, kernel `.config`, BTF, BPF-LSM activation, fscrypt prerequisites, BPF sysctls) and tells you plainly whether the host can run app-listener. The one-line installer below runs it for you and refuses to install when it fails. (`make build` runs the toolchain in Docker, so nothing has to be installed on the host to build it.)
 
 | Distribution | Min. kernel | Support | Activation |
 |---|---|---|---|
@@ -33,31 +38,46 @@ Run `make check-compatibility` first — it performs every static check (kernel 
 
 ## Quick Start
 
-```bash
-# 1. Build. `make build` runs the toolchain in a rootful Docker container with
-#    the host's BTF vmlinux mounted, output at build/linux/app-listener owned
-#    by you. No Docker? Install clang/LLVM, bpftool, Go 1.26+, GCC and run
-#    `make build-host`.
-make build
+**1. Install the binary.** The one-liner runs `check-compatibility`, downloads the latest signed release from GitHub, verifies it (Ed25519 signature + sha256 + GitHub asset digest — the same checks as `app-listener update`) and installs it to `/usr/local/sbin/app-listener`:
 
-# 2. Interactive installer (root): builds the binary, generates the fscrypt
-#    master key, discovers critical directories, encrypts the selected ones
-#    (with backups), installs the systemd unit + pacman reload hook, enables
-#    the daemon. Revert with `sudo ./build/linux/app-listener uninstall`.
-sudo ./build/linux/app-listener install
+```bash
+curl -fsSL https://raw.githubusercontent.com/Virgula0/app-listener/main/scripts/install.sh | sudo bash
+```
+
+Only pre-release builds are published right now — add `--channel prerelease` until the first stable release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Virgula0/app-listener/main/scripts/install.sh | sudo bash -s -- --channel prerelease
+```
+
+<details><summary>Build from source instead</summary>
+
+```bash
+# `make build` runs the toolchain in a rootful Docker container with the host's
+# BTF vmlinux mounted, output at build/linux/app-listener owned by you. No
+# Docker? Install clang/LLVM, bpftool, Go 1.26+, GCC and run `make build-host`.
+make build
+sudo ./build/linux/app-listener install   # (below) — uses ./build/linux/app-listener in place of app-listener
+```
+</details>
+
+**2. Protect directories with the daemon** (interactive, root) — builds/keeps the fscrypt master key, discovers critical directories, encrypts the selected ones (with backups), installs the systemd unit + pacman reload hook, enables the daemon. **Never automatic — you run it.** Revert with `sudo app-listener uninstall`.
+
+```bash
+sudo app-listener install
 ```
 
 One line per mode:
 
 ```bash
-sudo ./build/linux/app-listener monitor -w /tmp                                  # observe file ops
-sudo ./build/linux/app-listener guard /tmp -w /usr/bin/cat                       # block all but cat
-sudo ./build/linux/app-listener network-monitor /usr/bin/bash                    # watch bash network ops
-sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
-sudo ./build/linux/app-listener daemon --genkey                                  # fscrypt master key
-sudo ./build/linux/app-listener daemon --headless --blocked-only                 # protected daemon
-sudo systemctl reload app-listener-daemon                                        # re-resolve whitelist inodes
-sudo app-listener update --yes                                                   # self-update from GitHub
+sudo app-listener monitor -w /tmp                                  # observe file ops
+sudo app-listener guard /tmp -w /usr/bin/cat                       # block all but cat
+sudo app-listener network-monitor /usr/bin/bash                    # watch bash network ops
+sudo app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
+sudo app-listener daemon --genkey                                  # fscrypt master key
+sudo app-listener daemon --headless --blocked-only                 # protected daemon
+sudo systemctl reload app-listener-daemon                          # re-resolve whitelist inodes
+sudo app-listener update --yes                                     # self-update from GitHub
 ```
 
 Exit any TUI with `q` or `Ctrl+C`.
@@ -195,7 +215,9 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 - **SIGHUP reload** (`systemctl reload`): recomputes every binary's inode identity atomically — new guards attach before old ones detach; a malformed config keeps the previous one running.
 - **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy. Shutdown deprovisions keys in two passes while guards still deny access; hooks detach only after every vault is keyless. A hard `SIGKILL` cannot be caught, but the guard's LSM links are pinned to `/sys/fs/bpf` so the trees stay enforced until `ExecStopPost` locks the vaults.
 
-### install / uninstall / update / edit-protected
+### install.sh / install / uninstall / update / edit-protected
+
+**`scripts/install.sh`** (the `curl … | sudo bash` one-liner) — runs `check-compatibility` and aborts if it fails; downloads the latest release of `--channel` (`release` [default] / `prerelease`) from GitHub; verifies the Ed25519 signature of the checksum against the embedded release key, the checksum against the binary, and the GitHub asset digest; then atomically installs `/usr/local/sbin/app-listener` + the PATH symlink. It does **not** install the daemon — it prints the reminder to run `sudo app-listener install` yourself.
 
 **install** — TUI wizard, in safe order: stop a running daemon → build → generate the fscrypt key (existing kept) → pick users → probe a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypt selected directories (backup first, verified against the master key) → deploy systemd unit, pacman reload hook, per-user ssh-agent unit, binary and config.
 
