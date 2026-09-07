@@ -97,7 +97,7 @@ func initLogger() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().BoolVarP(&guiFlag, "gui", "", false, "Launch GUI instead of TUI (default: false)")
+	rootCmd.PersistentFlags().BoolVarP(&guiFlag, "gui", "", false, "Launch the desktop GUI instead of the TUI (monitor only; requires a build with -tags gui / make GUI=1)")
 	rootCmd.PersistentFlags().IntVarP(&verboseFlag, "verbose", "v", 0,
 		fmt.Sprintf("Verbosity level 0..%d for the headless console stream and --dump-log "+
 			"(%d=errors only, %d=essential, %d=current display, %d=+internal details, %d=everything). "+

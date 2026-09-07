@@ -85,6 +85,14 @@ func (f *fakeGuardRepo) ReSyncBinaries() (int, error) {
 	return 1, nil
 }
 
+func (f *fakeGuardRepo) SweepInodes() error {
+	if f.populateErr != nil {
+		return f.populateErr
+	}
+	f.populated = true
+	return nil
+}
+
 func (f *fakeGuardRepo) Start() error {
 	f.started = true
 	return f.startErr

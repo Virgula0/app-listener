@@ -156,7 +156,12 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 24);
+	// 2 MiB (~3.5k events). The reader drains continuously on a dedicated
+	// goroutine and enforcement is synchronous in the LSM hook, so an
+	// overflow only drops a telemetry record, never a decision. The old
+	// 16 MiB ring cost ~32 MiB of double-mapped user memory *per guard*
+	// (dozens of guards on a grouped config) for headroom nothing needs.
+	__uint(max_entries, 1 << 21);
 } rb SEC(".maps");
 
 char LICENSE[] SEC("license") = "GPL";

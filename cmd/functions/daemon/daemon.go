@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -68,6 +70,7 @@ var (
 	lockdownFlag bool
 	headless     bool
 	blockedOnly  bool
+	pprofAddr    string
 )
 
 var DaemonCmd = &cobra.Command{
@@ -124,6 +127,38 @@ func init() {
 		"Force-lock every encryption root in the config and exit. Wired into the systemd unit as ExecStopPost: "+
 			"systemd runs it after every exit (clean stop, crash, SIGKILL, startup timeout), so a daemon that died "+
 			"before its own lockdown finished never leaves a vault unlocked.")
+	DaemonCmd.Flags().StringVarP(&pprofAddr, "pprof", "", "",
+		"Serve net/http/pprof on this loopback address for profiling (e.g. 127.0.0.1:6060). Refused on non-loopback addresses. Off by default.")
+}
+
+// startPprof exposes the Go profiler on a loopback address only. It is opt-in
+// (--pprof) and meant for diagnosing daemon CPU/memory: `go tool pprof
+// http://127.0.0.1:6060/debug/pprof/{heap,profile,goroutine}`.
+func startPprof(addr string) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		log.Errorf("pprof: ignoring --pprof %q: %v", addr, err)
+		return
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		log.Errorf("pprof: refusing to expose the profiler on non-loopback address %q", addr)
+		return
+	}
+	// Own mux, not DefaultServeMux: keeps the profiler entirely inside this
+	// listener (nothing else is exposed) and off any global handler table.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	go func() {
+		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		log.Warnf("pprof: profiler on http://%s/debug/pprof/ — diagnostic only, do not leave enabled", addr)
+		if err := srv.ListenAndServe(); err != nil {
+			log.Errorf("pprof: %v", err)
+		}
+	}()
 }
 
 func runDaemon(cmd *cobra.Command, args []string) error {
@@ -137,6 +172,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if lockdownFlag {
 		runLockdown()
 		return nil
+	}
+	if pprofAddr != "" {
+		startPprof(pprofAddr)
 	}
 
 	configPath, cfg, pin, err := prepareDaemonStart()

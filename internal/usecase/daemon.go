@@ -21,9 +21,11 @@ const (
 	// resyncMinInterval throttles post-denial re-syncs: a denial storm must
 	// not re-stat every whitelisted binary on each event.
 	resyncMinInterval = 2 * time.Second
-	// resyncSweepEvery is the background re-sync interval, catching
-	// replacements that never produced a denied access (swapped while the
-	// old binary was still running).
+	// resyncSweepEvery is the background sweep interval, catching binary
+	// replacements that never produced a denied access (swapped while the old
+	// binary was still running) and recreated single-file watch roots. The
+	// sweep is fingerprint-gated (SweepInodes) so each tick is cheap when
+	// nothing changed.
 	resyncSweepEvery = 30 * time.Second
 
 	// Rollback lock-back budget: bounded (unlike Stop's infinite wait)
@@ -243,16 +245,17 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 }
 
 // periodicSweep re-syncs the binary whitelist (catching replacements that
-// never produced a denial) and re-populates the inode map: single-file watch
-// roots recreated by their application (sqlite journaling/migrations) get a
-// new inode that runtime discovery cannot cover — without the re-scan the
-// recreated file would silently leave the guarded set.
+// never produced a denial) and refreshes the inode map. SweepInodes only does
+// real work when the watch root's fingerprint moved (a recreated single-file
+// root — sqlite journals — or a directory that gained/lost a top-level
+// entry); an unconditional full re-walk every tick was a large share of the
+// daemon's steady-state CPU.
 func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardRepository) {
 	if _, err := g.ReSyncBinaries(); err != nil {
 		log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
 	}
-	if err := g.PopulateInodes(); err != nil {
-		log.Errorf("daemon: periodic inode re-scan for %s: %v", resource, err)
+	if err := g.SweepInodes(); err != nil {
+		log.Errorf("daemon: periodic inode sweep for %s: %v", resource, err)
 	}
 }
 

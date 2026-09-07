@@ -98,6 +98,15 @@ type Guard struct {
 	deployed map[string]GuardInodeKey
 	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
 	eagerPopulate bool
+	// sweepRootKey / sweepRootMtime fingerprint the watch root between
+	// SweepInodes ticks: a single-file root that its app deletes and recreates
+	// gets a new inode (nothing else re-maps it), and a directory root whose
+	// own mtime moved gained or lost a top-level entry. An unchanged
+	// fingerprint means the periodic re-scan can be skipped entirely — deeper
+	// changes are covered by BPF runtime discovery and the ancestor walk.
+	sweepRootKey   GuardInodeKey
+	sweepRootMtime time.Time
+	sweepLastFull  time.Time
 	// pinPrefix, when set (WithPinning), is the bpffs path prefix each LSM
 	// link is pinned at (prefix + hook name) after it attaches: the pin holds
 	// the link — and through it the program and its maps — alive past process
@@ -809,6 +818,70 @@ func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
 	return walkInodes(dir, g.recursive, g.depth, currentDepth, g.addInode)
 }
 
+// SweepInodes is the cheap periodic refresh of guard_inodes. It replaces an
+// unconditional full re-walk on every tick (which, across many guards over
+// large trees, was ~14% of the daemon's CPU):
+//
+//   - single-file watch root: re-map it only when its inode changed (an app
+//     that deletes and recreates the file — sqlite journals — would otherwise
+//     leave the new inode out of the fast-path map);
+//   - directory watch root: re-scan only when the directory's own mtime moved
+//     since the last sweep (a top-level entry was added or removed). Deeper
+//     additions are still guarded — new dirs are mapped by the BPF path_mkdir
+//     hook, new files fall through to the ancestor walk — so a full recursive
+//     re-scan every tick is wasted work.
+func (g *Guard) SweepInodes() error {
+	info, err := os.Stat(g.path)
+	if err != nil {
+		return fmt.Errorf("stating guarded path %s: %w", g.path, err)
+	}
+
+	if !info.IsDir() {
+		dev, ino, statErr := ebpf.StatInode(g.path)
+		if statErr != nil {
+			return statErr
+		}
+		key := GuardInodeKey{Dev: dev, Ino: ino}
+		g.mu.Lock()
+		unchanged := key == g.sweepRootKey
+		g.mu.Unlock()
+		if unchanged {
+			return nil
+		}
+		if addErr := g.addInode(g.path); addErr != nil {
+			return addErr
+		}
+		g.mu.Lock()
+		g.sweepRootKey = key
+		g.mu.Unlock()
+		return nil
+	}
+
+	mtime := info.ModTime()
+	g.mu.Lock()
+	// Re-walk only when a top-level entry changed, and never more often than
+	// dirRescanMinGap: a chatty root (an app writing lockfiles beside its
+	// data) must not force a full recursive walk every tick. New subtrees in
+	// the meantime are still mapped by the BPF path_mkdir hook and covered by
+	// the ancestor walk.
+	skip := mtime.Equal(g.sweepRootMtime) || time.Since(g.sweepLastFull) < dirRescanMinGap
+	g.mu.Unlock()
+	if skip {
+		return nil
+	}
+	if scanErr := g.scanDirInodes(g.path, 0); scanErr != nil {
+		return scanErr
+	}
+	now := time.Now()
+	g.mu.Lock()
+	g.sweepRootMtime = mtime
+	g.sweepLastFull = now
+	g.mu.Unlock()
+	return nil
+}
+
+const dirRescanMinGap = 5 * time.Minute
+
 // walkInodes walks dir depth-first, invoking add for dir and every entry below it: ENOENT/ENOTDIR failures
 // (vanished mid-walk, dangling symlinks) and any other per-entry stat error are skipped with a warning;
 // E2BIG stops the walk with degraded coverage (open/read enforcement survives via the BPF ancestor walk);
@@ -964,15 +1037,64 @@ func (g *Guard) startDegradeWatch() {
 }
 
 // binaryVerifyState is the verifier's pinned identity of one admitted
-// whitelist binary: the inode key it was admitted under and the content
-// hash at admission time.
+// whitelist binary: the inode key it was admitted under, the content hash,
+// and the stat fingerprint that hash was computed from (so an unchanged
+// binary is never re-hashed).
 type binaryVerifyState struct {
 	key     GuardInodeKey
+	stat    ebpf.BinaryStat
 	hash    [32]byte
+	hashed  bool // a real content hash has been taken at least once
 	demoted bool
 }
 
+// binaryHashVerifyInterval is short because the check is now cheap: an
+// unchanged binary costs one stat and no read (see verifyBinaryHashesOnce),
+// so a fast tick keeps in-place-tamper detection responsive without cost.
 const binaryHashVerifyInterval = 10 * time.Second
+
+// sharedBinaryHashes dedupes content hashing across every guard in the
+// process. The same binary is admitted by many guards (the ssh tool set, and
+// especially Discord's ~170 MiB app blob shared by 10 grouped watch paths);
+// re-reading and re-hashing it once per guard per tick was the daemon's
+// single largest CPU and allocation cost. Keyed by inode; the stored
+// fingerprint gates reuse. Realistic size is a few dozen entries.
+var (
+	sharedHashMu sync.Mutex
+	sharedHashes = map[GuardInodeKey]sharedHashEntry{}
+)
+
+type sharedHashEntry struct {
+	stat ebpf.BinaryStat
+	hash [32]byte
+}
+
+// hashBinaryShared returns path's content hash, reusing one another guard (or
+// an earlier tick) already computed for the same inode+fingerprint and only
+// reading the file when nothing cached matches.
+func hashBinaryShared(path string, fp ebpf.BinaryStat) ([32]byte, error) {
+	key := GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
+
+	sharedHashMu.Lock()
+	if e, ok := sharedHashes[key]; ok && e.stat == fp {
+		sharedHashMu.Unlock()
+		return e.hash, nil
+	}
+	sharedHashMu.Unlock()
+
+	entry, err := ComputeBinaryEntry(path)
+	if err != nil {
+		return [32]byte{}, err
+	}
+
+	sharedHashMu.Lock()
+	if len(sharedHashes) > 8192 { // pathological only; keeps the map bounded
+		sharedHashes = map[GuardInodeKey]sharedHashEntry{}
+	}
+	sharedHashes[key] = sharedHashEntry{stat: fp, hash: entry.Hash}
+	sharedHashMu.Unlock()
+	return entry.Hash, nil
+}
 
 // startBinaryHashVerifier pins every admitted whitelist binary's content
 // hash and periodically re-verifies it: whitelist identity is the exe inode
@@ -1011,8 +1133,9 @@ func (g *Guard) verifyBinaryHashLoop() {
 	}
 }
 
-// verifyBinaryHashesOnce re-hashes every admitted binary and demotes
-// same-inode replacements. States are owned by this goroutine (created in
+// verifyBinaryHashesOnce re-hashes admitted binaries whose stat fingerprint
+// moved and demotes same-inode replacements. An unchanged binary costs one
+// stat and no read. States are owned by this goroutine (created in
 // startBinaryHashVerifier, extended by ReSyncBinaries under g.mu), so field
 // access needs no extra locking.
 func (g *Guard) verifyBinaryHashesOnce() {
@@ -1024,29 +1147,41 @@ func (g *Guard) verifyBinaryHashesOnce() {
 	g.mu.Unlock()
 
 	for canonical, st := range states {
-		dev, ino, err := ebpf.StatInode(canonical)
+		fp, err := ebpf.StatBinary(canonical)
 		if err != nil {
 			continue // vanished mid-update: ReSyncBinaries handles it
 		}
-		entry, err := ComputeBinaryEntry(canonical)
+		freshKey := GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
+
+		// Common path: same inode and same size/mtime/ctime as the last
+		// hash — an in-place overwrite always bumps mtime and ctime, so
+		// nothing changed. No read, no hash.
+		if st.hashed && freshKey == st.key && fp == st.stat {
+			continue
+		}
+
+		hash, err := hashBinaryShared(canonical, fp)
 		if err != nil {
 			continue // unreadable right now: keep the current decision
 		}
-		freshKey := GuardInodeKey{Dev: dev, Ino: ino}
 
 		if freshKey != st.key {
 			// Inode changed: a replacement flow (ReSyncBinaries, SIGHUP
 			// reload) owns re-admission — adopt the new identity so a
 			// legitimate upgrade is never mistaken for tampering.
 			st.key = freshKey
-			st.hash = entry.Hash
+			st.stat = fp
+			st.hash = hash
+			st.hashed = true
 			st.demoted = false
 			continue
 		}
+		st.stat = fp
+		st.hashed = true
 		if st.demoted {
 			continue // once tampering is detected the entry stays blocked
 		}
-		if entry.Hash != st.hash {
+		if hash != st.hash {
 			// Same inode, different content: the admitted binary was
 			// replaced in place. Demote to GUARD_BLOCK — fail-closed.
 			if putErr := g.objs.GuardExeActions.Put(st.key, uint8(GUARD_BLOCK)); putErr != nil {
@@ -1113,15 +1248,18 @@ func (g *Guard) readEvent(rd *ringbuf.Reader) (*GuardEvent, bool) {
 // running for blocked events too catches impersonation that would mislead logs. Guarded binaries whose threads
 // rename themselves (Chromium's "libuv-worker", Bun's "Bun Pool N") are normal and produce no warning.
 func (g *Guard) checkCommSpoof(ge *GuardEvent) {
+	// Cheap string gate first \u2014 this runs once per guard event, and the vast
+	// majority of events come from processes whose comm does not collide with
+	// any guarded binary name. Only a collision is worth a /proc lookup.
+	if !commMatchesGuardedBinary(ge.Comm, g.binaries) {
+		return
+	}
+
 	exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", ge.PID))
 	if err != nil {
 		return
 	}
-
 	if g.isGuardedBinary(exePath) {
-		return
-	}
-	if !commMatchesGuardedBinary(ge.Comm, g.binaries) {
 		return
 	}
 
@@ -1145,16 +1283,17 @@ func commMatchesGuardedBinary(comm string, binaries []BinaryEntry) bool {
 }
 
 func (g *Guard) isGuardedBinary(exePath string) bool {
+	// Resolve the process's exe once, not once per whitelist entry.
+	absExe, absErr := filepath.EvalSymlinks(exePath)
 	for _, b := range g.binaries {
 		canonical := g.canonicalPaths[b.Path]
 		if canonical == "" {
 			canonical = b.Path // guard created without canonical map
 		}
-		if b.Path == exePath || canonical == exePath {
+		if exePath == b.Path || exePath == canonical {
 			return true
 		}
-		abs, err := filepath.EvalSymlinks(exePath)
-		if err == nil && (abs == b.Path || abs == canonical) {
+		if absErr == nil && (absExe == b.Path || absExe == canonical) {
 			return true
 		}
 	}
