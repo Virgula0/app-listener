@@ -1,180 +1,253 @@
 #!/usr/bin/env bash
 #
-# check-compatibility — exhaustive host compatibility check for
-# app-listener (build, install, and Docker integration tests).
+# check-compatibility — static host compatibility check for app-listener.
+#
+# It performs every check that can be done WITHOUT loading eBPF or running
+# the integration suite: kernel version, kernel .config, BTF, the BPF LSM
+# activation, fscrypt prerequisites and BPF sysctls. Build tooling is NOT
+# checked — `make build` runs the whole toolchain in a Docker container.
+# The final verdict is binary: the host can run app-listener, or it cannot
+# (with the exact blockers listed). Warnings never change the verdict.
 #
 # Usage:
-#   make check-compatibility       (or directly: bash scripts/check-compatibility.sh)
+#   make check-compatibility        (or: bash scripts/check-compatibility.sh)
 #
-# Exit code: 0 when everything needed is present, 1 when a hard
-# requirement is missing. Warnings never change the exit code.
+# Exit code: 0 = installable, 1 = a hard requirement is missing.
 #
-# Internal test hooks (not meant for end users):
-#   CHECK_LSM_PATH   alternate path for the LSM list file
-#   CHECK_BTF_PATH   alternate path for the BTF vmlinux file
-#   CHECK_KERNEL     alternate uname -r output
+# Test hooks (not for end users):
+#   CHECK_KERNEL / CHECK_BTF_PATH / CHECK_LSM_PATH / CHECK_CONFIG_PATH /
+#   CHECK_CMDLINE_PATH / CHECK_OS_RELEASE — override the probed sources.
 
 set -uo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BOLD='\033[1m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BOLD='\033[1m'; NC='\033[0m'
 
-PASS=0
-WARN=0
-FAIL=0
+PASS=0; WARN=0; FAIL=0
+FAILED_ITEMS=()
 
-pass() { PASS=$((PASS + 1)); printf "  ${GREEN}[OK]${NC}   %s\n" "$*"; }
-warn() { WARN=$((WARN + 1)); printf "  ${YELLOW}[WARN]${NC} %s\n" "$*"; }
-fail() { FAIL=$((FAIL + 1)); printf "  ${RED}[FAIL]${NC}  %s\n" "$*"; }
-
+pass() { PASS=$((PASS + 1)); printf "  ${GREEN}[OK]${NC}    %s\n" "$*"; }
+warn() { WARN=$((WARN + 1)); printf "  ${YELLOW}[WARN]${NC}  %s\n" "$*"; }
+fail() { FAIL=$((FAIL + 1)); FAILED_ITEMS+=("$*"); printf "  ${RED}[FAIL]${NC}  %s\n" "$*"; }
+note() { printf "          %s\n" "$*"; }
 section() { printf "\n${BOLD}%s${NC}\n" "$*"; }
 
-version_at_least() {
-	# version_at_least <required> <got> — true when got >= required (sort -V)
-	[ "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
-}
+version_at_least() { [ "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
 
 ##############################################################################
-# Kernel: version, BTF, securityfs, BPF LSM, BPF sysctls
+# Sources
 ##############################################################################
 
 KERNEL_RELEASE="${CHECK_KERNEL:-$(uname -r)}"
-KERNEL_MAJOR="$(printf '%s' "$KERNEL_RELEASE" | cut -d. -f1)"
-KERNEL_MINOR="$(printf '%s' "$KERNEL_RELEASE" | cut -d. -f2)"
+KVER="$(printf '%s' "$KERNEL_RELEASE" | grep -oE '^[0-9]+\.[0-9]+' || true)"
 BTF_PATH="${CHECK_BTF_PATH:-/sys/kernel/btf/vmlinux}"
 LSM_PATH="${CHECK_LSM_PATH:-/sys/kernel/security/lsm}"
+CMDLINE_PATH="${CHECK_CMDLINE_PATH:-/proc/cmdline}"
+OS_RELEASE="${CHECK_OS_RELEASE:-/etc/os-release}"
 
-section "Kernel"
-if [ -z "$KERNEL_MAJOR" ]; then
-	fail "cannot determine kernel version (uname -r returned empty)"
-elif [ "$KERNEL_MAJOR" -ge 5 ]; then
-	pass "kernel $KERNEL_RELEASE (>= 5.x required)"
-	if [ "$KERNEL_MAJOR" -eq 5 ] && [ "${KERNEL_MINOR:-0}" -lt 10 ]; then
-		warn "kernel < 5.10: guard/network-guard/daemon LSM hooks may be unreliable (monitor still works)"
-	fi
-else
-	fail "kernel $KERNEL_RELEASE is too old: 5.x or newer is required"
+DISTRO_ID=""; DISTRO_PRETTY=""
+if [ -r "$OS_RELEASE" ]; then
+	DISTRO_ID="$(sed -n 's/^ID=//p' "$OS_RELEASE" | tr -d '"')"
+	DISTRO_PRETTY="$(sed -n 's/^PRETTY_NAME=//p' "$OS_RELEASE" | tr -d '"')"
 fi
 
-section "BTF (needed to load the pre-compiled CO-RE eBPF programs)"
+# read_config <CONFIG_NAME> — echoes the value (y/m/…) or empty; sets
+# CONFIG_SOURCE the first time a config file is found.
+CONFIG_SOURCE=""
+CONFIG_CACHE=""
+load_config() {
+	if [ -n "${CHECK_CONFIG_PATH:-}" ] && [ -r "$CHECK_CONFIG_PATH" ]; then
+		CONFIG_SOURCE="$CHECK_CONFIG_PATH"
+		CONFIG_CACHE="$(cat "$CHECK_CONFIG_PATH")"
+	elif [ -r /proc/config.gz ]; then
+		CONFIG_SOURCE="/proc/config.gz"
+		CONFIG_CACHE="$(zcat /proc/config.gz 2>/dev/null)"
+	elif [ -r "/boot/config-$KERNEL_RELEASE" ]; then
+		CONFIG_SOURCE="/boot/config-$KERNEL_RELEASE"
+		CONFIG_CACHE="$(cat "/boot/config-$KERNEL_RELEASE")"
+	fi
+}
+read_config() { printf '%s\n' "$CONFIG_CACHE" | sed -n "s/^$1=//p" | head -1; }
+
+# require_config <NAME> <purpose> <hardness: fail|warn>
+require_config() {
+	local name="$1" purpose="$2" hard="$3" val
+	[ -z "$CONFIG_SOURCE" ] && return 0
+	val="$(read_config "$name")"
+	if [ "$val" = "y" ] || [ "$val" = "m" ]; then
+		pass "$name=$val ($purpose)"
+	elif [ "$hard" = "fail" ]; then
+		fail "$name is not set — $purpose (rebuild the kernel with $name=y)"
+	else
+		warn "$name is not set — $purpose"
+	fi
+}
+
+lsm_bpf_instructions() {
+	case "$DISTRO_ID" in
+	ubuntu | debian)
+		note "Ubuntu/Debian: append 'bpf' to the LSM list on the kernel cmdline:"
+		note "  echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT lsm=landlock,lockdown,yama,integrity,apparmor,bpf\"' | sudo tee /etc/default/grub.d/bpf-lsm.cfg"
+		note "  sudo update-grub && sudo reboot"
+		note "  cloud images also override the cmdline in /etc/default/grub.d/50-cloudimg-settings.cfg — edit there too" ;;
+	arch)
+		note "Arch: add 'lsm=...,bpf' to the kernel cmdline of your boot entry:"
+		note "  systemd-boot: append to the 'options' line in /boot/loader/entries/*.conf"
+		note "  GRUB: add to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then grub-mkconfig -o /boot/grub/grub.cfg"
+		note "  then reboot" ;;
+	*)
+		note "Add 'bpf' to the kernel's 'lsm=' cmdline parameter (keep the existing entries) and reboot." ;;
+	esac
+	note "verify after boot:  grep -o bpf $LSM_PATH"
+}
+
+##############################################################################
+
+printf "${BOLD}app-listener — host compatibility${NC}\n"
+[ -n "$DISTRO_PRETTY" ] && printf "  detected: %s, kernel %s\n" "$DISTRO_PRETTY" "$KERNEL_RELEASE"
+load_config
+if [ -n "$CONFIG_SOURCE" ]; then
+	printf "  kernel config: %s\n" "$CONFIG_SOURCE"
+else
+	printf "  kernel config: ${YELLOW}not found${NC} (no /proc/config.gz, no /boot/config-%s) — config checks skipped\n" "$KERNEL_RELEASE"
+fi
+
+##############################################################################
+section "Kernel version"
+##############################################################################
+
+if [ -z "$KVER" ]; then
+	fail "cannot parse kernel version from '$KERNEL_RELEASE'"
+else
+	if version_at_least "5.8" "$KVER"; then
+		pass "kernel $KERNEL_RELEASE (>= 5.8, monitor mode)"
+	else
+		fail "kernel $KERNEL_RELEASE is too old — monitor needs >= 5.8 (BPF ring buffer)"
+	fi
+	if version_at_least "5.10" "$KVER"; then
+		pass "kernel $KERNEL_RELEASE (>= 5.10, guard / network-guard / daemon)"
+	else
+		fail "kernel $KERNEL_RELEASE < 5.10 — guard / network-guard / daemon need BPF-LSM bpf_link"
+	fi
+	version_at_least "6.2" "$KVER" || warn "kernel < 6.2 — the file_truncate LSM hook is unavailable (ftruncate on a pre-opened fd is not denied; path truncate still is)"
+fi
+
+##############################################################################
+section "BTF (required to load the pre-compiled CO-RE eBPF programs)"
+##############################################################################
+
 if [ -r "$BTF_PATH" ]; then
 	pass "BTF present ($BTF_PATH)"
 else
-	fail "BTF not found at $BTF_PATH — kernel needs CONFIG_DEBUG_INFO_BTF=y (stock Ubuntu/Arch kernels ship it since 5.4)"
+	fail "BTF not found at $BTF_PATH — kernel needs CONFIG_DEBUG_INFO_BTF=y"
 fi
 
-lsm_exists=0
+##############################################################################
+section "Kernel configuration"
+##############################################################################
+
+if [ -z "$CONFIG_SOURCE" ]; then
+	warn "kernel .config not readable — cannot verify CONFIG_* options statically"
+else
+	require_config CONFIG_BPF_SYSCALL     "eBPF core"                              fail
+	require_config CONFIG_DEBUG_INFO_BTF  "CO-RE BTF"                              fail
+	require_config CONFIG_BPF_LSM         "guard / network-guard / daemon"        fail
+	require_config CONFIG_KPROBES         "monitor (VFS kprobes)"                 fail
+	require_config CONFIG_BPF_EVENTS      "attaching BPF to kprobes/tracepoints"  fail
+	require_config CONFIG_SECURITY_PATH   "path-based LSM hooks (unlink/rename/mkdir/symlink/…)"  warn
+	require_config CONFIG_FS_ENCRYPTION   "fscrypt (daemon + installer)"          warn
+fi
+
+##############################################################################
+section "BPF LSM activation (guard / network-guard / daemon)"
+##############################################################################
+
+lsm_list=""
+lsm_readable=0
 if [ -r "$LSM_PATH" ]; then
-	lsm_exists=1
-	pass "securityfs readable ($LSM_PATH)"
+	lsm_readable=1
+	lsm_list="$(tr -d '[:space:]' < "$LSM_PATH")"
+	pass "securityfs readable ($LSM_PATH: $lsm_list)"
 else
-	fail "cannot read $LSM_PATH (is securityfs mounted? run: mount -t securityfs securityfs /sys/kernel/security)"
+	fail "cannot read $LSM_PATH — securityfs not mounted (mount -t securityfs securityfs /sys/kernel/security)"
 fi
 
-section "BPF LSM (required by guard, network-guard and daemon modes)"
-if [ "$lsm_exists" -eq 1 ] && tr ',' '\n' < "$LSM_PATH" | grep -qw 'bpf'; then
-	pass "bpf is in the active LSM list ($(tr '\n' ',' < "$LSM_PATH" | sed 's/,$//' | tr -d '\n'))"
-else
-	fail "the BPF LSM is not active: $LSM_PATH does not list 'bpf'"
-	printf "        ${RED}Without it the LSM hooks attach but NEVER fire: guard modes\n"
-	printf "        ${RED}would seem to work while denying nothing. Enable it and reboot:\n"
-	printf "        ${RED}  1) echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash lsm=landlock,lockdown,yama,integrity,apparmor,bpf\"' | sudo tee /etc/default/grub.d/bpf-lsm.cfg\n"
-	printf "        ${RED}  2) sudo update-grub && sudo reboot\n"
-	printf "        ${RED}  3) verify after boot: grep -o bpf $LSM_PATH\n"
-	printf "        ${RED}Note: Ubuntu cloud images (EC2/Azure/GCE) override the cmdline in\n"
-	printf "        ${RED}/etc/default/grub.d/50-cloudimg-settings.cfg — add 'lsm=...bpf' there too.\n"
+if [ "$lsm_readable" -eq 1 ] && printf '%s' "$lsm_list" | tr ',' '\n' | grep -qx 'bpf'; then
+	pass "the BPF LSM is ACTIVE — guard modes can deny"
+elif [ "$lsm_readable" -eq 1 ]; then
+	fail "the BPF LSM is NOT active ($LSM_PATH has no 'bpf') — guard modes would attach but never deny"
+	if [ -n "$CONFIG_SOURCE" ] && [ "$(read_config CONFIG_BPF_LSM)" != "y" ]; then
+		note "this kernel also lacks CONFIG_BPF_LSM=y — a kernel rebuild or a different kernel is required."
+	else
+		lsm_bpf_instructions
+	fi
+	if [ -r "$CMDLINE_PATH" ] && ! grep -qE 'lsm=' "$CMDLINE_PATH"; then
+		note "(current cmdline has no 'lsm=' parameter, so the kernel is using its compiled-in list)"
+	fi
 fi
 
-section "BPF runtime"
-unprivileged_bpf="$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || true)"
-case "$unprivileged_bpf" in
-1) warn "kernel.unprivileged_bpf_disabled=1: eBPF loads only as privileged user (root / CAP_BPF)" ;;
-2) warn "kernel.unprivileged_bpf_disabled=2: unprivileged BPF fully disabled — run app-listener as root" ;;
-*) pass "unprivileged BPF is not disabled (value ${unprivileged_bpf:-n/a})" ;;
+##############################################################################
+section "fscrypt (daemon + installer)"
+##############################################################################
+
+if command -v fscrypt >/dev/null 2>&1; then
+	pass "fscrypt CLI found ($(command -v fscrypt))"
+else
+	warn "fscrypt not found — the installer's encryption lifecycle needs it (Ubuntu: apt install fscrypt; Arch: pacman -S fscrypt)"
+fi
+
+home_fs="$(findmnt -no FSTYPE -T "${HOME:-/root}" 2>/dev/null || true)"
+case "$home_fs" in
+ext4 | f2fs) pass "home filesystem is $home_fs (fscrypt-capable)" ;;
+"")          warn "could not determine the filesystem backing \$HOME — fscrypt needs ext4 or f2fs" ;;
+*)           warn "home filesystem is '$home_fs' — fscrypt needs ext4 or f2fs; run the daemon with need_encryption: false, or move protected dirs onto ext4/f2fs" ;;
 esac
 
-bpf_jit="$(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || true)"
-if [ "$bpf_jit" = "0" ]; then
-	warn "net.core.bpf_jit_enable=0: JIT disabled — eBPF programs may fail to load; set it to 1"
+bpffs="$(findmnt -no FSTYPE /sys/fs/bpf 2>/dev/null || true)"
+[ -z "$bpffs" ] && bpffs="$(stat -f -c %T /sys/fs/bpf 2>/dev/null || true)"
+case "$bpffs" in
+bpf | bpffs | bpf_fs)
+	pass "/sys/fs/bpf is a bpffs mount (daemon pins LSM links there so they survive a SIGKILL)" ;;
+*)
+	warn "/sys/fs/bpf is not a bpffs mount — the daemon will try to mount one; if it cannot, guards still enforce but do not survive a SIGKILL" ;;
+esac
+
+##############################################################################
+section "BPF runtime"
+##############################################################################
+
+ubpf="$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || true)"
+case "$ubpf" in
+1 | 2) pass "unprivileged BPF disabled (=$ubpf) — run app-listener as root (it is meant to)" ;;
+*)     pass "unprivileged_bpf_disabled=${ubpf:-n/a}" ;;
+esac
+
+jit="$(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || true)"
+if [ "$jit" = "0" ]; then
+	warn "net.core.bpf_jit_enable=0 — some programs may fail to load; set it to 1"
 else
-	pass "BPF JIT enabled (net.core.bpf_jit_enable=${bpf_jit:-n/a})"
+	pass "BPF JIT enabled (net.core.bpf_jit_enable=${jit:-n/a})"
 fi
 
-if [ "$(id -u)" -ne 0 ]; then
-	warn "not running as root: loading eBPF programs needs CAP_SYS_ADMIN+CAP_BPF (use sudo)"
+[ "$(id -u)" -ne 0 ] && warn "not running this check as root — 'app-listener install' and every mode need root (sudo)"
+
+# No build-toolchain checks: `make build` runs the whole toolchain inside a
+# Docker container, so nothing (Go, clang, bpftool, GCC) has to be installed
+# on the host to build or install app-listener.
+
+##############################################################################
+section "Verdict"
+##############################################################################
+
+if [ "$FAIL" -eq 0 ]; then
+	printf "\n  ${GREEN}${BOLD}app-listener CAN be installed on this host.${NC}"
+	[ "$WARN" -gt 0 ] && printf "  ${YELLOW}(%d warning(s) above — read them; none block installation.)${NC}" "$WARN"
+	printf "\n"
+	exit 0
 fi
 
-section "Toolchain (needed to build)"
-if command -v go >/dev/null 2>&1; then
-	go_ver="$(go version 2>/dev/null | sed -E 's/^.*go([0-9]+\.[0-9]+\.[0-9]+).*$/\1/')"
-	go_require="$(sed -n 's/^go[[:space:]]*//p' go.mod 2>/dev/null | head -1)"
-	if [ -z "$go_require" ] || version_at_least "$go_require" "$go_ver"; then
-		pass "Go $go_ver (>= $go_require from go.mod)"
-	else
-		fail "Go $go_ver installed but go.mod requires $go_require — install Go $go_require from go.dev"
-	fi
-else
-	fail "Go not found — needed for any build (install Go 1.26+ from go.dev)"
-fi
-
-if command -v gcc >/dev/null 2>&1; then
-	pass "gcc found (CGO static build + exploit tests)"
-else
-	fail "gcc not found — 'make build' and 'make test-integration' will fail (install gcc + libc6-dev)"
-fi
-
-if command -v make >/dev/null 2>&1; then
-	pass "make found"
-else
-	fail "make not found — the Makefile targets will not run (install make)"
-fi
-
-section "Docker (needed for 'make test-integration')"
-if command -v docker >/dev/null 2>&1; then
-	if docker info >/dev/null 2>&1; then
-		pass "docker CLI + daemon reachable"
-	else
-		warn "docker found but daemon not reachable (is it running? is your user in the docker group?)"
-	fi
-else
-	warn "docker not found — 'make test-integration' requires it (apt install docker.io)"
-fi
-
-section "Optional tools"
-for tool in clang bpftool git; do
-	if command -v "$tool" >/dev/null 2>&1; then
-		pass "$tool found"
-	else
-		case "$tool" in
-		clang) warn "clang not found — only needed to regenerate BPF bindings (make generate)" ;;
-		bpftool) warn "bpftool not found — only needed to regenerate vmlinux.h (make bpftool-headers)" ;;
-		git) warn "git not found — only needed for development workflows" ;;
-		esac
-	fi
+printf "\n  ${RED}${BOLD}app-listener CANNOT be installed on this host.${NC}  %d blocker(s):\n" "$FAIL"
+for item in "${FAILED_ITEMS[@]}"; do
+	printf "    ${RED}•${NC} %s\n" "$item"
 done
-
-section "LLVM suite (needed with clang to regenerate BPF bindings)"
-llvm_tools="llvm-objdump llvm-readelf llvm-strip llvm-link llvm-nm llvm-ar llvm-size ld.lld"
-for tool in $llvm_tools; do
-	if command -v "$tool" >/dev/null 2>&1; then
-		pass "$tool found"
-	else
-		warn "$tool not found — only needed for 'make generate' (Ubuntu: apt install llvm lld; Arch: pacman -S llvm lld)"
-	fi
-done
-
-section "Summary"
-if [ "$FAIL" -gt 0 ]; then
-	printf "\n  ${RED}%d problem(s) found, %d warning(s)${NC}.\n" "$FAIL" "$WARN"
-	printf "  Fix the FAIL items above, reboot when asked, then re-run this check.\n"
-	exit 1
-fi
-if [ "$WARN" -gt 0 ]; then
-	printf "\n  ${GREEN}All hard checks passed, %d warning(s)${NC} — read them above (none block, but they matter).\n" "$WARN"
-else
-	printf "\n  ${GREEN}All checks passed — your host is compatible.${NC}\n"
-fi
-exit 0
+printf "  Fix the blockers (reboot where asked) and re-run this check.\n"
+exit 1

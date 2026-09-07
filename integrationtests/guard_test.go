@@ -2047,3 +2047,13 @@ func (s *IntegrationSuite) TestGuard_ReSyncBinaries_Replacement() {
 
 	s.runGuardTest(c, "TestReSyncBinariesReplacement")
 }
+
+// TestGuard_SweepInodes_RecreatedFileRoot verifies the fingerprint-gated
+// periodic sweep re-maps a single-file watch root the application deleted
+// and recreated (the case the old unconditional full re-walk covered).
+func (s *IntegrationSuite) TestGuard_SweepInodes_RecreatedFileRoot() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestSweepInodesRecreatedFileRoot")
+}

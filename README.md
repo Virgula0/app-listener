@@ -4,107 +4,101 @@ Monitor or guard file system and network operations with eBPF — the daemon pro
 
 ![demo.gif](./media/demo.gif)
 
-> [!IMPORTANT]
-> **Verify before you install.** The only way to be sure that **100% of the operations will work on your current system** is to run the integration suite:
->
-> ```bash
-> make test-integration
-> ```
->
-> It exercises every mode and bypass vector inside Docker containers. **Rootful Docker is required** — the suite loads real eBPF programs, which rootless or remote Docker daemons cannot run. All tests must pass.
-
 ## Contents
 
-- [Why](#why)
-- [Quick Start](#quick-start)
 - [Compatibility](#compatibility)
+- [Quick Start](#quick-start)
 - [How it works](#how-it-works)
 - [Modes](#modes)
+  - [monitor](#monitor--observe)
+  - [guard](#guard--block-file-access)
+  - [network-monitor](#network-monitor--watch-network)
+  - [network-guard](#network-guard--block-network)
+  - [daemon](#daemon--fscrypt--whitelist-lifecycle)
+  - [install.sh / install / uninstall / update / edit-protected](#installsh--install--uninstall--update--edit-protected)
 - [Debug](#debug)
 - [Makefile targets](#makefile-targets)
 - [Docker](#docker)
-- [Architecture](#architecture)
-- [Key design decisions](#key-design-decisions)
 
-## Why
+> Vibe-coding experiment, coded mainly with the free DeepSeek V4 Flash and Claude Code. Not for production systems.
 
-A serious eBPF rewrite of [arch-supply-chain-hardening](https://github.com/Virgula0/arch-app-armor-hardening). Tested on **Arch Linux, ext4, amd64**, kernel `7.0.11-hardened2-1-hardened` — other kernels, patches and filesystems may produce bugs or bypasses (exactly what `make test-integration` checks on your machine).
+## Compatibility
 
-> This is a vibe-coding experiment (coded mainly with the free DeepSeek V4 Flash). Do not use it to protect production systems.
+Run `make check-compatibility` first — it performs every static check (kernel version, kernel `.config`, BTF, BPF-LSM activation, fscrypt prerequisites, BPF sysctls) and tells you plainly whether the host can run app-listener. The one-line installer below runs it for you and refuses to install when it fails. (`make build` runs the toolchain in Docker, so nothing has to be installed on the host to build it.)
+
+| Distribution | Min. kernel | Support | Activation |
+|---|---|---|---|
+| **Arch Linux** | rolling (6.x) | ✅ **Fully supported** — all 23 LSM hooks attach | Add `bpf` to the `lsm=` list on your boot entry's kernel cmdline, reboot |
+| **Ubuntu 24.04 LTS** | 6.8 | ✅ **Fully supported** | Append `lsm=landlock,lockdown,yama,integrity,apparmor,bpf` to `GRUB_CMDLINE_LINUX_DEFAULT`, `sudo update-grub`, reboot |
+| **Ubuntu 22.04 LTS** | 5.15 (GA) | 🟡 **Partially supported** on the 5.15 GA kernel — a few later-kernel LSM hooks (notably `file_truncate`) are absent, so `ftruncate(2)` on a pre-opened fd is not denied (path `truncate(2)` still is); every other hook works. Install the HWE kernel (`linux-generic-hwe-22.04`, 6.x) for full support | same as 24.04 |
+
+**Kernel floor:** `monitor` needs ≥ 5.8 (BPF ring buffer); `guard` / `network-guard` / `daemon` need ≥ 5.10 (BPF-LSM). Ubuntu 20.04 (kernel 5.4) is not supported. Only the two hooks `file_open` and `file_permission` are mandatory — every other LSM hook is best-effort: a kernel that lacks one logs a warning and keeps enforcing the rest.
+
+**Stock Ubuntu and cloud images compile `CONFIG_BPF_LSM=y` but do not activate it** — without the cmdline change the LSM hooks attach but never deny. `linux/amd64` is the released target; `linux/arm64` cross-compiles but is untested.
 
 ## Quick Start
 
-```bash
-# 1. Build (regenerates BPF bindings from the running kernel, then compiles)
-#    Requires a ROOTFUL Docker daemon: the build runs in an isolated container
-#    with the host's BTF vmlinux mounted, and outputs build/linux/app-listener
-#    owned by your user. No Docker? Install clang/LLVM, bpftool, Go 1.26+ and
-#    GCC, then run `make build-host` instead.
-make build
+**1. Install the binary.** The one-liner runs `check-compatibility`, downloads the latest signed release from GitHub, verifies it (Ed25519 signature + sha256 + GitHub asset digest — the same checks as `app-listener update`) and installs it to `/usr/local/sbin/app-listener`:
 
-# 2. Interactive installer (root): builds the binary, generates the fscrypt
-#    master key, discovers critical directories, encrypts the selected ones
-#    with backups, installs the systemd unit + pacman reload hook, enables
-#    the daemon. Revert with `sudo ./build/linux/app-listener uninstall`.
-sudo ./build/linux/app-listener install
+```bash
+curl -fsSL https://raw.githubusercontent.com/Virgula0/app-listener/main/scripts/install.sh | sudo bash
+```
+
+Only pre-release builds are published right now — add `--channel prerelease` until the first stable release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Virgula0/app-listener/main/scripts/install.sh | sudo bash -s -- --channel prerelease
+```
+
+<details><summary>Build from source instead</summary>
+
+```bash
+# `make build` runs the toolchain in a rootful Docker container with the host's
+# BTF vmlinux mounted, output at build/linux/app-listener owned by you. No
+# Docker? Install clang/LLVM, bpftool, Go 1.26+, GCC and run `make build-host`.
+make build
+sudo ./build/linux/app-listener install   # (below) — uses ./build/linux/app-listener in place of app-listener
+```
+</details>
+
+**2. Protect directories with the daemon** (interactive, root) — builds/keeps the fscrypt master key, discovers critical directories, encrypts the selected ones (with backups), installs the systemd unit + pacman reload hook, enables the daemon. **Never automatic — you run it.** Revert with `sudo app-listener uninstall`.
+
+```bash
+sudo app-listener install
 ```
 
 One line per mode:
 
 ```bash
-sudo ./build/linux/app-listener monitor -w /tmp                                  # observe file ops
-sudo ./build/linux/app-listener guard /tmp -w /usr/bin/cat                       # block all but cat
-sudo ./build/linux/app-listener network-monitor /usr/bin/bash                    # watch bash network ops
-sudo ./build/linux/app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
-sudo ./build/linux/app-listener daemon --genkey                                  # fscrypt master key
-sudo ./build/linux/app-listener daemon --headless --blocked-only                 # protected daemon
-sudo systemctl reload app-listener-daemon                                       # re-resolve whitelist inodes
-sudo app-listener update --yes                                                   # self-update from GitHub
+sudo app-listener monitor -w /tmp                                  # observe file ops
+sudo app-listener guard /tmp -w /usr/bin/cat                       # block all but cat
+sudo app-listener network-monitor /usr/bin/bash                    # watch bash network ops
+sudo app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
+sudo app-listener daemon --genkey                                  # fscrypt master key
+sudo app-listener daemon --headless --blocked-only                 # protected daemon
+sudo systemctl reload app-listener-daemon                          # re-resolve whitelist inodes
+sudo app-listener update --yes                                     # self-update from GitHub
 ```
 
 Exit any TUI with `q` or `Ctrl+C`.
-
-## Compatibility
-
-| Aspect | Requirement |
-|--------|-------------|
-| Kernel | 5.4+ (monitor), 5.10+ (guard/daemon, needs `CONFIG_BPF_LSM`). CO-RE BPF — needs BTF (`/sys/kernel/btf/vmlinux`). |
-| Architecture | `linux/amd64` (CI-tested); `linux/arm64` cross-compiled. |
-| Tools | `make build` needs a **rootful Docker** daemon. `make build-host` instead needs clang/LLVM + bpftool + Go 1.26+ + GCC installed locally. |
-
-Run `make check-compatibility` **before** building — it verifies kernel, BTF, the **BPF LSM** (`bpf` in `/sys/kernel/security/lsm`, mandatory for guard/daemon, absent by default on stock Ubuntu/cloud kernels), sysctls, root and build tools.
-
-> **Ubuntu / cloud VMs**: stock kernels build `CONFIG_BPF_LSM=y` but don't activate it. Add `lsm=landlock,lockdown,yama,integrity,apparmor,bpf` to the kernel cmdline and reboot, or guard modes attach but never deny.
 
 ## How it works
 
 eBPF programs, compiled and embedded in the binary, attach at three levels:
 
-- **kprobes** (`monitor`) — observe all I/O regardless of syscall path (io_uring, splice, sendfile, mmap) plus metadata operations (chmod/truncate/stat/access/readlink/mknod).
-- **LSM hooks** (`guard`, `daemon`) — the only kernel mechanism that can **deny**; 22 hooks covering open, read/write permissions, mmap, unlink/rename/symlink/link/mkdir/rmdir/mknod, attributes (chmod/chown/utimes/truncate/setxattr), stat/access/readlink probes, mount and ptrace.
+- **kprobes** (`monitor`) — observe all I/O regardless of syscall path (io_uring, splice, sendfile, mmap) plus metadata ops (chmod/truncate/stat/access/readlink/mknod).
+- **LSM hooks** (`guard`, `network-guard`, `daemon`) — the only kernel mechanism that can **deny**; 23 hooks covering open, read/write, mmap, unlink/rename/symlink/link/mkdir/rmdir/mknod, attributes, stat/access/readlink, mount, ptrace and exec.
 - **tracepoints/kretprobes** (`network-monitor`) — TCP/UDP/DNS operations.
 
 **Binary identity is by exe inode**, never by name: renaming a binary or comm-spoofing cannot bypass policy. Keep whitelisted binaries **root-owned** — an attacker who can modify a binary's contents owns its identity anyway.
 
+Any mode can mirror its TUI into a browser with `--serve[=host:port]` (loopback by default): the local terminal TUI keeps running and the same event stream is shared read-only over WebSockets. `--user`/`--password` add HTTP Basic Auth (both required together). No TLS — put a reverse proxy in front when binding off-loopback. Mutually exclusive with `--headless` and `--gui`.
+
 ## Modes
-
-### Browser TUI
-
-`monitor`, `guard`, `network-monitor`, `network-guard`, and `daemon` can mirror their TUI into a browser. With `--serve` the normal local TUI keeps running on the terminal **and** the same event stream is shared, read-only, over WebSockets; quitting the local TUI (`q`, `ctrl+c` or SIGINT/SIGTERM) also stops the browser endpoint. A served TUI accepts one browser viewer at a time so browser dimensions map deterministically to its Bubble Tea viewport — the terminal and the browser size independently.
-
-```bash
-sudo ./build/linux/app-listener monitor -w /tmp --serve
-sudo ./build/linux/app-listener guard /secret --serve=192.168.1.10:8080
-sudo ./build/linux/app-listener daemon --serve --user admin --password secret
-```
-
-`--serve` binds to `127.0.0.1:9999`; use `--serve=host:port` to choose another address. `--user` and `--password` must be supplied together and protect both the page and WebSocket with HTTP Basic Auth. They cannot be used without `--serve`. Serving is mutually exclusive with `--headless` and `--gui`, and requires an interactive terminal (systemd-style services should stay on `--headless`).
-
-The built-in server does not provide TLS. When binding outside loopback, place it behind a TLS reverse proxy because TUI data and Basic Auth credentials otherwise cross the network unencrypted.
 
 ### monitor — observe
 
-Traces file operations under watched paths; nothing is blocked. In addition to data I/O (`OPEN/READ/WRITE/MMAP`) and tree changes it observes **metadata operations**: `ATTR` (chmod/chown/utimes/truncate/setxattr), `STAT` (stat/access/readlink) and `MKNOD` — the same path-based operations the guard denies.
+Traces file operations under watched paths; nothing is blocked. Covers data I/O (`OPEN/READ/WRITE/MMAP`), tree changes, and metadata: `ATTR` (chmod/chown/utimes/truncate/setxattr), `STAT` (stat/access/readlink), `MKNOD`.
 
 ```bash
 sudo ./build/linux/app-listener monitor -w /var/log --recursive --depth 3
@@ -117,14 +111,12 @@ sudo ./build/linux/app-listener monitor -w /path/to/file.txt
 | `-r, --recursive` | `false` | Recurse into subdirectories |
 | `-d, --depth <n>` | `0` | Max depth (needs `--recursive`; `0` = unlimited) |
 | `-e, --events <list>` | all | `OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD` |
-| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
-| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
-| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
 | `--headless` | `false` | No TUI; log to stderr |
+| `--gui` | `false` | Desktop GUI (needs a `-tags gui` build — `make build-linux GUI=1`) |
 
 ### guard — block file access
 
-Denies file operations on the guarded path by process identity, in **blacklist** or **whitelist** mode (default whitelist: omitted `-w` blocks everything).
+Denies file operations on the guarded path by process identity, in **blacklist** or **whitelist** mode (default whitelist; omitted `-w` blocks everything).
 
 ```bash
 sudo ./build/linux/app-listener guard /secret                 # block everything
@@ -139,30 +131,23 @@ sudo ./build/linux/app-listener guard /secret -b /usr/bin/rm  # block only rm
 | `-b, --blacklist <binary>` | — | Binaries blocked (repeatable; mutually exclusive with `-w`) |
 | `-r, --recursive` | `true` | Recurse into subdirectories |
 | `-d, --depth <n>` | `0` | Max depth (`0` = unlimited) |
-| `-e, --events <list>` | all | Event type filter (`OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD`) |
-| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
-| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
-| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
+| `-e, --events <list>` | all | Event type filter (same set as monitor) |
 | `--headless` | `false` | No TUI; log `GUARD\|` events to stderr |
 
-**Exec-open attribution (whitelist mode)**: executing a binary is an OPEN performed by the *launcher* — a shell wrapper runs through its interpreter, which the whitelist deliberately excludes. Opens are attributed to the **binary being executed** instead, so whitelisted binaries *inside* the guarded tree (e.g. Discord under `~/.config/discord`) work from any shell or wrapper, and their in-tree helpers resolve under the same attribution. The exec fd is never exposed to the launcher, so this grants no way to read guarded content; separate helper binaries an app spawns must be whitelisted explicitly. Blacklist mode always attributes to the launcher.
+**Exec-open attribution (whitelist mode)**: executing a binary is an OPEN performed by the *launcher* — a shell wrapper runs through its interpreter, which the whitelist deliberately excludes. Opens are attributed to the **binary being executed** instead, so whitelisted binaries *inside* the guarded tree (e.g. Discord under `~/.config/discord`) work from any shell or wrapper. The exec fd is never exposed to the launcher; helper binaries an app spawns must be whitelisted explicitly. Blacklist mode always attributes to the launcher.
 
 ### network-monitor — watch network
 
-Traces network operations (TCP, UDP, DNS, …) of the listed binaries only.
+Traces network operations (TCP, UDP, DNS) of the listed binaries only.
 
 ```bash
 sudo ./build/linux/app-listener network-monitor /usr/bin/curl /usr/bin/wget -e CONNECT,ACCEPT,DNS
-sudo ./build/linux/app-listener network-monitor /usr/bin/tcpdump --headless
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `<binary>` | required | Binaries to watch (positional, repeatable) |
 | `-e, --events <list>` | all | `CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS` |
-| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
-| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
-| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
 | `--headless` | `false` | No TUI; log `NETEVENT\|` events to stderr |
 
 | Event | Meaning | Hook |
@@ -175,53 +160,46 @@ sudo ./build/linux/app-listener network-monitor /usr/bin/tcpdump --headless
 
 ### network-guard — block network
 
-Denies socket operations by binary identity, blacklist or whitelist mode, via LSM `socket_connect/bind/listen/sendmsg/recvmsg` hooks.
+Denies socket operations by binary identity (blacklist or whitelist) via LSM `socket_connect/bind/listen/sendmsg/recvmsg` hooks.
 
 ```bash
-sudo ./build/linux/app-listener network-guard -b /usr/bin/curl /usr/bin/wget -e CONNECT,SEND
+sudo ./build/linux/app-listener network-guard -b /usr/bin/curl -e CONNECT,SEND
 sudo ./build/linux/app-listener network-guard -w /usr/bin/vim --auto-infra   # only vim + system infra
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-b, --blacklist <binary>` | — | Block network ops for these binaries only (repeatable; exclusive with `-w`) |
+| `-b, --blacklist <binary>` | — | Block network ops for these binaries only (exclusive with `-w`) |
 | `-w, --whitelist <binary>` | — | Block network ops for **all** binaries except these (default deny) |
-| `--auto-infra` | `false` | Auto-allowlist running infra daemons (resolved, NetworkManager, …) — otherwise DNS breaks for everyone |
+| `--auto-infra` | `false` | Auto-allowlist running infra daemons (resolved, NetworkManager…) — otherwise DNS breaks for everyone |
 | `--unsafe` | `false` | Also block AF_UNIX (X11, D-Bus, systemd) — may break the desktop |
 | `--no-throttle` | `false` | Disable rate limiting (1 event/type/process per 250 ms default) |
 | `-e, --events <list>` | all | `CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN` |
-| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
-| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
-| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
 | `--headless` | `false` | No TUI; log `NETGUARD\|` events to stderr |
 
-**Pick the real executable, not a wrapper**: identity is the exe inode, so whitelisting a `#!/bin/sh` wrapper (many distros ship `/usr/bin/firefox` as one) matches nothing. Resolve first:
+**Pick the real executable, not a wrapper** — identity is the exe inode, so whitelisting a `#!/bin/sh` wrapper matches nothing:
 
 ```bash
 ls -l /proc/$(pgrep -n firefox)/exe    # running process → real binary
 readlink -f /usr/bin/firefox           # follows symlinks, NOT shell wrappers
-# then whitelist the real path, e.g. /usr/lib/firefox/firefox
 ```
 
 ### daemon — fscrypt + whitelist lifecycle
 
-Config-driven daemon protecting any number of directories with the guard's whitelist engine, plus fscrypt encryption lifecycle: resources are unlocked at startup and locked again on shutdown **while the guards remain attached** — never an unprotected window. Successor of [ssh-guard](https://github.com/Virgula0/arch-app-armor-hardening) (same philosophy, LSM instead of fanotify, no `chattr`).
+Config-driven daemon protecting any number of directories with the guard's whitelist engine plus an fscrypt encryption lifecycle: resources are unlocked at startup and locked again on shutdown **while the guards remain attached** — never an unprotected window.
 
 ```bash
 sudo ./build/linux/app-listener daemon --genkey   # create the fscrypt master key
-sudo ./build/linux/app-listener daemon            # default config: /etc/app-listener/daemon.conf → daemon-samples/daemon.conf
-sudo ./build/linux/app-listener daemon --config /etc/ssh-guard/config --headless --blocked-only
+sudo ./build/linux/app-listener daemon            # /etc/app-listener/daemon.conf → daemon-samples/daemon.conf
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config <path>` | — | Config resolution: flag → `/etc/app-listener/daemon.conf` → `daemon-samples/daemon.conf` |
-| `--serve[=<host:port>]` | disabled | Mirror the TUI into a browser and keep the local TUI (`127.0.0.1:9999` when no address is given) |
-| `--user <name>` | — | HTTP Basic Auth username (requires non-empty `--password` and `--serve`) |
-| `--password <password>` | — | HTTP Basic Auth password (requires non-empty `--user` and `--serve`) |
-| `--headless` | `false` | Log `DAEMON [DENIED]\|` to stderr (journald when a systemd service) |
+| `--headless` | `false` | Log `DAEMON …` to stderr (journald when a systemd service) |
 | `--blocked-only` | `false` | Print only denied attempts (presentational) |
-| `--genkey` | `false` | Generate `/etc/app-listener/fscrypt.key` and exit; regeneration asks for confirmation (it invalidates every encrypted directory) |
+| `--genkey` | `false` | Generate `/etc/app-listener/fscrypt.key` and exit (regeneration asks for confirmation) |
+| `--pprof <addr>` | — | Serve `net/http/pprof` on a loopback address for profiling |
 
 Config grammar (full template in `daemon-samples/daemon.conf`):
 
@@ -232,85 +210,65 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 /usr/bin/ssh-agent                # bare path = all events allowed
 ```
 
-- **Whitelist only, default deny**; identity by inode — renaming a binary does not grant access.
-- **Per-binary event masks**: unlisted events are denied (EPERM); `READ`/`WRITE`/`MMAP` implicitly allow `OPEN`. Valid: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD`. Masks are a per-binary least-privilege hint, **not a confinement boundary**: whitelist mode re-attributes an `execve` to the executed binary, so a masked binary that execs another whitelisted (unmasked) binary escapes its own mask. Do not rely on masks to contain a binary that may launch other whitelisted programs.
-- **Tolerance**: missing paths/binaries are skipped with a warning; malformed directives in a valid section fail fast.
-- **SIGHUP reload** (`systemctl reload`): recomputes every binary's inode identity atomically — new guards attach before old ones detach, protection is never weaker; a malformed config keeps the previous one running.
-- **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy or the daemon refuses to start. Shutdown deprovisions keys in two passes (plain, then force-flush with an EBUSY retry loop) while guards still deny access; hooks detach only after every vault is keyless. Keys speculatively provisioned by single-file unlocks whose cleanup hit a pin are retried and removed on every force flush (collateral cleanup) — an unconfigured directory is never left readable. The installed systemd unit (`daemon-samples/app-listener-daemon.service`) ships with `ProtectSystem=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `TimeoutStopSec=infinity`.
+- **Whitelist only, default deny**; identity by inode.
+- **Per-binary event masks**: unlisted events are denied; `READ`/`WRITE`/`MMAP` imply `OPEN`. Masks are a least-privilege hint, **not a confinement boundary** — a masked binary that execs another whitelisted binary escapes its mask.
+- **SIGHUP reload** (`systemctl reload`): recomputes every binary's inode identity atomically — new guards attach before old ones detach; a malformed config keeps the previous one running.
+- **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy. Shutdown deprovisions keys in two passes while guards still deny access; hooks detach only after every vault is keyless. A hard `SIGKILL` cannot be caught, but the guard's LSM links are pinned to `/sys/fs/bpf` so the trees stay enforced until `ExecStopPost` locks the vaults.
 
-### install / uninstall / update / edit-protected
+### install.sh / install / uninstall / update / edit-protected
 
-**install** — TUI wizard, in safe order: stops a running daemon → builds the binary → generates the fscrypt key (existing keys kept) → picks users to protect → probes a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypts selected directories (backup first, then verified against the master key) → deploys systemd unit, pacman reload hook, per-user ssh-agent unit, binary and config. An existing backup **aborts** the migration; a failed policy application rolls back; empty whitelists still deny everything.
+**`scripts/install.sh`** (the `curl … | sudo bash` one-liner) — runs `check-compatibility` and aborts if it fails; downloads the latest release of `--channel` (`release` [default] / `prerelease`) from GitHub; verifies the Ed25519 signature of the checksum against the embedded release key, the checksum against the binary, and the GitHub asset digest; then atomically installs `/usr/local/sbin/app-listener` + the PATH symlink. It does **not** install the daemon — it prints the reminder to run `sudo app-listener install` yourself.
 
-**install --update-catalog-only** (the pacman `PostTransaction` hook, fires on every package transaction): re-expands every catalog-matched whitelist and rewrites the config. Two modes:
-- **stopped mode** (default): stops the daemon; encrypted vaults are unlocked per-resource **under an ephemeral self-only guard attached before the unlock**, re-locking retries unbounded while that guard stays attached — a vault that cannot be locked back is a hard error, so the hook never proceeds on an unlocked vault.
-- **`--live`** (requires the daemon running): no daemon stop, no lock churn — the vaults are already unlocked and guarded by the running daemon, the re-scan runs under the installer's own `GUARD_ALLOW_ROOT` identity, and the patched config is applied via SIGHUP (atomic reload). A resource whose re-scan comes back **empty** while the config lists binaries is refused (vault locked, or a different installer binary) — the whitelist is never silently shrunk.
+**install** — TUI wizard, in safe order: stop a running daemon → build → generate the fscrypt key (existing kept) → pick users → probe a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypt selected directories (backup first, verified against the master key) → deploy systemd unit, pacman reload hook, per-user ssh-agent unit, binary and config.
 
-> **⚠ Self-updating applications (Discord, VS Code helpers, …)**: the whitelist is pinned to concrete binary inodes at config load. Apps that update **themselves** — outside pacman — change those binaries and paths (Discord's updater renames `app-<old>` away, downloads `app-<new>`, and its `updater-client` bootstrap is denied on `installer.db`), so the app breaks until the whitelist is refreshed. The pacman hook does **not** fire for these updates. Remedy (Discord, real case):
+**install --update-catalog-only** (the pacman `PostTransaction` hook) — re-expands every catalog-matched whitelist and rewrites the config. Default: stops the daemon, unlocks each vault under an ephemeral self-only guard. `--live` (daemon running): no stop, no lock churn — applied via SIGHUP.
+
+> **Self-updating apps (Discord, VS Code helpers…)** change their own binaries outside pacman, so the whitelist (pinned to inodes) goes stale and the app breaks until refreshed. The pacman hook does **not** fire for these. Fix, no downtime:
 > ```bash
-> sudo app-listener install --update-catalog-only --live --yes   # daemon running, no downtime
+> sudo app-listener install --update-catalog-only --live --yes
 > ```
-> Extension-signature denials (`comm=vsce-sign` in the journal) are the same class: the helper is whitelisted by the catalog since this fix. Encrypted resources make planting whitelisted binaries practically impossible: while the daemon runs the guards deny every non-whitelisted write into the vault, and when it is stopped the vault is locked.
+> The catalog narrows watches for these apps: only the sensitive subtrees are guarded (Discord's `Local Storage/`, `Cookies`, …), the vault root the updater writes to stays unguarded.
 >
-> For self-updating apps the catalog now generates **narrowed watches**: instead of guarding the whole vault (whose root the updater must write to), only the sensitive subtrees are guarded — Discord's config, for example, becomes one group section with `watch:` directives for `Local Storage/`, `Cookies`, `Local State`, `Crashpad/`, etc. The vault root stays unguarded (the updater writes there freely), while the token stores remain protected against every non-whitelisted reader. Only the app binary itself still needs the refresh after each self-update.
+> **fscrypt prerequisite**: each filesystem must be initialized (`sudo fscrypt setup --all-users`) and support encryption (ext4: `sudo tune2fs -O encrypt <dev>`). The installer verifies this before asking anything.
 
-> **Prerequisite**: each filesystem must be fscrypt-initialized (`sudo fscrypt setup --all-users`) and support encryption (ext4: `sudo tune2fs -O encrypt <dev>`; f2fs: `sudo fsck.f2fs -O encrypt <dev>`). The installer verifies both before asking anything.
+**uninstall** — refuses while the daemon runs; re-scans the catalog; decrypts in place by default; deletes the master key only with `--delete-key`.
 
-**uninstall** — refuses while the daemon runs; re-scans the catalog (never trusts the config); tests every encrypted directory against the key; decrypts in place by default (never half-decrypted); reverts systemd unit/hook/binary/config; deletes the master key **only with `--delete-key`**.
+**update** — self-updates from the latest signed `pre-YYYYMMDD-<sha>` GitHub pre-release (Ed25519 signature + checksum + asset digest all verified before anything is written).
 
-**update** — self-updates from the latest signed `pre-YYYYMMDD-<sha>` GitHub pre-release. The Ed25519 signature, checksum and GitHub's asset digest are all verified before anything is written; the running binary is replaced atomically and the daemon restarted.
-
-**edit-protected** — edit one fscrypt-encrypted catalog directory in a two-pane vim-style editor without touching the install. Refuses while the daemon runs; one vault is unlocked at a time and re-locked with the daemon's own two-pass teardown on exit. `Ctrl+S` saves atomically (preserving mode/owner); binaries, symlinks and files > 2 MiB are refused.
+**edit-protected** — edit one fscrypt-encrypted catalog directory in a two-pane editor. Refuses while the daemon runs; one vault unlocked at a time, re-locked on exit; `Ctrl+S` saves atomically. Binaries, symlinks and files > 2 MiB refused.
 
 ## Debug
 
 ```bash
-systemctl is-enabled app-listener-daemon    # expect: enabled
-systemctl is-active  app-listener-daemon    # expect: active
-journalctl -u app-listener-daemon -f        # follow live (errors are here)
-sudo journalctl -u app-listener-daemon -f | grep -i denied   # only guard decisions
-```
+systemctl is-active app-listener-daemon              # expect: active
+journalctl -u app-listener-daemon -f                 # follow live
+sudo journalctl -u app-listener-daemon -f | grep -i denied
 
-The whitelist is matched by inode, so `pacman -Syu` replacing a whitelisted binary locks it out until reload:
+sudo systemctl reload app-listener-daemon            # SIGHUP after a package update replaced a binary
 
-```bash
-sudo systemctl reload app-listener-daemon   # SIGHUP: recomputes identities atomically
-sudo systemctl kill -s HUP app-listener-daemon   # same (done automatically by the pacman hook)
-```
-
-Manual guard check:
-
-```bash
+# manual guard check
 sudo systemctl stop app-listener-daemon
 sudo /usr/local/sbin/app-listener daemon --headless --verbose 3
-# another terminal: ssh-add -l / ssh -T git@github.com → must WORK
-#                   cat /home/alice/.ssh/id_ed25519 → must be DENIED
+#   another terminal: ssh -T git@github.com → must WORK
+#                     cat ~/.ssh/id_ed25519  → must be DENIED
+
+sudo fscrypt status /home/alice/.ssh                 # Encrypted / Not encrypted
 ```
 
-fscrypt lifecycle:
-
-```bash
-sudo fscrypt status /home/alice/.ssh     # "Encrypted" / "Not encrypted"
-sudo fscrypt unlock /home/alice/.ssh --key=/etc/app-listener/fscrypt.key
-sudo fscrypt lock /home/alice/.ssh       # daemon does this automatically at shutdown
-```
-
-A wrong/old key fails immediately with "invalid wrapping key" — the daemon never silently generates a new one. Backups live at `<dir>.app_listener.backup` (kept by default); `sudo app-listener install --restore-backups` restores them (aborts while the daemon runs). The ssh-agent service is per user: `systemctl --user start ssh-agent`.
+A wrong/old key fails immediately with "invalid wrapping key" — the daemon never silently generates a new one. Backups live at `<dir>.app_listener.backup`; `sudo app-listener install --restore-backups` restores them.
 
 ## Makefile targets
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Dockerized build: isolated rootful container (host `/sys/kernel/btf/vmlinux` mounted read-only) regenerates BPF bindings + builds to `build/linux/app-listener`, owned by your user |
-| `make build-host` | On-host build (needs clang/LLVM, bpftool, Go, GCC installed): regenerates BPF bindings + builds |
-| `make build-image` | Build the `app-listener-builder` toolchain image (auto-run by `make build`) |
-| `make build-linux` | Build the Go binary only |
-| `make generate` / `make generate-{monitor,guard,networkmonitor,networkguard}` | Regenerate BPF bindings |
-| `make bpftool-headers` | Regenerate shared `internal/bpf/vmlinux.h` |
-| `make test-integration` | Builds exploit binaries + Docker integration suite (rootful Docker required) |
-| `make check-compatibility` | Verify the host before building/installing |
-| `make lint` / `make test` | golangci-lint / unit tests |
-| `make clean` / `make install-deps` / `make run` | Artifacts / deps / `go run` |
+| `make build` | Dockerized build (rootful): regenerate BPF bindings + build to `build/linux/app-listener` |
+| `make build-host` | On-host build (needs clang/LLVM, bpftool, Go, GCC) |
+| `make build-linux` | Build the Go binary only (`GUI=1` links the desktop GUI) |
+| `make check-compatibility` | Static host check — can it run app-listener? |
+| `make test` / `make lint` | Unit tests / golangci-lint |
+| `make test-integration` | Docker integration + bypass suite (rootful Docker) |
+| `make generate` | Regenerate BPF bindings |
+| `make clean` | Remove build artifacts |
 
 ## Docker
 
@@ -319,38 +277,4 @@ docker compose build
 docker compose run --rm app-listener monitor -w /tmp
 ```
 
-Multi-stage build; runner is Debian slim. eBPF needs the host kernel — run privileged or with `/sys/kernel/btf/` + `CAP_BPF`.
-
-`make build` uses a dedicated, separately-built toolchain image (`docker/builder.Dockerfile`, built by `make build-image`); it does **not** touch this runtime multi-stage image.
-
-## Architecture
-
-```
-cmd/functions/            monitor, guard, networkmonitor, networkguard, daemon, install, uninstall, update, edit-protected
-cmd/common, cmd/printers  shared eBPF availability check, logo
-internal/infrastructure/  FileEvent/NetEvent types, path resolution, eBPF availability check
-internal/monitor/         bpf/monitor.bpf.c + kprobe loading, ringbuf reading, path/depth/type filters
-internal/guard/           bpf/guard.bpf.c (LSM hooks) + policy maps (guard_inodes, guard_exe_actions, guard_exe_events, taint)
-internal/networkmonitor/  tracepoint programs + exe-inode binary filter
-internal/networkguard/    LSM socket hooks, blacklist/whitelist, --auto-infra discovery
-internal/daemonconfig/    [watch <dir>] config parser
-internal/fscrypt/         vault: master key, policy detection, unlock/lock lifecycle
-internal/repository/      ports (GuardRepository, Vault…) + ErrKeyBusy/ErrKeyMissing sentinels
-internal/usecase/         daemon orchestration (TOC-TOU-safe shutdown, atomic SIGHUP reload) + mode usecases
-internal/tui/             bubbletea TUIs per mode, shared event-line formatting
-integrationtests/         Docker suite: monitor/guard/network tests, C exploit binaries in exploits/
-```
-
-## Key design decisions
-
-- **VFS kprobes for monitoring** — catch all I/O regardless of syscall path (io_uring, splice, sendfile, mmap); they survive hardened kernels where `__x64_sys_*` probes are unreliable. Metadata ops (chmod/truncate/stat/access/readlink/mknod) via `notify_change`, `vfs_setxattr/removexattr`, `vfs_getattr`, `vfs_readlink`, `do_faccessat`, `vfs_mknod`.
-- **LSM hooks for guard** — the only kernel mechanism that can *deny*; guard reverts to blocking when the policy denies.
-- **Metadata bypass coverage** — 22 hooks deny path-based ops that never create a struct file: truncate/chmod/chown/utimes/setxattr → `ATTR`, mknod → `MKNOD`, stat/access/readlink → `STAT`. `inode_permission` fires only on `access(2)`/`faccessat` probes (`MAY_ACCESS`), because plain read/write opens pass through it too and blocking them would steal identity from `file_open`/`path_truncate`/`inode_setxattr`.
-- **Identity by exe inode** — renaming/symlinking a binary and comm-spoofing cannot bypass policy; exec-opens attribute to the binary being executed so whitelisted binaries work behind shell wrappers.
-- **CO-RE + embedded BPF** — one `vmlinux.h` regenerated from the running kernel; `.o` files embedded — no runtime compilation, portable across kernels with BTF.
-- **Per-binary event masks** — daemon.conf `READ,WRITE`-style restrictions enforced in BPF; a missing entry = all events (plain guard mode unaffected); `OPEN` implied by `READ`/`WRITE`/`MMAP`.
-- **Reload without a protection gap** — new LSM programs attach before old ones detach; the kernel denies when *any* denies — protection is the intersection.
-- **TOC-TOU-safe fscrypt teardown** — two-pass deprovision (plain + force-flush EBUSY retry) while guards still deny, hooks detached only after every vault is keyless — stronger than ssh-guard.
-- **Taint tracking** — processes that touched guarded content are tracked; `process_vm_readv`, ptrace and `/proc/<pid>/mem` against them are blocked unless the caller is whitelisted; taint is inherited across fork/exec.
-- **No `chattr`** — dropped for the LSM engine (finer granularity, no immutable/append race).
-- **Non-destructive master key** — `O_EXCL` creation; regeneration needs explicit confirmation (it invalidates every provisioned directory).
+Multi-stage build, Debian-slim runner. eBPF needs the host kernel — run privileged or with `/sys/kernel/btf/` + `CAP_BPF`. `make build` uses a separate toolchain image (`docker/builder.Dockerfile`), not this one.

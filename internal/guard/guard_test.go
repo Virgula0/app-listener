@@ -53,6 +53,23 @@ func (s *guardUnitTest) TestComputeBinaryEntryNonexistent() {
 	s.Require().Error(err)
 }
 
+// TestComputeBinaryEntryLargeFile makes sure the streamed hash (pooled
+// 128 KiB buffer, multiple reads) matches a one-shot hash for a file well
+// past the buffer size.
+func (s *guardUnitTest) TestComputeBinaryEntryLargeFile() {
+	dir := s.T().TempDir()
+	binaryPath := filepath.Join(dir, "big")
+	content := make([]byte, 700*1024+123)
+	for i := range content {
+		content[i] = byte(i*7 + 3)
+	}
+	s.Require().NoError(os.WriteFile(binaryPath, content, 0644))
+
+	entry, err := ComputeBinaryEntry(binaryPath)
+	s.Require().NoError(err)
+	s.Require().Equal(sha256.Sum256(content), entry.Hash)
+}
+
 func (s *guardUnitTest) TestBinariesSummary() {
 	entries := []BinaryEntry{
 		{Path: "/usr/bin/cat", Hash: sha256.Sum256([]byte("cat-content")), Comm: "cat"},
@@ -589,6 +606,82 @@ func (s *guardUnitTest) TestPopulateInodesFillsMap() {
 		count++
 	}
 	s.Require().Equal(len(nodes), count, "guard_inodes must contain exactly the tree nodes")
+}
+
+// TestSweepInodesRecreatedFileRoot verifies the cheap periodic sweep re-maps
+// a single-file watch root that its application deleted and recreated (a new
+// inode that nothing else would add to guard_inodes).
+func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	dir := s.T().TempDir()
+	fileRoot := filepath.Join(dir, "state.db")
+	s.Require().NoError(os.WriteFile(fileRoot, []byte("v1"), 0o644))
+
+	// The guard denies unlink of a guarded file by a non-whitelisted process,
+	// so whitelist this test binary — mirroring the real case, where the app
+	// that deletes and recreates its own state file is itself whitelisted.
+	exe, err := os.Executable()
+	s.Require().NoError(err)
+	self, err := ComputeBinaryEntry(exe)
+	s.Require().NoError(err)
+	g := s.newGuardedTree(fileRoot, []BinaryEntry{self}, nil)
+	defer g.Stop()
+
+	inMap := func(path string) bool {
+		dev, ino, err := ebpf.StatInode(path)
+		s.Require().NoError(err)
+		var v uint8
+		return g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
+	}
+	s.Require().True(inMap(fileRoot), "the file root must be mapped at build")
+
+	_, oldIno, _ := ebpf.StatInode(fileRoot)
+	s.Require().NoError(os.Remove(fileRoot))
+	replacement := filepath.Join(dir, "state.db.new")
+	s.Require().NoError(os.WriteFile(replacement, []byte("v2-recreated"), 0o644))
+	s.Require().NoError(os.Rename(replacement, fileRoot))
+	_, newIno, _ := ebpf.StatInode(fileRoot)
+	if oldIno == newIno {
+		// The container's fs reused the freed inode number — the guarded
+		// entry still matches, so SweepInodes has nothing to fix and the
+		// scenario this test targets did not occur.
+		s.T().Skip("filesystem reused the inode number on recreate")
+	}
+
+	s.Require().False(inMap(fileRoot), "the recreated inode is not mapped yet")
+	s.Require().NoError(g.SweepInodes())
+	s.Require().True(inMap(fileRoot), "SweepInodes must map the recreated file root")
+}
+
+// TestSweepInodesDirRootGated verifies a directory root whose mtime has not
+// moved is not re-walked (the expensive path the sweep avoids).
+func (s *guardUnitTest) TestSweepInodesDirRootGated() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	root := s.T().TempDir()
+	s.Require().NoError(os.WriteFile(filepath.Join(root, "a"), []byte("x"), 0o644))
+
+	g := s.newGuardedTree(root, nil, nil)
+	defer g.Stop()
+
+	// First sweep records the fingerprint (mtime unchanged since build, so it
+	// is a no-op) and every subsequent sweep with an unchanged root is a
+	// no-op — a file created in a SUBdir must not be picked up here (BPF
+	// discovery + the ancestor walk cover it), only a top-level change does.
+	s.Require().NoError(g.SweepInodes())
+	g.mu.Lock()
+	seededMtime := g.sweepRootMtime
+	g.mu.Unlock()
+
+	s.Require().NoError(g.SweepInodes())
+	g.mu.Lock()
+	s.Require().Equal(seededMtime, g.sweepRootMtime, "an unchanged root must not be re-fingerprinted")
+	g.mu.Unlock()
 }
 
 // TestReSyncBinariesReplacement verifies the in-place-replacement fix

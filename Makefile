@@ -1,4 +1,4 @@
-.PHONY: build build-host build-image build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration check-compatibility deploy deploy-down tidy clean
+.PHONY: build build-host build-image build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration check-compatibility deploy deploy-down tidy clean pprof
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
@@ -66,8 +66,12 @@ build-image:
 	docker build -t $(BUILD_IMAGE) -f docker/builder.Dockerfile .
 .PHONY: build-image
 
+# GUI=1 links the fyne desktop window for `monitor --gui` (~20 MiB larger
+# binary, X11/OpenGL deps). Off by default: the daemon and the other
+# subcommands share this binary and must not carry a GUI toolkit.
+GUI ?=
 build-linux:
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(if $(VERSION),-ldflags "-X github.com/Virgula0/app-listener/internal/constants.Version=$(VERSION)",) -o $(OUTPUT_DIR)/$(BINARY_NAME) .
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(if $(GUI),-tags gui,) $(if $(VERSION),-ldflags "-X github.com/Virgula0/app-listener/internal/constants.Version=$(VERSION)",) -o $(OUTPUT_DIR)/$(BINARY_NAME) .
 .PHONY: build-linux
 
 # Ensure the shared vmlinux.h is dumped before any BPF module is compiled
@@ -190,6 +194,58 @@ check-compatibility:
 	@bash scripts/check-compatibility.sh
 .PHONY: check-compatibility
 
+# Collect a full profiling snapshot from a running daemon started with
+#   app-listener daemon ... --pprof $(PPROF_ADDR)
+# Saves raw *.pb.gz profiles (open later with: go tool pprof -http=: <file>)
+# plus ready-to-read -top text reports and the runtime MemStats dump.
+#   make pprof                       # 30s CPU sample, default 127.0.0.1:6060
+#   make pprof PPROF_SECONDS=60
+#   make pprof PPROF_ADDR=127.0.0.1:7070
+PPROF_ADDR    ?= 127.0.0.1:6060
+PPROF_SECONDS ?= 30
+PPROF_URL     := http://$(PPROF_ADDR)/debug/pprof
+PPROF_OUT     ?= build/pprof/$(shell date +%Y%m%d-%H%M%S)
+pprof:
+	@command -v go >/dev/null || { echo "ERROR: go not found"; exit 1; }
+	@curl -sf -o /dev/null "$(PPROF_URL)/" 2>/dev/null || { \
+		echo "ERROR: no pprof endpoint at $(PPROF_URL)"; \
+		echo "  start the daemon with --pprof $(PPROF_ADDR), e.g. via a systemd drop-in:"; \
+		echo "    sudo systemctl edit app-listener-daemon"; \
+		echo "      [Service]"; \
+		echo "      ExecStart="; \
+		echo "      ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only --pprof $(PPROF_ADDR)"; \
+		echo "      Environment=GODEBUG=gctrace=1"; \
+		echo "    sudo systemctl restart app-listener-daemon"; \
+		exit 1; \
+	}
+	@mkdir -p "$(PPROF_OUT)"
+	@echo ">> profiling $(PPROF_ADDR) -> $(PPROF_OUT)"
+	@echo ">> raw profiles (heap, allocs, goroutine, threadcreate)"
+	@curl -sf "$(PPROF_URL)/heap"         -o "$(PPROF_OUT)/heap.pb.gz"
+	@curl -sf "$(PPROF_URL)/allocs"       -o "$(PPROF_OUT)/allocs.pb.gz"
+	@curl -sf "$(PPROF_URL)/goroutine"    -o "$(PPROF_OUT)/goroutine.pb.gz"
+	@curl -sf "$(PPROF_URL)/threadcreate" -o "$(PPROF_OUT)/threadcreate.pb.gz" || true
+	@echo ">> CPU profile ($(PPROF_SECONDS)s — hold on)"
+	@curl -sf "$(PPROF_URL)/profile?seconds=$(PPROF_SECONDS)" -o "$(PPROF_OUT)/cpu.pb.gz"
+	@echo ">> text reports"
+	@go tool pprof -top -nodecount=40 -inuse_space "$(PPROF_OUT)/heap.pb.gz"   > "$(PPROF_OUT)/heap.inuse_space.txt"   2>/dev/null || true
+	@go tool pprof -top -nodecount=40 -inuse_objects "$(PPROF_OUT)/heap.pb.gz" > "$(PPROF_OUT)/heap.inuse_objects.txt" 2>/dev/null || true
+	@go tool pprof -top -nodecount=40 -alloc_space "$(PPROF_OUT)/allocs.pb.gz" > "$(PPROF_OUT)/allocs.alloc_space.txt" 2>/dev/null || true
+	@go tool pprof -top -nodecount=40 "$(PPROF_OUT)/cpu.pb.gz"                  > "$(PPROF_OUT)/cpu.top.txt"            2>/dev/null || true
+	@go tool pprof -tree -nodecount=30 "$(PPROF_OUT)/cpu.pb.gz"                 > "$(PPROF_OUT)/cpu.tree.txt"           2>/dev/null || true
+	@echo ">> goroutine summary + runtime MemStats"
+	@curl -sf "$(PPROF_URL)/goroutine?debug=1" -o "$(PPROF_OUT)/goroutine.summary.txt" || true
+	@curl -sf "$(PPROF_URL)/goroutine?debug=2" -o "$(PPROF_OUT)/goroutine.stacks.txt"  || true
+	@curl -sf "$(PPROF_URL)/heap?debug=1"      -o "$(PPROF_OUT)/heap.debug.txt"         || true
+	@echo
+	@echo "=== CPU top ==="        ; head -25 "$(PPROF_OUT)/cpu.top.txt"          2>/dev/null || true
+	@echo "=== heap inuse_space ===" ; head -25 "$(PPROF_OUT)/heap.inuse_space.txt" 2>/dev/null || true
+	@echo "=== alloc_space (churn) ===" ; head -25 "$(PPROF_OUT)/allocs.alloc_space.txt" 2>/dev/null || true
+	@echo "=== goroutines by count ===" ; grep -E '^goroutine profile|^[0-9]+ @' "$(PPROF_OUT)/goroutine.summary.txt" 2>/dev/null | head -25 || true
+	@echo "=== MemStats ===" ; sed -n '/^# runtime.MemStats/,/^# NumGC/p' "$(PPROF_OUT)/heap.debug.txt" 2>/dev/null | head -40 || true
+	@echo
+	@echo ">> saved to $(PPROF_OUT)/  (interactive: go tool pprof -http=: $(PPROF_OUT)/heap.pb.gz)"
+
 deploy:
 	docker compose up --build -d
 .PHONY: deploy
@@ -203,7 +259,7 @@ tidy:
 .PHONY: tidy
 
 clean:
-	rm -rf $(OUTPUT_DIR) build/test \
+	rm -rf $(OUTPUT_DIR) build/test build/pprof \
 		internal/bpf/vmlinux.h \
 		internal/monitor/monitor_bpf.go internal/monitor/embeds/ \
 		internal/guard/guard_bpf.go internal/guard/embeds/ \

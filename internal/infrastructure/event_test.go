@@ -1,6 +1,8 @@
 package ebpf
 
 import (
+	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -100,4 +102,25 @@ func (s *eventUnitTest) TestBpfEventToFileEventZeroValue() {
 	s.Require().Equal("", fe.Comm)
 	s.Require().Equal("", fe.Path)
 	s.Require().Equal("", fe.Dest)
+}
+
+// TestDecodeBpfEventMatchesBinaryRead: the hand-rolled decoder must produce
+// exactly what binary.Read produced (the layout it replaced).
+func (s *eventUnitTest) TestDecodeBpfEventMatchesBinaryRead() {
+	raw := make([]byte, BpfEventSize)
+	for i := range raw {
+		raw[i] = byte((i*131 + 7) % 251)
+	}
+	// keep the NUL terminators realistic for the byte arrays
+	raw[24+9], raw[40+13], raw[296+20] = 0, 0, 0
+
+	var want BpfEvent
+	s.Require().NoError(binary.Read(bytes.NewReader(raw), binary.LittleEndian, &want))
+
+	var got BpfEvent
+	s.Require().True(DecodeBpfEvent(raw, &got))
+	s.Require().Equal(want, got)
+
+	// short records are rejected, not partially decoded
+	s.Require().False(DecodeBpfEvent(raw[:BpfEventSize-1], &got))
 }

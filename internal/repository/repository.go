@@ -38,6 +38,12 @@ type GuardRepository interface {
 	// repeatedly; it also retries binaries still deferred from load. It
 	// returns the number of binaries whose map entries changed.
 	ReSyncBinaries() (int, error)
+	// SweepInodes is the cheap periodic guard_inodes refresh: it re-scans
+	// only when the watch root's fingerprint moved (a recreated single-file
+	// root, or a directory root that gained/lost a top-level entry).
+	// Unconditional full re-walks are avoided — deeper changes are covered by
+	// BPF runtime discovery and the ancestor walk.
+	SweepInodes() error
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

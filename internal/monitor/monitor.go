@@ -1,8 +1,6 @@
 package monitor
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -37,6 +35,53 @@ type Monitor struct {
 	eventTypes atomic.Value // stores []ebpf.EventType
 
 	watchInodes map[string]string // "dev:ino" → watched path for hardlink detection
+
+	// paths memoizes the two per-event path lookups readEvent does for an
+	// event path that is NOT lexically inside a watched target — its
+	// EvalSymlinks resolution and its hardlink-inode check. On the
+	// unfiltered VFS firehose the same non-watched paths recur constantly,
+	// so this turns a per-event EvalSymlinks + stat into a map lookup
+	// without changing the filtering decision.
+	paths *pathCache
+}
+
+const (
+	pathCacheMax = 16384
+	pathCacheTTL = 30 * time.Second
+)
+
+type pathCacheEntry struct {
+	resolved string // filepath.EvalSymlinks(path); "" when it errored
+	hardlink string // checkHardlinkByInode(path) verdict
+	at       time.Time
+}
+
+type pathCache struct {
+	mu sync.Mutex
+	m  map[string]pathCacheEntry
+}
+
+func newPathCache() *pathCache {
+	return &pathCache{m: make(map[string]pathCacheEntry, 1024)}
+}
+
+func (c *pathCache) lookup(path string) (pathCacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[path]
+	if !ok || time.Since(e.at) > pathCacheTTL {
+		return pathCacheEntry{}, false
+	}
+	return e, true
+}
+
+func (c *pathCache) store(path string, e pathCacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.m) >= pathCacheMax {
+		c.m = make(map[string]pathCacheEntry, pathCacheMax)
+	}
+	c.m[path] = e
 }
 
 func NewMonitor(targets []ebpf.Target, recursive bool, depth int) (*Monitor, error) {
@@ -51,6 +96,7 @@ func NewMonitor(targets []ebpf.Target, recursive bool, depth int) (*Monitor, err
 		recursive: recursive,
 		depth:     depth,
 		ownPID:    os.Getpid(),
+		paths:     newPathCache(),
 	}
 	m.eventTypes.Store(ebpf.EventTypes())
 
@@ -183,8 +229,8 @@ func (m *Monitor) readEvent(rd *ringbuf.Reader) (*ebpf.FileEvent, bool) {
 	}
 
 	var be ebpf.BpfEvent
-	if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &be); err != nil {
-		log.Errorf("decode event: %v", err)
+	if !ebpf.DecodeBpfEvent(record.RawSample, &be) {
+		log.Errorf("decode event: short record (%d bytes, want %d)", len(record.RawSample), ebpf.BpfEventSize)
 		return nil, true
 	}
 
@@ -223,6 +269,46 @@ func (m *Monitor) readEvent(rd *ringbuf.Reader) (*ebpf.FileEvent, bool) {
 		return &ev, true
 	}
 	return nil, true
+}
+
+// pathInfo returns the cached EvalSymlinks resolution and hardlink verdict
+// for path (both computed together on a miss). Nil-safe: a Monitor built
+// without a cache computes each time.
+func (m *Monitor) pathInfo(path string) pathCacheEntry {
+	if m.paths != nil {
+		if e, ok := m.paths.lookup(path); ok {
+			return e
+		}
+	}
+	e := pathCacheEntry{
+		resolved: evalSymlinksOrEmpty(path),
+		hardlink: m.hardlinkTarget(path),
+		at:       time.Now(),
+	}
+	if m.paths != nil {
+		m.paths.store(path, e)
+	}
+	return e
+}
+
+func evalSymlinksOrEmpty(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return ""
+	}
+	return resolved
+}
+
+// hardlinkTarget returns the watched path whose inode this path shares, or "".
+func (m *Monitor) hardlinkTarget(path string) string {
+	if path == "" || len(m.watchInodes) == 0 {
+		return ""
+	}
+	var s syscall.Stat_t
+	if err := syscall.Stat(path, &s); err != nil {
+		return ""
+	}
+	return m.watchInodes[fmt.Sprintf("%d:%d", s.Dev, s.Ino)]
 }
 
 func (m *Monitor) resolveRelativePath(pid uint32, path string) string {
@@ -377,33 +463,23 @@ func (m *Monitor) scanDirInodes(dir string, currentDepth int) {
 	}
 }
 
+// resolveSymlinkToTarget rewrites an event path that is a symlink resolving
+// into a watched target; a path already inside a target, or not a symlink
+// alias of one, is returned unchanged. The EvalSymlinks call is cached.
 func (m *Monitor) resolveSymlinkToTarget(path string) string {
 	if path == "" || m.matchesAnyTarget(path) {
 		return path
 	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return path
-	}
-	if m.matchesAnyTarget(resolved) {
+	if resolved := m.pathInfo(path).resolved; resolved != "" && m.matchesAnyTarget(resolved) {
 		return resolved
 	}
 	return path
 }
 
+// checkHardlinkByInode returns the watched path this path is a hard link of,
+// or "". The stat is cached (see pathInfo).
 func (m *Monitor) checkHardlinkByInode(path string) string {
-	if path == "" || len(m.watchInodes) == 0 {
-		return ""
-	}
-	var s syscall.Stat_t
-	if err := syscall.Stat(path, &s); err != nil {
-		return ""
-	}
-	key := fmt.Sprintf("%d:%d", s.Dev, s.Ino)
-	if watchedPath, ok := m.watchInodes[key]; ok {
-		return watchedPath
-	}
-	return ""
+	return m.pathInfo(path).hardlink
 }
 
 func (m *Monitor) Stop() {
