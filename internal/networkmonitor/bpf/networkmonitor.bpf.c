@@ -70,10 +70,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	// 4 MiB (~10k events). Events are already filtered in-kernel to the
-	// watched exe inodes / comms, so the volume is bounded; 16 MiB was
-	// 32 MiB of double-mapped user memory for headroom nothing needs.
-	__uint(max_entries, 1 << 22);
+	__uint(max_entries, 1 << 24);
 } rb SEC(".maps");
 
 char LICENSE[] SEC("license") = "GPL";

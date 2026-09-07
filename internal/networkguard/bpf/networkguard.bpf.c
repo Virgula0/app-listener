@@ -92,10 +92,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	// 4 MiB (~10k events). Events are filtered in-kernel to the configured
-	// exe actions and rate-limited by guard_net_throttle, so volume is
-	// bounded; 16 MiB was 32 MiB of double-mapped user memory for nothing.
-	__uint(max_entries, 1 << 22);
+	__uint(max_entries, 1 << 24);
 } guard_net_rb SEC(".maps");
 
 char LICENSE[] SEC("license") = "GPL";
