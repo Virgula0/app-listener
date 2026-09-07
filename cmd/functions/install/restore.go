@@ -196,8 +196,13 @@ func restoreCandidates() ([]string, error) {
 		if loadErr != nil {
 			return nil, fmt.Errorf("reading %s: %w", systemd.SystemConfigPath, loadErr)
 		}
-		for _, r := range cfg.Resources {
+		for i := range cfg.Resources {
+			r := &cfg.Resources[i]
+			// The backup lives at the encryption root for grouped sections
+			// (the whole vault is renamed aside during migration), at the
+			// watch path itself otherwise.
 			add(r.Path)
+			add(r.EncryptionRootOrPath())
 		}
 	}
 

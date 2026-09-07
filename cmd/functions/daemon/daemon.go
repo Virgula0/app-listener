@@ -122,20 +122,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	vault := fscrypt.New()
 
-	guards, err := buildGuards(cfg.Resources)
+	d, err := startGuardedDaemon(cfg, vault)
 	if err != nil {
 		return err
-	}
-
-	d, err := usecase.NewDaemonUseCase(cfg.Resources, vault, guards)
-	if err != nil {
-		return err
-	}
-
-	if startErr := d.Start(); startErr != nil {
-		// Lock back any resources that were already unlocked.
-		d.Stop()
-		return startErr
 	}
 	defer d.Stop()
 
@@ -146,7 +135,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	defer os.Remove(pidFile)
 
-	reload := makeReloadHandler(d, configPath)
+	reload := makeReloadHandler(d, configPath, vault)
 
 	if headless {
 		runHeadless(d, reload)
@@ -192,29 +181,180 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 // their new inodes whitelisted), and hand the batch to the usecase, which
 // applies it without ever dropping protection. Any failure keeps the
 // previous configuration running, exactly like the original ssh-guard.
-func makeReloadHandler(d usecase.DaemonUseCase, configPath string) func() {
+func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault) func() {
 	return func() {
-		cfg, err := daemonconfig.Load(configPath)
-		if err != nil {
+		if err := reloadOnce(d, configPath, vault); err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
 			return
 		}
-		if len(cfg.Resources) == 0 {
-			log.Error("daemon: reload failed, keeping previous configuration: config contains no [watch] sections")
-			return
-		}
-
-		newGuards, err := buildGuards(cfg.Resources)
-		if err != nil {
-			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
-			return
-		}
-		if err := d.Reload(cfg.Resources, newGuards); err != nil {
-			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
-			return
-		}
-		log.Infof("daemon: configuration reloaded from %s \u2014 resources: %d", configPath, len(cfg.Resources))
+		log.Infof("daemon: configuration reloaded from %s", configPath)
 	}
+}
+
+// reloadOnce performs one SIGHUP reload: re-parse, unlock any newly added
+// locked grouped vault under an ephemeral guard (a manual edit \u2014 the install
+// flow restarts the daemon; existing grouped resources are already unlocked
+// so this is a no-op), rebuild the guards and hand the batch to the usecase.
+// On any failure the freshly unlocked vaults are locked back and the previous
+// configuration keeps running.
+func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault) error {
+	cfg, err := daemonconfig.Load(configPath)
+	if err != nil {
+		return err
+	}
+	if len(cfg.Resources) == 0 {
+		return fmt.Errorf("config contains no [watch] sections")
+	}
+
+	pending, err := unlockPendingGroupRoots(cfg, vault)
+	if err != nil {
+		return err
+	}
+	defer pending.stop()
+
+	if resolveErr := daemonconfig.ResolvePendingPaths(cfg); resolveErr != nil {
+		pending.lockRoots(vault)
+		return resolveErr
+	}
+	newGuards, buildErr := buildGuards(cfg.Resources)
+	if buildErr != nil {
+		pending.lockRoots(vault)
+		return buildErr
+	}
+	if reloadErr := d.Reload(cfg.Resources, newGuards); reloadErr != nil {
+		pending.lockRoots(vault)
+		return reloadErr
+	}
+	// Reload committed: the new resources' roots are now owned by the
+	// usecase (locked on Stop). The deferred pending.stop retires the
+	// ephemeral unlock guards.
+	return nil
+}
+
+// startGuardedDaemon brings the guard engine up in the fail-closed order:
+// unlock any locked grouped vaults under ephemeral guards, re-validate the
+// now-visible sub-paths, build the real per-resource guards, then start the
+// usecase (attach -> unlock -> populate). The ephemeral vault-unlock guards
+// are retired once the real guards are attached and their inodes populated.
+// Every error path locks the freshly unlocked vaults back before returning.
+func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault) (usecase.DaemonUseCase, error) {
+	pending, err := unlockPendingGroupRoots(cfg, vault)
+	if err != nil {
+		return nil, err
+	}
+	defer pending.stop()
+
+	if resolveErr := daemonconfig.ResolvePendingPaths(cfg); resolveErr != nil {
+		pending.lockRoots(vault)
+		return nil, resolveErr
+	}
+
+	guards, buildErr := buildGuards(cfg.Resources)
+	if buildErr != nil {
+		pending.lockRoots(vault)
+		return nil, buildErr
+	}
+
+	d, ucErr := usecase.NewDaemonUseCase(cfg.Resources, vault, guards)
+	if ucErr != nil {
+		pending.lockRoots(vault)
+		return nil, ucErr
+	}
+
+	if startErr := d.Start(); startErr != nil {
+		// d.Stop locks back every root it unlocked (the pending roots
+		// included — uniqueEncryptionRoots covers them); the ephemeral
+		// guards stay attached through that lockdown, then pending.stop
+		// (deferred) retires them.
+		d.Stop()
+		return nil, startErr
+	}
+	// The real per-resource guards are attached and their inodes populated:
+	// the ephemeral vault-unlock guards have done their job.
+	pending.stop()
+	return d, nil
+}
+
+// pendingGroupUnlock tracks the ephemeral guards and freshly unlocked
+// encryption roots produced by unlockPendingGroupRoots, so startup / reload
+// error paths can lock the vaults back (while the ephemeral guards still
+// protect them) and every path can retire the ephemeral guards once the real
+// per-resource guards take over.
+type pendingGroupUnlock struct {
+	guards []*guard.Guard
+	roots  []string
+}
+
+// stop retires the ephemeral guards. Idempotent (guard.Stop is).
+func (p *pendingGroupUnlock) stop() {
+	for _, g := range p.guards {
+		g.Stop()
+	}
+	p.guards = nil
+}
+
+// lockRoots force-flushes every root this unlock provisioned. The ephemeral
+// guards stay attached until stop(), so the tree is never left unlocked and
+// unguarded even if a lock-back fails.
+func (p *pendingGroupUnlock) lockRoots(vault *fscrypt.Vault) {
+	for _, root := range p.roots {
+		if err := vault.Lock(root, true); err != nil && !errors.Is(err, repository.ErrKeyMissing) {
+			log.Errorf("daemon: could not lock %s back after an aborted startup/reload "+
+				"(ephemeral guard stays attached until it is retired): %v", root, err)
+		}
+	}
+	p.roots = nil
+}
+
+// unlockPendingGroupRoots unlocks the fscrypt vault of every PathPending
+// grouped resource so buildGuards can resolve the real sub-path inodes. Each
+// root is unlocked UNDER an ephemeral recursive self-only guard attached
+// first: the unlock window denies every reader except the root daemon, the
+// same discipline the running daemon and the installer's --update-catalog-only
+// use. Returns an empty tracker (no-op stop/lockRoots) when nothing is
+// pending.
+func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault) (*pendingGroupUnlock, error) {
+	seen := make(map[string]bool)
+	var roots []string
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
+		if !r.PathPending {
+			continue
+		}
+		root := r.EncryptionRootOrPath()
+		if !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	p := &pendingGroupUnlock{}
+	if len(roots) == 0 {
+		return p, nil
+	}
+
+	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
+	if err != nil {
+		return nil, fmt.Errorf("resolving daemon executable for the pending-vault guard: %w", err)
+	}
+
+	for _, root := range roots {
+		g, guardErr := guard.NewGuard(root, guard.ModeWhitelist, nil, true, 0,
+			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}))
+		if guardErr != nil {
+			p.lockRoots(vault)
+			p.stop()
+			return nil, fmt.Errorf("attaching ephemeral guard for locked vault %s: %w (vault left locked)", root, guardErr)
+		}
+		p.guards = append(p.guards, g)
+		if unlockErr := vault.Unlock(root); unlockErr != nil {
+			p.lockRoots(vault)
+			p.stop()
+			return nil, fmt.Errorf("unlocking vault %s for grouped watch paths: %w (vault left locked)", root, unlockErr)
+		}
+		p.roots = append(p.roots, root)
+		log.Infof("daemon: unlocked encryption root %s for grouped watch paths (under an ephemeral guard)", root)
+	}
+	return p, nil
 }
 
 // runGenKey implements --genkey: create the master key, but when one

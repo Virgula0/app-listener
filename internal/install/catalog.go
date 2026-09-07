@@ -87,7 +87,8 @@ var Catalog = []CandidateDir{
 		}},
 	{Name: "Claude Code", RelPath: ".claude",
 		Whitelist: map[string][]string{
-			"/usr/local/bin/claude": nil, "/usr/bin/claude": nil,
+			"/usr/local/bin/claude":    nil,
+			"/usr/bin/claude":          nil,
 			"%HOME%/.local/bin/claude": nil,
 		}},
 	{Name: "Claude Code config", RelPath: ".config/claude",

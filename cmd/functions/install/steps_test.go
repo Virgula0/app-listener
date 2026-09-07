@@ -142,6 +142,121 @@ func TestApplyLiveRefreshDeliversReload(t *testing.T) {
 	}
 }
 
+// groupedDiscordConf builds a grouped [watch <root>] config for a synthetic
+// Discord layout under home, returning the config text and its parsed form.
+// The whitelist glob (%HOME%/.config/discord/*/Discord) matches app-1.0.0.
+func groupedDiscordConf(t *testing.T, home string) (string, *daemonconfig.Config) {
+	t.Helper()
+	root := filepath.Join(home, ".config", "discord")
+	lsDir := filepath.Join(root, "Local Storage")
+	cookies := filepath.Join(root, "Cookies")
+	appBin := filepath.Join(root, "app-1.0.0", "Discord")
+	for _, d := range []string{lsDir, filepath.Dir(appBin)} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{cookies, appBin} {
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	confText := inst.GenerateConf([]inst.Section{{
+		Path:            root,
+		Allow:           []inst.BinaryRule{{Path: "/usr/bin/stale-entry"}},
+		Encrypt:         true,
+		ExtraWatchPaths: []string{lsDir, cookies},
+	}})
+	cfg, err := validateConfigText(confText)
+	if err != nil {
+		t.Fatalf("generated grouped config does not parse: %v", err)
+	}
+	return confText, cfg
+}
+
+// TestPatchCatalogSectionGroupedConfig is the regression test for the
+// pacman-hook breaker: `install --update-catalog-only` addressed a grouped
+// section's whitelist by its first watch sub-path, which has no [watch]
+// header — SetSectionWhitelist failed "section not found" and, in the
+// non-live flow, left the daemon stopped. The refresh must address the
+// section by its encryption root, re-expand the shared whitelist, and
+// preserve the `watch:` group structure.
+func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
+	home := t.TempDir()
+	confText, cfg := groupedDiscordConf(t, home)
+	root := filepath.Join(home, ".config", "discord")
+	appBin := filepath.Join(root, "app-1.0.0", "Discord")
+
+	groups := cfg.EncryptionGroups()
+	if len(groups) != 1 {
+		t.Fatalf("want 1 encryption group, got %d", len(groups))
+	}
+	r := groups[0]
+	if r.EncryptionRootOrPath() == r.Path {
+		t.Fatalf("test needs a grouped resource: root %q == watch path %q", r.EncryptionRootOrPath(), r.Path)
+	}
+
+	users := []inst.User{{Name: "tester", Home: home}}
+	updated, patched, err := patchCatalogSection(fscrypt.New(), confText, r, users, false)
+	if err != nil {
+		t.Fatalf("patchCatalogSection on a grouped config: %v", err)
+	}
+	if !patched {
+		t.Fatal("the Discord catalog entry must match its own encryption root")
+	}
+	if strings.Contains(updated, "/usr/bin/stale-entry") {
+		t.Errorf("stale whitelist entry survived the refresh:\n%s", updated)
+	}
+	if !strings.Contains(updated, appBin) {
+		t.Errorf("re-expanded whitelist missing %s:\n%s", appBin, updated)
+	}
+	if !strings.Contains(updated, "watch: "+filepath.Join(root, "Local Storage")) ||
+		!strings.Contains(updated, "watch: "+filepath.Join(root, "Cookies")) {
+		t.Errorf("group watch directives were erased:\n%s", updated)
+	}
+
+	confPath := filepath.Join(t.TempDir(), "daemon.conf")
+	if err := os.WriteFile(confPath, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reparsed, err := daemonconfig.Load(confPath)
+	if err != nil {
+		t.Fatalf("refreshed grouped config does not parse: %v", err)
+	}
+	if len(reparsed.Resources) != 2 {
+		t.Fatalf("want 2 grouped resources after refresh, got %+v", reparsed.Resources)
+	}
+	for _, res := range reparsed.Resources {
+		if res.EncryptionRoot != root {
+			t.Errorf("resource %s lost its encryption root: %+v", res.Path, res)
+		}
+		if len(res.Binaries) != 1 || res.Binaries[0].Path != appBin {
+			t.Errorf("resource %s: shared whitelist not applied: %+v", res.Path, res.Binaries)
+		}
+	}
+}
+
+// TestGroupedSectionAddressedByEncryptionRoot documents why askEncryption /
+// patchCatalogSection must address a grouped section by its encryption root:
+// the config text has ONE [watch <root>] header, so a text patch keyed on a
+// watch sub-path fails "section not found" — the exact FATAL the installer
+// hit on a grouped Discord config.
+func TestGroupedSectionAddressedByEncryptionRoot(t *testing.T) {
+	home := t.TempDir()
+	confText, cfg := groupedDiscordConf(t, home)
+	r := cfg.EncryptionGroups()[0]
+	if r.EncryptionRootOrPath() == r.Path {
+		t.Fatalf("test needs a grouped resource: root == watch path %q", r.Path)
+	}
+
+	if _, err := inst.SetNeedEncryption(confText, r.EncryptionRootOrPath(), false); err != nil {
+		t.Errorf("SetNeedEncryption keyed on the encryption root must succeed: %v", err)
+	}
+	if _, err := inst.SetNeedEncryption(confText, r.Path, false); err == nil {
+		t.Error("SetNeedEncryption keyed on a watch sub-path must fail (no section header): regression guard for the installer FATAL")
+	}
+}
+
 // TestSetSectionWhitelistPreservesGroupStructure is the regression test for
 // grouped-section refreshes: SetSectionWhitelist must replace ONLY the
 // whitelist-entry lines, preserving the `watch:` group directives — a

@@ -244,23 +244,28 @@ func validateConfigText(text string) (*daemonconfig.Config, error) {
 // group, not one per watch path).
 func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Config) (text string, toEncrypt []string, err error) {
 	for _, r := range cfg.EncryptionGroups() {
+		// Grouped sections share ONE [watch <root>] header: the fscrypt
+		// lifecycle and every config-text patch address the encryption
+		// root, never a watch sub-path (which has no section header of its
+		// own — SetNeedEncryption would fail "section not found").
+		sectionPath := r.EncryptionRootOrPath()
 		if !r.NeedEncryption {
-			log.Infof("%s declares need_encryption: false: skipping the encryption question", r.Path)
+			log.Infof("%s declares need_encryption: false: skipping the encryption question", sectionPath)
 			continue
 		}
-		encrypted, encErr := vault.IsEncrypted(r.Path)
+		encrypted, encErr := vault.IsEncrypted(sectionPath)
 		if encErr != nil {
-			return "", nil, fmt.Errorf("checking encryption of %s: %w", r.Path, encErr)
+			return "", nil, fmt.Errorf("checking encryption of %s: %w", sectionPath, encErr)
 		}
 		if encrypted {
-			log.Infof("%s is already encrypted: keeping need_encryption: true (no question, no backup)", r.Path)
+			log.Infof("%s is already encrypted: keeping need_encryption: true (no question, no backup)", sectionPath)
 			continue
 		}
 
 		answer := true
 		formErr := huh.NewForm(huh.NewGroup(
 			huh.NewConfirm().
-				Title(fmt.Sprintf("Require fscrypt encryption for %s?", r.Path)).
+				Title(fmt.Sprintf("Require fscrypt encryption for %s?", sectionPath)).
 				Description("The resource is not encrypted yet: the installer will encrypt it in place, keeping a backup.").
 				Affirmative("Yes, encrypt").
 				Negative("No encryption").
@@ -269,13 +274,13 @@ func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Confi
 		if formErr != nil {
 			return "", nil, formErr
 		}
-		updated, updateErr := inst.SetNeedEncryption(cfgText, r.Path, answer)
+		updated, updateErr := inst.SetNeedEncryption(cfgText, sectionPath, answer)
 		if updateErr != nil {
 			return "", nil, updateErr
 		}
 		cfgText = updated
 		if answer {
-			toEncrypt = append(toEncrypt, r.Path)
+			toEncrypt = append(toEncrypt, sectionPath)
 		}
 	}
 	return cfgText, toEncrypt, nil
@@ -452,9 +457,10 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 		return confText, false, nil
 	}
 
-	// Grouped sections (watch: directives) share one encryption root: the
-	// vault-level lifecycle (ephemeral-guarded unlock, re-lock) targets the
-	// root, while r.Path is the guarded tree whose whitelist is refreshed.
+	// Grouped sections (watch: directives) share one encryption root AND one
+	// [watch <root>] header carrying one shared whitelist: the vault-level
+	// lifecycle (ephemeral-guarded unlock, re-lock) and the whitelist text
+	// patch both address that root, never a watch sub-path.
 	root := sectionPath
 
 	wasEncrypted := false
@@ -466,7 +472,7 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 		if encrypted {
 			wasEncrypted = true
 			if live {
-				log.Infof("re-scanning %s (daemon running: vault already unlocked and guarded) ...", r.Path)
+				log.Infof("re-scanning %s (daemon running: vault already unlocked and guarded) ...", sectionPath)
 			} else {
 				log.Infof("unlocking %s for whitelist re-expansion (under an ephemeral guard) ...", root)
 				release, unlockErr := unlockUnderGuard(vault, root)
@@ -496,9 +502,9 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 		lockVaultFully(vault, root)
 	}
 
-	updated, patchErr := inst.SetSectionWhitelist(confText, r.Path, freshWhitelist)
+	updated, patchErr := inst.SetSectionWhitelist(confText, sectionPath, freshWhitelist)
 	if patchErr != nil {
-		return "", false, fmt.Errorf("patching section %s: %w", r.Path, patchErr)
+		return "", false, fmt.Errorf("patching section %s: %w", sectionPath, patchErr)
 	}
 	return updated, true, nil
 }

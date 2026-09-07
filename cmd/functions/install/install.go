@@ -273,11 +273,22 @@ func runUpdateCatalogOnly(autoConfirm, live bool) error {
 		}
 		return applyLiveRefresh(changed)
 	}
+	wasActive := systemd.IsDaemonActive()
 	if err := systemd.StopDaemonIfRunning(); err != nil {
 		return err
 	}
 	vault := fscrypt.New()
 	if _, err := updateCatalogConfig(vault, autoConfirm, false); err != nil {
+		// updateCatalogConfig writes the config only after every section
+		// patched successfully, so on error the on-disk config is unchanged.
+		// The daemon was stopped by this flow (StopDaemonIfRunning) — bring
+		// it back on the existing config so a failed refresh never silently
+		// leaves protection off, then surface the original error.
+		if wasActive {
+			if restartErr := deliverReload(true); restartErr != nil {
+				log.Errorf("catalog refresh failed AND the daemon could not be restarted: %v", restartErr)
+			}
+		}
 		return err
 	}
 	// The daemon was stopped by this flow: it must run again regardless of
@@ -351,22 +362,25 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 
 // askFilesystemsReady fails fast on filesystems lacking `fscrypt setup`,
 // before any prompting; dedup by device verifies each fs exactly once.
+// Grouped sections are checked once, at their encryption root (the fscrypt
+// lifecycle is per vault root, and every watch sub-path lives on it).
 func askFilesystemsReady(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
 	var checkedDevs []uint64
-	for _, r := range cfg.Resources {
+	for _, r := range cfg.EncryptionGroups() {
 		if !r.NeedEncryption {
 			continue
 		}
-		info, statErr := os.Stat(r.Path)
+		root := r.EncryptionRootOrPath()
+		info, statErr := os.Stat(root)
 		if statErr != nil {
-			return fmt.Errorf("stat %s: %w", r.Path, statErr)
+			return fmt.Errorf("stat %s: %w", root, statErr)
 		}
 		dev := info.Sys().(*syscall.Stat_t).Dev
 		if slices.Contains(checkedDevs, dev) {
 			continue
 		}
 		checkedDevs = append(checkedDevs, dev)
-		if readyErr := vault.CheckFilesystemReady(r.Path); readyErr != nil {
+		if readyErr := vault.CheckFilesystemReady(root); readyErr != nil {
 			return readyErr
 		}
 	}
@@ -427,21 +441,24 @@ func ensureMasterKey() error {
 // verifyEncryptionState checks every resource: encrypted while declared
 // need_encryption: false is fatal (unmanaged encryption), and encrypted
 // dirs must unlock with the current master key (fatal on mismatch).
+// Grouped sections are verified once per encryption root — the fscrypt
+// policy is per vault root and every watch sub-path inherits it.
 func verifyEncryptionState(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
-	for _, r := range cfg.Resources {
-		encrypted, err := vault.IsEncrypted(r.Path)
+	for _, r := range cfg.EncryptionGroups() {
+		root := r.EncryptionRootOrPath()
+		encrypted, err := vault.IsEncrypted(root)
 		if err != nil {
-			return fmt.Errorf("checking encryption of %s: %w", r.Path, err)
+			return fmt.Errorf("checking encryption of %s: %w", root, err)
 		}
 		if encrypted && !r.NeedEncryption {
-			return fmt.Errorf("fatal: %s is already encrypted with fscrypt but the config declares need_encryption: false — set need_encryption: true in the editor, or decrypt the directory first (an encrypted directory must never be left unmanaged)", r.Path)
+			return fmt.Errorf("fatal: %s is already encrypted with fscrypt but the config declares need_encryption: false — set need_encryption: true in the editor, or decrypt the directory first (an encrypted directory must never be left unmanaged)", root)
 		}
 		if !encrypted {
 			continue
 		}
-		log.Infof("verifying master key against %s ...", r.Path)
-		if err := vault.VerifyKey(r.Path); err != nil {
-			return fmt.Errorf("fatal: %v — the master key %s does not match the policy of %s; fix the key before installing", err, fscrypt.MasterKeyFile, r.Path)
+		log.Infof("verifying master key against %s ...", root)
+		if err := vault.VerifyKey(root); err != nil {
+			return fmt.Errorf("fatal: %v — the master key %s does not match the policy of %s; fix the key before installing", err, fscrypt.MasterKeyFile, root)
 		}
 	}
 	return nil
@@ -476,9 +493,12 @@ func encryptDirectories(vault *fscrypt.Vault, toEncrypt []string) error {
 }
 
 // cleanupBackups asks per backup whether to delete it (final step, post-verify).
+// The migration backup is created at the encryption root (the whole vault is
+// renamed aside, not each watch sub-path), so grouped sections are handled
+// once, at that root.
 func cleanupBackups(cfg *daemonconfig.Config) error {
-	for _, r := range cfg.Resources {
-		backup := r.Path + fscrypt.BackupSuffix
+	for _, r := range cfg.EncryptionGroups() {
+		backup := r.EncryptionRootOrPath() + fscrypt.BackupSuffix
 		if _, err := os.Lstat(backup); err != nil {
 			continue
 		}

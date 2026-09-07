@@ -40,6 +40,14 @@ type Resource struct {
 	// fscrypt-locked directory). Until a post-unlock pass moves them into Binaries they stay
 	// absent from the BPF whitelist — denied: fail-closed, never fail-open.
 	PendingBinaries []BinaryRule
+	// PathPending marks a grouped watch path that could not be validated at
+	// parse time because its encryption root is a locked fscrypt vault: the
+	// plaintext sub-path name does not resolve until the daemon unlocks the
+	// vault. The daemon unlocks the root under an ephemeral guard and then
+	// calls ResolvePendingPaths, which runs the same symlink / hard-link /
+	// type refusal addResource applies and clears this flag. A path still
+	// missing after the unlock is a hard error — never silently dropped.
+	PathPending bool
 }
 
 // EncryptionRootOrPath returns the vault root whose fscrypt key lifecycle
@@ -256,7 +264,10 @@ func parsePathDirective(line string) (string, bool) {
 
 // materializeWatchGroup appends one Resource per guarded tree, sharing the
 // group's whitelist, need_encryption and encryption root. Unguardable paths
-// (missing, symlinks, …) are skipped with a warning by addResource.
+// (missing, symlinks, …) are skipped with a warning by addResource — except a
+// grouped watch path that is merely invisible because its encryption root is
+// a locked fscrypt vault, which is kept as a PathPending resource for the
+// daemon to re-validate after the unlock (see deferPendingWatchPath).
 func materializeWatchGroup(cfg *Config, g *watchGroup) {
 	paths := g.watchPaths
 	if len(paths) == 0 {
@@ -266,7 +277,12 @@ func materializeWatchGroup(cfg *Config, g *watchGroup) {
 	for _, watchPath := range paths {
 		res := addResource(cfg, watchPath, g.lineNo)
 		if res == nil {
-			continue
+			if grouped {
+				res = deferPendingWatchPath(cfg, g, watchPath)
+			}
+			if res == nil {
+				continue
+			}
 		}
 		res.NeedEncryption = g.needEncryption
 		if grouped {
@@ -275,6 +291,53 @@ func materializeWatchGroup(cfg *Config, g *watchGroup) {
 		res.Binaries = append(res.Binaries, g.binaries...)
 		res.PendingBinaries = append(res.PendingBinaries, g.pending...)
 	}
+}
+
+// deferPendingWatchPath keeps a grouped watch path that addResource rejected
+// ONLY when the rejection is "invisible while the vault is locked": the group
+// declares need_encryption, the watch path currently fails to stat, and the
+// encryption root is a real directory (an unlocked, locked-name fscrypt
+// tree). Any other rejection — a symlink, a hard-linked file, a genuinely
+// missing path under an unencrypted group — stays dropped. Returns nil when
+// the path must not be resurrected.
+func deferPendingWatchPath(cfg *Config, g *watchGroup, watchPath string) *Resource {
+	if !g.needEncryption {
+		return nil
+	}
+	if _, statErr := os.Lstat(watchPath); statErr == nil {
+		// The path resolves: addResource rejected it on its merits
+		// (symlink / hard link / special file), not on visibility.
+		return nil
+	}
+	rootInfo, rootErr := os.Lstat(g.root)
+	if rootErr != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return nil
+	}
+	log.Warnf("daemon config line %d: grouped watch path not resolvable yet (encryption root %s locked?), deferring: %s",
+		g.lineNo, g.root, watchPath)
+	cfg.Resources = append(cfg.Resources, Resource{Path: watchPath, NeedEncryption: true, PathPending: true})
+	return &cfg.Resources[len(cfg.Resources)-1]
+}
+
+// ResolvePendingPaths re-validates every PathPending resource after its
+// encryption root has been unlocked by the daemon: the plaintext sub-path
+// must now resolve to a directory or a unique regular file — symlinks,
+// hard-linked files and special files are refused exactly as addResource
+// does at parse time. A path still missing is a hard error: the config named
+// a guarded tree that does not exist inside the vault, and silently dropping
+// it would leave a declared-protected directory unguarded.
+func ResolvePendingPaths(cfg *Config) error {
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
+		if !r.PathPending {
+			continue
+		}
+		if err := validateWatchTarget(r.Path); err != nil {
+			return fmt.Errorf("grouped watch path %s (encryption root %s): %w", r.Path, r.EncryptionRoot, err)
+		}
+		r.PathPending = false
+	}
+	return nil
 }
 
 // validateResources rejects duplicate watch paths across the whole config.
@@ -313,27 +376,35 @@ func parseWatchSection(line string) (path string, isSection bool, err error) {
 // missing paths, symlinks, hard-linked regular files (the inode-based guard would
 // implicitly cover another path) and anything not a directory or unique regular file.
 func addResource(cfg *Config, watchPath string, lineNo int) *Resource {
-	info, err := os.Lstat(watchPath)
-	if err != nil {
-		log.Warnf("daemon config line %d: skipping missing or unreadable path: %s", lineNo, watchPath)
+	if err := validateWatchTarget(watchPath); err != nil {
+		log.Warnf("daemon config line %d: skipping %s: %v", lineNo, watchPath, err)
 		return nil
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		log.Warnf("daemon config line %d: skipping %s: symbolic links are refused as watch targets (guard identity is inode based)", lineNo, watchPath)
-		return nil
-	}
-	if !info.IsDir() {
-		if !info.Mode().IsRegular() {
-			log.Warnf("daemon config line %d: skipping %s: only directories and regular files can be watched", lineNo, watchPath)
-			return nil
-		}
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
-			log.Warnf("daemon config line %d: skipping %s: hard-linked files (%d links) are refused as watch targets", lineNo, watchPath, stat.Nlink)
-			return nil
-		}
 	}
 	cfg.Resources = append(cfg.Resources, Resource{Path: watchPath, NeedEncryption: true})
 	return &cfg.Resources[len(cfg.Resources)-1]
+}
+
+// validateWatchTarget refuses a watch target that would make the inode-based
+// guard ambiguous or meaningless: an unreadable/missing path, a symlink, a
+// hard-linked regular file (the inode also names another path) and anything
+// that is not a directory or a unique regular file.
+func validateWatchTarget(watchPath string) error {
+	info, err := os.Lstat(watchPath)
+	if err != nil {
+		return fmt.Errorf("missing or unreadable path")
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("symbolic links are refused as watch targets (guard identity is inode based)")
+	}
+	if !info.IsDir() {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("only directories and regular files can be watched")
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
+			return fmt.Errorf("hard-linked files (%d links) are refused as watch targets", stat.Nlink)
+		}
+	}
+	return nil
 }
 
 // applyDirective handles one [watch]-group directive: need_encryption, binary rules

@@ -568,3 +568,134 @@ func TestLoadMissingSectionRootSkipsDirectives(t *testing.T) {
 		t.Errorf("want 0 resources, got %+v", cfg.Resources)
 	}
 }
+
+// TestLoadGroupedEncryptedWatchPathsDeferred: a grouped need_encryption: true
+// section whose encryption root exists (an unlocked-name locked fscrypt tree)
+// but whose watch sub-paths do not resolve yet must NOT be dropped — the
+// sub-path names only appear once the daemon unlocks the vault. Each is kept
+// as a PathPending resource carrying the shared whitelist and encryption
+// root, so the daemon can unlock the root and re-validate.
+func TestLoadGroupedEncryptedWatchPathsDeferred(t *testing.T) {
+	root := t.TempDir() // exists; the sub-paths deliberately do not
+	sshPath := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(writeConfig(t, `[watch `+root+`]
+watch: `+root+`/Local Storage
+watch: `+root+`/Cookies
+`+sshPath+`
+need_encryption: true
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 2 {
+		t.Fatalf("want 2 deferred grouped resources, got %+v", cfg.Resources)
+	}
+	for _, r := range cfg.Resources {
+		if !r.PathPending {
+			t.Errorf("resource %s: PathPending = false, want true", r.Path)
+		}
+		if r.EncryptionRoot != root {
+			t.Errorf("resource %s: EncryptionRoot = %q, want %q", r.Path, r.EncryptionRoot, root)
+		}
+		if !r.NeedEncryption {
+			t.Errorf("resource %s: NeedEncryption = false", r.Path)
+		}
+		if len(r.Binaries) != 1 || r.Binaries[0].Path != sshPath {
+			t.Errorf("resource %s: shared whitelist not applied: %+v", r.Path, r.Binaries)
+		}
+	}
+
+	// The daemon unlocks the vault -> the sub-paths appear -> ResolvePendingPaths
+	// clears the flag.
+	if err := os.MkdirAll(root+"/Local Storage", 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(root+"/Cookies", []byte("sqlite"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ResolvePendingPaths(cfg); err != nil {
+		t.Fatalf("ResolvePendingPaths after unlock: %v", err)
+	}
+	for _, r := range cfg.Resources {
+		if r.PathPending {
+			t.Errorf("resource %s still PathPending after the sub-path appeared", r.Path)
+		}
+	}
+}
+
+// TestResolvePendingPathsRejectsMissingAndSymlink: a pending sub-path that is
+// still missing after the unlock, or that an attacker planted a symlink at
+// during the unlock window, is a hard error — never silently dropped (that
+// would leave a declared-protected tree unguarded, or let a symlink redirect
+// the inode-based guard).
+func TestResolvePendingPathsRejectsMissingAndSymlink(t *testing.T) {
+	sshPath := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	loadPending := func(root string) *Config {
+		cfg, err := Load(writeConfig(t, `[watch `+root+`]
+watch: `+root+`/data
+`+sshPath+`
+need_encryption: true
+`))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.Resources) != 1 || !cfg.Resources[0].PathPending {
+			t.Fatalf("want 1 pending resource, got %+v", cfg.Resources)
+		}
+		return cfg
+	}
+
+	// Still missing after the unlock.
+	missingRoot := t.TempDir()
+	if err := ResolvePendingPaths(loadPending(missingRoot)); err == nil {
+		t.Error("a still-missing pending path must be a hard error")
+	}
+
+	// Symlink planted during the unlock window (deferred while missing, then
+	// a symlink appears before ResolvePendingPaths runs).
+	symRoot := t.TempDir()
+	cfg := loadPending(symRoot)
+	if err := os.Symlink(t.TempDir(), symRoot+"/data"); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := ResolvePendingPaths(cfg); err == nil {
+		t.Error("a pending path resolving to a symlink must be a hard error")
+	}
+}
+
+// TestLoadGroupedUnencryptedMissingPathStillDropped: the defer only applies
+// to need_encryption: true groups (the locked-vault case). A missing sub-path
+// in a need_encryption: false group has no vault to unlock and stays dropped.
+func TestLoadGroupedUnencryptedMissingPathStillDropped(t *testing.T) {
+	root := t.TempDir()
+	present := filepath.Join(root, "present")
+	if err := os.MkdirAll(present, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sshPath := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(writeConfig(t, `[watch `+root+`]
+watch: `+present+`
+watch: `+filepath.Join(root, "gone")+`
+`+sshPath+`
+need_encryption: false
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 1 || cfg.Resources[0].Path != present {
+		t.Fatalf("want only the present sub-path, got %+v", cfg.Resources)
+	}
+	if cfg.Resources[0].PathPending {
+		t.Error("an unencrypted group's resource must never be PathPending")
+	}
+}
