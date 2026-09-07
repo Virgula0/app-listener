@@ -10,6 +10,13 @@ type Section struct {
 	Path    string
 	Allow   []BinaryRule // whitelisted binaries and their event restrictions
 	Encrypt bool
+	// ExtraWatchPaths optionally turns the section into an encryption GROUP:
+	// the section path stays the fscrypt root (its need_encryption governs
+	// the group) while each extra path becomes its own guarded tree sharing
+	// the section's whitelist, emitted as `watch: <path>` directives. Used
+	// for self-updating applications whose update workspace must stay
+	// outside the guarded set (e.g. Discord's versioned app dirs).
+	ExtraWatchPaths []string
 }
 
 // GenerateConf renders the daemon configuration for the given sections.
@@ -26,12 +33,25 @@ func GenerateConf(sections []Section) string {
 	b.WriteString("# binaries listed below may access it, everything else is\n")
 	b.WriteString("# denied (EPERM). Identity is verified by inode, not name.\n")
 	b.WriteString("#\n")
+	b.WriteString("# A section may also carry `watch: <path>` directives: the section\n")
+	b.WriteString("# path is then the ENCRYPTION root only, and each watched path is a\n")
+	b.WriteString("# separate guarded tree sharing the section whitelist (for\n")
+	b.WriteString("# self-updating apps whose updater writes the vault root).\n")
+	b.WriteString("#\n")
 	b.WriteString("# Edit freely, then save. See daemon-samples/daemon.conf\n")
 	b.WriteString("# for the full syntax documentation.\n")
 	for _, s := range sections {
 		b.WriteString("\n[watch ")
 		b.WriteString(s.Path)
 		b.WriteString("]\n\n")
+		for _, w := range s.ExtraWatchPaths {
+			b.WriteString("watch: ")
+			b.WriteString(w)
+			b.WriteString("\n")
+		}
+		if len(s.ExtraWatchPaths) > 0 {
+			b.WriteString("\n")
+		}
 		for _, bin := range s.Allow {
 			b.WriteString(bin.Path)
 			if len(bin.Events) > 0 {
@@ -102,10 +122,14 @@ func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, 
 	}
 	end := findSectionEnd(lines, start)
 
+	// Collect the WHITELIST-entry lines only: `watch:` directives (grouped
+	// sections) and `path =` placeholders are group STRUCTURE — replacing
+	// them would silently unwatch the grouped trees on every refresh.
 	var binaryIndices []int
 	for i := start + 1; i < end; i++ {
 		t := strings.TrimSpace(lines[i])
-		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "need_encryption:") {
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "need_encryption:") ||
+			isWatchDirectiveText(t) || isPathDirectiveText(t) {
 			continue
 		}
 		binaryIndices = append(binaryIndices, i)
@@ -143,6 +167,17 @@ func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, 
 	result = append(result, newLines...)
 	result = append(result, suffix...)
 	return strings.Join(result, "\n"), nil
+}
+
+// isWatchDirectiveText recognizes a `watch: <path>` group-structure line
+// (trimmed) inside a section body.
+func isWatchDirectiveText(t string) bool {
+	return strings.HasPrefix(t, "watch:") || strings.HasPrefix(t, "watch ")
+}
+
+// isPathDirectiveText recognizes the TUI placeholder `path = <dir>` line.
+func isPathDirectiveText(t string) bool {
+	return strings.HasPrefix(t, "path = ") || t == "path ="
 }
 
 // findSectionStart returns the index of the exact [watch ...] header line,

@@ -251,6 +251,8 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 > sudo app-listener install --update-catalog-only --live --yes   # daemon running, no downtime
 > ```
 > Extension-signature denials (`comm=vsce-sign` in the journal) are the same class: the helper is whitelisted by the catalog since this fix. Encrypted resources make planting whitelisted binaries practically impossible: while the daemon runs the guards deny every non-whitelisted write into the vault, and when it is stopped the vault is locked.
+>
+> For self-updating apps the catalog now generates **narrowed watches**: instead of guarding the whole vault (whose root the updater must write to), only the sensitive subtrees are guarded — Discord's config, for example, becomes one group section with `watch:` directives for `Local Storage/`, `Cookies`, `Local State`, `Crashpad/`, etc. The vault root stays unguarded (the updater writes there freely), while the token stores remain protected against every non-whitelisted reader. Only the app binary itself still needs the refresh after each self-update.
 
 > **Prerequisite**: each filesystem must be fscrypt-initialized (`sudo fscrypt setup --all-users`) and support encryption (ext4: `sudo tune2fs -O encrypt <dev>`; f2fs: `sudo fsck.f2fs -O encrypt <dev>`). The installer verifies both before asking anything.
 

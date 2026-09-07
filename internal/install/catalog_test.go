@@ -3,6 +3,7 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -466,5 +467,47 @@ func TestFilterExistingWhitelistMixed(t *testing.T) {
 	}
 	if got[1].Path != bin || len(got[1].Events) != 0 {
 		t.Errorf("concrete binary = %+v, want %s with no events", got[1], bin)
+	}
+}
+
+// TestDiscordNarrowedWatches verifies the Discord catalog entry generates
+// the narrowed watch set: the sensitive subtrees (token stores, crash
+// dumps) are guarded while the update workspace (app dirs, installer.db)
+// stays out of the guarded set for the self-updating wrapper.
+func TestDiscordNarrowedWatches(t *testing.T) {
+	var discord *CandidateDir
+	for i := range Catalog {
+		if Catalog[i].Name == "Discord" {
+			discord = &Catalog[i]
+			break
+		}
+	}
+	if discord == nil {
+		t.Fatal("Discord catalog entry not found")
+	}
+	if discord.RelPath != ".config/discord" {
+		t.Errorf("RelPath = %q, want .config/discord (the encryption root)", discord.RelPath)
+	}
+	want := []string{
+		".config/discord/Local Storage",
+		".config/discord/Session Storage",
+		".config/discord/IndexedDB",
+		".config/discord/WebStorage",
+		".config/discord/Service Worker",
+		".config/discord/Cookies",
+		".config/discord/Local State",
+		".config/discord/Crashpad",
+		".config/discord/blob_storage",
+		".config/discord/sentry",
+	}
+	if !reflect.DeepEqual(discord.WatchRelPaths, want) {
+		t.Errorf("WatchRelPaths = %v, want %v", discord.WatchRelPaths, want)
+	}
+	// The update workspace must NOT be watched: planting binaries there is
+	// the updater's job (the wrapper writes the vault root freely).
+	for _, watched := range discord.WatchRelPaths {
+		if strings.Contains(watched, "app-") || strings.Contains(watched, "installer") {
+			t.Errorf("update workspace %q must not be watched", watched)
+		}
 	}
 }

@@ -463,3 +463,108 @@ func TestLoadMalformedSectionHeaderFails(t *testing.T) {
 		t.Errorf("error should mention the malformed header, got: %v", err)
 	}
 }
+
+// TestLoadWatchGroup covers the `watch:` group syntax: the section path is
+// the encryption root only (it is NOT itself watched — the app's updater
+// writes there), each `watch:` path becomes its own guarded resource sharing
+// the group whitelist, and need_encryption applies to the whole group.
+func TestLoadWatchGroup(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir+"/Local Storage", 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/Cookies", []byte("sqlite"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+watch: `+dir+`/Local Storage
+watch: `+dir+`/Cookies
+`+sshPath+`
+need_encryption: true
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 2 {
+		t.Fatalf("want 2 grouped resources, got %+v", cfg.Resources)
+	}
+	for _, r := range cfg.Resources {
+		if r.EncryptionRoot != dir {
+			t.Errorf("resource %s: EncryptionRoot = %q, want %q", r.Path, r.EncryptionRoot, dir)
+		}
+		if !r.NeedEncryption {
+			t.Errorf("resource %s: NeedEncryption = false, want true", r.Path)
+		}
+		if len(r.Binaries) != 1 || r.Binaries[0].Path != sshPath {
+			t.Errorf("resource %s: shared whitelist not applied: %+v", r.Path, r.Binaries)
+		}
+	}
+	if cfg.Resources[0].Path != dir+"/Local Storage" || cfg.Resources[1].Path != dir+"/Cookies" {
+		t.Errorf("unexpected watch paths: %q, %q", cfg.Resources[0].Path, cfg.Resources[1].Path)
+	}
+}
+
+// TestLoadWatchGroupValidation covers the group parse errors: watch paths
+// outside the section directory, duplicates, and the section path itself.
+func TestLoadWatchGroupValidation(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name    string
+		watchLn string
+	}{
+		{name: "outside root", watchLn: "watch: /elsewhere/data"},
+		{name: "section path itself", watchLn: "watch: " + dir},
+		{name: "traversal escape", watchLn: "watch: " + dir + "/../escape"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, "[watch "+dir+"]\n"+tc.watchLn+"\n"))
+			if err == nil {
+				t.Fatalf("expected error for %q", tc.watchLn)
+			}
+		})
+	}
+}
+
+// TestLoadUngroupedUnchanged is the backward-compatibility anchor: a section
+// without watch: directives keeps the historical single-resource behavior
+// (section path watched, empty EncryptionRoot).
+func TestLoadUngroupedUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+`+sshPath+`
+need_encryption: false
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 1 {
+		t.Fatalf("want 1 resource, got %d", len(cfg.Resources))
+	}
+	r := cfg.Resources[0]
+	if r.Path != dir || r.EncryptionRoot != "" || r.NeedEncryption {
+		t.Errorf("ungrouped resource changed: %+v", r)
+	}
+}
+
+// TestLoadMissingSectionRootSkipsDirectives preserves the historical
+// tolerance: a section whose root is missing is skipped wholesale — its
+// directives (even malformed ones) are warned and ignored, never fatal.
+func TestLoadMissingSectionRootSkipsDirectives(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `[watch /nonexistent/root]
+/usr/bin/ssh BOGUS
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 0 {
+		t.Errorf("want 0 resources, got %+v", cfg.Resources)
+	}
+}

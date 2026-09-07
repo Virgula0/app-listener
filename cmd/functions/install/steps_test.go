@@ -1,11 +1,15 @@
 package install
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
+	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
 // TestAskEncryptionSkipsNeedEncryptionFalse verifies that a resource
@@ -135,5 +139,74 @@ func TestApplyLiveRefreshDeliversReload(t *testing.T) {
 	}
 	if len(calls) != 1 {
 		t.Fatalf("an unchanged config must not trigger a reload, calls=%v", calls)
+	}
+}
+
+// TestSetSectionWhitelistPreservesGroupStructure is the regression test for
+// grouped-section refreshes: SetSectionWhitelist must replace ONLY the
+// whitelist-entry lines, preserving the `watch:` group directives — a
+// refresh that erased them would silently unwatch the grouped trees. The
+// refreshed config must also parse back into the grouped resources with
+// their shared whitelist and encryption root intact.
+func TestSetSectionWhitelistPreservesGroupStructure(t *testing.T) {
+	vault := t.TempDir()
+	lsDir := filepath.Join(vault, "Local Storage")
+	if err := os.MkdirAll(lsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vault, "Cookies"), []byte("sqlite"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	appBin := filepath.Join(vault, "app-1.0.155", "Discord")
+	if err := os.MkdirAll(filepath.Dir(appBin), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(appBin, []byte("ELF"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	conf := `[watch ` + vault + `]
+
+watch: ` + lsDir + `
+watch: ` + filepath.Join(vault, "Cookies") + `
+
+` + appBin + `
+
+need_encryption: true
+`
+	fresh := []inst.BinaryRule{{Path: appBin}}
+
+	updated, err := inst.SetSectionWhitelist(conf, vault, fresh)
+	if err != nil {
+		t.Fatalf("SetSectionWhitelist: %v", err)
+	}
+	if !strings.Contains(updated, "watch: "+lsDir) ||
+		!strings.Contains(updated, "watch: "+filepath.Join(vault, "Cookies")) {
+		t.Errorf("group watch directives were erased:\n%s", updated)
+	}
+	if strings.Contains(updated, "/usr/bin/old-binary") {
+		t.Errorf("stale whitelist entry survived:\n%s", updated)
+	}
+
+	// The refreshed config must still parse into the grouped resources with
+	// their shared whitelist and encryption root intact.
+	confPath := filepath.Join(t.TempDir(), "daemon.conf")
+	if err := os.WriteFile(confPath, []byte(updated), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := daemonconfig.Load(confPath)
+	if err != nil {
+		t.Fatalf("refreshed config does not parse: %v", err)
+	}
+	if len(cfg.Resources) != 2 {
+		t.Errorf("want 2 grouped resources after refresh, got %+v", cfg.Resources)
+	}
+	for _, r := range cfg.Resources {
+		if r.EncryptionRoot != vault {
+			t.Errorf("resource %s lost its encryption root: %+v", r.Path, r)
+		}
+		if len(r.Binaries) != 1 || r.Binaries[0].Path != appBin {
+			t.Errorf("resource %s: whitelist not applied: %+v", r.Path, r.Binaries)
+		}
 	}
 }

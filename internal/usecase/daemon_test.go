@@ -912,3 +912,42 @@ func TestDaemonUseCaseReloadRollbackBusyPinKeepsGuardsAttached(t *testing.T) {
 		t.Error("main guards must be stopped by Stop")
 	}
 }
+
+// TestDaemonUseCaseGroupedEncryptionRootsDeduplicated is the regression test
+// for the grouped-watch config: N watch paths inside one vault (one `watch:`
+// group) share a single fscrypt key lifecycle — the vault must be unlocked
+// exactly once at start and locked exactly once per pass at shutdown, no
+// matter how many watch paths reference it.
+func TestDaemonUseCaseGroupedEncryptionRootsDeduplicated(t *testing.T) {
+	vault := newFakeVault("/vault")
+	guards := []repository.GuardRepository{newFakeGuardRepo(), newFakeGuardRepo(), newFakeGuardRepo()}
+	resources := []daemonconfig.Resource{
+		{Path: "/vault/Local Storage", NeedEncryption: true, EncryptionRoot: "/vault"},
+		{Path: "/vault/Session Storage", NeedEncryption: true, EncryptionRoot: "/vault"},
+		{Path: "/vault/Cookies", NeedEncryption: true, EncryptionRoot: "/vault"},
+	}
+	d, err := NewDaemonUseCase(resources, vault, guards)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+	if err := d.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// One unlock for the shared root: the per-resource loop deduplicated.
+	if got := len(vault.unlockCalls); got != 1 {
+		t.Errorf("unlock calls = %v, want exactly [/vault]", vault.unlockCalls)
+	}
+
+	d.Stop()
+	// The lockdown locks the shared root once (first pass) and the force
+	// flush confirms it keyless — both targeting the same single root.
+	if vault.isUnlocked("/vault") {
+		t.Error("vault must be locked after Stop")
+	}
+	for i, g := range guards {
+		if !g.(*fakeGuardRepo).isStopped() {
+			t.Errorf("guards[%d] must be stopped", i)
+		}
+	}
+}
