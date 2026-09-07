@@ -33,6 +33,28 @@ func TestVerifyResourcesLocked(t *testing.T) {
 	if err := VerifyResourcesLocked(unlocked, provisionedFn); err == nil {
 		t.Fatal("VerifyResourcesLocked accepted an unlocked encrypted resource")
 	}
+
+	// Grouped resources share one vault keyed on the encryption root: the
+	// lock state is checked there, not on the (unaddressable-while-locked)
+	// watch sub-paths, and only once per root.
+	calls := 0
+	countingFn := func(path string) (bool, error) {
+		calls++
+		if path != "/encrypted-locked" {
+			t.Errorf("checked lock state of %q, want the encryption root /encrypted-locked", path)
+		}
+		return false, nil
+	}
+	grouped := []daemonconfig.Resource{
+		{Path: "/encrypted-locked/Local Storage", EncryptionRoot: "/encrypted-locked", NeedEncryption: true},
+		{Path: "/encrypted-locked/Cookies", EncryptionRoot: "/encrypted-locked", NeedEncryption: true},
+	}
+	if err := VerifyResourcesLocked(grouped, countingFn); err != nil {
+		t.Fatalf("VerifyResourcesLocked on a locked grouped vault: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("grouped vault checked %d times, want exactly 1 (per encryption root)", calls)
+	}
 }
 
 func TestEnsureAndRemoveBinSymlink(t *testing.T) {

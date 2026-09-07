@@ -7,6 +7,12 @@ After=local-fs.target
 Type=simple
 ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only
 ExecReload=/bin/kill -HUP $MAINPID
+# Safety net: systemd runs ExecStopPost after EVERY exit — clean stop, crash,
+# SIGKILL, a startup that timed out. It force-locks every encryption root in
+# the config, so a daemon that died before its own lockdown finished (or was
+# killed mid-startup, before the guard even installed its signal handler)
+# never leaves a vault decrypted.
+ExecStopPost=-/usr/local/sbin/app-listener daemon --lockdown
 Restart=on-failure
 RestartSec=2s
 # The daemon only exits after every watched directory is locked again; a
@@ -14,6 +20,11 @@ RestartSec=2s
 # Never SIGKILL it mid-lockdown — that would leave the trees unlocked and
 # unguarded.
 TimeoutStopSec=infinity
+# Startup unlocks vaults and attaches guards; it now catches SIGTERM/SIGINT
+# and locks back on abort, but a hard SIGKILL from a startup timeout would
+# still leave vaults unlocked until ExecStopPost runs. Give startup room to
+# finish (a large tree scan is slow) rather than race that timeout.
+TimeoutStartSec=900
 
 User=root
 Group=root

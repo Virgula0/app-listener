@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
@@ -40,10 +41,11 @@ const (
 )
 
 var (
-	configFlag  string
-	genKeyFlag  bool
-	headless    bool
-	blockedOnly bool
+	configFlag   string
+	genKeyFlag   bool
+	lockdownFlag bool
+	headless     bool
+	blockedOnly  bool
 )
 
 var DaemonCmd = &cobra.Command{
@@ -57,7 +59,12 @@ default), optionally restricted to specific event types. Resources are
 expected to be encrypted with fscrypt unless need_encryption: false is
 set; encrypted resources are unlocked at startup and locked again on
 shutdown while the guards remain attached, so there is never an
-unprotected window.
+unprotected window. A SIGTERM/SIGINT that arrives mid-startup (before the
+run loop is up) is caught: startup finishes its in-flight unlock/attach,
+then the same secure lockdown runs. A hard SIGKILL cannot be caught — the
+systemd unit's ExecStopPost (app-listener daemon --lockdown) is the net
+for that, and the next startup re-locks any vault a previous run left
+provisioned.
 
 The config file is resolved in this order:
   1. the --config flag, if given
@@ -90,6 +97,10 @@ func init() {
 		"Only print blocked (denied) events, skip allowed ones (headless only)")
 	DaemonCmd.Flags().BoolVarP(&genKeyFlag, "genkey", "", false,
 		"Generate the fscrypt master key file and exit")
+	DaemonCmd.Flags().BoolVarP(&lockdownFlag, "lockdown", "", false,
+		"Force-lock every encryption root in the config and exit. Wired into the systemd unit as ExecStopPost: "+
+			"systemd runs it after every exit (clean stop, crash, SIGKILL, startup timeout), so a daemon that died "+
+			"before its own lockdown finished never leaves a vault unlocked.")
 }
 
 func runDaemon(cmd *cobra.Command, args []string) error {
@@ -99,6 +110,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	if genKeyFlag {
 		return runGenKey()
+	}
+	if lockdownFlag {
+		runLockdown()
+		return nil
 	}
 
 	printers.PrintLogo()
@@ -122,9 +137,25 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	vault := fscrypt.New()
 
-	d, err := startGuardedDaemon(cfg, vault)
+	// Catch termination signals BEFORE the first fscrypt unlock. Without this,
+	// a SIGTERM/SIGINT during startup (systemctl stop, a startup timeout,
+	// Ctrl+C) hits Go's default disposition and kills the process outright —
+	// no deferred Stop runs, so the just-unlocked vaults stay provisioned in
+	// the kernel keyring while the unpinned BPF guards detach on exit:
+	// decrypted AND unguarded, with nothing to lock them back. Registered for
+	// the whole process lifetime; the run loop selects on the same channel.
+	termSig := make(chan os.Signal, 1)
+	signal.Notify(termSig, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(termSig)
+
+	d, err := startGuardedDaemonAbortable(termSig, cfg, vault)
 	if err != nil {
 		return err
+	}
+	if d == nil {
+		// A termination signal aborted startup; the vaults were locked back
+		// under the secure lockdown. Nothing else to unwind.
+		return nil
 	}
 	defer d.Stop()
 
@@ -138,14 +169,61 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	reload := makeReloadHandler(d, configPath, vault)
 
 	if headless {
-		runHeadless(d, reload)
+		runHeadless(d, reload, termSig)
 		return nil
 	}
 	if serve.Enabled {
+		// tui.Serve installs its own SIGINT/SIGTERM handling; leaving termSig
+		// registered too is harmless (both channels get the signal, tui.Serve
+		// drives the teardown, then runDaemon's defer d.Stop runs) and avoids
+		// a brief unhandled window that signal.Stop here would open.
 		return runServedTUI(d, cfg, reload, serve)
 	}
 
-	return runTUI(d, cfg, reload)
+	return runTUI(d, cfg, reload, termSig)
+}
+
+// startGuardedDaemonAbortable runs startup while honoring a termination
+// signal. Startup is a chain of blocking syscalls (fscrypt unlock, BPF
+// attach) that cannot be interrupted mid-call, so on a signal it lets startup
+// reach its next consistent point and then runs the secure lockdown (Stop
+// keeps the guards attached until every vault is keyless). Returns (nil, nil)
+// when startup was aborted this way.
+func startGuardedDaemonAbortable(termSig <-chan os.Signal, cfg *daemonconfig.Config, vault *fscrypt.Vault) (usecase.DaemonUseCase, error) {
+	return awaitStartupOrSignal(termSig, func() (usecase.DaemonUseCase, error) {
+		return startGuardedDaemon(cfg, vault)
+	})
+}
+
+// awaitStartupOrSignal runs start in a goroutine and races it against a
+// termination signal. On a signal it waits for start to reach a consistent
+// point (its blocking syscalls cannot be interrupted mid-call), then runs the
+// secure lockdown on whatever it produced and returns (nil, nil) to signal
+// "aborted — do not proceed".
+func awaitStartupOrSignal(termSig <-chan os.Signal, start func() (usecase.DaemonUseCase, error)) (usecase.DaemonUseCase, error) {
+	type result struct {
+		d   usecase.DaemonUseCase
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		d, err := start()
+		done <- result{d, err}
+	}()
+
+	select {
+	case r := <-done:
+		return r.d, r.err
+	case <-termSig:
+		log.Warn("daemon: termination signal during startup — finishing the in-flight unlock/attach, then locking every vault back")
+		r := <-done
+		if r.d != nil {
+			r.d.Stop() // secure lockdown: guards stay attached until keyless
+		} else if r.err != nil {
+			log.Infof("daemon: startup had already failed and cleaned up after itself: %v", r.err)
+		}
+		return nil, nil
+	}
 }
 
 // configureDaemonLogging keeps daemon log lines plain (no ANSI colors) so
@@ -238,6 +316,8 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 // are retired once the real guards are attached and their inodes populated.
 // Every error path locks the freshly unlocked vaults back before returning.
 func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault) (usecase.DaemonUseCase, error) {
+	relockStaleVaults(cfg, vault)
+
 	pending, err := unlockPendingGroupRoots(cfg, vault)
 	if err != nil {
 		return nil, err
@@ -355,6 +435,105 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault) (*p
 		log.Infof("daemon: unlocked encryption root %s for grouped watch paths (under an ephemeral guard)", root)
 	}
 	return p, nil
+}
+
+// runLockdown force-locks every encryption root in the resolved config and
+// exits. It is the systemd ExecStopPost safety net: systemd runs ExecStopPost
+// after EVERY exit — clean stop, crash, SIGTERM, SIGKILL, startup timeout — so
+// a daemon that died before its own lockdown could finish still ends with its
+// vaults keyless. Best-effort per root (a file another process holds open in
+// the tree makes a force flush fail); failures are logged CRITICAL and the
+// command still exits 0 so it never blocks the unit from settling.
+func runLockdown() {
+	configureDaemonLogging()
+
+	configPath, err := resolveConfigPath()
+	if err != nil {
+		log.Errorf("lockdown: %v — nothing to lock", err)
+		return
+	}
+	cfg, err := daemonconfig.Load(configPath)
+	if err != nil {
+		log.Errorf("lockdown: cannot parse %s (%v) — lock the watched directories manually: fscrypt lock <dir>", configPath, err)
+		return
+	}
+
+	vault := fscrypt.New()
+	seen := make(map[string]bool)
+	locked, stillUnlocked := 0, 0
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
+		if !r.NeedEncryption {
+			continue
+		}
+		root := r.EncryptionRootOrPath()
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		if lockOneRoot(vault, root) {
+			locked++
+		} else {
+			stillUnlocked++
+		}
+	}
+	log.Infof("lockdown: %d encryption root(s) locked, %d still unlocked", locked, stillUnlocked)
+}
+
+// lockOneRoot force-flushes root's fscrypt key, retrying briefly on EBUSY
+// (a pinned file). Reports whether the vault ended up keyless.
+func lockOneRoot(vault *fscrypt.Vault, root string) bool {
+	const attempts = 50
+	for i := 0; i < attempts; i++ {
+		err := vault.Lock(root, true)
+		if err == nil || errors.Is(err, repository.ErrKeyMissing) {
+			log.Infof("lockdown: %s is locked", root)
+			return true
+		}
+		if !errors.Is(err, repository.ErrKeyBusy) {
+			log.Errorf("lockdown: CRITICAL: could not lock %s: %v", root, err)
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	log.Errorf("lockdown: CRITICAL: %s is STILL unlocked after %d attempts — a process holds files open in it "+
+		"(lsof +D %q); its plaintext stays exposed until that process exits and the vault locks", root, attempts, root)
+	return false
+}
+
+// relockStaleVaults runs before the daemon unlocks anything: an encryption
+// root already provisioned at this point means the PREVIOUS daemon exited
+// without locking it (SIGKILL, OOM, power loss) — its plaintext has been
+// exposed and, since that daemon's unpinned guards died with it, unguarded.
+// Lock it back now; startGuards re-provisions it below with this run's guards
+// already attached. Best-effort and loud; never fatal (aborting would only
+// leave the stale vault unlocked for longer).
+func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault) {
+	seen := make(map[string]bool)
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
+		if !r.NeedEncryption {
+			continue
+		}
+		root := r.EncryptionRootOrPath()
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+
+		provisioned, err := vault.IsProvisioned(root)
+		if err != nil {
+			log.Warnf("daemon: could not check the startup lock state of %s: %v", root, err)
+			continue
+		}
+		if !provisioned {
+			continue
+		}
+		log.Warnf("daemon: SECURITY: %s was already unlocked at startup — the previous daemon did not lock it back "+
+			"(killed mid-run or mid-startup?). Its plaintext has been exposed and unguarded; locking it now before "+
+			"re-provisioning it under this run's guards.", root)
+		lockOneRoot(vault, root)
+	}
 }
 
 // runGenKey implements --genkey: create the master key, but when one
@@ -518,10 +697,11 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 	return true
 }
 
-func runHeadless(d usecase.DaemonUseCase, reload func()) {
+func runHeadless(d usecase.DaemonUseCase, reload func(), termSig <-chan os.Signal) {
 	uidr := common.NewUIDResolver()
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
 
 	for {
 		select {
@@ -532,37 +712,31 @@ func runHeadless(d usecase.DaemonUseCase, reload func()) {
 			if !writeEvent(os.Stderr, blockedOnly, uidr, &ev) {
 				continue
 			}
-		case s := <-sig:
-			switch s {
-			case syscall.SIGHUP:
-				log.Info("daemon: SIGHUP received, reloading configuration")
-				reload()
-			case syscall.SIGINT, syscall.SIGTERM:
-				log.Info("daemon: caught termination signal, shutting down")
-				return
-			}
+		case <-hup:
+			log.Info("daemon: SIGHUP received, reloading configuration")
+			reload()
+		case <-termSig:
+			log.Info("daemon: caught termination signal, shutting down")
+			return
 		}
 	}
 }
 
-func runTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func()) error {
+func runTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func(), termSig <-chan os.Signal) error {
 	p := tea.NewProgram(newDaemonModel(d.Events(), cfg), tea.WithAltScreen())
 
-	sig := make(chan os.Signal, 2)
-	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
 	quit := make(chan struct{})
 	go func() {
 		for {
 			select {
-			case s := <-sig:
-				switch s {
-				case syscall.SIGHUP:
-					log.Info("daemon: SIGHUP received, reloading configuration")
-					reload()
-				case syscall.SIGINT, syscall.SIGTERM:
-					p.Quit()
-					return
-				}
+			case <-hup:
+				log.Info("daemon: SIGHUP received, reloading configuration")
+				reload()
+			case <-termSig:
+				p.Quit()
+				return
 			case <-quit:
 				return
 			}
@@ -571,7 +745,7 @@ func runTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func()) er
 
 	_, runErr := p.Run()
 	close(quit)
-	signal.Stop(sig)
+	signal.Stop(hup)
 	return runErr
 }
 
