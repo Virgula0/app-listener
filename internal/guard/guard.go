@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -97,6 +98,20 @@ type Guard struct {
 	deployed map[string]GuardInodeKey
 	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
 	eagerPopulate bool
+	// pinPrefix, when set (WithPinning), is the bpffs path prefix each LSM
+	// link is pinned at (prefix + hook name) after it attaches: the pin holds
+	// the link — and through it the program and its maps — alive past process
+	// death, so a SIGKILL (or OOM, or power loss between crash and restart)
+	// leaves the guarded tree still enforced instead of instantly
+	// unprotected. Stop() removes the pins; pins a killed process left behind
+	// are retired by CleanupStalePins on the next start. Cleared to "" if
+	// pinning fails mid-attach (see pinDegraded).
+	pinPrefix string
+	// pinDegraded is set when pinning was requested but the kernel refused it
+	// (hardened bpffs, unusual mount): the guard still enforces while the
+	// process is alive, but it will NOT survive a SIGKILL. Surfaced so the
+	// daemon can warn loudly.
+	pinDegraded bool
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -143,6 +158,17 @@ func WithSelfAllowBinary(entry BinaryEntry, events []ebpf.EventType) GuardOption
 	return func(g *Guard) {
 		g.selfBinary = &entry
 		g.selfEvents = events
+	}
+}
+
+// WithPinning pins every attached LSM link at prefix+<hook> on bpffs, so the
+// guard keeps enforcing after the daemon process dies (SIGKILL, OOM, power
+// loss). prefix must be unique per guard instance and encode the daemon
+// generation — see guard.PinPrefix. Stop() unpins; CleanupStalePins retires
+// pins a killed daemon left behind.
+func WithPinning(prefix string) GuardOption {
+	return func(g *Guard) {
+		g.pinPrefix = prefix
 	}
 }
 
@@ -219,32 +245,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		}
 	}
 
-	// Required hooks: without file_open and file_permission files can be opened and read without
-	// restriction, so the guard refuses to start if they cannot attach. All other hooks are optional —
-	// failure yields reduced protection (no mmap, rename, or unlink blocking).
-	required := map[string]bool{
-		"file_open":       true,
-		"file_permission": true,
-	}
-
-	attachments := guardLSMHooks(g)
-
-	var failedRequired []string
-	for _, a := range attachments {
-		l, err := link.AttachLSM(link.LSMOptions{
-			Program: a.prog,
-		})
-		if err != nil {
-			if required[a.hook] {
-				failedRequired = append(failedRequired, a.hook)
-				log.Errorf("CRITICAL: required LSM hook %s failed to attach: %v", a.hook, err)
-			} else {
-				log.Warnf("skipping optional LSM hook %s: %v", a.hook, err)
-			}
-			continue
-		}
-		g.links = append(g.links, l)
-	}
+	failedRequired, total := g.attachHooks()
 
 	if len(failedRequired) > 0 {
 		g.cleanup()
@@ -258,9 +259,57 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	}
 
 	log.Infof("guard created \u2014 %d/%d LSM hooks attached, watching: %s (%s)",
-		len(g.links), len(attachments), path, modeString(mode))
+		len(g.links), total, path, modeString(mode))
 	return g, nil
 }
+
+// requiredHooks are the LSM hooks without which the guard cannot provide
+// meaningful protection: files could be opened and read unchecked.
+var requiredHooks = map[string]bool{"file_open": true, "file_permission": true}
+
+// attachHooks attaches every guard LSM program and, when pinning is enabled,
+// pins each link at g.pinPrefix+<hook> so it survives process death. A
+// required hook that fails to attach is collected (the caller aborts); an
+// optional one is warned and skipped. A pin failure does NOT abort: the guard
+// still enforces while the process runs, so it degrades (pinDegraded) with a
+// CRITICAL log and drops the already-made pins rather than leave the tree
+// unprotected entirely.
+func (g *Guard) attachHooks() (failedRequired []string, total int) {
+	attachments := guardLSMHooks(g)
+	for _, a := range attachments {
+		l, attachErr := link.AttachLSM(link.LSMOptions{Program: a.prog})
+		if attachErr != nil {
+			if requiredHooks[a.hook] {
+				failedRequired = append(failedRequired, a.hook)
+				log.Errorf("CRITICAL: required LSM hook %s failed to attach: %v", a.hook, attachErr)
+			} else {
+				log.Warnf("skipping optional LSM hook %s: %v", a.hook, attachErr)
+			}
+			continue
+		}
+		g.links = append(g.links, l)
+		if g.pinPrefix != "" {
+			// Hook names carry underscores; some hardened bpffs implementations
+			// only accept [a-z0-9-] in pin names, so normalise here.
+			pinPath := g.pinPrefix + strings.ReplaceAll(a.hook, "_", "-")
+			if pinErr := l.Pin(pinPath); pinErr != nil {
+				log.Errorf("guard %s: CRITICAL: LSM link pinning failed at %s (%v) \u2014 this guard will NOT "+
+					"survive a SIGKILL. The daemon keeps running with live enforcement; investigate bpffs "+
+					"(kernel hardening, mount options).", g.path, pinPath, pinErr)
+				for _, prev := range g.links {
+					_ = prev.Unpin()
+				}
+				g.pinPrefix = ""
+				g.pinDegraded = true
+			}
+		}
+	}
+	return failedRequired, len(attachments)
+}
+
+// PinDegraded reports that link pinning was requested for this guard but the
+// kernel refused it: enforcement is live but will not survive a SIGKILL.
+func (g *Guard) PinDegraded() bool { return g.pinDegraded }
 
 func guardLSMHooks(g *Guard) []struct {
 	prog *cilium.Program
@@ -1134,6 +1183,17 @@ func (g *Guard) Stop() {
 
 func (g *Guard) cleanup() {
 	for _, l := range g.links {
+		// A pinned link outlives Close() until the pin is removed, so unpin
+		// first: Stop() means "this guard is going away for good" (clean
+		// shutdown, reload swap, or rollback), and leaving the bpffs entry
+		// would keep the LSM program attached with no owner. NewGuard pins
+		// all-or-nothing, so pinPrefix != "" implies every link here is pinned.
+		if g.pinPrefix != "" {
+			if err := l.Unpin(); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Errorf("guard %s: unpinning LSM link failed (%v) — the program stays attached; "+
+					"remove its pin file under %s* manually", g.path, err, g.pinPrefix)
+			}
+		}
 		l.Close()
 	}
 	g.links = nil

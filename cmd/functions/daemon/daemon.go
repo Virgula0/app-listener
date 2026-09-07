@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +39,28 @@ const (
 	sampleConfigPath = "daemon-samples/daemon.conf"
 	// pidFilePath mirrors ssh-guard's /run/<name>.pid contract.
 	pidFile = "/run/app-listener-daemon.pid"
+	// bpffsMount is the conventional bpffs mountpoint the guard pins its LSM
+	// links under, so a SIGKILL leaves the guarded trees still enforced until
+	// ExecStopPost locks the vaults and the next start retires the stale pins.
+	bpffsMount = "/sys/fs/bpf"
 )
+
+// pinCfg is where and under which generation this daemon instance pins its
+// LSM links. base is fixed for the process; gen is fresh per start and per
+// reload so CleanupStalePins can tell a killed predecessor's pins apart.
+type pinCfg struct {
+	base string
+	gen  string
+}
+
+func (p pinCfg) prefix(resourcePath string) string {
+	return guard.PinPrefix(p.base, p.gen, resourcePath) // "" when p.base == "" (pinning unavailable)
+}
+
+// newPinGeneration returns a fresh generation tag for one batch of guards.
+func newPinGeneration() string {
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
+}
 
 var (
 	configFlag   string
@@ -61,10 +83,11 @@ set; encrypted resources are unlocked at startup and locked again on
 shutdown while the guards remain attached, so there is never an
 unprotected window. A SIGTERM/SIGINT that arrives mid-startup (before the
 run loop is up) is caught: startup finishes its in-flight unlock/attach,
-then the same secure lockdown runs. A hard SIGKILL cannot be caught — the
-systemd unit's ExecStopPost (app-listener daemon --lockdown) is the net
-for that, and the next startup re-locks any vault a previous run left
-provisioned.
+then the same secure lockdown runs. A hard SIGKILL cannot be caught, but
+the guard's LSM links are pinned to /sys/fs/bpf, so the guarded trees stay
+enforced after the process dies; the systemd unit's ExecStopPost
+(app-listener daemon --lockdown) then removes the vault keys, and the next
+start retires the stale pins once its own guards are attached.
 
 The config file is resolved in this order:
   1. the --config flag, if given
@@ -116,39 +139,26 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	printers.PrintLogo()
-	configureDaemonLogging()
-
-	if ebpfErr := common.CheckEBPF(); ebpfErr != nil {
-		return ebpfErr
-	}
-
-	// The daemon wraps fs guards (and the LSM network guard), which enforce
-	// through BPF LSM hooks: refuse to start without an active bpf LSM.
-	if lsmErr := common.CheckBPFLSM(); lsmErr != nil {
-		return lsmErr
-	}
-
-	configPath, cfg, err := loadDaemonConfig()
+	configPath, cfg, pin, err := prepareDaemonStart()
 	if err != nil {
 		return err
 	}
-	log.Infof("daemon starting \u2014 config: %s, resources: %d", configPath, len(cfg.Resources))
 
 	vault := fscrypt.New()
 
 	// Catch termination signals BEFORE the first fscrypt unlock. Without this,
 	// a SIGTERM/SIGINT during startup (systemctl stop, a startup timeout,
-	// Ctrl+C) hits Go's default disposition and kills the process outright —
-	// no deferred Stop runs, so the just-unlocked vaults stay provisioned in
-	// the kernel keyring while the unpinned BPF guards detach on exit:
-	// decrypted AND unguarded, with nothing to lock them back. Registered for
-	// the whole process lifetime; the run loop selects on the same channel.
+	// Ctrl+C) hits Go's default disposition and kills the process with no
+	// deferred Stop — the just-unlocked vaults would then stay provisioned in
+	// the kernel keyring until ExecStopPost runs. (The guards themselves are
+	// pinned, so the trees stay enforced regardless; this is about locking the
+	// vault key promptly, under the same secure lockdown a clean stop uses.)
+	// Registered for the whole process lifetime; the run loop selects on it.
 	termSig := make(chan os.Signal, 1)
 	signal.Notify(termSig, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(termSig)
 
-	d, err := startGuardedDaemonAbortable(termSig, cfg, vault)
+	d, err := startGuardedDaemonAbortable(termSig, cfg, vault, pin)
 	if err != nil {
 		return err
 	}
@@ -166,7 +176,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	defer os.Remove(pidFile)
 
-	reload := makeReloadHandler(d, configPath, vault)
+	reload := makeReloadHandler(d, configPath, vault, pin.base)
 
 	if headless {
 		runHeadless(d, reload, termSig)
@@ -189,9 +199,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 // reach its next consistent point and then runs the secure lockdown (Stop
 // keeps the guards attached until every vault is keyless). Returns (nil, nil)
 // when startup was aborted this way.
-func startGuardedDaemonAbortable(termSig <-chan os.Signal, cfg *daemonconfig.Config, vault *fscrypt.Vault) (usecase.DaemonUseCase, error) {
+func startGuardedDaemonAbortable(termSig <-chan os.Signal, cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg) (usecase.DaemonUseCase, error) {
 	return awaitStartupOrSignal(termSig, func() (usecase.DaemonUseCase, error) {
-		return startGuardedDaemon(cfg, vault)
+		return startGuardedDaemon(cfg, vault, pin)
 	})
 }
 
@@ -224,6 +234,41 @@ func awaitStartupOrSignal(termSig <-chan os.Signal, start func() (usecase.Daemon
 		}
 		return nil, nil
 	}
+}
+
+// prepareDaemonStart runs the pre-startup checks common to every run mode:
+// logo + logging, eBPF / BPF-LSM availability, config load, and the bpffs
+// preflight for guard link pinning. Returns the resolved config plus the pin
+// location/generation for this daemon instance.
+func prepareDaemonStart() (configPath string, cfg *daemonconfig.Config, pin pinCfg, err error) {
+	printers.PrintLogo()
+	configureDaemonLogging()
+
+	if ebpfErr := common.CheckEBPF(); ebpfErr != nil {
+		return "", nil, pinCfg{}, ebpfErr
+	}
+	// The daemon wraps fs guards (and the LSM network guard), which enforce
+	// through BPF LSM hooks: refuse to start without an active bpf LSM.
+	if lsmErr := common.CheckBPFLSM(); lsmErr != nil {
+		return "", nil, pinCfg{}, lsmErr
+	}
+
+	configPath, cfg, err = loadDaemonConfig()
+	if err != nil {
+		return "", nil, pinCfg{}, err
+	}
+	log.Infof("daemon starting — config: %s, resources: %d", configPath, len(cfg.Resources))
+
+	// The guard pins its LSM links to bpffs so they keep enforcing if the
+	// daemon is SIGKILLed. ResolvePinBase mounts bpffs if it is missing and
+	// returns "" (with a CRITICAL log) when this host cannot support pinning
+	// at all — the daemon still runs, just without SIGKILL survival.
+	base := guard.ResolvePinBase(bpffsMount)
+	if base == "" {
+		log.Error("daemon: CRITICAL: LSM link pinning is UNAVAILABLE on this host — the guards enforce " +
+			"while the daemon runs but will NOT survive a SIGKILL. Fix bpffs to restore the kill-safety guarantee.")
+	}
+	return configPath, cfg, pinCfg{base: base, gen: newPinGeneration()}, nil
 }
 
 // configureDaemonLogging keeps daemon log lines plain (no ANSI colors) so
@@ -259,11 +304,18 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 // their new inodes whitelisted), and hand the batch to the usecase, which
 // applies it without ever dropping protection. Any failure keeps the
 // previous configuration running, exactly like the original ssh-guard.
-func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault) func() {
+func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pinBase string) func() {
 	return func() {
-		if err := reloadOnce(d, configPath, vault); err != nil {
+		liveGen, err := reloadOnce(d, configPath, vault, pinBase)
+		if err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
 			return
+		}
+		// The pre-reload generation's guards were unpinned by the usecase's
+		// commit (old guard Stop); sweep every other generation, keeping only
+		// the batch that is now live.
+		if _, cleanErr := guard.CleanupStalePins(pinBase, map[string]bool{liveGen: true}); cleanErr != nil {
+			log.Warnf("daemon: could not sweep stale guard pins after reload: %v", cleanErr)
 		}
 		log.Infof("daemon: configuration reloaded from %s", configPath)
 	}
@@ -272,41 +324,44 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 // reloadOnce performs one SIGHUP reload: re-parse, unlock any newly added
 // locked grouped vault under an ephemeral guard (a manual edit \u2014 the install
 // flow restarts the daemon; existing grouped resources are already unlocked
-// so this is a no-op), rebuild the guards and hand the batch to the usecase.
-// On any failure the freshly unlocked vaults are locked back and the previous
-// configuration keeps running.
-func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault) error {
+// so this is a no-op), rebuild the guards (pinned under a fresh generation)
+// and hand the batch to the usecase. On any failure the freshly unlocked
+// vaults are locked back and the previous configuration keeps running.
+// Returns the pin generation that is live after a successful reload.
+func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pinBase string) (string, error) {
 	cfg, err := daemonconfig.Load(configPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(cfg.Resources) == 0 {
-		return fmt.Errorf("config contains no [watch] sections")
+		return "", fmt.Errorf("config contains no [watch] sections")
 	}
 
-	pending, err := unlockPendingGroupRoots(cfg, vault)
+	pin := pinCfg{base: pinBase, gen: newPinGeneration()}
+
+	pending, err := unlockPendingGroupRoots(cfg, vault, pin)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer pending.stop()
 
 	if resolveErr := daemonconfig.ResolvePendingPaths(cfg); resolveErr != nil {
 		pending.lockRoots(vault)
-		return resolveErr
+		return "", resolveErr
 	}
-	newGuards, buildErr := buildGuards(cfg.Resources)
+	newGuards, buildErr := buildGuards(cfg.Resources, pin)
 	if buildErr != nil {
 		pending.lockRoots(vault)
-		return buildErr
+		return "", buildErr
 	}
 	if reloadErr := d.Reload(cfg.Resources, newGuards); reloadErr != nil {
 		pending.lockRoots(vault)
-		return reloadErr
+		return "", reloadErr
 	}
 	// Reload committed: the new resources' roots are now owned by the
 	// usecase (locked on Stop). The deferred pending.stop retires the
 	// ephemeral unlock guards.
-	return nil
+	return pin.gen, nil
 }
 
 // startGuardedDaemon brings the guard engine up in the fail-closed order:
@@ -315,10 +370,20 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 // usecase (attach -> unlock -> populate). The ephemeral vault-unlock guards
 // are retired once the real guards are attached and their inodes populated.
 // Every error path locks the freshly unlocked vaults back before returning.
-func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault) (usecase.DaemonUseCase, error) {
+func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg) (usecase.DaemonUseCase, error) {
 	relockStaleVaults(cfg, vault)
 
-	pending, err := unlockPendingGroupRoots(cfg, vault)
+	// Retire pins a previous daemon left when it was killed. relockStaleVaults
+	// (and the unit's ExecStopPost --lockdown) has locked any vault those pins
+	// were the last guard for, so removing them now exposes only encrypted
+	// data — and it must happen before this run touches fscrypt, because a
+	// stale guard pinned by an OLDER daemon binary would deny this (new-inode)
+	// process's unlock/lock ioctls on the guarded trees.
+	if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{pin.gen: true}); cleanErr != nil {
+		log.Warnf("daemon: could not sweep stale guard pins: %v", cleanErr)
+	}
+
+	pending, err := unlockPendingGroupRoots(cfg, vault, pin)
 	if err != nil {
 		return nil, err
 	}
@@ -329,7 +394,7 @@ func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault) (usecase
 		return nil, resolveErr
 	}
 
-	guards, buildErr := buildGuards(cfg.Resources)
+	guards, buildErr := buildGuards(cfg.Resources, pin)
 	if buildErr != nil {
 		pending.lockRoots(vault)
 		return nil, buildErr
@@ -393,7 +458,7 @@ func (p *pendingGroupUnlock) lockRoots(vault *fscrypt.Vault) {
 // same discipline the running daemon and the installer's --update-catalog-only
 // use. Returns an empty tracker (no-op stop/lockRoots) when nothing is
 // pending.
-func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault) (*pendingGroupUnlock, error) {
+func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg) (*pendingGroupUnlock, error) {
 	seen := make(map[string]bool)
 	var roots []string
 	for i := range cfg.Resources {
@@ -419,7 +484,10 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault) (*p
 
 	for _, root := range roots {
 		g, guardErr := guard.NewGuard(root, guard.ModeWhitelist, nil, true, 0,
-			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}))
+			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}),
+			// Pin the ephemeral guard too: a SIGKILL during the grouped-vault
+			// unlock window must still leave the root enforced.
+			guard.WithPinning(pin.prefix("ephemeral:"+root)))
 		if guardErr != nil {
 			p.lockRoots(vault)
 			p.stop()
@@ -503,11 +571,11 @@ func lockOneRoot(vault *fscrypt.Vault, root string) bool {
 
 // relockStaleVaults runs before the daemon unlocks anything: an encryption
 // root already provisioned at this point means the PREVIOUS daemon exited
-// without locking it (SIGKILL, OOM, power loss) — its plaintext has been
-// exposed and, since that daemon's unpinned guards died with it, unguarded.
-// Lock it back now; startGuards re-provisions it below with this run's guards
-// already attached. Best-effort and loud; never fatal (aborting would only
-// leave the stale vault unlocked for longer).
+// without locking it (SIGKILL, OOM, power loss). Its pinned guards may still
+// be enforcing (that is the point of pinning), but the vault key is stale —
+// lock it back now, before this run re-provisions it under its own guards.
+// Best-effort and loud; never fatal (aborting would only leave it unlocked
+// for longer). ExecStopPost --lockdown normally does this first anyway.
 func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault) {
 	seen := make(map[string]bool)
 	for i := range cfg.Resources {
@@ -530,8 +598,7 @@ func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault) {
 			continue
 		}
 		log.Warnf("daemon: SECURITY: %s was already unlocked at startup — the previous daemon did not lock it back "+
-			"(killed mid-run or mid-startup?). Its plaintext has been exposed and unguarded; locking it now before "+
-			"re-provisioning it under this run's guards.", root)
+			"(killed mid-run or mid-startup?). Locking it now before re-provisioning it under this run's guards.", root)
 		lockOneRoot(vault, root)
 	}
 }
@@ -596,7 +663,7 @@ func resolveConfigPath() (string, error) {
 // to inherit full access to every guarded tree. On failure the partially
 // built guards (which are already attached to the kernel) are detached
 // before returning.
-func buildGuards(resources []daemonconfig.Resource) ([]repository.GuardRepository, error) {
+func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.GuardRepository, error) {
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {
 		return nil, fmt.Errorf("resolving daemon executable: %w", err)
@@ -628,12 +695,18 @@ func buildGuards(resources []daemonconfig.Resource) ([]repository.GuardRepositor
 			// Root-gated self access with the minimal event set the fscrypt
 			// lifecycle needs; guarded content reads by non-root executors of
 			// this binary stay denied (see the self-key bypass regression test).
-			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}))
+			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}),
+			// Pin the LSM links to bpffs so a SIGKILL leaves this tree still
+			// enforced until ExecStopPost locks the vault.
+			guard.WithPinning(pin.prefix(r.Path)))
 		if err != nil {
 			for _, built := range guards {
 				built.Stop()
 			}
 			return nil, fmt.Errorf("creating guard for %s: %w", r.Path, err)
+		}
+		if pin.base != "" && g.PinDegraded() {
+			log.Errorf("daemon: CRITICAL: guard for %s could not pin its LSM links — it will not survive a SIGKILL", r.Path)
 		}
 		guards = append(guards, g)
 	}
