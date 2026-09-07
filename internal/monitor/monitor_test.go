@@ -1,10 +1,12 @@
 package monitor
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 
@@ -225,6 +227,45 @@ func (s *monitorUnitTest) TestResolveSymlinkToTarget() {
 			s.Require().Equal(tt.expected, result)
 		})
 	}
+}
+
+func (s *monitorUnitTest) TestPathCacheEvictionAndTTL() {
+	c := newPathCache()
+	c.store("/a", pathCacheEntry{resolved: "/watched/a", at: time.Now()})
+	if e, ok := c.lookup("/a"); !ok || e.resolved != "/watched/a" {
+		s.Failf("lookup", "got (%+v,%v)", e, ok)
+	}
+	// expired entry is a miss
+	c.m["/a"] = pathCacheEntry{resolved: "/watched/a", at: time.Now().Add(-2 * pathCacheTTL)}
+	if _, ok := c.lookup("/a"); ok {
+		s.Fail("expired entry must be a miss")
+	}
+	// overflow clears the map
+	for i := 0; i < pathCacheMax+1; i++ {
+		c.store(fmt.Sprintf("/p%d", i), pathCacheEntry{at: time.Now()})
+	}
+	s.Require().LessOrEqual(len(c.m), pathCacheMax)
+}
+
+// TestResolveSymlinkCachesResult: the EvalSymlinks resolution is memoized — a
+// symlink resolved once keeps reporting its target within the TTL even after
+// the link is removed (the documented staleness tradeoff that keeps the
+// firehose cheap). The filtering decision is unchanged.
+func (s *monitorUnitTest) TestResolveSymlinkCachesResult() {
+	dir := s.T().TempDir()
+	watchedDir := filepath.Join(dir, "watched")
+	s.Require().NoError(os.Mkdir(watchedDir, 0755))
+	watchedFile := filepath.Join(watchedDir, "secret.txt")
+	s.Require().NoError(os.WriteFile(watchedFile, []byte("x"), 0644))
+	link := filepath.Join(dir, "lnk")
+	s.Require().NoError(os.Symlink(watchedFile, link))
+
+	m := &Monitor{targets: dirTarget(watchedDir), paths: newPathCache()}
+
+	s.Require().Equal(watchedFile, m.resolveSymlinkToTarget(link))
+
+	s.Require().NoError(os.Remove(link))
+	s.Require().Equal(watchedFile, m.resolveSymlinkToTarget(link), "resolution stays cached within TTL")
 }
 
 func (s *monitorUnitTest) TestCheckHardlinkByInode() {

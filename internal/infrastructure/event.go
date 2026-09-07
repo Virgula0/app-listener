@@ -1,6 +1,9 @@
 package ebpf
 
-import "strings"
+import (
+	"encoding/binary"
+	"strings"
+)
 
 // unknownLabel is the display name used when an event type cannot be mapped.
 const unknownLabel = "UNKNOWN"
@@ -75,6 +78,31 @@ type BpfEvent struct {
 	Comm [16]byte
 	Path [256]byte
 	Dest [256]byte
+}
+
+// BpfEventSize is the wire size of BpfEvent as the BPF side lays it out:
+// 6 x u32 header, then the three fixed byte arrays. Kept in sync with the C
+// struct event {} in monitor.bpf.c.
+const BpfEventSize = 6*4 + 16 + 256 + 256
+
+// DecodeBpfEvent fills e from a raw ring-buffer record without reflection or
+// a per-record bytes.Reader allocation (binary.Read does both, which adds up
+// on the monitor's unfiltered VFS firehose). Reports false for a short
+// record.
+func DecodeBpfEvent(raw []byte, e *BpfEvent) bool {
+	if len(raw) < BpfEventSize {
+		return false
+	}
+	e.PID = binary.LittleEndian.Uint32(raw[0:4])
+	e.UID = binary.LittleEndian.Uint32(raw[4:8])
+	e.GID = binary.LittleEndian.Uint32(raw[8:12])
+	e.Type = binary.LittleEndian.Uint32(raw[12:16])
+	e.FD = binary.LittleEndian.Uint32(raw[16:20])
+	e.Pad = binary.LittleEndian.Uint32(raw[20:24])
+	copy(e.Comm[:], raw[24:40])
+	copy(e.Path[:], raw[40:296])
+	copy(e.Dest[:], raw[296:552])
+	return true
 }
 
 func (e *BpfEvent) ToFileEvent() FileEvent {

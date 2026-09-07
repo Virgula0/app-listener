@@ -620,7 +620,14 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	fileRoot := filepath.Join(dir, "state.db")
 	s.Require().NoError(os.WriteFile(fileRoot, []byte("v1"), 0o644))
 
-	g := s.newGuardedTree(fileRoot, nil, nil)
+	// The guard denies unlink of a guarded file by a non-whitelisted process,
+	// so whitelist this test binary — mirroring the real case, where the app
+	// that deletes and recreates its own state file is itself whitelisted.
+	exe, err := os.Executable()
+	s.Require().NoError(err)
+	self, err := ComputeBinaryEntry(exe)
+	s.Require().NoError(err)
+	g := s.newGuardedTree(fileRoot, []BinaryEntry{self}, nil)
 	defer g.Stop()
 
 	inMap := func(path string) bool {
@@ -633,9 +640,16 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 
 	_, oldIno, _ := ebpf.StatInode(fileRoot)
 	s.Require().NoError(os.Remove(fileRoot))
-	s.Require().NoError(os.WriteFile(fileRoot, []byte("v2-recreated"), 0o644))
+	replacement := filepath.Join(dir, "state.db.new")
+	s.Require().NoError(os.WriteFile(replacement, []byte("v2-recreated"), 0o644))
+	s.Require().NoError(os.Rename(replacement, fileRoot))
 	_, newIno, _ := ebpf.StatInode(fileRoot)
-	s.Require().NotEqual(oldIno, newIno, "recreated file must have a new inode for this test to be meaningful")
+	if oldIno == newIno {
+		// The container's fs reused the freed inode number — the guarded
+		// entry still matches, so SweepInodes has nothing to fix and the
+		// scenario this test targets did not occur.
+		s.T().Skip("filesystem reused the inode number on recreate")
+	}
 
 	s.Require().False(inMap(fileRoot), "the recreated inode is not mapped yet")
 	s.Require().NoError(g.SweepInodes())
