@@ -358,6 +358,48 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleDir_DeepDestRename() {
 	s.stopGuard(c)
 }
 
+// TestGuard_Bypass_RenameOverGuardedFile is the regression test for the
+// destination-target rename bypass: renaming another file ON TOP OF a guarded
+// single-file watch root silently unlinks the guarded inode (the kernel never
+// fires security_path_unlink for a rename victim) and repoints the name at
+// unguarded, attacker-controlled content. The guard's own inode stays in
+// guard_inodes, but the path no longer resolves to it — and because a
+// single-file watch root's parent directory is NOT in guard_inodes, the
+// destination-parent check in path_rename misses it entirely.
+//
+// path_rename must deny the rename when the victim inode is the guard's watch
+// root (guard_config[3..4]).
+func (s *IntegrationSuite) TestGuard_Bypass_RenameOverGuardedFile() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"sh", "-c", "printf 'ORIGINAL-GUARDED-SECRET' > /watch/secret.txt"})
+	s.exec(c, []string{"sh", "-c", "printf 'ATTACKER-CONTROLLED-CONTENT' > /outside-evil.txt"})
+
+	// Single-file watch root: only secret.txt's inode enters guard_inodes,
+	// never its parent /watch.
+	s.startGuardStd(c, "/watch/secret.txt")
+	logBefore := s.readGuardLog(c)
+
+	// Attacker (non-whitelisted) renames a file they control over the
+	// guarded file. rename(2) is same-filesystem here, so mv uses it
+	// directly rather than falling back to copy+unlink.
+	code, out := s.exec(c, []string{"mv", "-f", "/outside-evil.txt", "/watch/secret.txt"})
+	s.Require().NotEqualf(0, code, "rename over the guarded watch root must be denied: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "RENAME")
+
+	s.stopGuard(c)
+
+	// With the guard down, the guarded file must still hold its original
+	// content: the rename victim was never unlinked.
+	_, content := s.exec(c, []string{"cat", "/watch/secret.txt"})
+	s.Require().Equalf("ORIGINAL-GUARDED-SECRET", content,
+		"guarded file content was replaced through the rename-over bypass")
+}
+
 // ---------------------------------------------------------------
 // Test: guard blocks all operations on a directory
 // ---------------------------------------------------------------

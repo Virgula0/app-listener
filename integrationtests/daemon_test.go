@@ -175,6 +175,96 @@ need_encryption: false
 }
 
 // ---------------------------------------------------------------
+// Test: the daemon protects its own on-disk state
+//
+// While the daemon runs it guards /etc/app-listener independent of any
+// [watch] section:
+//   - daemon.conf stays world-READABLE, but no process other than the
+//     app-listener binary may write / rename-over / delete it, nor create
+//     new files in the directory (ModeReadOnly);
+//   - fscrypt.key is not even readable except by the app-listener binary
+//     (ModeWhitelist, empty list — the key guard stacks on the RO dir guard).
+//
+// The app-listener binary itself (uid 0) keeps full access so install /
+// --genkey / --update-catalog-only work.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestDaemon_SelfProtection_ConfigAndKey() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /etc/app-listener && echo SECRET > /protected/secret && " +
+			"head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/sleep`)
+
+	log := s.readDaemonLog(c)
+	s.Require().Containsf(log, "/etc/app-listener (readonly)", "RO self-protection guard did not attach: %s", log)
+
+	// 1. daemon.conf stays world-readable.
+	code, out := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Equalf(0, code, "daemon.conf must stay world-readable: %s", out)
+	s.Require().Contains(out, "[watch /protected]")
+
+	// 2. daemon.conf is not writable by a non-app-listener process.
+	code, out = s.exec(c, []string{"sh", "-c", "echo pwned >> /etc/app-listener/daemon.conf 2>&1"})
+	s.Require().NotEqualf(0, code, "append to daemon.conf must be denied: %s", out)
+
+	// 3. daemon.conf cannot be replaced by renaming a file over it.
+	code, out = s.exec(c, []string{"sh", "-c", "echo pwned > /tmp/evil && mv -f /tmp/evil /etc/app-listener/daemon.conf 2>&1"})
+	s.Require().NotEqualf(0, code, "rename over daemon.conf must be denied: %s", out)
+
+	// 4. no new files in the guarded directory.
+	code, out = s.exec(c, []string{"sh", "-c", "touch /etc/app-listener/newfile 2>&1"})
+	s.Require().NotEqualf(0, code, "creating a file in /etc/app-listener must be denied: %s", out)
+
+	// 5. fscrypt.key is not readable at all.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/fscrypt.key 2>&1"})
+	s.Require().NotEqualf(0, code, "reading fscrypt.key must be denied: %s", out)
+
+	// 6. fscrypt.key is not writable.
+	code, out = s.exec(c, []string{"sh", "-c", "echo x >> /etc/app-listener/fscrypt.key 2>&1"})
+	s.Require().NotEqualf(0, code, "writing fscrypt.key must be denied: %s", out)
+
+	events := parseDaemonEvents(s.readDaemonLog(c))
+	keyDenied, dirDenied := false, false
+	for _, ev := range events {
+		if !ev.Denied {
+			continue
+		}
+		if ev.Resource == "/etc/app-listener/fscrypt.key" {
+			keyDenied = true
+		}
+		if ev.Resource == "/etc/app-listener" {
+			dirDenied = true
+		}
+	}
+	s.Require().Truef(keyDenied, "expected a DENIED event for resource=/etc/app-listener/fscrypt.key, log:\n%s", s.readDaemonLog(c))
+	s.Require().Truef(dirDenied, "expected a DENIED event for resource=/etc/app-listener, log:\n%s", s.readDaemonLog(c))
+
+	// daemon.conf never lost its content (readable while the daemon runs).
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Contains(conf, "[watch /protected]")
+	s.Require().NotContains(conf, "pwned")
+
+	// Stop the daemon; its guards unpin on shutdown. Poll until fscrypt.key
+	// is reachable again, then confirm it was never modified.
+	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
+	var keyLen string
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		code, out = s.exec(c, []string{"sh", "-c", "wc -c < /etc/app-listener/fscrypt.key 2>/dev/null"})
+		if code == 0 {
+			keyLen = out
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	s.Require().Equal("32", strings.TrimSpace(keyLen), "fscrypt.key was modified or the guard never detached")
+}
+
+// ---------------------------------------------------------------
 // Test: raw block-device gate is daemon-wide and device-granular
 //
 // Two resources (/mnt/data/guardedA, /mnt/data/guardedB) share one backing

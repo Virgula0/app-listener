@@ -25,6 +25,19 @@
 // local user can execute to inherit full access to guarded trees.
 #define GUARD_ALLOW_ROOT 3
 #define __FMODE_EXEC 0x20 // set in file->f_flags by kernel exec opens (do_open_execat)
+#define FMODE_WRITE 0x2   // file->f_mode: file is open for write (stable across kernels)
+#define PROT_WRITE 0x2    // mmap prot
+#define MAP_SHARED 0x1    // mmap flags
+
+// guard_config[0] mode values.  0/1 are the historical blacklist/whitelist.
+// GUARD_MODE_READONLY (2): every process may READ the guarded tree, but only
+// a whitelisted binary may modify it (write, truncate, rename, unlink, chmod,
+// mkdir, mknod, xattr, writable mmap, mount-over).  Used for /etc/app-listener,
+// whose daemon.conf stays world-readable while only the app-listener binary
+// can change it.
+#define GUARD_MODE_BLACKLIST 0
+#define GUARD_MODE_WHITELIST 1
+#define GUARD_MODE_READONLY 2
 
 // guard_event.reason: why an event was emitted. GUARD_REASON_NONE is the
 // ordinary path-keyed decision (the event belongs to the watched resource).
@@ -301,6 +314,36 @@ static __always_inline int should_add_new_dir(void)
 	return 1;
 }
 
+// is_readonly_mode reports whether this guard runs in GUARD_MODE_READONLY.
+// Callers use it to skip taint-tracking on an allowed read: RO mode guards
+// world-readable content (a config file), not secrets, so tainting every
+// reader would only bloat guard_tainted_pids and over-restrict ptrace.
+static __always_inline int is_readonly_mode(void)
+{
+	__u32 key = 0;
+	__u64 *mode = bpf_map_lookup_elem(&guard_config, &key);
+	return mode != NULL && *mode == GUARD_MODE_READONLY;
+}
+
+// event_is_read_class reports whether, in GUARD_MODE_READONLY, this event
+// leaks no modification and is therefore allowed for every process (only
+// non-read-class events are gated on the whitelist).  OPEN and MMAP count as
+// read-class only without write intent (FMODE_WRITE / MAP_SHARED|PROT_WRITE),
+// which check_and_emit_ex receives as write_intent.
+static __always_inline int event_is_read_class(__u32 type, bool write_intent)
+{
+	switch (type) {
+	case EVENT_READ:
+	case EVENT_STAT:
+		return 1;
+	case EVENT_OPEN:
+	case EVENT_MMAP:
+		return !write_intent;
+	default:
+		return 0;
+	}
+}
+
 // Walk up from `parent` toward the root and report whether the subtree
 // under it lies inside the guarded region.  The guarded region is the
 // subtree rooted at the farthest (closest-to-root) inode present in
@@ -448,6 +491,39 @@ static __always_inline int is_guarded_block_device(struct inode *inode)
 
 	__u8 *val = bpf_map_lookup_elem(&guard_fs_devices, &rdev);
 	return val != NULL;
+}
+
+// inode_is_watch_root reports whether inode is exactly the guard's watch
+// root (guard_config[3] = dev, [4] = ino).  A direct identity check with no
+// dentry walk: root_in_chain already treats this same (dev, ino) equality as
+// decisive, so nothing weaker is trusted here.  Used by path_rename to deny a
+// rename that would clobber the watch root itself — its parent directory is
+// not in guard_inodes for a single-file watch, so the destination-parent
+// check cannot see it.
+static __always_inline int inode_is_watch_root(struct inode *inode)
+{
+	if (!inode)
+		return 0;
+
+	__u32 dev_key = 3;
+	__u32 ino_key = 4;
+	__u64 *root_dev = bpf_map_lookup_elem(&guard_config, &dev_key);
+	__u64 *root_ino = bpf_map_lookup_elem(&guard_config, &ino_key);
+	if (!root_dev || !root_ino)
+		return 0;
+
+	__u64 ino = 0;
+	bpf_probe_read_kernel(&ino, sizeof(ino), &inode->i_ino);
+	if (ino != *root_ino)
+		return 0;
+
+	struct super_block *sb = NULL;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return 0;
+	dev_t dev = 0;
+	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+	return (__u64)dev == *root_dev;
 }
 
 // Mark the current process as tainted — it now has guarded file content
@@ -798,7 +874,7 @@ static __always_inline int is_allow_action(const __u8 *action)
 	return 0;
 }
 
-static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry, bool is_exec_open, bool quiet_allow, __u32 reason)
+static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry, bool is_exec_open, bool quiet_allow, bool write_intent, __u32 reason)
 {
 	__u32 key = 0;
 	__u64 *mode = bpf_map_lookup_elem(&guard_config, &key);
@@ -825,8 +901,19 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 		if (get_current_exe_inode(&exe_ik))
 			action = bpf_map_lookup_elem(&guard_exe_actions, &exe_ik);
 
-		if (mode_val == 0) {
+		if (mode_val == GUARD_MODE_BLACKLIST) {
 			is_blocked = action != NULL && *action == GUARD_BLOCK;
+		} else if (mode_val == GUARD_MODE_READONLY) {
+			// Read-only guard: every process may read the tree (and
+			// the allow is not logged — a config file is read
+			// constantly); every modifying operation is gated on the
+			// whitelist exactly like whitelist mode.
+			if (event_is_read_class(type, write_intent)) {
+				is_blocked = 0;
+				quiet_allow = true;
+			} else {
+				is_blocked = !is_allow_action(action);
+			}
 		} else {
 			is_blocked = !is_allow_action(action);
 
@@ -933,7 +1020,7 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 // gets GUARD_REASON_NONE. The raw block-device gate calls check_and_emit_ex
 // directly with GUARD_REASON_RAW_DEVICE.
 #define check_and_emit(type, dentry, dest_str, dest_is_user, dest_dentry, is_exec_open, quiet_allow) \
-	check_and_emit_ex((type), (dentry), (dest_str), (dest_is_user), (dest_dentry), (is_exec_open), (quiet_allow), GUARD_REASON_NONE)
+	check_and_emit_ex((type), (dentry), (dest_str), (dest_is_user), (dest_dentry), (is_exec_open), (quiet_allow), false, GUARD_REASON_NONE)
 
 // Lazy directory discovery for file_open.
 // When a file is accessed inside a newly-created directory whose inode is
@@ -1044,8 +1131,11 @@ int guard_file_open(unsigned long long *ctx)
 		__u32 f_flags = 0;
 		bpf_probe_read_kernel(&f_flags, sizeof(f_flags), &file->f_flags);
 		bool is_exec_open = (f_flags & __FMODE_EXEC) != 0;
-		int ret = check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, is_exec_open, false);
-		if (ret == 0)
+		__u32 f_mode = 0;
+		bpf_probe_read_kernel(&f_mode, sizeof(f_mode), &file->f_mode);
+		bool is_write_open = (f_mode & FMODE_WRITE) != 0;
+		int ret = check_and_emit_ex(EVENT_OPEN, dentry, NULL, false, NULL, is_exec_open, false, is_write_open, GUARD_REASON_NONE);
+		if (ret == 0 && !is_readonly_mode())
 			mark_tainted();
 		return ret;
 	}
@@ -1058,7 +1148,7 @@ int guard_file_open(unsigned long long *ctx)
 	// the device, not a watched path; the RAW_DEVICE reason tells
 	// userspace not to blame a specific resource.
 	if (is_guarded_block_device(inode))
-		return check_and_emit_ex(EVENT_OPEN, dentry, NULL, false, NULL, false, false, GUARD_REASON_RAW_DEVICE);
+		return check_and_emit_ex(EVENT_OPEN, dentry, NULL, false, NULL, false, false, false, GUARD_REASON_RAW_DEVICE);
 
 	return 0;
 }
@@ -1079,8 +1169,11 @@ int guard_mmap_file(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
 	if (is_guarded_access(dentry, inode)) {
-		int ret = check_and_emit(EVENT_MMAP, dentry, NULL, false, NULL, false, false);
-		if (ret == 0)
+		unsigned long prot = (unsigned long)ctx[2];
+		unsigned long flags = (unsigned long)ctx[3];
+		bool is_write_map = (prot & PROT_WRITE) && (flags & MAP_SHARED);
+		int ret = check_and_emit_ex(EVENT_MMAP, dentry, NULL, false, NULL, false, false, is_write_map, GUARD_REASON_NONE);
+		if (ret == 0 && !is_readonly_mode())
 			mark_tainted();
 		return ret;
 	}
@@ -1114,7 +1207,7 @@ int guard_file_permission(unsigned long long *ctx)
 
 	__u32 event_type = (mask & MAY_WRITE) ? EVENT_WRITE : EVENT_READ;
 	int ret = check_and_emit(event_type, dentry, NULL, false, NULL, false, false);
-	if (ret == 0)
+	if (ret == 0 && !is_readonly_mode())
 		mark_tainted();
 	return ret;
 }
@@ -1141,7 +1234,7 @@ int guard_file_truncate(unsigned long long *ctx)
 
 	if (is_guarded_access(dentry, inode)) {
 		int ret = check_and_emit(EVENT_WRITE, dentry, NULL, false, NULL, false, false);
-		if (ret == 0)
+		if (ret == 0 && !is_readonly_mode())
 			mark_tainted();
 		return ret;
 	}
@@ -1206,6 +1299,21 @@ int guard_path_rename(unsigned long long *ctx)
 	// guarded region even though its parent is not in the map.
 	if (old_parent && guarded_ancestor_within_limit(old_parent))
 		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
+
+	// Destination-target side: a rename onto an existing file silently
+	// unlinks that victim (security_path_unlink never fires for a rename
+	// target).  When the victim IS the guard's watch root, the rename swaps
+	// guarded content for an unguarded inode — a bypass for a single-file
+	// watch root, whose parent directory is not in guard_inodes, so the
+	// destination-parent checks below cannot catch it.  Deny on identity
+	// with the configured watch root; RENAME_EXCHANGE with the root on the
+	// destination side lands here too.
+	if (new_dentry) {
+		struct inode *victim;
+		bpf_probe_read_kernel(&victim, sizeof(victim), &new_dentry->d_inode);
+		if (victim && inode_is_watch_root(victim))
+			return check_and_emit(EVENT_RENAME, new_dentry, NULL, false, NULL, false, false);
+	}
 
 	// Also check the destination parent directory.  This prevents renaming
 	// files from outside the guarded area INTO a guarded directory, and
@@ -1577,7 +1685,10 @@ int guard_sb_mount(unsigned long long *ctx)
 		return 0;
 
 	if (guarded_map_hit(dentry, inode, 32)) {
-		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false, false);
+		// write_intent = true: mounting over a guarded path shadows it —
+		// a modification, so it stays gated on the whitelist even in
+		// GUARD_MODE_READONLY.
+		return check_and_emit_ex(EVENT_OPEN, dentry, NULL, false, NULL, false, false, true, GUARD_REASON_NONE);
 	}
 
 	return 0;

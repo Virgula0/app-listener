@@ -29,6 +29,14 @@ type Mode int
 const (
 	ModeBlacklist Mode = iota
 	ModeWhitelist
+	// ModeReadOnly allows every process to READ the guarded tree while
+	// gating every modifying operation (write, truncate, rename, unlink,
+	// chmod, mkdir, mknod, xattr, writable mmap, mount-over) on the
+	// whitelist, exactly like ModeWhitelist. It backs the daemon's
+	// self-protection guard on /etc/app-listener, whose daemon.conf must
+	// stay world-readable while only the app-listener binary can change it.
+	// Mirrors GUARD_MODE_READONLY in guard.bpf.c.
+	ModeReadOnly
 )
 
 const (
@@ -394,17 +402,21 @@ func guardLSMHooks(g *Guard) []struct {
 }
 
 func modeString(mode Mode) string {
-	if mode == ModeWhitelist {
+	switch mode {
+	case ModeWhitelist:
 		return "whitelist"
+	case ModeReadOnly:
+		return "readonly"
+	default:
+		return "blacklist"
 	}
-	return "blacklist"
 }
 
 // guardModeKey converts a Mode to the uint64 value stored in the BPF config map, rejecting unknown modes.
 func guardModeKey(m Mode) (uint64, error) {
 	switch m {
-	case ModeBlacklist, ModeWhitelist:
-		return uint64(m), nil //nolint:gosec // m is validated to one of two small enum values above
+	case ModeBlacklist, ModeWhitelist, ModeReadOnly:
+		return uint64(m), nil //nolint:gosec // m is validated to one of three small enum values above
 	default:
 		return 0, fmt.Errorf("invalid guard mode %d", m)
 	}
@@ -422,7 +434,7 @@ func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 			Ino: ino,
 		}
 		action := uint8(GUARD_BLOCK)
-		if g.mode == ModeWhitelist {
+		if g.mode == ModeWhitelist || g.mode == ModeReadOnly {
 			action = uint8(GUARD_ALLOW)
 		}
 		if err := g.objs.GuardExeActions.Put(inodeKey, action); err != nil {
@@ -439,8 +451,13 @@ func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 // the BPF layer) with an optional event mask. It never touches g.binaries, so re-sync and deferred
 // resolution cannot re-register it as a plain GUARD_ALLOW.
 func (g *Guard) addAllowRootBinary(b BinaryEntry, events []ebpf.EventType) error {
-	if g.mode != ModeWhitelist {
-		return fmt.Errorf("self allow is only supported in whitelist mode")
+	// ModeReadOnly reuses the whitelist decision path for every modifying
+	// operation, so the root-gated self allow applies there too. The
+	// per-binary event mask is only consulted by the BPF whitelist branch;
+	// in ModeReadOnly the self binary is expected to be registered maskless
+	// (all events), which is what the daemon does.
+	if g.mode != ModeWhitelist && g.mode != ModeReadOnly {
+		return fmt.Errorf("self allow is only supported in whitelist / read-only mode")
 	}
 
 	dev, ino, err := ebpf.StatInode(b.Path)
