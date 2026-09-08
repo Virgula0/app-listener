@@ -38,7 +38,7 @@ const (
 	etcConfigPath = "/etc/app-listener/daemon.conf"
 	// selfProtectDir holds the daemon's own on-disk state (daemon.conf,
 	// fscrypt.key). The daemon guards it whenever it exists — see
-	// appendSelfProtectionGuards.
+	// selfGuards in selfguards.go.
 	selfProtectDir = "/etc/app-listener"
 	// sampleConfigPath is the shipped template, relative to the working
 	// directory.
@@ -550,7 +550,7 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 
 	for _, root := range roots {
 		g, guardErr := guard.NewGuard(root, guard.ModeWhitelist, nil, true, 0,
-			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}),
+			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat}),
 			// Pin the ephemeral guard too: a SIGKILL during the grouped-vault
 			// unlock window must still leave the root enforced.
 			guard.WithPinning(pin.prefix("ephemeral:"+root)))
@@ -776,7 +776,7 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			// Root-gated self access with the minimal event set the fscrypt
 			// lifecycle needs; guarded content reads by non-root executors of
 			// this binary stay denied (see the self-key bypass regression test).
-			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}),
+			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat}),
 			// Pin the LSM links to bpffs so a SIGKILL leaves this tree still
 			// enforced until ExecStopPost locks the vault.
 			guard.WithPinning(pin.prefix(r.Path)),

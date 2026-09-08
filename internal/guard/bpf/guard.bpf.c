@@ -1597,16 +1597,43 @@ int guard_path_rmdir(unsigned long long *ctx)
 	return 0;
 }
 
-// Observe-only: never blocks.  stat(2)/statx(2) are probe-only and
-// ubiquitous — most tools (e.g. coreutils cat/mkdir) stat a guarded file
-// before their real syscall, so denying here would pre-empt file_open and
-// turn every blocked read into a STAT event instead of the OPEN event the
-// enforcement is defined by.  Real enforcement stays in file_open and the
-// path_*/inode_* hooks; metadata probing is observable via monitor mode.
+// stat(2)/statx(2)/lstat(2) on a guarded path.  A stat leaks file size,
+// mtime, mode, owner, link count and existence — for a guarded tree that is
+// itself a disclosure, so it is denied like every other access.  The hook
+// receives a `struct path *` (ctx[0]), so is_guarded_access can confine the
+// decision to the watch root exactly like inode_readlink / path_truncate;
+// an inode number reused outside the tree is not denied.
+//
+// A tool that stats a guarded file before its real syscall (cp, rm, mv, ls)
+// is now denied here first — the blocked event is STAT rather than the later
+// OPEN/DELETE/RENAME.  The guard owner's own binary keeps working: the
+// daemon registers EVENT_STAT in its root-gated self-allow mask so the
+// post-attach inode scan and the fscrypt lifecycle stats are not denied.
 SEC("lsm/inode_getattr")
 int guard_inode_getattr(unsigned long long *ctx)
 {
-	return 0;
+	struct dentry *dentry = get_dentry_from_path((void *)ctx[0]);
+	if (!dentry)
+		return 0;
+
+	struct inode *inode = get_inode_from_path((void *)ctx[0]);
+
+	if (!is_guarded_access(dentry, inode))
+		return 0;
+
+	// Allow stat of the watch-root DIRECTORY node itself: its metadata
+	// leaks almost nothing (the path is known — it is in the config), and
+	// denying it breaks `mkdir -p`, path probes and `ls` of the parent
+	// directory.  A single-file watch root IS the protected secret, so its
+	// stat stays denied.
+	if (inode && inode_is_watch_root(inode)) {
+		umode_t mode = 0;
+		bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode);
+		if ((mode & S_IFMT) == S_IFDIR)
+			return 0;
+	}
+
+	return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false);
 }
 
 SEC("lsm/inode_readlink")

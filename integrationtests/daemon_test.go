@@ -152,24 +152,26 @@ need_encryption: false
 	log := s.readDaemonLog(c)
 	events := parseDaemonEvents(log)
 
-	// The self-key must never let a non-root app-listener process open the
-	// guarded file.
+	// The self-key must never let a NON-ROOT app-listener process touch the
+	// guarded file. (The daemon itself — uid=root — legitimately stats every
+	// file under /protected during its inode scan; those ALLOWED STAT events
+	// are expected and are not the bypass.)
 	for _, ev := range events {
-		if ev.Comm == "app-listener" && ev.Path == "/protected/secret" && !ev.Denied {
+		if ev.Comm == "app-listener" && ev.Path == "/protected/secret" && !ev.Denied && ev.UID != "root" {
 			s.Require().Failf("self-key bypass",
-				"daemon allowed uid=%s app-listener open of %s (self-whitelist acted as a universal key)", ev.UID, ev.Path)
+				"daemon allowed uid=%s app-listener %s of %s (self-whitelist acted as a universal key)", ev.UID, ev.Op, ev.Path)
 		}
 	}
 
-	// And the guarded read attempt by the non-root process must be visible
+	// And the guarded access attempt by the non-root process must be visible
 	// as denied enforcement, not silently dropped.
 	denied := false
 	for _, ev := range events {
-		if ev.Comm == "app-listener" && ev.Path == "/protected/secret" && ev.Denied {
+		if ev.Comm == "app-listener" && ev.Path == "/protected/secret" && ev.Denied && ev.UID != "root" {
 			denied = true
 		}
 	}
-	s.Require().True(denied, "expected DAEMON DENIED event for the non-root app-listener read of /protected/secret, got: %s", log)
+	s.Require().True(denied, "expected a DAEMON DENIED event for the non-root app-listener access of /protected/secret, got: %s", log)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

@@ -184,6 +184,21 @@ func (s *IntegrationSuite) requireBlockedEvent(events []guardEvent, expectedType
 		"expected blocked GUARD|%s%s, got %v", expectedType, commsStr, events)
 }
 
+// requireCatBlocked asserts the live-guard control — a plain `cat` of a
+// guarded file — produced a blocked event. The block point depends on the
+// coreutils build: uutils (ubuntu:latest) stat(2)s the file first and is
+// denied at STAT before it ever opens; GNU cat opens directly and is denied
+// at OPEN. Either proves the guard is enforcing against cat.
+func (s *IntegrationSuite) requireCatBlocked(events []guardEvent) {
+	for _, e := range events {
+		if e.Comm == "cat" && e.Blocked && (e.Type == "OPEN" || e.Type == "STAT") {
+			return
+		}
+	}
+	s.Require().Failf("cat control not blocked",
+		"expected a blocked OPEN or STAT from cat, got %v", events)
+}
+
 func (s *IntegrationSuite) requireNoBlockedEvent(events []guardEvent, unexpectedType string) {
 	for _, e := range events {
 		if e.Type == unexpectedType && e.Blocked {
@@ -242,7 +257,7 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree() {
 	// The in-tree positive control must have produced a blocked OPEN event
 	// from cat.
 	logAfter := s.readGuardLog(c)
-	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "OPEN", "cat")
+	s.requireCatBlocked(guardDeltaEvents(logBefore, logAfter))
 
 	s.stopGuard(c)
 }
@@ -299,7 +314,7 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree_Deep() {
 	// The in-tree positive control must still have produced a blocked OPEN
 	// event from cat.
 	logAfter := s.readGuardLog(c)
-	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "OPEN", "cat")
+	s.requireCatBlocked(guardDeltaEvents(logBefore, logAfter))
 
 	s.stopGuard(c)
 }
@@ -376,6 +391,7 @@ func (s *IntegrationSuite) TestGuard_Bypass_RenameOverGuardedFile() {
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "printf 'ORIGINAL-GUARDED-SECRET' > /watch/secret.txt"})
 	s.exec(c, []string{"sh", "-c", "printf 'ATTACKER-CONTROLLED-CONTENT' > /outside-evil.txt"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/rawfsop"), "/exploits/rawfsop", 0755))
 
 	// Single-file watch root: only secret.txt's inode enters guard_inodes,
 	// never its parent /watch.
@@ -383,9 +399,9 @@ func (s *IntegrationSuite) TestGuard_Bypass_RenameOverGuardedFile() {
 	logBefore := s.readGuardLog(c)
 
 	// Attacker (non-whitelisted) renames a file they control over the
-	// guarded file. rename(2) is same-filesystem here, so mv uses it
-	// directly rather than falling back to copy+unlink.
-	code, out := s.exec(c, []string{"mv", "-f", "/outside-evil.txt", "/watch/secret.txt"})
+	// guarded file. rawfsop issues the bare rename(2) — coreutils mv stats
+	// the destination first and would be denied at STAT before path_rename.
+	code, out := s.exec(c, []string{"/exploits/rawfsop", "rename", "/outside-evil.txt", "/watch/secret.txt"})
 	s.Require().NotEqualf(0, code, "rename over the guarded watch root must be denied: %s", out)
 
 	logAfter := s.readGuardLog(c)
@@ -564,7 +580,7 @@ func (s *IntegrationSuite) TestGuard_NoFlags_Whitelist() {
 
 	logAfter := s.readGuardLog(c)
 	deltaEvents := guardDeltaEvents(logBefore, logAfter)
-	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireCatBlocked(deltaEvents)
 	s.requireBlockedEvent(deltaEvents, "MKDIR", "gnumkdir")
 
 	s.stopGuard(c)
@@ -886,7 +902,8 @@ func (s *IntegrationSuite) TestGuard_NonRecursive() {
 	s.startGuardStd(c, "/watch", "--recursive=false")
 	logBefore := s.readGuardLog(c)
 
-	// 1. Direct child file IS blocked (own inode in map)
+	// 1. Direct child file IS blocked (own inode in map) — cat is denied at
+	//    the pre-open stat on this image.
 	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/top.txt > /dev/null 2>&1"})
 	s.Require().NotEqualf(0, code, "direct child file should be blocked: %s", out)
 
@@ -895,8 +912,10 @@ func (s *IntegrationSuite) TestGuard_NonRecursive() {
 	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/subdir/deep.txt > /dev/null 2>&1"})
 	s.Require().Equalf(0, code, "file in subdir should NOT be blocked (non-recursive): %s", out)
 
-	// 3. mkdir inside subdir is NOT blocked (same reason)
-	code, out = s.exec(c, []string{"mkdir", "-p", "/watch/subdir/newchild"})
+	// 3. mkdir inside subdir is NOT blocked (same reason). Plain mkdir, not
+	//    `mkdir -p`: the latter stat-walks the path and would be denied on
+	//    the guarded direct-child subdir /watch/subdir.
+	code, out = s.exec(c, []string{"mkdir", "/watch/subdir/newchild"})
 	s.Require().Equalf(0, code, "mkdir in subdir should NOT be blocked: %s", out)
 	// Clean up
 	s.exec(c, []string{"rmdir", "/watch/subdir/newchild"})
@@ -904,7 +923,7 @@ func (s *IntegrationSuite) TestGuard_NonRecursive() {
 	logAfter := s.readGuardLog(c)
 	deltaEvents := guardDeltaEvents(logBefore, logAfter)
 
-	// Only the top.txt OPEN event should be present and blocked; no subdir events
+	// Only the top.txt event should be present and blocked; no subdir events
 	s.Require().NotEmpty(deltaEvents, "expected at least one blocked event")
 	// All events should be blocked (only root-level events fire)
 	for _, e := range deltaEvents {
@@ -1546,7 +1565,7 @@ func (s *IntegrationSuite) TestGuard_RuntimeNewDir() {
 
 	logAfter := s.readGuardLog(c)
 	deltaEvents := guardDeltaEvents(logBefore, logAfter)
-	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireCatBlocked(deltaEvents)
 
 	s.stopGuard(c)
 }
@@ -1799,7 +1818,7 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk() {
 	deltaEvents := guardDeltaEvents(logBefore, logAfter)
 
 	s.Require().NotEmpty(deltaEvents, "expected blocked events in guard log")
-	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireCatBlocked(deltaEvents)
 	s.requireBlockedEvent(deltaEvents, "DELETE", "rm")
 	s.requireBlockedEvent(deltaEvents, "RENAME", "mv")
 	s.requireBlockedEvent(deltaEvents, "MKDIR", "mkdir")
@@ -1885,7 +1904,7 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk_Tmpfs() {
 	logAfter := s.readGuardLog(c)
 	deltaEvents := guardDeltaEvents(logBefore, logAfter)
 	s.Require().NotEmpty(deltaEvents, "expected blocked events in guard log")
-	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireCatBlocked(deltaEvents)
 	s.requireBlockedEvent(deltaEvents, "DELETE", "rm")
 	s.requireBlockedEvent(deltaEvents, "MKDIR", "mkdir")
 
@@ -1929,7 +1948,7 @@ func (s *IntegrationSuite) TestGuard_RuntimeRenameDir() {
 
 	logAfter := s.readGuardLog(c)
 	deltaEvents := guardDeltaEvents(logBefore, logAfter)
-	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireCatBlocked(deltaEvents)
 
 	s.stopGuard(c)
 }
@@ -1974,7 +1993,7 @@ func (s *IntegrationSuite) TestGuard_RuntimeRenameFile() {
 
 	logAfter := s.readGuardLog(c)
 	deltaEvents := guardDeltaEvents(logBefore, logAfter)
-	s.requireBlockedEvent(deltaEvents, "OPEN", "cat")
+	s.requireCatBlocked(deltaEvents)
 
 	s.stopGuard(c)
 }
@@ -2118,6 +2137,59 @@ func (s *IntegrationSuite) TestGuard_BypassVectors() {
 			s.runAttrOp(tc.binary, tc.expect, tc.targetFn)
 		})
 	}
+}
+
+// TestGuard_Bypass_StatMetadata is the regression test for the metadata leak:
+// stat(2)/statx(2)/lstat(2) on a file inside a guarded tree used to return
+// full metadata (size, mtime, mode, owner) even though opening the directory
+// — or the file — was denied. `ls -la /watch/secret` worked; only readlink(2)
+// on a guarded symlink was blocked. inode_getattr must now deny a
+// non-whitelisted stat, while a whitelisted binary's stat still succeeds.
+// The watch-root DIRECTORY node itself is a deliberate exception (its stat
+// leaks almost nothing and blocking it breaks `mkdir -p` / path probes).
+func (s *IntegrationSuite) TestGuard_Bypass_StatMetadata() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"sh", "-c", "printf 'TOP-SECRET-SIZE-LEAK' > /watch/secret"})
+	exploitHostPath := absPath("./exploits/statonly")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/statonly", 0755))
+
+	// ---- Phase 1: block-all mode ----
+	s.startGuardStd(c, "/watch")
+	logBefore := s.readGuardLog(c)
+
+	// stat of a file inside the guarded tree must be denied and leak nothing.
+	code, out := s.exec(c, []string{"/exploits/statonly", "/watch/secret"})
+	s.Require().NotEqualf(0, code, "stat of a guarded file must be denied: %s", out)
+	s.Require().NotContainsf(out, "SIZE=", "stat leaked metadata of a guarded file: %s", out)
+
+	// `ls -la <file>` (statx) — same.
+	code, out = s.exec(c, []string{"sh", "-c", "ls -la /watch/secret 2>&1"})
+	s.Require().NotEqualf(0, code, "ls -la of a guarded file must be denied: %s", out)
+
+	// stat of the guarded root DIRECTORY node is the deliberate exception —
+	// it must still succeed so `mkdir -p` / path traversal through it work.
+	code, out = s.exec(c, []string{"/exploits/statonly", "/watch"})
+	s.Require().Equalf(0, code, "stat of the guarded root directory node must be allowed: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "STAT", "statonly")
+
+	// ---- Phase 2: whitelist mode (statonly whitelisted) ----
+	s.stopGuard(c)
+	s.startGuardStd(c, "/watch", "-w", "/exploits/statonly")
+
+	// The guard is still restrictive: a plain cat stays blocked.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/secret > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "control cat should stay blocked under whitelist: %s", out)
+
+	code, out = s.exec(c, []string{"/exploits/statonly", "/watch/secret"})
+	s.Require().Equalf(0, code, "whitelisted stat must succeed: %s", out)
+	s.Require().Contains(out, "SIZE=20")
+
+	s.stopGuard(c)
 }
 
 // newGuardTestContainer starts a privileged container and copies the

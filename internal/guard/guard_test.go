@@ -596,17 +596,23 @@ func (s *guardUnitTest) TestPopulateInodesFillsMap() {
 	}
 	nodes := append(append([]string{}, dirs...), files...)
 
+	// Stat every node BEFORE the guard attaches: once it is live this
+	// non-whitelisted test process is denied stat(2) on a guarded path
+	// (inode_getattr enforcement).
+	keys := make(map[string]GuardInodeKey, len(nodes))
+	for _, p := range nodes {
+		dev, ino, err := ebpf.StatInode(p)
+		s.Require().NoError(err, "stating %s", p)
+		keys[p] = GuardInodeKey{Dev: dev, Ino: ino}
+	}
+
 	g := s.newGuardedTree(root, nil, nil)
 	defer g.Stop()
 
-	inMap := func(path string) bool {
-		dev, ino, err := ebpf.StatInode(path)
-		s.Require().NoError(err, "stating %s", path)
-		var v uint8
-		return g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
-	}
 	for _, p := range nodes {
-		s.Require().True(inMap(p), "inode of %s missing from guard_inodes", p)
+		var v uint8
+		s.Require().Truef(g.objs.GuardInodes.Lookup(keys[p], &v) == nil,
+			"inode of %s missing from guard_inodes", p)
 	}
 
 	count := 0
