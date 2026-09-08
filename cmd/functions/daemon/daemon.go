@@ -707,8 +707,16 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 		return nil, fmt.Errorf("resolving daemon executable: %w", err)
 	}
 
+	// The raw block-device gate is device-granular: a block device is a whole
+	// filesystem, so debugfs/dd/fsck reading it bypasses every per-path check.
+	// It is enforced ONCE, daemon-wide — one guard carries the union of every
+	// resource's backing device, the rest opt out — instead of each
+	// per-resource guard redundantly stamping (and, in its denial logs,
+	// mis-attributing) the same shared device.
+	rawDevices := backingDeviceUnion(resources)
+
 	guards := make([]repository.GuardRepository, 0, len(resources))
-	for _, r := range resources {
+	for i, r := range resources {
 		binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
 		events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
 		var deferred []daemonconfig.BinaryRule
@@ -727,6 +735,13 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			events[b.Path] = b.Events
 		}
 
+		// Exactly one guard carries the raw block-device union; the others
+		// pass an empty set so the device is not stamped N times.
+		deviceSet := []uint32(nil)
+		if i == 0 {
+			deviceSet = rawDevices
+		}
+
 		g, err := guard.NewGuard(r.Path, guard.ModeWhitelist, binaries, true, 0,
 			guard.WithBinaryEvents(events),
 			guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
@@ -736,7 +751,8 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}),
 			// Pin the LSM links to bpffs so a SIGKILL leaves this tree still
 			// enforced until ExecStopPost locks the vault.
-			guard.WithPinning(pin.prefix(r.Path)))
+			guard.WithPinning(pin.prefix(r.Path)),
+			guard.WithBackingDevices(deviceSet))
 		if err != nil {
 			for _, built := range guards {
 				built.Stop()
@@ -749,6 +765,29 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 		guards = append(guards, g)
 	}
 	return guards, nil
+}
+
+// backingDeviceUnion is the deduplicated set of block devices backing the
+// configured resources, in guard_fs_devices key form. Major-0 filesystems
+// (tmpfs/overlay) and paths that cannot be stat'd are skipped — the former
+// have no device to raw-read, the latter are reported and left uncovered
+// rather than aborting guard construction.
+func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
+	seen := make(map[uint32]bool, len(resources))
+	out := make([]uint32, 0, len(resources))
+	for _, r := range resources {
+		rdev, hasDevice, err := guard.BackingDevice(r.Path)
+		if err != nil {
+			log.Warnf("daemon: raw block-device gate: %v (raw access to this device is not blocked)", err)
+			continue
+		}
+		if !hasDevice || seen[rdev] {
+			continue
+		}
+		seen[rdev] = true
+		out = append(out, rdev)
+	}
+	return out
 }
 
 // notifySystemdReady tells systemd (when started as a service) that the

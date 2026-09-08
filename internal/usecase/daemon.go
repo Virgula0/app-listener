@@ -217,17 +217,24 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 			if !ok {
 				return
 			}
+			// The raw block-device gate names a device, not this resource:
+			// label it as such and skip the re-sync (it is never an
+			// in-place binary replacement).
+			label := resource
+			if ev.RawDevice {
+				label = guard.RawDeviceResourceLabel
+			}
 			// A denial usually means the binary was replaced in place;
 			// re-sync (throttled by resyncMinInterval) to admit the new
 			// inode instead of re-statting the whitelist per event.
-			if ev.Blocked && time.Since(lastResync) >= resyncMinInterval {
+			if ev.Blocked && !ev.RawDevice && time.Since(lastResync) >= resyncMinInterval {
 				if _, err := g.ReSyncBinaries(); err != nil {
 					log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
 				}
 				lastResync = time.Now()
 			}
 			select {
-			case d.events <- DaemonEvent{Resource: resource, Event: ev}:
+			case d.events <- DaemonEvent{Resource: label, Event: ev}:
 			case <-d.done:
 				return
 			case <-stop:

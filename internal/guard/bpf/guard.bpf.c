@@ -26,6 +26,14 @@
 #define GUARD_ALLOW_ROOT 3
 #define __FMODE_EXEC 0x20 // set in file->f_flags by kernel exec opens (do_open_execat)
 
+// guard_event.reason: why an event was emitted. GUARD_REASON_NONE is the
+// ordinary path-keyed decision (the event belongs to the watched resource).
+// GUARD_REASON_RAW_DEVICE marks a denial from the raw block-device gate
+// (is_guarded_block_device): the target is the backing block device, not a
+// watched path, so userspace must NOT attribute it to a specific resource.
+#define GUARD_REASON_NONE 0
+#define GUARD_REASON_RAW_DEVICE 1
+
 enum event_type {
 	EVENT_OPEN,
 	EVENT_READ,
@@ -48,6 +56,7 @@ struct guard_event {
 	__u32 type;
 	__u32 fd;
 	__u32 blocked;
+	__u32 reason; // GUARD_REASON_* — how userspace should attribute the event
 	char comm[16];
 	char path[MAX_PATH];
 	char dest[MAX_PATH];
@@ -789,7 +798,7 @@ static __always_inline int is_allow_action(const __u8 *action)
 	return 0;
 }
 
-static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry, bool is_exec_open, bool quiet_allow)
+static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry, bool is_exec_open, bool quiet_allow, __u32 reason)
 {
 	__u32 key = 0;
 	__u64 *mode = bpf_map_lookup_elem(&guard_config, &key);
@@ -898,6 +907,7 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 		e->type = type;
 		e->fd = 0;
 		e->blocked = is_blocked ? 1 : 0;
+		e->reason = reason;
 		bpf_get_current_comm(e->comm, sizeof(e->comm));
 
 		fill_path(dentry, e->path);
@@ -918,6 +928,12 @@ static __always_inline int check_and_emit(__u32 type, struct dentry *dentry, con
 
 	return is_blocked ? -EPERM : 0;
 }
+
+// Back-compat wrapper: every ordinary call site keeps the 7-arg form and
+// gets GUARD_REASON_NONE. The raw block-device gate calls check_and_emit_ex
+// directly with GUARD_REASON_RAW_DEVICE.
+#define check_and_emit(type, dentry, dest_str, dest_is_user, dest_dentry, is_exec_open, quiet_allow) \
+	check_and_emit_ex((type), (dentry), (dest_str), (dest_is_user), (dest_dentry), (is_exec_open), (quiet_allow), GUARD_REASON_NONE)
 
 // Lazy directory discovery for file_open.
 // When a file is accessed inside a newly-created directory whose inode is
@@ -1037,9 +1053,12 @@ int guard_file_open(unsigned long long *ctx)
 	// Block access to the block device that hosts a guarded filesystem.
 	// Without this, tools like debugfs, dd, and fsck can read guarded
 	// files by opening the raw block device and interpreting filesystem
-	// metadata directly (bypassing VFS entirely).
+	// metadata directly (bypassing VFS entirely). This gate is coarse by
+	// nature — a block device is the whole filesystem, so the target is
+	// the device, not a watched path; the RAW_DEVICE reason tells
+	// userspace not to blame a specific resource.
 	if (is_guarded_block_device(inode))
-		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false, false);
+		return check_and_emit_ex(EVENT_OPEN, dentry, NULL, false, NULL, false, false, GUARD_REASON_RAW_DEVICE);
 
 	return 0;
 }

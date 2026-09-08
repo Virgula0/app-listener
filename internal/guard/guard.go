@@ -50,7 +50,20 @@ var ComputeBinaryEntry = ebpf.ComputeBinaryEntry
 type GuardEvent struct {
 	ebpf.FileEvent
 	Blocked bool
+	// RawDevice is set when the event came from the raw block-device gate
+	// (a denied open of a block device backing a guarded filesystem) rather
+	// than a decision about a watched path. The gate is device-granular, so
+	// the event names the device, not any resource — userspace must not
+	// attribute it to a specific watched path.
+	RawDevice bool
 }
+
+// guardReasonRawDevice mirrors GUARD_REASON_RAW_DEVICE in guard.bpf.c.
+const guardReasonRawDevice = 1
+
+// RawDeviceResourceLabel is the resource string the daemon logs for a raw
+// block-device denial, in place of a (misleading) specific watched path.
+const RawDeviceResourceLabel = "raw-block-device"
 
 const maxResolveAttempts = 5
 
@@ -121,6 +134,16 @@ type Guard struct {
 	// process is alive, but it will NOT survive a SIGKILL. Surfaced so the
 	// daemon can warn loudly.
 	pinDegraded bool
+	// rawDevices / rawDevicesSet override the raw block-device gate's default
+	// "derive the device from my own watched path". When rawDevicesSet is
+	// true the guard writes exactly rawDevices (rdev-encoded major<<20|minor)
+	// into guard_fs_devices — an empty slice disables the gate for this
+	// guard. The daemon computes the union of every resource's backing device
+	// once and hands it to a single guard (the rest opt out with an empty
+	// set), so the same device is not stamped — and mis-attributed — N times.
+	// See WithBackingDevices.
+	rawDevices    []uint32
+	rawDevicesSet bool
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -167,6 +190,22 @@ func WithSelfAllowBinary(entry BinaryEntry, events []ebpf.EventType) GuardOption
 	return func(g *Guard) {
 		g.selfBinary = &entry
 		g.selfEvents = events
+	}
+}
+
+// WithBackingDevices overrides the raw block-device gate for this guard: it
+// writes exactly rdevs (each major<<20|minor, from BackingDevice) into
+// guard_fs_devices instead of deriving one device from the watched path. Pass
+// the union of every guarded resource's backing device to a single guard and
+// an empty slice to the others — the gate is device-granular (a block device
+// is the whole filesystem), so one guard enforcing the union covers the whole
+// daemon, and stamping it once keeps the denial attributable to the daemon's
+// raw-device protection rather than a random resource. A nil/empty slice
+// disables the gate for the guard it is passed to.
+func WithBackingDevices(rdevs []uint32) GuardOption {
+	return func(g *Guard) {
+		g.rawDevices = rdevs
+		g.rawDevicesSet = true
 	}
 }
 
@@ -748,30 +787,51 @@ func (g *Guard) addFsDeviceGate() error {
 	return nil
 }
 
-// addBackingBlockDevice adds the block device backing the guarded path to guard_fs_devices so raw opens of it are blocked.
-func (g *Guard) addBackingBlockDevice() error {
+// BackingDevice returns the guard_fs_devices map key (kernel dev_t, encoded
+// major<<20|minor) for the block device backing path, and whether path has one
+// at all — false for tmpfs, overlayfs, procfs and every other major-0
+// pseudo-filesystem, which have no block device to raw-read.
+func BackingDevice(path string) (rdev uint32, hasDevice bool, err error) {
 	var s syscall.Stat_t
-	if err := syscall.Stat(g.path, &s); err != nil {
-		return fmt.Errorf("stating guarded path: %w", err)
+	if statErr := syscall.Stat(path, &s); statErr != nil {
+		return 0, false, fmt.Errorf("stating %s: %w", path, statErr)
 	}
-
 	major := unix.Major(s.Dev)
 	if major == 0 {
+		return 0, false, nil
+	}
+	return major<<20 | unix.Minor(s.Dev), true, nil
+}
+
+// addBackingBlockDevice populates guard_fs_devices so raw opens of the block
+// device(s) hosting guarded content are blocked. With WithBackingDevices the
+// caller supplies the exact set (the daemon's cross-resource union, or an
+// empty set to opt this guard out); otherwise the device is derived from the
+// watched path (standalone `guard`).
+func (g *Guard) addBackingBlockDevice() error {
+	if g.rawDevicesSet {
+		return g.putBackingDevices(g.rawDevices)
+	}
+	rdev, hasDevice, err := BackingDevice(g.path)
+	if err != nil {
+		return err
+	}
+	if !hasDevice {
 		// Pseudo-filesystem (tmpfs, overlay, procfs, etc.) — no backing block device.
 		return nil
 	}
+	return g.putBackingDevices([]uint32{rdev})
+}
 
-	// Encode as the BPF map key (32-bit dev_t).
-	minor := unix.Minor(s.Dev)
-	rdev := major<<20 | minor
-
+func (g *Guard) putBackingDevices(rdevs []uint32) error {
 	var val uint8 = 1
-	if err := g.objs.GuardFsDevices.Put(rdev, val); err != nil {
-		return fmt.Errorf("storing backing block device %d:%d in map: %w", major, minor, err)
+	for _, rdev := range rdevs {
+		if err := g.objs.GuardFsDevices.Put(rdev, val); err != nil {
+			return fmt.Errorf("storing backing block device %d:%d in map: %w",
+				rdev>>20, rdev&0xFFFFF, err)
+		}
+		log.Infof("blocking raw access to backing block device %d:%d", rdev>>20, rdev&0xFFFFF)
 	}
-
-	log.Infof("blocking raw access to backing block device %d:%d for guarded path %s",
-		major, minor, g.path)
 	return nil
 }
 
@@ -1236,6 +1296,7 @@ func (g *Guard) readEvent(rd *ringbuf.Reader) (*GuardEvent, bool) {
 	ge := &GuardEvent{
 		FileEvent: fe,
 		Blocked:   be.Blocked != 0,
+		RawDevice: be.Reason == guardReasonRawDevice,
 	}
 
 	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions key on exe inode).
@@ -1346,6 +1407,7 @@ type bpfGuardEvent struct {
 	Type    uint32
 	FD      uint32
 	Blocked uint32
+	Reason  uint32
 	Comm    [16]byte
 	Path    [256]byte
 	Dest    [256]byte

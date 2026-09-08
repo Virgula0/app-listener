@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/testcontainers/testcontainers-go"
+
+	"github.com/Virgula0/app-listener/internal/guard"
 )
 
 // ---------------------------------------------------------------
@@ -170,4 +172,96 @@ need_encryption: false
 	s.Require().True(denied, "expected DAEMON DENIED event for the non-root app-listener read of /protected/secret, got: %s", log)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// ---------------------------------------------------------------
+// Test: raw block-device gate is daemon-wide and device-granular
+//
+// Two resources (/mnt/data/guardedA, /mnt/data/guardedB) share one backing
+// block device (a loop-mounted ext4 at /mnt/data). The gate must:
+//   - be stamped ONCE, not once per resource ("blocking raw access to
+//     backing block device" appears a single time);
+//   - block raw reads of the device even for an UNGUARDED path on it
+//     (/mnt/data/open/*) — coarse by design, documented, accepted;
+//   - log the denial as resource=raw-block-device, never as one of the
+//     watched paths (the old bug attributed it to a random resource).
+//
+// Skips if the environment cannot provide a loop device.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestDaemon_RawBlockDevice_DeviceScope() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "RAW-DEVICE-DAEMON-SECRET-9C1F"
+
+	setup := `
+set -e
+mkdir -p /etc/app-listener /mnt/data
+dd if=/dev/zero of=/img.ext4 bs=1M count=48 status=none
+mkfs.ext4 -q -F /img.ext4
+for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+LOOP=$(losetup -f --show /img.ext4)
+mount "$LOOP" /mnt/data
+mkdir -p /mnt/data/guardedA /mnt/data/guardedB /mnt/data/open
+echo "` + marker + `" > /mnt/data/guardedA/secret
+echo "` + marker + `" > /mnt/data/open/plain
+chmod -R 755 /mnt/data
+sync
+printf 'LOOPDEV=%s\n' "$LOOP"
+`
+	code, out := s.exec(c, []string{"sh", "-c", setup})
+	loopDev := ""
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "LOOPDEV=/dev/loop") {
+			loopDev = strings.TrimPrefix(ln, "LOOPDEV=")
+		}
+	}
+	if code != 0 || loopDev == "" {
+		s.T().Skipf("loop device / ext4 setup unavailable in this environment (exit %d): %s", code, out)
+	}
+
+	// Whitelist grep (a standalone inode on this image — the uutils coreutils
+	// applets, dd/cat included, share one multi-call inode, so whitelisting
+	// any of them would whitelist dd and defeat the dd assertion below).
+	s.startDaemon(c, `[watch /mnt/data/guardedA]
+need_encryption: false
+/usr/bin/grep
+
+[watch /mnt/data/guardedB]
+need_encryption: false
+/usr/bin/grep`)
+
+	// The gate is stamped exactly once for the shared device.
+	_, stamp := s.exec(c, []string{"sh", "-c",
+		"grep -c 'blocking raw access to backing block device' /tmp/daemon.log || true"})
+	s.Require().Equalf("1", strings.TrimSpace(stamp),
+		"raw block-device gate must be stamped once for the shared device, daemon log:\n%s", s.readDaemonLog(c))
+
+	// Raw read of an UNGUARDED path on the shared device is still blocked
+	// (coarse by design) — debugfs and a plain dd.
+	code, out = s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"debugfs -R 'cat /open/plain' %s 2>&1 | grep -q %s && echo LEAK || echo safe", loopDev, marker)})
+	s.Require().Containsf(out, "safe", "debugfs raw read of the shared device must be blocked: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"dd if=%s bs=1M count=48 2>/dev/null | tr -c '[:print:]' '\\n' | grep -q %s && echo LEAK || echo safe", loopDev, marker)})
+	s.Require().Containsf(out, "safe", "dd raw read of the shared device must be blocked: %s", out)
+
+	// The denials are attributed to the raw-device gate, never to a watched path.
+	events := parseDaemonEvents(s.readDaemonLog(c))
+	rawDenied := false
+	for _, ev := range events {
+		if !ev.Denied || (ev.Comm != "debugfs" && ev.Comm != "dd") {
+			continue
+		}
+		rawDenied = true
+		s.Require().Equalf(guard.RawDeviceResourceLabel, ev.Resource,
+			"raw block-device denial must be labelled %q, got resource=%q (comm=%s path=%s)",
+			guard.RawDeviceResourceLabel, ev.Resource, ev.Comm, ev.Path)
+	}
+	s.Require().Truef(rawDenied, "expected a DENIED debugfs/dd raw block-device event, daemon log:\n%s", s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c",
+		fmt.Sprintf("pkill -f 'app-listener daemon' || true; umount /mnt/data 2>/dev/null; losetup -d %s 2>/dev/null; true", loopDev)})
 }
