@@ -38,30 +38,25 @@ Run `make check-compatibility` first — it performs every static check (kernel 
 
 ## Quick Start
 
-**1. Install the binary.** The one-liner runs `check-compatibility`, downloads the latest signed release from GitHub, verifies it (Ed25519 signature + sha256 + GitHub asset digest — the same checks as `app-listener update`) and installs it to `/usr/local/sbin/app-listener`:
+**1. Install the binary** (`check-compatibility` + signed release from GitHub → `/usr/local/sbin/app-listener`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Virgula0/app-listener/main/scripts/install.sh | sudo bash
 ```
 
-Only pre-release builds are published right now — add `--channel prerelease` until the first stable release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Virgula0/app-listener/main/scripts/install.sh | sudo bash -s -- --channel prerelease
-```
+Installs the latest **stable** release. For pre-release builds, append `-s -- --channel prerelease`.
 
 <details><summary>Build from source instead</summary>
 
 ```bash
-# `make build` runs the toolchain in a rootful Docker container with the host's
-# BTF vmlinux mounted, output at build/linux/app-listener owned by you. No
-# Docker? Install clang/LLVM, bpftool, Go 1.26+, GCC and run `make build-host`.
+# Toolchain runs in a rootful Docker container (host BTF mounted); output at
+# build/linux/app-listener. No Docker? clang/LLVM + bpftool + Go 1.26+ + GCC, then `make build-host`.
 make build
-sudo ./build/linux/app-listener install   # (below) — uses ./build/linux/app-listener in place of app-listener
+sudo ./build/linux/app-listener install
 ```
 </details>
 
-**2. Protect directories with the daemon** (interactive, root) — builds/keeps the fscrypt master key, discovers critical directories, encrypts the selected ones (with backups), installs the systemd unit + pacman reload hook, enables the daemon. **Never automatic — you run it.** Revert with `sudo app-listener uninstall`.
+**2. Protect directories with the daemon** — interactive, root, never automatic. Sets up fscrypt + whitelist + systemd units. Revert with `sudo app-listener uninstall`.
 
 ```bash
 sudo app-listener install
@@ -219,11 +214,14 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 
 **`scripts/install.sh`** (the `curl … | sudo bash` one-liner) — runs `check-compatibility` and aborts if it fails; downloads the latest release of `--channel` (`release` [default] / `prerelease`) from GitHub; verifies the Ed25519 signature of the checksum against the embedded release key, the checksum against the binary, and the GitHub asset digest; then atomically installs `/usr/local/sbin/app-listener` + the PATH symlink. It does **not** install the daemon — it prints the reminder to run `sudo app-listener install` yourself.
 
-**install** — TUI wizard, in safe order: stop a running daemon → build → generate the fscrypt key (existing kept) → pick users → probe a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypt selected directories (backup first, verified against the master key) → deploy systemd unit, pacman reload hook, per-user ssh-agent unit, binary and config.
+**install** — TUI wizard, in safe order: stop a running daemon → build → generate the fscrypt key (existing kept) → pick users → probe a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypt selected directories (backup first, verified against the master key) → deploy systemd units, the package-manager catalog-refresh hook, per-user ssh-agent unit, binary and config.
 
-**install --update-catalog-only** (the pacman `PostTransaction` hook) — re-expands every catalog-matched whitelist and rewrites the config. Default: stops the daemon, unlocks each vault under an ephemeral self-only guard. `--live` (daemon running): no stop, no lock churn — applied via SIGHUP.
+**install --update-catalog-only** (the package hooks + the boot-time unit) — re-expands every catalog-matched whitelist and rewrites the config. Default: stops the daemon, unlocks each vault under an ephemeral self-only guard. `--live` (daemon running): no stop, no lock churn — applied via SIGHUP. It runs automatically from:
+> - **pacman** — `/etc/pacman.d/hooks/50-app-listener-reload.hook` (`PostTransaction`);
+> - **apt/dpkg** — `/etc/apt/apt.conf.d/95app-listener-reload` (`DPkg::Post-Invoke`);
+> - **every boot** — `app-listener-catalog-refresh.service` runs a `--live` refresh once, after the daemon, catching package changes made while no hook fired (offline installs, direct `dpkg -i`/`pacman -U`, a failed hook). dnf/zypper have no bundled hook — the boot unit covers them, or run it by hand.
 
-> **Self-updating apps (Discord, VS Code helpers…)** change their own binaries outside pacman, so the whitelist (pinned to inodes) goes stale and the app breaks until refreshed. The pacman hook does **not** fire for these. Fix, no downtime:
+> **Self-updating apps (Discord, VS Code helpers…)** change their own binaries outside the package manager, so the whitelist (pinned to inodes) goes stale and the app breaks until refreshed. The package hooks do **not** fire for these. Fix, no downtime:
 > ```bash
 > sudo app-listener install --update-catalog-only --live --yes
 > ```

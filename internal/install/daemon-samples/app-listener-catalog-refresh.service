@@ -1,0 +1,26 @@
+[Unit]
+Description=Refresh the app-listener catalog whitelist at boot
+Documentation=https://github.com/Virgula0/app-listener
+# The daemon must be up first: a --live refresh re-expands the whitelist
+# against the already-unlocked trees and talks to the running daemon. If
+# the daemon fails to start, this refresh is skipped (Requires= propagates
+# the failure) — never run against locked vaults.
+Requires=app-listener-daemon.service
+After=app-listener-daemon.service
+
+[Service]
+Type=oneshot
+# The daemon unit is Type=simple, so "started" does not mean "guards
+# attached". The pid file is written immediately after the guards go live,
+# so wait for it (up to 5 min) before refreshing.
+ExecStartPre=/bin/sh -c 'n=0; while [ ! -e /run/app-listener-daemon.pid ] && [ "$n" -lt 150 ]; do sleep 2; n=$((n+1)); done; exit 0'
+# --live: the running daemon keeps guarding throughout; a changed whitelist
+# is delivered via SIGHUP, an unchanged one is a no-op. Leading "-" so a
+# refresh failure never marks the boot degraded or disturbs the daemon.
+ExecStart=-/usr/local/sbin/app-listener install --update-catalog-only --live --yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=app-listener-catalog-refresh
+
+[Install]
+WantedBy=multi-user.target

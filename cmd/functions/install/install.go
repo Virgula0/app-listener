@@ -32,7 +32,7 @@ func init() {
 	InstallCmd.Flags().Bool("live", false,
 		"With --update-catalog-only: refresh the whitelists WITHOUT stopping the daemon (vaults are already unlocked and guarded by the running daemon; the config change is applied via SIGHUP reload). Requires the daemon to be running")
 	InstallCmd.Flags().BoolP("yes", "y", false,
-		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. pacman hooks)")
+		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. the pacman/apt hooks and the boot-time refresh unit)")
 }
 
 var InstallCmd = &cobra.Command{
@@ -62,13 +62,19 @@ The wizard walks through the whole installation:
      migrated — then encrypts the ones that need it (keeping a
      .app_listener.backup copy) while a progress bar shows the copy
      progress
-  8. installs the systemd units and pacman reload hook from the embedded
-     daemon-samples, copies the binary to /usr/local/sbin/app-listener and
-     the config to /etc/app-listener/daemon.conf. Already-installed files
-     and an existing config are compared with the bundled ones: identical
-     files are left alone, differing ones show the diff in the TUI and
-     ask whether to overwrite them
-  9. enables the daemon across reboots and ensures it is running. When the
+  8. installs the systemd units and the package-manager catalog-refresh
+     hook from the embedded daemon-samples, copies the binary to
+     /usr/local/sbin/app-listener and the config to
+     /etc/app-listener/daemon.conf. The refresh hook is chosen from the
+     host's package manager: pacman (/etc/pacman.d/hooks) or apt
+     (/etc/apt/apt.conf.d); dnf/zypper are reported and left to the
+     boot-time refresh. Already-installed files and an existing config are
+     compared with the bundled ones: identical files are left alone,
+     differing ones show the diff in the TUI and ask whether to overwrite
+  9. enables the daemon across reboots and ensures it is running, and
+     enables app-listener-catalog-refresh.service — a boot-time --live
+     catalog refresh that catches package changes made while no hook ran
+     (offline installs, direct dpkg/pacman -U, a failed hook). When the
      config changed on a running daemon it is reloaded with SIGHUP instead
      of restarted
  10. cleans up orphaned fscrypt metadata: policies and raw-key protectors
@@ -269,7 +275,7 @@ func runUpdateCatalogOnly(autoConfirm, live bool) error {
 		vault := fscrypt.New()
 		changed, err := updateCatalogConfig(vault, autoConfirm, true)
 		if err != nil {
-			return err
+			return softenAutomatedRefreshErr(err, autoConfirm)
 		}
 		return applyLiveRefresh(changed)
 	}
@@ -289,11 +295,24 @@ func runUpdateCatalogOnly(autoConfirm, live bool) error {
 				log.Errorf("catalog refresh failed AND the daemon could not be restarted: %v", restartErr)
 			}
 		}
-		return err
+		return softenAutomatedRefreshErr(err, autoConfirm)
 	}
 	// The daemon was stopped by this flow: it must run again regardless of
 	// whether the config changed.
 	return deliverReload(true)
+}
+
+// softenAutomatedRefreshErr turns the "all-manual config, nothing matched the
+// catalog" outcome into a no-op for automated callers (--yes: the pacman/apt
+// hooks and the boot-time refresh unit). A package transaction or a boot must
+// not be reported as failed just because the config has no catalog-managed
+// section. Interactive callers still see the error.
+func softenAutomatedRefreshErr(err error, autoConfirm bool) error {
+	if err != nil && autoConfirm && errors.Is(err, errNoCatalogMatch) {
+		log.Infof("catalog refresh: %v — nothing to do", err)
+		return nil
+	}
+	return err
 }
 
 // applyLiveRefresh delivers a patched config to the running daemon: SIGHUP
@@ -398,7 +417,10 @@ func deploy(cfgText string) error {
 	if err != nil {
 		return err
 	}
-	return systemd.EnableAndVerify(configChanged)
+	if err := systemd.EnableAndVerify(configChanged); err != nil {
+		return err
+	}
+	return systemd.EnableCatalogRefresh()
 }
 
 // buildBinaryIfNeeded compiles with the Makefile flags when

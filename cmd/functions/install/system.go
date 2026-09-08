@@ -31,9 +31,9 @@ func mustCwd() string {
 	return cwd
 }
 
-// installServices copies the embedded service units and pacman hook from
-// daemon-samples into place, skipping anything that already exists.
-// ssh-agent.service is installed per selected user.
+// installServices copies the embedded system unit files from daemon-samples
+// into place, skipping anything that already exists, installs the per-user
+// ssh-agent units, and drops the package-manager catalog-refresh hooks.
 func installServices() error {
 	files, err := inst.SampleFiles()
 	if err != nil {
@@ -41,14 +41,10 @@ func installServices() error {
 	}
 	for _, name := range files {
 		switch {
-		case strings.HasSuffix(name, ".hook"):
-			if _, err := os.Stat("/etc/pacman.d"); err != nil {
-				log.Warnf("no /etc/pacman.d directory: skipping pacman hook %s", name)
-				continue
-			}
-			if err := installFile(name, filepath.Join(systemd.PacmanHooksDir, name), 0o644); err != nil {
-				return err
-			}
+		case name == systemd.PacmanHookName || name == systemd.AptHookSample:
+			// Package-manager hooks are installed together, after the loop,
+			// once per detected manager (see installReloadHooks).
+			continue
 		case name == "ssh-agent.service":
 			for _, u := range selectedUsers {
 				if err := installSSHAgent(u); err != nil {
@@ -64,12 +60,65 @@ func installServices() error {
 			log.Debugf("not installing %s", name)
 		}
 	}
+	return installReloadHooks()
+}
+
+// installReloadHooks drops the catalog-refresh post-transaction hook for every
+// package manager present on the host. Package managers without a shipped hook
+// (dnf, zypper) are reported: the boot-time app-listener-catalog-refresh unit
+// still covers reboots, and `app-listener install --update-catalog-only` can
+// be run by hand otherwise.
+func installReloadHooks() error {
+	managers := systemd.DetectPackageManagers()
+	if len(managers) == 0 {
+		log.Warn("no package manager detected: the catalog whitelist will not refresh " +
+			"automatically after package changes — the boot-time refresh still runs, or run " +
+			"`app-listener install --update-catalog-only` manually")
+		return nil
+	}
+	hooked := false
+	for _, pm := range managers {
+		switch pm {
+		case systemd.PkgPacman:
+			if err := os.MkdirAll(systemd.PacmanHooksDir, 0o755); err != nil {
+				return fmt.Errorf("creating %s: %w", systemd.PacmanHooksDir, err)
+			}
+			if err := installFile(systemd.PacmanHookName,
+				filepath.Join(systemd.PacmanHooksDir, systemd.PacmanHookName), 0o644); err != nil {
+				return err
+			}
+			hooked = true
+		case systemd.PkgApt:
+			if err := os.MkdirAll(systemd.AptHooksDir, 0o755); err != nil {
+				return fmt.Errorf("creating %s: %w", systemd.AptHooksDir, err)
+			}
+			if err := installFileAs(systemd.AptHookSample,
+				filepath.Join(systemd.AptHooksDir, systemd.AptHookName), 0o644); err != nil {
+				return err
+			}
+			hooked = true
+		default:
+			log.Warnf("%s has no bundled catalog-refresh hook: the boot-time refresh covers "+
+				"reboots; run `app-listener install --update-catalog-only` after package changes",
+				pm)
+		}
+	}
+	if !hooked {
+		log.Warn("no package manager with a bundled catalog-refresh hook was found: relying on " +
+			"the boot-time refresh and manual `app-listener install --update-catalog-only`")
+	}
 	return nil
 }
 
 // installFile writes one embedded sample to dest unless it already exists.
 func installFile(name, dest string, mode os.FileMode) error {
-	data, err := inst.SampleContent(name)
+	return installFileAs(name, dest, mode)
+}
+
+// installFileAs writes the embedded sample "sample" to "dest" (whose basename
+// may differ from the sample name), unless dest already matches.
+func installFileAs(sample, dest string, mode os.FileMode) error {
+	data, err := inst.SampleContent(sample)
 	if err != nil {
 		return err
 	}

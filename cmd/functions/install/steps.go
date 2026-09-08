@@ -348,6 +348,12 @@ func isInsidePath(path, dir string) bool {
 	return path != dir && strings.HasPrefix(path+"/", dir+"/")
 }
 
+// errNoCatalogMatch means the installed config has no section that maps to a
+// catalog entry (an all-manual config). Interactive callers surface it as an
+// error; automated ones (`--yes`, the package hooks and the boot unit) treat
+// it as "nothing to refresh".
+var errNoCatalogMatch = errors.New("no catalog entries match any configured directory")
+
 // updateCatalogConfig reads the installed daemon.conf, re-expands the
 // catalog whitelist for every matched section and shows a diff for
 // confirmation. Unmatched (user-added) sections are preserved verbatim.
@@ -395,7 +401,7 @@ func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm, live bool) (changed 
 	}
 
 	if patched == 0 {
-		return false, fmt.Errorf("no catalog entries match any configured directory")
+		return false, errNoCatalogMatch
 	}
 
 	newBytes := []byte(confText)
