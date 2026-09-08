@@ -675,6 +675,13 @@ func (s *IntegrationSuite) TestExploit_execve() {
 	s.stopMonitor(c)
 }
 
+// TestExploit_io_uring verifies the monitor sees an io_uring READV, not just
+// the plain open() that precedes it. io_uring's data path
+// (io_read -> call_read_iter -> f_op->read_iter) never touches vfs_read /
+// vfs_readv / vfs_iter_read, so before the dedicated io_read/io_write kprobes
+// the READ was invisible and this test could only ever skip. It still skips
+// on a kernel where io_uring is unavailable entirely (io_uring_setup fails,
+// so not even the OPEN lands).
 func (s *IntegrationSuite) TestExploit_io_uring() {
 	et := exploitTests[7]
 
@@ -687,13 +694,41 @@ func (s *IntegrationSuite) TestExploit_io_uring() {
 
 	s.startMonitorStd(c, "/watch")
 	logBefore := s.readMonitorLog(c)
-	found, allOk := s.runExploitExpect(c, et, testFilePath, logBefore)
-	if !allOk {
-		s.T().Skipf("io_uring not supported on this kernel: expected %v, got %v", et.events, found)
+
+	exploitHostPath := absPath("./exploits/" + et.binary)
+	s.Require().NoError(
+		c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/"+et.binary, 0755),
+		"copy io_uring exploit binary")
+
+	code, out := s.exec(c, []string{"/exploits/" + et.binary, testFilePath})
+
+	time.Sleep(2 * time.Second)
+	deltaEvents := newEventTypes(logBefore, s.readMonitorLog(c))
+	eventSet := make(map[string]bool, len(deltaEvents))
+	for _, e := range deltaEvents {
+		eventSet[e] = true
+	}
+
+	if code != 0 && !eventSet["OPEN"] {
+		s.T().Skipf("io_uring unavailable on this kernel (setup failed, exit %d): %s", code, out)
+	}
+	s.Require().Equalf(0, code, "io_uring exploit should succeed:\n%s", out)
+
+	for _, evt := range et.events {
+		s.Require().Truef(eventSet[evt],
+			"io_uring: expected %v, got %v (delta %v)", et.events, evt, deltaEvents)
 	}
 	s.stopMonitor(c)
 }
 
+// TestExploit_open_by_handle_at verifies the monitor sees an open (and read)
+// that came in via open_by_handle_at(2) rather than a pathname. /watch is a
+// tmpfs mount: the container root is overlayfs, which does not implement
+// name_to_handle_at, and the exploit needs CAP_DAC_READ_SEARCH (root — the
+// privileged container has it). The monitor watches the single file rather
+// than the dir: a fresh mount terminates the kprobe dentry walk at the mount
+// root, so events carry the mount-relative path (/test_file.txt) which only
+// the single-file suffix match catches.
 func (s *IntegrationSuite) TestExploit_open_by_handle_at() {
 	et := exploitTests[8]
 
@@ -701,14 +736,33 @@ func (s *IntegrationSuite) TestExploit_open_by_handle_at() {
 	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
+	code, out := s.exec(c, []string{"mount", "-t", "tmpfs", "tmpfs", "/watch"})
+	s.Require().Equalf(0, code, "mounting tmpfs on /watch: %s", out)
+	defer s.exec(c, []string{"umount", "/watch"})
+
 	testFilePath := "/watch/test_file.txt"
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("echo 'test data' > %s", testFilePath)})
 
-	s.startMonitorStd(c, "/watch")
+	s.startMonitorStd(c, testFilePath)
 	logBefore := s.readMonitorLog(c)
-	found, allOk := s.runExploitExpect(c, et, testFilePath, logBefore)
-	if !allOk {
-		s.T().Logf("open_by_handle_at may require root: expected %v, got %v", et.events, found)
+
+	exploitHostPath := absPath("./exploits/" + et.binary)
+	s.Require().NoError(
+		c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/"+et.binary, 0755),
+		"copy open_by_handle_at exploit binary")
+
+	code, out = s.exec(c, []string{"/exploits/" + et.binary, testFilePath})
+	s.Require().Equalf(0, code, "open_by_handle_at exploit should succeed:\n%s", out)
+
+	time.Sleep(2 * time.Second)
+	deltaEvents := newEventTypes(logBefore, s.readMonitorLog(c))
+	eventSet := make(map[string]bool, len(deltaEvents))
+	for _, e := range deltaEvents {
+		eventSet[e] = true
+	}
+	for _, evt := range et.events {
+		s.Require().Truef(eventSet[evt],
+			"open_by_handle_at: expected %v, got %v (delta %v)", et.events, evt, deltaEvents)
 	}
 	s.stopMonitor(c)
 }
