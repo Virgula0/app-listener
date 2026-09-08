@@ -32,8 +32,26 @@ const (
 	SystemdDir = "/etc/systemd/system"
 	// PacmanHooksDir is Arch's post-transaction hook directory.
 	PacmanHooksDir = "/etc/pacman.d/hooks"
+	// PacmanHookName is the embedded sample and installed file name of the
+	// pacman post-transaction catalog-refresh hook.
+	PacmanHookName = "50-app-listener-reload.hook"
+	// AptHooksDir is apt's config drop-in directory; AptHookName is the
+	// embedded sample and installed file name of the DPkg::Post-Invoke
+	// catalog-refresh hook (mirrors the pacman hook on Debian/Ubuntu).
+	AptHooksDir = "/etc/apt/apt.conf.d"
+	AptHookName = "95app-listener-reload"
+	// AptHookSample is the embedded daemon-samples file the apt hook is
+	// installed from (kept distinct from AptHookName so the drop-in gets the
+	// conventional numeric prefix while the sample name stays descriptive).
+	AptHookSample = "apt-app-listener-reload"
 	// DaemonServiceName is the systemd unit name (without .service).
 	DaemonServiceName = "app-listener-daemon"
+	// CatalogRefreshServiceName is the boot-time catalog-refresh oneshot unit
+	// (without .service): it runs `install --update-catalog-only --live` once
+	// per boot, after the daemon, so package changes made while the hook was
+	// not running (offline installs, direct dpkg/pacman -U, a failed hook)
+	// are still picked up.
+	CatalogRefreshServiceName = "app-listener-catalog-refresh"
 )
 
 const (
@@ -185,6 +203,29 @@ func EnableAndVerify(configChanged bool) error {
 		return fmt.Errorf("daemon is not running (is-active: %q) — inspect with: journalctl -u %s -e", active, DaemonServiceName)
 	}
 	log.Infof("daemon is running (%s)", active)
+	return nil
+}
+
+// EnableCatalogRefresh enables the boot-time catalog-refresh oneshot unit so
+// it runs once on every subsequent boot (after the daemon). It is not started
+// now: `install` has just written the freshest possible config. A missing unit
+// file (older sample set, manual removal) is a warning, not an error — the
+// package-manager hooks remain the primary refresh path.
+func EnableCatalogRefresh() error {
+	unit := CatalogRefreshServiceName + ".service"
+	if _, err := os.Stat(filepath.Join(SystemdDir, unit)); err != nil {
+		log.Warnf("%s not installed: skipping boot-time catalog refresh (%v)", unit, err)
+		return nil
+	}
+	enabled := strings.TrimSpace(SystemctlOutput("is-enabled", unit))
+	if enabled == daemonEnabledState {
+		log.Infof("%s already enabled across reboots", unit)
+		return nil
+	}
+	if err := RunCmd("systemctl", "enable", unit); err != nil {
+		return fmt.Errorf("systemctl enable %s: %w", unit, err)
+	}
+	log.Infof("%s enabled: the catalog whitelist is refreshed once per boot", unit)
 	return nil
 }
 

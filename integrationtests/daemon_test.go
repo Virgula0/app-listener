@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/testcontainers/testcontainers-go"
+
+	"github.com/Virgula0/app-listener/internal/guard"
 )
 
 // ---------------------------------------------------------------
@@ -170,4 +172,232 @@ need_encryption: false
 	s.Require().True(denied, "expected DAEMON DENIED event for the non-root app-listener read of /protected/secret, got: %s", log)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// ---------------------------------------------------------------
+// Test: the daemon protects its own on-disk state
+//
+// While the daemon runs it guards /etc/app-listener independent of any
+// [watch] section:
+//   - daemon.conf stays world-READABLE, but no process other than the
+//     app-listener binary may write / rename-over / delete it, nor create
+//     new files in the directory (ModeReadOnly);
+//   - fscrypt.key is not even readable except by the app-listener binary
+//     (ModeWhitelist, empty list — the key guard stacks on the RO dir guard).
+//
+// The app-listener binary itself (uid 0) keeps full access so install /
+// --genkey / --update-catalog-only work.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestDaemon_SelfProtection_ConfigAndKey() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /protected2 /etc/app-listener && echo SECRET > /protected/secret && " +
+			"head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/sleep
+
+[watch /protected2]
+need_encryption: false
+/usr/bin/sleep`)
+
+	// Self guards attach after the daemon signals ready (best-effort
+	// hardening, slow LSM attach on hardened kernels) — wait for both.
+	selfReady := false
+	for dl := time.Now().Add(45 * time.Second); time.Now().Before(dl); {
+		if strings.Contains(s.readDaemonLog(c), "self-protection: guarding /etc/app-listener/fscrypt.key") {
+			selfReady = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	log := s.readDaemonLog(c)
+	s.Require().Truef(selfReady, "self-protection guards did not attach, log:\n%s", log)
+	s.Require().Contains(log, "/etc/app-listener (readonly)")
+
+	// 0. `systemctl reload` runs helper processes (ExecReload=/bin/kill …)
+	// inside the unit's mount namespace, and setting that up bind-mounts the
+	// guarded directory. A mount onto /etc/app-listener must NOT be blocked
+	// in read-only mode or the helper dies with 226/NAMESPACE and reload
+	// fails (regression: the RO guard used to deny sb_mount here).
+	code, out := s.exec(c, []string{"sh", "-c",
+		"mkdir -p /tmp/mnt-probe && mount --bind /tmp/mnt-probe /etc/app-listener && umount /etc/app-listener && echo OK"})
+	s.Require().Equalf(0, code, "a bind mount over the RO-guarded dir must be allowed (systemctl reload namespacing): %s", out)
+
+	// 1. daemon.conf stays world-readable.
+	code, out = s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Equalf(0, code, "daemon.conf must stay world-readable: %s", out)
+	s.Require().Contains(out, "[watch /protected]")
+
+	// 2. daemon.conf is not writable by a non-app-listener process.
+	code, out = s.exec(c, []string{"sh", "-c", "echo pwned >> /etc/app-listener/daemon.conf 2>&1"})
+	s.Require().NotEqualf(0, code, "append to daemon.conf must be denied: %s", out)
+
+	// 3. daemon.conf cannot be replaced by renaming a file over it.
+	code, out = s.exec(c, []string{"sh", "-c", "echo pwned > /tmp/evil && mv -f /tmp/evil /etc/app-listener/daemon.conf 2>&1"})
+	s.Require().NotEqualf(0, code, "rename over daemon.conf must be denied: %s", out)
+
+	// 4. no new files in the guarded directory.
+	code, out = s.exec(c, []string{"sh", "-c", "touch /etc/app-listener/newfile 2>&1"})
+	s.Require().NotEqualf(0, code, "creating a file in /etc/app-listener must be denied: %s", out)
+
+	// 5. fscrypt.key is not readable at all.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/fscrypt.key 2>&1"})
+	s.Require().NotEqualf(0, code, "reading fscrypt.key must be denied: %s", out)
+
+	// 6. fscrypt.key is not writable.
+	code, out = s.exec(c, []string{"sh", "-c", "echo x >> /etc/app-listener/fscrypt.key 2>&1"})
+	s.Require().NotEqualf(0, code, "writing fscrypt.key must be denied: %s", out)
+
+	// 7. SIGHUP reload: the self guards detach for the config swap (so the
+	// transient old+new guard count stays under the kernel's per-LSM-hook
+	// program cap) and re-attach afterwards. Self-protection must survive.
+	_, pidOut := s.exec(c, []string{"sh", "-c", "cat /run/app-listener-daemon.pid"})
+	s.exec(c, []string{"sh", "-c", "kill -HUP " + strings.TrimSpace(pidOut)})
+	reloaded := false
+	for rlDeadline := time.Now().Add(45 * time.Second); time.Now().Before(rlDeadline); {
+		if strings.Contains(s.readDaemonLog(c), "configuration reloaded from") {
+			reloaded = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Require().Truef(reloaded, "SIGHUP reload did not complete, log:\n%s", s.readDaemonLog(c))
+
+	code, out = s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Equalf(0, code, "daemon.conf must still be readable after reload: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", "echo x >> /etc/app-listener/daemon.conf 2>&1"})
+	s.Require().NotEqualf(0, code, "daemon.conf write must still be denied after reload: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/fscrypt.key 2>&1"})
+	s.Require().NotEqualf(0, code, "fscrypt.key read must still be denied after reload: %s", out)
+
+	events := parseDaemonEvents(s.readDaemonLog(c))
+	keyDenied, dirDenied := false, false
+	for _, ev := range events {
+		if !ev.Denied {
+			continue
+		}
+		if ev.Resource == "/etc/app-listener/fscrypt.key" {
+			keyDenied = true
+		}
+		if ev.Resource == "/etc/app-listener" {
+			dirDenied = true
+		}
+	}
+	s.Require().Truef(keyDenied, "expected a DENIED event for resource=/etc/app-listener/fscrypt.key, log:\n%s", s.readDaemonLog(c))
+	s.Require().Truef(dirDenied, "expected a DENIED event for resource=/etc/app-listener, log:\n%s", s.readDaemonLog(c))
+
+	// daemon.conf never lost its content (readable while the daemon runs).
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Contains(conf, "[watch /protected]")
+	s.Require().NotContains(conf, "pwned")
+
+	// Stop the daemon; its guards unpin on shutdown. Poll until fscrypt.key
+	// is reachable again, then confirm it was never modified.
+	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
+	var keyLen string
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		code, out = s.exec(c, []string{"sh", "-c", "wc -c < /etc/app-listener/fscrypt.key 2>/dev/null"})
+		if code == 0 {
+			keyLen = out
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	s.Require().Equal("32", strings.TrimSpace(keyLen), "fscrypt.key was modified or the guard never detached")
+}
+
+// ---------------------------------------------------------------
+// Test: raw block-device gate is daemon-wide and device-granular
+//
+// Two resources (/mnt/data/guardedA, /mnt/data/guardedB) share one backing
+// block device (a loop-mounted ext4 at /mnt/data). The gate must:
+//   - be stamped ONCE, not once per resource ("blocking raw access to
+//     backing block device" appears a single time);
+//   - block raw reads of the device even for an UNGUARDED path on it
+//     (/mnt/data/open/*) — coarse by design, documented, accepted;
+//   - log the denial as resource=raw-block-device, never as one of the
+//     watched paths (the old bug attributed it to a random resource).
+//
+// Skips if the environment cannot provide a loop device.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestDaemon_RawBlockDevice_DeviceScope() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "RAW-DEVICE-DAEMON-SECRET-9C1F"
+
+	setup := `
+set -e
+mkdir -p /etc/app-listener /mnt/data
+dd if=/dev/zero of=/img.ext4 bs=1M count=48 status=none
+mkfs.ext4 -q -F /img.ext4
+for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+LOOP=$(losetup -f --show /img.ext4)
+mount "$LOOP" /mnt/data
+mkdir -p /mnt/data/guardedA /mnt/data/guardedB /mnt/data/open
+echo "` + marker + `" > /mnt/data/guardedA/secret
+echo "` + marker + `" > /mnt/data/open/plain
+chmod -R 755 /mnt/data
+sync
+printf 'LOOPDEV=%s\n' "$LOOP"
+`
+	code, out := s.exec(c, []string{"sh", "-c", setup})
+	loopDev := ""
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "LOOPDEV=/dev/loop") {
+			loopDev = strings.TrimPrefix(ln, "LOOPDEV=")
+		}
+	}
+	if code != 0 || loopDev == "" {
+		s.T().Skipf("loop device / ext4 setup unavailable in this environment (exit %d): %s", code, out)
+	}
+
+	// Whitelist grep (a standalone inode on this image — the uutils coreutils
+	// applets, dd/cat included, share one multi-call inode, so whitelisting
+	// any of them would whitelist dd and defeat the dd assertion below).
+	s.startDaemon(c, `[watch /mnt/data/guardedA]
+need_encryption: false
+/usr/bin/grep
+
+[watch /mnt/data/guardedB]
+need_encryption: false
+/usr/bin/grep`)
+
+	// The gate is stamped exactly once for the shared device.
+	_, stamp := s.exec(c, []string{"sh", "-c",
+		"grep -c 'blocking raw access to backing block device' /tmp/daemon.log || true"})
+	s.Require().Equalf("1", strings.TrimSpace(stamp),
+		"raw block-device gate must be stamped once for the shared device, daemon log:\n%s", s.readDaemonLog(c))
+
+	// Raw read of an UNGUARDED path on the shared device is still blocked
+	// (coarse by design) — debugfs and a plain dd.
+	code, out = s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"debugfs -R 'cat /open/plain' %s 2>&1 | grep -q %s && echo LEAK || echo safe", loopDev, marker)})
+	s.Require().Containsf(out, "safe", "debugfs raw read of the shared device must be blocked: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"dd if=%s bs=1M count=48 2>/dev/null | tr -c '[:print:]' '\\n' | grep -q %s && echo LEAK || echo safe", loopDev, marker)})
+	s.Require().Containsf(out, "safe", "dd raw read of the shared device must be blocked: %s", out)
+
+	// The denials are attributed to the raw-device gate, never to a watched path.
+	events := parseDaemonEvents(s.readDaemonLog(c))
+	rawDenied := false
+	for _, ev := range events {
+		if !ev.Denied || (ev.Comm != "debugfs" && ev.Comm != "dd") {
+			continue
+		}
+		rawDenied = true
+		s.Require().Equalf(guard.RawDeviceResourceLabel, ev.Resource,
+			"raw block-device denial must be labelled %q, got resource=%q (comm=%s path=%s)",
+			guard.RawDeviceResourceLabel, ev.Resource, ev.Comm, ev.Path)
+	}
+	s.Require().Truef(rawDenied, "expected a DENIED debugfs/dd raw block-device event, daemon log:\n%s", s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c",
+		fmt.Sprintf("pkill -f 'app-listener daemon' || true; umount /mnt/data 2>/dev/null; losetup -d %s 2>/dev/null; true", loopDev)})
 }

@@ -52,10 +52,11 @@ The wizard reverts everything the installer installed:
      plaintext copy completed, so a failure leaves it untouched
   4. cleans the orphaned fscrypt metadata left behind by the decrypted
      directories (still-encrypted directories keep their metadata)
-  5. reverts the installed systemd service, pacman reload hook, binary,
-     PATH symlink and config, and — after a final confirmation (default:
-     no) and only for units whose content matches the bundled sample — the
-     per-user ssh-agent systemd units
+  5. reverts the installed systemd units (daemon + boot-time catalog
+     refresh), the pacman/apt catalog-refresh hook, binary, PATH symlink
+     and config, and — after a final confirmation (default: no) and only
+     for units whose content matches the bundled sample — the per-user
+     ssh-agent systemd units
   6. deletes the fscrypt master key ONLY when --delete-key is passed; the
      default keeps it, because without it every still-encrypted directory
      can never be unlocked again

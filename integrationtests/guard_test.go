@@ -358,6 +358,48 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleDir_DeepDestRename() {
 	s.stopGuard(c)
 }
 
+// TestGuard_Bypass_RenameOverGuardedFile is the regression test for the
+// destination-target rename bypass: renaming another file ON TOP OF a guarded
+// single-file watch root silently unlinks the guarded inode (the kernel never
+// fires security_path_unlink for a rename victim) and repoints the name at
+// unguarded, attacker-controlled content. The guard's own inode stays in
+// guard_inodes, but the path no longer resolves to it — and because a
+// single-file watch root's parent directory is NOT in guard_inodes, the
+// destination-parent check in path_rename misses it entirely.
+//
+// path_rename must deny the rename when the victim inode is the guard's watch
+// root (guard_config[3..4]).
+func (s *IntegrationSuite) TestGuard_Bypass_RenameOverGuardedFile() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/watch"})
+	s.exec(c, []string{"sh", "-c", "printf 'ORIGINAL-GUARDED-SECRET' > /watch/secret.txt"})
+	s.exec(c, []string{"sh", "-c", "printf 'ATTACKER-CONTROLLED-CONTENT' > /outside-evil.txt"})
+
+	// Single-file watch root: only secret.txt's inode enters guard_inodes,
+	// never its parent /watch.
+	s.startGuardStd(c, "/watch/secret.txt")
+	logBefore := s.readGuardLog(c)
+
+	// Attacker (non-whitelisted) renames a file they control over the
+	// guarded file. rename(2) is same-filesystem here, so mv uses it
+	// directly rather than falling back to copy+unlink.
+	code, out := s.exec(c, []string{"mv", "-f", "/outside-evil.txt", "/watch/secret.txt"})
+	s.Require().NotEqualf(0, code, "rename over the guarded watch root must be denied: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "RENAME")
+
+	s.stopGuard(c)
+
+	// With the guard down, the guarded file must still hold its original
+	// content: the rename victim was never unlinked.
+	_, content := s.exec(c, []string{"cat", "/watch/secret.txt"})
+	s.Require().Equalf("ORIGINAL-GUARDED-SECRET", content,
+		"guarded file content was replaced through the rename-over bypass")
+}
+
 // ---------------------------------------------------------------
 // Test: guard blocks all operations on a directory
 // ---------------------------------------------------------------
@@ -1358,24 +1400,108 @@ func (s *IntegrationSuite) TestGuard_Bypass_InPlaceBinarySwap() {
 }
 
 // ---------------------------------------------------------------
-// Bypass: raw block device — read via debugfs on loop device
+// Bypass: raw block device — read a guarded file straight off the
+// block device that backs its filesystem, going around the VFS.
 //
-// This test requires loop device support in Docker and is skipped
-// in automated CI.  Run manually on a real host to verify:
+// The privileged test container has no real disk under /watch (it is
+// overlayfs, an anonymous major-0 device with no backing block
+// device), so the test builds one: a 32 MiB ext4 image on a loop
+// device, mounted at /watch.  ubuntu:latest already ships mkfs.ext4
+// and debugfs (e2fsprogs, in /usr/sbin); the container's /dev has no
+// loop nodes, so a handful are mknod'd (major 7) before losetup(8).
 //
-//   sudo ./integrationtests/exploits/raw_block_device /dev/mapper/cryptlvm /home/user/secret.txt
+// Before the fix: debugfs / dd open the loop device directly and read
+//   the file's data blocks without any guard event — a VFS bypass.
 //
-// Before the fix: debugfs opens the block device and reads the file
-//   without triggering any guard event — VFS bypass.
+// After the fix: g.addBackingBlockDevice() stats the guarded path,
+//   stores its backing dev_t in the guard_fs_devices BPF map, and
+//   guard_file_open denies any open() of that device.
 //
-// After the fix: the guard auto-detects the backing block device for
-//   each watched path and blocks open() on that device via the
-//   guard_fs_devices BPF map.  The above command should now fail
-//   with the guard blocking the block device access.
+// If the environment cannot provide a loop device at all (exotic CI
+// kernels), the test skips with a clear reason rather than failing.
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Bypass_RawBlockDevice() {
-	s.T().Skip("requires loop device support and a real ext4 filesystem — run manually")
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	const marker = "TOP-SECRET-RAW-BLOCK-DEVICE-4F2A"
+
+	// Build a real ext4 filesystem on a loop device, mounted at /watch,
+	// and print the loop device path on a LOOPDEV= line.
+	setup := `
+set -e
+dd if=/dev/zero of=/img.ext4 bs=1M count=32 status=none
+mkfs.ext4 -q -F /img.ext4
+for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+mkdir -p /watch
+LOOP=$(losetup -f --show /img.ext4)
+mount "$LOOP" /watch
+echo "` + marker + `" > /watch/secret.txt
+sync
+printf 'LOOPDEV=%s\n' "$LOOP"
+`
+	code, out := s.exec(c, []string{"sh", "-c", setup})
+	loopDev := ""
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "LOOPDEV=/dev/loop") {
+			loopDev = strings.TrimPrefix(ln, "LOOPDEV=")
+		}
+	}
+	if code != 0 || loopDev == "" {
+		s.T().Skipf("loop device / ext4 setup unavailable in this environment (exit %d): %s", code, out)
+	}
+
+	// Always release the mount + loop binding for the next pooled test.
+	defer s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"umount /watch 2>/dev/null; losetup -d %s 2>/dev/null; rm -f /img.ext4; true", loopDev)})
+
+	s.Require().NoError(
+		c.CopyFileToContainer(s.ctx, absPath("./exploits/raw_block_device"), "/exploits/raw_block_device", 0755),
+		"copy raw_block_device exploit")
+
+	// Positive control: the bypass works BEFORE the guard starts.
+	code, out = s.exec(c, []string{"/exploits/raw_block_device", loopDev, "/secret.txt"})
+	s.Require().Equalf(0, code, "pre-guard: raw block device read should succeed (bypass): %s", out)
+	s.Require().Containsf(out, marker, "pre-guard: exploit must recover the secret: %s", out)
+
+	// Start the guard — it must auto-detect and block the backing device.
+	s.startGuardStd(c, "/watch")
+	startLog := s.readGuardLog(c)
+	s.Require().Containsf(startLog, "blocking raw access to backing block device",
+		"guard must log backing-block-device detection:\n%s", startLog)
+
+	// Control: a direct VFS read of the guarded file is blocked.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/secret.txt 2>&1"})
+	s.Require().NotEqualf(0, code, "direct read of guarded file must be blocked: %s", out)
+
+	// Cursor AFTER the control cat so the delta covers only exploit activity.
+	logBefore := s.readGuardLog(c)
+
+	// The exploit is now blocked at the raw block-device open (exit 3).
+	code, out = s.exec(c, []string{"/exploits/raw_block_device", loopDev, "/secret.txt"})
+	s.Require().NotEqualf(0, code, "raw_block_device must be blocked by the guard: %s", out)
+	s.Require().NotContainsf(out, marker, "guard must prevent the exploit reading the secret: %s", out)
+
+	// A plain dd of the raw device is blocked the same way.
+	code, out = s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"dd if=%s bs=1M count=32 2>/dev/null | tr -c '[:print:]' '\\n' | grep -q %s && echo LEAK || echo safe",
+		loopDev, marker)})
+	s.Require().Containsf(out, "safe", "dd raw read of the backing device must not surface the secret: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	deltaEvents := guardDeltaEvents(logBefore, logAfter)
+	// comm is truncated to 15 chars by the kernel: "raw_block_devic".
+	blocked := s.requireBlockedEventSilent(deltaEvents, "OPEN",
+		"raw_block_devic", "raw_block_device", "debugfs", "dd")
+	if !blocked {
+		s.T().Logf("raw guard log:\n%s", logAfter)
+	}
+	s.Require().Truef(blocked,
+		"expected a blocked OPEN on the backing block device, got %v", deltaEvents)
+
+	s.stopGuard(c)
 }
 
 // ---------------------------------------------------------------

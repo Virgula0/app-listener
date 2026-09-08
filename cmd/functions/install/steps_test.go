@@ -1,6 +1,7 @@
 package install
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -323,5 +324,24 @@ need_encryption: true
 		if len(r.Binaries) != 1 || r.Binaries[0].Path != appBin {
 			t.Errorf("resource %s: whitelist not applied: %+v", r.Path, r.Binaries)
 		}
+	}
+}
+
+// TestSoftenAutomatedRefreshErr: the pacman/apt hooks and the boot-time
+// refresh unit pass --yes and must not report failure just because the
+// installed config has no catalog-managed section. Interactive callers do.
+func TestSoftenAutomatedRefreshErr(t *testing.T) {
+	if err := softenAutomatedRefreshErr(errNoCatalogMatch, true); err != nil {
+		t.Errorf("automated caller: errNoCatalogMatch must be softened to nil, got %v", err)
+	}
+	if err := softenAutomatedRefreshErr(errNoCatalogMatch, false); err == nil {
+		t.Error("interactive caller: errNoCatalogMatch must surface")
+	}
+	other := errors.New("vault locked")
+	if err := softenAutomatedRefreshErr(other, true); err != other {
+		t.Errorf("unrelated errors must pass through even for automated callers, got %v", err)
+	}
+	if err := softenAutomatedRefreshErr(nil, true); err != nil {
+		t.Errorf("nil in, nil out, got %v", err)
 	}
 }

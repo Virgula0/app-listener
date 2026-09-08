@@ -36,6 +36,10 @@ const (
 	// etcConfigPath is the system-wide configuration location, preferred
 	// over the template in the working directory.
 	etcConfigPath = "/etc/app-listener/daemon.conf"
+	// selfProtectDir holds the daemon's own on-disk state (daemon.conf,
+	// fscrypt.key). The daemon guards it whenever it exists — see
+	// appendSelfProtectionGuards.
+	selfProtectDir = "/etc/app-listener"
 	// sampleConfigPath is the shipped template, relative to the working
 	// directory.
 	sampleConfigPath = "daemon-samples/daemon.conf"
@@ -214,10 +218,21 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	defer os.Remove(pidFile)
 
-	reload := makeReloadHandler(d, configPath, vault, pin.base)
+	// Always-on guards over the daemon's own state (/etc/app-listener,
+	// fscrypt.key). Kept OUT of the usecase so a SIGHUP reload's transient
+	// guard doubling stays under the kernel's per-LSM-hook program cap (see
+	// selfGuards). Attached in the background — best-effort hardening, and
+	// each LSM attach is slow on hardened kernels, so it must not delay the
+	// event loop or "ready". Denials are merged into the event stream.
+	sg := newSelfGuards()
+	events := mergeDaemonEvents(d.Events(), sg.Events())
+	go sg.attach(pin)
+	defer sg.detach()
+
+	reload := makeReloadHandler(d, configPath, vault, pin, sg)
 
 	if headless {
-		runHeadless(d, reload, termSig)
+		runHeadless(events, reload, termSig)
 		return nil
 	}
 	if serve.Enabled {
@@ -225,10 +240,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// registered too is harmless (both channels get the signal, tui.Serve
 		// drives the teardown, then runDaemon's defer d.Stop runs) and avoids
 		// a brief unhandled window that signal.Stop here would open.
-		return runServedTUI(d, cfg, reload, serve)
+		return runServedTUI(events, cfg, reload, serve)
 	}
 
-	return runTUI(d, cfg, reload, termSig)
+	return runTUI(events, cfg, reload, termSig)
 }
 
 // startGuardedDaemonAbortable runs startup while honoring a termination
@@ -342,19 +357,29 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 // their new inodes whitelisted), and hand the batch to the usecase, which
 // applies it without ever dropping protection. Any failure keeps the
 // previous configuration running, exactly like the original ssh-guard.
-func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pinBase string) func() {
+func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, sg *selfGuards) func() {
 	return func() {
-		liveGen, err := reloadOnce(d, configPath, vault, pinBase)
+		// The self guards step aside for the reload: the config guards
+		// briefly run old+new together and that peak must stay under the
+		// kernel's per-LSM-hook program cap (BPF_MAX_TRAMP_LINKS). They are
+		// re-attached (best effort) once the swap has settled — on both the
+		// success and keep-previous-config paths.
+		sg.detach()
+
+		liveGen, err := reloadOnce(d, configPath, vault, pin.base)
 		if err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
+			sg.attach(pin)
 			return
 		}
 		// The pre-reload generation's guards were unpinned by the usecase's
 		// commit (old guard Stop); sweep every other generation, keeping only
-		// the batch that is now live.
-		if _, cleanErr := guard.CleanupStalePins(pinBase, map[string]bool{liveGen: true}); cleanErr != nil {
+		// the batch that is now live. Self guards are detached here, so their
+		// pins are gone and cannot be mistaken for stale.
+		if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{liveGen: true}); cleanErr != nil {
 			log.Warnf("daemon: could not sweep stale guard pins after reload: %v", cleanErr)
 		}
+		sg.attach(pin)
 		log.Infof("daemon: configuration reloaded from %s", configPath)
 	}
 }
@@ -440,6 +465,9 @@ func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinC
 
 	d, ucErr := usecase.NewDaemonUseCase(cfg.Resources, vault, guards)
 	if ucErr != nil {
+		for _, g := range guards {
+			g.Stop()
+		}
 		pending.lockRoots(vault)
 		return nil, ucErr
 	}
@@ -707,8 +735,16 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 		return nil, fmt.Errorf("resolving daemon executable: %w", err)
 	}
 
+	// The raw block-device gate is device-granular: a block device is a whole
+	// filesystem, so debugfs/dd/fsck reading it bypasses every per-path check.
+	// It is enforced ONCE, daemon-wide — one guard carries the union of every
+	// resource's backing device, the rest opt out — instead of each
+	// per-resource guard redundantly stamping (and, in its denial logs,
+	// mis-attributing) the same shared device.
+	rawDevices := backingDeviceUnion(resources)
+
 	guards := make([]repository.GuardRepository, 0, len(resources))
-	for _, r := range resources {
+	for i, r := range resources {
 		binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
 		events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
 		var deferred []daemonconfig.BinaryRule
@@ -727,6 +763,13 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			events[b.Path] = b.Events
 		}
 
+		// Exactly one guard carries the raw block-device union; the others
+		// pass an empty set so the device is not stamped N times.
+		deviceSet := []uint32(nil)
+		if i == 0 {
+			deviceSet = rawDevices
+		}
+
 		g, err := guard.NewGuard(r.Path, guard.ModeWhitelist, binaries, true, 0,
 			guard.WithBinaryEvents(events),
 			guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
@@ -736,7 +779,8 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}),
 			// Pin the LSM links to bpffs so a SIGKILL leaves this tree still
 			// enforced until ExecStopPost locks the vault.
-			guard.WithPinning(pin.prefix(r.Path)))
+			guard.WithPinning(pin.prefix(r.Path)),
+			guard.WithBackingDevices(deviceSet))
 		if err != nil {
 			for _, built := range guards {
 				built.Stop()
@@ -749,6 +793,29 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 		guards = append(guards, g)
 	}
 	return guards, nil
+}
+
+// backingDeviceUnion is the deduplicated set of block devices backing the
+// configured resources, in guard_fs_devices key form. Major-0 filesystems
+// (tmpfs/overlay) and paths that cannot be stat'd are skipped — the former
+// have no device to raw-read, the latter are reported and left uncovered
+// rather than aborting guard construction.
+func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
+	seen := make(map[uint32]bool, len(resources))
+	out := make([]uint32, 0, len(resources))
+	for _, r := range resources {
+		rdev, hasDevice, err := guard.BackingDevice(r.Path)
+		if err != nil {
+			log.Warnf("daemon: raw block-device gate: %v (raw access to this device is not blocked)", err)
+			continue
+		}
+		if !hasDevice || seen[rdev] {
+			continue
+		}
+		seen[rdev] = true
+		out = append(out, rdev)
+	}
+	return out
 }
 
 // notifySystemdReady tells systemd (when started as a service) that the
@@ -808,7 +875,7 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 	return true
 }
 
-func runHeadless(d usecase.DaemonUseCase, reload func(), termSig <-chan os.Signal) {
+func runHeadless(events <-chan usecase.DaemonEvent, reload func(), termSig <-chan os.Signal) {
 	uidr := common.NewUIDResolver()
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
@@ -816,7 +883,7 @@ func runHeadless(d usecase.DaemonUseCase, reload func(), termSig <-chan os.Signa
 
 	for {
 		select {
-		case ev, ok := <-d.Events():
+		case ev, ok := <-events:
 			if !ok {
 				return
 			}
@@ -833,8 +900,8 @@ func runHeadless(d usecase.DaemonUseCase, reload func(), termSig <-chan os.Signa
 	}
 }
 
-func runTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func(), termSig <-chan os.Signal) error {
-	p := tea.NewProgram(newDaemonModel(d.Events(), cfg), tea.WithAltScreen())
+func runTUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, reload func(), termSig <-chan os.Signal) error {
+	p := tea.NewProgram(newDaemonModel(events, cfg), tea.WithAltScreen())
 
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
@@ -860,11 +927,11 @@ func runTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func(), te
 	return runErr
 }
 
-func runServedTUI(d usecase.DaemonUseCase, cfg *daemonconfig.Config, reload func(), serve common.ServeConfig) error {
+func runServedTUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, reload func(), serve common.ServeConfig) error {
 	// Two independent daemon models: one renders on the local terminal, one
 	// is mirrored to the browser. Both consume their own fanout stream so
 	// events, counters and dimensions never interfere.
-	fan := tui.NewEventFanout(d.Events())
+	fan := tui.NewEventFanout(events)
 	defer fan.Stop()
 	return tui.Serve(
 		newDaemonModel(fan.Local(), cfg),

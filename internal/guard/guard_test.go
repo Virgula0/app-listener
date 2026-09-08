@@ -85,6 +85,17 @@ func (s *guardUnitTest) TestBinariesSummary() {
 func (s *guardUnitTest) TestModeString() {
 	s.Require().Equal("whitelist", modeString(ModeWhitelist))
 	s.Require().Equal("blacklist", modeString(ModeBlacklist))
+	s.Require().Equal("readonly", modeString(ModeReadOnly))
+}
+
+func (s *guardUnitTest) TestGuardModeKey() {
+	for _, m := range []Mode{ModeBlacklist, ModeWhitelist, ModeReadOnly} {
+		k, err := guardModeKey(m)
+		s.Require().NoError(err)
+		s.Require().Equal(uint64(m), k)
+	}
+	_, err := guardModeKey(Mode(99))
+	s.Require().Error(err)
 }
 
 func (s *guardUnitTest) TestCommMatchesGuardedBinary() {

@@ -1,0 +1,17 @@
+// /etc/apt/apt.conf.d/95app-listener-reload
+//
+// Installed by `app-listener install` on apt/dpkg systems. Mirrors the
+// Arch pacman PostTransaction hook (50-app-listener-reload.hook): after
+// every dpkg transaction driven by apt, refresh the app-listener catalog
+// whitelist — removed binaries are dropped, new ones picked up, glob
+// patterns re-expanded — and reload the daemon (SIGHUP), or restart it,
+// only if the whitelist actually changed.
+//
+// `--update-catalog-only` never runs apt or dpkg, so invoking it from
+// DPkg::Post-Invoke cannot deadlock the package lock. Failures are
+// swallowed (`|| true`) so a refresh problem never blocks a package
+// operation; the boot-time app-listener-catalog-refresh.service is the
+// safety net for changes that slipped past this hook.
+DPkg::Post-Invoke {
+    "if [ -x /usr/local/bin/app-listener ]; then /usr/local/bin/app-listener install --update-catalog-only --yes || true; fi";
+};

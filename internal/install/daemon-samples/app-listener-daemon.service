@@ -35,7 +35,14 @@ Group=root
 
 PrivateTmp=yes
 ProtectSystem=yes
-ReadWritePaths=/run /etc/app-listener
+# NOTE: do NOT add /etc/app-listener here. ProtectSystem=yes already leaves
+# /etc writable, and the daemon process never writes there (only `install`
+# does). Listing it forces systemd to bind-mount /etc/app-listener when it
+# sets up the unit's mount namespace — and once the daemon's read-only
+# self-protection guard is attached, that bind mount is denied, so every
+# namespaced helper (ExecReload=/bin/kill …) fails with 226/NAMESPACE and
+# `systemctl reload` breaks.
+ReadWritePaths=/run
 NoNewPrivileges=yes
 
 StandardOutput=journal

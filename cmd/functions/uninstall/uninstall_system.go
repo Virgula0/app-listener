@@ -15,15 +15,18 @@ import (
 )
 
 // revertSystemFiles removes every file the installer deployed: the systemd
-// daemon unit, the pacman reload hook, the binary at /usr/local/sbin, the
-// PATH symlink and the config at /etc/app-listener/daemon.conf. The daemon
-// unit is disabled first (best effort — it may already be disabled), and
-// systemd is reloaded so the removal is visible to the manager. The
-// /etc/app-listener directory itself is kept: the fscrypt master key lives
-// there and is removed only by removeMasterKey.
+// daemon unit, the boot-time catalog-refresh unit, the pacman/apt
+// catalog-refresh hook, the binary at /usr/local/sbin, the PATH symlink and
+// the config at /etc/app-listener/daemon.conf. Both units are disabled first
+// (best effort — they may already be disabled), and systemd is reloaded so
+// the removal is visible to the manager. The /etc/app-listener directory
+// itself is kept: the fscrypt master key lives there and is removed only by
+// removeMasterKey.
 func revertSystemFiles() error {
-	if err := systemd.RunCmd("systemctl", "disable", systemd.DaemonServiceName); err != nil {
-		log.Warnf("systemctl disable %s failed: %v", systemd.DaemonServiceName, err)
+	for _, unit := range []string{systemd.DaemonServiceName, systemd.CatalogRefreshServiceName} {
+		if err := systemd.RunCmd("systemctl", "disable", unit); err != nil {
+			log.Warnf("systemctl disable %s failed: %v", unit, err)
+		}
 	}
 
 	// The PATH symlink must go before the binary it points to.
@@ -32,7 +35,9 @@ func revertSystemFiles() error {
 	removed := 0
 	for _, path := range []string{
 		filepath.Join(systemd.SystemdDir, systemd.DaemonServiceName+".service"),
-		filepath.Join(systemd.PacmanHooksDir, "50-app-listener-reload.hook"),
+		filepath.Join(systemd.SystemdDir, systemd.CatalogRefreshServiceName+".service"),
+		filepath.Join(systemd.PacmanHooksDir, systemd.PacmanHookName),
+		filepath.Join(systemd.AptHooksDir, systemd.AptHookName),
 		systemd.InstallBinaryPath,
 		systemd.SystemConfigPath,
 	} {
