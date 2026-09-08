@@ -97,10 +97,11 @@ func (s *IntegrationSuite) teardownPools() {
 // work directories. Guard logs are self-resetting (startGuardStd truncates
 // them via `>` on every start). A leftover mount on /watch (a failed
 // tmpfs-variant test) is lazily unmounted first — files inside a submount
-// report mount-relative paths in guard events.
+// report mount-relative paths in guard events — and any loop bindings from
+// the raw-block-device test are detached (losetup -D).
 func (s *IntegrationSuite) guardContainer() testcontainers.Container {
 	c := s.acquirePool("guard")
-	s.exec(c, []string{"sh", "-c", "mountpoint -q /watch && umount /watch 2>/dev/null; rm -rf /watch /protected /exploits /ctl; mkdir -p /watch"})
+	s.exec(c, []string{"sh", "-c", "mountpoint -q /watch && umount /watch 2>/dev/null; losetup -D 2>/dev/null || true; rm -rf /watch /protected /exploits /ctl /img.ext4; mkdir -p /watch"})
 	return c
 }
 
