@@ -1685,10 +1685,15 @@ int guard_sb_mount(unsigned long long *ctx)
 		return 0;
 
 	if (guarded_map_hit(dentry, inode, 32)) {
-		// write_intent = true: mounting over a guarded path shadows it —
-		// a modification, so it stays gated on the whitelist even in
-		// GUARD_MODE_READONLY.
-		return check_and_emit_ex(EVENT_OPEN, dentry, NULL, false, NULL, false, false, true, GUARD_REASON_NONE);
+		// Not marked write_intent: in GUARD_MODE_READONLY a mount over the
+		// guarded directory is left to pass. Blocking it broke systemd's
+		// own mount-namespace setup for helper processes of the daemon
+		// unit (ExecReload=/bin/kill …, run with ReadWritePaths=/etc/app-listener
+		// → a bind mount of the guarded dir → 226/NAMESPACE, reload fails).
+		// mount(2) needs CAP_SYS_ADMIN, which is already outside what an
+		// LSM file guard can contain; whitelist/blacklist mode still deny
+		// here (the mount-shadow bypass regression test covers that path).
+		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false, false);
 	}
 
 	return 0;

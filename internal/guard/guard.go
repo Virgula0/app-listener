@@ -31,11 +31,13 @@ const (
 	ModeWhitelist
 	// ModeReadOnly allows every process to READ the guarded tree while
 	// gating every modifying operation (write, truncate, rename, unlink,
-	// chmod, mkdir, mknod, xattr, writable mmap, mount-over) on the
-	// whitelist, exactly like ModeWhitelist. It backs the daemon's
-	// self-protection guard on /etc/app-listener, whose daemon.conf must
-	// stay world-readable while only the app-listener binary can change it.
-	// Mirrors GUARD_MODE_READONLY in guard.bpf.c.
+	// chmod, mkdir, mknod, xattr, writable mmap) on the whitelist, exactly
+	// like ModeWhitelist. It backs the daemon's self-protection guard on
+	// /etc/app-listener, whose daemon.conf must stay world-readable while
+	// only the app-listener binary can change it. mount(2) over the guarded
+	// dir is NOT blocked in this mode (it needs CAP_SYS_ADMIN and blocking
+	// it broke systemd's mount-namespace setup for the daemon unit's own
+	// ExecReload helper). Mirrors GUARD_MODE_READONLY in guard.bpf.c.
 	ModeReadOnly
 )
 

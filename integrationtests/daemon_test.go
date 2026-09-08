@@ -193,17 +193,41 @@ func (s *IntegrationSuite) TestDaemon_SelfProtection_ConfigAndKey() {
 	defer c.Terminate(s.ctx)
 
 	s.exec(c, []string{"sh", "-c",
-		"mkdir -p /protected /etc/app-listener && echo SECRET > /protected/secret && " +
+		"mkdir -p /protected /protected2 /etc/app-listener && echo SECRET > /protected/secret && " +
 			"head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
 	s.startDaemon(c, `[watch /protected]
 need_encryption: false
+/usr/bin/sleep
+
+[watch /protected2]
+need_encryption: false
 /usr/bin/sleep`)
 
+	// Self guards attach after the daemon signals ready (best-effort
+	// hardening, slow LSM attach on hardened kernels) — wait for both.
+	selfReady := false
+	for dl := time.Now().Add(45 * time.Second); time.Now().Before(dl); {
+		if strings.Contains(s.readDaemonLog(c), "self-protection: guarding /etc/app-listener/fscrypt.key") {
+			selfReady = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 	log := s.readDaemonLog(c)
-	s.Require().Containsf(log, "/etc/app-listener (readonly)", "RO self-protection guard did not attach: %s", log)
+	s.Require().Truef(selfReady, "self-protection guards did not attach, log:\n%s", log)
+	s.Require().Contains(log, "/etc/app-listener (readonly)")
+
+	// 0. `systemctl reload` runs helper processes (ExecReload=/bin/kill …)
+	// inside the unit's mount namespace, and setting that up bind-mounts the
+	// guarded directory. A mount onto /etc/app-listener must NOT be blocked
+	// in read-only mode or the helper dies with 226/NAMESPACE and reload
+	// fails (regression: the RO guard used to deny sb_mount here).
+	code, out := s.exec(c, []string{"sh", "-c",
+		"mkdir -p /tmp/mnt-probe && mount --bind /tmp/mnt-probe /etc/app-listener && umount /etc/app-listener && echo OK"})
+	s.Require().Equalf(0, code, "a bind mount over the RO-guarded dir must be allowed (systemctl reload namespacing): %s", out)
 
 	// 1. daemon.conf stays world-readable.
-	code, out := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	code, out = s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
 	s.Require().Equalf(0, code, "daemon.conf must stay world-readable: %s", out)
 	s.Require().Contains(out, "[watch /protected]")
 
@@ -226,6 +250,28 @@ need_encryption: false
 	// 6. fscrypt.key is not writable.
 	code, out = s.exec(c, []string{"sh", "-c", "echo x >> /etc/app-listener/fscrypt.key 2>&1"})
 	s.Require().NotEqualf(0, code, "writing fscrypt.key must be denied: %s", out)
+
+	// 7. SIGHUP reload: the self guards detach for the config swap (so the
+	// transient old+new guard count stays under the kernel's per-LSM-hook
+	// program cap) and re-attach afterwards. Self-protection must survive.
+	_, pidOut := s.exec(c, []string{"sh", "-c", "cat /run/app-listener-daemon.pid"})
+	s.exec(c, []string{"sh", "-c", "kill -HUP " + strings.TrimSpace(pidOut)})
+	reloaded := false
+	for rlDeadline := time.Now().Add(45 * time.Second); time.Now().Before(rlDeadline); {
+		if strings.Contains(s.readDaemonLog(c), "configuration reloaded from") {
+			reloaded = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Require().Truef(reloaded, "SIGHUP reload did not complete, log:\n%s", s.readDaemonLog(c))
+
+	code, out = s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Equalf(0, code, "daemon.conf must still be readable after reload: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", "echo x >> /etc/app-listener/daemon.conf 2>&1"})
+	s.Require().NotEqualf(0, code, "daemon.conf write must still be denied after reload: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/fscrypt.key 2>&1"})
+	s.Require().NotEqualf(0, code, "fscrypt.key read must still be denied after reload: %s", out)
 
 	events := parseDaemonEvents(s.readDaemonLog(c))
 	keyDenied, dirDenied := false, false
