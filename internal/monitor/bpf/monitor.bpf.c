@@ -105,9 +105,10 @@ static __always_inline int emit_event_kern(__u32 type, __u32 fd, const char *pat
 }
 
 /*
- * VFS-level kprobes – catch ALL open/read/write regardless of which
- * syscall or subsystem triggered them (normal syscalls, io_uring,
- * execve, sendfile, splice, copy_file_range, open_by_handle_at, etc.).
+ * VFS-level kprobes – catch open/read/write from the common syscall
+ * families (normal syscalls, execve, sendfile, splice, copy_file_range,
+ * open_by_handle_at, etc.). io_uring bypasses the vfs_* helpers entirely
+ * and is handled separately by the io_read / io_write kprobes below.
  *
  * We walk the dentry tree manually instead of using bpf_d_path
  * because bpf_d_path is not available in non-sleepable kprobe/fentry
@@ -453,6 +454,73 @@ int trace_vfs_iter_read(struct pt_regs *ctx)
 		return 0;
 
 	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+}
+
+/*
+ * io_uring read/write.
+ *
+ * io_uring does NOT go through vfs_read / vfs_readv / vfs_iter_read: its
+ * data path is io_read() -> call_read_iter() -> file->f_op->read_iter()
+ * (and the mirror for writes), so every vfs_* kprobe above misses it and
+ * an io_uring READV/WRITEV against a watched file would be invisible.
+ * io_read() / io_write() take the request as arg1; io_kiocb.file (first
+ * member of an anonymous union) is the target file, already resolved at
+ * this point. Executed inline in the submitter for NOWAIT-capable files,
+ * otherwise by an io-wq worker thread that shares the owner's tgid — so
+ * the pid still resolves to the real process either way.
+ */
+SEC("kprobe/io_read")
+int trace_io_read(struct pt_regs *ctx)
+{
+	struct io_kiocb *req = (struct io_kiocb *)PT_REGS_PARM1(ctx);
+	if (!req)
+		return 0;
+
+	struct file *file;
+	if (bpf_probe_read_kernel(&file, sizeof(file), &req->file))
+		return 0;
+	if (!file)
+		return 0;
+
+	struct dentry *dentry;
+	if (bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry))
+		return 0;
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+}
+
+SEC("kprobe/io_write")
+int trace_io_write(struct pt_regs *ctx)
+{
+	struct io_kiocb *req = (struct io_kiocb *)PT_REGS_PARM1(ctx);
+	if (!req)
+		return 0;
+
+	struct file *file;
+	if (bpf_probe_read_kernel(&file, sizeof(file), &req->file))
+		return 0;
+	if (!file)
+		return 0;
+
+	struct dentry *dentry;
+	if (bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry))
+		return 0;
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(EVENT_WRITE, 0, buf + off, NULL);
 }
 
 SEC("kprobe/security_mmap_file")

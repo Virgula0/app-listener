@@ -1155,10 +1155,17 @@ func (s *IntegrationSuite) TestGuard_Bypass_SCMRights() {
 // Bypass: open_by_handle_at — open file by inode handle
 //
 // Uses name_to_handle_at() + open_by_handle_at() to open a file
-// without specifying a filesystem path.  The guard's file_open
-// hook catches this because vfs_open resolves the dentry from
-// the handle.  Requires CONFIG_FHANDLE + CAP_DAC_READ_SEARCH.
-// Skipped if the kernel does not support name_to_handle_at.
+// without a pathname walk of the target.  The guard's file_open
+// hook catches it anyway: vfs_open runs on the dentry the handle
+// resolves to.  Requires CONFIG_FHANDLE + CAP_DAC_READ_SEARCH and a
+// filesystem that implements name_to_handle_at — the container root
+// is overlayfs, which does NOT, so /watch is a tmpfs mount here.
+//
+// The watch root is the single FILE, not /watch: the exploit opens the
+// containing directory for its dirfd (open_by_handle_at needs an fd on
+// the target's own superblock), and that open must not itself be the
+// thing the guard blocks — only the handle-resolved open of target.txt
+// may be.
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
@@ -1166,26 +1173,30 @@ func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
 	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
+	code, out := s.exec(c, []string{"mount", "-t", "tmpfs", "tmpfs", "/watch"})
+	s.Require().Equalf(0, code, "mounting tmpfs on /watch: %s", out)
+	// Unmount before returning: a leftover mount in the pooled container
+	// shifts every later /watch path onto the tmpfs (see the _Tmpfs test).
+	defer s.exec(c, []string{"umount", "/watch"})
+
 	s.exec(c, []string{"sh", "-c", "echo 'handle bypass target' > /watch/target.txt"})
 
 	exploitHostPath := absPath("./exploits/open_by_handle_at")
 	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/open_by_handle_at", 0755)
 	s.Require().NoError(err, "copy open_by_handle_at binary")
 
-	s.startGuardStd(c, "/watch")
+	s.startGuardStd(c, "/watch/target.txt")
 	logBefore := s.readGuardLog(c)
 
-	code, out := s.exec(c, []string{"/exploits/open_by_handle_at", "/watch/target.txt"})
+	code, out = s.exec(c, []string{"/exploits/open_by_handle_at", "/watch/target.txt"})
 
 	logAfter := s.readGuardLog(c)
 	deltaEvents := guardDeltaEvents(logBefore, logAfter)
 
-	if code != 0 && len(deltaEvents) == 0 {
-		s.T().Skipf("open_by_handle_at not supported on this kernel: %s", out)
-	}
-
 	s.Require().NotEqualf(0, code,
 		"open_by_handle_at should be blocked by guard: %s", out)
+	s.Require().NotContainsf(out, "handle bypass target",
+		"open_by_handle_at leaked the guarded file contents: %s", out)
 	s.requireBlockedEvent(deltaEvents, "OPEN")
 
 	s.stopGuard(c)

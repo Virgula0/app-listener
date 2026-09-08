@@ -21,6 +21,8 @@ const (
 	MonitorProgTraceDoSendfile       = "trace_do_sendfile"
 	MonitorProgTraceDoSplice         = "trace_do_splice"
 	MonitorProgTraceDoSpliceDirect   = "trace_do_splice_direct"
+	MonitorProgTraceIoRead           = "trace_io_read"
+	MonitorProgTraceIoWrite          = "trace_io_write"
 	MonitorProgTraceMmap             = "trace_mmap"
 	MonitorProgTraceNotifyChange     = "trace_notify_change"
 	MonitorProgTraceSecurityMmapFile = "trace_security_mmap_file"
@@ -90,6 +92,8 @@ type MonitorProgramSpecs struct {
 	TraceDoSendfile       *ebpf.ProgramSpec `ebpf:"trace_do_sendfile"`
 	TraceDoSplice         *ebpf.ProgramSpec `ebpf:"trace_do_splice"`
 	TraceDoSpliceDirect   *ebpf.ProgramSpec `ebpf:"trace_do_splice_direct"`
+	TraceIoRead           *ebpf.ProgramSpec `ebpf:"trace_io_read"`
+	TraceIoWrite          *ebpf.ProgramSpec `ebpf:"trace_io_write"`
 	TraceMmap             *ebpf.ProgramSpec `ebpf:"trace_mmap"`
 	TraceNotifyChange     *ebpf.ProgramSpec `ebpf:"trace_notify_change"`
 	TraceSecurityMmapFile *ebpf.ProgramSpec `ebpf:"trace_security_mmap_file"`
@@ -172,6 +176,8 @@ type MonitorPrograms struct {
 	TraceDoSendfile       *ebpf.Program `ebpf:"trace_do_sendfile"`
 	TraceDoSplice         *ebpf.Program `ebpf:"trace_do_splice"`
 	TraceDoSpliceDirect   *ebpf.Program `ebpf:"trace_do_splice_direct"`
+	TraceIoRead           *ebpf.Program `ebpf:"trace_io_read"`
+	TraceIoWrite          *ebpf.Program `ebpf:"trace_io_write"`
 	TraceMmap             *ebpf.Program `ebpf:"trace_mmap"`
 	TraceNotifyChange     *ebpf.Program `ebpf:"trace_notify_change"`
 	TraceSecurityMmapFile *ebpf.Program `ebpf:"trace_security_mmap_file"`
@@ -201,6 +207,8 @@ func (p *MonitorPrograms) Close() error {
 		p.TraceDoSendfile,
 		p.TraceDoSplice,
 		p.TraceDoSpliceDirect,
+		p.TraceIoRead,
+		p.TraceIoWrite,
 		p.TraceMmap,
 		p.TraceNotifyChange,
 		p.TraceSecurityMmapFile,
