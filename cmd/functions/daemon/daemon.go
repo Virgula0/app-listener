@@ -229,8 +229,20 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	go sg.attach(pin)
 	defer sg.detach()
 
-	reload := makeReloadHandler(d, configPath, vault, pin, sg)
+	// The edit-protected control socket (only when a password is configured).
+	// Best-effort like the self guards: a socket that cannot bind disables
+	// live editing but never blocks the daemon's core function.
+	control := newControlManager(d)
+	control.refresh()
+	defer control.close()
 
+	reload := makeReloadHandler(d, configPath, vault, pin, sg, control)
+	return runDaemonUI(events, cfg, reload, termSig, serve)
+}
+
+// runDaemonUI dispatches to the presentation layer chosen by the flags:
+// headless stderr stream, browser-mirrored TUI, or the local terminal TUI.
+func runDaemonUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, reload func(), termSig <-chan os.Signal, serve common.ServeConfig) error {
 	if headless {
 		runHeadless(events, reload, termSig)
 		return nil
@@ -242,7 +254,6 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// a brief unhandled window that signal.Stop here would open.
 		return runServedTUI(events, cfg, reload, serve)
 	}
-
 	return runTUI(events, cfg, reload, termSig)
 }
 
@@ -357,8 +368,17 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 // their new inodes whitelisted), and hand the batch to the usecase, which
 // applies it without ever dropping protection. Any failure keeps the
 // previous configuration running, exactly like the original ssh-guard.
-func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, sg *selfGuards) func() {
+func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, sg *selfGuards, control *controlManager) func() {
 	return func() {
+		// A reload rebuilds every guard: any live edit-protected write grant
+		// is on a guard that is about to be stopped, so end the session first
+		// (its client gets EOF and the tree is back to read-only before the
+		// swap).
+		control.endActiveSession("configuration reload")
+		// A password added/removed via `edit-protected --set-password` on a
+		// running daemon takes effect here: start or stop the control socket.
+		defer control.refresh()
+
 		// The self guards step aside for the reload: the config guards
 		// briefly run old+new together and that peak must stay under the
 		// kernel's per-LSM-hook program cap (BPF_MAX_TRAMP_LINKS). They are

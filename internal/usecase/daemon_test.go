@@ -163,6 +163,54 @@ func TestDaemonUseCaseStartLifecycle(t *testing.T) {
 	}
 }
 
+func TestDaemonUseCaseGrantEditAccess(t *testing.T) {
+	vault := newFakeVault("/vault", "/other")
+	g0, g1 := newFakeGuardRepo(), newFakeGuardRepo()
+	d, err := NewDaemonUseCase(
+		[]daemonconfig.Resource{resource("/vault"), resource("/other")},
+		vault,
+		[]repository.GuardRepository{g0, g1},
+	)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+	if err := d.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if _, err := d.GrantEditAccess("/nope"); err == nil {
+		t.Fatal("expected an error for an unknown resource")
+	}
+
+	revoke, err := d.GrantEditAccess("/vault")
+	if err != nil {
+		t.Fatalf("GrantEditAccess: %v", err)
+	}
+	if !g0.editGranted {
+		t.Error("target guard should have the grant")
+	}
+	if g1.editGranted {
+		t.Error("other guard must be untouched")
+	}
+
+	if _, err := d.GrantEditAccess("/other"); err == nil {
+		t.Fatal("a second concurrent grant should be refused")
+	}
+
+	if err := revoke(); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if g0.editGranted {
+		t.Error("grant should be cleared after revoke")
+	}
+	_ = revoke() // idempotent
+
+	// A fresh grant works once the first is released.
+	if _, err := d.GrantEditAccess("/other"); err != nil {
+		t.Fatalf("grant after revoke: %v", err)
+	}
+}
+
 func TestDaemonUseCaseResolveFailureFailsStart(t *testing.T) {
 	// Set after unlock+populate, so a failed resolution must leave the
 	// resource in the pre-unlock state once the caller runs Stop().

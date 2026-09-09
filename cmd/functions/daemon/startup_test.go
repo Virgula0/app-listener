@@ -24,6 +24,9 @@ func (f *fakeDaemon) Reload([]daemonconfig.Resource, []repository.GuardRepositor
 func (f *fakeDaemon) Stop()                              { f.stopped.Store(true) }
 func (f *fakeDaemon) Events() <-chan usecase.DaemonEvent { return nil }
 func (f *fakeDaemon) Resources() []daemonconfig.Resource { return nil }
+func (f *fakeDaemon) GrantEditAccess(string) (func() error, error) {
+	return func() error { return nil }, nil
+}
 
 // TestAwaitStartupOrSignalCompletes: no signal — the started daemon is passed
 // through untouched.

@@ -159,6 +159,16 @@ func IsDaemonActive() bool {
 	return strings.TrimSpace(SystemctlOutput("is-active", DaemonServiceName)) == daemonActiveState
 }
 
+// ReloadDaemonIfActive sends the daemon a SIGHUP (systemctl reload) when it
+// is running, and is a no-op otherwise. Used for changes the daemon can pick
+// up on reload without a restart — e.g. the edit-protected password file.
+func ReloadDaemonIfActive() error {
+	if !IsDaemonActive() {
+		return nil
+	}
+	return RunCmd("systemctl", "reload", DaemonServiceName)
+}
+
 // EnableAndVerify brings the daemon to enabled-and-running regardless of
 // prior state: a changed config on a running daemon is delivered via SIGHUP
 // reload (restart fallback); both states are verified.

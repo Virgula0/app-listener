@@ -8,6 +8,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/systemd"
@@ -16,12 +17,12 @@ import (
 
 // revertSystemFiles removes every file the installer deployed: the systemd
 // daemon unit, the boot-time catalog-refresh unit, the pacman/apt
-// catalog-refresh hook, the binary at /usr/local/sbin, the PATH symlink and
-// the config at /etc/app-listener/daemon.conf. Both units are disabled first
-// (best effort — they may already be disabled), and systemd is reloaded so
-// the removal is visible to the manager. The /etc/app-listener directory
-// itself is kept: the fscrypt master key lives there and is removed only by
-// removeMasterKey.
+// catalog-refresh hook, the binary at /usr/local/sbin, the PATH symlink, the
+// config at /etc/app-listener/daemon.conf and the edit-protected password
+// hash. Both units are disabled first (best effort — they may already be
+// disabled), and systemd is reloaded so the removal is visible to the
+// manager. The /etc/app-listener directory itself is kept: the fscrypt
+// master key lives there and is removed only by removeMasterKey.
 func revertSystemFiles() error {
 	for _, unit := range []string{systemd.DaemonServiceName, systemd.CatalogRefreshServiceName} {
 		if err := systemd.RunCmd("systemctl", "disable", unit); err != nil {
@@ -40,6 +41,7 @@ func revertSystemFiles() error {
 		filepath.Join(systemd.AptHooksDir, systemd.AptHookName),
 		systemd.InstallBinaryPath,
 		systemd.SystemConfigPath,
+		editprotected.HashFile,
 	} {
 		if _, err := os.Lstat(path); os.IsNotExist(err) {
 			continue
@@ -51,9 +53,12 @@ func revertSystemFiles() error {
 		removed++
 	}
 
-	// A stale pid file from a crash that never cleaned it up.
+	// Stale runtime files from a crash that never cleaned them up.
 	if err := os.Remove("/run/app-listener-daemon.pid"); err == nil {
 		log.Info("removed stale /run/app-listener-daemon.pid")
+	}
+	if err := os.Remove(editprotected.ControlSocket); err == nil {
+		log.Infof("removed stale %s", editprotected.ControlSocket)
 	}
 
 	if err := systemd.RunCmd("systemctl", "daemon-reload"); err != nil {

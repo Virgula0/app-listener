@@ -50,6 +50,11 @@ type DaemonUseCase interface {
 	Stop()
 	Events() <-chan DaemonEvent
 	Resources() []daemonconfig.Resource
+	// GrantEditAccess widens the guard of one configured resource so the
+	// app-listener binary (uid 0 only) may modify it for an authenticated
+	// live edit-protected session. Only one grant may be active at a time.
+	// The returned revoke restores the read-only baseline; it is idempotent.
+	GrantEditAccess(resourcePath string) (revoke func() error, err error)
 }
 
 type daemonUseCase struct {
@@ -75,6 +80,9 @@ type daemonUseCase struct {
 	// bounded rollback budget: they stay attached denying access and are
 	// retired by Stop after its own lockdown (see rollbackReload).
 	orphans []repository.GuardRepository
+	// editGrantActive is set while a live edit-protected session holds a
+	// write grant on one resource (see GrantEditAccess); only one at a time.
+	editGrantActive bool
 }
 
 func NewDaemonUseCase(resources []daemonconfig.Resource, vault repository.Vault, guards []repository.GuardRepository) (DaemonUseCase, error) {
@@ -555,6 +563,54 @@ func (d *daemonUseCase) lockWithRetry(path string) error {
 		time.Sleep(lockRetryDelay)
 	}
 	return fmt.Errorf("could not fully lock %s: still busy after %d retries", path, maxLockRetries)
+}
+
+// GrantEditAccess widens the guard for resourcePath to admit interactive
+// edits by the app-listener binary (uid 0 only), for the duration of an
+// authenticated live edit-protected session. Only one grant is active at a
+// time. The returned revoke restores the read-only baseline and clears the
+// active flag; it is safe to call more than once and safe to call after a
+// reload swapped the guard out (the new guard is built read-only anyway).
+func (d *daemonUseCase) GrantEditAccess(resourcePath string) (func() error, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.stopping {
+		return nil, errors.New("daemon: shutdown in progress")
+	}
+	if d.editGrantActive {
+		return nil, errors.New("another live edit session is already active")
+	}
+
+	idx := -1
+	for i := range d.resources {
+		if d.resources[i].Path == resourcePath {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("%s is not a guarded resource in the running configuration", resourcePath)
+	}
+
+	g := d.guards[idx]
+	if err := g.GrantSelfEditAccess(); err != nil {
+		return nil, err
+	}
+	d.editGrantActive = true
+
+	var once sync.Once
+	revoke := func() error {
+		var rerr error
+		once.Do(func() {
+			rerr = g.RevokeSelfEditAccess()
+			d.mu.Lock()
+			d.editGrantActive = false
+			d.mu.Unlock()
+		})
+		return rerr
+	}
+	return revoke, nil
 }
 
 // Events returns the merged, per-resource tagged event stream.
