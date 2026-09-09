@@ -1,0 +1,112 @@
+name: Build & sign release assets
+
+# Reusable build core for release.yml and promote-release.yml. Checks out
+# `ref`, compiles the linux/amd64 binaries with `version` embedded, then
+# sha256s and Ed25519-signs each. `app-listener` is the default build that
+# install.sh and `app-listener update` consume (by exact asset name);
+# `app-listener-gui` (make build-linux GUI=1) is best-effort and for manual
+# download only. Assets are uploaded as the `release-assets` artifact.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version string to embed via -ldflags (vX.Y.Z or pre-YYYYMMDD-sha).
+        required: true
+        type: string
+      ref:
+        description: Commit, tag or branch to build from.
+        required: true
+        type: string
+    secrets:
+      signing-key:
+        description: Ed25519 PEM private key (RELEASE_SIGNING_KEY).
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the ref being released
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Cache and install apt packages
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          # CGO for the fscrypt mlock dependency; GUI additionally links
+          # fyne/glfw against OpenGL + X11 + Wayland.
+          packages: gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+          version: 1.0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build default binary
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          make build-linux VERSION="$VERSION"
+          mv build/linux/app-listener dist/app-listener
+
+      - name: Build GUI binary (best-effort)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if make build-linux GUI=1 VERSION="$VERSION"; then
+            mv build/linux/app-listener dist/app-listener-gui
+          else
+            echo "::warning title=GUI build failed::app-listener-gui is omitted from this release"
+          fi
+
+      - name: Sanity-check the default binary
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/app-listener
+          got="$(dist/app-listener --version 2>&1)"
+          printf '%s\n' "$got"
+          printf '%s' "$got" | grep -qF -- "$VERSION" \
+            || { echo "::error::default binary reports '$got', expected '$VERSION'"; exit 1; }
+
+      - name: Checksum and Ed25519-sign the binaries
+        env:
+          SIGNING_KEY: ${{ secrets.signing-key }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::error::RELEASE_SIGNING_KEY is not set"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/app-listener-signing-key.pem"
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          chmod 600 "$key"
+          for b in app-listener app-listener-gui; do
+            [ -f "dist/$b" ] || continue
+            ( cd dist && sha256sum "$b" > "$b.sha256" )
+            openssl pkeyutl -sign -rawin -inkey "$key" \
+              -in "dist/$b.sha256" -out "dist/$b.sha256.sig"
+            openssl pkeyutl -verify -rawin -pubin \
+              -inkey certificates/app-listener-release.pub \
+              -in "dist/$b.sha256" -sigfile "dist/$b.sha256.sig"
+          done
+          rm -f "$key"
+          ls -la dist
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
