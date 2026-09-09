@@ -454,12 +454,13 @@ need_encryption: false
 	const nobody = "setpriv --reuid=65534 --regid=65534 --clear-groups"
 	const put = "/app-listener edit-protected --resource /protected --put live.txt"
 
-	// 1. a peer that is not the app-listener binary is rejected up front
-	//    (the grant is on the app-listener exe inode; anyone else is useless).
+	// 1. a peer that is not the app-listener binary is rejected before AUTH
+	//    is even considered — it never learns a single protected path.
 	code, out := s.exec(c, []string{"sh", "-c",
-		"/exploits/edit_auth_bypass " + sock + " /protected " + password + " 2>&1"})
+		"/exploits/edit_auth_bypass " + sock + " " + password + " 2>&1"})
 	s.Require().NotEqualf(0, code, "a non-app-listener peer must be refused: %s", out)
 	s.Require().Containsf(out, "not the installed app-listener binary", "expected the peer-exe rejection, got: %s", out)
+	s.Require().NotContainsf(out, "/protected", "an unauthenticated peer must not see any protected path: %s", out)
 
 	// 2. non-root is refused before it even connects.
 	code, out = s.exec(c, []string{"sh", "-c",

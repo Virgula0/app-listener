@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -21,20 +22,41 @@ import (
 )
 
 const (
-	// controlHandshakeTimeout bounds the BEGIN + password exchange.
+	// controlHandshakeTimeout bounds the AUTH exchange.
 	controlHandshakeTimeout = 10 * time.Second
-	// maxAuthFailures consecutive bad handshakes trip a cooldown.
+	// controlSelectTimeout is how long the client has, after AUTH, to pick a
+	// resource and send SELECT (it is navigating the picker in that window).
+	controlSelectTimeout = 5 * time.Minute
+	// maxAuthFailures consecutive bad passwords trip a cooldown.
 	maxAuthFailures = 5
 	// authLockout is how long the socket refuses every request after the
 	// failure budget is exhausted.
 	authLockout = 1 * time.Minute
 )
 
+// Control protocol, two phases on one connection:
+//
+//	client -> AUTH\n<password>\n
+//	server -> OK <n>\n<resource-1>\n…<resource-n>\n   (authenticated; the
+//	                                                   configured watch paths)
+//	       -> ERR <reason>\n                          (refused; closed)
+//	client -> SELECT <resource>\n
+//	server -> OK\n | ERR <reason>\n                   (grant activated)
+//	client -> END\n                                   (or EOF / 30-min cap)
+//
+// The password is verified BEFORE any resource path is disclosed, so an
+// unauthenticated caller learns nothing about the protected directories.
+const (
+	ctrlAuth   = "AUTH"
+	ctrlSelect = "SELECT"
+)
+
 // controlServer answers the local edit-protected control socket: it
 // authenticates a live edit request (peer uid 0, peer executable == this
-// daemon's binary, password matches the configured hash) and, on success,
-// asks the use case to widen the target resource's guard for the duration of
-// the session. Only one session is served at a time.
+// daemon's binary, password matches the configured hash), discloses the
+// configured watch paths only after that, and on SELECT asks the use case to
+// widen the target resource's guard for the duration of the session. Only one
+// session is served at a time.
 type controlServer struct {
 	uc       usecase.DaemonUseCase
 	ln       net.Listener
@@ -212,21 +234,41 @@ func (cs *controlServer) handle(conn net.Conn) {
 	}
 
 	reader := bufio.NewReader(conn)
-	resource, password, err := readHandshake(reader)
+
+	// Phase 1 — AUTH. Nothing about the protected directories is disclosed
+	// until the password checks out.
+	password, err := readAuthRequest(reader)
 	if err != nil {
 		_ = cs.reply(conn, false, "malformed request")
-		log.Warnf("daemon: control: malformed request: %v", err)
+		log.Warnf("daemon: control: malformed AUTH: %v", err)
+		return
+	}
+	if authErr := cs.authenticate(password); authErr != nil {
+		_ = cs.reply(conn, false, authErr.Error())
+		log.Warnf("daemon: control: authentication refused: %v", authErr)
+		return
+	}
+	resources := cs.resourcePaths()
+	if listErr := cs.replyResources(conn, resources); listErr != nil {
 		return
 	}
 
-	session, err := cs.authorize(resource, password)
+	// Phase 2 — SELECT one resource; the client has been navigating a picker.
+	_ = conn.SetDeadline(time.Now().Add(controlSelectTimeout))
+	resource, err := readSelectRequest(reader)
+	if err != nil {
+		_ = cs.reply(conn, false, "malformed SELECT")
+		log.Warnf("daemon: control: malformed SELECT: %v", err)
+		return
+	}
+
+	session, err := cs.grant(resource)
 	if err != nil {
 		_ = cs.reply(conn, false, err.Error())
-		log.Warnf("daemon: control: denied edit request for %s: %v",
+		log.Warnf("daemon: control: denied edit grant for %s: %v",
 			logging.SanitizeText(resource), err)
 		return
 	}
-
 	if err := cs.reply(conn, true, ""); err != nil {
 		// Could not confirm the grant to the client — do not leave it open.
 		session.end()
@@ -239,6 +281,16 @@ func (cs *controlServer) handle(conn net.Conn) {
 	cs.runSession(conn, reader, session)
 	cs.clearActive(session)
 	log.Infof("daemon: control: live edit session CLOSED for %s", logging.SanitizeText(resource))
+}
+
+// resourcePaths is the configured watch paths, disclosed only post-auth.
+func (cs *controlServer) resourcePaths() []string {
+	resources := cs.uc.Resources()
+	out := make([]string, 0, len(resources))
+	for i := range resources {
+		out = append(out, resources[i].Path)
+	}
+	return out
 }
 
 // runSession blocks until the client sends END, disconnects, or the hard cap
@@ -317,55 +369,72 @@ func (cs *controlServer) authPeer(conn net.Conn) error {
 	return nil
 }
 
-// readHandshake parses the two request lines: "BEGIN <resource>" then the
-// password on its own line.
-func readHandshake(reader *bufio.Reader) (resource, password string, err error) {
+// readAuthRequest parses "AUTH\n<password>\n".
+func readAuthRequest(reader *bufio.Reader) (password string, err error) {
 	first, err := reader.ReadString('\n')
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	fields := strings.SplitN(strings.TrimRight(first, "\r\n"), " ", 2)
-	if len(fields) != 2 || fields[0] != "BEGIN" || strings.TrimSpace(fields[1]) == "" {
-		return "", "", errors.New(`expected "BEGIN <resource-path>"`)
+	if strings.TrimRight(first, "\r\n") != ctrlAuth {
+		return "", fmt.Errorf("expected %q", ctrlAuth)
 	}
-	resource = strings.TrimSpace(fields[1])
-
 	pwLine, err := reader.ReadString('\n')
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	password = strings.TrimRight(pwLine, "\r\n")
 	if password == "" {
-		return "", "", errors.New("empty password")
+		return "", errors.New("empty password")
 	}
-	return resource, password, nil
+	return password, nil
 }
 
-// authorize runs the lockout check, verifies the password, enforces
-// single-session, and asks the use case for the write grant.
-func (cs *controlServer) authorize(resource, password string) (*editControlSession, error) {
+// readSelectRequest parses "SELECT <resource-path>".
+func readSelectRequest(reader *bufio.Reader) (resource string, err error) {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	fields := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 2)
+	if len(fields) != 2 || fields[0] != ctrlSelect || strings.TrimSpace(fields[1]) == "" {
+		return "", fmt.Errorf("expected %q <resource-path>", ctrlSelect)
+	}
+	return strings.TrimSpace(fields[1]), nil
+}
+
+// authenticate runs the lockout check and verifies the password. On failure
+// it records a strike toward the cooldown; on success it clears the counter.
+func (cs *controlServer) authenticate(password string) error {
 	cs.mu.Lock()
 	if time.Now().Before(cs.lockUntil) {
 		wait := time.Until(cs.lockUntil).Round(time.Second)
 		cs.mu.Unlock()
-		return nil, fmt.Errorf("too many failed attempts — locked for another %s", wait)
+		return fmt.Errorf("too many failed attempts — locked for another %s", wait)
 	}
+	cs.mu.Unlock()
+
+	if err := cs.checkPassword(password); err != nil {
+		cs.recordFailure()
+		return err
+	}
+	cs.mu.Lock()
+	cs.failures = 0
+	cs.mu.Unlock()
+	return nil
+}
+
+// grant enforces single-session and asks the use case for the write grant on
+// resource. The caller is already authenticated.
+func (cs *controlServer) grant(resource string) (*editControlSession, error) {
+	cs.mu.Lock()
 	if cs.active != nil {
 		cs.mu.Unlock()
 		return nil, errors.New("another live edit session is already active")
 	}
 	cs.mu.Unlock()
 
-	if err := cs.checkPassword(password); err != nil {
-		cs.recordFailure()
-		return nil, err
-	}
-
 	revoke, err := cs.uc.GrantEditAccess(resource)
 	if err != nil {
-		// A bad resource path is a caller mistake, not an auth failure, but
-		// it should not be free to probe either — count it.
-		cs.recordFailure()
 		return nil, err
 	}
 
@@ -377,7 +446,6 @@ func (cs *controlServer) authorize(resource, password string) (*editControlSessi
 		return nil, errors.New("another live edit session is already active")
 	}
 	cs.active = session
-	cs.failures = 0
 	cs.mu.Unlock()
 	return session, nil
 }
@@ -416,5 +484,19 @@ func (cs *controlServer) reply(conn net.Conn, ok bool, msg string) error {
 		return err
 	}
 	_, err := fmt.Fprintf(conn, "ERR %s\n", strings.ReplaceAll(msg, "\n", " "))
+	return err
+}
+
+// replyResources writes the post-auth "OK <n>" line followed by one resource
+// path per line.
+func (cs *controlServer) replyResources(conn net.Conn, resources []string) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(controlHandshakeTimeout))
+	var b strings.Builder
+	fmt.Fprintf(&b, "OK %d\n", len(resources))
+	for _, r := range resources {
+		b.WriteString(r)
+		b.WriteByte('\n')
+	}
+	_, err := io.WriteString(conn, b.String())
 	return err
 }

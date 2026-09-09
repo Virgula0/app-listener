@@ -40,13 +40,16 @@ every change to enforcement paths as security-sensitive:
 - **The live-edit grant is a real escalation path — keep it narrow.** `edit-protected`
   live mode (`cmd/functions/editprotected` + `cmd/functions/daemon/control.go`)
   authenticates over a `0600` root-only unix socket that *also* checks `SO_PEERCRED`
-  uid 0 **and** that the peer's exe inode is the daemon's own binary, then transiently
-  widens **only** that one resource's `GUARD_ALLOW_ROOT` self event-mask (never the
+  uid 0 **and** that the peer's exe inode is the daemon's own binary. The protocol is
+  two-phase — `AUTH` (password) must succeed **before** the daemon discloses any
+  watch path, then `SELECT <resource>` activates the grant — so an unauthenticated
+  caller learns nothing about the protected directories. The grant transiently widens
+  **only** that one resource's `GUARD_ALLOW_ROOT` self event-mask (never the
   whitelist), one session at a time, 30-min hard cap, revoked on disconnect / SIGHUP.
   The password hash (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded
-  like `fscrypt.key`. Don't loosen any of: the peer-exe check, the single-session lock,
-  the auth lockout, the `origin=install` guard on `--set-password`, or the mask being
-  restored in `RevokeSelfEditAccess`.
+  like `fscrypt.key`. Don't loosen any of: the peer-exe check, AUTH-before-disclosure,
+  the single-session lock, the auth lockout, the `origin=install` guard on
+  `--set-password`, or the mask being restored in `RevokeSelfEditAccess`.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
   key + edit-auth hash (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.

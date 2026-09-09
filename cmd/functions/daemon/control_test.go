@@ -7,24 +7,32 @@ import (
 	"time"
 )
 
-func TestReadHandshake(t *testing.T) {
-	ok := "BEGIN /home/alice/.ssh\nhunter2hunter2\n"
-	res, pw, err := readHandshake(bufio.NewReader(strings.NewReader(ok)))
+func TestReadAuthRequest(t *testing.T) {
+	pw, err := readAuthRequest(bufio.NewReader(strings.NewReader("AUTH\nhunter2hunter2\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res != "/home/alice/.ssh" || pw != "hunter2hunter2" {
-		t.Fatalf("parsed %q / %q", res, pw)
+	if pw != "hunter2hunter2" {
+		t.Fatalf("parsed %q", pw)
 	}
+	for _, bad := range []string{"HELLO\npw\n", "AUTH\n\n", "AUTH\n", "AUTH pw\n"} {
+		if _, err := readAuthRequest(bufio.NewReader(strings.NewReader(bad))); err == nil {
+			t.Errorf("readAuthRequest(%q) should error", bad)
+		}
+	}
+}
 
-	for _, bad := range []string{
-		"HELLO /x\npw\n",
-		"BEGIN\npw\n",
-		"BEGIN /x\n\n",
-		"BEGIN /x\n",
-	} {
-		if _, _, err := readHandshake(bufio.NewReader(strings.NewReader(bad))); err == nil {
-			t.Errorf("readHandshake(%q) should error", bad)
+func TestReadSelectRequest(t *testing.T) {
+	res, err := readSelectRequest(bufio.NewReader(strings.NewReader("SELECT /home/alice/.ssh\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != "/home/alice/.ssh" {
+		t.Fatalf("parsed %q", res)
+	}
+	for _, bad := range []string{"PICK /x\n", "SELECT\n", "SELECT \n", "SELECT /x"} {
+		if _, err := readSelectRequest(bufio.NewReader(strings.NewReader(bad))); err == nil {
+			t.Errorf("readSelectRequest(%q) should error", bad)
 		}
 	}
 }

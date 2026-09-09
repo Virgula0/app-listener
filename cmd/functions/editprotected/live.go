@@ -6,45 +6,47 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/Virgula0/app-listener/internal/daemonconfig"
-	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/tui"
 )
 
-// runLiveEdit is the daemon-running flow: pick a guarded resource from the
-// installed daemon.conf, authenticate to the daemon over the control socket
-// (which widens that resource's guard for the session), edit, then release
-// the grant. The daemon owns the vault lifecycle throughout — nothing is
-// unlocked or locked here.
+// runLiveEdit is the daemon-running flow. The password is asked ONCE, up
+// front — before any protected path is shown — then the daemon returns the
+// list of guarded directories, the user picks one, the daemon widens that
+// resource's guard for the session, the editor runs, and the grant is
+// released. The daemon owns the vault lifecycle throughout.
 func runLiveEdit() error {
-	cfg, err := daemonconfig.Load(systemd.SystemConfigPath)
-	if err != nil {
-		return fmt.Errorf("reading the installed daemon config %s: %w", systemd.SystemConfigPath, err)
-	}
-	if len(cfg.Resources) == 0 {
-		return fmt.Errorf("%s has no [watch] sections — nothing to edit", systemd.SystemConfigPath)
-	}
-
-	chosen, err := chooseResource(cfg)
+	session, err := dialLiveSession()
 	if err != nil {
 		return err
 	}
+	defer session.End()
 
 	password, err := promptPassword("Edit-protected password")
 	if err != nil {
 		return err
 	}
 
-	log.Infof("authenticating to the daemon for live edit access to %s ...", chosen)
-	session, err := beginLiveSession(chosen, password)
+	resources, err := session.Authenticate(password)
 	if err != nil {
-		return fmt.Errorf("live edit request refused: %w", err)
+		return fmt.Errorf("authentication failed: %w", err)
 	}
-	defer session.End()
+	if len(resources) == 0 {
+		return errors.New("the daemon reports no guarded directories")
+	}
+
+	chosen, err := chooseResource(resources)
+	if err != nil {
+		return err
+	}
+
+	if err := session.Select(chosen); err != nil {
+		return fmt.Errorf("activating live edit access to %s: %w", chosen, err)
+	}
 
 	log.Infof("editing %s LIVE — the daemon keeps guarding it; write access is granted only for this session", chosen)
 	if err := tui.RunFileEditor(chosen); err != nil {
@@ -52,22 +54,38 @@ func runLiveEdit() error {
 	}
 
 	session.End() // narrow the guard back before the audit reads the tree
-	auditAfterEditWithConfig(cfg, chosen)
+	auditAfterEdit(chosen)
 	return nil
 }
 
-// chooseResource honors --resource when given (validating it is configured),
-// otherwise prompts.
-func chooseResource(cfg *daemonconfig.Config) (string, error) {
+// chooseResource honors --resource when given (validating it against the
+// daemon's list), otherwise prompts.
+func chooseResource(resources []string) (string, error) {
 	if resourceFlag != "" {
-		for i := range cfg.Resources {
-			if cfg.Resources[i].Path == resourceFlag {
-				return resourceFlag, nil
-			}
+		if slices.Contains(resources, resourceFlag) {
+			return resourceFlag, nil
 		}
-		return "", fmt.Errorf("%s is not a [watch] path in %s", resourceFlag, systemd.SystemConfigPath)
+		return "", fmt.Errorf("%s is not a guarded directory in the running daemon", resourceFlag)
 	}
-	return pickGuardedResource(cfg)
+	if len(resources) == 1 {
+		log.Infof("only one guarded directory: %s", resources[0])
+		return resources[0], nil
+	}
+	opts := make([]huh.Option[string], 0, len(resources))
+	for _, r := range resources {
+		opts = append(opts, huh.NewOption(r, r))
+	}
+	chosen := ""
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Which guarded directory do you want to edit?").
+			Description("Write access is granted to this one directory for the edit session, then revoked.").
+			Options(opts...).
+			Value(&chosen),
+	)).Run(); err != nil {
+		return "", err
+	}
+	return chosen, nil
 }
 
 // runNonInteractiveLivePut performs one authenticated live write without any
@@ -81,14 +99,6 @@ func runNonInteractiveLivePut() error {
 		return fmt.Errorf("$%s is empty — set it to the edit-protected password for non-interactive --put", editPasswordEnv)
 	}
 
-	cfg, err := daemonconfig.Load(systemd.SystemConfigPath)
-	if err != nil {
-		return fmt.Errorf("reading %s: %w", systemd.SystemConfigPath, err)
-	}
-	if findResource(cfg, resourceFlag) == nil {
-		return fmt.Errorf("%s is not a [watch] path in %s", resourceFlag, systemd.SystemConfigPath)
-	}
-
 	dest := putFlag
 	if !filepath.IsAbs(dest) {
 		dest = filepath.Join(resourceFlag, dest)
@@ -96,17 +106,28 @@ func runNonInteractiveLivePut() error {
 	if !within(resourceFlag, dest) {
 		return fmt.Errorf("--put target %s is outside the resource %s", dest, resourceFlag)
 	}
-
 	content, err := readPutContent()
 	if err != nil {
 		return err
 	}
 
-	session, err := beginLiveSession(resourceFlag, password)
+	session, err := dialLiveSession()
 	if err != nil {
-		return fmt.Errorf("live edit request refused: %w", err)
+		return err
 	}
 	defer session.End()
+
+	resources, err := session.Authenticate(password)
+	if err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+	if !slices.Contains(resources, resourceFlag) {
+		return fmt.Errorf("%s is not a guarded directory in the running daemon", resourceFlag)
+	}
+
+	if err := session.Select(resourceFlag); err != nil {
+		return fmt.Errorf("activating live edit access to %s: %w", resourceFlag, err)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
 		return fmt.Errorf("creating parent of %s: %w", dest, err)
@@ -117,7 +138,7 @@ func runNonInteractiveLivePut() error {
 	log.Infof("wrote %d bytes to %s (live)", len(content), dest)
 
 	session.End()
-	auditAfterEditWithConfig(cfg, resourceFlag)
+	auditAfterEdit(resourceFlag)
 	return nil
 }
 
@@ -130,35 +151,6 @@ func readPutContent() ([]byte, error) {
 		return nil, fmt.Errorf("reading --put content from stdin: %w", err)
 	}
 	return data, nil
-}
-
-// pickGuardedResource asks which configured watch path to open. A single
-// resource skips the prompt.
-func pickGuardedResource(cfg *daemonconfig.Config) (string, error) {
-	if len(cfg.Resources) == 1 {
-		log.Infof("only one guarded resource: %s", cfg.Resources[0].Path)
-		return cfg.Resources[0].Path, nil
-	}
-	opts := make([]huh.Option[string], 0, len(cfg.Resources))
-	for i := range cfg.Resources {
-		r := &cfg.Resources[i]
-		label := r.Path
-		if r.NeedEncryption {
-			label += "  (encrypted)"
-		}
-		opts = append(opts, huh.NewOption(label, r.Path))
-	}
-	chosen := ""
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title("Which guarded directory do you want to edit?").
-			Description("The daemon grants write access to this one resource for the edit session, then revokes it.").
-			Options(opts...).
-			Value(&chosen),
-	)).Run(); err != nil {
-		return "", err
-	}
-	return chosen, nil
 }
 
 // promptPassword reads a password without echoing it.
