@@ -130,9 +130,11 @@ func (s *guardUnitTest) TestCommMatchesGuardedBinary() {
 func (s *guardUnitTest) TestEventMaskOpenImplied() {
 	mask, err := eventMask([]ebpf.EventType{ebpf.EventRead})
 	s.Require().NoError(err)
-	// READ bit set, and OPEN implicitly allowed.
+	// READ bit set, and OPEN + STAT implicitly allowed (a reader stat()s and
+	// open()s the file before reading it).
 	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventRead)))
 	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventOpen)))
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventStat)))
 }
 
 func (s *guardUnitTest) TestEventMaskWriteMmap() {
@@ -141,6 +143,7 @@ func (s *guardUnitTest) TestEventMaskWriteMmap() {
 	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventWrite)))
 	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventMmap)))
 	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventOpen)))
+	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventStat)))
 	// Independent events stay unset.
 	s.Require().Equal(uint32(0), mask&(1<<uint(ebpf.EventDelete)))
 	s.Require().Equal(uint32(0), mask&(1<<uint(ebpf.EventMkdir)))
@@ -151,8 +154,9 @@ func (s *guardUnitTest) TestEventMaskIndependent() {
 	s.Require().NoError(err)
 	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventDelete)))
 	s.Require().NotEqual(uint32(0), mask&(1<<uint(ebpf.EventRename)))
-	// No read/write → OPEN must NOT be implied.
+	// No read/write/mmap → OPEN and STAT must NOT be implied.
 	s.Require().Equal(uint32(0), mask&(1<<uint(ebpf.EventOpen)))
+	s.Require().Equal(uint32(0), mask&(1<<uint(ebpf.EventStat)))
 }
 
 func (s *guardUnitTest) TestEventMaskAllEvents() {

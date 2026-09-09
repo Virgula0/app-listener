@@ -238,9 +238,15 @@ func WithPinning(prefix string) GuardOption {
 	}
 }
 
-// eventMask converts event types into the BPF bitmask stored in guard_exe_events. Listing READ, WRITE or
-// MMAP implicitly allows OPEN (those operations require opening the file first); the OPEN bit is never
-// cleared when any of the three is present.
+// eventMask converts event types into the BPF bitmask stored in
+// guard_exe_events. Listing READ, WRITE or MMAP implicitly allows OPEN and
+// STAT: a binary trusted to read, write or map a guarded file's contents is
+// necessarily trusted to open it and to see its metadata, and every real
+// consumer stat()s a file before it uses it. Without the implied STAT bit a
+// restricted mask like `ssh READ,WRITE` is denied at the inode_getattr hook
+// (op=STAT) the moment ssh probes ~/.ssh/config, breaking the whitelisted
+// binary. The implied bits are never cleared when any of the three is present.
+// DELETE / RENAME / HARDLINK stay independent (an unlink needs no open).
 func eventMask(types []ebpf.EventType) (uint32, error) {
 	var mask uint32
 	for _, t := range types {
@@ -251,6 +257,7 @@ func eventMask(types []ebpf.EventType) (uint32, error) {
 		switch t {
 		case ebpf.EventRead, ebpf.EventWrite, ebpf.EventMmap:
 			mask |= 1 << uint(ebpf.EventOpen)
+			mask |= 1 << uint(ebpf.EventStat)
 		}
 	}
 	return mask, nil
