@@ -26,4 +26,4 @@ const (
 // -ldflags "-X .../constants.Version=pre-<date>-<sha>" (a var, not a const,
 // enables ldflags injection). Local builds keep the dev marker, which the
 // updater treats as older than any pre-release.
-var Version = "v0.1.0"
+var Version = "v0.2.0"

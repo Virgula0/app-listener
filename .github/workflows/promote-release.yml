@@ -1,0 +1,124 @@
+name: Promote to stable release
+
+# Rebuilds a tested pre-release commit with a stable vX.Y.Z version
+# embedded, re-signs, and publishes/updates the vX.Y.Z release. A tag
+# rename alone is not enough: the version is compiled into the binary, and
+# install.sh / `app-listener update` reject a binary whose --version does
+# not contain the release tag.
+#
+# Auto-runs when a release with a vX.Y.Z tag is published as non-pre-release
+# (edit the pre-release: set tag to vX.Y.Z, untick pre-release, Update) —
+# provided that commit already contains this workflow. Otherwise / to
+# re-run: Actions ▸ Run workflow, giving version + ref.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable tag to build and publish, e.g. v0.1.0
+        required: true
+      ref:
+        description: Commit / tag / branch to build from
+        required: true
+  release:
+    types: [released]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-${{ github.event.release.tag_name || github.event.inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.r.outputs.version }}
+      ref: ${{ steps.r.outputs.ref }}
+    steps:
+      - name: Resolve version and ref
+        id: r
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_VERSION: ${{ github.event.inputs.version }}
+          IN_REF: ${{ github.event.inputs.ref }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            v="$IN_VERSION"
+            r="$IN_REF"
+          else
+            v="$RELEASE_TAG"
+            r="$RELEASE_TAG"
+          fi
+          case "$v" in
+            v[0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::version '$v' is not a vX.Y.Z tag"; exit 1 ;;
+          esac
+          case "$r" in
+            *[!A-Za-z0-9._/-]*) echo "::error::ref '$r' has unexpected characters"; exit 1 ;;
+          esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "ref=$r" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: meta
+    uses: ./.github/workflows/_build-release.yml
+    with:
+      version: ${{ needs.meta.outputs.version }}
+      ref: ${{ needs.meta.outputs.ref }}
+    secrets:
+      signing-key: ${{ secrets.RELEASE_SIGNING_KEY }}
+
+  release:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the promoted ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.ref }}
+
+      - name: Record commit SHA for the tag
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Verify assets
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for f in app-listener app-listener.sha256 app-listener.sha256.sig; do
+            test -f "dist/$f"
+          done
+          chmod +x dist/app-listener
+          dist/app-listener --version | grep -qF -- "$VERSION"
+          ls -la dist
+
+      - name: Publish / update the stable release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+        with:
+          tag: ${{ needs.meta.outputs.version }}
+          commit: ${{ steps.commit.outputs.sha }}
+          prerelease: false
+          makeLatest: true
+          allowUpdates: true
+          replacesArtifacts: true
+          omitNameDuringUpdate: true
+          omitBodyDuringUpdate: true
+          generateReleaseNotes: true
+          artifacts: >-
+            dist/app-listener,dist/app-listener.sha256,dist/app-listener.sha256.sig,dist/app-listener-gui,dist/app-listener-gui.sha256,dist/app-listener-gui.sha256.sig
