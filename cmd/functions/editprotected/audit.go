@@ -43,15 +43,26 @@ func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string) {
 		log.Warnf("  - %s", f)
 	}
 
-	ack := false
+	// A one-way acknowledgement, not a decision: the edit is already written
+	// and nothing here changes or reverts it — the prompt only makes sure the
+	// operator saw the warnings.
 	_ = huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Acknowledge the audit findings above?").
-			Description("These are warnings, not errors — nothing was changed. Review them before continuing.").
-			Affirmative("I understand").
-			Negative("I understand").
-			Value(&ack),
+		huh.NewNote().
+			Title("Post-edit audit — review the warnings above").
+			Description("Advisory only: the edit was saved and nothing here is changed or blocked.\n\n" +
+				strings.Join(bullet(findings), "\n")).
+			Next(true).
+			NextLabel("OK"),
 	)).Run()
+}
+
+// bullet prefixes each finding with "  • " for the acknowledgement note.
+func bullet(findings []string) []string {
+	out := make([]string, len(findings))
+	for i, f := range findings {
+		out[i] = "  • " + f
+	}
+	return out
 }
 
 // auditTree walks resource and flags symlinks, group/other-accessible files,
