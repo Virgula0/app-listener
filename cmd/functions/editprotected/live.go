@@ -19,17 +19,21 @@ import (
 // list of guarded directories, the user picks one, the daemon widens that
 // resource's guard for the session, the editor runs, and the grant is
 // released. The daemon owns the vault lifecycle throughout.
+//
+// The password is read BEFORE connecting: the daemon arms a short handshake
+// deadline the moment it accepts, so a connection that stays silent while the
+// operator types would be dropped as a timeout.
 func runLiveEdit() error {
+	password, err := promptPassword("Edit-protected password")
+	if err != nil {
+		return err
+	}
+
 	session, err := dialLiveSession()
 	if err != nil {
 		return err
 	}
 	defer session.End()
-
-	password, err := promptPassword("Edit-protected password")
-	if err != nil {
-		return err
-	}
 
 	resources, err := session.Authenticate(password)
 	if err != nil {

@@ -22,8 +22,11 @@ import (
 )
 
 const (
-	// controlHandshakeTimeout bounds the AUTH exchange.
-	controlHandshakeTimeout = 10 * time.Second
+	// controlHandshakeTimeout bounds the AUTH exchange. The client sends AUTH
+	// immediately after connecting (it prompts for the password first), so
+	// this only needs headroom for scheduling / a slow disk read of the hash
+	// file, not for a human typing.
+	controlHandshakeTimeout = 30 * time.Second
 	// controlSelectTimeout is how long the client has, after AUTH, to pick a
 	// resource and send SELECT (it is navigating the picker in that window).
 	controlSelectTimeout = 5 * time.Minute
