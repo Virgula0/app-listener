@@ -13,9 +13,9 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
-// TestEnsureInstalledBinary is the regression test for issue #44: the
-// wizard must not build or move the binary, only verify it is deployed —
-// a missing binary aborts before anything else, a present one passes.
+// TestEnsureInstalledBinary is the regression test for issue #44: the wizard
+// never recompiles. A missing binary is deployed by copying the running
+// executable into place; an already-installed binary is left untouched.
 func TestEnsureInstalledBinary(t *testing.T) {
 	orig := installedBinaryPath
 	defer func() { installedBinaryPath = orig }()
@@ -23,17 +23,28 @@ func TestEnsureInstalledBinary(t *testing.T) {
 	dir := t.TempDir()
 	installedBinaryPath = filepath.Join(dir, "app-listener")
 
-	if err := ensureInstalledBinary(); err == nil {
-		t.Fatal("ensureInstalledBinary must fail when the binary is not deployed")
-	} else if !strings.Contains(err.Error(), "not installed") {
-		t.Fatalf("unexpected error: %v", err)
+	// Missing: the running test binary is copied into place, no error.
+	if err := ensureInstalledBinary(); err != nil {
+		t.Fatalf("ensureInstalledBinary with no binary deployed: %v", err)
+	}
+	deployed, err := os.Stat(installedBinaryPath)
+	if err != nil {
+		t.Fatalf("binary was not deployed: %v", err)
+	}
+	if deployed.Mode().Perm() != 0o700 {
+		t.Fatalf("deployed binary mode = %o, want 700", deployed.Mode().Perm())
 	}
 
-	if err := os.WriteFile(installedBinaryPath, []byte("ELF"), 0o700); err != nil {
+	// Already installed: left untouched (sentinel content survives).
+	if err := os.WriteFile(installedBinaryPath, []byte("SENTINEL"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := ensureInstalledBinary(); err != nil {
 		t.Fatalf("ensureInstalledBinary on a deployed binary: %v", err)
+	}
+	got, err := os.ReadFile(installedBinaryPath)
+	if err != nil || string(got) != "SENTINEL" {
+		t.Fatalf("existing binary was overwritten: content = %q (err %v)", got, err)
 	}
 }
 
