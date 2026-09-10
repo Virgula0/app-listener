@@ -301,18 +301,18 @@ func (v *Vault) IsProvisioned(path string) (bool, error) {
 }
 
 // CheckFilesystemReady verifies the filesystem backing path is initialized for fscrypt (`fscrypt setup`)
-// and actually has encryption enabled (the ext4 `encrypt` feature flag) — the fscrypt CLI's non-destructive
-// pre-check — so failures surface here instead of deep inside later policy creation.
+// and actually has encryption enabled (the ext4 `encrypt` feature flag) — a non-destructive pre-check —
+// so failures surface here instead of deep inside later policy creation. It reports the first unmet
+// prerequisite as an error naming the command that fixes it; the installer instead offers to run that
+// command (see FilesystemPrereqs).
 func (v *Vault) CheckFilesystemReady(path string) error {
-	mnt, err := filesystem.FindMount(path)
+	prereqs, err := v.FilesystemPrereqs(path)
 	if err != nil {
-		return fmt.Errorf("resolve filesystem of %s: %w", path, err)
+		return err
 	}
-	if err := mnt.CheckSetup(nil); err != nil {
-		return classifySetupError(path, err)
-	}
-	if err := mnt.CheckSupport(); err != nil {
-		return classifySupportError(path, err)
+	if len(prereqs) > 0 {
+		p := prereqs[0]
+		return fmt.Errorf("%s Run `%s` as root, then re-run the installer", p.Reason, p.Command())
 	}
 	return nil
 }

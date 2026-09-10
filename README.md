@@ -230,9 +230,9 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 > ```
 > The catalog narrows watches for these apps: only the sensitive subtrees are guarded (Discord's `Local Storage/`, `Cookies`, …), the vault root the updater writes to stays unguarded.
 >
-> **fscrypt prerequisite**: each filesystem must be initialized (`sudo fscrypt setup --all-users`) and support encryption (ext4: `sudo tune2fs -O encrypt <dev>`). The installer verifies this before asking anything.
+> **fscrypt prerequisite**: each filesystem must be initialized (`fscrypt setup --all-users`) and support encryption (ext4: `tune2fs -O encrypt <dev>`). The installer checks this before migrating anything and, for a fixable gap, shows the exact command + reason and offers to run it for you (it is already root) — decline and it aborts, as before. Every command it may run is listed in `internal/fscrypt/prereq.go`.
 
-**uninstall** — refuses while the daemon runs; re-scans the catalog; decrypts in place by default; deletes the master key only with `--delete-key`.
+**uninstall** — refuses while the daemon runs; re-scans the catalog; decrypts in place by default; deletes the master key only with `--delete-key`; at the end, lists any `.app_listener.backup` migration copies and offers to delete them (all preselected, one confirmation — plain unencrypted copies, harmless to keep).
 
 **update** — self-updates from the latest signed `pre-YYYYMMDD-<sha>` GitHub pre-release (Ed25519 signature + checksum + asset digest all verified before anything is written).
 

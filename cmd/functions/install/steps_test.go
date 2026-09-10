@@ -102,12 +102,13 @@ func TestAskEncryptionSkipsNeedEncryptionFalse(t *testing.T) {
 	}
 }
 
-// TestAskFilesystemsReadyNoPanic is a regression test for the preflight
+// TestCollectFilesystemPrereqsNoPanic is a regression test for the preflight
 // added with the fscrypt setup check: statting a real directory must not
 // panic (os.Stat returns *syscall.Stat_t, and the preflight must accept
-// exactly that type). The helper must return either nil (host filesystem
-// is already initialized for fscrypt) or the classified setup error.
-func TestAskFilesystemsReadyNoPanic(t *testing.T) {
+// exactly that type). The pure collector must return either no prerequisites
+// (host filesystem is already ready), a slice of runnable Prereq commands,
+// or a terminal classified error — never panic.
+func TestCollectFilesystemPrereqsNoPanic(t *testing.T) {
 	dir := t.TempDir()
 
 	cfgText := "[watch]\npath = " + dir + "\nneed_encryption: true\n"
@@ -116,9 +117,14 @@ func TestAskFilesystemsReadyNoPanic(t *testing.T) {
 		t.Fatalf("parsing config: %v", err)
 	}
 
-	if err := askFilesystemsReady(fscrypt.New(), cfg); err != nil &&
-		!strings.Contains(err.Error(), "fscrypt setup") {
-		t.Errorf("unexpected error from preflight: %v", err)
+	prereqs, err := collectFilesystemPrereqs(fscrypt.New(), cfg)
+	if err != nil && !strings.Contains(err.Error(), "fscrypt") {
+		t.Errorf("unexpected error from prereq collection: %v", err)
+	}
+	for _, p := range prereqs {
+		if len(p.Argv) == 0 || p.Title == "" || p.Reason == "" {
+			t.Errorf("malformed prereq: %+v", p)
+		}
 	}
 }
 

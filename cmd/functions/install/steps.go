@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
@@ -19,6 +18,7 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/repository"
 	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // pickUsers asks which local users the installation should protect. Every
@@ -52,7 +52,7 @@ func pickUsers() ([]inst.User, error) {
 			Height(10).
 			Value(&picked),
 	))
-	if err := form.WithKeyMap(selectionKeymap()).Run(); err != nil {
+	if err := form.WithKeyMap(wizard.MultiSelectKeymap()).Run(); err != nil {
 		return nil, err
 	}
 	if len(picked) == 0 {
@@ -148,7 +148,7 @@ func pickFromCandidates(candidates []inst.Candidate, title, description string) 
 			Height(12).
 			Value(&pickedIdx),
 	))
-	if err := form.WithKeyMap(selectionKeymap()).Run(); err != nil {
+	if err := form.WithKeyMap(wizard.MultiSelectKeymap()).Run(); err != nil {
 		return nil, err
 	}
 	var picked []inst.Candidate
@@ -161,22 +161,6 @@ func pickFromCandidates(candidates []inst.Candidate, title, description string) 
 		log.Infof("will protect %s (%s) — %d whitelisted binaries", c.Path, c.Entry.Name, len(allowed))
 	}
 	return picked, nil
-}
-
-// selectionKeymap customizes the multi-select keys used by the user and
-// directory pickers: Ctrl+K selects/deselects all entries, space/x selects
-// one entry at a time. The legend at the bottom of the field shows both.
-// It must be applied to the Form (not the field): NewForm overwrites
-// every field's keymap with the form default.
-func selectionKeymap() *huh.KeyMap {
-	keys := huh.NewDefaultKeyMap()
-	keys.MultiSelect.SelectAll = key.NewBinding(
-		key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "select/deselect all"))
-	keys.MultiSelect.SelectNone = key.NewBinding(
-		key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "select/deselect all"))
-	keys.MultiSelect.Toggle = key.NewBinding(
-		key.WithKeys(" ", "x"), key.WithHelp("space/x", "select one"))
-	return keys
 }
 
 // addManualDirectories asks for additional paths that were not discovered

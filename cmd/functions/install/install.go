@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
-	"syscall"
 
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
@@ -62,6 +60,10 @@ The wizard walks through the whole installation:
      verifies every already-encrypted directory unlocks with the master
      key (a directory encrypted while declared need_encryption: false is
      a fatal error)
+  6b. checks each backing filesystem is fscrypt-ready; for a fixable gap
+     (missing 'encrypt' feature flag, no 'fscrypt setup') it shows the
+     exact command and its reason and offers to run it now as root —
+     declining aborts the install, just like the old hard error
   7. asks per-directory whether fscrypt encryption is required, but ONLY
      for directories that are not yet encrypted and declare
      need_encryption: true — need_encryption: false resources are skipped
@@ -455,7 +457,7 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 	if err := verifyEncryptionState(vault, cfg); err != nil {
 		return "", err
 	}
-	if err := askFilesystemsReady(vault, cfg); err != nil {
+	if err := resolveFilesystemPrereqs(vault, cfg); err != nil {
 		return "", err
 	}
 	updated, toEncrypt, err := askEncryption(vault, cfgText, cfg)
@@ -466,33 +468,6 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 		return "", err
 	}
 	return updated, nil
-}
-
-// askFilesystemsReady fails fast on filesystems lacking `fscrypt setup`,
-// before any prompting; dedup by device verifies each fs exactly once.
-// Grouped sections are checked once, at their encryption root (the fscrypt
-// lifecycle is per vault root, and every watch sub-path lives on it).
-func askFilesystemsReady(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
-	var checkedDevs []uint64
-	for _, r := range cfg.EncryptionGroups() {
-		if !r.NeedEncryption {
-			continue
-		}
-		root := r.EncryptionRootOrPath()
-		info, statErr := os.Stat(root)
-		if statErr != nil {
-			return fmt.Errorf("stat %s: %w", root, statErr)
-		}
-		dev := info.Sys().(*syscall.Stat_t).Dev
-		if slices.Contains(checkedDevs, dev) {
-			continue
-		}
-		checkedDevs = append(checkedDevs, dev)
-		if readyErr := vault.CheckFilesystemReady(root); readyErr != nil {
-			return readyErr
-		}
-	}
-	return nil
 }
 
 // deploy installs services/hook, copies binary+config, enables the daemon.

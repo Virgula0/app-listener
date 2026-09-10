@@ -3,37 +3,25 @@ package install
 import (
 	"errors"
 	"fmt"
-	"os"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/Virgula0/app-listener/internal/fscrypt"
-	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/backups"
 	"github.com/Virgula0/app-listener/internal/protected"
-	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
-
-// backupEntry is one discovered migration backup and the directory it
-// belongs to.
-type backupEntry struct {
-	path   string
-	backup string
-}
 
 // restoreBackups undoes the fscrypt migration: the found
 // .app_listener.backup directories are shown in a TUI list (all
 // preselected) and, after a single confirmation, the encrypted copies are
 // deleted and the backups moved back to the original locations. It aborts
 // when the daemon is running — restoring while the daemon is active would
-// let it keep unlocking and using the very directories being deleted. A
-// TUI progress bar shows the operation progress.
+// let it keep unlocking and using the very directories being deleted.
 func restoreBackups() error {
 	if protected.DaemonRunning() {
 		return errors.New("fatal: the daemon is running — stop it before restoring backups: systemctl stop app-listener-daemon")
 	}
-	entries, err := findBackups()
+	entries, err := backups.Find()
 	if err != nil {
 		return err
 	}
@@ -41,7 +29,7 @@ func restoreBackups() error {
 		log.Info("no migration backups found: nothing to restore")
 		return nil
 	}
-	entries, err = pickBackups(entries,
+	entries, err = backups.Select(entries,
 		"Migration backups found — select the ones to restore",
 		"All are preselected. Restoring DELETES the encrypted directory and moves the backup back to the original location.")
 	if err != nil {
@@ -59,13 +47,7 @@ func restoreBackups() error {
 		log.Info("restore canceled")
 		return nil
 	}
-	vault := fscrypt.New()
-	if err := runWithProgress("Restoring", entries, func(path string) error {
-		if err := vault.RestoreBackup(path); err != nil {
-			return fmt.Errorf("fatal: %v", err)
-		}
-		return nil
-	}); err != nil {
+	if err := backups.Restore(entries); err != nil {
 		return err
 	}
 	log.Infof("restored %d backup(s)", len(entries))
@@ -76,7 +58,7 @@ func restoreBackups() error {
 // are shown in a TUI list (all preselected) and, after a single
 // confirmation, removed with a TUI progress bar showing the progress.
 func deletePostBackups() error {
-	entries, err := findBackups()
+	entries, err := backups.Find()
 	if err != nil {
 		return err
 	}
@@ -84,7 +66,7 @@ func deletePostBackups() error {
 		log.Info("no migration backups found: nothing to delete")
 		return nil
 	}
-	entries, err = pickBackups(entries,
+	entries, err = backups.Select(entries,
 		"Migration backups found — select the ones to delete",
 		"All are preselected. The backups are plain, unencrypted copies of the migrated directories.")
 	if err != nil {
@@ -102,117 +84,9 @@ func deletePostBackups() error {
 		log.Info("delete canceled")
 		return nil
 	}
-	if err := runWithProgress("Deleting", entries, func(path string) error {
-		backup := path + fscrypt.BackupSuffix
-		if err := os.RemoveAll(backup); err != nil {
-			return fmt.Errorf("removing backup %s: %w", backup, err)
-		}
-		return nil
-	}); err != nil {
+	if err := backups.Delete(entries); err != nil {
 		return err
 	}
 	log.Infof("deleted %d backup(s)", len(entries))
 	return nil
-}
-
-// findBackups lists every catalog/config path that still carries a
-// .app_listener.backup.
-func findBackups() ([]backupEntry, error) {
-	candidates, err := restoreCandidates()
-	if err != nil {
-		return nil, err
-	}
-	var out []backupEntry
-	for _, path := range candidates {
-		backup := path + fscrypt.BackupSuffix
-		if _, err := os.Lstat(backup); err != nil {
-			continue
-		}
-		out = append(out, backupEntry{path: path, backup: backup})
-	}
-	return out, nil
-}
-
-// pickBackups shows the found backups in a TUI multi-select (all
-// preselected) and returns the selected ones.
-func pickBackups(entries []backupEntry, title, description string) ([]backupEntry, error) {
-	opts := make([]huh.Option[int], 0, len(entries))
-	for i := range entries {
-		opts = append(opts, huh.NewOption(entries[i].backup, i).Selected(true))
-	}
-	var pickedIdx []int
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewMultiSelect[int]().
-			Title(title).
-			Description(description).
-			Options(opts...).
-			Height(10).
-			Value(&pickedIdx),
-	))
-	if err := form.WithKeyMap(selectionKeymap()).Run(); err != nil {
-		return nil, err
-	}
-	picked := make([]backupEntry, 0, len(pickedIdx))
-	for _, i := range pickedIdx {
-		picked = append(picked, entries[i])
-	}
-	return picked, nil
-}
-
-// runWithProgress executes op for every entry while a single-line progress
-// bar at the bottom of the terminal shows the operation progress (one step
-// per directory); the fscrypt logs scroll normally above it.
-func runWithProgress(verb string, entries []backupEntry, op func(path string) error) error {
-	total := len(entries)
-	return wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
-		for i := range entries {
-			label := fmt.Sprintf("%s %d/%d: %s", verb, i+1, total, entries[i].backup)
-			bar.Set(label, float64(i)/float64(total))
-			if err := op(entries[i].path); err != nil {
-				return err
-			}
-			bar.Set(label+" (done)", float64(i+1)/float64(total))
-		}
-		return nil
-	})
-}
-
-// restoreCandidates lists every path that could carry a migration backup:
-// the resources of /etc/app-listener/daemon.conf when it exists (covering
-// manually added directories) merged with every catalog path discovered
-// for all local users plus the system-level entries. Deduplicated by path.
-func restoreCandidates() ([]string, error) {
-	seen := make(map[string]bool)
-	var out []string
-	add := func(path string) {
-		if !seen[path] {
-			seen[path] = true
-			out = append(out, path)
-		}
-	}
-
-	if data, err := os.ReadFile(systemd.SystemConfigPath); err == nil {
-		cfg, loadErr := validateConfigText(string(data))
-		if loadErr != nil {
-			return nil, fmt.Errorf("reading %s: %w", systemd.SystemConfigPath, loadErr)
-		}
-		for i := range cfg.Resources {
-			r := &cfg.Resources[i]
-			// The backup lives at the encryption root for grouped sections
-			// (the whole vault is renamed aside during migration), at the
-			// watch path itself otherwise.
-			add(r.Path)
-			add(r.EncryptionRootOrPath())
-		}
-	}
-
-	users, err := inst.ListUsers()
-	if err != nil {
-		return nil, err
-	}
-	found := inst.DiscoverForUsers(users)
-	for i := range found {
-		add(found[i].Path)
-	}
-	return out, nil
 }
