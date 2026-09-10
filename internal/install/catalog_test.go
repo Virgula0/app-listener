@@ -4,36 +4,44 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
 
 // TestCatalogSanity verifies the master list is well-formed: every entry
-// has a name, exactly one of RelPath/AbsPath, absolute whitelist binaries,
-// and no two entries probe the same path.
+// has a name, exactly one non-empty of RelPaths/AbsPaths, absolute
+// whitelist binaries, WatchRelPaths only with a single RelPaths entry, and
+// no two entries probe the same path.
 func TestCatalogSanity(t *testing.T) {
 	seen := make(map[string]string)
 	for _, entry := range Catalog {
 		if entry.Name == "" {
-			t.Errorf("entry %q/%q has an empty name", entry.RelPath, entry.AbsPath)
+			t.Errorf("entry with empty name: %+v", entry)
 		}
-		if (entry.RelPath == "") == (entry.AbsPath == "") {
-			t.Errorf("entry %q must set exactly one of RelPath or AbsPath", entry.Name)
+		rel, abs := len(entry.RelPaths), len(entry.AbsPaths)
+		if (rel == 0) == (abs == 0) {
+			t.Errorf("entry %q must set exactly one of RelPaths or AbsPaths (non-empty)", entry.Name)
 		}
-		if entry.RelPath != "" && filepath.IsAbs(entry.RelPath) {
-			t.Errorf("entry %q: RelPath must be relative to the home directory, got %q", entry.Name, entry.RelPath)
+		for _, p := range entry.RelPaths {
+			if p == "" || filepath.IsAbs(p) {
+				t.Errorf("entry %q: RelPaths entry %q must be a non-empty home-relative path", entry.Name, p)
+			}
 		}
-		if entry.AbsPath != "" && !filepath.IsAbs(entry.AbsPath) {
-			t.Errorf("entry %q: AbsPath must be absolute, got %q", entry.Name, entry.AbsPath)
+		for _, p := range entry.AbsPaths {
+			if !filepath.IsAbs(p) {
+				t.Errorf("entry %q: AbsPaths entry %q must be absolute", entry.Name, p)
+			}
 		}
-		key := entry.RelPath
-		if key == "" {
-			key = entry.AbsPath
+		if len(entry.WatchRelPaths) > 0 && len(entry.RelPaths) != 1 {
+			t.Errorf("entry %q: WatchRelPaths is only valid with exactly one RelPaths entry (has %d)", entry.Name, len(entry.RelPaths))
 		}
-		if prev, ok := seen[key]; ok {
-			t.Errorf("duplicate catalog path %q (%s and %s)", key, prev, entry.Name)
+		for _, key := range slices.Concat(entry.RelPaths, entry.AbsPaths) {
+			if prev, ok := seen[key]; ok {
+				t.Errorf("duplicate catalog path %q (%s and %s)", key, prev, entry.Name)
+			}
+			seen[key] = entry.Name
 		}
-		seen[key] = entry.Name
 		for bin := range entry.Whitelist {
 			if !isAbsoluteCandidate(bin) {
 				t.Errorf("entry %q: whitelist path %q is not absolute (use %%HOME%%/ or %%USER%%/ for home-relative paths)", entry.Name, bin)
@@ -42,6 +50,45 @@ func TestCatalogSanity(t *testing.T) {
 	}
 	if len(Catalog) < 30 {
 		t.Errorf("catalog unexpectedly small: %d entries", len(Catalog))
+	}
+}
+
+// TestCatalogMergedResources pins the multi-location entries introduced for
+// issue #51: one Name, one shared whitelist, several watch roots. The old
+// per-location names must be gone.
+func TestCatalogMergedResources(t *testing.T) {
+	want := map[string][]string{
+		"Claude Code":   {".claude", ".config/claude"},
+		"Azure CLI":     {".azure", ".config/azure"},
+		"GNOME keyring": {".local/share/keyrings", ".keyring"},
+		"Zed editor":    {".config/zed", ".local/share/zed"},
+		"Steam":         {".local/share/Steam/config", ".steam"},
+	}
+	for name, paths := range want {
+		var e *CandidateDir
+		for i := range Catalog {
+			if Catalog[i].Name == name {
+				e = &Catalog[i]
+				break
+			}
+		}
+		if e == nil {
+			t.Errorf("merged entry %q not found in catalog", name)
+			continue
+		}
+		if !reflect.DeepEqual(e.RelPaths, paths) {
+			t.Errorf("%s: RelPaths = %v, want %v", name, e.RelPaths, paths)
+		}
+	}
+	gone := []string{
+		"Claude Code config", "Azure CLI config", "GNOME keyring (legacy)",
+		"Zed editor data", "Steam (legacy home)",
+		"Steam client config (accounts/credentials)",
+	}
+	for i := range Catalog {
+		if slices.Contains(gone, Catalog[i].Name) {
+			t.Errorf("entry %q should have been merged away", Catalog[i].Name)
+		}
 	}
 }
 
@@ -58,7 +105,7 @@ func isAbsoluteCandidate(bin string) bool {
 func TestCatalogHasWireGuardSystemEntry(t *testing.T) {
 	found := false
 	for _, entry := range Catalog {
-		if entry.AbsPath == "/etc/wireguard" {
+		if slices.Contains(entry.AbsPaths, "/etc/wireguard") {
 			found = true
 			for bin := range entry.Whitelist {
 				if bin == "/usr/bin/nmcli" {
@@ -73,11 +120,17 @@ func TestCatalogHasWireGuardSystemEntry(t *testing.T) {
 	}
 }
 
-// TestPathFor verifies placeholder expansion in candidate paths.
-func TestPathFor(t *testing.T) {
-	entry := CandidateDir{RelPath: ".config/opencode"}
-	if got := entry.PathFor("/home/alice", "alice"); got != "/home/alice/.config/opencode" {
-		t.Errorf("PathFor = %q", got)
+// TestPathsFor verifies placeholder expansion in candidate paths, for both
+// a single-location and a multi-location entry.
+func TestPathsFor(t *testing.T) {
+	single := CandidateDir{RelPaths: []string{".config/opencode"}}
+	if got := single.PathsFor("/home/alice", "alice"); len(got) != 1 || got[0] != "/home/alice/.config/opencode" {
+		t.Errorf("PathsFor = %q", got)
+	}
+	multi := CandidateDir{RelPaths: []string{".claude", ".config/claude"}}
+	want := []string{"/home/alice/.claude", "/home/alice/.config/claude"}
+	if got := multi.PathsFor("/home/alice", "alice"); !reflect.DeepEqual(got, want) {
+		t.Errorf("PathsFor = %q, want %q", got, want)
 	}
 }
 
@@ -110,7 +163,7 @@ func TestExpandWhitelist(t *testing.T) {
 func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	var entry *CandidateDir
 	for i := range Catalog {
-		if Catalog[i].RelPath == ".ssh" {
+		if slices.Contains(Catalog[i].RelPaths, ".ssh") {
 			entry = &Catalog[i]
 			break
 		}
@@ -147,12 +200,14 @@ func TestBuildxWhitelistedInKubeAndDocker(t *testing.T) {
 	const buildx = "/usr/lib/docker/cli-plugins/docker-buildx"
 	seen := map[string]bool{}
 	for i := range Catalog {
-		switch Catalog[i].RelPath {
-		case ".kube", ".docker":
-			if _, ok := Catalog[i].Whitelist[buildx]; !ok {
-				t.Errorf("%s entry does not whitelist docker-buildx", Catalog[i].RelPath)
+		for _, rel := range Catalog[i].RelPaths {
+			if rel != ".kube" && rel != ".docker" {
+				continue
 			}
-			seen[Catalog[i].RelPath] = true
+			if _, ok := Catalog[i].Whitelist[buildx]; !ok {
+				t.Errorf("%s entry does not whitelist docker-buildx", rel)
+			}
+			seen[rel] = true
 		}
 	}
 	for _, rel := range []string{".kube", ".docker"} {
@@ -170,7 +225,7 @@ func TestBuildxWhitelistedInKubeAndDocker(t *testing.T) {
 func TestSSHWhitelistIncludesModularDaemon(t *testing.T) {
 	var entry *CandidateDir
 	for i := range Catalog {
-		if Catalog[i].RelPath == ".ssh" {
+		if slices.Contains(Catalog[i].RelPaths, ".ssh") {
 			entry = &Catalog[i]
 			break
 		}
@@ -202,7 +257,7 @@ func TestSSHWhitelistIncludesModularDaemon(t *testing.T) {
 func TestGHWhitelistIncludesCommonPaths(t *testing.T) {
 	var entry *CandidateDir
 	for i := range Catalog {
-		if Catalog[i].RelPath == ".config/gh" {
+		if slices.Contains(Catalog[i].RelPaths, ".config/gh") {
 			entry = &Catalog[i]
 			break
 		}
@@ -268,7 +323,7 @@ func TestDiscoverPerUserHomes(t *testing.T) {
 
 	got := map[string]User{}
 	for _, c := range DiscoverForUsers(users) {
-		if c.Entry.RelPath == ".ssh" {
+		if slices.Contains(c.Entry.RelPaths, ".ssh") {
 			got[c.Path] = c.User
 		}
 	}
@@ -308,16 +363,16 @@ func TestDiscoverSystemOnlyAbsolute(t *testing.T) {
 	user := User{Name: "tester", Home: home}
 
 	for _, c := range Discover(user) {
-		if c.Entry.AbsPath != "" {
+		if c.Entry.IsSystem() {
 			t.Errorf("per-user Discover returned system entry %s", c.Path)
 		}
 	}
 	for _, c := range DiscoverSystem() {
-		if c.Entry.AbsPath == "" {
+		if !c.Entry.IsSystem() {
 			t.Errorf("DiscoverSystem returned per-user entry %s", c.Path)
 		}
-		if c.Path != c.Entry.AbsPath {
-			t.Errorf("DiscoverSystem path %q != AbsPath %q", c.Path, c.Entry.AbsPath)
+		if !slices.Contains(c.Entry.AbsPaths, c.Path) {
+			t.Errorf("DiscoverSystem path %q not among AbsPaths %v", c.Path, c.Entry.AbsPaths)
 		}
 	}
 }
@@ -485,8 +540,8 @@ func TestDiscordNarrowedWatches(t *testing.T) {
 	if discord == nil {
 		t.Fatal("Discord catalog entry not found")
 	}
-	if discord.RelPath != ".config/discord" {
-		t.Errorf("RelPath = %q, want .config/discord (the encryption root)", discord.RelPath)
+	if len(discord.RelPaths) != 1 || discord.RelPaths[0] != ".config/discord" {
+		t.Errorf("RelPaths = %q, want [.config/discord] (the encryption root)", discord.RelPaths)
 	}
 	want := []string{
 		".config/discord/Local Storage",

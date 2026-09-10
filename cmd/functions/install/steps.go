@@ -65,30 +65,69 @@ func pickUsers() ([]inst.User, error) {
 	return picked, nil
 }
 
+// catalogGroup bundles every discovered path of one resource (one catalog
+// Name, one user) behind a single TUI checkbox — a resource stored in more
+// than one location (Steam's data dir + legacy home) is selected as a unit.
+type catalogGroup struct {
+	label      string
+	candidates []inst.Candidate
+}
+
+// groupCandidates collapses the per-path candidates into per-resource
+// groups, preserving first-seen order.
+func groupCandidates(cands []inst.Candidate) []catalogGroup {
+	type key struct{ name, user string }
+	var order []key
+	byKey := map[key][]int{}
+	for i := range cands {
+		k := key{cands[i].Entry.Name, cands[i].User.Name}
+		if _, ok := byKey[k]; !ok {
+			order = append(order, k)
+		}
+		byKey[k] = append(byKey[k], i)
+	}
+	out := make([]catalogGroup, 0, len(order))
+	for _, k := range order {
+		idxs := byKey[k]
+		cs := make([]inst.Candidate, 0, len(idxs))
+		paths := make([]string, 0, len(idxs))
+		for _, i := range idxs {
+			cs = append(cs, cands[i])
+			paths = append(paths, cands[i].Path)
+		}
+		label := k.name
+		if k.user != "" {
+			label = fmt.Sprintf("%s (user %s)", k.name, k.user)
+		}
+		if len(paths) == 1 {
+			label += "  " + paths[0]
+		} else {
+			label += fmt.Sprintf("  [%d locations] %s", len(paths), strings.Join(paths, ", "))
+		}
+		out = append(out, catalogGroup{label: label, candidates: cs})
+	}
+	return out
+}
+
 // pickDirectories probes the catalog for every selected user (and the
 // system-level entries) and asks which of the found critical directories
 // to protect. All are preselected.
 func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
-	candidates := inst.DiscoverForUsers(users)
-	if len(candidates) == 0 {
+	groups := groupCandidates(inst.DiscoverForUsers(users))
+	if len(groups) == 0 {
 		log.Warn("no catalog directories found for the selected users — you can still add directories manually")
 		return nil, nil
 	}
 
-	opts := make([]huh.Option[int], 0, len(candidates))
-	for i := range candidates {
-		c := &candidates[i]
-		label := fmt.Sprintf("%s  %s", c.Entry.Name, c.Path)
-		if c.User.Name != "" {
-			label = fmt.Sprintf("%s (user %s)  %s", c.Entry.Name, c.User.Name, c.Path)
-		}
-		opts = append(opts, huh.NewOption(label, i).Selected(true))
+	opts := make([]huh.Option[int], 0, len(groups))
+	for i := range groups {
+		opts = append(opts, huh.NewOption(groups[i].label, i).Selected(true))
 	}
 	var pickedIdx []int
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewMultiSelect[int]().
 			Title("Critical directories found — select the ones to protect").
-			Description("Only existing paths are listed. All are preselected. Whitelisted binaries per directory are curated and minimal.").
+			Description("Only existing paths are listed. All are preselected. A resource stored in several locations is one entry. Whitelisted binaries per directory are curated and minimal.").
 			Options(opts...).
 			Height(12).
 			Value(&pickedIdx),
@@ -98,7 +137,7 @@ func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 	}
 	var picked []inst.Candidate
 	for _, i := range pickedIdx {
-		picked = append(picked, candidates[i])
+		picked = append(picked, groups[i].candidates...)
 	}
 	if len(picked) == 0 {
 		log.Warn("no catalog directories selected — you can still add directories manually")
@@ -288,12 +327,13 @@ func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Confi
 
 // resolveCatalogEntry performs a reverse lookup: given an absolute path from
 // the existing daemon.conf, finds which Catalog entry it originated from.
-// System-level entries (AbsPath) are matched by exact path. User-level
-// entries (RelPath) are matched by computing PathFor for each known user.
-// Grouped entries (WatchRelPaths) also match their watch sub-paths — e.g.
-// ~/.config/discord/Local Storage resolves to the Discord entry — so a
-// refresh re-expands the whitelist of every grouped section. Returns nil
-// when the section was user-added and has no catalog origin.
+// System-level entries (AbsPaths) are matched by exact path. User-level
+// entries (RelPaths) are matched by computing PathsFor for each known user —
+// any of an entry's locations matches its shared whitelist. Grouped entries
+// (WatchRelPaths) also match their watch sub-paths — e.g. ~/.config/discord/
+// Local Storage resolves to the Discord entry — so a refresh re-expands the
+// whitelist of every grouped section. Returns nil when the section was
+// user-added and has no catalog origin.
 func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
 	if entry, user := findCatalogRoot(resourcePath, users); entry != nil {
 		return entry, user
@@ -301,21 +341,34 @@ func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.Candidat
 	return findCatalogWatchSubPath(resourcePath, users)
 }
 
-// findCatalogRoot matches the entry's own watch root exactly.
+// catalogEntryMatch returns the user whose expansion of entry contains a
+// path satisfying match, or nil. System entries yield the zero user.
+func catalogEntryMatch(entry *inst.CandidateDir, users []inst.User, match func(catalogPath string) bool) *inst.User {
+	if entry.IsSystem() {
+		for _, p := range entry.PathsFor("", "") {
+			if match(p) {
+				return &inst.User{}
+			}
+		}
+		return nil
+	}
+	for j := range users {
+		u := &users[j]
+		for _, p := range entry.PathsFor(u.Home, u.Name) {
+			if match(p) {
+				return u
+			}
+		}
+	}
+	return nil
+}
+
+// findCatalogRoot matches one of the entry's own watch roots exactly.
 func findCatalogRoot(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
 	for i := range inst.Catalog {
 		entry := &inst.Catalog[i]
-		if entry.AbsPath != "" {
-			if entry.AbsPath == resourcePath {
-				return entry, &inst.User{}
-			}
-			continue
-		}
-		for j := range users {
-			u := &users[j]
-			if entry.PathFor(u.Home, u.Name) == resourcePath {
-				return entry, u
-			}
+		if u := catalogEntryMatch(entry, users, func(p string) bool { return p == resourcePath }); u != nil {
+			return entry, u
 		}
 	}
 	return nil, nil
@@ -327,17 +380,8 @@ func findCatalogRoot(resourcePath string, users []inst.User) (*inst.CandidateDir
 func findCatalogWatchSubPath(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
 	for i := range inst.Catalog {
 		entry := &inst.Catalog[i]
-		if entry.AbsPath != "" {
-			if isInsidePath(resourcePath, entry.AbsPath) {
-				return entry, &inst.User{}
-			}
-			continue
-		}
-		for j := range users {
-			u := &users[j]
-			if isInsidePath(resourcePath, entry.PathFor(u.Home, u.Name)) {
-				return entry, u
-			}
+		if u := catalogEntryMatch(entry, users, func(p string) bool { return isInsidePath(resourcePath, p) }); u != nil {
+			return entry, u
 		}
 	}
 	return nil, nil

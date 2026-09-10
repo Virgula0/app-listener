@@ -13,6 +13,31 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
+// TestGroupCandidates verifies the installer collapses the per-path
+// candidates of one resource (issue #51) into a single TUI group, ordered
+// by first appearance, and that selecting a group yields every path.
+func TestGroupCandidates(t *testing.T) {
+	u := inst.User{Name: "alice", Home: "/home/alice"}
+	cands := []inst.Candidate{
+		{User: u, Entry: inst.CandidateDir{Name: "Claude Code"}, Path: "/home/alice/.claude"},
+		{User: u, Entry: inst.CandidateDir{Name: "SSH"}, Path: "/home/alice/.ssh"},
+		{User: u, Entry: inst.CandidateDir{Name: "Claude Code"}, Path: "/home/alice/.config/claude"},
+	}
+	groups := groupCandidates(cands)
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups, want 2: %+v", len(groups), groups)
+	}
+	if len(groups[0].candidates) != 2 || groups[0].candidates[1].Path != "/home/alice/.config/claude" {
+		t.Errorf("Claude Code group not merged in order: %+v", groups[0].candidates)
+	}
+	if !strings.Contains(groups[0].label, "[2 locations]") || !strings.Contains(groups[0].label, "(user alice)") {
+		t.Errorf("group label = %q", groups[0].label)
+	}
+	if len(groups[1].candidates) != 1 || strings.Contains(groups[1].label, "locations]") {
+		t.Errorf("single-path group should not show a location count: %q", groups[1].label)
+	}
+}
+
 // TestEnsureInstalledBinary is the regression test for issue #44: the wizard
 // never recompiles. A missing binary is deployed by copying the running
 // executable into place; an already-installed binary is left untouched.
