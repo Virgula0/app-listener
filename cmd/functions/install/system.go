@@ -200,18 +200,14 @@ func installSSHAgent(u inst.User) error {
 	return nil
 }
 
-// installBinaryAndConfig copies the freshly built binary to the service
-// path (always, so upgrades are deployed) and writes the final config.
-// An existing config with different content is diffed and the user is
-// asked whether to overwrite it; identical configs are left alone. It
-// reports whether the installed config differs from what the daemon was
-// running with.
-func installBinaryAndConfig(cfgText string) (configChanged bool, err error) {
-	if err := systemd.ReplaceInstalledBinary(buildBinaryPath, systemd.InstallBinaryPath); err != nil {
-		return false, fmt.Errorf("installing binary: %w", err)
-	}
-	log.Infof("installed binary at %s", systemd.InstallBinaryPath)
-
+// installConfig writes the final daemon config to its system path and
+// ensures the PATH symlink. The binary is deployed separately (the
+// one-line installer or `install --binary-only`); the wizard only checks
+// it is present (see ensureInstalledBinary). An existing config with
+// different content is diffed and the user is asked whether to overwrite
+// it; identical configs are left alone. It reports whether the installed
+// config differs from what the daemon was running with.
+func installConfig(cfgText string) (configChanged bool, err error) {
 	if err := systemd.EnsureBinSymlink(); err != nil {
 		return false, err
 	}

@@ -152,6 +152,24 @@ func TestEnsureBinSymlinkMissingParent(t *testing.T) {
 	}
 }
 
+func TestDaemonUnitInstalled(t *testing.T) {
+	orig := daemonUnitFile
+	defer func() { daemonUnitFile = orig }()
+
+	dir := t.TempDir()
+	daemonUnitFile = filepath.Join(dir, "app-listener-daemon.service")
+
+	if DaemonUnitInstalled() {
+		t.Fatal("DaemonUnitInstalled = true with no unit file on disk")
+	}
+	if err := os.WriteFile(daemonUnitFile, []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !DaemonUnitInstalled() {
+		t.Fatal("DaemonUnitInstalled = false after writing the unit file")
+	}
+}
+
 func TestReplaceInstalledBinary(t *testing.T) {
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "app-listener")
