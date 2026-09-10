@@ -208,6 +208,7 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 - **Whitelist only, default deny**; identity by inode.
 - **Per-binary event masks**: unlisted events are denied; `READ`/`WRITE`/`MMAP` imply `OPEN`. Masks are a least-privilege hint, **not a confinement boundary** — a masked binary that execs another whitelisted binary escapes its mask.
 - **SIGHUP reload** (`systemctl reload`): recomputes every binary's inode identity atomically — new guards attach before old ones detach; a malformed config keeps the previous one running.
+- **Live edit control socket**: when `/etc/app-listener/edit-auth.hash` exists (an edit-protected password was set), the daemon opens `/run/app-listener-daemon.control` (`0600`, root + app-listener-binary peer only) so `edit-protected` can make an authenticated live change — see the [edit-protected](#installsh--install--uninstall--update--edit-protected) section.
 - **fscrypt lifecycle**: `need_encryption: true` resources must already carry an fscrypt policy. Shutdown deprovisions keys in two passes while guards still deny access; hooks detach only after every vault is keyless. A hard `SIGKILL` cannot be caught, but the guard's LSM links are pinned to `/sys/fs/bpf` so the trees stay enforced until `ExecStopPost` locks the vaults.
 
 ### install.sh / install / uninstall / update / edit-protected
@@ -233,7 +234,26 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 
 **update** — self-updates from the latest signed `pre-YYYYMMDD-<sha>` GitHub pre-release (Ed25519 signature + checksum + asset digest all verified before anything is written).
 
-**edit-protected** — edit one fscrypt-encrypted catalog directory in a two-pane editor. Refuses while the daemon runs; one vault unlocked at a time, re-locked on exit; `Ctrl+S` saves atomically. Binaries, symlinks and files > 2 MiB refused.
+**edit-protected** — edit a protected directory in a two-pane editor. `Ctrl+S` saves atomically; binaries, symlinks and files > 2 MiB refused.
+
+Two modes, chosen automatically:
+
+- **offline** (default) — refuses while the daemon runs; re-scans the catalog, unlocks one vault with the master key, edits, re-locks it on exit (a vault never stays open).
+- **live** — when an *edit-protected password* was chosen during `sudo app-listener install` **and** the daemon is running: you enter the password **once, first**; only then does the daemon (over a local root-only control socket, `/run/app-listener-daemon.control`) return the list of guarded directories to pick from. It briefly grants write access to the one you pick, you edit, and the grant is dropped. The daemon keeps running and the fscrypt vaults are never touched. An unauthenticated caller learns **nothing** about which directories are protected. Grants are one-at-a-time, capped at 30 min, and revoked on disconnect or a SIGHUP reload; the socket locks out after 5 failed attempts.
+
+The password is **separate from the fscrypt master key** — it only authenticates `edit-protected`. Its PBKDF2 hash lives at `/etc/app-listener/edit-auth.hash` (`0600` root), guarded by the running daemon the same way as `fscrypt.key` (readable/writable only by the app-listener binary).
+
+```bash
+sudo app-listener edit-protected                       # auto: live if a password is set + daemon up, else offline
+sudo app-listener edit-protected --set-password         # set/rotate the password (refused if it was set at install — re-run install to rotate that)
+sudo app-listener edit-protected --clear-password       # remove it (disables live mode)
+
+# non-interactive live write (automation): password from $APP_LISTENER_EDIT_PASSWORD
+echo "new contents" | sudo APP_LISTENER_EDIT_PASSWORD=… \
+  app-listener edit-protected --resource /home/alice/.ssh --put config
+```
+
+Before exiting, both modes audit the edited tree against `daemon.conf` and warn (advisory, acknowledged once) about anything that would sit outside the daemon's protection: a file created outside every guarded watch path of a grouped vault, a new symlink, a world-readable new secret, a freshly dropped executable.
 
 ## Debug
 

@@ -163,6 +163,7 @@ func newFileEditModel(root string) *fileEditModel {
 		m.status = "error: " + err.Error()
 	}
 	m.rebuild()
+	m.refit() // sane geometry for the first frame, before the WindowSizeMsg
 	return m
 }
 
@@ -175,27 +176,54 @@ func (m *fileEditModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
 	case tea.KeyMsg:
+		prevMode := m.mode
 		cmd, quit := m.handleKey(msg)
 		if quit {
 			return m, tea.Quit
+		}
+		if m.mode != prevMode {
+			// A mode change alters the pane split (the editor is a sidebar
+			// vs. half vs. focus) — re-fit before the next render.
+			m.refit()
 		}
 		return m, cmd
 	}
 	return m, nil
 }
 
-// resize adapts the pane geometry to the terminal and re-fits the editor.
-// The right pane is sized from the width the terminal actually gives the
-// content (after the app margin) so the editor reaches the right edge.
+// treeSidebarWidth is the tree pane width while editing a file: the editor
+// is the focus, so the tree shrinks to a context sidebar and the editor
+// takes the rest of the terminal.
+const treeSidebarWidth = 32
+
+// paneLayout returns the left (tree) and right (info/editor) column widths
+// for the current mode, from the width the terminal actually gives the
+// content (after the app margin) minus one column for the separator. In
+// modeEdit the tree is a sidebar; every other mode splits evenly.
+func (m *fileEditModel) paneLayout() (left, right int) {
+	usable := max(m.width-appStyle.GetHorizontalMargins(), 4)
+	if m.mode == modeEdit {
+		left = min(treeSidebarWidth, usable/3)
+	} else {
+		left = usable / 2
+	}
+	left = max(left, 16)
+	right = max(usable-left-1, 10)
+	return left, right
+}
+
+// resize records the new terminal size and re-fits the panes/editor.
 func (m *fileEditModel) resize(width, height int) {
 	m.width = width
 	m.height = height
-	usable := width - appStyle.GetHorizontalMargins()
-	m.leftW = usable / 2
-	if m.leftW < 16 {
-		m.leftW = 16
-	}
-	m.rightW = usable - m.leftW - 1
+	m.refit()
+}
+
+// refit recomputes the pane geometry (mode-dependent) and re-sizes the
+// editor to it. Call it whenever the terminal size or the mode changes, so
+// entering/leaving the editor widens/narrows it immediately.
+func (m *fileEditModel) refit() {
+	m.leftW, m.rightW = m.paneLayout()
 	m.editor.SetWidth(max(m.rightW, 10))
 	m.editor.SetHeight(max(m.paneHeight()-1, 3))
 	m.ensureCursorVisible()
@@ -823,7 +851,15 @@ func (m *fileEditModel) paneHeight() int {
 	if m.height < 6 {
 		return 2
 	}
-	return m.height - 3
+	// 2 chrome rows (the header + the top margin) plus however many rows the
+	// legend wraps to at this width.
+	return max(m.height-2-m.legendRows(), 2)
+}
+
+// legendRows is the number of terminal rows the (width-wrapped) legend
+// occupies for the current mode.
+func (m *fileEditModel) legendRows() int {
+	return strings.Count(m.legend(), "\n") + 1
 }
 
 func (m *fileEditModel) View() string {
@@ -842,12 +878,21 @@ func (m *fileEditModel) View() string {
 		"  ",
 		infoStyle.Render(status),
 	)
-	body := lipgloss.JoinHorizontal(lipgloss.Top,
+	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, head, m.body(), m.legend()))
+}
+
+// body lays the tree and the info/editor pane side by side, each fixed to
+// its column width so the layout fills the terminal.
+func (m *fileEditModel) body() string {
+	return lipgloss.JoinHorizontal(lipgloss.Top,
 		m.renderTree(m.leftW, m.paneHeight()),
 		paneSepStyle.Render("│"),
-		m.renderRight(m.rightW, m.paneHeight()),
+		// Fix the right column to rightW so the pane reaches the terminal
+		// edge (renderRight clips its own content to rightW, so Width only
+		// pads; MaxWidth is the belt against a stray wide line).
+		lipgloss.NewStyle().Width(m.rightW).MaxWidth(m.rightW).
+			Render(m.renderRight(m.rightW, m.paneHeight())),
 	)
-	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, head, body, m.legend()))
 }
 
 func (m *fileEditModel) renderTree(width, height int) string {
@@ -862,11 +907,17 @@ func (m *fileEditModel) renderTree(width, height int) string {
 			}
 		}
 		prefix := strings.Repeat("  ", n.depth)
-		line := clipLabel(prefix+marker+n.name, width)
+		// Pad every row to the full pane width so the block lipgloss lays out
+		// is exactly `width` wide — otherwise JoinHorizontal sizes the tree
+		// column to its longest line and the right pane never reaches the
+		// terminal edge. Padding first also makes the selection bar span the
+		// whole pane.
+		label := clipLabel(prefix+marker+n.name, width)
+		label += strings.Repeat(" ", max(0, width-lipgloss.Width(label)))
 		if i == m.cur {
-			line = fileTreeCursor.Render(line)
+			label = fileTreeCursor.Render(label)
 		}
-		b.WriteString(line + "\n")
+		b.WriteString(label + "\n")
 	}
 	return b.String()
 }
@@ -915,7 +966,7 @@ func (m *fileEditModel) renderEntryInfo(width, height int) string {
 		return "no selection"
 	}
 	var b strings.Builder
-	b.WriteString(infoStyle.Render(clipLabel(n.path, width)))
+	b.WriteString(infoStyle.Render(clipLabel(n.path, width-infoStyle.GetHorizontalFrameSize())))
 	b.WriteString("\n\n")
 	if n.isDir {
 		if err := m.loadChildren(n); err != nil {
@@ -955,7 +1006,11 @@ func (m *fileEditModel) legend() string {
 	for _, h := range legendHints[m.mode] {
 		parts = append(parts, fileEditHintKey.Render(h.keys)+" "+h.label)
 	}
-	return footerStyle.Render(strings.Join(parts, "  ·  "))
+	// Wrap to the terminal so the nav-mode hint list (which is wider than a
+	// typical terminal) never spills past the right edge; paneHeight accounts
+	// for the extra rows.
+	usable := max(m.width-appStyle.GetHorizontalMargins(), 20)
+	return footerStyle.Width(usable).Render(strings.Join(parts, "  ·  "))
 }
 
 var legendHints = map[fileEditMode][]hint{

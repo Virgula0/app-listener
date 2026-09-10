@@ -37,8 +37,21 @@ every change to enforcement paths as security-sensitive:
   `process_vm_readv`, raw block-device reads, bind-mount / rename-over-watchroot,
   `SCM_RIGHTS` fd passing, `ptrace`, stat/metadata leaks. Don't reintroduce a gap a past
   commit closed.
+- **The live-edit grant is a real escalation path — keep it narrow.** `edit-protected`
+  live mode (`cmd/functions/editprotected` + `cmd/functions/daemon/control.go`)
+  authenticates over a `0600` root-only unix socket that *also* checks `SO_PEERCRED`
+  uid 0 **and** that the peer's exe inode is the daemon's own binary. The protocol is
+  two-phase — `AUTH` (password) must succeed **before** the daemon discloses any
+  watch path, then `SELECT <resource>` activates the grant — so an unauthenticated
+  caller learns nothing about the protected directories. The grant transiently widens
+  **only** that one resource's `GUARD_ALLOW_ROOT` self event-mask (never the
+  whitelist), one session at a time, 30-min hard cap, revoked on disconnect / SIGHUP.
+  The password hash (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded
+  like `fscrypt.key`. Don't loosen any of: the peer-exe check, AUTH-before-disclosure,
+  the single-session lock, the auth lockout, the `origin=install` guard on
+  `--set-password`, or the mask being restored in `RevokeSelfEditAccess`.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
-  key (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
+  key + edit-auth hash (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.
 - Run `/security-review` on diffs that touch `internal/guard`, `internal/networkguard`,
   `internal/usecase/daemon.go`, `internal/fscrypt`, `internal/protected`, or any
@@ -139,9 +152,13 @@ shutdown deprovisions fscrypt keys in passes *while guards still deny*. LSM link
 pinned under `/sys/fs/bpf` so a `SIGKILL` leaves trees enforced until `ExecStopPost`
 re-locks the vaults. `systemctl reload` (SIGHUP) recomputes every binary's inode identity
 atomically — new guards attach before old ones detach; a broken config keeps the running
-one. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key.
-The `GuardRepository` port has daemon-specific methods (`PopulateInodes`,
-`ResolvePendingBinaries`, `ReSyncBinaries`, `SweepInodes`) — read their doc comments in
+one. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
+edit-auth hash. When `edit-protected` has a password configured, `control.go` opens the
+live-edit control socket and `DaemonUseCase.GrantEditAccess` / the guard's
+`GrantSelfEditAccess`+`RevokeSelfEditAccess` implement the transient per-resource write
+grant. The `GuardRepository` port has daemon-specific methods (`PopulateInodes`,
+`ResolvePendingBinaries`, `ReSyncBinaries`, `SweepInodes`, `GrantSelfEditAccess`,
+`RevokeSelfEditAccess`) — read their doc comments in
 `internal/repository/repository.go` before changing reload/resync behaviour.
 
 ### Install / lifecycle packages

@@ -44,6 +44,13 @@ type GuardRepository interface {
 	// Unconditional full re-walks are avoided — deeper changes are covered by
 	// BPF runtime discovery and the ancestor walk.
 	SweepInodes() error
+	// GrantSelfEditAccess widens the root-gated self binary mask to cover the
+	// operations an interactive edit performs, for an authenticated live
+	// edit-protected session; RevokeSelfEditAccess restores the read-only
+	// baseline. Both touch only the uid-0-gated self inode, never the
+	// whitelist, and the change lives in the BPF map only (gone on restart).
+	GrantSelfEditAccess() error
+	RevokeSelfEditAccess() error
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

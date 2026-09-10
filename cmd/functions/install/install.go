@@ -155,6 +155,13 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Collected now, persisted last (finalizeEditPassword): an aborted
+	// install must never leave a dangling password hash.
+	editPassword, err := promptEditPassword(cfg)
+	if err != nil {
+		return err
+	}
+
 	if err := deploy(cfgText); err != nil {
 		return err
 	}
@@ -163,7 +170,12 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	return cleanupBackups(cfg)
+	if err := cleanupBackups(cfg); err != nil {
+		return err
+	}
+
+	// The very last install action.
+	return finalizeEditPassword(editPassword)
 }
 
 // runMaintenanceMode dispatches the mutually exclusive maintenance flags,

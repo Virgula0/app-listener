@@ -1,123 +1,125 @@
-// The `app-listener edit-protected` command opens the fscrypt-encrypted
-// catalog directories in the embedded two-pane editor. It fatally refuses
-// while the daemon is running, re-scans the catalog (NOT the installed
-// daemon.conf) exactly like the uninstaller, verifies the master key, lets
-// the user pick ONE directory to open (only one vault is ever unlocked at
-// a time), unlocks it, runs the TUI editor, and re-locks it again no
-// matter how the editor exits: a vault never stays open after this
-// command returns.
+// The `app-listener edit-protected` command opens fscrypt-encrypted
+// (or plain) protected directories in the embedded two-pane editor.
+//
+// Two modes, chosen automatically:
+//
+//   - offline (no edit-protected password configured, or the daemon is
+//     stopped): fatally refuses while the daemon runs, re-scans the catalog
+//     like the uninstaller, unlocks ONE vault with the master key, edits, and
+//     re-locks it — a vault never stays open after the command returns.
+//
+//   - live (an edit-protected password was set at install time and the
+//     daemon is running): authenticates to the daemon over its local control
+//     socket, which briefly widens that one resource's guard so the edit can
+//     be written, then narrows it again. The daemon keeps running and the
+//     vault lifecycle is never touched.
+//
+// `--set-password` / `--clear-password` manage the password itself.
 package editprotected
 
 import (
 	"errors"
-	"fmt"
 	"os"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-
-	"github.com/Virgula0/app-listener/internal/fscrypt"
-	"github.com/Virgula0/app-listener/internal/protected"
-	"github.com/Virgula0/app-listener/internal/tui"
 )
+
+var (
+	setPasswordFlag   bool
+	clearPasswordFlag bool
+	resourceFlag      string
+	putFlag           string
+	contentFileFlag   string
+)
+
+// editPasswordEnv carries the password for the non-interactive live apply
+// mode (--put). It exists for automation; interactive runs prompt instead.
+const editPasswordEnv = "APP_LISTENER_EDIT_PASSWORD" //nolint:gosec // env var name, not a credential
 
 var EditProtectedCmd = &cobra.Command{
 	Use:   "edit-protected",
-	Short: "Edit one of the fscrypt-encrypted catalog directories in the embedded TUI editor",
-	Long: `Open one of the fscrypt-encrypted catalog directories in the embedded
-two-pane editor instead of configuring the daemon or installing anything.
+	Short: "Edit a protected directory in the embedded TUI editor (live when an edit-protected password is set)",
+	Long: `Open one of the protected directories in the embedded two-pane editor.
 
-The command re-scans the catalog (NOT the installed daemon.conf) like the
-uninstaller does, verifies that every found directory unlocks with the
-master key, lets you pick ONE directory to open (only one is ever unlocked
-at a time), unlocks it with the master key, runs the editor, and
-re-locks it again no matter how the editor exits — a protected directory
-never stays unlocked after this command returns.
+If an edit-protected password was chosen during ` + "`app-listener install`" + ` and
+the daemon is running, the edit happens LIVE: the command authenticates to
+the daemon over its local control socket, the daemon briefly grants write
+access to that one resource, you edit, and the grant is dropped again. The
+daemon keeps running and the fscrypt vaults are never touched.
 
-It fatally refuses while the daemon is running: the directory being edited
-is the very one the daemon guards and unlocks.`,
+Otherwise it runs OFFLINE: it fatally refuses while the daemon is running,
+re-scans the catalog (NOT the installed daemon.conf) like the uninstaller,
+unlocks ONE directory with the master key, runs the editor, and re-locks it
+no matter how the editor exits.
+
+Before exiting, both modes audit the edited tree against daemon.conf and
+warn about anything that would sit outside the daemon's protection (a file
+created outside every guarded watch path, a new symlink, a world-readable
+new secret, a freshly dropped executable).
+
+Use --set-password to set or rotate the edit-protected password (only when
+it was not chosen during installation — rotating that one requires
+re-running the installer), and --clear-password to remove it.
+
+For automation, --resource <path> --put <file-in-that-resource> performs one
+live write non-interactively: the new content is read from --content-file
+(or stdin) and the password from the ` + editPasswordEnv + ` environment
+variable. It requires the daemon to be running with a configured password.`,
 	Args: cobra.NoArgs,
 	RunE: runEditProtected,
 }
 
-// runEditProtected drives the whole edit-protected flow: require the daemon
-// to be stopped, re-scan which catalog directories are encrypted, let the
-// user pick ONE, verify the master key, unlock, edit, and re-lock.
+func init() {
+	EditProtectedCmd.Flags().BoolVar(&setPasswordFlag, "set-password", false,
+		"Set or rotate the edit-protected authentication password (refused if it was set during installation)")
+	EditProtectedCmd.Flags().BoolVar(&clearPasswordFlag, "clear-password", false,
+		"Remove the edit-protected authentication password (disables live mode)")
+	EditProtectedCmd.Flags().StringVar(&resourceFlag, "resource", "",
+		"Skip the picker and act on this configured watch path")
+	EditProtectedCmd.Flags().StringVar(&putFlag, "put", "",
+		"Non-interactive live mode: write this file (must be inside --resource) from --content-file/stdin, authenticating with $"+editPasswordEnv)
+	EditProtectedCmd.Flags().StringVar(&contentFileFlag, "content-file", "",
+		"Source of the --put content (default: stdin)")
+}
+
 func runEditProtected(cmd *cobra.Command, args []string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("edit-protected must be run as root: sudo app-listener edit-protected")
 	}
 
-	if err := protected.RequireDaemonStopped(); err != nil {
-		return err
+	if setPasswordFlag && clearPasswordFlag {
+		return errors.New("--set-password and --clear-password are mutually exclusive")
+	}
+	if setPasswordFlag {
+		return runSetPassword()
+	}
+	if clearPasswordFlag {
+		return runClearPassword()
 	}
 
-	vault := fscrypt.New()
-
-	encrypted, err := protected.ScanEncryptedCatalogDirs(vault)
+	hasPassword, err := HashFileExists()
 	if err != nil {
 		return err
 	}
-	if len(encrypted) == 0 {
-		return errors.New("no catalog directory is currently encrypted: nothing to edit (run `app-listener install` first)")
-	}
+	// The control socket exists only when a running daemon has a password
+	// configured — the exact precondition for live mode, and independent of
+	// whether systemd supervises the daemon.
+	liveReady := LiveModeAvailable()
 
-	chosen, err := pickEncryptedDir(encrypted)
-	if err != nil {
-		return err
-	}
-
-	// A directory whose policy does not unlock with the master key must
-	// never be edited: the writes would land in an unreadable policy and
-	// the re-lock could not complete.
-	if err := protected.VerifyEncryptedKeys(vault, []string{chosen}); err != nil {
-		return err
-	}
-
-	log.Infof("unlocking %s ...", chosen)
-	if err := vault.Unlock(chosen); err != nil {
-		return fmt.Errorf("unlock %s: %w", chosen, err)
-	}
-
-	// Re-lock no matter how the editor exits: a protected directory must
-	// never stay unlocked after this command returns. On failure the
-	// operator gets the manual command.
-	defer func() {
-		if err := protected.RelockResources(vault, chosen); err != nil {
-			log.Errorf("could not fully re-lock %s: %v — run `fscrypt lock %s` manually as soon as possible", chosen, err, chosen)
+	if putFlag != "" {
+		if !liveReady {
+			return errors.New("--put needs the daemon running with an edit-protected password configured " +
+				"(the control socket " + ControlSocket + " is not present)")
 		}
-	}()
+		return runNonInteractiveLivePut()
+	}
 
-	log.Infof("editing %s (it is unlocked and accessible while the editor is open)", chosen)
-	if err := tui.RunFileEditor(chosen); err != nil {
-		return fmt.Errorf("edit %s: %w", chosen, err)
+	if liveReady {
+		return runLiveEdit()
 	}
-	return nil
-}
-
-// pickEncryptedDir asks which of the encrypted catalog directories to open.
-// Only one vault is ever unlocked at a time, so exactly one directory is
-// returned. With a single candidate the picker is skipped.
-func pickEncryptedDir(encrypted []string) (string, error) {
-	if len(encrypted) == 1 {
-		path := encrypted[0]
-		log.Infof("only one encrypted catalog directory found: %s", path)
-		return path, nil
+	if hasPassword {
+		log.Info("an edit-protected password is configured, but the daemon control socket is not present — using the offline flow")
 	}
-	opts := make([]huh.Option[string], 0, len(encrypted))
-	for _, p := range encrypted {
-		opts = append(opts, huh.NewOption(p, p))
-	}
-	chosen := ""
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title("Which protected directory do you want to open?").
-			Description("Only one directory is unlocked at a time; it is re-locked when the editor closes.").
-			Options(opts...).
-			Value(&chosen),
-	)).Run(); err != nil {
-		return "", err
-	}
-	return chosen, nil
+	return runOfflineEdit()
 }
