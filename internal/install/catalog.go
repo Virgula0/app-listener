@@ -306,7 +306,7 @@ var Catalog = []CandidateDir{
 	// Browser binaries are shell wrappers; the whitelist matches the
 	// executed ELF under /usr/lib and /opt. Firefox's crashhelper and the
 	// chrome_crashpad_handler family write the Crash Reports dirs separately.
-	{Name: "Firefox profile", RelPaths: []string{".mozilla/firefox" , ".config/mozilla/firefox"},
+	{Name: "Firefox profile", RelPaths: []string{".mozilla/firefox", ".config/mozilla/firefox"},
 		Whitelist: map[string][]string{
 			"/usr/bin/firefox":             nil,
 			"/usr/lib/firefox/firefox":     nil,

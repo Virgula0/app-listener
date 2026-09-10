@@ -31,6 +31,8 @@ func init() {
 		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon if its service is installed; no wizard, no config, no fscrypt, no systemd units")
 	InstallCmd.Flags().Bool("update-catalog-only", false,
 		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
+	InstallCmd.Flags().Bool("diff-catalog", false,
+		"Diff the catalog against the installed daemon.conf: list the critical directories that exist on the host but are not yet guarded, let you pick which to add, then append them to the config and encrypt them like a fresh install (existing sections untouched; stops the daemon for the cycle; requires a previous installation)")
 	InstallCmd.Flags().Bool("live", false,
 		"With --update-catalog-only: refresh the whitelists WITHOUT stopping the daemon (vaults are already unlocked and guarded by the running daemon; the config change is applied via SIGHUP reload). Requires the daemon to be running")
 	InstallCmd.Flags().BoolP("yes", "y", false,
@@ -120,7 +122,17 @@ Use --update-catalog-only to refresh the whitelist of every guarded
 directory from the catalog: encrypted vaults are unlocked, glob patterns
 are re-expanded (picking up new binaries and dropping deleted ones),
 and the diff is shown before overwriting. User-added sections (not in
-the catalog) are preserved as-is. Requires a previous installation.`,
+the catalog) are preserved as-is. Requires a previous installation.
+
+Use --diff-catalog to add directories the catalog now discovers but the
+installed daemon.conf does not yet guard (a catalog update, or a newly
+installed application): the missing critical directories are listed in the
+same picker as the wizard, the selected ones are appended to the config
+and encrypted like a fresh install, and every existing section is left
+byte-for-byte intact. It stops the daemon for the cycle and restarts it on
+the merged config. Requires a previous installation. Unlike
+--update-catalog-only this never touches existing sections' whitelists —
+run both to fully re-sync.`,
 	Args: cobra.NoArgs,
 	RunE: runInstall,
 }
@@ -195,6 +207,7 @@ type maintenanceFlags struct {
 	deleteBackup  bool
 	binaryOnly    bool
 	updateCatalog bool
+	diffCatalog   bool
 	live          bool
 	autoConfirm   bool
 }
@@ -214,6 +227,9 @@ func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
 	if f.updateCatalog, err = cmd.Flags().GetBool("update-catalog-only"); err != nil {
 		return f, err
 	}
+	if f.diffCatalog, err = cmd.Flags().GetBool("diff-catalog"); err != nil {
+		return f, err
+	}
 	if f.live, err = cmd.Flags().GetBool("live"); err != nil {
 		return f, err
 	}
@@ -228,20 +244,8 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
-		return false, errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
-	}
-	if f.live && !f.updateCatalog {
-		return false, errors.New("--live can only be used with --update-catalog-only")
-	}
-	modes := 0
-	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.updateCatalog} {
-		if on {
-			modes++
-		}
-	}
-	if modes > 1 {
-		return false, errors.New("--restore-backups, --delete-post-backups, --binary-only and --update-catalog-only are mutually exclusive")
+	if err := validateMaintenanceFlags(f); err != nil {
+		return false, err
 	}
 	switch {
 	case f.restore:
@@ -252,8 +256,32 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 		return true, installBinaryOnly()
 	case f.updateCatalog:
 		return true, runUpdateCatalogOnly(f.autoConfirm, f.live)
+	case f.diffCatalog:
+		return true, runDiffCatalog()
 	}
 	return false, nil
+}
+
+// validateMaintenanceFlags rejects flag combinations the maintenance modes
+// do not support: --yes / --live outside their owning modes, and more than
+// one mutually exclusive mode at once.
+func validateMaintenanceFlags(f maintenanceFlags) error {
+	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
+		return errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
+	}
+	if f.live && !f.updateCatalog {
+		return errors.New("--live can only be used with --update-catalog-only")
+	}
+	modes := 0
+	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.updateCatalog, f.diffCatalog} {
+		if on {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return errors.New("--restore-backups, --delete-post-backups, --binary-only, --update-catalog-only and --diff-catalog are mutually exclusive")
+	}
+	return nil
 }
 
 // installBinaryOnly deploys only the freshly built binary (see

@@ -217,6 +217,8 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 
 **install** — TUI wizard, in safe order: stop a running daemon → build → generate the fscrypt key (existing kept) → pick users → probe a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypt selected directories (backup first, verified against the master key) → deploy systemd units, the package-manager catalog-refresh hook, per-user ssh-agent unit, binary and config.
 
+**install --diff-catalog** — the *incremental* wizard: after a catalog update or a newly installed app, it lists the critical directories that now exist on the host but are **not** yet in `daemon.conf`, lets you pick which to add in the same picker as the full install, appends them to the config and encrypts them (backup first) — every existing section is left byte-for-byte intact. Stops the daemon for the cycle, restarts it on the merged config. `--update-catalog-only` refreshes existing sections' whitelists; `--diff-catalog` adds new sections — run both to fully re-sync. Requires a previous installation; interactive only.
+
 **install --update-catalog-only** (the package hooks + the boot-time unit) — re-expands every catalog-matched whitelist and rewrites the config. Default: stops the daemon, unlocks each vault under an ephemeral self-only guard. `--live` (daemon running): no stop, no lock churn — applied via SIGHUP. It runs automatically from:
 > - **pacman** — `/etc/pacman.d/hooks/50-app-listener-reload.hook` (`PostTransaction`);
 > - **apt/dpkg** — `/etc/apt/apt.conf.d/95app-listener-reload` (`DPkg::Post-Invoke`);

@@ -113,12 +113,28 @@ func groupCandidates(cands []inst.Candidate) []catalogGroup {
 // system-level entries) and asks which of the found critical directories
 // to protect. All are preselected.
 func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
-	groups := groupCandidates(inst.DiscoverForUsers(users))
-	if len(groups) == 0 {
+	candidates := inst.DiscoverForUsers(users)
+	if len(candidates) == 0 {
 		log.Warn("no catalog directories found for the selected users — you can still add directories manually")
 		return nil, nil
 	}
+	picked, err := pickFromCandidates(candidates,
+		"Critical directories found — select the ones to protect",
+		"Only existing paths are listed. All are preselected. A resource stored in several locations is one entry. Whitelisted binaries per directory are curated and minimal.")
+	if err != nil {
+		return nil, err
+	}
+	if len(picked) == 0 {
+		log.Warn("no catalog directories selected — you can still add directories manually")
+	}
+	return picked, nil
+}
 
+// pickFromCandidates groups the candidates per resource (one checkbox per
+// catalog Name + user) and runs the preselected multi-select, returning the
+// flattened per-path candidates of every picked group.
+func pickFromCandidates(candidates []inst.Candidate, title, description string) ([]inst.Candidate, error) {
+	groups := groupCandidates(candidates)
 	opts := make([]huh.Option[int], 0, len(groups))
 	for i := range groups {
 		opts = append(opts, huh.NewOption(groups[i].label, i).Selected(true))
@@ -126,8 +142,8 @@ func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 	var pickedIdx []int
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewMultiSelect[int]().
-			Title("Critical directories found — select the ones to protect").
-			Description("Only existing paths are listed. All are preselected. A resource stored in several locations is one entry. Whitelisted binaries per directory are curated and minimal.").
+			Title(title).
+			Description(description).
 			Options(opts...).
 			Height(12).
 			Value(&pickedIdx),
@@ -138,10 +154,6 @@ func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 	var picked []inst.Candidate
 	for _, i := range pickedIdx {
 		picked = append(picked, groups[i].candidates...)
-	}
-	if len(picked) == 0 {
-		log.Warn("no catalog directories selected — you can still add directories manually")
-		return nil, nil
 	}
 	for i := range picked {
 		c := &picked[i]
@@ -213,11 +225,10 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 	}
 }
 
-// editConfig renders the config from the selected candidates and opens the
-// embedded editor. The user's version is validated with the real parser;
-// an invalid config re-opens the editor until it parses or the user
-// aborts.
-func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, error) {
+// sectionsFromCandidates turns discovered/added candidates into config
+// sections: the filtered whitelist, encryption on by default, and any
+// grouped extra watch sub-paths from the catalog entry.
+func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
 	for i := range candidates {
 		c := &candidates[i]
@@ -228,10 +239,24 @@ func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, erro
 			ExtraWatchPaths: c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name),
 		})
 	}
-	confText := inst.GenerateConf(sections)
+	return sections
+}
 
+// editConfig renders the config from the selected candidates and opens the
+// embedded editor.
+func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, error) {
+	return runConfigEditor(
+		"app-listener daemon.conf — review and save (Ctrl+S)",
+		inst.GenerateConf(sectionsFromCandidates(candidates)))
+}
+
+// runConfigEditor opens initial in the embedded editor and validates the
+// result through the same strict parser the daemon uses; an invalid config
+// re-opens the editor until it parses or the user aborts (Esc).
+func runConfigEditor(title, initial string) (string, *daemonconfig.Config, error) {
+	confText := initial
 	for {
-		edited, err := inst.EditText("app-listener daemon.conf — review and save (Ctrl+S)", confText)
+		edited, err := inst.EditText(title, confText)
 		if err != nil {
 			return "", nil, fmt.Errorf("config editing aborted: %w", err)
 		}

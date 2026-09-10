@@ -40,6 +40,16 @@ func GenerateConf(sections []Section) string {
 	b.WriteString("#\n")
 	b.WriteString("# Edit freely, then save. See daemon-samples/daemon.conf\n")
 	b.WriteString("# for the full syntax documentation.\n")
+	b.WriteString(GenerateSections(sections))
+	return b.String()
+}
+
+// GenerateSections renders just the [watch ...] blocks, with no file header,
+// each block preceded by a blank line. Used to append new sections to an
+// existing daemon.conf (install --diff-catalog) without disturbing what is
+// already there.
+func GenerateSections(sections []Section) string {
+	var b strings.Builder
 	for _, s := range sections {
 		b.WriteString("\n[watch ")
 		b.WriteString(s.Path)
