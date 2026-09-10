@@ -38,6 +38,22 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Generated eBPF bindings are no longer committed (issue #45: a stale
+      # object shipped in a release and crashed a newer kernel). Regenerate
+      # them inside the pinned builder image against the runner's BTF.
+      - name: Regenerate eBPF bindings (pinned builder image)
+        run: |
+          set -euo pipefail
+          test -r /sys/kernel/btf/vmlinux || { echo "::error::runner has no readable BTF"; exit 1; }
+          make build-image
+          docker run --rm \
+            -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
+            -v "$PWD:/app/app-listener:rw" \
+            -e HOME=/tmp -e GOCACHE=/tmp/.gocache -e GOPATH=/tmp/gopath -e GOMODCACHE=/tmp/gopath/pkg/mod \
+            -w /app/app-listener \
+            app-listener-builder:local \
+            make generate
+
       - name: Install golangci-lint
         run: make install-linter
 
@@ -67,6 +83,22 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+
+      # Generated eBPF bindings are no longer committed (issue #45: a stale
+      # object shipped in a release and crashed a newer kernel). Regenerate
+      # them inside the pinned builder image against the runner's BTF.
+      - name: Regenerate eBPF bindings (pinned builder image)
+        run: |
+          set -euo pipefail
+          test -r /sys/kernel/btf/vmlinux || { echo "::error::runner has no readable BTF"; exit 1; }
+          make build-image
+          docker run --rm \
+            -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
+            -v "$PWD:/app/app-listener:rw" \
+            -e HOME=/tmp -e GOCACHE=/tmp/.gocache -e GOPATH=/tmp/gopath -e GOMODCACHE=/tmp/gopath/pkg/mod \
+            -w /app/app-listener \
+            app-listener-builder:local \
+            make generate
 
       - name: Test
         run: make test

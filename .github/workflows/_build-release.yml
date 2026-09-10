@@ -48,6 +48,27 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The eBPF objects MUST be regenerated here, never taken from git: an
+      # object compiled against a different kernel's BTF than the release
+      # target can hit the verifier's complexity limit — or, worse, verify
+      # wrong and corrupt kernel memory at runtime (issue #45). Generate them
+      # inside the pinned builder image (known-good clang + bpftool) against
+      # the runner's BTF; CO-RE relocates field offsets at load time, and
+      # `daemon --check` fails the install closed on any kernel whose verifier
+      # still rejects a program.
+      - name: Regenerate eBPF bindings (pinned builder image)
+        run: |
+          set -euo pipefail
+          test -r /sys/kernel/btf/vmlinux || { echo "::error::runner has no readable BTF — cannot generate CO-RE objects"; exit 1; }
+          make build-image
+          docker run --rm \
+            -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
+            -v "$PWD:/app/app-listener:rw" \
+            -e HOME=/tmp -e GOCACHE=/tmp/.gocache -e GOPATH=/tmp/gopath -e GOMODCACHE=/tmp/gopath/pkg/mod \
+            -w /app/app-listener \
+            app-listener-builder:local \
+            make generate
+
       - name: Build default binary
         env:
           VERSION: ${{ inputs.version }}

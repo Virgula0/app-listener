@@ -417,10 +417,34 @@ func deploy(cfgText string) error {
 	if err != nil {
 		return err
 	}
+	if err := preflightDeployedBinary(); err != nil {
+		return err
+	}
 	if err := systemd.EnableAndVerify(configChanged); err != nil {
 		return err
 	}
 	return systemd.EnableCatalogRefresh()
+}
+
+// preflightDeployedBinary runs `<installed binary> daemon --check` against the
+// just-deployed binary and config BEFORE the service is enabled. It verifies
+// the BPF-LSM stack is active and that every guard eBPF program is accepted by
+// this kernel's verifier (attaching nothing). A failure here means the daemon
+// would crash-loop — or, with a prebuilt object too complex for a newer
+// kernel, panic — so the install aborts now, having changed only the on-disk
+// binary/config, rather than leaving an enabled unit that never runs.
+func preflightDeployedBinary() error {
+	log.Info("preflight: verifying the guard eBPF loads on this kernel ...")
+	if err := systemd.RunCmd(systemd.InstallBinaryPath, "daemon", "--check", "--config", systemd.SystemConfigPath); err != nil {
+		log.Error("if you installed a prebuilt release binary, rebuild from source on this host so " +
+			"the eBPF is compiled against this kernel: " +
+			"git clone https://github.com/Virgula0/app-listener && cd app-listener && " +
+			"make build && sudo ./build/linux/app-listener install")
+		return fmt.Errorf("guard eBPF preflight failed — the daemon was NOT enabled "+
+			"(binary and config are in place, but no service is running): %w", err)
+	}
+	log.Info("preflight OK")
+	return nil
 }
 
 // buildBinaryIfNeeded compiles with the Makefile flags when

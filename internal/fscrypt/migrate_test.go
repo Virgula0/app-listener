@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -89,6 +90,32 @@ func TestStripImmutableFlagsSkipsDanglingSymlink(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "prefs.js")); err != nil {
 		t.Errorf("regular file was lost during the walk: %v", err)
+	}
+}
+
+// TestStripImmutableFlagsDoesNotHangOnFIFO is the "orphaned installer process"
+// regression: ~/.gnupg and some browser profiles contain named pipes. The walk
+// used to open every entry O_RDONLY, and open(FIFO, O_RDONLY) blocks forever
+// when there is no writer — wedging `app-listener install`. The walk must skip
+// non-regular, non-directory entries (and open the rest O_NONBLOCK).
+func TestStripImmutableFlagsDoesNotHangOnFIFO(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "regular"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "S.gpg-agent"), 0o600); err != nil {
+		t.Skipf("mkfifo unavailable here: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- stripImmutableFlags(dir) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stripImmutableFlags must tolerate a FIFO, got: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("stripImmutableFlags hung on a writerless FIFO (open O_RDONLY blocked)")
 	}
 }
 
