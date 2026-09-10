@@ -679,29 +679,46 @@ func stripImmutableFlags(root string) error {
 			// firefox lock file) would fail the open below.
 			return nil
 		}
-		fd, openErr := unix.Open(path, unix.O_RDONLY, 0)
-		if openErr != nil {
-			if errors.Is(openErr, fs.ErrNotExist) && path != root {
-				return nil
-			}
-			return fmt.Errorf("open %s: %w", path, openErr)
-		}
-		// On error (e.g. tmpfs without chattr support) flags is zeroed,
-		// comparing equal to the cleared value below.
-		flags, _, _ := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.FS_IOC_GETFLAGS, 0)
-		unix.Close(fd)
-		cleared := flags &^ (fsImmutableFlag | fsAppendFlag)
-		if cleared == flags {
+		if !d.IsDir() && !d.Type().IsRegular() {
+			// The immutable/append flags this clears only exist on regular
+			// files and directories. Opening a FIFO O_RDONLY blocks forever
+			// when no writer is present (a real hang seen on ~/.gnupg and
+			// browser profiles), and a device node would be opened for real;
+			// skip every non-regular, non-directory entry, exactly as
+			// copyTree already does for the migration copy itself.
 			return nil
 		}
-		fd, openErr = unix.Open(path, unix.O_RDONLY, 0)
-		if openErr != nil {
-			return fmt.Errorf("open %s: %w", path, openErr)
-		}
-		_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.FS_IOC_SETFLAGS, cleared)
-		unix.Close(fd)
-		return nil
+		return stripEntryFlags(path, path == root)
 	})
+}
+
+// stripEntryFlags clears the immutable/append-only flags on one regular file or
+// directory. isRoot suppresses the ENOENT tolerance (the watch root vanishing
+// is fatal). Opens use O_NONBLOCK so a race that turns `path` into a FIFO
+// between the WalkDir stat and here can never wedge the installer.
+func stripEntryFlags(path string, isRoot bool) error {
+	fd, openErr := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK, 0)
+	if openErr != nil {
+		if errors.Is(openErr, fs.ErrNotExist) && !isRoot {
+			return nil
+		}
+		return fmt.Errorf("open %s: %w", path, openErr)
+	}
+	// On error (e.g. tmpfs without chattr support) flags is zeroed,
+	// comparing equal to the cleared value below.
+	flags, _, _ := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.FS_IOC_GETFLAGS, 0)
+	unix.Close(fd)
+	cleared := flags &^ (fsImmutableFlag | fsAppendFlag)
+	if cleared == flags {
+		return nil
+	}
+	fd, openErr = unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK, 0)
+	if openErr != nil {
+		return fmt.Errorf("open %s: %w", path, openErr)
+	}
+	_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.FS_IOC_SETFLAGS, cleared)
+	unix.Close(fd)
+	return nil
 }
 
 func wipe(b []byte) {

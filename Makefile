@@ -19,19 +19,23 @@ require-kernel51:
 	fi
 
 # Isolated build: runs the whole pipeline (vmlinux.h dump + BPF bindings +
-# Go build) inside a rootful Docker container. The host's BTF vmlinux is
-# mounted read-only (the CO-RE programs must target the host kernel) and the
-# repo — including the output directory — is mounted read-write. The
-# container runs as the calling host user, so every artifact (binary, embeds,
-# vmlinux.h) ends up owned by the host user. Requires a rootful Docker daemon.
+# Go build) inside a Docker container. The host's BTF vmlinux is mounted
+# read-only (the CO-RE programs must target the host kernel) and the repo —
+# including the output directory — is mounted read-write. Every artifact
+# (binary, embeds, vmlinux.h) ends up owned by the invoking host user.
+#
+# Works with both rootful and rootless Docker: under rootful the container is
+# pinned to the caller's uid:gid (--user); under rootless that flag maps to an
+# unwritable subordinate uid, so it is dropped and the container's namespaced
+# root — which already maps back to the host user — writes the artifacts.
 build:
 	@if ! command -v docker >/dev/null 2>&1; then \
-		echo "ERROR: docker not found — 'make build' needs a rootful Docker daemon"; \
-		echo "       (install Docker, or install clang/LLVM, bpftool, Go and GCC and run 'make build-host')"; \
+		echo "ERROR: docker not found — 'make build' needs Docker (rootful or rootless)"; \
+		echo "       (or install clang/LLVM, bpftool, Go and GCC and run 'make build-host')"; \
 		exit 1; \
 	fi
 	@docker info >/dev/null 2>&1 || { \
-		echo "ERROR: docker daemon not reachable — is it running (rootful)?"; \
+		echo "ERROR: docker daemon not reachable — is it running?"; \
 		exit 1; \
 	}
 	@if [ ! -r /sys/kernel/btf/vmlinux ]; then \
@@ -45,10 +49,18 @@ build:
 	fi
 	@mkdir -p $(OUTPUT_DIR)
 	$(MAKE) build-image
+	@if docker info -f '{{println .SecurityOptions}}' 2>/dev/null | grep -q rootless; then \
+		user_arg=""; \
+		echo "make build: rootless Docker detected — running the builder as its namespaced root"; \
+		echo "            (artifacts are still written as $$(id -un):$$(id -gn))"; \
+	else \
+		user_arg="--user $$(id -u):$$(id -g)"; \
+	fi; \
+	set -x; \
 	docker run --rm \
 		-v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
 		-v "$$PWD:/app/app-listener:rw" \
-		--user "$$(id -u):$$(id -g)" \
+		$$user_arg \
 		-e HOME=/tmp \
 		-e GOCACHE=/tmp/.gocache \
 		-e GOPATH=/tmp/gopath \

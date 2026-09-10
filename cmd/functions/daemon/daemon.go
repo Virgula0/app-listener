@@ -72,6 +72,7 @@ var (
 	configFlag   string
 	genKeyFlag   bool
 	lockdownFlag bool
+	checkFlag    bool
 	headless     bool
 	blockedOnly  bool
 	pprofAddr    string
@@ -127,6 +128,12 @@ func init() {
 		"Only print blocked (denied) events, skip allowed ones (headless only)")
 	DaemonCmd.Flags().BoolVarP(&genKeyFlag, "genkey", "", false,
 		"Generate the fscrypt master key file and exit")
+	DaemonCmd.Flags().BoolVarP(&checkFlag, "check", "", false,
+		"Preflight: verify the BPF-LSM prerequisites and load every guard eBPF program "+
+			"into this kernel's verifier, then exit 0 (all accepted) or non-zero (any rejected). "+
+			"Attaches nothing, changes nothing. The installer runs this against the deployed "+
+			"binary before enabling the service, so a kernel whose verifier rejects a guard "+
+			"program fails the install cleanly instead of crash-looping (or panicking) the daemon.")
 	DaemonCmd.Flags().BoolVarP(&lockdownFlag, "lockdown", "", false,
 		"Force-lock every encryption root in the config and exit. Wired into the systemd unit as ExecStopPost: "+
 			"systemd runs it after every exit (clean stop, crash, SIGKILL, startup timeout), so a daemon that died "+
@@ -172,6 +179,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	if genKeyFlag {
 		return runGenKey()
+	}
+	if checkFlag {
+		return runBPFCheck()
 	}
 	if lockdownFlag {
 		runLockdown()
@@ -692,6 +702,27 @@ func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault) {
 // runGenKey implements --genkey: create the master key, but when one
 // already exists ask the operator on the terminal first, because
 // regenerating it invalidates every fscrypt directory using it.
+// runBPFCheck is `daemon --check`: the enforcement preflight. It verifies the
+// BPF-LSM stack is active and that every guard eBPF program is accepted by THIS
+// kernel's verifier, without attaching anything. `install` runs it against the
+// freshly deployed binary before enabling the service, so a kernel whose
+// verifier rejects a guard program (e.g. a prebuilt object that is too complex
+// for a newer kernel) fails the install cleanly here instead of at runtime.
+func runBPFCheck() error {
+	if lsmErr := common.CheckBPFLSM(); lsmErr != nil {
+		return fmt.Errorf("BPF-LSM preflight failed: %w", lsmErr)
+	}
+	if loadErr := guard.VerifyLoad(); loadErr != nil {
+		log.Error("this kernel cannot run the bundled guard programs — rebuild from source on " +
+			"this host (`make build`) so the eBPF is compiled against this kernel's BTF; if the " +
+			"rebuilt programs still fail, enforcement is not available on this kernel yet " +
+			"(`monitor` mode, kprobes/observe-only, is unaffected)")
+		return fmt.Errorf("guard eBPF preflight failed: %w", loadErr)
+	}
+	log.Info("BPF-LSM preflight OK: LSM stack active and every guard eBPF program is accepted by this kernel")
+	return nil
+}
+
 func runGenKey() error {
 	exists, err := fscrypt.MasterKeyExists()
 	if err != nil {

@@ -65,10 +65,10 @@ needs cgo (`mlock`). A `CGO_ENABLED=0` build no longer compiles.
 | Command | Use |
 |---|---|
 | `make build` | Full pipeline in a **rootful Docker** container: dumps `vmlinux.h` from the host BTF, regenerates BPF bindings, builds to `build/linux/app-listener`. Nothing but Docker needed on the host. |
-| `make build-host` | Same pipeline on the host — needs `clang`/LLVM, `bpftool`, Go 1.26+, GCC. |
+| `make build-host` | Same pipeline on the host — needs a **recent** `clang`/LLVM (`docker/builder.Dockerfile` pins clang 22; clang 14 emits a `guard_path_rename` that overflows the BPF verifier's 1M-insn budget on modern kernels — issue #45), `bpftool`, Go 1.26+, GCC. |
 | `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui` (fyne desktop window for `monitor --gui`, ~20 MiB larger, X11/OpenGL deps) — off by default because the daemon shares this binary. |
 | `make generate` | Regenerate BPF bindings (`bpf2go`). Needs `bpftool` + readable `/sys/kernel/btf/vmlinux`. |
-| `make check-compatibility` | Static host check (kernel version, `.config`, BTF, BPF-LSM activation, fscrypt prereqs). Run before building/running on a new host. |
+| `make check-compatibility` | Static host check (kernel version, `.config`, BTF, BPF-LSM activation, fscrypt prereqs). Run before building/running on a new host. `--binary <path>` (as root) also loads that binary's guard eBPF into the running verifier (`daemon --check`), catching a prebuilt/kernel mismatch; `scripts/install.sh` runs this against the downloaded release before installing anything. |
 
 BPF C sources live in `internal/<mode>/bpf/*.bpf.c`. `make generate` compiles each with
 clang and, via `bpf2go`, emits `internal/<mode>/<name>_bpf.go` plus

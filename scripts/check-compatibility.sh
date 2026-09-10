@@ -11,14 +11,37 @@
 #
 # Usage:
 #   make check-compatibility        (or: bash scripts/check-compatibility.sh)
+#   bash scripts/check-compatibility.sh --binary /usr/local/sbin/app-listener
 #
-# Exit code: 0 = installable, 1 = a hard requirement is missing.
+#   --binary <path>   additionally load every guard eBPF program in <path> into
+#                     THIS kernel's verifier (runs "<path> daemon --check").
+#                     Catches a prebuilt-release / kernel mismatch (issue #45)
+#                     at install time instead of at "systemctl start". Needs
+#                     root and an active BPF LSM; skipped with a note otherwise.
+#   --binary-only     run only the checks the eBPF probe depends on (kernel
+#                     version, BTF, BPF-LSM activation) plus the probe itself.
+#                     Used by scripts/install.sh to re-check just the download.
+#
+# Exit code: 0 = installable, 1 = a hard requirement is missing (or the
+# --binary program's guard eBPF is rejected by this kernel).
 #
 # Test hooks (not for end users):
 #   CHECK_KERNEL / CHECK_BTF_PATH / CHECK_LSM_PATH / CHECK_CONFIG_PATH /
 #   CHECK_CMDLINE_PATH / CHECK_OS_RELEASE — override the probed sources.
 
 set -uo pipefail
+
+CHECK_BINARY=""
+BINARY_ONLY=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--binary)      CHECK_BINARY="${2:-}"; shift 2 || { echo "--binary needs a path" >&2; exit 2; } ;;
+	--binary=*)    CHECK_BINARY="${1#*=}"; shift ;;
+	--binary-only) BINARY_ONLY=1; shift ;;
+	-h | --help)   sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	*)             echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
+	esac
+done
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -141,6 +164,7 @@ else
 	fail "BTF not found at $BTF_PATH — kernel needs CONFIG_DEBUG_INFO_BTF=y"
 fi
 
+if [ "$BINARY_ONLY" -eq 0 ]; then
 ##############################################################################
 section "Kernel configuration"
 ##############################################################################
@@ -156,6 +180,7 @@ else
 	require_config CONFIG_SECURITY_PATH   "path-based LSM hooks (unlink/rename/mkdir/symlink/…)"  warn
 	require_config CONFIG_FS_ENCRYPTION   "fscrypt (daemon + installer)"          warn
 fi
+fi  # BINARY_ONLY
 
 ##############################################################################
 section "BPF LSM activation (guard / network-guard / daemon)"
@@ -171,7 +196,9 @@ else
 	fail "cannot read $LSM_PATH — securityfs not mounted (mount -t securityfs securityfs /sys/kernel/security)"
 fi
 
+BPF_LSM_ACTIVE=0
 if [ "$lsm_readable" -eq 1 ] && printf '%s' "$lsm_list" | tr ',' '\n' | grep -qx 'bpf'; then
+	BPF_LSM_ACTIVE=1
 	pass "the BPF LSM is ACTIVE — guard modes can deny"
 elif [ "$lsm_readable" -eq 1 ]; then
 	fail "the BPF LSM is NOT active ($LSM_PATH has no 'bpf') — guard modes would attach but never deny"
@@ -185,6 +212,31 @@ elif [ "$lsm_readable" -eq 1 ]; then
 	fi
 fi
 
+##############################################################################
+section "Guard eBPF — does THIS build load on THIS kernel? (issue #45)"
+##############################################################################
+
+if [ -z "$CHECK_BINARY" ]; then
+	note "skipped — pass '--binary <path-to-app-listener>' to load every guard"
+	note "eBPF program into this kernel's verifier. scripts/install.sh and"
+	note "'sudo app-listener install' run this automatically against the binary"
+	note "they are about to install."
+elif [ ! -f "$CHECK_BINARY" ]; then
+	warn "guard eBPF probe skipped — '$CHECK_BINARY' is not a file"
+elif [ "$BPF_LSM_ACTIVE" -ne 1 ]; then
+	warn "guard eBPF probe skipped — the BPF LSM is not active on this kernel (see above)"
+elif [ "$(id -u)" -ne 0 ]; then
+	warn "guard eBPF probe skipped — re-run as root to load the programs into the verifier"
+else
+	if probe_out="$("$CHECK_BINARY" daemon --check 2>&1)"; then
+		pass "every guard eBPF program is accepted by this kernel's verifier"
+	else
+		fail "this build's guard eBPF is REJECTED by this kernel's verifier — a prebuilt-release / kernel mismatch (issue #45), not a fault in your host. Rebuild from source so the eBPF is compiled against this kernel: git clone https://github.com/Virgula0/app-listener && cd app-listener && make build && sudo ./build/linux/app-listener install"
+		printf '%s\n' "$probe_out" | sed 's/^/          | /'
+	fi
+fi
+
+if [ "$BINARY_ONLY" -eq 0 ]; then
 ##############################################################################
 section "fscrypt (daemon + installer)"
 ##############################################################################
@@ -233,6 +285,7 @@ fi
 # No build-toolchain checks: `make build` runs the whole toolchain inside a
 # Docker container, so nothing (Go, clang, bpftool, GCC) has to be installed
 # on the host to build or install app-listener.
+fi  # BINARY_ONLY
 
 ##############################################################################
 section "Verdict"

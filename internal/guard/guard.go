@@ -263,6 +263,49 @@ func eventMask(types []ebpf.EventType) (uint32, error) {
 	return mask, nil
 }
 
+// VerifyLoad loads every guard eBPF program into THIS kernel's verifier and
+// immediately releases them. It attaches nothing and changes no kernel state.
+//
+// A non-nil error means at least one program was rejected by the running
+// kernel — either it exceeds the verifier's complexity budget or it fails a
+// CO-RE relocation against this kernel's BTF. Enforcement is then impossible
+// (and forcing a partially-loaded guard would be a bypass), so every caller
+// MUST treat a failure as fatal: the daemon refuses to start, and `install`
+// aborts before enabling the service instead of leaving a crash-looping unit.
+//
+// A prebuilt binary carries eBPF objects compiled against whatever kernel the
+// release runner had; CO-RE fixes field offsets at load time but not verifier
+// complexity, so this check is the only thing standing between "runs fine" and
+// "the LSM hook corrupts kernel memory" on a kernel newer than the build host.
+func VerifyLoad() error {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return fmt.Errorf("removing memlock rlimit (need CAP_SYS_RESOURCE / root): %w", err)
+	}
+	spec, err := LoadGuard()
+	if err != nil {
+		return fmt.Errorf("reading embedded guard objects: %w", err)
+	}
+	coll, err := cilium.NewCollection(spec)
+	if err != nil {
+		// Dump the FULL verifier log (%+v) to a file — the wrapped error is
+		// truncated, and the instruction-by-instruction log is what shows
+		// where a program blows the complexity budget.
+		var ve *cilium.VerifierError
+		if errors.As(err, &ve) {
+			const logPath = "/tmp/app-listener-verifier.log"
+			if werr := os.WriteFile(logPath, []byte(fmt.Sprintf("%+v\n", ve)), 0o600); werr == nil {
+				log.Errorf("full verifier log written to %s (read with sudo)", logPath)
+			}
+			// Echo the tail (where the rejection actually happens) straight to
+			// the terminal / journal so it needs no file chasing.
+			log.Errorf("verifier log tail:\n%v", ve)
+		}
+		return fmt.Errorf("this kernel's verifier rejected a guard eBPF program: %w", err)
+	}
+	coll.Close()
+	return nil
+}
+
 func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, depth int, opts ...GuardOption) (*Guard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("failed to remove memlock rlimit: %v", err)
