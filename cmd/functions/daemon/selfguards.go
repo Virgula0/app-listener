@@ -7,6 +7,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -28,14 +29,22 @@ type selfProtectSpec struct {
 //	                               in it (write / rename / unlink / chmod / …)
 //	/etc/app-listener/fscrypt.key  ModeWhitelist, empty list — not even
 //	                               readable except by the app-listener binary
+//	/etc/app-listener/edit-auth.hash  ModeWhitelist, empty list — the
+//	                               edit-protected password hash, sealed the
+//	                               same way as the fscrypt key so a root
+//	                               process that is not the app-listener binary
+//	                               cannot read it to mount an offline crack
+//	                               nor overwrite it to install its own
+//	                               password
 //
-// The key guard stacks on top of the directory guard: the RO guard would
-// allow the key's read, the key guard denies it, and any-deny-wins across
-// stacked LSM programs keeps it sealed.
+// The key / hash guards stack on top of the directory guard: the RO guard
+// would allow the read, the whitelist-empty guard denies it, and
+// any-deny-wins across stacked LSM programs keeps it sealed.
 func selfProtectSpecs() []selfProtectSpec {
 	return []selfProtectSpec{
 		{selfProtectDir, guard.ModeReadOnly},
 		{fscrypt.MasterKeyFile, guard.ModeWhitelist},
+		{editprotected.HashFile, guard.ModeWhitelist},
 	}
 }
 

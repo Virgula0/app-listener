@@ -7,6 +7,7 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 
+	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
 	"github.com/Virgula0/app-listener/internal/guard"
 )
 
@@ -402,4 +403,112 @@ need_encryption: false
 
 	s.exec(c, []string{"sh", "-c",
 		fmt.Sprintf("pkill -f 'app-listener daemon' || true; umount /mnt/data 2>/dev/null; losetup -d %s 2>/dev/null; true", loopDev)})
+}
+
+// ---------------------------------------------------------------
+// Test: edit-protected live mode (issue #40)
+//
+// With an edit-protected password configured, the daemon exposes a local
+// control socket. It must:
+//   - reject a peer that is not root (SO_PEERCRED);
+//   - reject a wrong password (and, after enough failures, lock out — not
+//     asserted here to keep the test quick);
+//   - on a correct password from a root app-listener peer, briefly widen the
+//     target resource's guard so `edit-protected --put` can write, then
+//     narrow it again (GRANTED / REVOKED both logged);
+//   - allow only one live session at a time.
+//
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestDaemon_EditProtected_LiveMode() {
+	const password = "Sup3r-Secret-99"
+
+	hash, err := editprotected.Hash(password, editprotected.OriginInstall)
+	s.Require().NoError(err)
+
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /etc/app-listener /outside && echo SECRET > /protected/secret && echo ORIGINAL > /outside/victim && " +
+			"chmod 755 /protected && chmod 600 /protected/secret && " +
+			// a symlink placed inside the tree BEFORE the daemon guards it —
+			// --put must refuse it, not follow it out of the guarded tree.
+			"ln -s /outside/victim /protected/escape && " +
+			"printf '%s\\n' " + shQuote(hash) + " > /etc/app-listener/edit-auth.hash && chmod 600 /etc/app-listener/edit-auth.hash"})
+
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/sleep`)
+
+	// The control socket comes up during startup.
+	socketReady := false
+	for dl := time.Now().Add(20 * time.Second); time.Now().Before(dl); {
+		if strings.Contains(s.readDaemonLog(c), "edit-protected control socket ready") {
+			socketReady = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Require().Truef(socketReady, "control socket never came up, log:\n%s", s.readDaemonLog(c))
+
+	s.Require().NoError(c.CopyFileToContainer(s.ctx,
+		absPath("./exploits/edit_auth_bypass"), "/exploits/edit_auth_bypass", 0o755))
+
+	const sock = "/run/app-listener-daemon.control"
+	const nobody = "setpriv --reuid=65534 --regid=65534 --clear-groups"
+	const put = "/app-listener edit-protected --resource /protected --put live.txt"
+
+	// 1. a peer that is not the app-listener binary is rejected before AUTH
+	//    is even considered — it never learns a single protected path.
+	code, out := s.exec(c, []string{"sh", "-c",
+		"/exploits/edit_auth_bypass " + sock + " " + password + " 2>&1"})
+	s.Require().NotEqualf(0, code, "a non-app-listener peer must be refused: %s", out)
+	s.Require().Containsf(out, "not the installed app-listener binary", "expected the peer-exe rejection, got: %s", out)
+	s.Require().NotContainsf(out, "/protected", "an unauthenticated peer must not see any protected path: %s", out)
+
+	// 2. non-root is refused before it even connects.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"echo x | " + nobody + " " + put + " 2>&1"})
+	s.Require().NotEqualf(0, code, "non-root must be refused: %s", out)
+	s.Require().Containsf(out, "must be run as root", "expected the root check, got: %s", out)
+
+	// 3. wrong password -> refused, nothing written.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"echo x | APP_LISTENER_EDIT_PASSWORD=wrong-Pass-1234 " + put + " 2>&1"})
+	s.Require().NotEqualf(0, code, "a wrong password must be refused: %s", out)
+	s.Require().Containsf(out, "authentication failed", "expected an auth failure, got: %s", out)
+	code, _ = s.exec(c, []string{"sh", "-c", "test -e /protected/live.txt"})
+	s.Require().NotEqualf(0, code, "no file may be written on a failed auth")
+
+	// 4. correct password -> the grant works and the file is written.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"echo LIVE-EDIT | APP_LISTENER_EDIT_PASSWORD=" + password + " " + put + " 2>&1"})
+	s.Require().Equalf(0, code, "live --put must succeed: %s", out)
+	_, content := s.exec(c, []string{"sh", "-c", "cat /protected/live.txt"})
+	s.Require().Equal("LIVE-EDIT", strings.TrimSpace(content))
+
+	// 5. the grant is transient: GRANTED and REVOKED both logged.
+	log := s.readDaemonLog(c)
+	s.Require().Containsf(log, "write access GRANTED", "expected a GRANTED log line, got:\n%s", log)
+	s.Require().Containsf(log, "write access REVOKED", "expected a REVOKED log line, got:\n%s", log)
+
+	// 6. between sessions a non-authenticated write to the tree is still denied.
+	code, out = s.exec(c, []string{"sh", "-c", "echo pwned > /protected/pwned 2>&1"})
+	s.Require().NotEqualf(0, code, "an unauthenticated write to the guarded tree must be denied: %s", out)
+
+	// 7. --put must not follow a symlink out of the guarded tree.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"echo PWNED | APP_LISTENER_EDIT_PASSWORD=" + password +
+			" /app-listener edit-protected --resource /protected --put escape 2>&1"})
+	s.Require().NotEqualf(0, code, "--put through a symlink must be refused: %s", out)
+	s.Require().Containsf(out, "symlink", "expected a symlink refusal, got: %s", out)
+	_, victim := s.exec(c, []string{"sh", "-c", "cat /outside/victim"})
+	s.Require().Equal("ORIGINAL", strings.TrimSpace(victim), "the symlink target outside the tree was written")
+
+	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
+}
+
+// shQuote single-quotes s for safe embedding in a /bin/sh -c string.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

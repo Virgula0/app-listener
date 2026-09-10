@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // testTree builds the temp vault tree used by most tests:
@@ -148,6 +149,96 @@ func TestFileEditNavigateAndEdit(t *testing.T) {
 	if string(data) != "hello edited" {
 		t.Errorf("file on disk = %q, want hello edited", data)
 	}
+}
+
+func TestFileEditPaneGeometry(t *testing.T) {
+	root := testTree(t)
+	m := newFileEditModel(root)
+	const w = 120
+	m.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+
+	usable := w - appStyle.GetHorizontalMargins()
+
+	// Nav mode: even split, and the two panes + separator exactly fill the
+	// usable width.
+	if m.leftW+1+m.rightW != usable {
+		t.Fatalf("nav: leftW(%d)+1+rightW(%d) = %d, want usable %d", m.leftW, m.rightW, m.leftW+1+m.rightW, usable)
+	}
+	if abs(m.leftW-m.rightW) > 1 {
+		t.Fatalf("nav: panes should be roughly even, got left=%d right=%d", m.leftW, m.rightW)
+	}
+
+	// The rendered tree block is padded to exactly leftW so the layout does
+	// not collapse to the longest filename.
+	for _, line := range strings.Split(strings.TrimRight(m.renderTree(m.leftW, m.paneHeight()), "\n"), "\n") {
+		if lw := lipgloss.Width(line); lw != m.leftW {
+			t.Fatalf("tree line width = %d, want leftW %d (%q)", lw, m.leftW, line)
+		}
+	}
+
+	// The two panes + separator fill the usable width (the bug: the body used
+	// to collapse to the tree's longest line + the editor, leaving dead space).
+	if got := maxLineWidth(m.body()); got != usable {
+		t.Fatalf("nav: body width = %d, want usable %d", got, usable)
+	}
+
+	// And nothing (including the long nav-mode legend) spills past the
+	// terminal's right edge.
+	if got := maxLineWidth(m.View()); got > w {
+		t.Fatalf("nav: View width = %d, overflows terminal %d", got, w)
+	}
+	// The legend wraps rather than overflowing, so the editor still gets a
+	// sensible height.
+	if m.paneHeight() < 10 {
+		t.Fatalf("nav: paneHeight collapsed to %d after the legend wrap", m.paneHeight())
+	}
+
+	// Edit mode: the tree becomes a sidebar and the editor takes most of the
+	// width.
+	navRight := m.rightW
+	updateKey(m, "j") // -> bin
+	updateKey(m, "l") // expand
+	updateKey(m, "j") // tool.sh
+	updateKey(m, "j") // alpha.txt
+	updateKey(m, "e") // edit
+	if m.mode != modeEdit {
+		t.Fatalf("mode = %v, want modeEdit", m.mode)
+	}
+	if m.leftW > treeSidebarWidth {
+		t.Fatalf("edit: tree pane should shrink to a sidebar, got leftW=%d", m.leftW)
+	}
+	if m.rightW <= navRight {
+		t.Fatalf("edit: editor pane should widen (was %d, now %d)", navRight, m.rightW)
+	}
+	if m.leftW+1+m.rightW != usable {
+		t.Fatalf("edit: panes+sep = %d, want usable %d", m.leftW+1+m.rightW, usable)
+	}
+	if got := maxLineWidth(m.body()); got != usable {
+		t.Fatalf("edit: body width = %d, want usable %d", got, usable)
+	}
+
+	// Leaving the editor restores the even split.
+	updateKey(m, "esc")
+	if m.rightW != navRight {
+		t.Fatalf("after esc: rightW = %d, want the nav split %d", m.rightW, navRight)
+	}
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func maxLineWidth(view string) int {
+	w := 0
+	for _, line := range strings.Split(view, "\n") {
+		if lw := lipgloss.Width(line); lw > w {
+			w = lw
+		}
+	}
+	return w
 }
 
 func TestFileTreeGotoEdges(t *testing.T) {

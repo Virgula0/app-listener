@@ -159,6 +159,16 @@ func IsDaemonActive() bool {
 	return strings.TrimSpace(SystemctlOutput("is-active", DaemonServiceName)) == daemonActiveState
 }
 
+// ReloadDaemonIfActive sends the daemon a SIGHUP (systemctl reload) when it
+// is running, and is a no-op otherwise. Used for changes the daemon can pick
+// up on reload without a restart — e.g. the edit-protected password file.
+func ReloadDaemonIfActive() error {
+	if !IsDaemonActive() {
+		return nil
+	}
+	return RunCmd("systemctl", "reload", DaemonServiceName)
+}
+
 // EnableAndVerify brings the daemon to enabled-and-running regardless of
 // prior state: a changed config on a running daemon is delivered via SIGHUP
 // reload (restart fallback); both states are verified.
@@ -324,9 +334,26 @@ func ReplaceInstalledBinary(srcPath, dstPath string) error {
 	return nil
 }
 
+// daemonUnitFile is the on-disk path of the daemon service unit; a package
+// var so tests can point it at a temp directory.
+var daemonUnitFile = filepath.Join(SystemdDir, DaemonServiceName+".service")
+
+// DaemonUnitInstalled reports whether the daemon systemd unit file is present.
+// The binary-only and update flows use it to skip the enable/start/verify
+// step when only the binary was ever deployed (the one-line installer path):
+// there is no unit to bring up, so replacing the binary is the whole job —
+// `sudo app-listener install` sets the daemon up later.
+func DaemonUnitInstalled() bool {
+	_, err := os.Stat(daemonUnitFile)
+	return err == nil
+}
+
 // DeployInstalledBinary installs srcPath as the service binary: stops the
 // daemon first (outside-systemd is fatal), replaces it atomically, recreates
 // the PATH symlink and restores enabled-and-running. Shared by update/install.
+// When the daemon service unit is not installed yet (only the binary was ever
+// deployed) it stops after the atomic replace and the symlink — there is no
+// unit to enable or verify.
 func DeployInstalledBinary(srcPath string) error {
 	if err := StopDaemonIfRunning(); err != nil {
 		return err
@@ -339,6 +366,11 @@ func DeployInstalledBinary(srcPath string) error {
 
 	if err := EnsureBinSymlink(); err != nil {
 		return err
+	}
+
+	if !DaemonUnitInstalled() {
+		log.Infof("daemon service is not installed: binary deployed at %s — run `sudo app-listener install` to set up the protective daemon", InstallBinaryPath)
+		return nil
 	}
 
 	return EnableAndVerify(false)

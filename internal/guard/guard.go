@@ -108,6 +108,14 @@ type Guard struct {
 	// other local users (WithSelfAllowBinary).
 	selfBinary *BinaryEntry
 	selfEvents []ebpf.EventType
+	// selfKey / selfKeySet pin the inode key the self binary was registered
+	// under, so GrantSelfEditAccess can widen (and RevokeSelfEditAccess
+	// restore) its guard_exe_events mask at runtime for a live edit-protected
+	// session. selfGrantMu serializes the grant/revoke pair.
+	selfKey     GuardInodeKey
+	selfKeySet  bool
+	selfGrantMu sync.Mutex
+	selfGranted bool
 	// binaryVerifyStates pins the admitted binaries' inode keys and content
 	// hashes for the in-place replacement detector; verifyStop shuts the
 	// verifier goroutine down (see startBinaryHashVerifier).
@@ -230,9 +238,15 @@ func WithPinning(prefix string) GuardOption {
 	}
 }
 
-// eventMask converts event types into the BPF bitmask stored in guard_exe_events. Listing READ, WRITE or
-// MMAP implicitly allows OPEN (those operations require opening the file first); the OPEN bit is never
-// cleared when any of the three is present.
+// eventMask converts event types into the BPF bitmask stored in
+// guard_exe_events. Listing READ, WRITE or MMAP implicitly allows OPEN and
+// STAT: a binary trusted to read, write or map a guarded file's contents is
+// necessarily trusted to open it and to see its metadata, and every real
+// consumer stat()s a file before it uses it. Without the implied STAT bit a
+// restricted mask like `ssh READ,WRITE` is denied at the inode_getattr hook
+// (op=STAT) the moment ssh probes ~/.ssh/config, breaking the whitelisted
+// binary. The implied bits are never cleared when any of the three is present.
+// DELETE / RENAME / HARDLINK stay independent (an unlink needs no open).
 func eventMask(types []ebpf.EventType) (uint32, error) {
 	var mask uint32
 	for _, t := range types {
@@ -243,6 +257,7 @@ func eventMask(types []ebpf.EventType) (uint32, error) {
 		switch t {
 		case ebpf.EventRead, ebpf.EventWrite, ebpf.EventMmap:
 			mask |= 1 << uint(ebpf.EventOpen)
+			mask |= 1 << uint(ebpf.EventStat)
 		}
 	}
 	return mask, nil
@@ -514,6 +529,10 @@ func (g *Guard) addAllowRootBinary(b BinaryEntry, events []ebpf.EventType) error
 	if err := g.objs.GuardExeActions.Put(key, uint8(GUARD_ALLOW_ROOT)); err != nil {
 		return fmt.Errorf("storing self exe action for %s: %w", b.Path, err)
 	}
+	g.mu.Lock()
+	g.selfKey = key
+	g.selfKeySet = true
+	g.mu.Unlock()
 	if len(events) > 0 {
 		mask, err := eventMask(events)
 		if err != nil {
@@ -524,6 +543,85 @@ func (g *Guard) addAllowRootBinary(b BinaryEntry, events []ebpf.EventType) error
 		}
 	}
 	return nil
+}
+
+// editGrantEvents is the widened self event mask a live edit-protected
+// session needs: the read set plus every operation the embedded editor's
+// atomic save performs (temp file create + write + rename, plus new
+// file/dir creation and deletion and mode preservation). SYMLINK, HARDLINK
+// and MMAP are deliberately excluded — the editor never needs them and the
+// post-edit audit flags any that appeared.
+var editGrantEvents = []ebpf.EventType{
+	ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat,
+	ebpf.EventWrite, ebpf.EventDelete, ebpf.EventRename,
+	ebpf.EventMkdir, ebpf.EventMknod, ebpf.EventAttr,
+}
+
+// GrantSelfEditAccess widens this guard's root-gated self binary mask to
+// cover the operations an interactive edit performs, for the duration of an
+// authenticated live edit-protected session. It touches only the self
+// (GUARD_ALLOW_ROOT, uid-0-gated) inode key — never the whitelist — and the
+// widened mask lives in the BPF map only: it is gone on daemon restart and is
+// meant to be paired with RevokeSelfEditAccess. Whitelist / read-only mode
+// only (the only modes that register a self binary).
+func (g *Guard) GrantSelfEditAccess() error {
+	g.selfGrantMu.Lock()
+	defer g.selfGrantMu.Unlock()
+
+	g.mu.Lock()
+	key, ok := g.selfKey, g.selfKeySet
+	g.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("guard %s: no self binary registered — cannot grant edit access", g.path)
+	}
+
+	mask, err := eventMask(editGrantEvents)
+	if err != nil {
+		return err
+	}
+	if err := g.objs.GuardExeEvents.Put(key, mask); err != nil {
+		return fmt.Errorf("guard %s: widening self edit mask: %w", g.path, err)
+	}
+	g.selfGranted = true
+	log.Warnf("guard %s: edit-protected write access GRANTED to the app-listener binary (uid 0 only) for this resource", g.path)
+	return nil
+}
+
+// RevokeSelfEditAccess restores the self binary's baseline (read-only) mask
+// after a live edit-protected session. Idempotent; safe to call even if the
+// grant never took (best-effort teardown path).
+func (g *Guard) RevokeSelfEditAccess() error {
+	g.selfGrantMu.Lock()
+	defer g.selfGrantMu.Unlock()
+
+	g.mu.Lock()
+	key, ok := g.selfKey, g.selfKeySet
+	base := append([]ebpf.EventType(nil), g.selfEvents...)
+	g.mu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	var restoreErr error
+	if len(base) == 0 {
+		// No baseline mask means "all events allowed": drop the entry.
+		if err := g.objs.GuardExeEvents.Delete(key); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			restoreErr = fmt.Errorf("guard %s: clearing self edit mask: %w", g.path, err)
+		}
+	} else {
+		mask, err := eventMask(base)
+		if err != nil {
+			return err
+		}
+		if err := g.objs.GuardExeEvents.Put(key, mask); err != nil {
+			restoreErr = fmt.Errorf("guard %s: restoring self edit mask: %w", g.path, err)
+		}
+	}
+	if restoreErr == nil && g.selfGranted {
+		log.Infof("guard %s: edit-protected write access REVOKED — self binary back to read-only", g.path)
+	}
+	g.selfGranted = false
+	return restoreErr
 }
 
 // addBinaryEvents stores per-binary allowed-event bitmasks in guard_exe_events for binaries with an explicit

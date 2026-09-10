@@ -44,17 +44,19 @@ func (f *fakeMonitorRepo) SetEventTypes(types []ebpf.EventType) {
 }
 
 type fakeGuardRepo struct {
-	mu          sync.Mutex
-	started     bool
-	stopped     bool
-	populated   bool
-	resolved    bool
-	resynced    int
-	resyncErr   error
-	startErr    error
-	populateErr error
-	resolveErr  error
-	events      chan guard.GuardEvent
+	mu           sync.Mutex
+	started      bool
+	stopped      bool
+	populated    bool
+	resolved     bool
+	resynced     int
+	resyncErr    error
+	startErr     error
+	populateErr  error
+	resolveErr   error
+	editGranted  bool
+	editGrantErr error
+	events       chan guard.GuardEvent
 }
 
 func newFakeGuardRepo() *fakeGuardRepo {
@@ -90,6 +92,16 @@ func (f *fakeGuardRepo) SweepInodes() error {
 		return f.populateErr
 	}
 	f.populated = true
+	return nil
+}
+
+func (f *fakeGuardRepo) GrantSelfEditAccess() error {
+	f.editGranted = true
+	return f.editGrantErr
+}
+
+func (f *fakeGuardRepo) RevokeSelfEditAccess() error {
+	f.editGranted = false
 	return nil
 }
 

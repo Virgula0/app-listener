@@ -2201,6 +2201,17 @@ func (s *IntegrationSuite) TestGuard_Bypass_StatMetadata() {
 	s.Require().Contains(out, "SIZE=20")
 
 	s.stopGuard(c)
+
+	// ---- Phase 3: a READ-restricted whitelist entry still gets STAT ----
+	// Regression for the `ssh READ,WRITE` breakage: once inode_getattr
+	// enforces EVENT_STAT, a binary whitelisted to READ a guarded file must
+	// still be allowed to stat it (every real reader stat()s first), so
+	// eventMask implies STAT from READ/WRITE/MMAP.
+	s.startGuardStd(c, "/watch", "-w", "/exploits/statonly", "-e", "READ")
+	code, out = s.exec(c, []string{"/exploits/statonly", "/watch/secret"})
+	s.Require().Equalf(0, code, "a READ-masked whitelist entry must still be allowed to stat: %s", out)
+	s.Require().Contains(out, "SIZE=20")
+	s.stopGuard(c)
 }
 
 // newGuardTestContainer starts a privileged container and copies the
