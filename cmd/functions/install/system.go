@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
@@ -17,10 +19,6 @@ const (
 	// buildBinaryPath is the Makefile output path for the linux build.
 	buildBinaryPath = "build/linux/app-listener"
 )
-
-// selectedUsers remembers the users picked in the selection step so the
-// per-user ssh-agent unit can be installed during deployment.
-var selectedUsers []inst.User
 
 // mustCwd returns the current working directory (empty on failure).
 func mustCwd() string {
@@ -32,9 +30,9 @@ func mustCwd() string {
 }
 
 // installServices copies the embedded system unit files from daemon-samples
-// into place, skipping anything that already exists, installs the per-user
+// into place, skipping anything that already exists, offers the per-user
 // ssh-agent units, and drops the package-manager catalog-refresh hooks.
-func installServices() error {
+func installServices(cfg *daemonconfig.Config) error {
 	files, err := inst.SampleFiles()
 	if err != nil {
 		return err
@@ -46,10 +44,8 @@ func installServices() error {
 			// once per detected manager (see installReloadHooks).
 			continue
 		case name == "ssh-agent.service":
-			for _, u := range selectedUsers {
-				if err := installSSHAgent(u); err != nil {
-					return err
-				}
+			if err := offerSSHAgentUnits(cfg); err != nil {
+				return err
 			}
 		case strings.HasSuffix(name, ".service"):
 			if err := installFile(name, filepath.Join(systemd.SystemdDir, name), 0o644); err != nil {
@@ -160,6 +156,63 @@ func upsertFile(path, label string, data []byte, mode os.FileMode, uid int) erro
 	if uid >= 0 {
 		if err := os.Chown(path, uid, -1); err != nil {
 			return fmt.Errorf("chown %s: %w", label, err)
+		}
+	}
+	return nil
+}
+
+// offerSSHAgentUnits installs the per-user ssh-agent systemd unit — but only
+// for a user whose ~/.ssh is guarded by this config, and only after asking.
+// The unit is per-user (it lives under ~/.config/systemd/user and runs in
+// that user's session, not system-wide), so there is one question per such
+// user and it names the user and the exact path. Users without a guarded
+// ~/.ssh are skipped silently; root is always skipped (no interactive
+// session); an already-installed matching unit is kept without a prompt.
+func offerSSHAgentUnits(cfg *daemonconfig.Config) error {
+	users, err := inst.ListUsers()
+	if err != nil {
+		return err
+	}
+	sample, err := inst.SampleContent("ssh-agent.service")
+	if err != nil {
+		return err
+	}
+	covered := configPaths(cfg)
+	for i := range users {
+		u := users[i]
+		if u.UID == 0 {
+			continue
+		}
+		sshDir := filepath.Join(u.Home, ".ssh")
+		if !pathCovered(sshDir, covered) {
+			continue
+		}
+		unitPath := filepath.Join(u.Home, ".config", "systemd", "user", "ssh-agent.service")
+		if cur, rerr := os.ReadFile(unitPath); rerr == nil && bytes.Equal(cur, sample) {
+			log.Infof("ssh-agent unit for %s already installed — keeping it", u.Name)
+			continue
+		}
+
+		install := true
+		if ferr := huh.NewForm(huh.NewGroup(
+			huh.NewConfirm().
+				Title(fmt.Sprintf("Install the ssh-agent unit for user %s?", u.Name)).
+				Description(fmt.Sprintf(
+					"%s is guarded, so ssh-agent must run as a known service to keep reading the keys.\n"+
+						"This installs and enables a per-user systemd unit (that user's session only) at:\n    %s",
+					sshDir, unitPath)).
+				Affirmative("Install it").
+				Negative("Skip").
+				Value(&install),
+		)).Run(); ferr != nil {
+			return ferr
+		}
+		if !install {
+			log.Infof("skipping the ssh-agent unit for %s — start ssh-agent another way, or guarded ~/.ssh access from it will be denied", u.Name)
+			continue
+		}
+		if err := installSSHAgent(u); err != nil {
+			return err
 		}
 	}
 	return nil

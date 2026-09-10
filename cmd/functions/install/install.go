@@ -80,7 +80,10 @@ The wizard walks through the whole installation:
      (/etc/apt/apt.conf.d); dnf/zypper are reported and left to the
      boot-time refresh. Already-installed files and an existing config are
      compared with the bundled ones: identical files are left alone,
-     differing ones show the diff in the TUI and ask whether to overwrite
+     differing ones show the diff in the TUI and ask whether to overwrite.
+     For every user whose ~/.ssh ends up guarded it asks (once per user,
+     naming the user and path) whether to install that user's per-user
+     ssh-agent systemd unit — declined or skipped when no ~/.ssh is guarded
   9. enables the daemon across reboots and ensures it is running, and
      enables app-listener-catalog-refresh.service — a boot-time --live
      catalog refresh that catches package changes made while no hook ran
@@ -184,7 +187,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := deploy(cfgText); err != nil {
+	if err := deploy(cfgText, cfg); err != nil {
 		return err
 	}
 
@@ -472,9 +475,10 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 
 // deploy installs services/hook, copies binary+config, enables the daemon.
 // Existing files are diffed: identical ones stay, differing ones show the
-// diff and ask; a changed config reaches a running daemon via SIGHUP.
-func deploy(cfgText string) error {
-	if err := installServices(); err != nil {
+// diff and ask; a changed config reaches a running daemon via SIGHUP. cfg is
+// the parsed config (its resource paths drive the ssh-agent-unit question).
+func deploy(cfgText string, cfg *daemonconfig.Config) error {
+	if err := installServices(cfg); err != nil {
 		return err
 	}
 	configChanged, err := installConfig(cfgText)

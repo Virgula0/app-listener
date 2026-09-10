@@ -96,7 +96,7 @@ func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error
 	// deploy writes the config only after ConfirmOverwrite, runs the eBPF
 	// preflight, and (re)starts the daemon — its own failure modes already
 	// leave the box in a documented state, so surface them as-is.
-	if deployErr := deploy(securedText); deployErr != nil {
+	if deployErr := deploy(securedText, mergedCfg); deployErr != nil {
 		return deployErr
 	}
 	if cleanErr := cleanOrphanedFscrypt(mergedCfg); cleanErr != nil {
@@ -105,14 +105,21 @@ func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error
 	return cleanupBackups(mergedCfg)
 }
 
+// configPaths returns every path a config resource occupies: the watch path
+// and its encryption root (equal unless the section is a grouped watch).
+func configPaths(cfg *daemonconfig.Config) []string {
+	out := make([]string, 0, len(cfg.Resources)*2)
+	for i := range cfg.Resources {
+		out = append(out, cfg.Resources[i].Path, cfg.Resources[i].EncryptionRootOrPath())
+	}
+	return out
+}
+
 // uncoveredCandidates returns the catalog candidates whose path is neither a
 // configured watch path / encryption root nor nested with one (in either
 // direction) — i.e. the directories a diff would propose adding.
 func uncoveredCandidates(cfg *daemonconfig.Config, users []inst.User) []inst.Candidate {
-	covered := make([]string, 0, len(cfg.Resources)*2)
-	for i := range cfg.Resources {
-		covered = append(covered, cfg.Resources[i].Path, cfg.Resources[i].EncryptionRootOrPath())
-	}
+	covered := configPaths(cfg)
 	all := inst.DiscoverForUsers(users)
 	var fresh []inst.Candidate
 	for i := range all {

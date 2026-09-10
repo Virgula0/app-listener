@@ -23,8 +23,8 @@ import (
 
 // pickUsers asks which local users the installation should protect. Every
 // user (root included) is preselected; root's /root is probed like any
-// other user, but no ssh-agent unit is installed for root (see
-// installSSHAgent).
+// other user. The per-user ssh-agent unit is offered later, and only for a
+// user whose ~/.ssh ends up guarded (see offerSSHAgentUnits).
 func pickUsers() ([]inst.User, error) {
 	users, err := inst.ListUsers()
 	if err != nil {
@@ -38,9 +38,6 @@ func pickUsers() ([]inst.User, error) {
 	for i := range users {
 		u := &users[i]
 		label := fmt.Sprintf("%s (uid %d, home %s)", u.Name, u.UID, u.Home)
-		if u.UID == 0 {
-			label += " — no ssh-agent unit will be installed"
-		}
 		opts = append(opts, huh.NewOption(label, *u).Selected(true))
 	}
 	var picked []inst.User
@@ -58,7 +55,6 @@ func pickUsers() ([]inst.User, error) {
 	if len(picked) == 0 {
 		return nil, fmt.Errorf("no users selected")
 	}
-	selectedUsers = picked
 	for i := range picked {
 		log.Infof("protecting user %s (home %s)", picked[i].Name, picked[i].Home)
 	}
