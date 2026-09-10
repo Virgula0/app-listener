@@ -52,7 +52,8 @@ Installs the latest **stable** release. For pre-release builds, append `-s -- --
 # Toolchain runs in a rootful Docker container (host BTF mounted); output at
 # build/linux/app-listener. No Docker? clang/LLVM + bpftool + Go 1.26+ + GCC, then `make build-host`.
 make build
-sudo ./build/linux/app-listener install
+sudo ./build/linux/app-listener install --binary-only   # deploy the binary to /usr/local/sbin
+sudo app-listener install                                # then run the wizard
 ```
 </details>
 

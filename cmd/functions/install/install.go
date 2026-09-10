@@ -1,6 +1,8 @@
-// Package install implements the `app-listener install` wizard: builds the
-// binary, ensures the fscrypt master key, picks users and critical dirs,
-// migrates to fscrypt with backups, installs units/hook, enables the daemon.
+// Package install implements the `app-listener install` wizard: checks the
+// binary is deployed, ensures the fscrypt master key, picks users and critical
+// dirs, migrates to fscrypt with backups, installs units/hook, enables the
+// daemon. The binary itself is deployed by the one-line installer or
+// `install --binary-only`, never by the wizard.
 package install
 
 import (
@@ -26,7 +28,7 @@ func init() {
 	InstallCmd.Flags().Bool("delete-post-backups", false,
 		"Delete the found .app_listener.backup directories (listed in the TUI, confirmed once, with progress)")
 	InstallCmd.Flags().Bool("binary-only", false,
-		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon; no wizard, no config, no fscrypt, no systemd units")
+		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon if its service is installed; no wizard, no config, no fscrypt, no systemd units")
 	InstallCmd.Flags().Bool("update-catalog-only", false,
 		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
 	InstallCmd.Flags().Bool("live", false,
@@ -45,7 +47,10 @@ The wizard walks through the whole installation:
   0. stops a running daemon before anything else: an active systemd unit is
      stopped (and re-enabled at the end); a daemon process running outside
      systemd is a fatal error — stop it manually first
-  1. builds the binary when build/linux/app-listener is missing
+  1. verifies the app-listener binary is already deployed at
+     /usr/local/sbin/app-listener (the wizard never builds or moves it —
+     use the one-line installer, or "install --binary-only" after
+     "make build", first)
   2. ensures the fscrypt master key exists in /etc/app-listener/fscrypt.key
   3. asks which users to protect and probes a catalog of critical
      directories (SSH, keys, AI agents, IDEs, browsers, VPNs, ...)
@@ -63,9 +68,10 @@ The wizard walks through the whole installation:
      .app_listener.backup copy) while a progress bar shows the copy
      progress
   8. installs the systemd units and the package-manager catalog-refresh
-     hook from the embedded daemon-samples, copies the binary to
-     /usr/local/sbin/app-listener and the config to
-     /etc/app-listener/daemon.conf. The refresh hook is chosen from the
+     hook from the embedded daemon-samples and writes the config to
+     /etc/app-listener/daemon.conf (the binary is left as deployed). The
+     PATH symlink /usr/local/bin/app-listener is (re)created. The refresh
+     hook is chosen from the
      host's package manager: pacman (/etc/pacman.d/hooks) or apt
      (/etc/apt/apt.conf.d); dnf/zypper are reported and left to the
      boot-time refresh. Already-installed files and an existing config are
@@ -107,6 +113,8 @@ binary: it builds build/linux/app-listener when it does not exist, stops
 a running daemon, replaces /usr/local/sbin/app-listener atomically,
 recreates the /usr/local/bin/app-listener symlink and starts the daemon
 again — nothing else is touched (no config, no fscrypt, no services).
+When the daemon service is not installed yet it just deploys the binary
+and the symlink and stops there (there is no unit to restart).
 
 Use --update-catalog-only to refresh the whitelist of every guarded
 directory from the catalog: encrypted vaults are unlocked, glob patterns
@@ -258,6 +266,10 @@ func installBinaryOnly() error {
 	if err := systemd.DeployInstalledBinary(buildBinaryPath); err != nil {
 		return fmt.Errorf("installing binary: %w", err)
 	}
+	if !systemd.DaemonUnitInstalled() {
+		log.Info("binary-only install complete: binary deployed; the daemon service is not installed (run `sudo app-listener install`)")
+		return nil
+	}
 	log.Info("binary-only install complete: the daemon is running the new binary")
 	return nil
 }
@@ -343,12 +355,37 @@ func applyLiveRefresh(changed bool) error {
 	return deliverReload(true)
 }
 
-// prepareInstallation builds the binary and ensures the master key exists.
+// prepareInstallation checks the binary is deployed and ensures the master
+// key exists. The wizard never builds or moves the binary — that is the job
+// of the one-line installer (scripts/install.sh) or, for a source build,
+// `app-listener install --binary-only`.
 func prepareInstallation() error {
-	if err := buildBinaryIfNeeded(); err != nil {
+	if err := ensureInstalledBinary(); err != nil {
 		return err
 	}
 	return ensureMasterKey()
+}
+
+// installedBinaryPath is the path ensureInstalledBinary checks; a package
+// var so tests can point it at a temp file.
+var installedBinaryPath = systemd.InstallBinaryPath
+
+// ensureInstalledBinary refuses to run the wizard until the app-listener
+// binary is already present at its service path. It does not build or copy
+// anything: deploy the binary first with the one-line installer, or with
+// `sudo app-listener install --binary-only` after `make build`.
+func ensureInstalledBinary() error {
+	_, err := os.Stat(installedBinaryPath)
+	if err == nil {
+		log.Infof("binary is installed: %s", installedBinaryPath)
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("checking %s: %w", installedBinaryPath, err)
+	}
+	return fmt.Errorf("the app-listener binary is not installed at %s — deploy it first "+
+		"with the one-line installer (curl … | sudo bash), or with `sudo app-listener install --binary-only` "+
+		"after `make build`, then re-run `sudo app-listener install`", installedBinaryPath)
 }
 
 // selectAndEditConfig runs users, catalog, manual additions, then the editor.
@@ -425,7 +462,7 @@ func deploy(cfgText string) error {
 	if err := installServices(); err != nil {
 		return err
 	}
-	configChanged, err := installBinaryAndConfig(cfgText)
+	configChanged, err := installConfig(cfgText)
 	if err != nil {
 		return err
 	}
@@ -435,8 +472,9 @@ func deploy(cfgText string) error {
 	return systemd.EnableCatalogRefresh()
 }
 
-// buildBinaryIfNeeded compiles with the Makefile flags when
-// build/linux/app-listener is missing; without a source tree it refuses.
+// buildBinaryIfNeeded compiles build/linux/app-listener when it is missing;
+// without a source tree it refuses. Only the --binary-only path uses it —
+// the full wizard never builds (see ensureInstalledBinary).
 func buildBinaryIfNeeded() error {
 	if _, err := os.Stat(buildBinaryPath); err == nil {
 		log.Infof("binary already built: %s", buildBinaryPath)

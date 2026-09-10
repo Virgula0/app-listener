@@ -13,6 +13,30 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
+// TestEnsureInstalledBinary is the regression test for issue #44: the
+// wizard must not build or move the binary, only verify it is deployed —
+// a missing binary aborts before anything else, a present one passes.
+func TestEnsureInstalledBinary(t *testing.T) {
+	orig := installedBinaryPath
+	defer func() { installedBinaryPath = orig }()
+
+	dir := t.TempDir()
+	installedBinaryPath = filepath.Join(dir, "app-listener")
+
+	if err := ensureInstalledBinary(); err == nil {
+		t.Fatal("ensureInstalledBinary must fail when the binary is not deployed")
+	} else if !strings.Contains(err.Error(), "not installed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := os.WriteFile(installedBinaryPath, []byte("ELF"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureInstalledBinary(); err != nil {
+		t.Fatalf("ensureInstalledBinary on a deployed binary: %v", err)
+	}
+}
+
 // TestAskEncryptionSkipsNeedEncryptionFalse verifies that a resource
 // declared need_encryption: false in the config never triggers the
 // encryption question: the directory is not added to toEncrypt, the config
