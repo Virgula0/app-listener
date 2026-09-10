@@ -14,21 +14,23 @@ import (
 )
 
 // auditAfterEdit loads the installed daemon.conf (if any) and audits the
-// edited tree. Used by the offline flow, which has no Config in hand.
-func auditAfterEdit(resource string) {
+// edited tree. interactive controls how findings are surfaced: an acknowledge
+// prompt for the TUI flows, plain warnings for --put (no TTY).
+func auditAfterEdit(resource string, interactive bool) {
 	cfg, err := daemonconfig.Load(systemd.SystemConfigPath)
 	if err != nil {
-		auditAfterEditWithConfig(nil, resource)
+		auditAfterEditWithConfig(nil, resource, interactive)
 		return
 	}
-	auditAfterEditWithConfig(cfg, resource)
+	auditAfterEditWithConfig(cfg, resource, interactive)
 }
 
 // auditAfterEditWithConfig inspects the edited resource tree for things that
-// would sit outside the daemon's protection or weaken it, and — if it finds
-// any — prints them and asks the operator to acknowledge before returning.
-// Advisory only: nothing is changed or blocked.
-func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string) {
+// would sit outside the daemon's protection or weaken it and reports any
+// findings. Advisory only: nothing is changed or blocked. In an interactive
+// flow it also shows a one-way acknowledgement so the operator cannot miss
+// the warnings; --put just logs them.
+func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string, interactive bool) {
 	findings := make([]string, 0, 8)
 	findings = append(findings, auditTree(resource)...)
 	findings = append(findings, auditGroupCoverage(cfg, resource)...)
@@ -41,6 +43,9 @@ func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string) {
 	log.Warn("post-edit audit found potential issues:")
 	for _, f := range findings {
 		log.Warnf("  - %s", f)
+	}
+	if !interactive {
+		return
 	}
 
 	// A one-way acknowledgement, not a decision: the edit is already written

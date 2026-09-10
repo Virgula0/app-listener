@@ -61,7 +61,7 @@ func runOfflineEdit() error {
 		return fmt.Errorf("edit %s: %w", chosen, err)
 	}
 
-	auditAfterEdit(chosen)
+	auditAfterEdit(chosen, true)
 	return nil
 }
 

@@ -429,7 +429,11 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_LiveMode() {
 	defer c.Terminate(s.ctx)
 
 	s.exec(c, []string{"sh", "-c",
-		"mkdir -p /protected /etc/app-listener && echo SECRET > /protected/secret && chmod 755 /protected && chmod 600 /protected/secret && " +
+		"mkdir -p /protected /etc/app-listener /outside && echo SECRET > /protected/secret && echo ORIGINAL > /outside/victim && " +
+			"chmod 755 /protected && chmod 600 /protected/secret && " +
+			// a symlink placed inside the tree BEFORE the daemon guards it —
+			// --put must refuse it, not follow it out of the guarded tree.
+			"ln -s /outside/victim /protected/escape && " +
 			"printf '%s\\n' " + shQuote(hash) + " > /etc/app-listener/edit-auth.hash && chmod 600 /etc/app-listener/edit-auth.hash"})
 
 	s.startDaemon(c, `[watch /protected]
@@ -491,6 +495,15 @@ need_encryption: false
 	// 6. between sessions a non-authenticated write to the tree is still denied.
 	code, out = s.exec(c, []string{"sh", "-c", "echo pwned > /protected/pwned 2>&1"})
 	s.Require().NotEqualf(0, code, "an unauthenticated write to the guarded tree must be denied: %s", out)
+
+	// 7. --put must not follow a symlink out of the guarded tree.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"echo PWNED | APP_LISTENER_EDIT_PASSWORD=" + password +
+			" /app-listener edit-protected --resource /protected --put escape 2>&1"})
+	s.Require().NotEqualf(0, code, "--put through a symlink must be refused: %s", out)
+	s.Require().Containsf(out, "symlink", "expected a symlink refusal, got: %s", out)
+	_, victim := s.exec(c, []string{"sh", "-c", "cat /outside/victim"})
+	s.Require().Equal("ORIGINAL", strings.TrimSpace(victim), "the symlink target outside the tree was written")
 
 	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
 }

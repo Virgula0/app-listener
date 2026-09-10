@@ -58,7 +58,7 @@ func runLiveEdit() error {
 	}
 
 	session.End() // narrow the guard back before the audit reads the tree
-	auditAfterEdit(chosen)
+	auditAfterEdit(chosen, true)
 	return nil
 }
 
@@ -107,6 +107,9 @@ func runNonInteractiveLivePut() error {
 	if !filepath.IsAbs(dest) {
 		dest = filepath.Join(resourceFlag, dest)
 	}
+	// Lexical containment is a first gate only; writeWithin re-checks every
+	// component with O_NOFOLLOW so a symlink in the tree cannot redirect the
+	// write outside the guarded resource.
 	if !within(resourceFlag, dest) {
 		return fmt.Errorf("--put target %s is outside the resource %s", dest, resourceFlag)
 	}
@@ -133,16 +136,13 @@ func runNonInteractiveLivePut() error {
 		return fmt.Errorf("activating live edit access to %s: %w", resourceFlag, err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-		return fmt.Errorf("creating parent of %s: %w", dest, err)
-	}
-	if err := os.WriteFile(dest, content, 0o600); err != nil {
-		return fmt.Errorf("writing %s: %w", dest, err)
+	if err := writeWithin(resourceFlag, dest, content); err != nil {
+		return err
 	}
 	log.Infof("wrote %d bytes to %s (live)", len(content), dest)
 
 	session.End()
-	auditAfterEdit(resourceFlag)
+	auditAfterEdit(resourceFlag, false)
 	return nil
 }
 
