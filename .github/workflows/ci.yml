@@ -46,6 +46,9 @@ jobs:
           set -euo pipefail
           test -r /sys/kernel/btf/vmlinux || { echo "::error::runner has no readable BTF"; exit 1; }
           make build-image
+          # clang < ~17 emits a guard_path_rename that overflows the verifier's
+          # 1M-insn budget on modern kernels (issue #45); the image pins clang 22.
+          docker run --rm app-listener-builder:local clang --version
           docker run --rm \
             -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
             -v "$PWD:/app/app-listener:rw" \
@@ -92,6 +95,9 @@ jobs:
           set -euo pipefail
           test -r /sys/kernel/btf/vmlinux || { echo "::error::runner has no readable BTF"; exit 1; }
           make build-image
+          # clang < ~17 emits a guard_path_rename that overflows the verifier's
+          # 1M-insn budget on modern kernels (issue #45); the image pins clang 22.
+          docker run --rm app-listener-builder:local clang --version
           docker run --rm \
             -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
             -v "$PWD:/app/app-listener:rw" \

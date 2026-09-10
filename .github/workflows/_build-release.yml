@@ -52,7 +52,7 @@ jobs:
       # object compiled against a different kernel's BTF than the release
       # target can hit the verifier's complexity limit — or, worse, verify
       # wrong and corrupt kernel memory at runtime (issue #45). Generate them
-      # inside the pinned builder image (known-good clang + bpftool) against
+      # inside the pinned builder image (clang 22 + bpftool) against
       # the runner's BTF; CO-RE relocates field offsets at load time, and
       # `daemon --check` fails the install closed on any kernel whose verifier
       # still rejects a program.
@@ -61,6 +61,10 @@ jobs:
           set -euo pipefail
           test -r /sys/kernel/btf/vmlinux || { echo "::error::runner has no readable BTF — cannot generate CO-RE objects"; exit 1; }
           make build-image
+          # Provenance: record the exact BPF compiler. clang < ~17 emits a
+          # guard_path_rename that overflows the verifier's 1M-insn budget on
+          # modern kernels (issue #45); builder.Dockerfile pins clang 22.
+          docker run --rm app-listener-builder:local clang --version
           docker run --rm \
             -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
             -v "$PWD:/app/app-listener:rw" \
