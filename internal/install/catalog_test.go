@@ -566,3 +566,38 @@ func TestDiscordNarrowedWatches(t *testing.T) {
 		}
 	}
 }
+
+// TestExtraWatchPathsForSkipsMissing is the regression test for a daemon
+// startup crash: a fresh Discord install only creates some of the catalog's
+// WatchRelPaths sub-directories (e.g. "IndexedDB" may not exist yet), and
+// ExtraWatchPathsFor used to return every one of them unconditionally. The
+// generated config then declared a `watch:` path that never resolves, and
+// the daemon's ResolvePendingPaths pass (daemonconfig.go) treats a grouped
+// watch path still missing after its encryption root is available as a
+// fatal error — by design, per ResolvePendingPaths' doc comment, "silently
+// dropping it would leave a declared-protected directory unguarded". A
+// non-existent sub-path must therefore never reach the generated config in
+// the first place, exactly like a plain (non-grouped) RelPaths candidate
+// that Discover simply does not propose when missing.
+func TestExtraWatchPathsForSkipsMissing(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".config", "discord")
+	existing := filepath.Join(root, "Local Storage")
+	if err := os.MkdirAll(existing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// "Cookies" and every other WatchRelPaths entry deliberately left absent.
+
+	entry := CandidateDir{
+		RelPaths: []string{".config/discord"},
+		WatchRelPaths: []string{
+			".config/discord/Local Storage",
+			".config/discord/Cookies",
+		},
+	}
+	got := entry.ExtraWatchPathsFor(home, "someuser")
+	want := []string{existing}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ExtraWatchPathsFor = %v, want %v (missing sub-paths must be dropped)", got, want)
+	}
+}

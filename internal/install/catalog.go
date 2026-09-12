@@ -332,10 +332,12 @@ var Catalog = []CandidateDir{
 			"/usr/lib/brave-browser/chrome_crashpad_handler": nil,
 		}},
 	{Name: "Discord", RelPaths: []string{".config/discord"},
-		// The Arch package is a launcher stub: the app self-updates into
-		// versioned app-<ver> dirs and its wrapper/updater writes the vault
-		// root (installer.db, downloads) — so only the SENSIBLE subtrees are
-		// guarded and the update workspace stays out of the guarded set.
+		// The real difference with RelPaths is that it is faster.
+		// In fact it encrypted/decrypts the whole ~/.config/discord with fscrypt but
+		// watches and guards the watch rel paths, others ~/config/discord accesses are ignored.
+		// This is actually handy, because adds an extra security layer where on shutdown the whole directory
+		// is re-encrypted not only those one of the watched groups. For steam this is not feasible
+		// too big because may contain games
 		WatchRelPaths: []string{
 			".config/discord/Local Storage",
 			".config/discord/Session Storage",
@@ -384,7 +386,6 @@ var Catalog = []CandidateDir{
 			// Webhelper moved across versioned dirs; the glob covers all layouts.
 			"%HOME%/.local/share/Steam/*/steamwebhelper": nil,
 			"/usr/bin/lsof": nil,
-			// "%HOME%/.steam/root/steamapps/common": nil, // TODO: protons installs needs to be allowed
 		}},
 
 	// --- System-level paths (probed once, not per user; ssh-guard template) ---
@@ -411,14 +412,24 @@ func (c *CandidateDir) PathsFor(home, user string) []string {
 }
 
 // ExtraWatchPathsFor expands the entry's WatchRelPaths into absolute paths
-// for the given user (placeholders resolved, same as PathsFor).
+// for the given user (placeholders resolved, same as PathsFor), keeping only
+// the ones that currently exist — the same existence gate Discover applies to
+// a plain RelPaths entry. A missing sub-path must never reach the generated
+// config: the daemon treats every grouped `watch:` directive as a tree that
+// must resolve once its encryption root is unlocked and fails closed
+// (fatal) if it still doesn't, so writing a non-existent one out crashes the
+// daemon instead of silently under-protecting it.
 func (c *CandidateDir) ExtraWatchPathsFor(home, user string) []string {
 	if len(c.WatchRelPaths) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(c.WatchRelPaths))
 	for _, rel := range c.WatchRelPaths {
-		out = append(out, filepath.Join(home, expandPlaceholders(rel, user, home)))
+		p := filepath.Join(home, expandPlaceholders(rel, user, home))
+		if _, err := os.Lstat(p); err != nil {
+			continue
+		}
+		out = append(out, p)
 	}
 	return out
 }

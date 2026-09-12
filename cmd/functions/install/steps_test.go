@@ -92,8 +92,8 @@ func TestEnsureInstalledBinary(t *testing.T) {
 // (same inode — the normal "install via the deployed symlink" case), and a
 // DIFFERENT file at the install path (a freshly rebuilt standalone binary
 // run against an existing install) — the exact scenario that used to fail
-// only at the very last wizard step, inside finalizeEditPassword, with a
-// confusing "operation not permitted".
+// only at the very last wizard step, writing the edit-protected password
+// hash, with a confusing "operation not permitted".
 func TestCheckRunningBinaryMatchesInstalled(t *testing.T) {
 	orig := installedBinaryPath
 	defer func() { installedBinaryPath = orig }()
@@ -388,6 +388,66 @@ func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
 			t.Errorf("resource %s: shared whitelist not applied: %+v", res.Path, res.Binaries)
 		}
 	}
+}
+
+// TestSectionsFromCandidatesSkipsMissingWatchSubPaths is the regression test
+// for a daemon startup crash: a fresh Discord config directory only creates
+// some of the catalog's WatchRelPaths sub-directories, and the installer used
+// to emit a `watch:` directive for every one of them regardless of whether it
+// existed. The daemon's ResolvePendingPaths pass (internal/daemonconfig)
+// treats a grouped watch path still missing once its encryption root is
+// available as a HARD, FATAL error by design (fail-closed: a declared but
+// unresolvable protected directory must not be silently dropped at runtime).
+// The fix has to happen earlier, at config-generation time, mirroring how a
+// plain (non-grouped) candidate is simply never proposed when its path does
+// not exist.
+func TestSectionsFromCandidatesSkipsMissingWatchSubPaths(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".config", "discord")
+	existing := filepath.Join(root, "Local Storage")
+	if err := os.MkdirAll(existing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Every other Discord WatchRelPaths entry (IndexedDB, Cookies, ...) is
+	// deliberately left absent, as on a freshly created Discord profile.
+
+	u := inst.User{Name: "tester", Home: home}
+	candidates := []inst.Candidate{{User: u, Entry: discordCatalogEntry(t), Path: root}}
+
+	sections := sectionsFromCandidates(candidates)
+	if len(sections) != 1 {
+		t.Fatalf("want 1 section, got %d", len(sections))
+	}
+	if !reflect.DeepEqual(sections[0].ExtraWatchPaths, []string{existing}) {
+		t.Errorf("ExtraWatchPaths = %v, want only the existing sub-path %q", sections[0].ExtraWatchPaths, existing)
+	}
+
+	confText := inst.GenerateConf(sections)
+	cfg, err := validateConfigText(confText)
+	if err != nil {
+		t.Fatalf("generated config does not parse: %v", err)
+	}
+	for _, r := range cfg.Resources {
+		if r.PathPending {
+			t.Errorf("resource %s must not be left PathPending: a missing watch sub-path must never reach the config", r.Path)
+		}
+	}
+	if err := daemonconfig.ResolvePendingPaths(cfg); err != nil {
+		t.Errorf("ResolvePendingPaths must never fail on a freshly generated config: %v", err)
+	}
+}
+
+// discordCatalogEntry returns the real Discord catalog entry, failing the
+// test if it's ever removed or renamed.
+func discordCatalogEntry(t *testing.T) inst.CandidateDir {
+	t.Helper()
+	for _, e := range inst.Catalog {
+		if e.Name == "Discord" {
+			return e
+		}
+	}
+	t.Fatal("Discord catalog entry not found")
+	return inst.CandidateDir{}
 }
 
 // TestGroupedSectionAddressedByEncryptionRoot documents why askEncryption /
