@@ -72,6 +72,30 @@ const fileVaultRecoverSuffix = ".app_listener.recover"
 
 func fileVaultRecoverPath(path string) string { return path + fileVaultRecoverSuffix }
 
+// rejectSidecarSymlink Lstats sidecar and errors if it currently exists as a
+// symbolic link. The sidecar is only ever a plain regular file this package
+// created itself (see fileVaultRecoverSuffix): every entry point that opens,
+// reads, or writes it (EnsureRecoverySidecarPlaceholder, writeSidecarInPlace,
+// recoverFileInPlace) calls this FIRST, so a symlink swapped in by whoever
+// controls the resource's parent directory — while no guard is attached yet,
+// e.g. between an install and the daemon's first start — is refused outright
+// instead of silently followed into an arbitrary root-writable file
+// elsewhere on the system. Missing entirely is not an error here (callers
+// each handle "does not exist" in their own next step).
+func rejectSidecarSymlink(sidecar string) error {
+	info, err := os.Lstat(sidecar)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("checking %s: %w", sidecar, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing recovery sidecar %s: it is a symbolic link", sidecar)
+	}
+	return nil
+}
+
 // EnsureRecoverySidecarPlaceholder creates path's (empty) recovery sidecar
 // if it does not already exist yet. Callers must run this BEFORE path's
 // guard ever attaches (see fileVaultRecoverSuffix) — mirrors
@@ -83,7 +107,10 @@ func EnsureRecoverySidecarPlaceholder(path string) error {
 		return nil
 	}
 	sidecar := fileVaultRecoverPath(path)
-	if _, err := os.Stat(sidecar); err == nil {
+	if err := rejectSidecarSymlink(sidecar); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(sidecar); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("checking %s: %w", sidecar, err)
@@ -255,6 +282,9 @@ func transformFileInPlace(path string, newContent []byte) error {
 // mirrors editprotected.WriteHashFile's identical two-branch shape and
 // justification.
 func writeSidecarInPlace(sidecar string, content []byte) error {
+	if err := rejectSidecarSymlink(sidecar); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(sidecar, os.O_RDWR, 0o600)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -318,6 +348,9 @@ func clearRecovery(path string) error {
 // path's identity either.
 func recoverFileInPlace(path string) error {
 	sidecar := fileVaultRecoverPath(path)
+	if err := rejectSidecarSymlink(sidecar); err != nil {
+		return err
+	}
 	sealed, err := os.ReadFile(sidecar)
 	if err != nil {
 		if os.IsNotExist(err) {
