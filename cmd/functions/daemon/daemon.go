@@ -182,6 +182,43 @@ func startPprof(addr string) {
 	}()
 }
 
+// catchLifecycleSignals registers termination and reload signals BEFORE the
+// first fscrypt unlock / guard construction, not just once the run loop
+// (runDaemonUI) is reached — both matter from process start, not from
+// whenever this function happens to run:
+//
+//   - SIGTERM/SIGINT: without this, a signal during startup (systemctl stop,
+//     a startup timeout, Ctrl+C) hits Go's default disposition and kills the
+//     process with no deferred Stop — the just-unlocked vaults would then
+//     stay provisioned in the kernel keyring until ExecStopPost runs. (The
+//     guards themselves are pinned, so the trees stay enforced regardless;
+//     this is about locking the vault key promptly, under the same secure
+//     lockdown a clean stop uses.)
+//   - SIGHUP: `install` can send a reload (finalizeEditPassword / a config
+//     refresh) within a second or two of starting the daemon, well before
+//     guard construction finishes on a slow/hardened kernel. SIGHUP's
+//     default disposition is also to TERMINATE the process — until this
+//     call, nothing has asked Go to handle it — so a reload landing
+//     mid-startup used to kill the daemon outright (no graceful shutdown log
+//     at all, straight to ExecStopPost) and leave the systemd unit inactive
+//     instead of reloaded.
+//
+// Both channels are buffered so an early signal is queued, not lost:
+// runDaemonUI's loop drains hup and reloads once startup actually completes,
+// instead of the signal being silently dropped or (worse) killing the
+// process. Registered for the whole process lifetime; the caller defers the
+// returned stop function.
+func catchLifecycleSignals() (termSig, hup chan os.Signal, stop func()) {
+	termSig = make(chan os.Signal, 1)
+	signal.Notify(termSig, syscall.SIGINT, syscall.SIGTERM)
+	hup = make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	return termSig, hup, func() {
+		signal.Stop(termSig)
+		signal.Stop(hup)
+	}
+}
+
 func runDaemon(cmd *cobra.Command, args []string) error {
 	serve, err := common.ParseServeFlags(cmd)
 	if err != nil {
@@ -208,17 +245,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	vault := fscrypt.New()
 
-	// Catch termination signals BEFORE the first fscrypt unlock. Without this,
-	// a SIGTERM/SIGINT during startup (systemctl stop, a startup timeout,
-	// Ctrl+C) hits Go's default disposition and kills the process with no
-	// deferred Stop — the just-unlocked vaults would then stay provisioned in
-	// the kernel keyring until ExecStopPost runs. (The guards themselves are
-	// pinned, so the trees stay enforced regardless; this is about locking the
-	// vault key promptly, under the same secure lockdown a clean stop uses.)
-	// Registered for the whole process lifetime; the run loop selects on it.
-	termSig := make(chan os.Signal, 1)
-	signal.Notify(termSig, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(termSig)
+	termSig, hup, stopSignals := catchLifecycleSignals()
+	defer stopSignals()
 
 	d, err := startGuardedDaemonAbortable(termSig, cfg, vault, pin)
 	if err != nil {
@@ -266,24 +294,29 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	defer control.close()
 
 	reload := makeReloadHandler(d, configPath, vault, pin, sg, control)
-	return runDaemonUI(events, cfg, reload, termSig, serve)
+	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
 }
 
 // runDaemonUI dispatches to the presentation layer chosen by the flags:
 // headless stderr stream, browser-mirrored TUI, or the local terminal TUI.
-func runDaemonUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, reload func(), termSig <-chan os.Signal, serve common.ServeConfig) error {
+// hup is already registered (see runDaemon) — from process start, not from
+// whenever this function happens to run — so a reload requested while
+// startup was still in progress is queued, never lost, and never fatal.
+func runDaemonUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, reload func(), termSig, hup <-chan os.Signal, serve common.ServeConfig) error {
 	if headless {
-		runHeadless(events, reload, termSig)
+		runHeadless(events, reload, termSig, hup)
 		return nil
 	}
 	if serve.Enabled {
 		// tui.Serve installs its own SIGINT/SIGTERM handling; leaving termSig
 		// registered too is harmless (both channels get the signal, tui.Serve
 		// drives the teardown, then runDaemon's defer d.Stop runs) and avoids
-		// a brief unhandled window that signal.Stop here would open.
+		// a brief unhandled window that signal.Stop here would open. Reload
+		// there is web-triggered only (tui.ServeOptions.Reload) — it does not
+		// consume hup at all.
 		return runServedTUI(events, cfg, reload, serve)
 	}
-	return runTUI(events, cfg, reload, termSig)
+	return runTUI(events, cfg, reload, termSig, hup)
 }
 
 // startGuardedDaemonAbortable runs startup while honoring a termination
@@ -901,6 +934,18 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			deviceSet = rawDevices
 		}
 
+		// File-vault resources (a single guarded regular file) stage a
+		// crash-recovery sidecar before every unlock/lock transform; that
+		// sidecar must already exist before THIS guard attaches — once it
+		// is live, creating a new directory entry beside a single-file
+		// watch root is denied (see fscrypt.EnsureRecoverySidecarPlaceholder
+		// and guard_path_rename's destination-parent-directory check). A
+		// no-op for directory resources.
+		if err := fscrypt.EnsureRecoverySidecarPlaceholder(r.Path); err != nil {
+			log.Warnf("daemon: could not pre-create the recovery sidecar for %s (%v) — "+
+				"a lock/unlock interrupted by a crash may not be recoverable", r.Path, err)
+		}
+
 		g, err := guard.NewGuard(r.Path, guard.ModeWhitelist, binaries, true, 0,
 			guard.WithBinaryEvents(events),
 			guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
@@ -1006,11 +1051,8 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 	return true
 }
 
-func runHeadless(events <-chan usecase.DaemonEvent, reload func(), termSig <-chan os.Signal) {
+func runHeadless(events <-chan usecase.DaemonEvent, reload func(), termSig, hup <-chan os.Signal) {
 	uidr := common.NewUIDResolver()
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
 
 	for {
 		select {
@@ -1031,11 +1073,9 @@ func runHeadless(events <-chan usecase.DaemonEvent, reload func(), termSig <-cha
 	}
 }
 
-func runTUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, reload func(), termSig <-chan os.Signal) error {
+func runTUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, reload func(), termSig, hup <-chan os.Signal) error {
 	p := tea.NewProgram(newDaemonModel(events, cfg), tea.WithAltScreen())
 
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
 	quit := make(chan struct{})
 	go func() {
 		for {
@@ -1054,7 +1094,6 @@ func runTUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, reload 
 
 	_, runErr := p.Run()
 	close(quit)
-	signal.Stop(hup)
 	return runErr
 }
 

@@ -354,11 +354,106 @@ func TestUnlockFileInPlaceRecoversFromInterruptedTransform(t *testing.T) {
 	if !bytes.Equal(got, original) {
 		t.Errorf("recovery did not restore the pre-crash content: got %q, want %q", got, original)
 	}
-	if _, err := os.Lstat(fileVaultRecoverPath(path)); !os.IsNotExist(err) {
-		t.Error("recovery sidecar must be removed once healed")
+	sidecarInfo, err := os.Lstat(fileVaultRecoverPath(path))
+	if err != nil {
+		t.Fatalf("recovery sidecar must still exist (emptied in place, never removed): %v", err)
+	}
+	if sidecarInfo.Size() != 0 {
+		t.Error("recovery sidecar must be emptied once healed")
 	}
 	if got := inode(t, path); got != before {
 		t.Errorf("recovery must not change the live path's inode: %d -> %d", before, got)
+	}
+}
+
+// TestStageRecoverySealsContentAndStaysInPlace is the regression test for
+// the bug this replaced: the recovery sidecar must never be created via a
+// temp-file + rename once it already exists (the guard for a single-file
+// watch root denies create/rename/delete beside it — see
+// fileVaultRecoverSuffix), and it must hold a sealed record, never the raw
+// plaintext bytes, so a leftover sidecar is never a second unguarded
+// plaintext copy of protected content.
+func TestStageRecoverySealsContentAndStaysInPlace(t *testing.T) {
+	withMasterKey(t)
+	path := filepath.Join(t.TempDir(), "registry.vdf")
+	plaintext := []byte("plaintext that must never hit disk raw")
+	if err := os.WriteFile(path, plaintext, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureRecoverySidecarPlaceholder(path); err != nil {
+		t.Fatalf("EnsureRecoverySidecarPlaceholder: %v", err)
+	}
+	sidecar := fileVaultRecoverPath(path)
+	before := inode(t, sidecar)
+
+	if err := stageRecovery(path, plaintext); err != nil {
+		t.Fatalf("stageRecovery: %v", err)
+	}
+	if got := inode(t, sidecar); got != before {
+		t.Errorf("stageRecovery changed the sidecar's inode (must rewrite in place): %d -> %d", before, got)
+	}
+	raw, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, plaintext) {
+		t.Error("recovery sidecar must never contain the raw plaintext")
+	}
+	if !looksLikeFileVaultRecord(raw) {
+		t.Error("recovery sidecar must hold a sealed file-vault record")
+	}
+
+	if err := clearRecovery(path); err != nil {
+		t.Fatalf("clearRecovery: %v", err)
+	}
+	if got := inode(t, sidecar); got != before {
+		t.Errorf("clearRecovery changed the sidecar's inode (must empty in place, never unlink): %d -> %d", before, got)
+	}
+	cleared, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cleared) != 0 {
+		t.Errorf("clearRecovery must leave the sidecar empty, got %d bytes", len(cleared))
+	}
+}
+
+// TestEnsureRecoverySidecarPlaceholder covers its three outcomes: created
+// for a regular file, left untouched if it already exists, and skipped
+// entirely for a directory (which never takes the file-vault path).
+func TestEnsureRecoverySidecarPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.vdf")
+	if err := os.WriteFile(path, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureRecoverySidecarPlaceholder(path); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sidecar := fileVaultRecoverPath(path)
+	info, err := os.Stat(sidecar)
+	if err != nil {
+		t.Fatalf("sidecar was not created: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("freshly created sidecar must be empty, got %d bytes", info.Size())
+	}
+	before := inode(t, sidecar)
+
+	if err := EnsureRecoverySidecarPlaceholder(path); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if got := inode(t, sidecar); got != before {
+		t.Errorf("an existing sidecar must be left untouched: inode %d -> %d", before, got)
+	}
+
+	if err := EnsureRecoverySidecarPlaceholder(dir); err != nil {
+		t.Fatalf("directory target must be a no-op, got: %v", err)
+	}
+	if _, err := os.Stat(fileVaultRecoverPath(dir)); !os.IsNotExist(err) {
+		t.Error("a directory target must never get a recovery sidecar")
 	}
 }
 

@@ -136,9 +136,12 @@ func ScanEncryptedCatalogDirs(vault interface {
 	return encrypted, nil
 }
 
-// ExistingEncryptedDirs returns the paths from the given set that currently
-// carry an fscrypt policy. Regular files and plain directories are skipped
-// (a file can never carry a policy).
+// ExistingEncryptedDirs returns the paths from the given set that are
+// currently encrypted: a kernel fscrypt policy for a directory, or a
+// file-vault ciphertext record for a regular file (vault.IsEncrypted
+// dispatches on the target's type — see isRegularFileTarget in
+// internal/fscrypt). A plain, never-encrypted entry of either kind is
+// skipped.
 func ExistingEncryptedDirs(vault interface {
 	IsEncrypted(path string) (bool, error)
 }, paths []string) ([]string, error) {

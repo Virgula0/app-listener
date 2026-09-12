@@ -24,6 +24,11 @@
 // lockFileInPlace) transforms content on the SAME inode, never via
 // rename — see their doc comments for why that specific property is the
 // one thing standing between this and a TOCTOU regression on the guard.
+// The same rule applies to the crash-recovery sidecar the cycle stages
+// before every transform (see fileVaultRecoverSuffix): it too is only ever
+// rewritten in place on its existing inode, never created, renamed or
+// removed once a guard could be watching, and it holds a sealed record, not
+// raw plaintext.
 package fscrypt
 
 import (
@@ -44,12 +49,54 @@ import (
 var readMasterKey = readKey
 
 // fileVaultRecoverSuffix names the crash-recovery sidecar written before
-// every in-place transform. It is NEVER a path the guard watches, so unlike
-// the live path, safe write+fsync+rename semantics are fine for it —
-// inode churn there has no bearing on guard_inodes.
+// every in-place transform.
+//
+// It looks like it sits outside the guard's scope, but it does not: the
+// guard for a single-file watch root also protects that file's PARENT
+// DIRECTORY against create/rename/delete of anything beside it (the same
+// "rename-over-watchroot" defense CLAUDE.md calls out — see
+// guard_path_rename's destination-parent-directory check in guard.bpf.c),
+// so a create-temp-then-rename dance for this sidecar is denied the moment
+// the resource's guard is live. This package therefore only ever rewrites
+// the sidecar's EXISTING inode in place (see EnsureRecoverySidecarPlaceholder,
+// stageRecovery, clearRecovery) — never creates or removes it while a guard
+// could be watching. An empty sidecar means "nothing to recover", exactly
+// like editprotected.HashFile's empty-means-unset convention.
+//
+// The content staged there is also sealed under the master key (see
+// stageRecovery), never raw plaintext: a sidecar left behind by a crash
+// survives even a reboot (which drops every BPF-LSM pin), so it must be
+// useless on its own, not a second unguarded plaintext copy of protected
+// content.
 const fileVaultRecoverSuffix = ".app_listener.recover"
 
 func fileVaultRecoverPath(path string) string { return path + fileVaultRecoverSuffix }
+
+// EnsureRecoverySidecarPlaceholder creates path's (empty) recovery sidecar
+// if it does not already exist yet. Callers must run this BEFORE path's
+// guard ever attaches (see fileVaultRecoverSuffix) — mirrors
+// cmd/functions/daemon/selfguards.go's ensureHashFilePlaceholder, same
+// reason and same timing requirement. A no-op for anything that is not
+// currently a regular file (directories never take the file-vault path).
+func EnsureRecoverySidecarPlaceholder(path string) error {
+	if !isRegularFileTarget(path) {
+		return nil
+	}
+	sidecar := fileVaultRecoverPath(path)
+	if _, err := os.Stat(sidecar); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking %s: %w", sidecar, err)
+	}
+	f, err := os.OpenFile(sidecar, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return fmt.Errorf("creating %s: %w", sidecar, err)
+	}
+	return f.Close()
+}
 
 // classifyRegularFileTarget is the safety gate every file-vault entry point
 // runs first: only a plain, non-symlink, single-hard-link regular file may
@@ -197,62 +244,95 @@ func transformFileInPlace(path string, newContent []byte) error {
 	return nil
 }
 
-// stageRecovery snapshots path's CURRENT bytes to its recovery sidecar
-// before an in-place transform begins. The sidecar write itself uses a
-// temp-file + fsync + rename (safe: nothing watches the sidecar path, so
-// its inode churn has no guard implication) so the snapshot is never
-// itself torn.
-func stageRecovery(path string, current []byte) error {
-	sidecar := fileVaultRecoverPath(path)
-	tmp := sidecar + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+// writeSidecarInPlace rewrites sidecar with content (which may be empty),
+// on the sidecar's EXISTING inode when there is one — open, truncate,
+// write, fsync — never a rename. The O_CREATE branch is only a bootstrap
+// fallback for a sidecar EnsureRecoverySidecarPlaceholder never got to run
+// for yet (the initial `install`-time encryption pass runs before any guard
+// exists at all, so nothing denies it there); by the time a guard is
+// watching path, EnsureRecoverySidecarPlaceholder has always already made
+// the sidecar exist, so this always takes the open-existing branch — this
+// mirrors editprotected.WriteHashFile's identical two-branch shape and
+// justification.
+func writeSidecarInPlace(sidecar string, content []byte) error {
+	f, err := os.OpenFile(sidecar, os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("staging recovery sidecar for %s: %w", path, err)
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("opening %s: %w", sidecar, err)
+		}
+		f, err = os.OpenFile(sidecar, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("creating %s: %w", sidecar, err)
+		}
 	}
-	if _, err := f.Write(current); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("staging recovery sidecar for %s: %w", path, err)
+	defer f.Close()
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("truncate %s: %w", sidecar, err)
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("staging recovery sidecar for %s: %w", path, err)
+	if len(content) > 0 {
+		if _, err := f.WriteAt(content, 0); err != nil {
+			return fmt.Errorf("write %s: %w", sidecar, err)
+		}
 	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("staging recovery sidecar for %s: %w", path, err)
+	return f.Sync()
+}
+
+// stageRecovery seals path's CURRENT bytes under the master key — the same
+// AEAD format as the vault's own on-disk record, never raw plaintext — and
+// writes the result to path's recovery sidecar in place (see
+// fileVaultRecoverSuffix / writeSidecarInPlace). Sealing means a sidecar
+// left behind by a crash, even across a reboot that drops every BPF-LSM
+// pin, is just another vault-format ciphertext blob: useless without the
+// master key, never a second unguarded plaintext copy of protected content.
+func stageRecovery(path string, current []byte) error {
+	sealed, err := sealFileVaultWithMasterKey(current)
+	if err != nil {
+		return fmt.Errorf("sealing recovery sidecar for %s: %w", path, err)
 	}
-	if err := os.Rename(tmp, sidecar); err != nil {
+	if err := writeSidecarInPlace(fileVaultRecoverPath(path), sealed); err != nil {
 		return fmt.Errorf("staging recovery sidecar for %s: %w", path, err)
 	}
 	return nil
 }
 
-// clearRecovery removes path's recovery sidecar once an in-place transform
-// completed successfully; a missing sidecar is not an error.
+// clearRecovery empties path's recovery sidecar in place — truncate to zero
+// length on the same inode, never unlink (see fileVaultRecoverSuffix) — once
+// an in-place transform has completed successfully. A zero-length sidecar is
+// the "nothing to recover" state recoverFileInPlace reads.
 func clearRecovery(path string) error {
-	if err := os.Remove(fileVaultRecoverPath(path)); err != nil && !os.IsNotExist(err) {
+	if err := writeSidecarInPlace(fileVaultRecoverPath(path), nil); err != nil {
 		return fmt.Errorf("clearing recovery sidecar for %s: %w", path, err)
 	}
 	return nil
 }
 
 // recoverFileInPlace restores path from a leftover recovery sidecar, if one
-// exists — meaning a previous unlock/lock was interrupted mid-transform.
-// Both unlockFileInPlace and lockFileInPlace call this first, unconditionally,
-// before doing anything else. No-op when there is nothing to recover. The
-// restore itself is an in-place, same-inode write (transformFileInPlace):
-// recovery never touches the live path's identity either.
+// is staged (non-empty) — meaning a previous unlock/lock was interrupted
+// mid-transform. Both unlockFileInPlace and lockFileInPlace call this first,
+// unconditionally, before doing anything else. No-op when the sidecar is
+// empty or (tolerated, though EnsureRecoverySidecarPlaceholder means it
+// should not normally happen once a guard exists) missing. The sidecar
+// holds a sealed record (see stageRecovery), so recovering needs the master
+// key exactly like a normal unlock/lock. The restore itself is an in-place,
+// same-inode write (transformFileInPlace): recovery never touches the live
+// path's identity either.
 func recoverFileInPlace(path string) error {
 	sidecar := fileVaultRecoverPath(path)
-	backup, err := os.ReadFile(sidecar)
+	sealed, err := os.ReadFile(sidecar)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("reading recovery sidecar for %s: %w", path, err)
 	}
+	if len(sealed) == 0 {
+		return nil
+	}
+	backup, err := openFileVaultWithMasterKey(sealed)
+	if err != nil {
+		return fmt.Errorf("opening recovery sidecar for %s: %w", path, err)
+	}
+	defer wipe(backup)
 	if err := transformFileInPlace(path, backup); err != nil {
 		return fmt.Errorf("restoring %s from its recovery sidecar: %w", path, err)
 	}

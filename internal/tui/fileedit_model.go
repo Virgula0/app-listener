@@ -95,6 +95,13 @@ type fileEditModel struct {
 	cur  int
 	top  int // tree scroll offset
 
+	// singleFile is true when root itself is a guarded regular file (a
+	// file-vault resource) rather than a directory: there is nothing to
+	// browse, so the tree is a single, childless row and save() writes
+	// in place instead of through the tree editor's usual temp-file+rename
+	// (see writeFileInPlace).
+	singleFile bool
+
 	mode fileEditMode
 
 	editor    textarea.Model
@@ -127,10 +134,12 @@ type fileEditModel struct {
 	status string
 }
 
-// RunFileEditor opens a full-screen, two-pane editor rooted at root (a
-// directory that must already be unlocked). It returns when the editor is
-// closed; nothing about the fscrypt state is changed, so the caller must
-// re-lock the vault afterwards.
+// RunFileEditor opens a full-screen editor rooted at root, which must already
+// be unlocked/plaintext. root is usually a directory (the two-pane tree
+// browser); when it is a single guarded regular file (a file-vault resource)
+// the tree is skipped and the editor opens straight on that one file. It
+// returns when the editor is closed; nothing about the fscrypt state is
+// changed, so the caller must re-lock the vault afterwards.
 func RunFileEditor(root string) error {
 	m := newFileEditModel(root)
 	prog := tea.NewProgram(m, tea.WithAltScreen())
@@ -145,7 +154,6 @@ func newFileEditModel(root string) *fileEditModel {
 		name = root
 	}
 	m := &fileEditModel{
-		root:   &fileNode{path: root, name: name, isDir: true, open: true},
 		width:  80,
 		height: 24,
 		leftW:  40,
@@ -158,11 +166,30 @@ func newFileEditModel(root string) *fileEditModel {
 	m.editor.KeyMap.WordBackward.SetKeys("ctrl+left", "alt+left", "alt+b")
 	m.editor.KeyMap.WordForward.SetKeys("ctrl+right", "alt+right", "alt+f")
 	m.editor.Blur()
-	m.status = "loading " + root
-	if err := m.loadChildren(m.root); err != nil {
-		m.status = "error: " + err.Error()
+
+	// A single-file resource has nothing to browse — os.ReadDir(root) on a
+	// regular file fails outright ("open root: not a directory"), which is
+	// exactly the bug this branch fixes. Lstat, not Stat: a symlinked root
+	// is refused by enterEditor below, never silently followed.
+	info, statErr := os.Lstat(root)
+	if statErr == nil && info.Mode().IsRegular() {
+		m.singleFile = true
+		m.root = &fileNode{path: root, name: name, loaded: true}
+	} else {
+		m.root = &fileNode{path: root, name: name, isDir: true, open: true}
+		m.status = "loading " + root
+		if err := m.loadChildren(m.root); err != nil {
+			m.status = "error: " + err.Error()
+		}
 	}
 	m.rebuild()
+	if m.singleFile {
+		// Nothing to navigate to first: open straight into the editor,
+		// exactly like pressing enter on the single row would.
+		if err := m.enterEditor(); err != nil {
+			m.status = "error: " + err.Error()
+		}
+	}
 	m.refit() // sane geometry for the first frame, before the WindowSizeMsg
 	return m
 }
@@ -591,7 +618,17 @@ func (m *fileEditModel) save() error {
 	if m.editPath == "" {
 		return nil
 	}
-	if err := writeFileKeepMeta(m.editPath, []byte(m.editor.Value())); err != nil {
+	// A single-file resource's parent directory is itself guarded against
+	// anything created or renamed beside it (the same "rename-over-
+	// watchroot" defense CLAUDE.md calls out) — writeFileKeepMeta's usual
+	// temp-sibling + rename would be denied there. writeFileInPlace rewrites
+	// the file's existing inode directly, same as every other in-place
+	// unlock/lock in this codebase.
+	writer := writeFileKeepMeta
+	if m.singleFile {
+		writer = writeFileInPlace
+	}
+	if err := writer(m.editPath, []byte(m.editor.Value())); err != nil {
 		return err
 	}
 	m.original = m.editor.Value()
@@ -615,6 +652,10 @@ func (m *fileEditModel) savePending() {
 func (m *fileEditModel) beginCreate(kind fileKind) {
 	n := m.selected()
 	if n == nil {
+		return
+	}
+	if n == m.root && !n.isDir {
+		m.status = "cannot create inside a single-file resource"
 		return
 	}
 	dir := n.path
