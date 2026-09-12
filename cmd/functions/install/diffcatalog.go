@@ -95,8 +95,10 @@ func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error
 
 	// deploy writes the config only after ConfirmOverwrite, runs the eBPF
 	// preflight, and (re)starts the daemon — its own failure modes already
-	// leave the box in a documented state, so surface them as-is.
-	if deployErr := deploy(securedText, mergedCfg); deployErr != nil {
+	// leave the box in a documented state, so surface them as-is. --diff-catalog
+	// never touches the edit-protected password (an existing hash file, if
+	// any, is untouched and self-guarded again by the restarted daemon).
+	if deployErr := deploy(securedText, mergedCfg, ""); deployErr != nil {
 		return deployErr
 	}
 	if cleanErr := cleanOrphanedFscrypt(mergedCfg); cleanErr != nil {

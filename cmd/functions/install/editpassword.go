@@ -8,13 +8,15 @@ import (
 
 	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
-	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
 // promptEditPassword offers the optional edit-protected authentication
-// password. It is collected here but persisted only as the very last install
-// action (finalizeEditPassword), so an aborted install never leaves a
-// dangling hash file. Returns "" when the user declines.
+// password. It is collected here but persisted only by writeEditPasswordHash,
+// called from deploy() right before the daemon's first start — after every
+// step that could still abort the install (services, config, eBPF preflight)
+// but before there is a running daemon to reload, so an aborted install never
+// leaves a dangling hash file AND the very first start already self-guards it
+// (no SIGHUP needed afterward). Returns "" when the user declines.
 func promptEditPassword(cfg *daemonconfig.Config) (string, error) {
 	anyEncrypted := false
 	for i := range cfg.Resources {
@@ -47,11 +49,16 @@ func promptEditPassword(cfg *daemonconfig.Config) (string, error) {
 	return editprotected.PromptNewPassword()
 }
 
-// finalizeEditPassword is the very last install step: persist the
-// edit-protected password hash (0600 root, origin=install) and, when the
-// daemon is already running, reload it so its self-protection guard covers
-// the new file and the control socket comes up.
-func finalizeEditPassword(password string) error {
+// writeEditPasswordHash persists the edit-protected password hash (0600
+// root, origin=install), or is a no-op when no password was collected.
+// Called from deploy(), after installServices/installConfig/
+// preflightDeployedBinary have all succeeded but BEFORE systemd.EnableAndVerify
+// brings up the daemon for the first time: the daemon isn't running yet, so
+// there is no self-guard on /etc/app-listener to fight with, and that first
+// Start() picks up the hash file directly — no SIGHUP reload required
+// afterward (that used to re-attach every guard a second time on every
+// fresh install).
+func writeEditPasswordHash(password string) error {
 	if password == "" {
 		log.Infof("no edit-protected password set — live edit-protected is disabled "+
 			"(add one later with `sudo app-listener edit-protected --set-password`); %s not created", editprotected.HashFile)
@@ -64,14 +71,6 @@ func finalizeEditPassword(password string) error {
 	if err := editprotected.WriteHashFile(hashed); err != nil {
 		return fmt.Errorf("writing %s: %w", editprotected.HashFile, err)
 	}
-	log.Infof("edit-protected password hash written to %s (0600, root) — this was the final install step", editprotected.HashFile)
-
-	if systemd.IsDaemonActive() {
-		log.Info("reloading the daemon so it self-guards the password file and opens the control socket ...")
-		if err := systemd.ReloadDaemonIfActive(); err != nil {
-			return fmt.Errorf("password saved but reloading the daemon failed (%w) — run: sudo systemctl reload %s",
-				err, systemd.DaemonServiceName)
-		}
-	}
+	log.Infof("edit-protected password hash written to %s (0600, root)", editprotected.HashFile)
 	return nil
 }

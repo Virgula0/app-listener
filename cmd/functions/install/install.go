@@ -184,14 +184,15 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Collected now, persisted last (finalizeEditPassword): an aborted
-	// install must never leave a dangling password hash.
+	// Collected now, persisted inside deploy() — only once every step that
+	// could still abort the install has succeeded, and only just before the
+	// daemon's first start (see writeEditPasswordHash).
 	editPassword, err := promptEditPassword(cfg)
 	if err != nil {
 		return err
 	}
 
-	if err := deploy(cfgText, cfg); err != nil {
+	if err := deploy(cfgText, cfg, editPassword); err != nil {
 		return err
 	}
 
@@ -199,12 +200,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := cleanupBackups(cfg); err != nil {
-		return err
-	}
-
-	// The very last install action.
-	return finalizeEditPassword(editPassword)
+	return cleanupBackups(cfg)
 }
 
 // runMaintenanceMode dispatches the mutually exclusive maintenance flags,
@@ -413,20 +409,21 @@ var installedBinaryPath = systemd.InstallBinaryPath
 //
 // Why this matters: when a binary is already installed, the full wizard
 // deliberately leaves it untouched (see ensureInstalledBinary) and, at
-// deploy(), restarts the daemon on that SAME already-installed binary. The
-// wizard's very last step, finalizeEditPassword, then writes
-// /etc/app-listener/edit-auth.hash while that daemon is running and
-// self-guarding it — but the self-guard's allow only ever trusts the exact
-// on-disk file the daemon exec'd, never a same-name/same-content binary
-// running elsewhere (that would be a bypass of the "identity is dev:ino,
-// never path/name" invariant). Running the wizard from a freshly rebuilt
-// standalone binary on a machine that already has a (older, or just
+// deploy(), restarts the daemon on that SAME already-installed binary — every
+// self-guard decision downstream (config, fscrypt key, edit-auth hash) trusts
+// the exact on-disk file the daemon exec'd, never a same-name/same-content
+// binary running elsewhere (that would be a bypass of the "identity is
+// dev:ino, never path/name" invariant). Running the wizard from a freshly
+// rebuilt standalone binary on a machine that already has a (older, or just
 // different) binary installed is a real and easy-to-hit case of this — the
-// two are different files even though they're "the same app-listener" —
-// and it used to surface only at the very end, as a confusing "operation
-// not permitted" after backups, fscrypt migration and the config editor had
-// already run. os.SameFile compares dev:ino, matching the guard's own
-// notion of identity exactly.
+// two are different files even though they're "the same app-listener" — and
+// it used to surface only at the very end, as a confusing "operation not
+// permitted" writing the edit-protected password hash after backups, fscrypt
+// migration and the config editor had already run (that specific write now
+// happens before the daemon's first start — see writeEditPasswordHash — but
+// the identity mismatch is still a real footgun for other self-guarded
+// writes, so this check stays). os.SameFile compares dev:ino, matching the
+// guard's own notion of identity exactly.
 func checkRunningBinaryMatchesInstalled() error {
 	installedInfo, err := os.Stat(installedBinaryPath)
 	if err != nil {
@@ -535,7 +532,12 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 // Existing files are diffed: identical ones stay, differing ones show the
 // diff and ask; a changed config reaches a running daemon via SIGHUP. cfg is
 // the parsed config (its resource paths drive the ssh-agent-unit question).
-func deploy(cfgText string, cfg *daemonconfig.Config) error {
+// editPassword (possibly "") is persisted via writeEditPasswordHash right
+// before EnableAndVerify's first start on a fresh install: every step above
+// that could still abort has already succeeded, and the daemon is not
+// running yet, so that first start already self-guards the hash file and
+// opens the control socket — no follow-up SIGHUP reload needed.
+func deploy(cfgText string, cfg *daemonconfig.Config, editPassword string) error {
 	if err := installServices(cfg); err != nil {
 		return err
 	}
@@ -544,6 +546,9 @@ func deploy(cfgText string, cfg *daemonconfig.Config) error {
 		return err
 	}
 	if err := preflightDeployedBinary(); err != nil {
+		return err
+	}
+	if err := writeEditPasswordHash(editPassword); err != nil {
 		return err
 	}
 	if err := systemd.EnableAndVerify(configChanged); err != nil {

@@ -194,8 +194,9 @@ func startPprof(addr string) {
 //     guards themselves are pinned, so the trees stay enforced regardless;
 //     this is about locking the vault key promptly, under the same secure
 //     lockdown a clean stop uses.)
-//   - SIGHUP: `install` can send a reload (finalizeEditPassword / a config
-//     refresh) within a second or two of starting the daemon, well before
+//   - SIGHUP: `edit-protected --set-password` or a catalog refresh (a
+//     package-manager hook, `install --update-catalog-only --live`) can send
+//     a reload within a second or two of starting the daemon, well before
 //     guard construction finishes on a slow/hardened kernel. SIGHUP's
 //     default disposition is also to TERMINATE the process — until this
 //     call, nothing has asked Go to handle it — so a reload landing
