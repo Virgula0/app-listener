@@ -743,10 +743,14 @@ func lockOneRoot(vault *fscrypt.Vault, root string) bool {
 // under root's pinned guard first when root is a file-vault (regular file)
 // target and rec names a usable recovered pin generation (rec.Gen == ""
 // means recoverPinState found nothing safe to act on — no record, or the
-// record's PID still looks alive). Directories, and a file root that turns
-// out to already be locked (see lockFileInPlace's read-only fast path — the
-// widen is requested regardless, but only ever matters when a write is
-// actually attempted), need no widening at all. A widen that fails
+// record's PID still looks alive). Directories, and a file root that is
+// already locked, need no widening at all — the already-locked check comes
+// first specifically to skip it: a graceful shutdown always locks and
+// unpins the resource itself (see Guard.cleanup/unpinSelfMaps) before
+// ExecStopPost's `--lockdown` (or relockStaleVaults) ever runs, so in the
+// overwhelmingly common case the pinned map is already gone and widening
+// would only fail to find it — a confusing warning for a resource that was
+// never actually left unlocked. A widen that DOES run and fails
 // structurally (pin missing/foreign/not-GUARD_ALLOW_ROOT — see
 // guard.WithPinnedSelfVaultAccess) falls back to the plain attempt: no worse
 // than before this recovery path existed.
@@ -756,6 +760,9 @@ func lockRootRecovering(vault *fscrypt.Vault, root, resourcePath, pinBase string
 	}
 	info, statErr := os.Stat(root)
 	if statErr != nil || !info.Mode().IsRegular() {
+		return lockOneRoot(vault, root)
+	}
+	if alreadyLocked, encErr := vault.IsEncrypted(root); encErr == nil && alreadyLocked {
 		return lockOneRoot(vault, root)
 	}
 
