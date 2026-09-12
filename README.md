@@ -215,7 +215,9 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 
 **`scripts/install.sh`** (the `curl … | sudo bash` one-liner) — runs `check-compatibility` and aborts if it fails; downloads the latest release of `--channel` (`release` [default] / `prerelease`) from GitHub; verifies the Ed25519 signature of the checksum against the embedded release key, the checksum against the binary, and the GitHub asset digest; then atomically installs `/usr/local/sbin/app-listener` + the PATH symlink. It does **not** install the daemon — it prints the reminder to run `sudo app-listener install` yourself.
 
-**install** — TUI wizard, in safe order: stop a running daemon → build → generate the fscrypt key (existing kept) → pick users → probe a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypt selected directories (backup first, verified against the master key) → deploy systemd units, the package-manager catalog-refresh hook, per-user ssh-agent unit, binary and config.
+**install** — TUI wizard, in safe order: stop a running daemon → build → generate the fscrypt key (existing kept) → pick users → probe a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypt selected directories (backup first, verified against the master key) → deploy systemd units, the package-manager catalog-refresh hook, binary and config. The per-user ssh-agent unit is offered only when that user's `~/.ssh` ends up guarded (one question per user, naming the user and the unit path); skipped entirely otherwise.
+
+**install --diff-catalog** — the *incremental* wizard: after a catalog update or a newly installed app, it lists the critical directories that now exist on the host but are **not** yet in `daemon.conf`, lets you pick which to add in the same picker as the full install, appends them to the config and encrypts them (backup first) — every existing section is left byte-for-byte intact. Stops the daemon for the cycle, restarts it on the merged config. `--update-catalog-only` refreshes existing sections' whitelists; `--diff-catalog` adds new sections — run both to fully re-sync. Requires a previous installation; interactive only.
 
 **install --update-catalog-only** (the package hooks + the boot-time unit) — re-expands every catalog-matched whitelist and rewrites the config. Default: stops the daemon, unlocks each vault under an ephemeral self-only guard. `--live` (daemon running): no stop, no lock churn — applied via SIGHUP. It runs automatically from:
 > - **pacman** — `/etc/pacman.d/hooks/50-app-listener-reload.hook` (`PostTransaction`);
@@ -228,9 +230,9 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 > ```
 > The catalog narrows watches for these apps: only the sensitive subtrees are guarded (Discord's `Local Storage/`, `Cookies`, …), the vault root the updater writes to stays unguarded.
 >
-> **fscrypt prerequisite**: each filesystem must be initialized (`sudo fscrypt setup --all-users`) and support encryption (ext4: `sudo tune2fs -O encrypt <dev>`). The installer verifies this before asking anything.
+> **fscrypt prerequisite**: each filesystem must be initialized (`fscrypt setup --all-users`) and support encryption (ext4: `tune2fs -O encrypt <dev>`). The installer checks this before migrating anything and, for a fixable gap, shows the exact command + reason and offers to run it for you (it is already root) — decline and it aborts, as before. Every command it may run is listed in `internal/fscrypt/prereq.go`.
 
-**uninstall** — refuses while the daemon runs; re-scans the catalog; decrypts in place by default; deletes the master key only with `--delete-key`.
+**uninstall** — refuses while the daemon runs; re-scans the catalog; decrypts in place by default; deletes the master key only with `--delete-key`; at the end, lists any `.app_listener.backup` migration copies and offers to delete them (all preselected, one confirmation — plain unencrypted copies, harmless to keep).
 
 **update** — self-updates from the latest signed `pre-YYYYMMDD-<sha>` GitHub pre-release (Ed25519 signature + checksum + asset digest all verified before anything is written).
 

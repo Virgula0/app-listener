@@ -13,6 +13,44 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
+// TestOfferSSHAgentUnitsNoGuardedSSH: when no user's ~/.ssh is in the
+// config, the ssh-agent step is a silent no-op — no prompt, no error.
+func TestOfferSSHAgentUnitsNoGuardedSSH(t *testing.T) {
+	cfgText := "[watch]\npath = " + t.TempDir() + "\nneed_encryption: false\n"
+	cfg, err := validateConfigText(cfgText)
+	if err != nil {
+		t.Fatalf("parsing config: %v", err)
+	}
+	if err := offerSSHAgentUnits(cfg); err != nil {
+		t.Errorf("offerSSHAgentUnits must be a no-op when no ~/.ssh is guarded: %v", err)
+	}
+}
+
+// TestGroupCandidates verifies the installer collapses the per-path
+// candidates of one resource (issue #51) into a single TUI group, ordered
+// by first appearance, and that selecting a group yields every path.
+func TestGroupCandidates(t *testing.T) {
+	u := inst.User{Name: "alice", Home: "/home/alice"}
+	cands := []inst.Candidate{
+		{User: u, Entry: inst.CandidateDir{Name: "Claude Code"}, Path: "/home/alice/.claude"},
+		{User: u, Entry: inst.CandidateDir{Name: "SSH"}, Path: "/home/alice/.ssh"},
+		{User: u, Entry: inst.CandidateDir{Name: "Claude Code"}, Path: "/home/alice/.config/claude"},
+	}
+	groups := groupCandidates(cands)
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups, want 2: %+v", len(groups), groups)
+	}
+	if len(groups[0].candidates) != 2 || groups[0].candidates[1].Path != "/home/alice/.config/claude" {
+		t.Errorf("Claude Code group not merged in order: %+v", groups[0].candidates)
+	}
+	if !strings.Contains(groups[0].label, "[2 locations]") || !strings.Contains(groups[0].label, "(user alice)") {
+		t.Errorf("group label = %q", groups[0].label)
+	}
+	if len(groups[1].candidates) != 1 || strings.Contains(groups[1].label, "locations]") {
+		t.Errorf("single-path group should not show a location count: %q", groups[1].label)
+	}
+}
+
 // TestEnsureInstalledBinary is the regression test for issue #44: the wizard
 // never recompiles. A missing binary is deployed by copying the running
 // executable into place; an already-installed binary is left untouched.
@@ -48,6 +86,55 @@ func TestEnsureInstalledBinary(t *testing.T) {
 	}
 }
 
+// TestCheckRunningBinaryMatchesInstalled covers the three outcomes of the
+// wizard's binary-identity preflight: nothing installed yet (defer to
+// ensureInstalledBinary), the installed binary IS this process's own exe
+// (same inode — the normal "install via the deployed symlink" case), and a
+// DIFFERENT file at the install path (a freshly rebuilt standalone binary
+// run against an existing install) — the exact scenario that used to fail
+// only at the very last wizard step, inside finalizeEditPassword, with a
+// confusing "operation not permitted".
+func TestCheckRunningBinaryMatchesInstalled(t *testing.T) {
+	orig := installedBinaryPath
+	defer func() { installedBinaryPath = orig }()
+
+	dir := t.TempDir()
+	installedBinaryPath = filepath.Join(dir, "app-listener")
+
+	if err := checkRunningBinaryMatchesInstalled(); err != nil {
+		t.Fatalf("nothing installed yet should be a no-op: %v", err)
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(self); resolveErr == nil {
+		self = resolved
+	}
+
+	if err := os.Link(self, installedBinaryPath); err != nil {
+		t.Skipf("cannot hard-link the test binary into %s (%v) — likely a cross-device temp dir", dir, err)
+	}
+	if err := checkRunningBinaryMatchesInstalled(); err != nil {
+		t.Fatalf("installed binary is this same file (same inode): %v", err)
+	}
+	if err := os.Remove(installedBinaryPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(installedBinaryPath, []byte("a different binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = checkRunningBinaryMatchesInstalled()
+	if err == nil {
+		t.Fatal("expected an error for an installed binary that is not this process's own exe")
+	}
+	if !strings.Contains(err.Error(), "install --binary-only") {
+		t.Errorf("error should point at the fix (install --binary-only / app-listener update): %v", err)
+	}
+}
+
 // TestAskEncryptionSkipsNeedEncryptionFalse verifies that a resource
 // declared need_encryption: false in the config never triggers the
 // encryption question: the directory is not added to toEncrypt, the config
@@ -77,12 +164,13 @@ func TestAskEncryptionSkipsNeedEncryptionFalse(t *testing.T) {
 	}
 }
 
-// TestAskFilesystemsReadyNoPanic is a regression test for the preflight
+// TestCollectFilesystemPrereqsNoPanic is a regression test for the preflight
 // added with the fscrypt setup check: statting a real directory must not
 // panic (os.Stat returns *syscall.Stat_t, and the preflight must accept
-// exactly that type). The helper must return either nil (host filesystem
-// is already initialized for fscrypt) or the classified setup error.
-func TestAskFilesystemsReadyNoPanic(t *testing.T) {
+// exactly that type). The pure collector must return either no prerequisites
+// (host filesystem is already ready), a slice of runnable Prereq commands,
+// or a terminal classified error — never panic.
+func TestCollectFilesystemPrereqsNoPanic(t *testing.T) {
 	dir := t.TempDir()
 
 	cfgText := "[watch]\npath = " + dir + "\nneed_encryption: true\n"
@@ -91,9 +179,39 @@ func TestAskFilesystemsReadyNoPanic(t *testing.T) {
 		t.Fatalf("parsing config: %v", err)
 	}
 
-	if err := askFilesystemsReady(fscrypt.New(), cfg); err != nil &&
-		!strings.Contains(err.Error(), "fscrypt setup") {
-		t.Errorf("unexpected error from preflight: %v", err)
+	prereqs, err := collectFilesystemPrereqs(fscrypt.New(), cfg)
+	if err != nil && !strings.Contains(err.Error(), "fscrypt") {
+		t.Errorf("unexpected error from prereq collection: %v", err)
+	}
+	for _, p := range prereqs {
+		if len(p.Argv) == 0 || p.Title == "" || p.Reason == "" {
+			t.Errorf("malformed prereq: %+v", p)
+		}
+	}
+}
+
+// TestCollectFilesystemPrereqsSkipsRegularFiles: a single-file resource is
+// encrypted by the package's own userspace vault, never the kernel fscrypt
+// ioctl (FS_IOC_SET_ENCRYPTION_POLICY cannot target a standalone regular
+// file — see internal/fscrypt/filevault.go), so it must never generate a
+// `tune2fs`/`fscrypt setup` prerequisite.
+func TestCollectFilesystemPrereqsSkipsRegularFiles(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "registry.vdf")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := "[watch]\npath = " + file + "\nneed_encryption: true\n"
+	cfg, err := validateConfigText(cfgText)
+	if err != nil {
+		t.Fatalf("parsing config: %v", err)
+	}
+
+	prereqs, err := collectFilesystemPrereqs(fscrypt.New(), cfg)
+	if err != nil {
+		t.Fatalf("collectFilesystemPrereqs on a regular-file resource must never error: %v", err)
+	}
+	if len(prereqs) != 0 {
+		t.Errorf("regular-file resource produced prerequisites: %+v", prereqs)
 	}
 }
 

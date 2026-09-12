@@ -98,6 +98,125 @@ func TestWriteFileKeepMetaRefusesSymlink(t *testing.T) {
 	}
 }
 
+func TestWriteFileInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.vdf")
+	if err := os.WriteFile(path, []byte("old content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := inodeOf(t, path)
+
+	if err := writeFileInPlace(path, []byte("new")); err != nil {
+		t.Fatalf("writeFileInPlace: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new" {
+		t.Errorf("content = %q, want %q", data, "new")
+	}
+	if got := inodeOf(t, path); got != before {
+		t.Errorf("writeFileInPlace changed the inode: %d -> %d", before, got)
+	}
+}
+
+func TestWriteFileInPlaceRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileInPlace(link, []byte("hijack")); err == nil {
+		t.Fatal("writing through a symlink was not refused")
+	}
+}
+
+func inodeOf(t *testing.T, path string) uint64 {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("Stat_t unavailable on this platform")
+	}
+	return st.Ino
+}
+
+// TestFileEditModelSingleFileTarget is the regression test for the bug where
+// RunFileEditor/newFileEditModel unconditionally treated root as a
+// directory: os.ReadDir on a single guarded regular file (a file-vault
+// resource, e.g. registry.vdf) failed outright with "open root: not a
+// directory" before the editor ever opened. A single-file root must skip
+// the tree entirely, open straight into the editor, and save in place —
+// never through the tree editor's usual temp-file + rename (which a
+// single-file watch root's guard denies, since it also protects its own
+// parent directory against anything created or renamed beside it).
+func TestFileEditModelSingleFileTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.vdf")
+	if err := os.WriteFile(path, []byte("original content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := inodeOf(t, path)
+
+	m := newFileEditModel(path)
+	if !m.singleFile {
+		t.Fatal("singleFile must be true for a regular-file root")
+	}
+	if m.mode != modeEdit {
+		t.Fatalf("mode = %v, want modeEdit (opened straight into the editor)", m.mode)
+	}
+	if got := m.editor.Value(); got != "original content" {
+		t.Errorf("editor = %q, want the file content", got)
+	}
+	if len(m.rows) != 1 || m.rows[0] != m.root {
+		t.Fatalf("rows = %v, want exactly [root] (nothing to browse)", m.rows)
+	}
+
+	m.editor.SetValue("edited content")
+	updateKey(m, "ctrl+s")
+	if m.mode != modeNav {
+		t.Fatalf("after save, mode = %v, want modeNav", m.mode)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "edited content" {
+		t.Errorf("file on disk = %q, want edited content", data)
+	}
+	if got := inodeOf(t, path); got != before {
+		t.Errorf("save changed the file's inode (must be in-place, never rename): %d -> %d", before, got)
+	}
+}
+
+// TestFileEditModelSingleFileCreateRefused: "a"/"A" would otherwise
+// dereference the (nil) parent of a single-file root's node.
+func TestFileEditModelSingleFileCreateRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.vdf")
+	if err := os.WriteFile(path, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := newFileEditModel(path)
+	// enterEditor() at construction leaves the model in modeEdit; back out
+	// to modeNav first, same as pressing esc, to reach the create keys.
+	m.mode = modeNav
+	m.editor.Blur()
+
+	m.beginCreate(createFile)
+	if m.mode == modeInput {
+		t.Fatal("beginCreate must refuse to enter input mode for a single-file resource")
+	}
+	if !strings.Contains(m.status, "single-file") {
+		t.Errorf("status = %q, want a message about single-file resources", m.status)
+	}
+}
+
 func TestFileEditNavigateAndEdit(t *testing.T) {
 	root := testTree(t)
 	m := newFileEditModel(root)

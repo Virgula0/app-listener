@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
@@ -19,12 +18,13 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/repository"
 	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // pickUsers asks which local users the installation should protect. Every
 // user (root included) is preselected; root's /root is probed like any
-// other user, but no ssh-agent unit is installed for root (see
-// installSSHAgent).
+// other user. The per-user ssh-agent unit is offered later, and only for a
+// user whose ~/.ssh ends up guarded (see offerSSHAgentUnits).
 func pickUsers() ([]inst.User, error) {
 	users, err := inst.ListUsers()
 	if err != nil {
@@ -38,9 +38,6 @@ func pickUsers() ([]inst.User, error) {
 	for i := range users {
 		u := &users[i]
 		label := fmt.Sprintf("%s (uid %d, home %s)", u.Name, u.UID, u.Home)
-		if u.UID == 0 {
-			label += " — no ssh-agent unit will be installed"
-		}
 		opts = append(opts, huh.NewOption(label, *u).Selected(true))
 	}
 	var picked []inst.User
@@ -52,17 +49,60 @@ func pickUsers() ([]inst.User, error) {
 			Height(10).
 			Value(&picked),
 	))
-	if err := form.WithKeyMap(selectionKeymap()).Run(); err != nil {
+	if err := form.WithKeyMap(wizard.MultiSelectKeymap()).Run(); err != nil {
 		return nil, err
 	}
 	if len(picked) == 0 {
 		return nil, fmt.Errorf("no users selected")
 	}
-	selectedUsers = picked
 	for i := range picked {
 		log.Infof("protecting user %s (home %s)", picked[i].Name, picked[i].Home)
 	}
 	return picked, nil
+}
+
+// catalogGroup bundles every discovered path of one resource (one catalog
+// Name, one user) behind a single TUI checkbox — a resource stored in more
+// than one location (Steam's data dir + legacy home) is selected as a unit.
+type catalogGroup struct {
+	label      string
+	candidates []inst.Candidate
+}
+
+// groupCandidates collapses the per-path candidates into per-resource
+// groups, preserving first-seen order.
+func groupCandidates(cands []inst.Candidate) []catalogGroup {
+	type key struct{ name, user string }
+	var order []key
+	byKey := map[key][]int{}
+	for i := range cands {
+		k := key{cands[i].Entry.Name, cands[i].User.Name}
+		if _, ok := byKey[k]; !ok {
+			order = append(order, k)
+		}
+		byKey[k] = append(byKey[k], i)
+	}
+	out := make([]catalogGroup, 0, len(order))
+	for _, k := range order {
+		idxs := byKey[k]
+		cs := make([]inst.Candidate, 0, len(idxs))
+		paths := make([]string, 0, len(idxs))
+		for _, i := range idxs {
+			cs = append(cs, cands[i])
+			paths = append(paths, cands[i].Path)
+		}
+		label := k.name
+		if k.user != "" {
+			label = fmt.Sprintf("%s (user %s)", k.name, k.user)
+		}
+		if len(paths) == 1 {
+			label += "  " + paths[0]
+		} else {
+			label += fmt.Sprintf("  [%d locations] %s", len(paths), strings.Join(paths, ", "))
+		}
+		out = append(out, catalogGroup{label: label, candidates: cs})
+	}
+	return out
 }
 
 // pickDirectories probes the catalog for every selected user (and the
@@ -74,35 +114,42 @@ func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 		log.Warn("no catalog directories found for the selected users — you can still add directories manually")
 		return nil, nil
 	}
+	picked, err := pickFromCandidates(candidates,
+		"Critical directories found — select the ones to protect",
+		"Only existing paths are listed. All are preselected. A resource stored in several locations is one entry. Whitelisted binaries per directory are curated and minimal.")
+	if err != nil {
+		return nil, err
+	}
+	if len(picked) == 0 {
+		log.Warn("no catalog directories selected — you can still add directories manually")
+	}
+	return picked, nil
+}
 
-	opts := make([]huh.Option[int], 0, len(candidates))
-	for i := range candidates {
-		c := &candidates[i]
-		label := fmt.Sprintf("%s  %s", c.Entry.Name, c.Path)
-		if c.User.Name != "" {
-			label = fmt.Sprintf("%s (user %s)  %s", c.Entry.Name, c.User.Name, c.Path)
-		}
-		opts = append(opts, huh.NewOption(label, i).Selected(true))
+// pickFromCandidates groups the candidates per resource (one checkbox per
+// catalog Name + user) and runs the preselected multi-select, returning the
+// flattened per-path candidates of every picked group.
+func pickFromCandidates(candidates []inst.Candidate, title, description string) ([]inst.Candidate, error) {
+	groups := groupCandidates(candidates)
+	opts := make([]huh.Option[int], 0, len(groups))
+	for i := range groups {
+		opts = append(opts, huh.NewOption(groups[i].label, i).Selected(true))
 	}
 	var pickedIdx []int
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewMultiSelect[int]().
-			Title("Critical directories found — select the ones to protect").
-			Description("Only existing paths are listed. All are preselected. Whitelisted binaries per directory are curated and minimal.").
+			Title(title).
+			Description(description).
 			Options(opts...).
 			Height(12).
 			Value(&pickedIdx),
 	))
-	if err := form.WithKeyMap(selectionKeymap()).Run(); err != nil {
+	if err := form.WithKeyMap(wizard.MultiSelectKeymap()).Run(); err != nil {
 		return nil, err
 	}
 	var picked []inst.Candidate
 	for _, i := range pickedIdx {
-		picked = append(picked, candidates[i])
-	}
-	if len(picked) == 0 {
-		log.Warn("no catalog directories selected — you can still add directories manually")
-		return nil, nil
+		picked = append(picked, groups[i].candidates...)
 	}
 	for i := range picked {
 		c := &picked[i]
@@ -110,22 +157,6 @@ func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 		log.Infof("will protect %s (%s) — %d whitelisted binaries", c.Path, c.Entry.Name, len(allowed))
 	}
 	return picked, nil
-}
-
-// selectionKeymap customizes the multi-select keys used by the user and
-// directory pickers: Ctrl+K selects/deselects all entries, space/x selects
-// one entry at a time. The legend at the bottom of the field shows both.
-// It must be applied to the Form (not the field): NewForm overwrites
-// every field's keymap with the form default.
-func selectionKeymap() *huh.KeyMap {
-	keys := huh.NewDefaultKeyMap()
-	keys.MultiSelect.SelectAll = key.NewBinding(
-		key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "select/deselect all"))
-	keys.MultiSelect.SelectNone = key.NewBinding(
-		key.WithKeys("ctrl+k"), key.WithHelp("ctrl+k", "select/deselect all"))
-	keys.MultiSelect.Toggle = key.NewBinding(
-		key.WithKeys(" ", "x"), key.WithHelp("space/x", "select one"))
-	return keys
 }
 
 // addManualDirectories asks for additional paths that were not discovered
@@ -174,11 +205,10 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 	}
 }
 
-// editConfig renders the config from the selected candidates and opens the
-// embedded editor. The user's version is validated with the real parser;
-// an invalid config re-opens the editor until it parses or the user
-// aborts.
-func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, error) {
+// sectionsFromCandidates turns discovered/added candidates into config
+// sections: the filtered whitelist, encryption on by default, and any
+// grouped extra watch sub-paths from the catalog entry.
+func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
 	for i := range candidates {
 		c := &candidates[i]
@@ -189,10 +219,24 @@ func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, erro
 			ExtraWatchPaths: c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name),
 		})
 	}
-	confText := inst.GenerateConf(sections)
+	return sections
+}
 
+// editConfig renders the config from the selected candidates and opens the
+// embedded editor.
+func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, error) {
+	return runConfigEditor(
+		"app-listener daemon.conf — review and save (Ctrl+S)",
+		inst.GenerateConf(sectionsFromCandidates(candidates)))
+}
+
+// runConfigEditor opens initial in the embedded editor and validates the
+// result through the same strict parser the daemon uses; an invalid config
+// re-opens the editor until it parses or the user aborts (Esc).
+func runConfigEditor(title, initial string) (string, *daemonconfig.Config, error) {
+	confText := initial
 	for {
-		edited, err := inst.EditText("app-listener daemon.conf — review and save (Ctrl+S)", confText)
+		edited, err := inst.EditText(title, confText)
 		if err != nil {
 			return "", nil, fmt.Errorf("config editing aborted: %w", err)
 		}
@@ -288,12 +332,13 @@ func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Confi
 
 // resolveCatalogEntry performs a reverse lookup: given an absolute path from
 // the existing daemon.conf, finds which Catalog entry it originated from.
-// System-level entries (AbsPath) are matched by exact path. User-level
-// entries (RelPath) are matched by computing PathFor for each known user.
-// Grouped entries (WatchRelPaths) also match their watch sub-paths — e.g.
-// ~/.config/discord/Local Storage resolves to the Discord entry — so a
-// refresh re-expands the whitelist of every grouped section. Returns nil
-// when the section was user-added and has no catalog origin.
+// System-level entries (AbsPaths) are matched by exact path. User-level
+// entries (RelPaths) are matched by computing PathsFor for each known user —
+// any of an entry's locations matches its shared whitelist. Grouped entries
+// (WatchRelPaths) also match their watch sub-paths — e.g. ~/.config/discord/
+// Local Storage resolves to the Discord entry — so a refresh re-expands the
+// whitelist of every grouped section. Returns nil when the section was
+// user-added and has no catalog origin.
 func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
 	if entry, user := findCatalogRoot(resourcePath, users); entry != nil {
 		return entry, user
@@ -301,21 +346,34 @@ func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.Candidat
 	return findCatalogWatchSubPath(resourcePath, users)
 }
 
-// findCatalogRoot matches the entry's own watch root exactly.
+// catalogEntryMatch returns the user whose expansion of entry contains a
+// path satisfying match, or nil. System entries yield the zero user.
+func catalogEntryMatch(entry *inst.CandidateDir, users []inst.User, match func(catalogPath string) bool) *inst.User {
+	if entry.IsSystem() {
+		for _, p := range entry.PathsFor("", "") {
+			if match(p) {
+				return &inst.User{}
+			}
+		}
+		return nil
+	}
+	for j := range users {
+		u := &users[j]
+		for _, p := range entry.PathsFor(u.Home, u.Name) {
+			if match(p) {
+				return u
+			}
+		}
+	}
+	return nil
+}
+
+// findCatalogRoot matches one of the entry's own watch roots exactly.
 func findCatalogRoot(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
 	for i := range inst.Catalog {
 		entry := &inst.Catalog[i]
-		if entry.AbsPath != "" {
-			if entry.AbsPath == resourcePath {
-				return entry, &inst.User{}
-			}
-			continue
-		}
-		for j := range users {
-			u := &users[j]
-			if entry.PathFor(u.Home, u.Name) == resourcePath {
-				return entry, u
-			}
+		if u := catalogEntryMatch(entry, users, func(p string) bool { return p == resourcePath }); u != nil {
+			return entry, u
 		}
 	}
 	return nil, nil
@@ -327,17 +385,8 @@ func findCatalogRoot(resourcePath string, users []inst.User) (*inst.CandidateDir
 func findCatalogWatchSubPath(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
 	for i := range inst.Catalog {
 		entry := &inst.Catalog[i]
-		if entry.AbsPath != "" {
-			if isInsidePath(resourcePath, entry.AbsPath) {
-				return entry, &inst.User{}
-			}
-			continue
-		}
-		for j := range users {
-			u := &users[j]
-			if isInsidePath(resourcePath, entry.PathFor(u.Home, u.Name)) {
-				return entry, u
-			}
+		if u := catalogEntryMatch(entry, users, func(p string) bool { return isInsidePath(resourcePath, p) }); u != nil {
+			return entry, u
 		}
 	}
 	return nil, nil

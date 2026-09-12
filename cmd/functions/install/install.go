@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
-	"syscall"
 
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
@@ -31,6 +29,8 @@ func init() {
 		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon if its service is installed; no wizard, no config, no fscrypt, no systemd units")
 	InstallCmd.Flags().Bool("update-catalog-only", false,
 		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
+	InstallCmd.Flags().Bool("diff-catalog", false,
+		"Diff the catalog against the installed daemon.conf: list the critical directories that exist on the host but are not yet guarded, let you pick which to add, then append them to the config and encrypt them like a fresh install (existing sections untouched; stops the daemon for the cycle; requires a previous installation)")
 	InstallCmd.Flags().Bool("live", false,
 		"With --update-catalog-only: refresh the whitelists WITHOUT stopping the daemon (vaults are already unlocked and guarded by the running daemon; the config change is applied via SIGHUP reload). Requires the daemon to be running")
 	InstallCmd.Flags().BoolP("yes", "y", false,
@@ -60,6 +60,10 @@ The wizard walks through the whole installation:
      verifies every already-encrypted directory unlocks with the master
      key (a directory encrypted while declared need_encryption: false is
      a fatal error)
+  6b. checks each backing filesystem is fscrypt-ready; for a fixable gap
+     (missing 'encrypt' feature flag, no 'fscrypt setup') it shows the
+     exact command and its reason and offers to run it now as root —
+     declining aborts the install, just like the old hard error
   7. asks per-directory whether fscrypt encryption is required, but ONLY
      for directories that are not yet encrypted and declare
      need_encryption: true — need_encryption: false resources are skipped
@@ -76,7 +80,10 @@ The wizard walks through the whole installation:
      (/etc/apt/apt.conf.d); dnf/zypper are reported and left to the
      boot-time refresh. Already-installed files and an existing config are
      compared with the bundled ones: identical files are left alone,
-     differing ones show the diff in the TUI and ask whether to overwrite
+     differing ones show the diff in the TUI and ask whether to overwrite.
+     For every user whose ~/.ssh ends up guarded it asks (once per user,
+     naming the user and path) whether to install that user's per-user
+     ssh-agent systemd unit — declined or skipped when no ~/.ssh is guarded
   9. enables the daemon across reboots and ensures it is running, and
      enables app-listener-catalog-refresh.service — a boot-time --live
      catalog refresh that catches package changes made while no hook ran
@@ -120,7 +127,17 @@ Use --update-catalog-only to refresh the whitelist of every guarded
 directory from the catalog: encrypted vaults are unlocked, glob patterns
 are re-expanded (picking up new binaries and dropping deleted ones),
 and the diff is shown before overwriting. User-added sections (not in
-the catalog) are preserved as-is. Requires a previous installation.`,
+the catalog) are preserved as-is. Requires a previous installation.
+
+Use --diff-catalog to add directories the catalog now discovers but the
+installed daemon.conf does not yet guard (a catalog update, or a newly
+installed application): the missing critical directories are listed in the
+same picker as the wizard, the selected ones are appended to the config
+and encrypted like a fresh install, and every existing section is left
+byte-for-byte intact. It stops the daemon for the cycle and restarts it on
+the merged config. Requires a previous installation. Unlike
+--update-catalog-only this never touches existing sections' whitelists —
+run both to fully re-sync.`,
 	Args: cobra.NoArgs,
 	RunE: runInstall,
 }
@@ -136,6 +153,10 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 	if done {
 		return nil
+	}
+
+	if err := checkRunningBinaryMatchesInstalled(); err != nil {
+		return err
 	}
 
 	// The daemon holds open the files being reconfigured and would keep
@@ -170,7 +191,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := deploy(cfgText); err != nil {
+	if err := deploy(cfgText, cfg); err != nil {
 		return err
 	}
 
@@ -195,6 +216,7 @@ type maintenanceFlags struct {
 	deleteBackup  bool
 	binaryOnly    bool
 	updateCatalog bool
+	diffCatalog   bool
 	live          bool
 	autoConfirm   bool
 }
@@ -214,6 +236,9 @@ func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
 	if f.updateCatalog, err = cmd.Flags().GetBool("update-catalog-only"); err != nil {
 		return f, err
 	}
+	if f.diffCatalog, err = cmd.Flags().GetBool("diff-catalog"); err != nil {
+		return f, err
+	}
 	if f.live, err = cmd.Flags().GetBool("live"); err != nil {
 		return f, err
 	}
@@ -228,20 +253,8 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
-		return false, errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
-	}
-	if f.live && !f.updateCatalog {
-		return false, errors.New("--live can only be used with --update-catalog-only")
-	}
-	modes := 0
-	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.updateCatalog} {
-		if on {
-			modes++
-		}
-	}
-	if modes > 1 {
-		return false, errors.New("--restore-backups, --delete-post-backups, --binary-only and --update-catalog-only are mutually exclusive")
+	if err := validateMaintenanceFlags(f); err != nil {
+		return false, err
 	}
 	switch {
 	case f.restore:
@@ -252,8 +265,32 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 		return true, installBinaryOnly()
 	case f.updateCatalog:
 		return true, runUpdateCatalogOnly(f.autoConfirm, f.live)
+	case f.diffCatalog:
+		return true, runDiffCatalog()
 	}
 	return false, nil
+}
+
+// validateMaintenanceFlags rejects flag combinations the maintenance modes
+// do not support: --yes / --live outside their owning modes, and more than
+// one mutually exclusive mode at once.
+func validateMaintenanceFlags(f maintenanceFlags) error {
+	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
+		return errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
+	}
+	if f.live && !f.updateCatalog {
+		return errors.New("--live can only be used with --update-catalog-only")
+	}
+	modes := 0
+	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.updateCatalog, f.diffCatalog} {
+		if on {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return errors.New("--restore-backups, --delete-post-backups, --binary-only, --update-catalog-only and --diff-catalog are mutually exclusive")
+	}
+	return nil
 }
 
 // installBinaryOnly deploys only the freshly built binary (see
@@ -368,6 +405,60 @@ func prepareInstallation() error {
 // package var so tests can point it at a temp file.
 var installedBinaryPath = systemd.InstallBinaryPath
 
+// checkRunningBinaryMatchesInstalled fails fast, before the interactive
+// wizard runs, when this executable is not the one already deployed at
+// installedBinaryPath (identity is inode-based, exactly what the daemon's
+// self-guard checks — see ensureInstalledBinary below and
+// internal/guard.WithSelfAllowBinary).
+//
+// Why this matters: when a binary is already installed, the full wizard
+// deliberately leaves it untouched (see ensureInstalledBinary) and, at
+// deploy(), restarts the daemon on that SAME already-installed binary. The
+// wizard's very last step, finalizeEditPassword, then writes
+// /etc/app-listener/edit-auth.hash while that daemon is running and
+// self-guarding it — but the self-guard's allow only ever trusts the exact
+// on-disk file the daemon exec'd, never a same-name/same-content binary
+// running elsewhere (that would be a bypass of the "identity is dev:ino,
+// never path/name" invariant). Running the wizard from a freshly rebuilt
+// standalone binary on a machine that already has a (older, or just
+// different) binary installed is a real and easy-to-hit case of this — the
+// two are different files even though they're "the same app-listener" —
+// and it used to surface only at the very end, as a confusing "operation
+// not permitted" after backups, fscrypt migration and the config editor had
+// already run. os.SameFile compares dev:ino, matching the guard's own
+// notion of identity exactly.
+func checkRunningBinaryMatchesInstalled() error {
+	installedInfo, err := os.Stat(installedBinaryPath)
+	if err != nil {
+		return nil //nolint:nilerr // nothing installed yet: ensureInstalledBinary deploys this exact binary next
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		return nil //nolint:nilerr // best-effort: let the wizard proceed and surface any real error itself
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(self); resolveErr == nil {
+		self = resolved
+	}
+	selfInfo, err := os.Stat(self)
+	if err != nil {
+		return nil //nolint:nilerr // same reasoning
+	}
+
+	if os.SameFile(selfInfo, installedInfo) {
+		return nil
+	}
+	return fmt.Errorf(
+		"this binary (%s) is not the one already installed at %s — `install` leaves an existing binary "+
+			"untouched (see `install --binary-only` / `app-listener update`), so the daemon that comes back "+
+			"up during this wizard would still be running the OLD binary. Its self-protection only trusts "+
+			"its own on-disk file, so the wizard's last step (writing the edit-protected password hash) "+
+			"would fail with a confusing \"operation not permitted\" after everything else already ran.\n"+
+			"Run 'sudo %s install --binary-only' (or 'app-listener update') first to deploy this binary and "+
+			"restart the daemon on it, then re-run 'sudo app-listener install'",
+		self, installedBinaryPath, self)
+}
+
 // ensureInstalledBinary makes sure the app-listener binary is deployed at its
 // service path. An existing binary is left untouched — upgrades go through
 // `install --binary-only` or `app-listener update`, which also restart the
@@ -427,7 +518,7 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 	if err := verifyEncryptionState(vault, cfg); err != nil {
 		return "", err
 	}
-	if err := askFilesystemsReady(vault, cfg); err != nil {
+	if err := resolveFilesystemPrereqs(vault, cfg); err != nil {
 		return "", err
 	}
 	updated, toEncrypt, err := askEncryption(vault, cfgText, cfg)
@@ -440,38 +531,12 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 	return updated, nil
 }
 
-// askFilesystemsReady fails fast on filesystems lacking `fscrypt setup`,
-// before any prompting; dedup by device verifies each fs exactly once.
-// Grouped sections are checked once, at their encryption root (the fscrypt
-// lifecycle is per vault root, and every watch sub-path lives on it).
-func askFilesystemsReady(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
-	var checkedDevs []uint64
-	for _, r := range cfg.EncryptionGroups() {
-		if !r.NeedEncryption {
-			continue
-		}
-		root := r.EncryptionRootOrPath()
-		info, statErr := os.Stat(root)
-		if statErr != nil {
-			return fmt.Errorf("stat %s: %w", root, statErr)
-		}
-		dev := info.Sys().(*syscall.Stat_t).Dev
-		if slices.Contains(checkedDevs, dev) {
-			continue
-		}
-		checkedDevs = append(checkedDevs, dev)
-		if readyErr := vault.CheckFilesystemReady(root); readyErr != nil {
-			return readyErr
-		}
-	}
-	return nil
-}
-
 // deploy installs services/hook, copies binary+config, enables the daemon.
 // Existing files are diffed: identical ones stay, differing ones show the
-// diff and ask; a changed config reaches a running daemon via SIGHUP.
-func deploy(cfgText string) error {
-	if err := installServices(); err != nil {
+// diff and ask; a changed config reaches a running daemon via SIGHUP. cfg is
+// the parsed config (its resource paths drive the ssh-agent-unit question).
+func deploy(cfgText string, cfg *daemonconfig.Config) error {
+	if err := installServices(cfg); err != nil {
 		return err
 	}
 	configChanged, err := installConfig(cfgText)

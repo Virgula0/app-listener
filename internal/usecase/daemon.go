@@ -3,6 +3,7 @@ package usecase
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -148,6 +149,56 @@ func uniqueEncryptionRoots(resources []daemonconfig.Resource) []string {
 	return roots
 }
 
+// partitionEncryptionRoots splits roots into fscrypt directories and
+// file-vault regular files. Used only to sequence startGuards' unlock pass
+// into two explicit phases — directories (unchanged kernel-keyring cycle)
+// then files (in-place, same-inode cycle, see internal/fscrypt/filevault.go)
+// — so the two different unlock mechanisms, and that neither can affect the
+// other's guard state, is visible by inspection. Each Vault.Unlock call is
+// independently safe regardless of interleaving; this split is a clarity
+// and auditability choice, not a correctness requirement. A stat failure
+// (e.g. the root does not exist yet) falls into dirs, matching the
+// pre-partition behavior of just calling Unlock and letting it report the
+// real error.
+func partitionEncryptionRoots(roots []string) (dirs, files []string) {
+	for _, root := range roots {
+		if info, err := os.Stat(root); err == nil && info.Mode().IsRegular() {
+			files = append(files, root)
+			continue
+		}
+		dirs = append(dirs, root)
+	}
+	return dirs, files
+}
+
+// vaultOpForGuard runs a Vault.Unlock/Lock call on root, temporarily
+// widening g's self-access when root is a file-vault target (see
+// guard.WithSelfVaultAccess) — a directory root's fscrypt lifecycle never
+// touches file content (pure kernel-keyring operations), so it always runs
+// unwidened. g may be nil (no guard found for root): op still runs, so the
+// real (denied) error surfaces instead of a silent skip.
+func vaultOpForGuard(g repository.GuardRepository, root string, op func() error) error {
+	info, statErr := os.Stat(root)
+	if statErr != nil || !info.Mode().IsRegular() || g == nil {
+		return op()
+	}
+	return g.WithSelfVaultAccess(op)
+}
+
+// vaultOpOnRoot is vaultOpForGuard, looking the guard up by encryption root
+// in resources/guards (index-aligned — Reload enforces this, and
+// d.resources/d.guards always are). A regular-file resource is never
+// grouped (WatchRelPaths targets directories only), so exactly one
+// resource/guard matches a file root — no ambiguity to resolve.
+func vaultOpOnRoot(resources []daemonconfig.Resource, guards []repository.GuardRepository, root string, op func() error) error {
+	for i := range resources {
+		if encryptionRootOf(&resources[i]) == root {
+			return vaultOpForGuard(guards[i], root, op)
+		}
+	}
+	return vaultOpForGuard(nil, root, op)
+}
+
 // verifyEncryptionStates checks every resource's encryption state against its
 // need_encryption setting before anything is unlocked or protected: a misconfigured
 // resource aborts the start.
@@ -175,8 +226,22 @@ func (d *daemonUseCase) startGuards() error {
 
 	// Grouped watch paths share one encryption root: the key is provisioned
 	// exactly once per vault (unlock is vault-wide by fscrypt semantics).
-	for _, root := range uniqueEncryptionRoots(d.resources) {
+	// Directories and file-vault regular files are unlocked in two explicit
+	// passes (see partitionEncryptionRoots) — guards for BOTH kinds are
+	// already attached at this point (built before Start), so there is no
+	// unlocked-and-unprotected window for either. A file root's guard self
+	// access is widened only for the call itself (vaultOpOnRoot ->
+	// guard.WithSelfVaultAccess): the in-place unlock reads+rewrites the
+	// file's own bytes, which the guard's baseline self mask (open/read/stat
+	// only) does not permit.
+	dirRoots, fileRoots := partitionEncryptionRoots(uniqueEncryptionRoots(d.resources))
+	for _, root := range dirRoots {
 		if err := d.vault.Unlock(root); err != nil {
+			return fmt.Errorf("unlocking %s: %w", root, err)
+		}
+	}
+	for _, root := range fileRoots {
+		if err := vaultOpOnRoot(d.resources, d.guards, root, func() error { return d.vault.Unlock(root) }); err != nil {
 			return fmt.Errorf("unlocking %s: %w", root, err)
 		}
 	}
@@ -291,7 +356,7 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	}
 
 	if d.stopping {
-		d.rollbackReload(guards, nil)
+		d.rollbackReload(resources, guards, nil)
 		return fmt.Errorf("daemon: reload refused: shutdown in progress — restart the daemon to apply the new configuration")
 	}
 
@@ -309,7 +374,7 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 		}
 	}
 	if len(removed) > 0 {
-		d.rollbackReload(guards, nil)
+		d.rollbackReload(resources, guards, nil)
 		return fmt.Errorf("reload refused: %v would be left unlocked and unprotected — stop the daemon, edit the config, and start it again to drop them", removed)
 	}
 
@@ -322,8 +387,8 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	// committed yet, so errors roll back (detach new guards, re-lock unlocks).
 	// Guards were attached by the caller: unlocks always have live protection.
 	var unlocked []string
-	if err := d.prepareNewResources(resources, oldByPath, &unlocked); err != nil {
-		d.rollbackReload(guards, unlocked)
+	if err := d.prepareNewResources(resources, guards, oldByPath, &unlocked); err != nil {
+		d.rollbackReload(resources, guards, unlocked)
 		return err
 	}
 
@@ -331,13 +396,13 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	// readable — no protection gap), then resolve deferred entries and
 	// re-sync: same fail-closed ordering as startup.
 	if err := d.prepareGuards(resources, guards); err != nil {
-		d.rollbackReload(guards, unlocked)
+		d.rollbackReload(resources, guards, unlocked)
 		return err
 	}
 
 	// Phase 3 — start new guards' ringbuf readers; old guards stay attached.
 	if err := d.startNewGuards(guards); err != nil {
-		d.rollbackReload(guards, unlocked)
+		d.rollbackReload(resources, guards, unlocked)
 		return err
 	}
 
@@ -349,19 +414,20 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 
 // prepareNewResources validates and unlocks resources new to the configuration; kept
 // resources are untouched. Each unlock is recorded so rollback can lock it back.
-func (d *daemonUseCase) prepareNewResources(resources []daemonconfig.Resource, oldByPath map[string]int, unlocked *[]string) error {
+// resources/guards are index-aligned (Reload enforces this).
+func (d *daemonUseCase) prepareNewResources(resources []daemonconfig.Resource, guards []repository.GuardRepository, oldByPath map[string]int, unlocked *[]string) error {
 	for i := range resources {
 		if _, existed := oldByPath[resources[i].Path]; existed {
 			continue
 		}
-		if err := d.prepareAddedResource(&resources[i], unlocked); err != nil {
+		if err := d.prepareAddedResource(&resources[i], guards[i], unlocked); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (d *daemonUseCase) prepareAddedResource(r *daemonconfig.Resource, unlocked *[]string) error {
+func (d *daemonUseCase) prepareAddedResource(r *daemonconfig.Resource, g repository.GuardRepository, unlocked *[]string) error {
 	// Grouped watch paths share the group's encryption root: the vault-level
 	// checks and the unlock target the root, and the rollback re-locks roots.
 	root := encryptionRootOf(r)
@@ -383,7 +449,7 @@ func (d *daemonUseCase) prepareAddedResource(r *daemonconfig.Resource, unlocked 
 	if provisioned {
 		return nil
 	}
-	if err := d.vault.Unlock(root); err != nil {
+	if err := vaultOpForGuard(g, root, func() error { return d.vault.Unlock(root) }); err != nil {
 		return fmt.Errorf("reload: unlocking %s: %w", root, err)
 	}
 	*unlocked = append(*unlocked, root)
@@ -430,13 +496,13 @@ func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards 
 // needs no extra locking. The retry budget is bounded — unlike Stop —
 // because rollback runs on the SIGHUP handler, which must keep serving
 // signals.
-func (d *daemonUseCase) rollbackReload(guards []repository.GuardRepository, unlocked []string) {
+func (d *daemonUseCase) rollbackReload(resources []daemonconfig.Resource, guards []repository.GuardRepository, unlocked []string) {
 	if len(unlocked) > 0 {
 		pending := append([]string(nil), unlocked...)
 		for round := 0; round < maxRollbackLockRounds && len(pending) > 0; round++ {
 			var still []string
 			for _, path := range pending {
-				if err := d.lockWithRetry(path); err != nil {
+				if err := d.lockWithRetry(resources, guards, path); err != nil {
 					log.Errorf("daemon: rollback: %s is still unlocked: %v", path, err)
 					still = append(still, path)
 				}
@@ -503,7 +569,7 @@ func (d *daemonUseCase) Stop() {
 
 		// First pass: remove the key where possible.
 		for _, root := range roots {
-			if err := d.vault.Lock(root, false); err != nil && !errors.Is(err, repository.ErrKeyMissing) {
+			if err := vaultOpOnRoot(resources, guards, root, func() error { return d.vault.Lock(root, false) }); err != nil && !errors.Is(err, repository.ErrKeyMissing) {
 				log.Warnf("daemon: first-pass lock of %s: %v", root, err)
 			}
 		}
@@ -511,7 +577,7 @@ func (d *daemonUseCase) Stop() {
 		// Second pass: force-flush with EBUSY retries; ENOKEY (ErrKeyMissing) counts
 		// as success. Busy resources retry forever — detaching guards here would leave
 		// the tree unlocked and unguarded, so shutdown never gives up.
-		d.lockUntilAllKeyless(roots)
+		d.lockUntilAllKeyless(resources, guards, roots)
 
 		for _, g := range guards {
 			g.Stop()
@@ -531,11 +597,11 @@ func (d *daemonUseCase) Stop() {
 // lockUntilAllKeyless retries the force-flush lock until every resource is keyless; it
 // never returns while one is unlocked — guards stay attached denying all access, so the
 // tree is never unprotected and shutdown just waits for file pins to close.
-func (d *daemonUseCase) lockUntilAllKeyless(pending []string) {
+func (d *daemonUseCase) lockUntilAllKeyless(resources []daemonconfig.Resource, guards []repository.GuardRepository, pending []string) {
 	for len(pending) > 0 {
 		var still []string
 		for _, path := range pending {
-			if err := d.lockWithRetry(path); err != nil {
+			if err := d.lockWithRetry(resources, guards, path); err != nil {
 				log.Errorf("daemon: %s is still unlocked: a process holds open files in it (investigate with: lsof +D %s, fuser -v %s): %v",
 					path, path, path, err)
 				still = append(still, path)
@@ -550,9 +616,9 @@ func (d *daemonUseCase) lockUntilAllKeyless(pending []string) {
 	}
 }
 
-func (d *daemonUseCase) lockWithRetry(path string) error {
+func (d *daemonUseCase) lockWithRetry(resources []daemonconfig.Resource, guards []repository.GuardRepository, path string) error {
 	for i := 0; i < maxLockRetries; i++ {
-		err := d.vault.Lock(path, true)
+		err := vaultOpOnRoot(resources, guards, path, func() error { return d.vault.Lock(path, true) })
 		if err == nil || errors.Is(err, repository.ErrKeyMissing) {
 			log.Infof("daemon: locked fscrypt directory fully: %s", path)
 			return nil

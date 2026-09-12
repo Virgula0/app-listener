@@ -374,6 +374,8 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 			failedRequired)
 	}
 
+	g.pinSelfMaps()
+
 	log.Infof("guard created \u2014 %d/%d LSM hooks attached, watching: %s (%s)",
 		len(g.links), total, path, modeString(mode))
 	return g, nil
@@ -426,6 +428,60 @@ func (g *Guard) attachHooks() (failedRequired []string, total int) {
 // PinDegraded reports that link pinning was requested for this guard but the
 // kernel refused it: enforcement is live but will not survive a SIGKILL.
 func (g *Guard) PinDegraded() bool { return g.pinDegraded }
+
+// ExeActionsPinName / ExeEventsPinName are the fixed suffixes pinSelfMaps
+// pins guard_exe_actions / guard_exe_events under (g.pinPrefix + suffix) —
+// exported so a SEPARATE process with no live Guard object (`daemon
+// --lockdown`, see cmd/functions/daemon/daemon.go) can compute the exact
+// same pin paths and reopen just these two maps, nothing else.
+const (
+	ExeActionsPinName = "exe-actions"
+	ExeEventsPinName  = "exe-events"
+)
+
+// pinSelfMaps pins guard_exe_actions and guard_exe_events (the maps a
+// GUARD_ALLOW_ROOT self-access widen/restore touches) alongside the LSM
+// links, when this guard has a self binary registered and pinning is
+// enabled. This exists for exactly one external consumer: `daemon
+// --lockdown` needs to widen a file-vault resource's self-access to lock it
+// in place after a crash left it still unlocked, from a fresh process with
+// no live Guard object — only the pinned maps this guard left behind. A pin
+// failure is logged but not fatal to guard startup: it only means that one
+// recovery path is unavailable later, not that this guard fails to enforce.
+func (g *Guard) pinSelfMaps() {
+	if g.pinPrefix == "" || !g.selfKeySet {
+		return
+	}
+	for _, spec := range []struct {
+		name string
+		m    *cilium.Map
+	}{
+		{ExeActionsPinName, g.objs.GuardExeActions},
+		{ExeEventsPinName, g.objs.GuardExeEvents},
+	} {
+		if err := spec.m.Pin(g.pinPrefix + spec.name); err != nil {
+			log.Errorf("guard %s: pinning %s failed (%v) — 'daemon --lockdown' will not be able to widen "+
+				"self-access here if the daemon crashes while this resource is unlocked", g.path, spec.name, err)
+		}
+	}
+}
+
+// unpinSelfMaps removes the map pins pinSelfMaps created, on a clean
+// shutdown (cleanup means this guard is going away for good — see Stop):
+// like the LSM links, a pin is meant to outlive only an UNCLEAN death, never
+// a graceful stop. Best-effort; a leftover pin file is retired later by
+// CleanupStalePins regardless.
+func (g *Guard) unpinSelfMaps() {
+	if g.pinPrefix == "" || !g.selfKeySet {
+		return
+	}
+	for _, name := range []string{ExeActionsPinName, ExeEventsPinName} {
+		if err := os.Remove(g.pinPrefix + name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Errorf("guard %s: removing pinned %s failed (%v) — remove it manually under %s*",
+				g.path, name, err, g.pinPrefix)
+		}
+	}
+}
 
 func guardLSMHooks(g *Guard) []struct {
 	prog *cilium.Program
@@ -622,6 +678,170 @@ func (g *Guard) RevokeSelfEditAccess() error {
 	}
 	g.selfGranted = false
 	return restoreErr
+}
+
+// vaultAccessEvents is the minimal self mask the fscrypt file-vault's
+// in-place unlock/lock needs on its OWN watched path (internal/fscrypt/
+// filevault.go): open, read and stat to load the current content, write —
+// the BPF file_truncate hook checks EVENT_WRITE, not a distinct truncate
+// event — to transform it in place. Deliberately narrower than
+// editGrantEvents: no delete/rename/mkdir/mknod/attr, since the in-place
+// transform never does any of those to the watched path itself (it only
+// ever truncates and rewrites the SAME existing file).
+var vaultAccessEvents = []ebpf.EventType{
+	ebpf.EventOpen, ebpf.EventRead, ebpf.EventWrite, ebpf.EventStat,
+}
+
+// WithSelfVaultAccess widens this guard's root-gated self binary mask to
+// vaultAccessEvents for the duration of fn, then unconditionally restores
+// the baseline mask — even if fn returns an error. The baseline self mask
+// (open/read/stat only, see WithSelfAllowBinary) is enough for the daemon's
+// normal directory-based fscrypt lifecycle (pure kernel-keyring operations
+// that never touch file content) but not for a single-file resource: its
+// vault unlock/lock must read and rewrite the file's own bytes on the
+// SAME guarded path, which the baseline mask does not permit — without
+// this, the daemon's own process is denied by its own guard.
+//
+// Deliberately separate from GrantSelfEditAccess/RevokeSelfEditAccess (a
+// broader, session-scoped grant for interactive, user-authenticated
+// edit-protected use): keeping the two independent means neither's log
+// trail is polluted by the other, and a routine vault unlock at boot can
+// never be mistaken for (or widen the window of) a live edit-protected
+// grant. Whitelist / read-only mode only (the only modes with a self
+// binary registered); returns fn's error, or a wrap error if no self
+// binary is registered at all.
+func (g *Guard) WithSelfVaultAccess(fn func() error) error {
+	g.selfGrantMu.Lock()
+	defer g.selfGrantMu.Unlock()
+
+	g.mu.Lock()
+	key, ok := g.selfKey, g.selfKeySet
+	base := append([]ebpf.EventType(nil), g.selfEvents...)
+	g.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("guard %s: no self binary registered — cannot grant vault access", g.path)
+	}
+
+	mask, err := eventMask(vaultAccessEvents)
+	if err != nil {
+		return err
+	}
+	if err := g.objs.GuardExeEvents.Put(key, mask); err != nil {
+		return fmt.Errorf("guard %s: widening self vault mask: %w", g.path, err)
+	}
+	defer func() {
+		var restoreErr error
+		if len(base) == 0 {
+			if derr := g.objs.GuardExeEvents.Delete(key); derr != nil && !errors.Is(derr, cilium.ErrKeyNotExist) {
+				restoreErr = derr
+			}
+		} else if baseMask, merr := eventMask(base); merr != nil {
+			restoreErr = merr
+		} else if perr := g.objs.GuardExeEvents.Put(key, baseMask); perr != nil {
+			restoreErr = perr
+		}
+		if restoreErr != nil {
+			log.Errorf("guard %s: restoring self baseline mask after vault access: %v — self access may be left WIDENED until the next restart", g.path, restoreErr)
+		}
+	}()
+
+	return fn()
+}
+
+// WithPinnedSelfVaultAccess is WithSelfVaultAccess for a process with NO live
+// *Guard object at all — specifically `daemon --lockdown`, the systemd
+// ExecStopPost safety net: it runs as a brand-new process after the daemon
+// that owned a file-vault resource has already exited (cleanly, crashed,
+// SIGKILLed, or OOM-killed), and must still be able to lock that resource in
+// place if the daemon died before locking it itself. There is nothing to
+// call a method on — only the pinned guard_exe_actions / guard_exe_events
+// maps that instance's pinSelfMaps left on bpffs (see pinPrefix, the same
+// prefix guard.PinPrefix(base, gen, resourcePath) computes for its LSM
+// links).
+//
+// pinPrefix must be exactly that prefix (base+gen+resource-hash) for the
+// resource being locked; the caller is responsible for knowing gen (see the
+// daemon's pin-state file, cmd/functions/daemon/pinstate.go, for how
+// `--lockdown` recovers it).
+//
+// Security invariants — deliberately mirroring the "NO bypass" requirement
+// this function exists under:
+//
+//   - The self-key (the caller's own executable's inode) is ALWAYS computed
+//     internally via infrastructure.StatInode("/proc/self/exe"); it is never
+//     accepted as a parameter, so nothing external can ever pick which inode
+//     gets widened.
+//   - Before touching the event mask at all, the self-key's existing entry in
+//     the pinned guard_exe_actions map must already read GUARD_ALLOW_ROOT.
+//     This function only ever WIDENS a pre-existing root-gated grant that a
+//     live guard itself created; it can never manufacture a new one — if the
+//     pin is missing, unreadable, or the key is not already GUARD_ALLOW_ROOT,
+//     it refuses and returns an error without touching guard_exe_events.
+//   - The mask is restored to exactly what it was before this call (read
+//     first, restored via defer) even if fn fails — never left widened
+//     longer than this one call.
+//   - Even on total failure to restore, the pinned maps are transient state
+//     scoped to one dead daemon generation: the next daemon start always
+//     retires them via CleanupStalePins (gen changes every start), which
+//     bounds the worst-case exposure window to "until the next restart"
+//     (RestartSec=2s in the systemd unit) regardless of what happens here.
+func WithPinnedSelfVaultAccess(pinPrefix string, fn func() error) error {
+	if pinPrefix == "" {
+		return errors.New("no pin prefix given — cannot widen a self grant that was never pinned")
+	}
+
+	dev, ino, err := ebpf.StatInode("/proc/self/exe")
+	if err != nil {
+		return fmt.Errorf("resolving own executable: %w", err)
+	}
+	key := GuardInodeKey{Dev: dev, Ino: ino}
+
+	actions, err := cilium.LoadPinnedMap(pinPrefix+ExeActionsPinName, nil)
+	if err != nil {
+		return fmt.Errorf("loading pinned %s (was this resource's guard ever pinned?): %w", ExeActionsPinName, err)
+	}
+	defer actions.Close()
+
+	var action uint8
+	if lookupErr := actions.Lookup(key, &action); lookupErr != nil {
+		return fmt.Errorf("this process is not the registered self binary for the pinned guard at %s: %w", pinPrefix, lookupErr)
+	}
+	if action != GUARD_ALLOW_ROOT {
+		return fmt.Errorf("refusing to widen: self key is not GUARD_ALLOW_ROOT in the pinned guard at %s (got action %d)", pinPrefix, action)
+	}
+
+	events, err := cilium.LoadPinnedMap(pinPrefix+ExeEventsPinName, nil)
+	if err != nil {
+		return fmt.Errorf("loading pinned %s: %w", ExeEventsPinName, err)
+	}
+	defer events.Close()
+
+	var baseMask uint32
+	hadBase := events.Lookup(key, &baseMask) == nil // absent baseline means "all events allowed" (whitelist mode's convention)
+
+	widened, err := eventMask(vaultAccessEvents)
+	if err != nil {
+		return err
+	}
+	if putErr := events.Put(key, widened); putErr != nil {
+		return fmt.Errorf("widening pinned self vault mask at %s: %w", pinPrefix, putErr)
+	}
+	defer func() {
+		var restoreErr error
+		if !hadBase {
+			if derr := events.Delete(key); derr != nil && !errors.Is(derr, cilium.ErrKeyNotExist) {
+				restoreErr = derr
+			}
+		} else if perr := events.Put(key, baseMask); perr != nil {
+			restoreErr = perr
+		}
+		if restoreErr != nil {
+			log.Errorf("lockdown: restoring pinned self baseline mask at %s failed (%v) — left WIDENED; "+
+				"the next daemon start's CleanupStalePins will retire this pin regardless", pinPrefix, restoreErr)
+		}
+	}()
+
+	return fn()
 }
 
 // addBinaryEvents stores per-binary allowed-event bitmasks in guard_exe_events for binaries with an explicit
@@ -1557,6 +1777,7 @@ func (g *Guard) cleanup() {
 		l.Close()
 	}
 	g.links = nil
+	g.unpinSelfMaps()
 	g.objs.Close()
 }
 

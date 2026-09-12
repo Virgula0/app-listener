@@ -22,9 +22,10 @@ import (
 )
 
 var (
-	amd64Bin          string
-	netTesterAmd64Bin string
-	guardTestAmd64Bin string
+	amd64Bin            string
+	netTesterAmd64Bin   string
+	guardTestAmd64Bin   string
+	fscryptTestAmd64Bin string
 )
 
 // hostInfraBindPaths are host binaries that the LSM network guard blocks in
@@ -71,6 +72,7 @@ func TestMain(m *testing.M) {
 	amd64Bin = absPath("../build/test/app-listener-amd64")
 	netTesterAmd64Bin = absPath("../build/test/net_tester-amd64")
 	guardTestAmd64Bin = absPath("../build/test/guard-amd64")
+	fscryptTestAmd64Bin = absPath("../build/test/fscrypt-amd64")
 
 	// The daemon mode links fscrypt, which needs cgo (mlock), so a pure-Go
 	// CGO_ENABLED=0 build no longer compiles. The binary must stay static
@@ -110,6 +112,25 @@ func TestMain(m *testing.M) {
 	cmdGuardTest.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	if err := cmdGuardTest.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build guard test binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	// The fscrypt TOCTOU tests need root plus real kernel fscrypt (a
+	// directory target) or the file-vault AEAD (a regular-file target) —
+	// production code the daemon itself links, exercised directly instead of
+	// reimplemented, exactly like guardTestAmd64Bin above. It links
+	// google/fscrypt, which needs cgo (mlock) — see CLAUDE.md's Build
+	// section — so unlike the guard test binary this one is built the same
+	// way as the main amd64 binary: CGO_ENABLED=1, statically linked so it
+	// runs against the container's older glibc.
+	cmdFscryptTest := exec.Command("go", "test", "-tags", "ci", "-c",
+		"-ldflags", "-linkmode external -extldflags -static",
+		"-o", fscryptTestAmd64Bin, "../internal/fscrypt/")
+	var fscryptBuildErr bytes.Buffer
+	cmdFscryptTest.Stderr = &fscryptBuildErr
+	cmdFscryptTest.Env = append(os.Environ(), "CGO_ENABLED=1", "GOOS=linux", "GOARCH=amd64")
+	if err := cmdFscryptTest.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build fscrypt test binary: %v\n%s\n", err, fscryptBuildErr.String())
 		os.Exit(1)
 	}
 

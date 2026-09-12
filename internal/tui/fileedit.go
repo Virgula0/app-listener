@@ -167,6 +167,39 @@ func writeFileKeepMeta(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
+// writeFileInPlace rewrites path's EXISTING inode directly — open, truncate,
+// write, fsync — never a temp file or a rename. Used only for a single-file
+// edit-protected resource (fileEditModel.singleFile): unlike a file nested
+// inside a guarded directory, a single-file watch root's own guard also
+// protects its parent directory against anything created or renamed beside
+// it (see guard_path_rename's destination-parent-directory check in
+// guard.bpf.c — the same "rename-over-watchroot" defense CLAUDE.md calls
+// out), so writeFileKeepMeta's temp-sibling dance is denied there. Mode and
+// ownership are left exactly as they are — there is no separate temp file
+// whose metadata could ever need copying onto the live one, unlike the
+// create-then-rename path.
+func writeFileInPlace(path string, data []byte) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to write through symlink %s", path)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.WriteAt(data, 0); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
 // dirEntry is one row of the right-pane directory listing.
 type dirEntry struct {
 	name  string

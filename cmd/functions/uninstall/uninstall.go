@@ -15,6 +15,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
+	"github.com/Virgula0/app-listener/internal/backups"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/protected"
@@ -60,10 +61,13 @@ The wizard reverts everything the installer installed:
   6. deletes the fscrypt master key ONLY when --delete-key is passed; the
      default keeps it, because without it every still-encrypted directory
      can never be unlocked again
+  7. asks whether to delete the migration backups (.app_listener.backup):
+     the found ones are listed (all preselected) and, after one
+     confirmation, removed — they are plain unencrypted copies, so keeping
+     them is harmless but usually pointless once the daemon is gone
 
-Migration backups (the .app_listener.backup directories) are NOT touched:
-use 'app-listener install --restore-backups' / '--delete-post-backups'
-for those.
+To move a backup back over its directory instead of deleting it, use
+'app-listener install --restore-backups'.
 
 Aborting (Esc) any step cancels the uninstall; completed steps stay
 completed.`,
@@ -85,33 +89,16 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 
 	vault := fscrypt.New()
 
-	encrypted, err := protected.ScanEncryptedCatalogDirs(vault)
-	if err != nil {
+	if err := decryptStep(vault); err != nil {
 		return err
 	}
 
-	var decrypted []string
-	if len(encrypted) > 0 {
-		if err := protected.VerifyEncryptedKeys(vault, encrypted); err != nil {
-			return err
-		}
-		toDecrypt, err := pickDirsToDecrypt(encrypted)
-		if err != nil {
-			return err
-		}
-		if err := decryptDirectories(vault, toDecrypt); err != nil {
-			return err
-		}
-		decrypted = toDecrypt
-		log.Infof("permanently decrypted %d directory(ies)", len(decrypted))
-	}
-
-	// Decrypted dirs left orphaned /.fscrypt metadata behind; remove it
-	// while keeping the still-encrypted directories' metadata.
-	if len(decrypted) > 0 {
-		if err := cleanOrphanedMetadata(); err != nil {
-			return err
-		}
+	// Scan for migration backups while daemon.conf still exists (it names
+	// manually added directories the catalog does not); the prompt runs at
+	// the end, after revertSystemFiles.
+	backupEntries, err := backups.Find()
+	if err != nil {
+		return err
 	}
 
 	if err := revertSSHAgents(); err != nil {
@@ -130,8 +117,77 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 		log.Infof("keeping the fscrypt master key at %s (pass --delete-key to remove it)", fscrypt.MasterKeyFile)
 	}
 
+	if err := offerBackupCleanup(backupEntries); err != nil {
+		return err
+	}
+
 	log.Info("uninstall complete")
 	return nil
+}
+
+// offerBackupCleanup asks, at the end of the uninstall, whether to delete the
+// .app_listener.backup directories the install-time fscrypt migration left
+// behind. They are plain, unencrypted copies of the original directories —
+// keeping them after an uninstall is usually pointless but harmless, so the
+// user chooses (all preselected, one confirmation).
+func offerBackupCleanup(entries []backups.Backup) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	entries, err := backups.Select(entries,
+		"Migration backups found — select the ones to delete",
+		"Left by the install-time fscrypt migration: plain, unencrypted copies of the original directories. All are preselected; unselect any you want to keep.")
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		log.Info("keeping all migration backups")
+		return nil
+	}
+	ok, err := wizard.ConfirmOnce(fmt.Sprintf("Delete %d selected backup(s) permanently?", len(entries)), "Delete all")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		log.Info("keeping all migration backups")
+		return nil
+	}
+	if err := backups.Delete(entries); err != nil {
+		return err
+	}
+	log.Infof("deleted %d migration backup(s)", len(entries))
+	return nil
+}
+
+// decryptStep scans for fscrypt-encrypted catalog directories, verifies the
+// master key against each, asks per directory whether to permanently
+// decrypt, decrypts the confirmed ones, and cleans the fscrypt metadata
+// they orphan. A no-op when nothing is encrypted.
+func decryptStep(vault *fscrypt.Vault) error {
+	encrypted, scanErr := protected.ScanEncryptedCatalogDirs(vault)
+	if scanErr != nil {
+		return scanErr
+	}
+	if len(encrypted) == 0 {
+		return nil
+	}
+	if verifyErr := protected.VerifyEncryptedKeys(vault, encrypted); verifyErr != nil {
+		return verifyErr
+	}
+	toDecrypt, pickErr := pickDirsToDecrypt(encrypted)
+	if pickErr != nil {
+		return pickErr
+	}
+	if decErr := decryptDirectories(vault, toDecrypt); decErr != nil {
+		return decErr
+	}
+	if len(toDecrypt) == 0 {
+		return nil
+	}
+	log.Infof("permanently decrypted %d directory(ies)", len(toDecrypt))
+	// Decrypted dirs left orphaned /.fscrypt metadata behind; remove it
+	// while keeping the still-encrypted directories' metadata.
+	return cleanOrphanedMetadata()
 }
 
 // pickDirsToDecrypt confirms permanent decryption per encrypted dir (default: no).

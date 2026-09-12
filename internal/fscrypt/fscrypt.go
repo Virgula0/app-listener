@@ -104,8 +104,13 @@ func hasEncryptionPolicy(path string) (bool, error) {
 	return false, fmt.Errorf("ioctl GET_ENCRYPTION_POLICY_EX on %s: %w", path, errno)
 }
 
-// IsEncrypted reports whether path carries an fscrypt policy.
+// IsEncrypted reports whether path carries an fscrypt policy (directories),
+// or a file-vault header (regular files — see filevault.go for why a
+// standalone regular file cannot carry a real fscrypt policy at all).
 func (v *Vault) IsEncrypted(path string) (bool, error) {
+	if isRegularFileTarget(path) {
+		return isFileVaultCiphertext(path)
+	}
 	return hasEncryptionPolicy(path)
 }
 
@@ -284,8 +289,19 @@ func (v *Vault) verifyLockedFileKey(fsctx *actions.Context, path string) error {
 		fsctx.Mount.Path, MasterKeyFile, path)
 }
 
-// IsProvisioned reports whether the policy key for path is currently provisioned (unlocked).
+// IsProvisioned reports whether the policy key for path is currently
+// provisioned/unlocked (directories), or, for a regular file, whether its
+// current content is plaintext (the file-vault equivalent of "unlocked" —
+// there is no kernel keyring involved, so state is read straight off the
+// file's own bytes, same as IsEncrypted).
 func (v *Vault) IsProvisioned(path string) (bool, error) {
+	if isRegularFileTarget(path) {
+		ciphertext, err := isFileVaultCiphertext(path)
+		if err != nil {
+			return false, err
+		}
+		return !ciphertext, nil
+	}
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
 		return false, fmt.Errorf("fscrypt context for %s: %w", path, err)
@@ -301,18 +317,18 @@ func (v *Vault) IsProvisioned(path string) (bool, error) {
 }
 
 // CheckFilesystemReady verifies the filesystem backing path is initialized for fscrypt (`fscrypt setup`)
-// and actually has encryption enabled (the ext4 `encrypt` feature flag) — the fscrypt CLI's non-destructive
-// pre-check — so failures surface here instead of deep inside later policy creation.
+// and actually has encryption enabled (the ext4 `encrypt` feature flag) — a non-destructive pre-check —
+// so failures surface here instead of deep inside later policy creation. It reports the first unmet
+// prerequisite as an error naming the command that fixes it; the installer instead offers to run that
+// command (see FilesystemPrereqs).
 func (v *Vault) CheckFilesystemReady(path string) error {
-	mnt, err := filesystem.FindMount(path)
+	prereqs, err := v.FilesystemPrereqs(path)
 	if err != nil {
-		return fmt.Errorf("resolve filesystem of %s: %w", path, err)
+		return err
 	}
-	if err := mnt.CheckSetup(nil); err != nil {
-		return classifySetupError(path, err)
-	}
-	if err := mnt.CheckSupport(); err != nil {
-		return classifySupportError(path, err)
+	if len(prereqs) > 0 {
+		p := prereqs[0]
+		return fmt.Errorf("%s Run `%s` as root, then re-run the installer", p.Reason, p.Command())
 	}
 	return nil
 }
@@ -495,9 +511,13 @@ func newBoundedKeyFn(masterKey []byte) actions.KeyFunc {
 	}
 }
 
-// Unlock provisions the policy key of path so its contents become readable;
-// no-op when already provisioned by the target user.
+// Unlock provisions the policy key of path so its contents become readable
+// (directories), or, for a regular file, decrypts the file-vault ciphertext
+// in place (see filevault.go); no-op when already unlocked/plaintext.
 func (v *Vault) Unlock(path string) error {
+	if isRegularFileTarget(path) {
+		return v.unlockFileInPlace(path)
+	}
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
 		return fmt.Errorf("fscrypt context for %s: %w", path, err)
@@ -537,7 +557,14 @@ func (v *Vault) Unlock(path string) error {
 // Lock deprovisions the policy key of path; skipped when not provisioned by
 // the target user and forceFlush is false (already locked). Errors map onto
 // repository.ErrKeyBusy (retry) / repository.ErrKeyMissing (fully locked).
+// For a regular file it re-encrypts the file-vault content in place instead
+// (see filevault.go); forceFlush is meaningless there (no kernel keyring —
+// state lives in the file's own bytes, so the operation is idempotent on
+// its own) and ignored.
 func (v *Vault) Lock(path string, forceFlush bool) error {
+	if isRegularFileTarget(path) {
+		return v.lockFileInPlace(path)
+	}
 	fsctx, err := actions.NewContextFromPath(path, nil)
 	if err != nil {
 		return fmt.Errorf("fscrypt context for %s: %w", path, err)
