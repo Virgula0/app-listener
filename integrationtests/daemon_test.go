@@ -1213,3 +1213,103 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 	s.sigDaemon(c, "TERM")
 	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not exit after the final SIGTERM")
 }
+
+// ---------------------------------------------------------------
+// F. Recovery-sidecar symlink-follow: the file-vault crash-recovery sidecar
+// (internal/fscrypt/filevault.go's <resource>.app_listener.recover) must
+// never be opened, read, or created through a symlink.
+// ---------------------------------------------------------------
+
+// TestDaemon_FileVault_RecoverySidecarSymlink_NeverFollowed proves a
+// link-following bug in the file-vault crash-recovery sidecar: an attacker
+// who fully controls the parent directory of a file-vault resource (a real
+// precondition — the catalog's file-vault targets, e.g. a Steam
+// registry.vdf, live directly inside a user's own home directory) can,
+// while the daemon is not running, delete the not-yet-created sidecar and
+// replace it with a symlink pointing at any existing file that only root
+// can write. On the next daemon start, the unlock cycle's stageRecovery
+// step opens that symlink with O_RDWR and writes sealed file-vault
+// ciphertext straight into whatever it resolves to — a file completely
+// outside the guarded resource and outside the attacker's own write
+// permissions.
+//
+// To make the corruption deterministic instead of racing a timing window,
+// the resource's own directory (/protected) is remounted read-only right
+// after the malicious symlink is staged: this leaves the harmful write
+// (through the symlink, into a file OUTSIDE /protected) unaffected, but
+// makes the very next step — transformFileInPlace rewriting the real
+// resource file, which lives under /protected — fail deterministically
+// with EROFS. That failure aborts the unlock before clearRecovery (the
+// step that would otherwise truncate the sidecar, and thus the symlinked
+// victim file, back to empty) ever runs, so the corruption persists and can
+// be asserted on directly.
+func (s *IntegrationSuite) TestDaemon_FileVault_RecoverySidecarSymlink_NeverFollowed() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.copyFscryptHarness(c)
+
+	const secretFile = "/protected/secret.txt"
+	const victim = "/etc/victim.txt"
+
+	setup := fmt.Sprintf(`set -e
+mkdir -p /protected /etc/app-listener
+head -c 32 /dev/zero > /etc/app-listener/fscrypt.key
+chmod 600 /etc/app-listener/fscrypt.key
+printf 'MARKER-CONTENT' > %s
+chmod 644 %s
+: > %s
+chown 0:0 %s
+chmod 600 %s
+`, secretFile, secretFile, victim, victim, victim)
+	code, out := s.exec(c, []string{"sh", "-c", setup})
+	s.Require().Equalf(0, code, "setup: %s", out)
+
+	s.harnessMigrate(c, secretFile)
+	s.Require().True(s.harnessIsEncrypted(c, secretFile), "setup: the file must be sealed before the daemon ever starts")
+
+	// The attack: the resource's parent directory is fully attacker-owned
+	// (chmod 777 stands in for that — the real precondition is the
+	// directory being the user's own, e.g. their home directory), so an
+	// unprivileged user can freely create the not-yet-existing sidecar
+	// themselves, as a symlink to a root-writable file elsewhere.
+	// Remounting /protected read-only afterward only pins down the
+	// deterministic-failure trick described above — it plays no part in
+	// the vulnerability itself.
+	attack := fmt.Sprintf(`set -e
+chmod 777 /protected
+setpriv --reuid=65534 --regid=65534 --clear-groups ln -s %s %s.app_listener.recover
+mount --bind /protected /protected
+mount -o remount,ro,bind /protected
+`, victim, secretFile)
+	code, out = s.exec(c, []string{"sh", "-c", attack})
+	s.Require().Equalf(0, code, "staging the symlink attack: %s", out)
+	defer s.exec(c, []string{"sh", "-c", "mount -o remount,rw,bind /protected 2>/dev/null; umount /protected 2>/dev/null; true"})
+
+	config := fmt.Sprintf("[watch %s]\nneed_encryption: true\n/usr/bin/grep", secretFile)
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", config)})
+
+	s.launchDaemon(c)
+	// The daemon is expected to fail closed here (the resource's own
+	// directory is read-only and its sidecar is hostile) rather than come
+	// up — poll for either outcome without hard-failing, since the real
+	// assertion is what happened to the symlink's target, not whether the
+	// daemon itself started.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if code, _ := s.exec(c, []string{"sh", "-c", "test -f /run/app-listener-daemon.pid && echo ready"}); code == 0 {
+			break
+		}
+		if code, _ := s.exec(c, []string{"sh", "-c", noLiveAppListenerProcs}); code == 0 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	_, victimContent := s.exec(c, []string{"cat", victim})
+	s.Require().Emptyf(strings.TrimSpace(victimContent),
+		"%s ended up non-empty (%q): an unprivileged user's symlink swap of the file-vault recovery sidecar made "+
+			"the daemon write sealed file-vault bytes into a file it does not own, entirely outside the guarded "+
+			"resource — daemon log:\n%s", victim, victimContent, s.readDaemonLog(c))
+
+	s.sigDaemon(c, "KILL")
+}
