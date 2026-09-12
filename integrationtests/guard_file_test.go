@@ -38,6 +38,12 @@ func (s *IntegrationSuite) TestGuard_Exploits_File() {
 
 	s.exec(c, []string{"mkdir", "-p", "/exploits"})
 
+	// Copied up front: the loop below skips the shared table's "execve"
+	// entry entirely (see the continue below), so its own CopyFileToContainer
+	// never runs — the dedicated execve block further down needs the binary
+	// staged independently of that loop.
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/execve"), "/exploits/execve", 0755))
+
 	const targetPath = "/watch/exploit_target.txt"
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("echo 'exploit target' > %s", targetPath)})
 
