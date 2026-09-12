@@ -62,7 +62,7 @@ func TestCatalogMergedResources(t *testing.T) {
 		"Azure CLI":     {".azure", ".config/azure"},
 		"GNOME keyring": {".local/share/keyrings", ".keyring"},
 		"Zed editor":    {".config/zed", ".local/share/zed"},
-		"Steam":         {".local/share/Steam/config", ".steam"},
+		"Steam":         {".local/share/Steam/config", ".local/share/Steam/userdata/*/config/localconfig.vdf", ".steam/registry.vdf"},
 	}
 	for name, paths := range want {
 		var e *CandidateDir

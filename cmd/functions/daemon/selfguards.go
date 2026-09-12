@@ -81,6 +81,46 @@ func newSelfGuards() *selfGuards {
 	return &selfGuards{events: make(chan usecase.DaemonEvent, 256)}
 }
 
+// ensureHashFilePlaceholder makes sure editprotected.HashFile exists (even
+// zero-length) before self-guards attach. Two things make this necessary:
+//
+//   - The per-file guard for it is only created when the file ALREADY
+//     exists at attach time (the os.Stat gate in the loop below) — so a
+//     fresh install where no password has ever been set gets no dedicated
+//     guard for it at all.
+//   - Once the /etc/app-listener ReadOnly guard IS attached, its self-allow
+//     covers rewriting an EXISTING directory entry but not creating a new
+//     one — so WriteHashFile's old create-temp-then-rename dance got denied
+//     the moment the daemon (which is itself the actor) was already running
+//     and guarding its own directory.
+//
+// Creating an empty placeholder here, before any guard exists, sidesteps
+// both: from then on the file always exists, so its own dedicated
+// ModeWhitelist guard (self-allow, maskless = every event, unaffected by
+// the ReadOnly restriction above) is what WriteHashFile's in-place rewrite
+// goes through. A zero-length file is the documented "no password
+// configured" state (editprotected.HashFileExists / LoadHashFile treat
+// empty the same as absent). A no-op when /etc/app-listener itself does not
+// exist yet (no install has run) or the file is already there.
+func ensureHashFilePlaceholder() error {
+	if _, err := os.Stat(editprotected.HashFile); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if _, statErr := os.Stat(selfProtectDir); statErr != nil {
+		return nil //nolint:nilerr // no /etc/app-listener yet (nothing installed): nothing to bootstrap, not an error for the caller
+	}
+	f, err := os.OpenFile(editprotected.HashFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	return f.Close()
+}
+
 // Events is the merged denial stream from every attached self guard, tagged
 // with the resource path (e.g. resource=/etc/app-listener). Never closed.
 func (s *selfGuards) Events() <-chan usecase.DaemonEvent { return s.events }
@@ -94,6 +134,16 @@ func (s *selfGuards) attach(pin pinCfg) {
 	s.mu.Lock()
 	s.stopped = false
 	s.mu.Unlock()
+
+	// Bootstrap the edit-auth hash file BEFORE any guard attaches (see
+	// ensureHashFilePlaceholder): once the /etc/app-listener ReadOnly guard
+	// below is live, creating a brand-new directory entry inside it is no
+	// longer possible for the self binary — only rewriting an EXISTING one
+	// is. Best-effort like the rest of self-protection; a failure here just
+	// means WriteHashFile falls back to its own create-if-missing path.
+	if err := ensureHashFilePlaceholder(); err != nil {
+		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — setting an edit-protected password while the daemon runs may fail until it does", editprotected.HashFile, err)
+	}
 
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {

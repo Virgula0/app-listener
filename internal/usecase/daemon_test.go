@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +13,86 @@ import (
 	"github.com/Virgula0/app-listener/internal/guard"
 	"github.com/Virgula0/app-listener/internal/repository"
 )
+
+// TestPartitionEncryptionRootsSplitsDirsAndFiles verifies dirs and regular
+// files land in separate buckets, and a root that cannot be stat'd (a fake
+// test path, or one not yet materialized) defaults to the dirs bucket —
+// matching the pre-partition behavior of just calling Unlock and letting it
+// report the real error.
+func TestPartitionEncryptionRootsSplitsDirsAndFiles(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "ssh")
+	file := filepath.Join(base, "registry.vdf")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(base, "does-not-exist")
+
+	dirs, files := partitionEncryptionRoots([]string{dir, file, missing})
+
+	if len(dirs) != 2 || dirs[0] != dir || dirs[1] != missing {
+		t.Errorf("dirs = %v, want [%s %s]", dirs, dir, missing)
+	}
+	if len(files) != 1 || files[0] != file {
+		t.Errorf("files = %v, want [%s]", files, file)
+	}
+}
+
+// TestDaemonUseCaseWidensGuardSelfAccessForFileVaultResource is the
+// regression test for the bug where the daemon's own process got denied by
+// its own guard while unlocking/locking a single-file vault resource in
+// place: the guard's baseline self mask (open/read/stat) does not permit
+// the write the in-place transform needs, so it must run under
+// guard.WithSelfVaultAccess — verified here by counting calls into the
+// fake guard's WithSelfVaultAccess, not by asserting on the (unrelated)
+// crypto outcome. A sibling directory resource must NOT get the same
+// treatment (its fscrypt lifecycle never touches file content).
+func TestDaemonUseCaseWidensGuardSelfAccessForFileVaultResource(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "ssh")
+	file := filepath.Join(base, "registry.vdf")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	vault := newFakeVault(dir, file)
+	dirRepo, fileRepo := newFakeGuardRepo(), newFakeGuardRepo()
+	resources := []daemonconfig.Resource{resource(dir), resource(file)}
+	guards := []repository.GuardRepository{dirRepo, fileRepo}
+
+	d, err := NewDaemonUseCase(resources, vault, guards)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+	if err := d.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := fileRepo.vaultAccessCallCount(); got != 1 {
+		t.Errorf("file resource: WithSelfVaultAccess called %d times on unlock, want 1", got)
+	}
+	if got := dirRepo.vaultAccessCallCount(); got != 0 {
+		t.Errorf("directory resource: WithSelfVaultAccess called %d times on unlock, want 0", got)
+	}
+
+	// Stop locks every root twice by design (a best-effort first pass, then
+	// the force-flush retry pass runs over the same full root list
+	// regardless of the first pass's outcome — see lockUntilAllKeyless) —
+	// so the file resource sees one more WithSelfVaultAccess call, both
+	// harmless no-ops on an already-locked file.
+	d.Stop()
+	if got := fileRepo.vaultAccessCallCount(); got != 3 {
+		t.Errorf("file resource: WithSelfVaultAccess called %d times total after Stop, want 3 (1 unlock + 2 lock passes)", got)
+	}
+	if got := dirRepo.vaultAccessCallCount(); got != 0 {
+		t.Errorf("directory resource: WithSelfVaultAccess called %d times total after Stop, want 0", got)
+	}
+}
 
 type fakeVault struct {
 	mu sync.Mutex

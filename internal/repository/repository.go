@@ -51,6 +51,16 @@ type GuardRepository interface {
 	// whitelist, and the change lives in the BPF map only (gone on restart).
 	GrantSelfEditAccess() error
 	RevokeSelfEditAccess() error
+	// WithSelfVaultAccess widens this resource's guard self-access to cover
+	// the fscrypt file-vault's in-place unlock/lock (internal/fscrypt/
+	// filevault.go) for the duration of fn, then unconditionally restores
+	// the baseline mask. Directory resources never need this (their fscrypt
+	// unlock/lock is a pure kernel-keyring operation that never touches
+	// file content); only a single-file resource's vault reads and rewrites
+	// its own bytes on the guarded path itself. Deliberately distinct from
+	// GrantSelfEditAccess/RevokeSelfEditAccess, which is a broader,
+	// session-scoped grant for interactive edit-protected use.
+	WithSelfVaultAccess(fn func() error) error
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

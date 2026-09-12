@@ -180,18 +180,24 @@ func OriginOf(encoded string) (Origin, error) {
 }
 
 // HashFileExists reports whether an edit-protected password is configured.
+// The daemon pre-creates HashFile as an empty placeholder before it ever
+// self-guards it (see cmd/functions/daemon/selfguards.go
+// ensureHashFilePlaceholder), so existence alone no longer means
+// "configured" — an empty (or whitespace-only) file means "not configured",
+// same as the file being absent entirely.
 func HashFileExists() (bool, error) {
-	_, err := os.Stat(hashFilePath)
-	if err == nil {
-		return true, nil
+	data, err := os.ReadFile(hashFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
+	return strings.TrimSpace(string(data)) != "", nil
 }
 
-// LoadHashFile reads the stored record, mapping absence to ErrNoHashFile.
+// LoadHashFile reads the stored record, mapping absence OR an empty
+// placeholder to ErrNoHashFile.
 func LoadHashFile() (string, error) {
 	data, err := os.ReadFile(hashFilePath)
 	if err != nil {
@@ -200,50 +206,68 @@ func LoadHashFile() (string, error) {
 		}
 		return "", err
 	}
-	return strings.TrimSpace(string(data)), nil
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return "", ErrNoHashFile
+	}
+	return trimmed, nil
 }
 
-// WriteHashFile atomically writes encoded to HashFile as 0600 root-owned
-// (temp sibling + fsync + rename), mirroring fscrypt.GenerateMasterKey. The
-// caller is responsible for reloading the daemon so its self-guard picks up
-// the (possibly new) inode.
+// WriteHashFile writes encoded to HashFile IN PLACE, on the file's existing
+// inode (open, truncate, write, fsync) — never by creating a new directory
+// entry and renaming it over. That distinction matters here specifically:
+// while the daemon runs, HashFile sits inside the ReadOnly-guarded
+// /etc/app-listener (see selfProtectSpecs), whose self-allow for the daemon's
+// own binary covers rewriting an EXISTING entry but not creating a new one.
+// The daemon guarantees HashFile always exists (as an empty placeholder if
+// no password is set — see ensureHashFilePlaceholder) before that guard ever
+// attaches, so this only ever needs the in-place path; the create branch
+// below is a fallback for the case nothing has bootstrapped it yet (no
+// daemon has run since /etc/app-listener was created).
 func WriteHashFile(encoded string) error {
 	dir := filepath.Dir(hashFilePath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
-	tmp, err := os.CreateTemp(dir, ".edit-auth.hash.*")
+	f, err := os.OpenFile(hashFilePath, os.O_RDWR, 0o600)
 	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("opening %s: %w", hashFilePath, err)
 		}
-	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		return err
+		f, err = os.OpenFile(hashFilePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("creating %s: %w", hashFilePath, err)
+		}
 	}
-	if _, err := tmp.WriteString(encoded + "\n"); err != nil {
-		return err
+	defer f.Close()
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("truncating %s: %w", hashFilePath, err)
 	}
-	if err := tmp.Sync(); err != nil {
-		return err
+	if _, err := f.WriteAt([]byte(encoded+"\n"), 0); err != nil {
+		return fmt.Errorf("writing %s: %w", hashFilePath, err)
 	}
-	if err := tmp.Close(); err != nil {
-		return err
+	if err := f.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod %s: %w", hashFilePath, err)
 	}
-	cleanup = false
-	return os.Rename(tmpPath, hashFilePath)
+	return f.Sync()
 }
 
-// RemoveHashFile deletes the hash file if present; a missing file is success.
+// RemoveHashFile clears the stored password by truncating HashFile to empty
+// IN PLACE — see WriteHashFile for why this never unlinks the file (removing
+// then recreating it would need a new directory entry in the ReadOnly-
+// guarded /etc/app-listener, which the daemon's own self-allow does not
+// permit while it is running). A missing file is treated as already-cleared.
 func RemoveHashFile() error {
-	if err := os.Remove(hashFilePath); err != nil && !os.IsNotExist(err) {
+	f, err := os.OpenFile(hashFilePath, os.O_WRONLY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
-	return nil
+	defer f.Close()
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("truncating %s: %w", hashFilePath, err)
+	}
+	return f.Sync()
 }

@@ -375,13 +375,15 @@ var Catalog = []CandidateDir{
 	// ~/.steam home — one resource, both locations guarded, one whitelist.
 	// The rest of the Steam tree holds no secrets; legacy ssfn* sentries
 	// stay unprotected (dirs-only guarding, low value alone).
-	{Name: "Steam", RelPaths: []string{".local/share/Steam/config", ".steam"},
+	{Name: "Steam", RelPaths: []string{".local/share/Steam/config", ".local/share/Steam/userdata/*/config/localconfig.vdf", ".steam/registry.vdf"},
 		Whitelist: map[string][]string{
 			"/usr/bin/steam": nil, "/usr/bin/steamwebhelper": nil,
 			"/usr/lib/steam/steam":                        nil,
 			"%HOME%/.local/share/Steam/ubuntu12_32/steam": nil,
 			// Webhelper moved across versioned dirs; the glob covers all layouts.
 			"%HOME%/.local/share/Steam/*/steamwebhelper": nil,
+			"/usr/bin/lsof":                       nil,
+			"%HOME%/.steam/root/steamapps/common": nil, // protons installs allowed
 		}},
 
 	// --- System-level paths (probed once, not per user; ssh-guard template) ---

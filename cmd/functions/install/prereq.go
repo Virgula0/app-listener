@@ -67,6 +67,12 @@ func resolveFilesystemPrereqs(vault *fscrypt.Vault, cfg *daemonconfig.Config) er
 // config's encryption roots (each backing filesystem checked once), or a
 // terminal error. It performs no I/O beyond stat + read-only fscrypt probes,
 // so it is safe to call in a loop between remediation commands.
+//
+// A regular-file resource is skipped entirely: single files are encrypted by
+// the package's own userspace AEAD vault (internal/fscrypt/filevault.go),
+// never the kernel fscrypt ioctl — FS_IOC_SET_ENCRYPTION_POLICY cannot
+// target a standalone regular file at all — so neither the `encrypt`
+// filesystem feature flag nor `fscrypt setup` applies to it.
 func collectFilesystemPrereqs(vault *fscrypt.Vault, cfg *daemonconfig.Config) ([]fscrypt.Prereq, error) {
 	var checkedDevs []uint64
 	var out []fscrypt.Prereq
@@ -78,6 +84,9 @@ func collectFilesystemPrereqs(vault *fscrypt.Vault, cfg *daemonconfig.Config) ([
 		info, statErr := os.Stat(root)
 		if statErr != nil {
 			return nil, fmt.Errorf("stat %s: %w", root, statErr)
+		}
+		if info.Mode().IsRegular() {
+			continue
 		}
 		dev := info.Sys().(*syscall.Stat_t).Dev
 		if slices.Contains(checkedDevs, dev) {

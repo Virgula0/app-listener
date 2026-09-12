@@ -44,19 +44,20 @@ func (f *fakeMonitorRepo) SetEventTypes(types []ebpf.EventType) {
 }
 
 type fakeGuardRepo struct {
-	mu           sync.Mutex
-	started      bool
-	stopped      bool
-	populated    bool
-	resolved     bool
-	resynced     int
-	resyncErr    error
-	startErr     error
-	populateErr  error
-	resolveErr   error
-	editGranted  bool
-	editGrantErr error
-	events       chan guard.GuardEvent
+	mu               sync.Mutex
+	started          bool
+	stopped          bool
+	populated        bool
+	resolved         bool
+	resynced         int
+	resyncErr        error
+	startErr         error
+	populateErr      error
+	resolveErr       error
+	editGranted      bool
+	editGrantErr     error
+	vaultAccessCalls int
+	events           chan guard.GuardEvent
 }
 
 func newFakeGuardRepo() *fakeGuardRepo {
@@ -103,6 +104,20 @@ func (f *fakeGuardRepo) GrantSelfEditAccess() error {
 func (f *fakeGuardRepo) RevokeSelfEditAccess() error {
 	f.editGranted = false
 	return nil
+}
+
+func (f *fakeGuardRepo) WithSelfVaultAccess(fn func() error) error {
+	f.mu.Lock()
+	f.vaultAccessCalls++
+	f.mu.Unlock()
+	return fn()
+}
+
+// vaultAccessCallCount is the mutex-safe accessor for vaultAccessCalls.
+func (f *fakeGuardRepo) vaultAccessCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.vaultAccessCalls
 }
 
 func (f *fakeGuardRepo) Start() error {

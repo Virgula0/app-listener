@@ -86,6 +86,55 @@ func TestEnsureInstalledBinary(t *testing.T) {
 	}
 }
 
+// TestCheckRunningBinaryMatchesInstalled covers the three outcomes of the
+// wizard's binary-identity preflight: nothing installed yet (defer to
+// ensureInstalledBinary), the installed binary IS this process's own exe
+// (same inode — the normal "install via the deployed symlink" case), and a
+// DIFFERENT file at the install path (a freshly rebuilt standalone binary
+// run against an existing install) — the exact scenario that used to fail
+// only at the very last wizard step, inside finalizeEditPassword, with a
+// confusing "operation not permitted".
+func TestCheckRunningBinaryMatchesInstalled(t *testing.T) {
+	orig := installedBinaryPath
+	defer func() { installedBinaryPath = orig }()
+
+	dir := t.TempDir()
+	installedBinaryPath = filepath.Join(dir, "app-listener")
+
+	if err := checkRunningBinaryMatchesInstalled(); err != nil {
+		t.Fatalf("nothing installed yet should be a no-op: %v", err)
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(self); resolveErr == nil {
+		self = resolved
+	}
+
+	if err := os.Link(self, installedBinaryPath); err != nil {
+		t.Skipf("cannot hard-link the test binary into %s (%v) — likely a cross-device temp dir", dir, err)
+	}
+	if err := checkRunningBinaryMatchesInstalled(); err != nil {
+		t.Fatalf("installed binary is this same file (same inode): %v", err)
+	}
+	if err := os.Remove(installedBinaryPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(installedBinaryPath, []byte("a different binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = checkRunningBinaryMatchesInstalled()
+	if err == nil {
+		t.Fatal("expected an error for an installed binary that is not this process's own exe")
+	}
+	if !strings.Contains(err.Error(), "install --binary-only") {
+		t.Errorf("error should point at the fix (install --binary-only / app-listener update): %v", err)
+	}
+}
+
 // TestAskEncryptionSkipsNeedEncryptionFalse verifies that a resource
 // declared need_encryption: false in the config never triggers the
 // encryption question: the directory is not added to toEncrypt, the config
@@ -138,6 +187,31 @@ func TestCollectFilesystemPrereqsNoPanic(t *testing.T) {
 		if len(p.Argv) == 0 || p.Title == "" || p.Reason == "" {
 			t.Errorf("malformed prereq: %+v", p)
 		}
+	}
+}
+
+// TestCollectFilesystemPrereqsSkipsRegularFiles: a single-file resource is
+// encrypted by the package's own userspace vault, never the kernel fscrypt
+// ioctl (FS_IOC_SET_ENCRYPTION_POLICY cannot target a standalone regular
+// file — see internal/fscrypt/filevault.go), so it must never generate a
+// `tune2fs`/`fscrypt setup` prerequisite.
+func TestCollectFilesystemPrereqsSkipsRegularFiles(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "registry.vdf")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := "[watch]\npath = " + file + "\nneed_encryption: true\n"
+	cfg, err := validateConfigText(cfgText)
+	if err != nil {
+		t.Fatalf("parsing config: %v", err)
+	}
+
+	prereqs, err := collectFilesystemPrereqs(fscrypt.New(), cfg)
+	if err != nil {
+		t.Fatalf("collectFilesystemPrereqs on a regular-file resource must never error: %v", err)
+	}
+	if len(prereqs) != 0 {
+		t.Errorf("regular-file resource produced prerequisites: %+v", prereqs)
 	}
 }
 

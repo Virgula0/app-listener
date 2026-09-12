@@ -392,30 +392,117 @@ func TestEncryptFileRefusesSpecialFile(t *testing.T) {
 // rollback test: on a filesystem without fscrypt support (t.TempDir is
 // usually tmpfs) the migration fails before any rename and the original
 // file plus its metadata must be untouched, with no staging leftovers.
+// TestEncryptFileRollbackOnUnsupportedFilesystem: single-file encryption no
+// longer depends on the kernel fscrypt ioctl (the kernel never supported it
+// for a standalone regular file — see filevault.go), so unlike the
+// directory case above, there is no "unsupported filesystem" escape hatch
+// left to exercise here: given a valid master key, Encrypt must succeed on
+// any filesystem, including tmpfs. See TestFileMigrationRoundTrip and
+// TestRestoreBackupWorksOnFileVaultCiphertext below for the full
+// backup-first, temp-cleanup rollback contract on the new implementation.
 func TestEncryptFileRollbackOnUnsupportedFilesystem(t *testing.T) {
+	withMasterKey(t)
 	path := filepath.Join(t.TempDir(), "secret.env")
 	content := "rollback-me"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	err := (&Vault{}).Encrypt(path)
-	if err == nil {
-		t.Skip("filesystem supports fscrypt: migration succeeded, rollback not exercised")
-	}
-
-	if _, statErr := os.Lstat(path + BackupSuffix); statErr == nil {
-		t.Fatalf("backup left behind after failed migration (error: %v)", err)
+	if err := (&Vault{}).Encrypt(path); err != nil {
+		t.Fatalf("Encrypt must succeed regardless of filesystem fscrypt support: %v", err)
 	}
 	if _, statErr := os.Lstat(path + encryptTmpSuffix); statErr == nil {
-		t.Fatalf("temp file left behind after failed migration (error: %v)", err)
+		t.Fatal("temp file left behind after a successful migration")
 	}
-	data, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatalf("original content lost after failed migration: %v (error: %v)", readErr, err)
+	data, err := os.ReadFile(path + BackupSuffix)
+	if err != nil {
+		t.Fatalf("backup missing after migration: %v", err)
 	}
 	if string(data) != content {
-		t.Errorf("original content corrupted: %q", data)
+		t.Errorf("backup content = %q, want %q", data, content)
+	}
+}
+
+// TestFileMigrationRoundTrip covers the full Encrypt/Decrypt cycle, as
+// distinct from the recurring unlockFileInPlace/lockFileInPlace daemon
+// cycle (filevault_test.go): this one still uses backup+rename (safe here —
+// it runs before any guard watches the path), and Decrypt is a PERMANENT
+// removal of encryption, not a toggle.
+func TestFileMigrationRoundTrip(t *testing.T) {
+	withMasterKey(t)
+	v := New()
+	path := filepath.Join(t.TempDir(), "secret.env")
+	original := "SUPER_SECRET=1"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := v.Encrypt(path); err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	locked, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !looksLikeFileVaultRecord(locked) {
+		t.Fatal("Encrypt did not produce file-vault ciphertext")
+	}
+	backup, err := os.ReadFile(path + BackupSuffix)
+	if err != nil {
+		t.Fatalf("migration must leave a plaintext backup: %v", err)
+	}
+	if string(backup) != original {
+		t.Errorf("backup content = %q, want %q", backup, original)
+	}
+	if _, err := os.Lstat(path + encryptTmpSuffix); !os.IsNotExist(err) {
+		t.Error("temp file left behind after a successful Encrypt")
+	}
+
+	if err := v.Decrypt(path); err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Errorf("Decrypt did not restore the original content: got %q, want %q", got, original)
+	}
+	if _, err := os.Lstat(path + DecryptSuffix); !os.IsNotExist(err) {
+		t.Error("temp file left behind after a successful Decrypt")
+	}
+}
+
+// TestRestoreBackupWorksOnFileVaultCiphertext: RestoreBackup must delete a
+// file-vault-encrypted target WITHOUT trying to unlock it via the kernel
+// keyring (there is none for these files) and move the backup into place.
+func TestRestoreBackupWorksOnFileVaultCiphertext(t *testing.T) {
+	withMasterKey(t)
+	v := New()
+	base := t.TempDir()
+	path := filepath.Join(base, "secret.env")
+	backup := path + BackupSuffix
+	if err := os.WriteFile(backup, []byte("original content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an interrupted-but-mostly-done migration: the live path
+	// already holds file-vault ciphertext (as Encrypt would leave it).
+	if err := os.WriteFile(path, []byte("original content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.lockFileInPlace(path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := v.RestoreBackup(path); err != nil {
+		t.Fatalf("RestoreBackup: %v", err)
+	}
+	if _, err := os.Lstat(backup); !os.IsNotExist(err) {
+		t.Error("backup still exists after restore")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "original content" {
+		t.Errorf("restored file = %q (err %v), want original content", data, err)
 	}
 }
 

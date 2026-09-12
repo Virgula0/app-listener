@@ -68,6 +68,16 @@ func newPinGeneration() string {
 	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
+// daemonSelfBaselineEvents is the root-gated self mask every config /
+// ephemeral guard registers its own binary under (guard.WithSelfAllowBinary):
+// enough for the daemon's normal directory-based fscrypt lifecycle (pure
+// kernel-keyring operations) and for a file-vault resource's "already
+// locked" read-only fast path, but never write. A single definition here so
+// every construction site — and `daemon --lockdown`'s recovery path, which
+// must widen from exactly this baseline and restore back to it — can never
+// drift apart from one another.
+var daemonSelfBaselineEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat}
+
 var (
 	configFlag   string
 	genKeyFlag   bool
@@ -220,6 +230,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	defer d.Stop()
+
+	// Record this run's config-guard pin generation for `daemon --lockdown`
+	// to recover later (see pinstate.go) — best-effort, and deliberately
+	// before the self guards below ever attach, so the very first write on a
+	// fresh host never has to fight its own not-yet-existent ReadOnly guard.
+	if pinErr := writePinState(pin); pinErr != nil {
+		log.Warnf("daemon: could not record pin state (%v) — `daemon --lockdown` will not be able to widen "+
+			"self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
+	}
 
 	notifySystemdReady()
 
@@ -409,6 +428,14 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{liveGen: true}); cleanErr != nil {
 			log.Warnf("daemon: could not sweep stale guard pins after reload: %v", cleanErr)
 		}
+		// The reload minted a fresh generation for the config guards (never
+		// the self guards' — pin.gen on this outer variable never changes):
+		// record it, or `daemon --lockdown` would keep recovering the
+		// pre-reload generation, whose pins CleanupStalePins just removed.
+		if pinErr := writePinState(pinCfg{base: pin.base, gen: liveGen}); pinErr != nil {
+			log.Warnf("daemon: could not record pin state after reload (%v) — `daemon --lockdown` will not be "+
+				"able to widen self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
+		}
 		sg.attach(pin)
 		log.Infof("daemon: configuration reloaded from %s", configPath)
 	}
@@ -464,7 +491,7 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 // are retired once the real guards are attached and their inodes populated.
 // Every error path locks the freshly unlocked vaults back before returning.
 func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg) (usecase.DaemonUseCase, error) {
-	relockStaleVaults(cfg, vault)
+	relockStaleVaults(cfg, vault, pin.base)
 
 	// Retire pins a previous daemon left when it was killed. relockStaleVaults
 	// (and the unit's ExecStopPost --lockdown) has locked any vault those pins
@@ -580,7 +607,7 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 
 	for _, root := range roots {
 		g, guardErr := guard.NewGuard(root, guard.ModeWhitelist, nil, true, 0,
-			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat}),
+			guard.WithSelfAllowBinary(self, daemonSelfBaselineEvents),
 			// Pin the ephemeral guard too: a SIGKILL during the grouped-vault
 			// unlock window must still leave the root enforced.
 			guard.WithPinning(pin.prefix("ephemeral:"+root)))
@@ -608,6 +635,17 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 // vaults keyless. Best-effort per root (a file another process holds open in
 // the tree makes a force flush fail); failures are logged CRITICAL and the
 // command still exits 0 so it never blocks the unit from settling.
+//
+// A directory root's lock is a pure kernel-keyring op that needs no
+// self-access of any kind. A file-vault (regular file) root instead rewrites
+// its own guarded bytes in place — if it is ALREADY locked (ciphertext on
+// disk) that only needs a read, which every self binary gets unconditionally,
+// but if the previous daemon died while it was still unlocked, actually
+// re-sealing it needs the same write access `guard.WithSelfVaultAccess`
+// grants a live daemon — and this process has no live *guard.Guard to call
+// that on. recoverPinState + lockRootRecovering close that gap by widening
+// the crashed daemon's own PINNED guard (see pinstate.go, guard.pinSelfMaps,
+// guard.WithPinnedSelfVaultAccess) instead.
 func runLockdown() {
 	configureDaemonLogging()
 
@@ -622,6 +660,9 @@ func runLockdown() {
 		return
 	}
 
+	pinBase := guard.ResolvePinBase(bpffsMount)
+	rec := recoverPinState("lockdown")
+
 	vault := fscrypt.New()
 	seen := make(map[string]bool)
 	locked, stillUnlocked := 0, 0
@@ -635,7 +676,7 @@ func runLockdown() {
 			continue
 		}
 		seen[root] = true
-		if lockOneRoot(vault, root) {
+		if lockRootRecovering(vault, root, r.Path, pinBase, rec) {
 			locked++
 		} else {
 			stillUnlocked++
@@ -665,14 +706,53 @@ func lockOneRoot(vault *fscrypt.Vault, root string) bool {
 	return false
 }
 
+// lockRootRecovering is lockOneRoot, widening this process's self-access
+// under root's pinned guard first when root is a file-vault (regular file)
+// target and rec names a usable recovered pin generation (rec.Gen == ""
+// means recoverPinState found nothing safe to act on — no record, or the
+// record's PID still looks alive). Directories, and a file root that turns
+// out to already be locked (see lockFileInPlace's read-only fast path — the
+// widen is requested regardless, but only ever matters when a write is
+// actually attempted), need no widening at all. A widen that fails
+// structurally (pin missing/foreign/not-GUARD_ALLOW_ROOT — see
+// guard.WithPinnedSelfVaultAccess) falls back to the plain attempt: no worse
+// than before this recovery path existed.
+func lockRootRecovering(vault *fscrypt.Vault, root, resourcePath, pinBase string, rec pinStateRecord) bool {
+	if rec.Gen == "" {
+		return lockOneRoot(vault, root)
+	}
+	info, statErr := os.Stat(root)
+	if statErr != nil || !info.Mode().IsRegular() {
+		return lockOneRoot(vault, root)
+	}
+
+	var ok bool
+	pinPrefix := guard.PinPrefix(pinBase, rec.Gen, resourcePath)
+	if widenErr := guard.WithPinnedSelfVaultAccess(pinPrefix, func() error {
+		ok = lockOneRoot(vault, root)
+		return nil
+	}); widenErr != nil {
+		log.Warnf("lockdown: could not widen self-access for %s (%v) — attempting a plain lock anyway "+
+			"(succeeds if it was already locked)", root, widenErr)
+		return lockOneRoot(vault, root)
+	}
+	return ok
+}
+
 // relockStaleVaults runs before the daemon unlocks anything: an encryption
 // root already provisioned at this point means the PREVIOUS daemon exited
 // without locking it (SIGKILL, OOM, power loss). Its pinned guards may still
 // be enforcing (that is the point of pinning), but the vault key is stale —
 // lock it back now, before this run re-provisions it under its own guards.
 // Best-effort and loud; never fatal (aborting would only leave it unlocked
-// for longer). ExecStopPost --lockdown normally does this first anyway.
-func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault) {
+// for longer). ExecStopPost --lockdown normally does this first anyway, so
+// this is usually a no-op; it reuses the exact same pin-state recovery path
+// as --lockdown (recoverPinState/lockRootRecovering) for the case where it
+// is not — e.g. --lockdown itself was killed mid-widen, or the unit's
+// ExecStopPost never ran at all (a manual SIGKILL outside systemd).
+func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault, pinBase string) {
+	rec := recoverPinState("daemon")
+
 	seen := make(map[string]bool)
 	for i := range cfg.Resources {
 		r := &cfg.Resources[i]
@@ -695,7 +775,7 @@ func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault) {
 		}
 		log.Warnf("daemon: SECURITY: %s was already unlocked at startup — the previous daemon did not lock it back "+
 			"(killed mid-run or mid-startup?). Locking it now before re-provisioning it under this run's guards.", root)
-		lockOneRoot(vault, root)
+		lockRootRecovering(vault, root, r.Path, pinBase, rec)
 	}
 }
 
@@ -827,7 +907,7 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			// Root-gated self access with the minimal event set the fscrypt
 			// lifecycle needs; guarded content reads by non-root executors of
 			// this binary stay denied (see the self-key bypass regression test).
-			guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat}),
+			guard.WithSelfAllowBinary(self, daemonSelfBaselineEvents),
 			// Pin the LSM links to bpffs so a SIGKILL leaves this tree still
 			// enforced until ExecStopPost locks the vault.
 			guard.WithPinning(pin.prefix(r.Path)),

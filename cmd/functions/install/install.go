@@ -155,6 +155,10 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	if err := checkRunningBinaryMatchesInstalled(); err != nil {
+		return err
+	}
+
 	// The daemon holds open the files being reconfigured and would keep
 	// guarding the dirs being moved: stop it first; outside-systemd daemons
 	// are fatally refused (the installer cannot control them).
@@ -400,6 +404,60 @@ func prepareInstallation() error {
 // installedBinaryPath is the service path ensureInstalledBinary manages; a
 // package var so tests can point it at a temp file.
 var installedBinaryPath = systemd.InstallBinaryPath
+
+// checkRunningBinaryMatchesInstalled fails fast, before the interactive
+// wizard runs, when this executable is not the one already deployed at
+// installedBinaryPath (identity is inode-based, exactly what the daemon's
+// self-guard checks — see ensureInstalledBinary below and
+// internal/guard.WithSelfAllowBinary).
+//
+// Why this matters: when a binary is already installed, the full wizard
+// deliberately leaves it untouched (see ensureInstalledBinary) and, at
+// deploy(), restarts the daemon on that SAME already-installed binary. The
+// wizard's very last step, finalizeEditPassword, then writes
+// /etc/app-listener/edit-auth.hash while that daemon is running and
+// self-guarding it — but the self-guard's allow only ever trusts the exact
+// on-disk file the daemon exec'd, never a same-name/same-content binary
+// running elsewhere (that would be a bypass of the "identity is dev:ino,
+// never path/name" invariant). Running the wizard from a freshly rebuilt
+// standalone binary on a machine that already has a (older, or just
+// different) binary installed is a real and easy-to-hit case of this — the
+// two are different files even though they're "the same app-listener" —
+// and it used to surface only at the very end, as a confusing "operation
+// not permitted" after backups, fscrypt migration and the config editor had
+// already run. os.SameFile compares dev:ino, matching the guard's own
+// notion of identity exactly.
+func checkRunningBinaryMatchesInstalled() error {
+	installedInfo, err := os.Stat(installedBinaryPath)
+	if err != nil {
+		return nil //nolint:nilerr // nothing installed yet: ensureInstalledBinary deploys this exact binary next
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		return nil //nolint:nilerr // best-effort: let the wizard proceed and surface any real error itself
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(self); resolveErr == nil {
+		self = resolved
+	}
+	selfInfo, err := os.Stat(self)
+	if err != nil {
+		return nil //nolint:nilerr // same reasoning
+	}
+
+	if os.SameFile(selfInfo, installedInfo) {
+		return nil
+	}
+	return fmt.Errorf(
+		"this binary (%s) is not the one already installed at %s — `install` leaves an existing binary "+
+			"untouched (see `install --binary-only` / `app-listener update`), so the daemon that comes back "+
+			"up during this wizard would still be running the OLD binary. Its self-protection only trusts "+
+			"its own on-disk file, so the wizard's last step (writing the edit-protected password hash) "+
+			"would fail with a confusing \"operation not permitted\" after everything else already ran.\n"+
+			"Run 'sudo %s install --binary-only' (or 'app-listener update') first to deploy this binary and "+
+			"restart the daemon on it, then re-run 'sudo app-listener install'",
+		self, installedBinaryPath, self)
+}
 
 // ensureInstalledBinary makes sure the app-listener binary is deployed at its
 // service path. An existing binary is left untouched — upgrades go through
