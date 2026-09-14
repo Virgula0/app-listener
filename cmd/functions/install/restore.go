@@ -1,7 +1,6 @@
 package install
 
 import (
-	"errors"
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
@@ -16,10 +15,14 @@ import (
 // preselected) and, after a single confirmation, the encrypted copies are
 // deleted and the backups moved back to the original locations. It aborts
 // when the daemon is running — restoring while the daemon is active would
-// let it keep unlocking and using the very directories being deleted.
+// let it keep unlocking and using the very directories being deleted, and
+// leaves daemon.conf declaring need_encryption: true for a resource that no
+// longer has a policy at all (see issue #53). RequireDaemonStopped (not the
+// bare DaemonRunning systemd check) also catches a daemon started manually
+// outside systemd.
 func restoreBackups() error {
-	if protected.DaemonRunning() {
-		return errors.New("fatal: the daemon is running — stop it before restoring backups: systemctl stop app-listener-daemon")
+	if err := protected.RequireDaemonStopped(); err != nil {
+		return err
 	}
 	entries, err := backups.Find()
 	if err != nil {
@@ -56,8 +59,15 @@ func restoreBackups() error {
 
 // deletePostBackups deletes every found .app_listener.backup: the backups
 // are shown in a TUI list (all preselected) and, after a single
-// confirmation, removed with a TUI progress bar showing the progress.
+// confirmation, removed with a TUI progress bar showing the progress. It
+// aborts when the daemon is running, exactly like restoreBackups: a backup
+// is the only way to recover a resource the daemon might still be relying
+// on (e.g. a crashed unlock), so it must never be deleted out from under a
+// live daemon.
 func deletePostBackups() error {
+	if err := protected.RequireDaemonStopped(); err != nil {
+		return err
+	}
 	entries, err := backups.Find()
 	if err != nil {
 		return err

@@ -90,6 +90,33 @@ func writePinState(pin pinCfg) error {
 	return f.Sync()
 }
 
+// ensurePinStateFilePlaceholder makes sure pinStateFile exists (even
+// zero-length) before self-guards attach — same reason as selfguards.go's
+// ensureHashFilePlaceholder: once the /etc/app-listener ReadOnly self-guard
+// is live, its self-allow permits rewriting an EXISTING directory entry but
+// not creating a new one. Self guards now attach before writePinState's own
+// first-ever-run create fallback would otherwise run, so that fallback would
+// fight the RO guard on a fresh host without this. A no-op when
+// /etc/app-listener does not exist yet or the file is already there.
+func ensurePinStateFilePlaceholder() error {
+	if _, err := os.Stat(pinStateFile); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if _, statErr := os.Stat(filepath.Dir(pinStateFile)); statErr != nil {
+		return nil //nolint:nilerr // no /etc/app-listener yet (nothing installed): nothing to bootstrap, not an error for the caller
+	}
+	f, err := os.OpenFile(pinStateFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	return f.Close()
+}
+
 // readPinState loads the last-recorded pin generation. Absent, empty, or
 // malformed content all map to errNoPinState: a record this process cannot
 // trust is no better than a missing one.

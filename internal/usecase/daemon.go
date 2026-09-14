@@ -9,6 +9,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
 	"github.com/Virgula0/app-listener/internal/repository"
@@ -210,7 +211,7 @@ func (d *daemonUseCase) verifyEncryptionStates() error {
 			return fmt.Errorf("checking encryption on %s: %w", r.Path, err)
 		}
 		if r.NeedEncryption && !encrypted {
-			return fmt.Errorf("directory %s is NOT encrypted: run the fscrypt migration first or set need_encryption: false", r.Path)
+			return fmt.Errorf("%w: directory %s is NOT encrypted: run the fscrypt migration first or set need_encryption: false", constants.ErrCriticalStartup, r.Path)
 		}
 		if !r.NeedEncryption && encrypted {
 			log.Warnf("resource %s is encrypted but need_encryption: false \u2014 leaving it locked", r.Path)
@@ -234,15 +235,20 @@ func (d *daemonUseCase) startGuards() error {
 	// guard.WithSelfVaultAccess): the in-place unlock reads+rewrites the
 	// file's own bytes, which the guard's baseline self mask (open/read/stat
 	// only) does not permit.
+	// An Unlock failure here means the master key/policy pairing itself is
+	// wrong (missing key file, wrong key, unsupported filesystem) — the same
+	// key, same policy and same filesystem will fail identically on every
+	// restart, so this is the same "administrator action required" class as
+	// verifyEncryptionStates' mismatch, not a transient condition.
 	dirRoots, fileRoots := partitionEncryptionRoots(uniqueEncryptionRoots(d.resources))
 	for _, root := range dirRoots {
 		if err := d.vault.Unlock(root); err != nil {
-			return fmt.Errorf("unlocking %s: %w", root, err)
+			return fmt.Errorf("%w: unlocking %s: %w", constants.ErrCriticalStartup, root, err)
 		}
 	}
 	for _, root := range fileRoots {
 		if err := vaultOpOnRoot(d.resources, d.guards, root, func() error { return d.vault.Unlock(root) }); err != nil {
-			return fmt.Errorf("unlocking %s: %w", root, err)
+			return fmt.Errorf("%w: unlocking %s: %w", constants.ErrCriticalStartup, root, err)
 		}
 	}
 
@@ -594,18 +600,31 @@ func (d *daemonUseCase) Stop() {
 	})
 }
 
-// lockUntilAllKeyless retries the force-flush lock until every resource is keyless; it
-// never returns while one is unlocked — guards stay attached denying all access, so the
-// tree is never unprotected and shutdown just waits for file pins to close.
+// lockUntilAllKeyless retries the force-flush lock until every resource is keyless or
+// permanently un-lockable; it never returns while one is genuinely still unlocked — guards
+// stay attached denying all access, so the tree is never unprotected and shutdown just
+// waits for file pins to close. repository.ErrNotEncrypted is the one exception: it means
+// path carries no fscrypt policy at all (a permanent condition — see lockWithRetry), so
+// retrying it can never succeed, unlike a busy key. Giving up on it here is safe ONLY
+// because the caller (Stop) detaches every guard together right after this function
+// returns, once every OTHER root is genuinely keyless — there is no per-resource window
+// where this one is unguarded while others remain protected. rollbackReload, which detaches
+// guards per-resource, must not reuse this leniency (see lockWithRetry).
 func (d *daemonUseCase) lockUntilAllKeyless(resources []daemonconfig.Resource, guards []repository.GuardRepository, pending []string) {
 	for len(pending) > 0 {
 		var still []string
 		for _, path := range pending {
-			if err := d.lockWithRetry(resources, guards, path); err != nil {
-				log.Errorf("daemon: %s is still unlocked: a process holds open files in it (investigate with: lsof +D %s, fuser -v %s): %v",
-					path, path, path, err)
-				still = append(still, path)
+			err := d.lockWithRetry(resources, guards, path)
+			if err == nil {
+				continue
 			}
+			if errors.Is(err, repository.ErrNotEncrypted) {
+				log.Errorf("daemon: %s has no fscrypt policy — it was decrypted, restored from a backup, or otherwise modified outside the daemon while the config still expects it encrypted; nothing left to lock, but this resource needs investigation before it is trusted again: %v", path, err)
+				continue
+			}
+			log.Errorf("daemon: %s is still unlocked: a process holds open files in it (investigate with: lsof +D %s, fuser -v %s): %v",
+				path, path, path, err)
+			still = append(still, path)
 		}
 		if len(still) == 0 {
 			break
@@ -616,6 +635,18 @@ func (d *daemonUseCase) lockUntilAllKeyless(resources []daemonconfig.Resource, g
 	}
 }
 
+// lockWithRetry retries Lock until it succeeds, the key is confirmed already gone
+// (ErrKeyMissing), or the retry budget for a busy key is exhausted. repository.ErrNotEncrypted
+// (path carries no fscrypt policy at all — e.g. a backup restore replaced the encrypted tree
+// with plaintext) is returned as-is rather than swallowed into success: unlike ErrKeyMissing,
+// there was never a key here to confirm gone, and the two callers must react to it
+// differently. lockUntilAllKeyless (Stop, full shutdown) may give up on this one path and
+// still finish, because every guard detaches together regardless. rollbackReload (a live
+// SIGHUP mid-run) must NOT — a newly-unlocked resource whose policy vanished before rollback
+// could lock it back has no old guard to fall back on, so treating this as "resolved" there
+// would detach its only remaining protection over an unencrypted resource; returning the
+// error keeps it in rollbackReload's pending set so the bounded retry budget's exhaustion
+// orphans (keeps attached) rather than stops that guard.
 func (d *daemonUseCase) lockWithRetry(resources []daemonconfig.Resource, guards []repository.GuardRepository, path string) error {
 	for i := 0; i < maxLockRetries; i++ {
 		err := vaultOpOnRoot(resources, guards, path, func() error { return d.vault.Lock(path, true) })

@@ -3,11 +3,13 @@ package daemon
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/repository"
 	"github.com/Virgula0/app-listener/internal/usecase"
@@ -93,5 +95,48 @@ func TestAwaitStartupOrSignalAbortWithFailedStartup(t *testing.T) {
 	}
 	if d != nil {
 		t.Fatal("want nil daemon after an aborted/failed startup")
+	}
+}
+
+// TestLoadDaemonConfigMissingFileIsCriticalStartup verifies that every
+// loadDaemonConfig failure wraps constants.ErrCriticalStartup: a config file
+// that fails to resolve, parse, or declare any [watch] section will fail the
+// exact same way on every future restart, so main.go must exit with the
+// non-retryable status instead of letting systemd's Restart=on-failure
+// crash-loop the daemon every RestartSec forever.
+func TestLoadDaemonConfigMissingFileIsCriticalStartup(t *testing.T) {
+	prevConfigFlag := configFlag
+	defer func() { configFlag = prevConfigFlag }()
+
+	configFlag = filepath.Join(t.TempDir(), "does-not-exist.conf")
+
+	_, _, err := loadDaemonConfig()
+	if err == nil {
+		t.Fatal("expected an error for a missing --config path")
+	}
+	if !errors.Is(err, constants.ErrCriticalStartup) {
+		t.Errorf("loadDaemonConfig error %q must wrap constants.ErrCriticalStartup", err)
+	}
+}
+
+// TestLoadDaemonConfigEmptyResourcesIsCriticalStartup verifies the "no
+// [watch] sections" branch is classified the same way — an empty config
+// reproduces identically on every restart.
+func TestLoadDaemonConfigEmptyResourcesIsCriticalStartup(t *testing.T) {
+	prevConfigFlag := configFlag
+	defer func() { configFlag = prevConfigFlag }()
+
+	empty := filepath.Join(t.TempDir(), "daemon.conf")
+	if err := os.WriteFile(empty, []byte("# no watch sections\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configFlag = empty
+
+	_, _, err := loadDaemonConfig()
+	if err == nil {
+		t.Fatal("expected an error for a config with no [watch] sections")
+	}
+	if !errors.Is(err, constants.ErrCriticalStartup) {
+		t.Errorf("loadDaemonConfig error %q must wrap constants.ErrCriticalStartup", err)
 	}
 }

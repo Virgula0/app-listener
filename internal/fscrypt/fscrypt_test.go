@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/fscrypt/actions"
 	"github.com/google/fscrypt/filesystem"
+	"github.com/google/fscrypt/metadata"
 )
 
 // TestNewBoundedKeyFnFirstCall verifies that the initial callback call
@@ -122,6 +123,25 @@ func TestIsEncryptedRegularFile(t *testing.T) {
 
 	if _, err := (&Vault{}).IsEncrypted(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Error("IsEncrypted on a missing path must error")
+	}
+}
+
+// TestIsNotEncryptedErr verifies the classifier Vault.Lock uses to map onto
+// repository.ErrNotEncrypted: it must recognize the library's
+// metadata.ErrNotEncrypted (a path with no fscrypt policy at all — e.g. one
+// a backup restore replaced with plaintext) and reject both an unrelated
+// error and the superficially similar metadata.ErrLockedRegularFile, which
+// means "policy exists, key is gone" and must keep mapping onto
+// repository.ErrKeyMissing instead.
+func TestIsNotEncryptedErr(t *testing.T) {
+	if !isNotEncryptedErr(&metadata.ErrNotEncrypted{Path: "/x"}) {
+		t.Error("expected metadata.ErrNotEncrypted to be recognized")
+	}
+	if isNotEncryptedErr(errors.New("some other error")) {
+		t.Error("an unrelated error must not be classified as ErrNotEncrypted")
+	}
+	if isNotEncryptedErr(&metadata.ErrLockedRegularFile{Path: "/x"}) {
+		t.Error("a locked regular file (policy exists, key gone) is not the same as \"not encrypted\"")
 	}
 }
 

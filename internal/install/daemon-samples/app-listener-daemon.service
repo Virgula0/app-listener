@@ -19,6 +19,13 @@ ExecReload=/bin/kill -HUP $MAINPID
 ExecStopPost=-/usr/local/sbin/app-listener daemon --lockdown
 Restart=on-failure
 RestartSec=2s
+# 78 (EX_CONFIG) is exit status constants.CriticalExitCode: a startup failure
+# that will reproduce identically on every restart (daemon.conf failing to
+# load/parse, or a configured resource whose on-disk encryption state no
+# longer matches need_encryption — see issue #53). The daemon locks every
+# vault back before exiting with this status, so leaving it stopped here is
+# safe; fix daemon.conf or the resource, then `systemctl start` again.
+RestartPreventExitStatus=78
 # The daemon only exits after every watched directory is locked again; a
 # process holding open files in one of them can make that take a while.
 # Never SIGKILL it mid-lockdown — that would leave the trees unlocked and

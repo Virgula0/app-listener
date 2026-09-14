@@ -22,6 +22,7 @@ import (
 
 	"github.com/Virgula0/app-listener/cmd/common"
 	"github.com/Virgula0/app-listener/cmd/printers"
+	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/guard"
@@ -266,6 +267,30 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	termSig, hup, stopSignals := catchLifecycleSignals()
 	defer stopSignals()
 
+	// Always-on guards over the daemon's own state (/etc/app-listener,
+	// fscrypt.key, edit-auth.hash). Attached synchronously, HERE, before the
+	// config-driven guards below ever touch bpffs. This used to be a
+	// background goroutine started only after the daemon was already fully
+	// up and marked "ready" — which left a real window on every restart
+	// where a killed predecessor's self-guard pins had just been swept
+	// (CleanupStalePins below shares pin.base with these) but this run's
+	// replacements did not exist yet, so /etc/app-listener/fscrypt.key etc.
+	// were briefly readable by anything. Attaching first closes that window;
+	// pinstate.go's ensurePinStateFilePlaceholder (called from sg.attach)
+	// keeps writePinState below working even though the RO self-guard is now
+	// live before it runs. Self guards stay OUT of the usecase's guard set
+	// so a SIGHUP reload's transient guard doubling stays under the kernel's
+	// per-LSM-hook program cap (see selfGuards.detach/attach around reload)
+	// — that tradeoff, and the reload-time gap it implies, are unchanged. A
+	// self guard that fails to attach is now logged as CRITICAL but still
+	// never aborts startup: the config-driven protection below is the
+	// daemon's core function and a secondary guard failing must not block
+	// it (a large config already competes for the same limited LSM link
+	// slots).
+	sg := newSelfGuards()
+	sg.attach(pin)
+	defer sg.detach()
+
 	d, err := startGuardedDaemonAbortable(termSig, cfg, vault, pin)
 	if err != nil {
 		return err
@@ -276,11 +301,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	defer d.Stop()
+	events := mergeDaemonEvents(d.Events(), sg.Events())
 
 	// Record this run's config-guard pin generation for `daemon --lockdown`
-	// to recover later (see pinstate.go) — best-effort, and deliberately
-	// before the self guards below ever attach, so the very first write on a
-	// fresh host never has to fight its own not-yet-existent ReadOnly guard.
+	// to recover later (see pinstate.go) — best-effort. The self guards
+	// above are already live by now; writePinState's own create-fallback
+	// relies on ensurePinStateFilePlaceholder having already run instead of
+	// on ordering, so this is safe even though it used to be a precondition.
 	if pinErr := writePinState(pin); pinErr != nil {
 		log.Warnf("daemon: could not record pin state (%v) — `daemon --lockdown` will not be able to widen "+
 			"self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
@@ -292,17 +319,6 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer os.Remove(pidFile)
-
-	// Always-on guards over the daemon's own state (/etc/app-listener,
-	// fscrypt.key). Kept OUT of the usecase so a SIGHUP reload's transient
-	// guard doubling stays under the kernel's per-LSM-hook program cap (see
-	// selfGuards). Attached in the background — best-effort hardening, and
-	// each LSM attach is slow on hardened kernels, so it must not delay the
-	// event loop or "ready". Denials are merged into the event stream.
-	sg := newSelfGuards()
-	events := mergeDaemonEvents(d.Events(), sg.Events())
-	go sg.attach(pin)
-	defer sg.detach()
 
 	// The edit-protected control socket (only when a password is configured).
 	// Best-effort like the self guards: a socket that cannot bind disables
@@ -428,17 +444,20 @@ func configureDaemonLogging() {
 }
 
 // loadDaemonConfig resolves, loads and sanity-checks the daemon configuration.
+// Every failure here is the same config file failing to resolve/parse/
+// declare a resource on every future run too — constants.ErrCriticalStartup,
+// not a transient condition worth systemd restarting for.
 func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	configPath, err := resolveConfigPath()
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("%w: %w", constants.ErrCriticalStartup, err)
 	}
 	cfg, err := daemonconfig.Load(configPath)
 	if err != nil {
-		return "", nil, fmt.Errorf("loading config %s: %w", configPath, err)
+		return "", nil, fmt.Errorf("%w: loading config %s: %w", constants.ErrCriticalStartup, configPath, err)
 	}
 	if len(cfg.Resources) == 0 {
-		return "", nil, fmt.Errorf("config %s contains no [watch] sections", configPath)
+		return "", nil, fmt.Errorf("%w: config %s contains no [watch] sections", constants.ErrCriticalStartup, configPath)
 	}
 	return configPath, cfg, nil
 }
@@ -750,6 +769,10 @@ func lockOneRoot(vault *fscrypt.Vault, root string) bool {
 			log.Infof("lockdown: %s is locked", root)
 			return true
 		}
+		if errors.Is(err, repository.ErrNotEncrypted) {
+			log.Errorf("lockdown: CRITICAL: %s is not encrypted and daemon.conf needs to be re-checked — need_encryption no longer matches this resource's actual on-disk state (was it decrypted, restored from a backup, or otherwise modified outside the daemon?): %v", root, err)
+			return false
+		}
 		if !errors.Is(err, repository.ErrKeyBusy) {
 			log.Errorf("lockdown: CRITICAL: could not lock %s: %v", root, err)
 			return false
@@ -990,7 +1013,12 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			for _, built := range guards {
 				built.Stop()
 			}
-			return nil, fmt.Errorf("creating guard for %s: %w", r.Path, err)
+			// A resource that daemon.conf declares but guard.NewGuard refuses
+			// (a symlink, a file with more than one hard link, a special
+			// file, an invalid path) fails the same way on every future run
+			// until the config or the filesystem entry is fixed — not a
+			// transient condition.
+			return nil, fmt.Errorf("%w: creating guard for %s: %w", constants.ErrCriticalStartup, r.Path, err)
 		}
 		if pin.base != "" && g.PinDegraded() {
 			log.Errorf("daemon: CRITICAL: guard for %s could not pin its LSM links — it will not survive a SIGKILL", r.Path)

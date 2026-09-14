@@ -122,6 +122,16 @@ func isLockedRegularFileErr(err error) bool {
 	return errors.As(err, &locked)
 }
 
+// isNotEncryptedErr reports whether err means "path carries no fscrypt policy
+// at all" (metadata.ErrNotEncrypted) — e.g. an fscrypt-encrypted directory
+// that was replaced by a plaintext backup restore, or one whose policy was
+// stripped outside the daemon. Unlike a locked-but-provisioned resource, there
+// is no key to deprovision here at all.
+func isNotEncryptedErr(err error) bool {
+	var notEncrypted *metadata.ErrNotEncrypted
+	return errors.As(err, &notEncrypted)
+}
+
 // acceptFirstProtectorOption is the protector-picker shared by every policy
 // unlock: there is exactly one protector per policy here.
 var acceptFirstProtectorOption = func(_ string, _ []*actions.ProtectorOption) (int, error) {
@@ -556,7 +566,8 @@ func (v *Vault) Unlock(path string) error {
 
 // Lock deprovisions the policy key of path; skipped when not provisioned by
 // the target user and forceFlush is false (already locked). Errors map onto
-// repository.ErrKeyBusy (retry) / repository.ErrKeyMissing (fully locked).
+// repository.ErrKeyBusy (retry) / repository.ErrKeyMissing (fully locked) /
+// repository.ErrNotEncrypted (no policy at all — permanent, never retryable).
 // For a regular file it re-encrypts the file-vault content in place instead
 // (see filevault.go); forceFlush is meaningless there (no kernel keyring —
 // state lives in the file's own bytes, so the operation is idempotent on
@@ -574,6 +585,9 @@ func (v *Vault) Lock(path string, forceFlush bool) error {
 		if isLockedRegularFileErr(err) {
 			// The file cannot even be opened: its key is already gone.
 			return fmt.Errorf("%w: %s is a locked encrypted regular file", repository.ErrKeyMissing, path)
+		}
+		if isNotEncryptedErr(err) {
+			return fmt.Errorf("%w: %s: %v", repository.ErrNotEncrypted, path, err)
 		}
 		return fmt.Errorf("get policy for %s: %w", path, err)
 	}

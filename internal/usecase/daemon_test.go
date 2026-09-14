@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
 	"github.com/Virgula0/app-listener/internal/repository"
@@ -113,6 +114,13 @@ type fakeVault struct {
 	// holding files open for an unbounded time.
 	busyForever map[string]bool
 
+	// notEncryptedForever: Lock on these paths always returns
+	// repository.ErrNotEncrypted (no queue consumption, never clears on its
+	// own) — simulates a path whose fscrypt policy is permanently gone (e.g.
+	// a backup restore replaced the encrypted tree with plaintext), unlike
+	// busyForever's transient condition.
+	notEncryptedForever map[string]bool
+
 	unlockErr error
 	checkErr  error
 
@@ -123,10 +131,11 @@ type fakeVault struct {
 
 func newFakeVault(paths ...string) *fakeVault {
 	v := &fakeVault{
-		encrypted:   make(map[string]bool),
-		unlocked:    make(map[string]bool),
-		lockErrs:    make(map[string][]error),
-		busyForever: make(map[string]bool),
+		encrypted:           make(map[string]bool),
+		unlocked:            make(map[string]bool),
+		lockErrs:            make(map[string][]error),
+		busyForever:         make(map[string]bool),
+		notEncryptedForever: make(map[string]bool),
 	}
 	for _, p := range paths {
 		v.encrypted[p] = true
@@ -165,6 +174,9 @@ func (f *fakeVault) Lock(path string, forceFlush bool) error {
 
 	if f.busyForever[path] {
 		return repository.ErrKeyBusy
+	}
+	if f.notEncryptedForever[path] {
+		return repository.ErrNotEncrypted
 	}
 	queue := f.lockErrs[path]
 	if len(queue) > 0 {
@@ -210,6 +222,33 @@ func TestDaemonUseCaseConstructorMismatch(t *testing.T) {
 	_, err := NewDaemonUseCase([]daemonconfig.Resource{resource("/a")}, newFakeVault(), []repository.GuardRepository{})
 	if err == nil {
 		t.Fatal("expected error on resource/guard count mismatch")
+	}
+}
+
+// TestDaemonUseCaseStartEncryptionMismatchIsCriticalStartup verifies that a
+// need_encryption: true resource whose disk state disagrees (issue #53 — a
+// backup restore, or any change made outside the daemon) makes Start fail
+// with an error wrapping constants.ErrCriticalStartup: this condition
+// reproduces identically on every restart, so main.go must exit with the
+// non-retryable status instead of letting systemd's Restart=on-failure
+// crash-loop the daemon forever.
+func TestDaemonUseCaseStartEncryptionMismatchIsCriticalStartup(t *testing.T) {
+	vault := newFakeVault() // /vault reports as NOT encrypted
+	d, err := NewDaemonUseCase(
+		[]daemonconfig.Resource{resource("/vault")},
+		vault,
+		[]repository.GuardRepository{newFakeGuardRepo()},
+	)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+
+	startErr := d.Start()
+	if startErr == nil {
+		t.Fatal("expected an error for a resource whose disk state disagrees with need_encryption")
+	}
+	if !errors.Is(startErr, constants.ErrCriticalStartup) {
+		t.Errorf("Start error %q must wrap constants.ErrCriticalStartup", startErr)
 	}
 }
 
@@ -498,6 +537,52 @@ func TestDaemonUseCaseStopKeyMissingIsSuccess(t *testing.T) {
 	d.Stop()
 	if !repo.stopped {
 		t.Error("guard must be stopped even when the key was already gone")
+	}
+}
+
+// TestDaemonUseCaseStopNotEncryptedDoesNotBlockForever is the regression
+// test for issue #53: a resource marked need_encryption: true whose fscrypt
+// policy is entirely gone (e.g. a backup restore replaced the encrypted tree
+// with plaintext while the daemon was down) must not turn Stop's lockdown
+// into an infinite retry loop the way a genuinely busy key correctly does
+// (see TestDaemonUseCaseStopBlocksUntilAllLocked) — there is no key to
+// remove, so retrying can never succeed. Stop must still complete and detach
+// the guard, having logged the condition, instead of deadlocking shutdown
+// (systemctl stop / SIGTERM re-enters the same stuck call forever).
+func TestDaemonUseCaseStopNotEncryptedDoesNotBlockForever(t *testing.T) {
+	vault := newFakeVault("/vault")
+	// Every Lock call on /vault hits the policy-less path, forever — unlike
+	// busyForever this condition can never resolve on its own, so a fix that
+	// merely retries a few extra times before giving up would still pass a
+	// bounded-queue version of this test; only a fix that stops retrying
+	// this specific error can pass here.
+	vault.notEncryptedForever["/vault"] = true
+	repo := newFakeGuardRepo()
+	d, err := NewDaemonUseCase(
+		[]daemonconfig.Resource{resource("/vault")},
+		vault,
+		[]repository.GuardRepository{repo},
+	)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+	if err := d.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		d.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop blocked forever on a resource with no fscrypt policy at all — this is the issue #53 deadlock")
+	}
+	if !repo.stopped {
+		t.Error("guard must still be stopped once the lockdown finishes")
 	}
 }
 
@@ -1034,6 +1119,60 @@ func TestDaemonUseCaseReloadRollbackBusyPinKeepsGuardsAttached(t *testing.T) {
 	}
 	if vault.isUnlocked("/a") {
 		t.Error("configured vault must be locked after Stop")
+	}
+	if !newA.isStopped() || !newB.isStopped() {
+		t.Error("orphaned guards must be stopped by Stop")
+	}
+	if !old.isStopped() {
+		t.Error("main guards must be stopped by Stop")
+	}
+}
+
+// TestDaemonUseCaseReloadRollbackNotEncryptedKeepsGuardsAttached is the
+// regression test for the security-review finding on the issue #53 fix: a
+// newly-unlocked resource whose fscrypt policy vanishes before rollback can
+// lock it back (e.g. a backup restore racing a SIGHUP reload) has no old
+// guard to fall back on. Unlike lockUntilAllKeyless (Stop, where every guard
+// detaches together regardless), rollbackReload must treat
+// repository.ErrNotEncrypted exactly like a stuck busy key here — the new
+// guard stays attached (orphaned) denying access, never detached early —
+// or this resource would end up both unencrypted AND unguarded.
+func TestDaemonUseCaseReloadRollbackNotEncryptedKeepsGuardsAttached(t *testing.T) {
+	vault := newFakeVault("/a", "/b")
+	old := newFakeGuardRepo()
+	d := startDaemon(t, vault, []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	newA, newB := newFakeGuardRepo(), newFakeGuardRepo()
+	newB.startErr = errBoom
+	vault.notEncryptedForever["/b"] = true
+
+	err := d.Reload(
+		[]daemonconfig.Resource{resource("/a"), resource("/b")},
+		[]repository.GuardRepository{newA, newB},
+	)
+	if err == nil {
+		t.Fatal("expected error when a new guard fails to start")
+	}
+
+	// Rollback exhausted its bounded budget on a permanent (never-encrypted)
+	// condition: the guards must be orphaned (kept attached), never treated
+	// as "resolved" and detached.
+	if newA.isStopped() || newB.isStopped() {
+		t.Error("orphaned guards must stay attached — /b has no fscrypt policy and no old guard to fall back on")
+	}
+	if old.isStopped() {
+		t.Error("the old guards must stay attached")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		d.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not complete")
 	}
 	if !newA.isStopped() || !newB.isStopped() {
 		t.Error("orphaned guards must be stopped by Stop")

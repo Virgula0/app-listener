@@ -12,6 +12,13 @@ var (
 	// ErrKeyMissing reports that the kernel confirms the key is gone
 	// (ENOKEY): the directory is fully locked.
 	ErrKeyMissing = errors.New("key not present")
+
+	// ErrNotEncrypted reports that path carries no fscrypt policy at all —
+	// distinct from ErrKeyBusy/ErrKeyMissing, which both presuppose a policy
+	// exists. Unlike ErrKeyBusy this is permanent: retrying Lock can never
+	// turn a policy-less path into a locked one, so callers must not retry
+	// it forever the way they retry ErrKeyBusy.
+	ErrNotEncrypted = errors.New("path is not encrypted")
 )
 
 // Vault abstracts the fscrypt lifecycle of an encrypted directory.
