@@ -267,6 +267,30 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	termSig, hup, stopSignals := catchLifecycleSignals()
 	defer stopSignals()
 
+	// Always-on guards over the daemon's own state (/etc/app-listener,
+	// fscrypt.key, edit-auth.hash). Attached synchronously, HERE, before the
+	// config-driven guards below ever touch bpffs. This used to be a
+	// background goroutine started only after the daemon was already fully
+	// up and marked "ready" — which left a real window on every restart
+	// where a killed predecessor's self-guard pins had just been swept
+	// (CleanupStalePins below shares pin.base with these) but this run's
+	// replacements did not exist yet, so /etc/app-listener/fscrypt.key etc.
+	// were briefly readable by anything. Attaching first closes that window;
+	// pinstate.go's ensurePinStateFilePlaceholder (called from sg.attach)
+	// keeps writePinState below working even though the RO self-guard is now
+	// live before it runs. Self guards stay OUT of the usecase's guard set
+	// so a SIGHUP reload's transient guard doubling stays under the kernel's
+	// per-LSM-hook program cap (see selfGuards.detach/attach around reload)
+	// — that tradeoff, and the reload-time gap it implies, are unchanged. A
+	// self guard that fails to attach is now logged as CRITICAL but still
+	// never aborts startup: the config-driven protection below is the
+	// daemon's core function and a secondary guard failing must not block
+	// it (a large config already competes for the same limited LSM link
+	// slots).
+	sg := newSelfGuards()
+	sg.attach(pin)
+	defer sg.detach()
+
 	d, err := startGuardedDaemonAbortable(termSig, cfg, vault, pin)
 	if err != nil {
 		return err
@@ -277,11 +301,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	defer d.Stop()
+	events := mergeDaemonEvents(d.Events(), sg.Events())
 
 	// Record this run's config-guard pin generation for `daemon --lockdown`
-	// to recover later (see pinstate.go) — best-effort, and deliberately
-	// before the self guards below ever attach, so the very first write on a
-	// fresh host never has to fight its own not-yet-existent ReadOnly guard.
+	// to recover later (see pinstate.go) — best-effort. The self guards
+	// above are already live by now; writePinState's own create-fallback
+	// relies on ensurePinStateFilePlaceholder having already run instead of
+	// on ordering, so this is safe even though it used to be a precondition.
 	if pinErr := writePinState(pin); pinErr != nil {
 		log.Warnf("daemon: could not record pin state (%v) — `daemon --lockdown` will not be able to widen "+
 			"self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
@@ -293,17 +319,6 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer os.Remove(pidFile)
-
-	// Always-on guards over the daemon's own state (/etc/app-listener,
-	// fscrypt.key). Kept OUT of the usecase so a SIGHUP reload's transient
-	// guard doubling stays under the kernel's per-LSM-hook program cap (see
-	// selfGuards). Attached in the background — best-effort hardening, and
-	// each LSM attach is slow on hardened kernels, so it must not delay the
-	// event loop or "ready". Denials are merged into the event stream.
-	sg := newSelfGuards()
-	events := mergeDaemonEvents(d.Events(), sg.Events())
-	go sg.attach(pin)
-	defer sg.detach()
 
 	// The edit-protected control socket (only when a password is configured).
 	// Best-effort like the self guards: a socket that cannot bind disables

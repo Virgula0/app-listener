@@ -125,6 +125,23 @@ func ensureHashFilePlaceholder() error {
 // with the resource path (e.g. resource=/etc/app-listener). Never closed.
 func (s *selfGuards) Events() <-chan usecase.DaemonEvent { return s.events }
 
+// bootstrapSelfProtectPlaceholders pre-creates every file that a later,
+// in-place-only write (see ensureHashFilePlaceholder) needs to already exist
+// BEFORE any self guard attaches: once the /etc/app-listener ReadOnly guard
+// is live, creating a brand-new directory entry inside it is no longer
+// possible for the self binary — only rewriting an EXISTING one is.
+// Best-effort — a failure here just means the real writer (WriteHashFile,
+// writePinState) falls back to its own create-if-missing path, which will
+// itself now race the RO guard.
+func bootstrapSelfProtectPlaceholders() {
+	if err := ensureHashFilePlaceholder(); err != nil {
+		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — setting an edit-protected password while the daemon runs may fail until it does", editprotected.HashFile, err)
+	}
+	if err := ensurePinStateFilePlaceholder(); err != nil {
+		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — daemon --lockdown may not be able to recover this run's generation after a crash", pinStateFile, err)
+	}
+}
+
 // attach builds and starts the self-protection guards, pinned under pin.gen.
 // Safe to run in its own goroutine: a detach() that races it wins (attach
 // stops whatever it had already built and returns). Best effort — a guard
@@ -135,15 +152,7 @@ func (s *selfGuards) attach(pin pinCfg) {
 	s.stopped = false
 	s.mu.Unlock()
 
-	// Bootstrap the edit-auth hash file BEFORE any guard attaches (see
-	// ensureHashFilePlaceholder): once the /etc/app-listener ReadOnly guard
-	// below is live, creating a brand-new directory entry inside it is no
-	// longer possible for the self binary — only rewriting an EXISTING one
-	// is. Best-effort like the rest of self-protection; a failure here just
-	// means WriteHashFile falls back to its own create-if-missing path.
-	if err := ensureHashFilePlaceholder(); err != nil {
-		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — setting an edit-protected password while the daemon runs may fail until it does", editprotected.HashFile, err)
-	}
+	bootstrapSelfProtectPlaceholders()
 
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {
@@ -170,13 +179,16 @@ func (s *selfGuards) attach(pin pinCfg) {
 			guard.WithBackingDevices(nil),
 			guard.WithPinning(pin.prefix("self:"+spec.path)))
 		if gErr != nil {
-			log.Errorf("daemon: self-protection: %s is NOT guarded (%v) — the daemon runs normally, config protection is unaffected", spec.path, gErr)
+			log.Errorf("daemon: self-protection: CRITICAL: %s is NOT guarded (%v) — it is readable/writable by anything outside the app-listener binary until the next restart or reload; the daemon runs normally otherwise, config protection is unaffected", spec.path, gErr)
 			continue
 		}
 		if startErr := g.Start(); startErr != nil {
-			log.Errorf("daemon: self-protection: %s guard attached but its reader failed to start (%v) — detaching", spec.path, startErr)
+			log.Errorf("daemon: self-protection: CRITICAL: %s guard attached but its reader failed to start (%v) — detaching, leaving it unguarded until the next restart or reload", spec.path, startErr)
 			g.Stop()
 			continue
+		}
+		if pin.base != "" && g.PinDegraded() {
+			log.Errorf("daemon: self-protection: CRITICAL: guard for %s could not pin its LSM links — it will not survive a SIGKILL", spec.path)
 		}
 		stop := make(chan struct{})
 
