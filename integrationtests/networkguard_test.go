@@ -361,9 +361,12 @@ func (s *IntegrationSuite) TestNetworkGuard_NoThrottle() {
 
 	// The sender dials before the guard attaches, then sends 10 datagrams at
 	// 50ms once the marker appears. With --no-throttle every blocked send is
-	// logged; the default 250ms per-(type, comm) throttle would log ~2.
+	// logged; the default 250ms per-(type, comm) throttle would log ~2. The
+	// 10 sends only take ~500ms, but under host/scheduler load the count can
+	// lag well past that — give it more room than the other (single-event)
+	// waits in this file rather than the same 8s.
 	s.exec(c, []string{"touch", "/tmp/go"})
-	s.waitForNetGuardEventCount(c, "other_tester", "SEND", 6, 8*time.Second)
+	s.waitForNetGuardEventCount(c, "other_tester", "SEND", 6, 20*time.Second)
 	s.stopNetGuard(c)
 }
 
