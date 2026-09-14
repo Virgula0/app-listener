@@ -70,7 +70,24 @@ func (s *IntegrationSuite) startDaemon(c testcontainers.Container, config string
 	writeConfig := fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", config)
 	s.exec(c, []string{"sh", "-c", writeConfig})
 	s.launchDaemon(c)
-	s.awaitDaemonUp(c)
+	s.awaitDaemonUp(c, config)
+}
+
+// watchPathsInConfig extracts every "[watch <path>]" section header's path
+// from a daemon.conf, in order, for awaitDaemonUp to wait on each one's own
+// "guard started" line individually rather than stopping at the first.
+func watchPathsInConfig(config string) []string {
+	var paths []string
+	for _, line := range strings.Split(config, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
+			continue
+		}
+		if path := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]")); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
 }
 
 // launchDaemon backgrounds the daemon process against the already-written
@@ -85,9 +102,17 @@ func (s *IntegrationSuite) launchDaemon(c testcontainers.Container) {
 }
 
 // awaitDaemonUp polls until the daemon's guards are attached and its event
-// readers are running (pid file, then the "guard started" log marker).
-func (s *IntegrationSuite) awaitDaemonUp(c testcontainers.Container) {
-	deadline := time.Now().Add(20 * time.Second)
+// readers are running for EVERY resource in config: the pid file, then one
+// "guard started — guarding: <path>" log line per "[watch <path>]" section.
+// Waiting for only the first such line (as this used to) is a real race on a
+// multi-resource config: each guard (re)attach is its own multi-second
+// BPF-verifier pass on a slow host (see daemonShutdownTimeout), so a caller
+// that immediately reads/writes a LATER resource can hit it before its guard
+// — let alone its fscrypt unlock — is actually live. config may be "" (a
+// caller re-launching against an already-written daemon.conf it doesn't have
+// handy); that falls back to the old "at least one guard started" check.
+func (s *IntegrationSuite) awaitDaemonUp(c testcontainers.Container, config string) {
+	deadline := time.Now().Add(daemonShutdownTimeout)
 	ready := false
 	for time.Now().Before(deadline) {
 		code, _ := s.exec(c, []string{"sh", "-c", "test -f /run/app-listener-daemon.pid && echo ready"})
@@ -101,7 +126,7 @@ func (s *IntegrationSuite) awaitDaemonUp(c testcontainers.Container) {
 	if !ready && strings.Contains(log, "OCI runtime exec failed") {
 		// Transient host-level runc flake: the daemon never ran — retry once.
 		s.launchDaemon(c)
-		deadline = time.Now().Add(20 * time.Second)
+		deadline = time.Now().Add(daemonShutdownTimeout)
 		for time.Now().Before(deadline) {
 			code, _ := s.exec(c, []string{"sh", "-c", "test -f /run/app-listener-daemon.pid && echo ready"})
 			if code == 0 {
@@ -113,18 +138,37 @@ func (s *IntegrationSuite) awaitDaemonUp(c testcontainers.Container) {
 		log = s.readDaemonLog(c)
 	}
 	if !ready {
-		s.Require().Failf("daemon did not attach its guards", "pid file missing after 20s, daemon log:\n%s", log)
+		s.Require().Failf("daemon did not attach its guards", "pid file missing after %s, daemon log:\n%s", daemonShutdownTimeout, log)
 	}
+
+	wantMarkers := []string{"guard started"}
+	if paths := watchPathsInConfig(config); len(paths) > 0 {
+		wantMarkers = wantMarkers[:0]
+		for _, p := range paths {
+			wantMarkers = append(wantMarkers, "guard started — guarding: "+p)
+		}
+	}
+	allPresent := func(l string) bool {
+		for _, m := range wantMarkers {
+			if !strings.Contains(l, m) {
+				return false
+			}
+		}
+		return true
+	}
+
 	// Guards are attached and readers running before the pid file appears;
-	// poll for the guard-started marker instead of a fixed settle sleep.
-	deadline2 := time.Now().Add(10 * time.Second)
+	// poll for every expected guard-started marker instead of a fixed settle
+	// sleep or stopping at the first resource's.
+	deadline2 := time.Now().Add(daemonShutdownTimeout)
 	for time.Now().Before(deadline2) {
-		if strings.Contains(log, "guard started") || strings.Contains(s.readDaemonLog(c), "guard started") {
-			break
+		if allPresent(log) {
+			return
 		}
 		time.Sleep(200 * time.Millisecond)
 		log = s.readDaemonLog(c)
 	}
+	s.Require().Truef(allPresent(log), "not every configured resource's guard started within %s, daemon log:\n%s", daemonShutdownTimeout, log)
 }
 
 func (s *IntegrationSuite) readDaemonLog(c testcontainers.Container) string {
@@ -684,6 +728,17 @@ func (s *IntegrationSuite) sigDaemon(c testcontainers.Container, sig string) {
 	s.exec(c, []string{"sh", "-c", "pkill -" + sig + " -f 'app-listener daemon' || true"})
 }
 
+// daemonShutdownTimeout is the budget awaitDaemonDead callers give a
+// graceful SIGTERM (Stop locks every vault back — see internal/usecase/daemon.go
+// — before the process exits) or a kill racing one. Each guard (re)attach is a
+// real BPF-verifier pass over 23 LSM hooks, observed taking 5-11s on a slower
+// host/kernel (e.g. a hardened kernel's extra verifier work); a reload or a
+// live-edit session can rebuild several guards (including the two
+// self-protection ones, selfguards.go) back to back, so the wait comfortably
+// covers a handful of those in sequence rather than the couple of seconds a
+// fast host needs.
+const daemonShutdownTimeout = 45 * time.Second
+
 // awaitDaemonDead polls until no live app-listener process remains,
 // returning false if one is still alive after timeout. Uses
 // noLiveAppListenerProcs (pool_test.go) — matching on `comm`, not the full
@@ -826,7 +881,7 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_Directory() 
 	go s.raceUnauthorizedReader(c, secretFile, marker, stop, &leaked)
 
 	s.launchDaemon(c)
-	s.awaitDaemonUp(c)
+	s.awaitDaemonUp(c, config)
 	close(stop)
 
 	s.Require().Falsef(leaked.Load(),
@@ -840,7 +895,7 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_Directory() 
 	s.Require().NotEqualf(0, code, "non-whitelisted reader must still be denied once the guard is fully up")
 
 	s.sigDaemon(c, "TERM")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not exit after SIGTERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 	s.Require().Truef(s.harnessIsEncrypted(c, secretDir), "a graceful stop must re-lock the directory")
 
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("umount %s 2>/dev/null; losetup -D 2>/dev/null; true", mnt)})
@@ -874,7 +929,7 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_File() {
 	go s.raceUnauthorizedReader(c, secretFile, marker, stop, &leaked)
 
 	s.launchDaemon(c)
-	s.awaitDaemonUp(c)
+	s.awaitDaemonUp(c, config)
 	close(stop)
 
 	s.Require().Falsef(leaked.Load(),
@@ -886,7 +941,7 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_File() {
 	s.Require().NotEqualf(0, code, "non-whitelisted reader must still be denied once the guard is fully up")
 
 	s.sigDaemon(c, "TERM")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not exit after SIGTERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 	s.Require().Truef(s.harnessIsEncrypted(c, secretFile), "a graceful stop must re-seal the file")
 }
 
@@ -946,12 +1001,12 @@ func (s *IntegrationSuite) TestDaemon_KillDuringUnlock_FileVault_NeverOrphansPla
 			// any corruption, so a matching grep here is real proof, not a
 			// coincidence.
 			s.launchDaemon(c)
-			s.awaitDaemonUp(c)
+			s.awaitDaemonUp(c, config)
 			_, grepOut := s.exec(c, []string{"grep", "-c", marker, secretFile})
 			s.Require().Contains(grepOut, "1", "round %d: content must round-trip intact through the kill + lockdown + restart cycle", i)
 
 			s.sigDaemon(c, "TERM")
-			s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "round %d: daemon did not exit after SIGTERM", i)
+			s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "round %d: daemon did not exit after SIGTERM", i)
 			s.runLockdown(c)
 		})
 	}
@@ -1025,7 +1080,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	s.Require().NotEqualf(0, code, "non-whitelisted reader must be denied once the new guard is live")
 
 	s.sigDaemon(c, "TERM")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not exit after SIGTERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 	s.runLockdown(c)
 
 	// ---- Round 2: a reload interrupted by SIGKILL must still never leave
@@ -1041,7 +1096,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	s.exec(c, []string{"sh", "-c", "kill -HUP " + pid})
 	time.Sleep(150 * time.Millisecond) // aim somewhere inside prepareNewResources/prepareGuards/startNewGuards
 	s.sigDaemon(c, "KILL")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not die after SIGKILL mid-reload")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not die after SIGKILL mid-reload")
 
 	s.assertNoUnauthorizedPlaintext(c, resourceB, marker, "kill mid-reload")
 
@@ -1054,7 +1109,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	s.Require().Contains(grepOut, "1", "content must round-trip intact through the kill-mid-reload + lockdown + restart cycle")
 
 	s.sigDaemon(c, "TERM")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not exit after SIGTERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 	s.runLockdown(c)
 }
 
@@ -1092,7 +1147,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringShutdown_LockdownRecovers() {
 	s.sigDaemon(c, "TERM")
 	time.Sleep(30 * time.Millisecond)
 	s.sigDaemon(c, "KILL")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not die after the SIGTERM+SIGKILL race")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not die after the SIGTERM+SIGKILL race")
 
 	s.assertNoUnauthorizedPlaintext(c, secretFile, marker, "SIGTERM raced by SIGKILL mid-shutdown")
 
@@ -1105,7 +1160,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringShutdown_LockdownRecovers() {
 	s.Require().Contains(grepOut, "1", "content must round-trip intact through the raced shutdown + lockdown + restart cycle")
 
 	s.sigDaemon(c, "TERM")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not exit after the final SIGTERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after the final SIGTERM")
 	s.runLockdown(c)
 }
 
@@ -1185,7 +1240,7 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 	s.Require().Truef(granted, "edit-protected session never reached GRANTED, log:\n%s", s.readDaemonLog(c))
 
 	s.sigDaemon(c, "KILL")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not die after SIGKILL raced against the live-edit session")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not die after SIGKILL raced against the live-edit session")
 
 	// Whether or not the kill actually beat the client's own END, the
 	// widened self mask (orphaned in the still-pinned BPF program if the
@@ -1211,7 +1266,7 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 	s.Require().NotEqualf(0, code, "a restarted daemon must not carry over the killed session's grant: %s", out)
 
 	s.sigDaemon(c, "TERM")
-	s.Require().True(s.awaitDaemonDead(c, 15*time.Second), "daemon did not exit after the final SIGTERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after the final SIGTERM")
 }
 
 // ---------------------------------------------------------------

@@ -78,6 +78,23 @@ func newPinGeneration() string {
 // drift apart from one another.
 var daemonSelfBaselineEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat}
 
+// groupUnlockSelfEvents is daemonSelfBaselineEvents plus EventMknod, for the
+// ephemeral guard unlockPendingGroupRoots puts over a grouped encryption
+// root. That guard stays attached through buildGuards (see
+// startGuardedDaemon/reloadDaemon), which — for every WatchRelPaths
+// sub-resource that resolves to a regular file — calls
+// fscrypt.EnsureRecoverySidecarPlaceholder to pre-stage that resource's
+// file-vault crash-recovery sidecar with an O_CREAT|O_EXCL open. Creating a
+// new dentry is gated by EVENT_MKNOD alone (guard_path_mknod), which
+// daemonSelfBaselineEvents deliberately excludes ("but never write"); without
+// it here, this guard denies the daemon's own placeholder create, and the
+// resource's crash-recovery sidecar can never be staged (the "could not
+// pre-create the recovery sidecar" warning). This mask is used ONLY for this
+// short-lived, self-only, whole-root guard — never for a permanent
+// per-resource guard — so it does not touch the "never write" guarantee
+// daemonSelfBaselineEvents documents for those.
+var groupUnlockSelfEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat, ebpf.EventMknod}
+
 var (
 	configFlag   string
 	genKeyFlag   bool
@@ -641,7 +658,11 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 
 	for _, root := range roots {
 		g, guardErr := guard.NewGuard(root, guard.ModeWhitelist, nil, true, 0,
-			guard.WithSelfAllowBinary(self, daemonSelfBaselineEvents),
+			// groupUnlockSelfEvents, not daemonSelfBaselineEvents: buildGuards
+			// runs while this guard is still attached and must be able to
+			// pre-create file-vault recovery sidecars for regular-file
+			// sub-resources under this root (see groupUnlockSelfEvents).
+			guard.WithSelfAllowBinary(self, groupUnlockSelfEvents),
 			// Pin the ephemeral guard too: a SIGKILL during the grouped-vault
 			// unlock window must still leave the root enforced.
 			guard.WithPinning(pin.prefix("ephemeral:"+root)))
