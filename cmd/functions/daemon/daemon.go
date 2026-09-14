@@ -22,6 +22,7 @@ import (
 
 	"github.com/Virgula0/app-listener/cmd/common"
 	"github.com/Virgula0/app-listener/cmd/printers"
+	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/guard"
@@ -428,17 +429,20 @@ func configureDaemonLogging() {
 }
 
 // loadDaemonConfig resolves, loads and sanity-checks the daemon configuration.
+// Every failure here is the same config file failing to resolve/parse/
+// declare a resource on every future run too — constants.ErrCriticalStartup,
+// not a transient condition worth systemd restarting for.
 func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	configPath, err := resolveConfigPath()
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("%w: %w", constants.ErrCriticalStartup, err)
 	}
 	cfg, err := daemonconfig.Load(configPath)
 	if err != nil {
-		return "", nil, fmt.Errorf("loading config %s: %w", configPath, err)
+		return "", nil, fmt.Errorf("%w: loading config %s: %w", constants.ErrCriticalStartup, configPath, err)
 	}
 	if len(cfg.Resources) == 0 {
-		return "", nil, fmt.Errorf("config %s contains no [watch] sections", configPath)
+		return "", nil, fmt.Errorf("%w: config %s contains no [watch] sections", constants.ErrCriticalStartup, configPath)
 	}
 	return configPath, cfg, nil
 }
@@ -750,6 +754,10 @@ func lockOneRoot(vault *fscrypt.Vault, root string) bool {
 			log.Infof("lockdown: %s is locked", root)
 			return true
 		}
+		if errors.Is(err, repository.ErrNotEncrypted) {
+			log.Errorf("lockdown: CRITICAL: %s is not encrypted and daemon.conf needs to be re-checked — need_encryption no longer matches this resource's actual on-disk state (was it decrypted, restored from a backup, or otherwise modified outside the daemon?): %v", root, err)
+			return false
+		}
 		if !errors.Is(err, repository.ErrKeyBusy) {
 			log.Errorf("lockdown: CRITICAL: could not lock %s: %v", root, err)
 			return false
@@ -990,7 +998,12 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			for _, built := range guards {
 				built.Stop()
 			}
-			return nil, fmt.Errorf("creating guard for %s: %w", r.Path, err)
+			// A resource that daemon.conf declares but guard.NewGuard refuses
+			// (a symlink, a file with more than one hard link, a special
+			// file, an invalid path) fails the same way on every future run
+			// until the config or the filesystem entry is fixed — not a
+			// transient condition.
+			return nil, fmt.Errorf("%w: creating guard for %s: %w", constants.ErrCriticalStartup, r.Path, err)
 		}
 		if pin.base != "" && g.PinDegraded() {
 			log.Errorf("daemon: CRITICAL: guard for %s could not pin its LSM links — it will not survive a SIGKILL", r.Path)
