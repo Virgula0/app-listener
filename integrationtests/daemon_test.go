@@ -1013,54 +1013,112 @@ func (s *IntegrationSuite) TestDaemon_KillDuringUnlock_FileVault_NeverOrphansPla
 }
 
 // ---------------------------------------------------------------
-// D. SIGHUP reload adding a new encrypted resource: both the ordinary
-// (uninterrupted) race window and a kill landing mid-reload.
+// D. Live catalog-refresh SIGHUP reload (whitelist change on an existing
+// resource): both the ordinary (uninterrupted) race window and a kill
+// landing mid-reload.
 // ---------------------------------------------------------------
 
+// installFakeSystemctl stubs a minimal /usr/local/bin/systemctl inside the
+// container. These test images run no systemd at all — the daemon here is
+// always launched directly via nohup, never as a unit — but install's LIVE
+// catalog refresh path (internal/systemd.IsDaemonActive / EnableAndVerify)
+// unconditionally shells out to the real systemctl to gate and deliver the
+// change. The stub covers exactly the subcommands that path calls:
+// is-active/is-enabled report the daemon as up (so the live-mode gate
+// passes and no unwanted enable/start/restart branch fires), daemon-reload
+// is a no-op, and reload is turned into what it would really do on a
+// systemd host — deliver an actual SIGHUP to the running daemon via its
+// pid file — which is what makes the resulting reload real and worth
+// racing/killing against.
+func (s *IntegrationSuite) installFakeSystemctl(c testcontainers.Container) {
+	script := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  is-active) echo active; exit 0;;\n" +
+		"  is-enabled) echo enabled; exit 0;;\n" +
+		"  daemon-reload) exit 0;;\n" +
+		"  reload) kill -HUP \"$(cat /run/app-listener-daemon.pid 2>/dev/null)\" 2>/dev/null; exit 0;;\n" +
+		"  *) exit 0;;\n" +
+		"esac\n"
+	code, out := s.exec(c, []string{"sh", "-c",
+		fmt.Sprintf("cat > /usr/local/bin/systemctl <<'EOF'\n%sEOF\nchmod +x /usr/local/bin/systemctl", script)})
+	s.Require().Equalf(0, code, "installing fake systemctl stub: %s", out)
+}
+
 // TestDaemon_KillDuringReload_NoUnprotectedWindow exercises Reload's own
-// documented ordering (attach the new guard -> unlock -> populate ->
-// resolve -> start, old guards never drop protection in the meantime) for
-// a resource ADDED via SIGHUP: first with a live racer through a normal,
-// uninterrupted reload, then with a SIGKILL landing mid-reload — in both
-// cases the newly added resource must never end up unlocked and
-// unprotected.
+// documented ordering (the new guard attaches before the old one detaches)
+// for a resource whose WHITELIST changes via a live SIGHUP reload: first
+// with a live racer through a normal, uninterrupted reload, then with a
+// SIGKILL landing mid-reload — in both cases the resource must never end up
+// fully unguarded (open to any reader).
+//
+// The trigger is `install --update-catalog-only --live --yes` against the
+// built-in WireGuard catalog entry (/etc/wireguard, whitelisting
+// /usr/bin/nmcli), not a raw shell rewrite of daemon.conf: the self-guard on
+// /etc/app-listener (see issue #53's follow-up hardening) now
+// deterministically denies any non-daemon-binary write there, so a brand
+// new [watch] section can never be introduced by hand-editing the config
+// while the daemon runs — and per README.md, adding a genuinely NEW
+// resource (`install` / `install --diff-catalog`) always stops the daemon
+// first anyway, live or not. `--update-catalog-only --live` is the one
+// documented live path: it re-expands an EXISTING catalog-matched section's
+// whitelist from inside the daemon's own binary (GUARD_ALLOW_ROOT — same
+// exe inode as the running daemon) and delivers the change via SIGHUP,
+// without any external process ever writing to the guarded config.
 func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
-	s.copyFscryptHarness(c)
+	s.installFakeSystemctl(c)
 
 	const marker = "TOCTOU-RELOAD-SECRET-7F31"
-	const resourceB = "/vault/added.txt"
+	const resourceB = "/etc/wireguard/secret.conf"
+	const nmcli = "/usr/bin/nmcli"
+
+	writeMarker := func() {
+		s.exec(c, []string{"sh", "-c", fmt.Sprintf("mkdir -p /etc/wireguard && printf '%%s' '%s' > %s", marker, resourceB)})
+	}
+	// installNmcli simulates the real-world trigger for this workflow: a
+	// package manager installs a catalog-whitelisted binary after the
+	// daemon already started guarding the resource with an empty (nothing
+	// matched yet) whitelist. FilterExistingWhitelist only picks up binaries
+	// that exist on disk at scan time. This must be a real, standalone ELF
+	// binary, not a shebang script: guard identity is the CALLING PROCESS's
+	// own exe inode, and a script's process runs under its interpreter's
+	// inode (/bin/sh), never the script file's own — so a script here would
+	// always be denied regardless of whitelisting. /bin/cat (and friends)
+	// won't do either on modern Ubuntu: they're symlinks into one uutils
+	// coreutils multi-call binary that dispatches on ITS OWN RESOLVED PATH's
+	// basename (not argv[0] — `exec -a` doesn't help), so a copy landing at
+	// a path named "nmcli" is rejected as an unknown applet regardless.
+	// /usr/bin/grep is GNU grep, a genuine standalone binary indifferent to
+	// its own path/name — copying it works as a stand-in reader.
+	installNmcli := func() {
+		s.exec(c, []string{"sh", "-c", fmt.Sprintf("cp /usr/bin/grep %s && chmod +x %s", nmcli, nmcli)})
+	}
+	removeNmcli := func() { s.exec(c, []string{"rm", "-f", nmcli}) }
 
 	s.exec(c, []string{"sh", "-c",
-		"mkdir -p /protected /vault /etc/app-listener && echo BASE > /protected/base.txt && chmod 755 /protected && " +
+		"mkdir -p /protected /etc/app-listener && echo BASE > /protected/base.txt && chmod 755 /protected && " +
 			"head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+	writeMarker()
 
-	baseConfig := "[watch /protected]\nneed_encryption: false\n/usr/bin/grep"
-	reloadedConfig := fmt.Sprintf("%s\n\n[watch %s]\nneed_encryption: true\n/usr/bin/grep", baseConfig, resourceB)
-
-	// resourceB must be sealed BEFORE any daemon here ever starts: once one
-	// is running, its self-guard denies every non-daemon-binary read of
-	// /etc/app-listener/fscrypt.key (including this harness), exactly like
-	// a real `install` migration has to run before the daemon is up.
-	s.resetFileVaultTarget(c, resourceB, marker)
-	s.harnessMigrate(c, resourceB)
-	s.Require().True(s.harnessIsEncrypted(c, resourceB), "round 1 setup: must start from a sealed file")
+	// /etc/wireguard starts with an empty whitelist (nmcli not installed
+	// yet): the WireGuard catalog entry still matches the section by path,
+	// so a later live refresh can re-expand it.
+	baseConfig := "[watch /protected]\nneed_encryption: false\n/usr/bin/grep\n\n[watch /etc/wireguard]\nneed_encryption: false"
 
 	s.startDaemon(c, baseConfig)
 
-	// ---- Round 1: a normal, uninterrupted reload must never expose
-	// plaintext early. ----
-	s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", reloadedConfig)})
-
-	_, pidOut := s.exec(c, []string{"sh", "-c", "cat /run/app-listener-daemon.pid"})
-	pid := strings.TrimSpace(pidOut)
+	// ---- Round 1: a normal, uninterrupted live catalog refresh must never
+	// open a window where /etc/wireguard is fully unguarded. ----
+	installNmcli()
 
 	stop := make(chan struct{})
 	var leaked atomic.Bool
 	go s.raceUnauthorizedReader(c, resourceB, marker, stop, &leaked)
 
-	s.exec(c, []string{"sh", "-c", "kill -HUP " + pid})
+	code, out := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	s.Require().Equalf(0, code, "live catalog refresh failed: %s", out)
+
 	reloaded := false
 	for dl := time.Now().Add(30 * time.Second); time.Now().Before(dl); {
 		if strings.Contains(s.readDaemonLog(c), "configuration reloaded") {
@@ -1072,45 +1130,34 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	close(stop)
 	s.Require().Truef(reloaded, "reload never completed, log:\n%s", s.readDaemonLog(c))
 	s.Require().Falsef(leaked.Load(),
-		"an unauthorized reader observed plaintext content of %s during the SIGHUP reload window", resourceB)
+		"an unauthorized reader observed %s during the live catalog refresh", resourceB)
 
-	_, grepOut := s.exec(c, []string{"grep", "-c", marker, resourceB})
-	s.Require().Contains(grepOut, "1", "the newly added resource must be unlocked and readable by its whitelisted binary after reload")
-	code, _ := s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat " + resourceB})
-	s.Require().NotEqualf(0, code, "non-whitelisted reader must be denied once the new guard is live")
+	code, out = s.exec(c, []string{nmcli, marker, resourceB})
+	s.Require().Equalf(0, code, "the newly whitelisted binary must be able to read %s after the refresh: %s", resourceB, out)
+	s.Require().Contains(out, marker)
+
+	code, _ = s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat " + resourceB})
+	s.Require().NotEqualf(0, code, "a non-whitelisted reader must still be denied after the refresh")
 
 	s.sigDaemon(c, "TERM")
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 	s.runLockdown(c)
 
-	// ---- Round 2: a reload interrupted by SIGKILL must still never leave
-	// the newly added resource unlocked and unguarded. ----
-	s.resetFileVaultTarget(c, resourceB, marker)
-	s.harnessMigrate(c, resourceB)
-	s.startDaemon(c, baseConfig) // back to just the base resource
+	// ---- Round 2: a live catalog refresh interrupted by SIGKILL must still
+	// never leave /etc/wireguard fully unguarded. ----
+	removeNmcli() // back to "not installed yet"
+	writeMarker()
+	s.startDaemon(c, baseConfig) // daemon.conf gets rewritten to baseConfig here, discarding round 1's patched whitelist
+	installNmcli()
 
-	s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", reloadedConfig)})
-	_, pidOut = s.exec(c, []string{"sh", "-c", "cat /run/app-listener-daemon.pid"})
-	pid = strings.TrimSpace(pidOut)
-
-	s.exec(c, []string{"sh", "-c", "kill -HUP " + pid})
-	time.Sleep(150 * time.Millisecond) // aim somewhere inside prepareNewResources/prepareGuards/startNewGuards
+	code, out = s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	s.Require().Equalf(0, code, "live catalog refresh (round 2 trigger) failed: %s", out)
+	time.Sleep(150 * time.Millisecond) // aim somewhere inside the guard swap (new attaches, old detaches)
 	s.sigDaemon(c, "KILL")
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not die after SIGKILL mid-reload")
 
-	s.assertNoUnauthorizedPlaintext(c, resourceB, marker, "kill mid-reload")
-
-	code, out := s.runLockdown(c)
-	s.Require().Equalf(0, code, "lockdown after a kill-mid-reload exited non-zero: %s", out)
-	s.assertFileVaultSealed(c, resourceB, marker, "lockdown after kill-mid-reload")
-
-	s.startDaemon(c, reloadedConfig)
-	_, grepOut = s.exec(c, []string{"grep", "-c", marker, resourceB})
-	s.Require().Contains(grepOut, "1", "content must round-trip intact through the kill-mid-reload + lockdown + restart cycle")
-
-	s.sigDaemon(c, "TERM")
-	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
-	s.runLockdown(c)
+	code, out = s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat " + resourceB})
+	s.Require().NotEqualf(0, code, "a non-whitelisted reader must still be denied after a kill mid-reload: %s", out)
 }
 
 // ---------------------------------------------------------------
