@@ -47,6 +47,7 @@ func TestWriteEventBlocked(t *testing.T) {
 			"resource=/home/alice/.ssh",
 			"op=OPEN",
 			"comm=ssh",
+			"commFullPath=~", // pid 1234 is not a real running process in the test
 			"path=/home/alice/.ssh/authorized_keys",
 			"pid=1234",
 		} {

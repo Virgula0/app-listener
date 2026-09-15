@@ -29,6 +29,12 @@ const (
 	// sweep is fingerprint-gated (SweepInodes) so each tick is cheap when
 	// nothing changed.
 	resyncSweepEvery = 30 * time.Second
+	// inodeGCEvery is the guard_inodes eviction cadence (ReconcileInodes): a
+	// full, complete tree walk, much coarser than resyncSweepEvery — it
+	// exists to bound how long a stale (dev, ino) entry for a long-deleted
+	// file can linger and risk colliding with an unrelated inode reused
+	// elsewhere on the same filesystem, not to catch changes quickly.
+	inodeGCEvery = time.Hour
 
 	// Rollback lock-back budget: bounded (unlike Stop's infinite wait)
 	// because rollback runs on the SIGHUP handler, which must keep serving
@@ -289,6 +295,8 @@ func (d *daemonUseCase) startGuards() error {
 func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardRepository, stop <-chan struct{}) {
 	sweep := time.NewTicker(resyncSweepEvery)
 	defer sweep.Stop()
+	inodeGC := time.NewTicker(inodeGCEvery)
+	defer inodeGC.Stop()
 	var lastResync time.Time
 	for {
 		select {
@@ -322,6 +330,10 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 		case <-sweep.C:
 			d.periodicSweep(resource, g)
 			lastResync = time.Now()
+		case <-inodeGC.C:
+			if err := g.ReconcileInodes(); err != nil {
+				log.Warnf("daemon: periodic inode GC for %s: %v", resource, err)
+			}
 		case <-d.done:
 			return
 		case <-stop:
