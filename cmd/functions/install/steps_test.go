@@ -364,8 +364,8 @@ func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
 	if !strings.Contains(updated, appBin) {
 		t.Errorf("re-expanded whitelist missing %s:\n%s", appBin, updated)
 	}
-	if !strings.Contains(updated, "watch: "+filepath.Join(root, "Local Storage")) ||
-		!strings.Contains(updated, "watch: "+filepath.Join(root, "Cookies")) {
+	if !strings.Contains(updated, `watch: "`+filepath.Join(root, "Local Storage")+`"`) ||
+		!strings.Contains(updated, `watch: "`+filepath.Join(root, "Cookies")+`"`) {
 		t.Errorf("group watch directives were erased:\n%s", updated)
 	}
 

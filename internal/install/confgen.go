@@ -47,23 +47,26 @@ func GenerateConf(sections []Section) string {
 // GenerateSections renders just the [watch ...] blocks, with no file header,
 // each block preceded by a blank line. Used to append new sections to an
 // existing daemon.conf (install --diff-catalog) without disturbing what is
-// already there.
+// already there. Every generated path (section root, `watch:` directives,
+// whitelisted binaries) is double-quoted: catalog paths regularly contain
+// spaces (e.g. Steam/Proton's "Proton - Experimental"), and quoting is the
+// only form the daemon config parser accepts for those unambiguously.
 func GenerateSections(sections []Section) string {
 	var b strings.Builder
 	for _, s := range sections {
 		b.WriteString("\n[watch ")
-		b.WriteString(s.Path)
+		b.WriteString(quotePath(s.Path))
 		b.WriteString("]\n\n")
 		for _, w := range s.ExtraWatchPaths {
 			b.WriteString("watch: ")
-			b.WriteString(w)
+			b.WriteString(quotePath(w))
 			b.WriteString("\n")
 		}
 		if len(s.ExtraWatchPaths) > 0 {
 			b.WriteString("\n")
 		}
 		for _, bin := range s.Allow {
-			b.WriteString(bin.Path)
+			b.WriteString(quotePath(bin.Path))
 			if len(bin.Events) > 0 {
 				b.WriteString(" ")
 				b.WriteString(strings.Join(bin.Events, ","))
@@ -95,10 +98,9 @@ func SetNeedEncryption(confText, path string, value bool) (string, error) {
 	}
 
 	lines := strings.Split(confText, "\n")
-	header := "[watch " + path + "]"
-	start := findSectionStart(lines, header)
+	start := findSectionStart(lines, path)
 	if start == -1 {
-		return "", fmt.Errorf("section %q not found in configuration", header)
+		return "", fmt.Errorf("section for %q not found in configuration", path)
 	}
 	end := findSectionEnd(lines, start)
 	replaced := false
@@ -125,10 +127,9 @@ func SetNeedEncryption(confText, path string, value bool) (string, error) {
 // non-comment, non-directive lines in the section body.
 func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, error) {
 	lines := strings.Split(confText, "\n")
-	header := "[watch " + path + "]"
-	start := findSectionStart(lines, header)
+	start := findSectionStart(lines, path)
 	if start == -1 {
-		return "", fmt.Errorf("section %q not found in configuration", header)
+		return "", fmt.Errorf("section for %q not found in configuration", path)
 	}
 	end := findSectionEnd(lines, start)
 
@@ -147,7 +148,7 @@ func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, 
 
 	newLines := make([]string, 0, len(newRules))
 	for _, rule := range newRules {
-		line := rule.Path
+		line := quotePath(rule.Path)
 		if len(rule.Events) > 0 {
 			line += " " + strings.Join(rule.Events, ",")
 		}
@@ -190,15 +191,46 @@ func isPathDirectiveText(t string) bool {
 	return strings.HasPrefix(t, "path = ") || t == "path ="
 }
 
-// findSectionStart returns the index of the exact [watch ...] header line,
-// or -1.
-func findSectionStart(lines []string, header string) int {
+// findSectionStart returns the index of the "[watch <path>]" header line
+// whose path — quoted or not — equals path, or -1.
+func findSectionStart(lines []string, path string) int {
 	for i, line := range lines {
-		if strings.TrimSpace(line) == header {
+		if headerPath, ok := ParseSectionHeaderPath(line); ok && headerPath == path {
 			return i
 		}
 	}
 	return -1
+}
+
+// ParseSectionHeaderPath extracts the path from a "[watch <path>]" section
+// header line (leading/trailing whitespace ignored), unquoting a
+// double-quoted path; ok is false for anything that is not a section header.
+// Exported so callers outside this package (e.g. the live re-scan safety
+// check in cmd/functions/install) can match a section header regardless of
+// whether it was written quoted or bare.
+func ParseSectionHeaderPath(line string) (path string, ok bool) {
+	t := strings.TrimSpace(line)
+	if !strings.HasPrefix(t, "[watch ") || !strings.HasSuffix(t, "]") {
+		return "", false
+	}
+	return unquotePath(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(t, "[watch "), "]"))), true
+}
+
+// quotePath wraps path in double quotes: the installer always quotes the
+// paths it generates (section roots, `watch:` directives, whitelisted
+// binaries) so a path containing spaces or other whitespace round-trips
+// through the daemon config parser unambiguously; quoting is optional there
+// only for hand-written configs.
+func quotePath(path string) string {
+	return `"` + path + `"`
+}
+
+// unquotePath strips a surrounding pair of double quotes from s, if present.
+func unquotePath(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 // findSectionEnd returns the index of the first line of the next section

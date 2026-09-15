@@ -375,3 +375,19 @@ func DeployInstalledBinary(srcPath string) error {
 
 	return EnableAndVerify(false)
 }
+
+// DeployInstalledBinaryNoRestart installs srcPath as the service binary
+// WITHOUT stopping or restarting a running daemon: ReplaceInstalledBinary's
+// atomic rename-over-the-running-binary technique means a daemon process
+// already running keeps executing its old, now-unlinked inode until
+// something restarts it, so guards stay attached and any unlocked fscrypt
+// vaults are never touched. Used by `install --binary-only` when the admin
+// chooses to skip the automatic restart; the caller is responsible for
+// telling them to restart manually to pick up the new binary.
+func DeployInstalledBinaryNoRestart(srcPath string) error {
+	if err := ReplaceInstalledBinary(srcPath, InstallBinaryPath); err != nil {
+		return err
+	}
+	log.Infof("installed binary at %s (daemon restart skipped)", InstallBinaryPath)
+	return EnsureBinSymlink()
+}

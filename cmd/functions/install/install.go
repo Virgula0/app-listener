@@ -26,7 +26,7 @@ func init() {
 	InstallCmd.Flags().Bool("delete-post-backups", false,
 		"Delete the found .app_listener.backup directories (listed in the TUI, confirmed once, with progress)")
 	InstallCmd.Flags().Bool("binary-only", false,
-		"Non-interactive: move the freshly built binary to the install path (and recreate the PATH symlink), then restart the daemon if its service is installed; no wizard, no config, no fscrypt, no systemd units")
+		"Move the freshly built binary to the install path (and recreate the PATH symlink); no wizard, no config, no fscrypt, no systemd units. If the daemon service is installed, asks (TUI) whether to restart it now to run the new binary or skip the restart for later")
 	InstallCmd.Flags().Bool("update-catalog-only", false,
 		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
 	InstallCmd.Flags().Bool("diff-catalog", false,
@@ -115,13 +115,17 @@ Use --delete-post-backups to delete the found .app_listener.backup
 directories instead of installing (also shown in a TUI list first). Both
 options show a TUI progress bar while running.
 
-Use --binary-only for a non-interactive shortcut that only deploys the
-binary: it builds build/linux/app-listener when it does not exist, stops
-a running daemon, replaces /usr/local/sbin/app-listener atomically,
-recreates the /usr/local/bin/app-listener symlink and starts the daemon
-again — nothing else is touched (no config, no fscrypt, no services).
-When the daemon service is not installed yet it just deploys the binary
-and the symlink and stops there (there is no unit to restart).
+Use --binary-only for a shortcut that only deploys the binary: it builds
+build/linux/app-listener when it does not exist and replaces
+/usr/local/sbin/app-listener atomically, recreating the
+/usr/local/bin/app-listener symlink — nothing else is touched (no config,
+no fscrypt, no services). When the daemon service is not installed yet it
+just deploys the binary and the symlink and stops there (there is no unit
+to restart). Otherwise it asks (TUI) whether to restart the daemon now —
+stopping it, replacing the binary and starting it again, the historical
+default — or skip the restart, which still replaces the binary file but
+leaves the running daemon on its old (already-loaded) binary until you
+restart it yourself.
 
 Use --update-catalog-only to refresh the whitelist of every guarded
 directory from the catalog: encrypted vaults are unlocked, glob patterns
@@ -291,17 +295,44 @@ func validateMaintenanceFlags(f maintenanceFlags) error {
 
 // installBinaryOnly deploys only the freshly built binary (see
 // systemd.DeployInstalledBinary); config, fscrypt and units stay untouched.
+// When the daemon service is installed, it asks whether to restart the
+// daemon now (the historical, automatic behavior) or leave it running the
+// old binary until a manual restart.
 func installBinaryOnly() error {
 	if err := buildBinaryIfNeeded(); err != nil {
 		return err
 	}
 
-	if err := systemd.DeployInstalledBinary(buildBinaryPath); err != nil {
-		return fmt.Errorf("installing binary: %w", err)
-	}
 	if !systemd.DaemonUnitInstalled() {
+		if err := systemd.DeployInstalledBinary(buildBinaryPath); err != nil {
+			return fmt.Errorf("installing binary: %w", err)
+		}
 		log.Info("binary-only install complete: binary deployed; the daemon service is not installed (run `sudo app-listener install`)")
 		return nil
+	}
+
+	restart := true
+	if formErr := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Restart the daemon now?").
+			Description("The daemon service is installed. Restarting picks up the new binary immediately (the current default). Skipping leaves the running daemon on the old binary — restart it yourself later (systemctl restart app-listener-daemon) to run the new one.").
+			Affirmative("Yes, restart now").
+			Negative("No, skip the restart").
+			Value(&restart),
+	)).Run(); formErr != nil {
+		return formErr
+	}
+
+	if !restart {
+		if err := systemd.DeployInstalledBinaryNoRestart(buildBinaryPath); err != nil {
+			return fmt.Errorf("installing binary: %w", err)
+		}
+		log.Info("binary-only install complete: binary deployed; the daemon restart was skipped — restart it manually (systemctl restart app-listener-daemon) to run the new binary")
+		return nil
+	}
+
+	if err := systemd.DeployInstalledBinary(buildBinaryPath); err != nil {
+		return fmt.Errorf("installing binary: %w", err)
 	}
 	log.Info("binary-only install complete: the daemon is running the new binary")
 	return nil
