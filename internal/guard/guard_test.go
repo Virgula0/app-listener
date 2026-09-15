@@ -675,6 +675,31 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	s.Require().False(inMap(fileRoot), "the recreated inode is not mapped yet")
 	s.Require().NoError(g.SweepInodes())
 	s.Require().True(inMap(fileRoot), "SweepInodes must map the recreated file root")
+
+	// Regression coverage for the false-DENY-on-unrelated-files /
+	// silently-unguarded-real-file bug: SweepInodes must move BOTH the
+	// kernel-side root-confinement anchor (guard_config[3..4], consulted by
+	// root_in_chain in guard.bpf.c) and g.rootKey to the new inode, and evict
+	// the old one from guard_inodes — otherwise the old, now-freed inode
+	// number stays "protected" forever (ReconcileInodes refuses to evict
+	// g.rootKey) and, once the filesystem hands that number to an unrelated
+	// file anywhere else, that file gets denied under this resource's
+	// whitelist purely by inode-number coincidence, while the real
+	// recreated file silently stops being guarded (its ancestor chain no
+	// longer contains the stale configured root).
+	var gotDev, gotIno uint64
+	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
+	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
+	s.Require().Equal(newIno, gotIno, "guard_config root ino must follow the recreated file")
+
+	g.mu.Lock()
+	gotRootKey := g.rootKey
+	g.mu.Unlock()
+	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match guard_config")
+
+	var v uint8
+	oldKey := GuardInodeKey{Dev: gotDev, Ino: oldIno}
+	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
 // TestSweepInodesDirRootGated verifies a directory root whose mtime has not

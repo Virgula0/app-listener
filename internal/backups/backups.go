@@ -33,6 +33,18 @@ type Backup struct {
 // it exists (covering manually added directories) plus every catalog path
 // discovered for all local users and the system entries.
 func Find() ([]Backup, error) {
+	return find(systemd.SystemConfigPath, install.ListUsers, install.DiscoverForUsers)
+}
+
+// find is Find's injectable core: systemConfigPath, listUsers and
+// discoverForUsers are parameters (rather than Find calling the real system
+// config path and install.ListUsers/DiscoverForUsers directly) so tests can
+// run this against fake data instead of the real system config and the real
+// catalog. On a host with the daemon actually installed, some catalog paths
+// (e.g. Steam's registry.vdf) can be live guarded resources — probing them
+// with os.Lstat from a process outside their whitelist (such as the test
+// binary itself) trips the guard and gets denied.
+func find(systemConfigPath string, listUsers func() ([]install.User, error), discoverForUsers func([]install.User) []install.Candidate) ([]Backup, error) {
 	seen := make(map[string]bool)
 	var paths []string
 	add := func(p string) {
@@ -42,10 +54,10 @@ func Find() ([]Backup, error) {
 		}
 	}
 
-	if _, err := os.Stat(systemd.SystemConfigPath); err == nil {
-		cfg, loadErr := daemonconfig.Load(systemd.SystemConfigPath)
+	if _, err := os.Stat(systemConfigPath); err == nil {
+		cfg, loadErr := daemonconfig.Load(systemConfigPath)
 		if loadErr != nil {
-			return nil, fmt.Errorf("reading %s: %w", systemd.SystemConfigPath, loadErr)
+			return nil, fmt.Errorf("reading %s: %w", systemConfigPath, loadErr)
 		}
 		for i := range cfg.Resources {
 			// Grouped sections: the backup is at the encryption root (the whole
@@ -56,11 +68,11 @@ func Find() ([]Backup, error) {
 		}
 	}
 
-	users, err := install.ListUsers()
+	users, err := listUsers()
 	if err != nil {
 		return nil, err
 	}
-	found := install.DiscoverForUsers(users)
+	found := discoverForUsers(users)
 	for i := range found {
 		add(found[i].Path)
 	}

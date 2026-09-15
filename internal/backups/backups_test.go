@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Virgula0/app-listener/internal/fscrypt"
+	"github.com/Virgula0/app-listener/internal/install"
 )
 
 func TestDelete(t *testing.T) {
@@ -27,16 +30,35 @@ func TestDelete(t *testing.T) {
 	}
 }
 
-// TestFindSmoke: Find must not panic or error on a host with no installed
-// config and no backups (it returns an empty slice).
+// TestFindSmoke exercises find's dedup/matching logic against fake
+// dependencies — never the real system config or the real catalog. Find()
+// itself (via install.DiscoverForUsers) probes real catalog paths for real
+// local users; on a host with the daemon actually installed, some of those
+// (e.g. Steam's registry.vdf) can be live guarded resources, and this test
+// binary is not on any resource's whitelist, so calling the real Find()
+// here would trip the guard and log a spurious DENIED.
 func TestFindSmoke(t *testing.T) {
-	got, err := Find()
-	if err != nil {
-		t.Fatalf("Find: %v", err)
+	root := t.TempDir()
+	withBackup := filepath.Join(root, "guarded")
+	if err := os.MkdirAll(withBackup+fscrypt.BackupSuffix, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	for _, b := range got {
-		if b.BackupPath != b.Path+".app_listener.backup" {
-			t.Errorf("inconsistent entry: %+v", b)
-		}
+	withoutBackup := filepath.Join(root, "plain")
+
+	got, err := find(
+		filepath.Join(t.TempDir(), "daemon.conf"), // does not exist: no installed config
+		func() ([]install.User, error) { return nil, nil },
+		func([]install.User) []install.Candidate {
+			return []install.Candidate{{Path: withBackup}, {Path: withoutBackup}}
+		},
+	)
+	if err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if len(got) != 1 || got[0].Path != withBackup {
+		t.Fatalf("find = %+v, want exactly one entry for %s", got, withBackup)
+	}
+	if got[0].BackupPath != withBackup+fscrypt.BackupSuffix {
+		t.Errorf("inconsistent entry: %+v", got[0])
 	}
 }

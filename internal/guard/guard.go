@@ -129,19 +129,27 @@ type Guard struct {
 	deployed map[string]GuardInodeKey
 	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
 	eagerPopulate bool
-	// sweepRootKey / sweepRootMtime fingerprint the watch root between
-	// SweepInodes ticks: a single-file root that its app deletes and recreates
-	// gets a new inode (nothing else re-maps it), and a directory root whose
-	// own mtime moved gained or lost a top-level entry. An unchanged
-	// fingerprint means the periodic re-scan can be skipped entirely — deeper
-	// changes are covered by BPF runtime discovery and the ancestor walk.
-	sweepRootKey   GuardInodeKey
+	// sweepRootMtime / sweepLastFull fingerprint a DIRECTORY watch root
+	// between SweepInodes ticks: an unchanged mtime means no top-level entry
+	// was gained or lost, so the periodic re-scan can be skipped entirely —
+	// deeper changes are covered by BPF runtime discovery and the ancestor
+	// walk.
 	sweepRootMtime time.Time
 	sweepLastFull  time.Time
-	// rootKey is the watch root's own (dev, ino), set once in populateMaps.
-	// ReconcileInodes must never evict it regardless of what a filesystem
-	// walk observes — a transient stat failure on the root must not read as
-	// "the guarded tree is gone" and unguard it.
+	// rootKey is the watch root's own (dev, ino): the ONLY source of truth
+	// for the kernel-side root-confinement check (guard_config[3]/[4],
+	// consulted by root_in_chain in guard.bpf.c) and the key ReconcileInodes
+	// must never evict regardless of what a filesystem walk observes — a
+	// transient stat failure on the root must not read as "the guarded tree
+	// is gone" and unguard it. Set in populateMaps and re-anchored by
+	// updateRootKey whenever SweepInodes detects a single-file watch root was
+	// deleted and recreated with a new inode (Steam's registry.vdf, sqlite
+	// journals): leaving it pointed at the freed old inode would both
+	// silently stop guarding the real file (root_in_chain can no longer find
+	// it rooted) and permanently protect whatever unrelated file the
+	// filesystem later hands that freed inode number to. Guarded by mu since
+	// updateRootKey and ReconcileInodes can observe it from different guard
+	// goroutines.
 	rootKey GuardInodeKey
 	// pinPrefix, when set (WithPinning), is the bpffs path prefix each LSM
 	// link is pinned at (prefix + hook name) after it attaches: the pin holds
@@ -1102,12 +1110,8 @@ func (g *Guard) populateMaps() error {
 	if rootStatErr != nil {
 		return fmt.Errorf("stating guard root %s: %w", g.path, rootStatErr)
 	}
-	g.rootKey = GuardInodeKey{Dev: rootDev, Ino: rootIno}
-	if putErr := g.objs.GuardConfig.Put(uint32(3), rootDev); putErr != nil {
-		return fmt.Errorf("setting root dev in config: %w", putErr)
-	}
-	if putErr := g.objs.GuardConfig.Put(uint32(4), rootIno); putErr != nil {
-		return fmt.Errorf("setting root ino in config: %w", putErr)
+	if rootErr := g.updateRootKey(GuardInodeKey{Dev: rootDev, Ino: rootIno}); rootErr != nil {
+		return rootErr
 	}
 
 	_, statErr := os.Stat(g.path)
@@ -1221,6 +1225,25 @@ func (g *Guard) putBackingDevices(rdevs []uint32) error {
 	return nil
 }
 
+// updateRootKey re-anchors the guard's watch-root identity to newKey in both
+// the kernel-side root-confinement check (guard_config[3..4], consulted by
+// root_in_chain in guard.bpf.c) and g.rootKey (the key ReconcileInodes never
+// evicts). Called once from populateMaps at attach time and again from
+// SweepInodes whenever a single-file watch root is deleted and recreated
+// with a new inode.
+func (g *Guard) updateRootKey(newKey GuardInodeKey) error {
+	if putErr := g.objs.GuardConfig.Put(uint32(3), newKey.Dev); putErr != nil {
+		return fmt.Errorf("setting root dev in config: %w", putErr)
+	}
+	if putErr := g.objs.GuardConfig.Put(uint32(4), newKey.Ino); putErr != nil {
+		return fmt.Errorf("setting root ino in config: %w", putErr)
+	}
+	g.mu.Lock()
+	g.rootKey = newKey
+	g.mu.Unlock()
+	return nil
+}
+
 func (g *Guard) addInode(path string) error {
 	dev, ino, err := ebpf.StatInode(path)
 	if err != nil {
@@ -1287,19 +1310,32 @@ func (g *Guard) SweepInodes() error {
 		if statErr != nil {
 			return statErr
 		}
-		key := GuardInodeKey{Dev: dev, Ino: ino}
+		newKey := GuardInodeKey{Dev: dev, Ino: ino}
 		g.mu.Lock()
-		unchanged := key == g.sweepRootKey
+		oldKey := g.rootKey
 		g.mu.Unlock()
-		if unchanged {
+		if newKey == oldKey {
 			return nil
 		}
+		// The watch root was deleted and recreated (sqlite journals, Steam's
+		// registry.vdf) with a new inode. Re-map the new one, then move the
+		// kernel-side root-confinement anchor (guard_config[3..4]) and
+		// g.rootKey to it: leaving them on the old, now-freed inode would
+		// silently stop guarding this file (root_in_chain can no longer find
+		// the stale root in the real file's ancestor chain) the moment the
+		// filesystem hands that freed inode number to an unrelated file
+		// elsewhere, that file's own dentry would satisfy root_in_chain's
+		// direct self-identity check and get denied under this resource's
+		// whitelist.
 		if addErr := g.addInode(g.path); addErr != nil {
 			return addErr
 		}
-		g.mu.Lock()
-		g.sweepRootKey = key
-		g.mu.Unlock()
+		if rootErr := g.updateRootKey(newKey); rootErr != nil {
+			return rootErr
+		}
+		if delErr := g.objs.GuardInodes.Delete(oldKey); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {
+			log.Warnf("guard %s: evicting the stale root inode %+v: %v", g.path, oldKey, delErr)
+		}
 		return nil
 	}
 
@@ -1497,12 +1533,16 @@ func (g *Guard) ReconcileInodes() error {
 		return fmt.Errorf("inode GC walk incomplete for %s, skipping this cycle: %w", g.path, err)
 	}
 
+	g.mu.Lock()
+	rootKey := g.rootKey
+	g.mu.Unlock()
+
 	var stale []GuardInodeKey
 	var key GuardInodeKey
 	var val uint8
 	it := g.objs.GuardInodes.Iterate()
 	for it.Next(&key, &val) {
-		if key == g.rootKey {
+		if key == rootKey {
 			continue
 		}
 		if _, ok := live[key]; ok {
