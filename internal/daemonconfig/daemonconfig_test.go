@@ -357,6 +357,101 @@ func TestLoadDuplicateWatchFails(t *testing.T) {
 	}
 }
 
+// TestLoadQuotedPathWithSpaces is the regression test for the installer bug:
+// a binary whose path contains spaces (e.g. Steam/Proton's
+// ".../Proton - Experimental/files/bin/wineserver") used to have its event
+// list parsed from the wrong field ("- Experimental/..." looked like an
+// unknown event type) because the binary-rule line was split on whitespace.
+// A double-quoted path must be taken whole, spaces and all.
+func TestLoadQuotedPathWithSpaces(t *testing.T) {
+	dir := t.TempDir()
+	binDir := filepath.Join(t.TempDir(), "Proton - Experimental", "files", "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binPath := filepath.Join(binDir, "wineserver")
+	if err := os.WriteFile(binPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+"`+binPath+`" READ,WRITE
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	r := cfg.Resources[0]
+	if len(r.Binaries) != 1 {
+		t.Fatalf("want 1 binary, got %+v", r.Binaries)
+	}
+	if r.Binaries[0].Path != binPath {
+		t.Errorf("binary path = %q, want %q", r.Binaries[0].Path, binPath)
+	}
+	if len(r.Binaries[0].Events) != 2 || r.Binaries[0].Events[0] != ebpf.EventRead || r.Binaries[0].Events[1] != ebpf.EventWrite {
+		t.Errorf("expected READ,WRITE restriction, got %+v", r.Binaries[0].Events)
+	}
+}
+
+// TestLoadQuotedBareBinary covers a quoted path with no trailing event list.
+func TestLoadQuotedBareBinary(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(t.TempDir(), "with space", "bin")
+	if err := os.MkdirAll(filepath.Dir(binPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binPath, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+"`+binPath+`"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources[0].Binaries) != 1 || cfg.Resources[0].Binaries[0].Path != binPath {
+		t.Fatalf("binaries = %+v, want exactly %q", cfg.Resources[0].Binaries, binPath)
+	}
+}
+
+// TestLoadQuotedSectionAndWatchPath covers quoting in the section header and
+// in a `watch:` group directive.
+func TestLoadQuotedSectionAndWatchPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "with space")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "also space")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(writeConfig(t, `[watch "`+dir+`"]
+watch: "`+sub+`"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 1 || cfg.Resources[0].Path != sub {
+		t.Fatalf("resources = %+v, want exactly %q", cfg.Resources, sub)
+	}
+	if cfg.Resources[0].EncryptionRoot != dir {
+		t.Errorf("EncryptionRoot = %q, want %q", cfg.Resources[0].EncryptionRoot, dir)
+	}
+}
+
+// TestLoadUnterminatedQuoteFails ensures a malformed quoted path is a hard
+// parse error, not silently truncated or misparsed.
+func TestLoadUnterminatedQuoteFails(t *testing.T) {
+	dir := t.TempDir()
+	_, err := Load(writeConfig(t, `[watch `+dir+`]
+"/no/closing/quote READ
+`))
+	if err == nil {
+		t.Fatal("expected error for an unterminated quoted path")
+	}
+}
+
 func TestLoadNonexistentFile(t *testing.T) {
 	if _, err := Load("/nonexistent/daemon.conf"); err == nil {
 		t.Fatal("expected error for missing config file")

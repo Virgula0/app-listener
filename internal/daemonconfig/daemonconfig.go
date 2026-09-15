@@ -225,7 +225,7 @@ func isWatchDirective(line string) bool {
 // fscrypt lifecycle is per master key, vault-wide) and must not duplicate
 // the section path or another watch path.
 func (g *watchGroup) addWatchPath(line string, lineNo int) error {
-	path := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "watch:"), "watch"))
+	path := unquotePath(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "watch:"), "watch")))
 	if path == "" {
 		return fmt.Errorf("daemon config line %d: empty watch path", lineNo)
 	}
@@ -249,13 +249,47 @@ func isInsidePath(path, dir string) bool {
 	return path != dir && strings.HasPrefix(path+"/", dir+"/")
 }
 
+// unquotePath strips a surrounding pair of double quotes from s, if present.
+// Quoting is optional: a path with no spaces or other special characters may
+// be written bare (the historical, still-supported form); a path containing
+// them must be quoted since the directives that follow a path on the same
+// line (event types) are otherwise ambiguous with it. The installer always
+// quotes the paths it generates.
+func unquotePath(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// splitPathAndRest extracts a leading path from a directive line: either a
+// double-quoted path (may contain spaces or other whitespace) terminated by
+// a matching closing quote, or, for backward compatibility with hand-written
+// configs, the first whitespace-delimited token (which cannot contain a
+// space). Returns the unquoted path and the trimmed remainder of the line.
+func splitPathAndRest(line string) (path, rest string, err error) {
+	if strings.HasPrefix(line, `"`) {
+		closeIdx := strings.IndexByte(line[1:], '"')
+		if closeIdx == -1 {
+			return "", "", fmt.Errorf("unterminated quoted path: %s", line)
+		}
+		return line[1 : 1+closeIdx], strings.TrimSpace(line[1+closeIdx+1:]), nil
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return "", "", nil
+	}
+	path = fields[0]
+	return path, strings.TrimSpace(line[len(path):]), nil
+}
+
 // parsePathDirective recognizes the TUI placeholder form `path = <dir>`,
 // which sets the root of a bare [watch] section before its directives.
 func parsePathDirective(line string) (string, bool) {
 	for _, prefix := range []string{"path = ", "path="} {
 		if strings.HasPrefix(line, prefix) {
 			if value := strings.TrimSpace(strings.TrimPrefix(line, prefix)); value != "" {
-				return value, true
+				return unquotePath(value), true
 			}
 		}
 	}
@@ -373,7 +407,7 @@ func parseWatchSection(line string) (path string, isSection bool, err error) {
 	if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
 		return "", false, fmt.Errorf("malformed section header %q: expected \"[watch <path>]\"", line)
 	}
-	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]")), true, nil
+	return unquotePath(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))), true, nil
 }
 
 // addResource creates a resource for watchPath, returning nil for unguardable targets:
@@ -469,14 +503,16 @@ func applyDirective(group *watchGroup, line string, lineNo int) error {
 		return nil
 	}
 
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
+	binPath, rest, splitErr := splitPathAndRest(line)
+	if splitErr != nil {
+		return fmt.Errorf("daemon config line %d: %w", lineNo, splitErr)
+	}
+	if binPath == "" {
 		return nil
 	}
-	binPath := fields[0]
 	rule := BinaryRule{Path: binPath}
-	if len(fields) > 1 {
-		events, parseErr := parseEvents(strings.Split(strings.Join(fields[1:], " "), ","))
+	if rest != "" {
+		events, parseErr := parseEvents(strings.Split(rest, ","))
 		if parseErr != nil {
 			return fmt.Errorf("daemon config line %d: %w", lineNo, parseErr)
 		}

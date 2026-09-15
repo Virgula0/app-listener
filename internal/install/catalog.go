@@ -379,12 +379,15 @@ var Catalog = []CandidateDir{
 	// stay unprotected (dirs-only guarding, low value alone).
 	{Name: "Steam", RelPaths: []string{".local/share/Steam/config", ".local/share/Steam/userdata/*/config/localconfig.vdf", ".steam/registry.vdf"},
 		Whitelist: map[string][]string{
-			"/usr/bin/steam":                              nil,
-			"/usr/bin/steamwebhelper":                     nil,
-			"/usr/lib/steam/steam":                        nil,
-			"%HOME%/.local/share/Steam/ubuntu12_32/steam": nil,
-			// Webhelper moved across versioned dirs; the glob covers all layouts.
+			"/usr/bin/steam":                             nil,
+			"/usr/bin/steamwebhelper":                    nil,
+			"/usr/lib/steam/steam":                       nil,
+			"%HOME%/.local/share/Steam/*/steam":          nil,
 			"%HOME%/.local/share/Steam/*/steamwebhelper": nil,
+			"%HOME%/.local/share/Steam/steamapps/common/*/*/bin/pressure-vessel-*":           nil,
+			"%HOME%/.local/share/Steam/*/gameoverlayui":                                      nil,
+			"%HOME%/.local/share/Steam/steamapps/common/*/files/bin/wineserver":              nil,
+			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine64-preloader": nil,
 			"/usr/bin/lsof": nil,
 		}},
 

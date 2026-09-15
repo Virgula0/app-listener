@@ -29,6 +29,12 @@ const (
 	// sweep is fingerprint-gated (SweepInodes) so each tick is cheap when
 	// nothing changed.
 	resyncSweepEvery = 30 * time.Second
+	// inodeGCEvery is the guard_inodes eviction cadence (ReconcileInodes): a
+	// full, complete tree walk, much coarser than resyncSweepEvery — it
+	// exists to bound how long a stale (dev, ino) entry for a long-deleted
+	// file can linger and risk colliding with an unrelated inode reused
+	// elsewhere on the same filesystem, not to catch changes quickly.
+	inodeGCEvery = time.Hour
 
 	// Rollback lock-back budget: bounded (unlike Stop's infinite wait)
 	// because rollback runs on the SIGHUP handler, which must keep serving
@@ -289,6 +295,8 @@ func (d *daemonUseCase) startGuards() error {
 func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardRepository, stop <-chan struct{}) {
 	sweep := time.NewTicker(resyncSweepEvery)
 	defer sweep.Stop()
+	inodeGC := time.NewTicker(inodeGCEvery)
+	defer inodeGC.Stop()
 	var lastResync time.Time
 	for {
 		select {
@@ -296,37 +304,52 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 			if !ok {
 				return
 			}
-			// The raw block-device gate names a device, not this resource:
-			// label it as such and skip the re-sync (it is never an
-			// in-place binary replacement).
-			label := resource
-			if ev.RawDevice {
-				label = guard.RawDeviceResourceLabel
-			}
-			// A denial usually means the binary was replaced in place;
-			// re-sync (throttled by resyncMinInterval) to admit the new
-			// inode instead of re-statting the whitelist per event.
-			if ev.Blocked && !ev.RawDevice && time.Since(lastResync) >= resyncMinInterval {
-				if _, err := g.ReSyncBinaries(); err != nil {
-					log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
-				}
-				lastResync = time.Now()
-			}
-			select {
-			case d.events <- DaemonEvent{Resource: label, Event: ev}:
-			case <-d.done:
-				return
-			case <-stop:
+			if !d.dispatchGuardEvent(resource, g, &ev, stop, &lastResync) {
 				return
 			}
 		case <-sweep.C:
 			d.periodicSweep(resource, g)
 			lastResync = time.Now()
+		case <-inodeGC.C:
+			if err := g.ReconcileInodes(); err != nil {
+				log.Warnf("daemon: periodic inode GC for %s: %v", resource, err)
+			}
 		case <-d.done:
 			return
 		case <-stop:
 			return
 		}
+	}
+}
+
+// dispatchGuardEvent re-syncs the binary whitelist on a throttled denial and
+// forwards ev to the daemon's event channel, reporting whether the forward
+// loop should keep running (false means the daemon or this resource's guard
+// is shutting down).
+func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRepository, ev *guard.GuardEvent, stop <-chan struct{}, lastResync *time.Time) bool {
+	// The raw block-device gate names a device, not this resource: label it
+	// as such and skip the re-sync (it is never an in-place binary
+	// replacement).
+	label := resource
+	if ev.RawDevice {
+		label = guard.RawDeviceResourceLabel
+	}
+	// A denial usually means the binary was replaced in place; re-sync
+	// (throttled by resyncMinInterval) to admit the new inode instead of
+	// re-statting the whitelist per event.
+	if ev.Blocked && !ev.RawDevice && time.Since(*lastResync) >= resyncMinInterval {
+		if _, err := g.ReSyncBinaries(); err != nil {
+			log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
+		}
+		*lastResync = time.Now()
+	}
+	select {
+	case d.events <- DaemonEvent{Resource: label, Event: *ev}:
+		return true
+	case <-d.done:
+		return false
+	case <-stop:
+		return false
 	}
 }
 

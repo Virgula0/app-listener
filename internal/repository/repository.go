@@ -44,6 +44,16 @@ type GuardRepository interface {
 	// Unconditional full re-walks are avoided — deeper changes are covered by
 	// BPF runtime discovery and the ancestor walk.
 	SweepInodes() error
+	// ReconcileInodes is the coarse-cadence counterpart to SweepInodes: it
+	// deletes guard_inodes entries whose (dev, ino) no longer corresponds to
+	// anything on disk. Every other path that touches guard_inodes only
+	// ever adds, so entries for long-deleted files accumulate for the life
+	// of the daemon; on a filesystem that reuses freed inode numbers, a
+	// stale entry can eventually collide with an unrelated file elsewhere
+	// on the same device and trigger a false denial. It never deletes
+	// anything unless a fresh, complete tree walk backs the decision, and
+	// never evicts the watch root's own key.
+	ReconcileInodes() error
 	// GrantSelfEditAccess widens the root-gated self binary mask to cover the
 	// operations an interactive edit performs, for an authenticated live
 	// edit-protected session; RevokeSelfEditAccess restores the read-only

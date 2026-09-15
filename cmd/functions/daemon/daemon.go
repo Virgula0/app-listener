@@ -1099,8 +1099,17 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 	path := logging.SanitizeText(ev.Event.Path)
 	comm := logging.SanitizeText(ev.Event.Comm)
 	if ev.Event.Blocked {
-		fmt.Fprintf(w, "%sDAEMON DENIED  op=%s  comm=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
-			syslogWarning, ev.Event.Type.String(), comm, ev.Event.PID, who, resource, path)
+		// commFullPath is best-effort telemetry, not identity: comm/pid come
+		// straight off the kernel event and can be spoofed or recycled by the
+		// time this readlink runs (see checkCommSpoof); it never feeds
+		// enforcement, which keys on exe inode. "~" means unresolved (process
+		// already exited, /proc/<pid>/exe unreadable, or pid reused).
+		commFullPath := "~"
+		if target, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", ev.Event.PID)); err == nil {
+			commFullPath = logging.SanitizeText(target)
+		}
+		fmt.Fprintf(w, "%sDAEMON DENIED  op=%s  comm=%s  commFullPath=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
+			syslogWarning, ev.Event.Type.String(), comm, commFullPath, ev.Event.PID, who, resource, path)
 		return true
 	}
 	fmt.Fprintf(w, "%sDAEMON ALLOWED  op=%s  comm=%s  pid=%d  uid=%s  resource=%s  path=%s\n",

@@ -568,13 +568,13 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 // [watch <path>] section of confText, for the live empty-whitelist safety
 // check. Returns nil when the section is absent.
 func parseSectionWhitelist(confText, resourcePath string) []string {
-	needle := "[watch " + resourcePath + "]"
 	var out []string
 	inSection := false
 	for _, line := range strings.Split(confText, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "[watch") {
-			inSection = trimmed == needle
+			headerPath, ok := inst.ParseSectionHeaderPath(trimmed)
+			inSection = ok && headerPath == resourcePath
 			continue
 		}
 		if !inSection || trimmed == "" || strings.HasPrefix(trimmed, "#") {
@@ -582,6 +582,15 @@ func parseSectionWhitelist(confText, resourcePath string) []string {
 		}
 		if trimmed == "need_encryption: true" || trimmed == "need_encryption: false" {
 			continue
+		}
+		// A binary line's path may be double-quoted (spaces and all, like the
+		// installer always emits); take it whole rather than splitting on
+		// whitespace, exactly like the real daemon config parser.
+		if strings.HasPrefix(trimmed, `"`) {
+			if end := strings.IndexByte(trimmed[1:], '"'); end != -1 {
+				out = append(out, trimmed[1:1+end])
+				continue
+			}
 		}
 		if fields := strings.Fields(trimmed); len(fields) > 0 {
 			out = append(out, fields[0])

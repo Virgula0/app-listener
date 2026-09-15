@@ -96,6 +96,10 @@ func (f *fakeGuardRepo) SweepInodes() error {
 	return nil
 }
 
+func (f *fakeGuardRepo) ReconcileInodes() error {
+	return nil
+}
+
 func (f *fakeGuardRepo) GrantSelfEditAccess() error {
 	f.editGranted = true
 	return f.editGrantErr

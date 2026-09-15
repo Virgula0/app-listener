@@ -675,6 +675,31 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	s.Require().False(inMap(fileRoot), "the recreated inode is not mapped yet")
 	s.Require().NoError(g.SweepInodes())
 	s.Require().True(inMap(fileRoot), "SweepInodes must map the recreated file root")
+
+	// Regression coverage for the false-DENY-on-unrelated-files /
+	// silently-unguarded-real-file bug: SweepInodes must move BOTH the
+	// kernel-side root-confinement anchor (guard_config[3..4], consulted by
+	// root_in_chain in guard.bpf.c) and g.rootKey to the new inode, and evict
+	// the old one from guard_inodes — otherwise the old, now-freed inode
+	// number stays "protected" forever (ReconcileInodes refuses to evict
+	// g.rootKey) and, once the filesystem hands that number to an unrelated
+	// file anywhere else, that file gets denied under this resource's
+	// whitelist purely by inode-number coincidence, while the real
+	// recreated file silently stops being guarded (its ancestor chain no
+	// longer contains the stale configured root).
+	var gotDev, gotIno uint64
+	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
+	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
+	s.Require().Equal(newIno, gotIno, "guard_config root ino must follow the recreated file")
+
+	g.mu.Lock()
+	gotRootKey := g.rootKey
+	g.mu.Unlock()
+	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match guard_config")
+
+	var v uint8
+	oldKey := GuardInodeKey{Dev: gotDev, Ino: oldIno}
+	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
 // TestSweepInodesDirRootGated verifies a directory root whose mtime has not
@@ -703,6 +728,88 @@ func (s *guardUnitTest) TestSweepInodesDirRootGated() {
 	g.mu.Lock()
 	s.Require().Equal(seededMtime, g.sweepRootMtime, "an unchanged root must not be re-fingerprinted")
 	g.mu.Unlock()
+}
+
+// TestWalkLiveEntriesRootFailureIsHardError verifies the one behavior that
+// distinguishes walkLiveEntries from walkInodes: unlike PopulateInodes'
+// tolerant root-vanish handling (safe there — the BPF ancestor walk and
+// fail-closed defenses still cover under-collection), ReconcileInodes must
+// never read "the root was briefly unreadable" as "the guarded tree is
+// empty" — that would license evicting every entry, including the watch
+// root's own protection.
+func (s *guardUnitTest) TestWalkLiveEntriesRootFailureIsHardError() {
+	err := walkLiveEntries("/some/path", false, 0, func(p string) error {
+		if p == "/some/path" {
+			return unix.ENOENT
+		}
+		return nil
+	})
+	s.Require().Error(err, "a root that fails to stat must abort the walk, not report an empty tree")
+}
+
+// TestWalkLiveEntriesToleratesVanishingChild verifies a child vanishing
+// mid-walk is normal churn, not grounds to abort: it correctly means that
+// entry is no longer live, so ReconcileInodes may evict its stale key.
+func (s *guardUnitTest) TestWalkLiveEntriesToleratesVanishingChild() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644))
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0o644))
+
+	seen := 0
+	err := walkLiveEntries(dir, false, 0, func(p string) error {
+		seen++
+		if filepath.Base(p) == "a.txt" {
+			return unix.ENOENT
+		}
+		return nil
+	})
+	s.Require().NoError(err, "a child vanishing mid-walk must not abort the walk")
+	s.Require().Equal(3, seen, "root + both children must be visited")
+}
+
+// TestReconcileInodesEvictsStale verifies the periodic inode GC removes a
+// guard_inodes entry once its file is genuinely gone, while leaving the
+// watch root's own entry untouched. Nothing else in the guard ever deletes
+// from guard_inodes (PopulateInodes/SweepInodes/the BPF mkdir/rename
+// auto-discovery hooks only add), so a long-lived guard otherwise
+// accumulates one stale (dev, ino) per deleted file — and on a filesystem
+// that reuses freed inode numbers, a stale entry can later collide with an
+// unrelated file elsewhere on the same device and trigger a false DENY.
+func (s *guardUnitTest) TestReconcileInodesEvictsStale() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	root := s.T().TempDir()
+	stale := filepath.Join(root, "stale.txt")
+	s.Require().NoError(os.WriteFile(stale, []byte("gone soon"), 0o644))
+
+	// Deleting inside the guarded tree requires whitelisting this test
+	// process, mirroring TestSweepInodesRecreatedFileRoot.
+	exe, err := os.Executable()
+	s.Require().NoError(err)
+	self, err := ComputeBinaryEntry(exe)
+	s.Require().NoError(err)
+	g := s.newGuardedTree(root, []BinaryEntry{self}, nil)
+	defer g.Stop()
+
+	dev, ino, err := ebpf.StatInode(stale)
+	s.Require().NoError(err)
+	staleKey := GuardInodeKey{Dev: dev, Ino: ino}
+
+	var v uint8
+	s.Require().NoError(g.objs.GuardInodes.Lookup(staleKey, &v), "the file must be mapped at build")
+
+	s.Require().NoError(os.Remove(stale))
+	s.Require().NoError(g.ReconcileInodes())
+
+	s.Require().Error(g.objs.GuardInodes.Lookup(staleKey, &v),
+		"the deleted file's stale inode entry must be evicted")
+
+	rootDev, rootIno, err := ebpf.StatInode(root)
+	s.Require().NoError(err)
+	s.Require().NoError(g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: rootDev, Ino: rootIno}, &v),
+		"ReconcileInodes must never evict the watch root's own entry")
 }
 
 // TestReSyncBinariesReplacement verifies the in-place-replacement fix

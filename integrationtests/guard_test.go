@@ -2277,3 +2277,15 @@ func (s *IntegrationSuite) TestGuard_SweepInodes_RecreatedFileRoot() {
 
 	s.runGuardTest(c, "TestSweepInodesRecreatedFileRoot")
 }
+
+// TestGuard_ReconcileInodes_EvictsStale verifies the coarse-cadence inode GC
+// removes a guard_inodes entry once its file is genuinely deleted, and never
+// touches the watch root's own entry — the fix for a stale entry (nothing
+// else ever evicts one) later colliding with an unrelated file's reused
+// inode number elsewhere on the same filesystem and causing a false DENY.
+func (s *IntegrationSuite) TestGuard_ReconcileInodes_EvictsStale() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestReconcileInodesEvictsStale")
+}
