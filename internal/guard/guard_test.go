@@ -780,6 +780,14 @@ func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
+// The guard_path_rmdir eviction fix itself (guard.bpf.c) is exercised at the
+// guard level, not here: see TestGuard_PathRmdirEvictsInodeImmediately in
+// integrationtests/guard_test.go, which queries the live guard_inodes map via
+// bpftool running as root inside the privileged test container — a directory
+// has no hard-link equivalent to prove eviction through ordinary black-box
+// filesystem behavior (Linux refuses to hard-link a directory), so that test
+// verifies the map directly instead of via a surviving second name.
+
 // TestSweepInodesDirRootGated verifies a directory root whose mtime has not
 // moved is not re-walked (the expensive path the sweep avoids).
 func (s *guardUnitTest) TestSweepInodesDirRootGated() {

@@ -561,6 +561,35 @@ static __always_inline void add_inode_to_guard(struct inode *inode)
 		count_degrade(0);
 }
 
+// Evict an inode from guard_inodes.  Used by path_unlink/path_rmdir the
+// moment a delete of a tracked inode is actually let through: the kernel
+// frees the inode right after the hook returns, and once it does, an
+// unrelated file/directory anywhere else can be handed that same number —
+// this closes that window at the instant it opens, instead of leaving the
+// stale entry for the periodic ReconcileInodes sweep (up to inodeGCEvery,
+// currently an hour) to eventually clean up. A miss (the inode was never a
+// member — the overwhelmingly common case, since most deletes are of files
+// the guard never scanned) is silent; there is nothing to report.
+static __always_inline void evict_inode_from_guard(struct inode *inode)
+{
+	if (!inode)
+		return;
+
+	struct inode_key ikey = {};
+	bpf_probe_read_kernel(&ikey.ino, sizeof(ikey.ino), &inode->i_ino);
+
+	struct super_block *sb;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return;
+
+	dev_t dev;
+	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+	ikey.dev = dev;
+
+	bpf_map_delete_elem(&guard_inodes, &ikey);
+}
+
 // Check if the accessed file is /proc/<pid>/mem for a tainted PID.
 // The guard can't protect /proc filesystem inodes (they're not in the
 // guarded inode map), so we must explicitly detect this vector.
@@ -1252,24 +1281,35 @@ int guard_path_unlink(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
-	if (guarded_map_hit(dentry, inode, 16)) {
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
-	}
+	// Captured up front, before any decision below: guarded_map_hit's own
+	// first check already computes this, so reusing it here costs nothing
+	// extra and lets the single evict-on-allow call at the bottom avoid a
+	// second guard_inodes lookup.
+	bool inode_was_guarded = read_inode_guard(inode);
 
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
-	if (parent) {
-		struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
-		if (parent_inode && parent_inode != inode && guarded_map_hit(parent, parent_inode, 12)) {
-			return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
-		}
+	struct inode *parent_inode = parent ? get_inode_from_path((void *)ctx[0]) : NULL;
+
+	int ret;
+	if (guarded_map_hit(dentry, inode, 16)) {
+		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
+	} else if (parent_inode && parent_inode != inode && guarded_map_hit(parent, parent_inode, 12)) {
+		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
+	} else if (parent && guarded_ancestor_within_limit(parent)) {
+		// Deep-file coverage: the parent is not in the map but the file may
+		// still be inside the guarded region (ancestor walk).
+		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
+	} else {
+		ret = 0;
 	}
 
-	// Deep-file coverage: the parent is not in the map but the file may
-	// still be inside the guarded region (ancestor walk).
-	if (parent && guarded_ancestor_within_limit(parent))
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
-
-	return 0;
+	// The delete is actually going through (never on a denied one — the
+	// file, and its map entry, are untouched then): evict this inode from
+	// guard_inodes right now instead of leaving a stale entry for the
+	// periodic sweep. See evict_inode_from_guard's doc comment.
+	if (ret == 0 && inode_was_guarded)
+		evict_inode_from_guard(inode);
+	return ret;
 }
 
 SEC("lsm/path_rename")
@@ -1586,15 +1626,30 @@ int guard_path_rmdir(unsigned long long *ctx)
 	if (!dentry)
 		return 0;
 
+	// rmdir only ever succeeds on an EMPTY directory, so evicting this
+	// dentry's own entry on allow (below) is complete — there are no
+	// descendant entries left to worry about; each would already have been
+	// evicted by its own path_unlink/path_rmdir call to get the directory
+	// empty in the first place.
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+	bool inode_was_guarded = read_inode_guard(inode);
+
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
-	if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 32))
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 
-	if (parent && guarded_ancestor_within_limit(parent))
-		return check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
+	int ret;
+	if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 32)) {
+		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
+	} else if (parent && guarded_ancestor_within_limit(parent)) {
+		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
+	} else {
+		ret = 0;
+	}
 
-	return 0;
+	if (ret == 0 && inode_was_guarded)
+		evict_inode_from_guard(inode);
+	return ret;
 }
 
 // stat(2)/statx(2)/lstat(2) on a guarded path.  A stat leaks file size,

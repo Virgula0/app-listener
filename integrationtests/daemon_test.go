@@ -1641,3 +1641,9 @@ func (s *IntegrationSuite) TestDaemon_StaleRootInode_File_RecreatedRootReguarded
 	s.sigDaemon(c, "TERM")
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 }
+
+// The guard_path_unlink eviction fix itself (guard.bpf.c) is exercised at the
+// guard level, not here: see TestGuard_PathUnlinkEvictsInodeImmediately and
+// TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode in
+// integrationtests/guard_test.go, alongside the rest of the
+// TestGuard_InodeReuse_* family this fix complements.
