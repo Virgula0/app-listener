@@ -945,6 +945,97 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_File() {
 	s.Require().Truef(s.harnessIsEncrypted(c, secretFile), "a graceful stop must re-seal the file")
 }
 
+// TestDaemon_StartupRace_NoPlaintextWindow_GroupedResources is the regression
+// test for the daemon startup fan-out (buildGuards attaching guards
+// concurrently, then startGuards unlocking encryption roots and preparing
+// guards concurrently — see internal/usecase/daemon.go and
+// cmd/functions/daemon/daemon.go): TWO `watch:` sub-paths share ONE
+// encryption root, exactly the shape a browser-profile catalog entry uses
+// (Local Storage + Cookies under one profile vault). The root's key is
+// unlocked exactly once for the whole group (uniqueEncryptionRoots dedup),
+// so unlocking it makes BOTH sub-paths' plaintext content readable at the
+// kernel level at the same instant — the guard for EACH sub-path must
+// already be attached by then, or the sibling whose own guard lags behind
+// is exposed with nothing denying access to it. A naive per-resource
+// pipeline (attach+unlock+populate+resolve+start for one resource, fully
+// independent of its group siblings) would reintroduce exactly this window;
+// the concurrency added to buildGuards/startGuards keeps the invariant by
+// construction instead: buildGuards attaches EVERY resource's guard —
+// including every member of this group — as one completed fan-out phase
+// before startGuards.Start() ever calls Unlock, and unlockRoots only fans
+// out over already-deduplicated unique roots, never issuing two concurrent
+// unlocks for the one root this group shares.
+func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_GroupedResources() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.copyFscryptHarness(c)
+
+	const markerA = "TOCTOU-GROUP-SUBA-SECRET-7F3C"
+	const markerB = "TOCTOU-GROUP-SUBB-SECRET-9E1D"
+	const mnt = "/mnt/fscrypt-group"
+	s.setupFscryptDirFilesystem(c, mnt) // skips the test if unsupported here
+
+	root := mnt + "/profile"
+	// No space in these names, unlike the real catalog's "Local Storage":
+	// these paths are interpolated unquoted into raw `sh -c` command strings
+	// below, and a space would word-split into two separate shell arguments.
+	subA := root + "/local-storage"
+	subB := root + "/cookies"
+	secretA := subA + "/secret.txt"
+	secretB := subB + "/secret.txt"
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"mkdir -p %s %s /etc/app-listener && "+
+			"printf '%s' > %s && printf '%s' > %s && "+
+			"chmod 755 %s %s %s && chmod 644 %s %s && "+
+			"head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key",
+		subA, subB, markerA, secretA, markerB, secretB, root, subA, subB, secretA, secretB)})
+
+	s.harnessMigrate(c, root)
+	s.Require().True(s.harnessIsEncrypted(c, root), "setup: the shared vault root must be encrypted before the daemon ever starts")
+
+	config := fmt.Sprintf("[watch %s]\nwatch: %s\nwatch: %s\nneed_encryption: true\n/usr/bin/grep", root, subA, subB)
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", config)})
+
+	stop := make(chan struct{})
+	var leakedA, leakedB atomic.Bool
+	go s.raceUnauthorizedReader(c, secretA, markerA, stop, &leakedA)
+	go s.raceUnauthorizedReader(c, secretB, markerB, stop, &leakedB)
+
+	s.launchDaemon(c)
+	// watchPathsInConfig only understands a `[watch <path>]` section header as
+	// the guarded resource, which is wrong for a group: the header names the
+	// ENCRYPTION ROOT, never itself guarded (see TestLoadWatchGroup), so the
+	// per-path "guard started — guarding: <path>" markers awaitDaemonUp would
+	// derive from the real config never appear for it. Passing "" falls back
+	// to "pid file exists" as the sole readiness signal, which is still
+	// exact: writePidFile only runs after startGuardedDaemon's call to
+	// d.Start() returns, which does not return until EVERY configured
+	// guard — both group members included — has been through the full
+	// attach/unlock/populate/resolve/start pipeline.
+	s.awaitDaemonUp(c, "")
+	close(stop)
+
+	s.Require().Falsef(leakedA.Load(),
+		"an unauthorized reader observed plaintext content of %s (shared vault root %s) before its guard was fully attached", secretA, root)
+	s.Require().Falsef(leakedB.Load(),
+		"an unauthorized reader observed plaintext content of %s (shared vault root %s) before its guard was fully attached", secretB, root)
+
+	// Sanity: the daemon actually did its job on BOTH group members —
+	// unlocked for the whitelisted reader, still denying everyone else.
+	for _, pair := range []struct{ path, marker string }{{secretA, markerA}, {secretB, markerB}} {
+		_, grepOut := s.exec(c, []string{"grep", "-c", pair.marker, pair.path})
+		s.Require().Containsf(grepOut, "1", "whitelisted reader must see the unlocked content of %s", pair.path)
+		code, _ := s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat " + pair.path})
+		s.Require().NotEqualf(0, code, "non-whitelisted reader must still be denied on %s once the guard is fully up", pair.path)
+	}
+
+	s.sigDaemon(c, "TERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
+	s.Require().Truef(s.harnessIsEncrypted(c, root), "a graceful stop must re-lock the shared vault root")
+
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf("umount %s 2>/dev/null; losetup -D 2>/dev/null; true", mnt)})
+}
+
 // ---------------------------------------------------------------
 // C. SIGKILL landing somewhere inside startup's unlock/populate window,
 // across several delays, for the file-vault resource — the newest, most

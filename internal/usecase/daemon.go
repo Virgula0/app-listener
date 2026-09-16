@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -106,13 +107,111 @@ func NewDaemonUseCase(resources []daemonconfig.Resource, vault repository.Vault,
 	}, nil
 }
 
-// populateInodes scans the already-attached guards' resource trees into their inode maps.
-// It runs after the resources are unlocked (a locked fscrypt tree cannot be stat'ed); guards
-// are attached by the caller before Start, preserving attach → unlock → populate ordering.
-func (d *daemonUseCase) populateInodes() error {
-	for i := range d.guards {
-		if err := d.guards[i].PopulateInodes(); err != nil {
-			return fmt.Errorf("populating guard for %s: %w", d.resources[i].Path, err)
+// concurrencyLimit bounds a resource-indexed fan-out to core count, and never
+// higher than there is work to do — avoids a thundering herd of concurrent
+// tree walks / BPF syscalls on hosts with many configured resources.
+func concurrencyLimit(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if lim := runtime.NumCPU(); lim < n {
+		return lim
+	}
+	return n
+}
+
+// unlockRoots unlocks every root in roots via unlockOne, fanned out with
+// bounded concurrency. Safe because: (1) roots is always already deduplicated
+// by the caller (uniqueEncryptionRoots) — a shared `watch:` group root never
+// appears twice, so no two goroutines ever race to unlock the SAME vault;
+// (2) every guard for every resource — including every member of a
+// shared-root group — is attached before startGuards ever calls this (guards
+// are built by buildGuards, which returns before Start() runs), so no root
+// unlocked here can expose a sibling resource whose own guard is not yet
+// live. Each Vault.Unlock call only touches its own root's kernel keyring
+// state (or, for a file-vault target, decrypts that one file); the only
+// shared mutable state in the Vault (the collateral map) is already
+// mutex-protected for concurrent access. On any failure every already-issued
+// unlock still runs to completion (no early cancellation) — they are all for
+// resources whose guards are already attached and denying, so letting them
+// finish is not a protection gap, just possibly-unneeded work that the
+// caller's error path locks back down.
+func unlockRoots(roots []string, unlockOne func(root string) error) error {
+	if len(roots) == 0 {
+		return nil
+	}
+	errs := make([]error, len(roots))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrencyLimit(len(roots)))
+	for i, root := range roots {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, root string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = unlockOne(root)
+		}(i, root)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			return fmt.Errorf("%w: unlocking %s: %w", constants.ErrCriticalStartup, roots[i], err)
+		}
+	}
+	return nil
+}
+
+// prepareOneGuard runs one guard's post-unlock startup: populate its inode
+// map, resolve whitelist entries deferred while its resource was locked,
+// re-sync replaced binaries, then start its ringbuf reader. Every guard is
+// already attached and every vault is already unlocked before this is called
+// (startGuards' two barriers above it), and each guard owns its own inode map
+// and BPF objects — no shared mutable state across resources — so
+// prepareAndStartGuards runs this concurrently across resources.
+//
+// The one behavior this trades away versus a fully sequential pass: a
+// whitelist entry naming a binary that lives inside a DIFFERENT resource's
+// tree may not resolve on this call if that other resource's populate hasn't
+// landed yet. It stays deferred — still fail-closed, never falls open — and
+// is picked up by the periodic re-sync (forwardEvents/periodicSweep) shortly
+// after, same as a binary replaced in place after startup already is.
+func (d *daemonUseCase) prepareOneGuard(i int) error {
+	g := d.guards[i]
+	if err := g.PopulateInodes(); err != nil {
+		return fmt.Errorf("populating guard for %s: %w", d.resources[i].Path, err)
+	}
+	if err := g.ResolvePendingBinaries(); err != nil {
+		return fmt.Errorf("resolving deferred binaries for %s: %w", d.resources[i].Path, err)
+	}
+	if _, err := g.ReSyncBinaries(); err != nil {
+		return fmt.Errorf("re-syncing binary whitelist for %s: %w", d.resources[i].Path, err)
+	}
+	if err := g.Start(); err != nil {
+		return fmt.Errorf("starting guard for %s: %w", d.resources[i].Path, err)
+	}
+	return nil
+}
+
+// prepareAndStartGuards fans prepareOneGuard out across every guard, bounded
+// by concurrencyLimit, and waits for all of them before returning.
+func (d *daemonUseCase) prepareAndStartGuards() error {
+	n := len(d.guards)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrencyLimit(n))
+	for i := range n {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = d.prepareOneGuard(i)
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -236,51 +335,35 @@ func (d *daemonUseCase) startGuards() error {
 	// Directories and file-vault regular files are unlocked in two explicit
 	// passes (see partitionEncryptionRoots) — guards for BOTH kinds are
 	// already attached at this point (built before Start), so there is no
-	// unlocked-and-unprotected window for either. A file root's guard self
-	// access is widened only for the call itself (vaultOpOnRoot ->
-	// guard.WithSelfVaultAccess): the in-place unlock reads+rewrites the
-	// file's own bytes, which the guard's baseline self mask (open/read/stat
-	// only) does not permit.
+	// unlocked-and-unprotected window for either. Within each pass, the
+	// per-root unlocks are independent of one another (see unlockRoots) and
+	// run concurrently. A file root's guard self access is widened only for
+	// the call itself (vaultOpOnRoot -> guard.WithSelfVaultAccess): the
+	// in-place unlock reads+rewrites the file's own bytes, which the guard's
+	// baseline self mask (open/read/stat only) does not permit.
 	// An Unlock failure here means the master key/policy pairing itself is
 	// wrong (missing key file, wrong key, unsupported filesystem) — the same
 	// key, same policy and same filesystem will fail identically on every
 	// restart, so this is the same "administrator action required" class as
 	// verifyEncryptionStates' mismatch, not a transient condition.
 	dirRoots, fileRoots := partitionEncryptionRoots(uniqueEncryptionRoots(d.resources))
-	for _, root := range dirRoots {
-		if err := d.vault.Unlock(root); err != nil {
-			return fmt.Errorf("%w: unlocking %s: %w", constants.ErrCriticalStartup, root, err)
-		}
+	if err := unlockRoots(dirRoots, d.vault.Unlock); err != nil {
+		return err
 	}
-	for _, root := range fileRoots {
-		if err := vaultOpOnRoot(d.resources, d.guards, root, func() error { return d.vault.Unlock(root) }); err != nil {
-			return fmt.Errorf("%w: unlocking %s: %w", constants.ErrCriticalStartup, root, err)
-		}
-	}
-
-	// Guards are already attached (built before Start): the scan runs with
-	// protection live and resources readable — no unlocked-and-unprotected window.
-	if err := d.populateInodes(); err != nil {
+	if err := unlockRoots(fileRoots, func(root string) error {
+		return vaultOpOnRoot(d.resources, d.guards, root, func() error { return d.vault.Unlock(root) })
+	}); err != nil {
 		return err
 	}
 
-	// Fail-closed contract: deferred whitelist entries stay absent from the BPF
-	// whitelist — denied — until resolved here, so unlock never precedes protection
-	// (attach → unlock → populate → resolve). The re-sync right after admits binaries
-	// replaced on disk while the daemon was down.
-	for i := range d.guards {
-		if err := d.guards[i].ResolvePendingBinaries(); err != nil {
-			return fmt.Errorf("resolving deferred binaries for %s: %w", d.resources[i].Path, err)
-		}
-		if _, err := d.guards[i].ReSyncBinaries(); err != nil {
-			return fmt.Errorf("re-syncing binary whitelist for %s: %w", d.resources[i].Path, err)
-		}
-	}
-
-	for i := range d.guards {
-		if err := d.guards[i].Start(); err != nil {
-			return fmt.Errorf("starting guard for %s: %w", d.resources[i].Path, err)
-		}
+	// Every vault is now unlocked and every guard is already attached
+	// (built before Start): for each resource, populate its inode map, resolve
+	// deferred whitelist entries, re-sync replaced binaries and start its
+	// ringbuf reader — fail-closed contract preserved (attach → unlock →
+	// populate → resolve), just fanned out across resources instead of run
+	// one at a time (see prepareOneGuard for why this is safe to parallelize).
+	if err := d.prepareAndStartGuards(); err != nil {
+		return err
 	}
 
 	for i := range d.guards {
