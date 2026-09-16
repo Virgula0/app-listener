@@ -1506,3 +1506,138 @@ mount -o remount,ro,bind /protected
 
 	s.sigDaemon(c, "KILL")
 }
+
+// ---------------------------------------------------------------
+// G. Stale watch-root inode after in-place recreation (steady state, not
+// startup): a guarded resource is deleted and recreated in place — an app
+// rebuilding its own directory/file, an fscrypt migration, a backup restore
+// — while the daemon keeps running. The kernel-side root-confinement anchor
+// (guard_config[3..4], consulted by root_in_chain in guard.bpf.c) and
+// g.rootKey must follow the new inode via the periodic SweepInodes, or two
+// things go wrong at once: the real recreated resource silently stops being
+// guarded (its ancestor chain no longer contains the stale anchor), and
+// whatever unrelated path later ends up holding the freed OLD inode number
+// gets denied purely by coincidence, misattributed to this resource. See
+// internal/guard/guard.go's SweepInodes doc comment and
+// TestSweepInodesRecreatedFileRoot / TestSweepInodesRecreatedDirRoot (unit
+// tests, internal/guard/guard_test.go) for the same regression at the
+// BPF-map level; these two exercise it through a real running daemon
+// instead, waiting out the real periodic sweep.
+// ---------------------------------------------------------------
+
+// staleRootSweepPollTimeout comfortably exceeds the daemon's hardcoded
+// periodic sweep interval (resyncSweepEvery, internal/usecase/daemon.go,
+// currently 30s) so these tests poll for the sweep's effect rather than
+// sleeping a fixed, easily-stale duration.
+const staleRootSweepPollTimeout = 75 * time.Second
+
+// awaitDenied polls until execing cmd in c is denied (nonzero exit),
+// returning false if it is still allowed after timeout — used here to wait
+// out the daemon's periodic SweepInodes tick rather than sleeping a fixed
+// duration tied to its interval constant.
+func (s *IntegrationSuite) awaitDenied(c testcontainers.Container, cmd []string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if code, _ := s.exec(c, cmd); code != 0 {
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
+}
+
+// TestDaemon_StaleRootInode_Directory_RecreatedRootReguarded is the
+// directory-root regression test for the bug fixed in SweepInodes: before
+// the fix, only a single-file watch root's own inode change was detected and
+// re-anchored — a directory root's own identity was never re-checked (only
+// its mtime, to decide whether to re-walk top-level entries), so a
+// wholesale directory recreation left guard_config/g.rootKey pointed at the
+// freed old inode forever.
+func (s *IntegrationSuite) TestDaemon_StaleRootInode_Directory_RecreatedRootReguarded() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /watch /etc/app-listener && echo 'inside content' > /watch/inside.txt"})
+
+	// mv is whitelisted so the moves below (simulating the app deleting and
+	// recreating its own directory) succeed while every other process stays
+	// denied on the guarded tree, exactly like the existing
+	// TestGuard_InodeReuse_StaleEntryOutsideTree family.
+	config := "[watch /watch]\nneed_encryption: false\n/usr/bin/mv"
+	s.startDaemon(c, config)
+
+	// Positive control: the original tree is guarded.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/inside.txt"})
+	s.Require().NotEqualf(0, code, "cat on the original in-tree file should be blocked: %s", out)
+
+	// rename(2) preserves (dev, ino): moving the watch root itself out
+	// leaves its old inode living at /old-root — exactly the state a
+	// filesystem produces when it later reuses that freed inode number for
+	// an unrelated path. A fresh mkdir at /watch then gets a genuinely new
+	// inode (the parent, /, is not guarded, so this mkdir is unconditionally
+	// allowed regardless of whitelist).
+	code, out = s.exec(c, []string{"mv", "/watch", "/old-root"})
+	s.Require().Equalf(0, code, "whitelisted mv should move the watch root itself out: %s", out)
+	code, out = s.exec(c, []string{"mkdir", "/watch"})
+	s.Require().Equalf(0, code, "recreating /watch should not be denied (its parent is unguarded): %s", out)
+	s.exec(c, []string{"sh", "-c", "echo 'recreated content' > /watch/new.txt"})
+
+	// Wait out the periodic sweep: it must re-anchor the root to the new
+	// inode, at which point the RECREATED tree becomes guarded again.
+	s.Require().Truef(
+		s.awaitDenied(c, []string{"sh", "-c", "cat /watch/new.txt"}, staleRootSweepPollTimeout),
+		"the recreated directory root must become guarded again once the periodic sweep re-anchors it — daemon log:\n%s",
+		s.readDaemonLog(c))
+
+	// Regression capture: the OLD path (now holding the stale inode) must
+	// no longer be denied by a leftover root-confinement match — it is
+	// genuinely outside the tree once the anchor has moved on.
+	code, out = s.exec(c, []string{"cat", "/old-root/inside.txt"})
+	s.Require().Equalf(0, code, "the old path holding the stale root inode must not be denied once the anchor has moved on: %s", out)
+	s.Require().Contains(out, "inside content")
+
+	s.sigDaemon(c, "TERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
+}
+
+// TestDaemon_StaleRootInode_File_RecreatedRootReguarded is
+// TestDaemon_StaleRootInode_Directory_RecreatedRootReguarded's single-file
+// counterpart: the case SweepInodes already handled before this fix (see
+// TestSweepInodesRecreatedFileRoot), exercised here end-to-end through a
+// real running daemon instead of a direct unit-level SweepInodes call, so a
+// future change to the shared plumbing (updateRootKey, the periodic sweep
+// wiring) that breaks either case gets caught by both.
+func (s *IntegrationSuite) TestDaemon_StaleRootInode_File_RecreatedRootReguarded() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /etc/app-listener && echo 'v1' > /registry.vdf"})
+
+	config := "[watch /registry.vdf]\nneed_encryption: false\n/usr/bin/mv"
+	s.startDaemon(c, config)
+
+	code, out := s.exec(c, []string{"cat", "/registry.vdf"})
+	s.Require().NotEqualf(0, code, "cat on the original guarded file should be blocked: %s", out)
+
+	// Same rename-preserves-inode trick as the directory case: moving the
+	// single-file watch root out leaves its old inode at /old-registry.vdf,
+	// then a fresh file created at the original path gets a new inode.
+	code, out = s.exec(c, []string{"mv", "/registry.vdf", "/old-registry.vdf"})
+	s.Require().Equalf(0, code, "whitelisted mv should move the watch root file itself out: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", "echo 'v2-recreated' > /registry.vdf"})
+	s.Require().Equalf(0, code, "recreating /registry.vdf should not be denied (its parent is unguarded): %s", out)
+
+	s.Require().Truef(
+		s.awaitDenied(c, []string{"cat", "/registry.vdf"}, staleRootSweepPollTimeout),
+		"the recreated file root must become guarded again once the periodic sweep re-anchors it — daemon log:\n%s",
+		s.readDaemonLog(c))
+
+	code, out = s.exec(c, []string{"cat", "/old-registry.vdf"})
+	s.Require().Equalf(0, code, "the old path holding the stale root inode must not be denied once the anchor has moved on: %s", out)
+	s.Require().Contains(out, "v1")
+
+	s.sigDaemon(c, "TERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
+}

@@ -702,6 +702,84 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
+// TestSweepInodesRecreatedDirRoot is TestSweepInodesRecreatedFileRoot's
+// directory-root counterpart: the regression test for the SAME bug class
+// (stale root-confinement anchor -> false DENY on an unrelated file
+// elsewhere + the real resource silently losing protection), for a
+// DIRECTORY watch root deleted and recreated wholesale (e.g. an in-place
+// fscrypt migration, a backup restore, or an app rebuilding its own config
+// directory) rather than a single guarded file. Before this fix, only the
+// single-file branch of SweepInodes re-anchored on a root-inode change; the
+// directory branch only tracked mtime and never re-checked its own inode.
+func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	parent := s.T().TempDir()
+	watchDir := filepath.Join(parent, "profile")
+	s.Require().NoError(os.Mkdir(watchDir, 0o755))
+	s.Require().NoError(os.WriteFile(filepath.Join(watchDir, "a.txt"), []byte("v1"), 0o644))
+
+	// Deleting/recreating the guarded directory requires whitelisting this
+	// test process, mirroring TestSweepInodesRecreatedFileRoot.
+	exe, err := os.Executable()
+	s.Require().NoError(err)
+	self, err := ComputeBinaryEntry(exe)
+	s.Require().NoError(err)
+	g := s.newGuardedTree(watchDir, []BinaryEntry{self}, nil)
+	defer g.Stop()
+
+	inMap := func(path string) bool {
+		dev, ino, err := ebpf.StatInode(path)
+		s.Require().NoError(err)
+		var v uint8
+		return g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
+	}
+	s.Require().True(inMap(watchDir), "the directory root must be mapped at build")
+
+	_, oldIno, _ := ebpf.StatInode(watchDir)
+	s.Require().NoError(os.RemoveAll(watchDir))
+	s.Require().NoError(os.Mkdir(watchDir, 0o755))
+	newFile := filepath.Join(watchDir, "b.txt")
+	s.Require().NoError(os.WriteFile(newFile, []byte("v2-recreated"), 0o644))
+	_, newIno, _ := ebpf.StatInode(watchDir)
+	if oldIno == newIno {
+		// The filesystem reused the freed inode number — the guarded entry
+		// still matches, so SweepInodes has nothing to fix and the scenario
+		// this test targets did not occur.
+		s.T().Skip("filesystem reused the inode number on recreate")
+	}
+
+	s.Require().False(inMap(watchDir), "the recreated directory root is not mapped yet")
+	s.Require().NoError(g.SweepInodes())
+	s.Require().True(inMap(watchDir), "SweepInodes must map the recreated directory root")
+	s.Require().True(inMap(newFile), "SweepInodes must map the recreated directory's new content")
+
+	// Same regression coverage as TestSweepInodesRecreatedFileRoot: the
+	// kernel-side root-confinement anchor (guard_config[3..4], consulted by
+	// root_in_chain in guard.bpf.c) and g.rootKey must both move to the new
+	// inode, and the old one must be evicted from guard_inodes — otherwise
+	// it stays "protected" forever (ReconcileInodes refuses to evict
+	// g.rootKey) and, once the filesystem hands that freed inode number to
+	// an unrelated file/directory anywhere else, that gets denied under
+	// this resource's whitelist purely by inode-number coincidence, while
+	// the real recreated directory silently stops being guarded.
+	var gotDev, gotIno uint64
+	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
+	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
+	s.Require().Equal(newIno, gotIno, "guard_config root ino must follow the recreated directory")
+
+	g.mu.Lock()
+	gotRootKey := g.rootKey
+	g.mu.Unlock()
+	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match guard_config")
+
+	var v uint8
+	oldKey := GuardInodeKey{Dev: gotDev, Ino: oldIno}
+	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
+}
+
 // TestSweepInodesDirRootGated verifies a directory root whose mtime has not
 // moved is not re-walked (the expensive path the sweep avoids).
 func (s *guardUnitTest) TestSweepInodesDirRootGated() {
