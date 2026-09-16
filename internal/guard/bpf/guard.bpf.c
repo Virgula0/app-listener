@@ -1287,6 +1287,18 @@ int guard_path_unlink(unsigned long long *ctx)
 	// second guard_inodes lookup.
 	bool inode_was_guarded = read_inode_guard(inode);
 
+	// i_nlink as seen by this pre-hook is the count BEFORE this unlink
+	// decrements it: 1 means this is the last name and the kernel is about
+	// to free the inode; anything higher means another hardlink survives,
+	// still pointing at this exact (dev, ino).  guard_inodes is keyed on
+	// (dev, ino) alone, so the entry also protects every surviving name —
+	// evicting on a non-final unlink would strip that protection from
+	// links this call never touches, open until the next periodic re-scan
+	// happens to rediscover them.
+	unsigned int nlink = 0;
+	if (inode)
+		bpf_probe_read_kernel(&nlink, sizeof(nlink), &inode->i_nlink);
+
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
 	struct inode *parent_inode = parent ? get_inode_from_path((void *)ctx[0]) : NULL;
 
@@ -1306,8 +1318,10 @@ int guard_path_unlink(unsigned long long *ctx)
 	// The delete is actually going through (never on a denied one — the
 	// file, and its map entry, are untouched then): evict this inode from
 	// guard_inodes right now instead of leaving a stale entry for the
-	// periodic sweep. See evict_inode_from_guard's doc comment.
-	if (ret == 0 && inode_was_guarded)
+	// periodic sweep. See evict_inode_from_guard's doc comment. Only on the
+	// final link, per the nlink note above — a surviving hardlink must stay
+	// covered by this same entry.
+	if (ret == 0 && inode_was_guarded && nlink <= 1)
 		evict_inode_from_guard(inode);
 	return ret;
 }

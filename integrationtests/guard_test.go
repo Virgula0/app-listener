@@ -487,6 +487,66 @@ func (s *IntegrationSuite) TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode() {
 	s.stopGuard(c)
 }
 
+// TestGuard_PathUnlinkKeepsGuardOnSurvivingHardlink is the regression test for
+// the eviction fix's own i_nlink check in guard_path_unlink (guard.bpf.c):
+// before that check existed, evict_inode_from_guard fired on ANY allowed
+// unlink, including one of several names pointing at a still-alive inode.
+// Since guard_inodes is keyed purely on (dev, ino), that unconditional
+// eviction stripped protection from every surviving hard-linked name too —
+// not just the one actually deleted.
+//
+// A single-file watch root makes the exposure total rather than partial: its
+// entire guard_inodes map is the one entry for the watched file's own inode
+// (guard_config[3..4] and the sole guard_inodes key are that same (dev,
+// ino)), and root_in_chain's very first check matches any hard link to that
+// inode directly by identity, with no dentry-chain walk involved — exactly
+// the "identity is inode-based" model in CLAUDE.md. So creating a second
+// hard link to the watched file, then deleting the ORIGINAL name (an
+// allowed, non-final unlink — the link count drops from 2 to 1, the inode is
+// not freed), must leave the surviving hard-linked name exactly as guarded
+// as the original was.
+func (s *IntegrationSuite) TestGuard_PathUnlinkKeepsGuardOnSurvivingHardlink() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"sh", "-c", "echo 'secret content' > /watch/secret.txt"})
+
+	// Single-file watch root: guard_inodes holds exactly one entry, the
+	// watched file's own (dev, ino) — also guard_config's root identity.
+	// gnuln creates the surviving hard link, rm performs the non-final
+	// delete; neither is the binary used for the regression check below.
+	s.startGuardStd(c, "/watch/secret.txt", "-w", "/usr/bin/rm", "-w", "/usr/bin/gnuln")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: the watched file is guarded under its original name.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/secret.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "cat on the watched file should be blocked: %s", out)
+
+	// Second name for the exact same inode, created while the original name
+	// still exists — link count goes from 1 to 2.
+	code, out = s.exec(c, []string{"/usr/bin/gnuln", "/watch/secret.txt", "/watch/secret-backup.txt"})
+	s.Require().Equalf(0, code, "whitelisted gnuln should create the second hard link: %s", out)
+
+	// Delete the ORIGINAL name. This is a non-final unlink (secret-backup.txt
+	// still holds the inode alive, link count 2 -> 1) and is allowed (rm is
+	// whitelisted) — exactly the case guard_path_unlink's i_nlink check must
+	// tell apart from an actually-final delete.
+	code, out = s.exec(c, []string{"rm", "/watch/secret.txt"})
+	s.Require().Equalf(0, code, "whitelisted rm should delete the original name: %s", out)
+
+	// Regression capture: before the i_nlink check, this non-final unlink
+	// evicted the guard's only guard_inodes entry (the watch root's own), so
+	// the surviving hard-linked name — the exact same inode the guard is
+	// still supposed to be watching — would wrongly be allowed here.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/secret-backup.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "the surviving hard-linked name must stay guarded after a non-final unlink of its sibling: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	s.requireCatBlocked(guardDeltaEvents(logBefore, logAfter))
+
+	s.stopGuard(c)
+}
+
 // installBPFTool installs the standalone bpftool package (no linux-tools-generic
 // dependency, ~2s, three small packages) inside the container. Only tests that
 // must inspect live BPF map state directly need this — every other guard
