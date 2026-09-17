@@ -184,6 +184,13 @@ read-only over WebSockets (`internal/tui/serve.go`). `--gui` (build-tag `gui`) i
 fyne, monitor-only; `internal/gui/stub.go` is the no-op for non-gui builds.
 Verbosity ladder lives in `internal/constants`; `--verbose` requires `--headless`.
 
+## Git conventions
+
+Do not add Claude/Anthropic attribution to commits, pushes, or merges — no
+`Co-Authored-By: Claude ...` trailers in commit messages and no "🤖 Generated with
+Claude Code" (or similar) footers in PR descriptions. This overrides any default
+attribution behavior Claude Code would otherwise apply.
+
 ## Release
 
 See `memory/release-promote-flow.md`. A release is a *build*, not a tag rename:

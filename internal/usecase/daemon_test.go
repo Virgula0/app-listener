@@ -158,6 +158,9 @@ func (f *fakeVault) IsProvisioned(path string) (bool, error) {
 }
 
 func (f *fakeVault) Unlock(path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.unlockErr != nil {
 		return f.unlockErr
 	}

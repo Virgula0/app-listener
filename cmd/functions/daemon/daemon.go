@@ -11,8 +11,10 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -937,14 +939,93 @@ func resolveConfigPath() (string, error) {
 		", or keep " + sampleConfigPath + " in the working directory")
 }
 
+// buildOneGuard builds and attaches the guard for a single resource. Its
+// inputs (self, deviceSet, pin) are read-only and precomputed by the caller,
+// and it touches nothing beyond r and the guard it returns — so buildGuards
+// can run it concurrently across resources with no shared mutable state.
+func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet []uint32, pin pinCfg) (*guard.Guard, error) {
+	binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
+	events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
+	var deferred []daemonconfig.BinaryRule
+	for _, b := range r.Binaries {
+		entry, err := ebpf.ComputeBinaryEntry(b.Path)
+		if err != nil {
+			// The binary lives in a tree that is still locked (or is
+			// genuinely gone). Defer it so the guard can resolve it
+			// after its resource is unlocked; until then it is not
+			// whitelisted and therefore denied — fail-closed.
+			log.Warnf("binary %q for %s not readable yet, deferring: %v", b.Path, r.Path, err)
+			deferred = append(deferred, b)
+			continue
+		}
+		binaries = append(binaries, entry)
+		events[b.Path] = b.Events
+	}
+
+	// File-vault resources (a single guarded regular file) stage a
+	// crash-recovery sidecar before every unlock/lock transform; that
+	// sidecar must already exist before THIS guard attaches — once it
+	// is live, creating a new directory entry beside a single-file
+	// watch root is denied (see fscrypt.EnsureRecoverySidecarPlaceholder
+	// and guard_path_rename's destination-parent-directory check). A
+	// no-op for directory resources.
+	if err := fscrypt.EnsureRecoverySidecarPlaceholder(r.Path); err != nil {
+		log.Warnf("daemon: could not pre-create the recovery sidecar for %s (%v) — "+
+			"a lock/unlock interrupted by a crash may not be recoverable", r.Path, err)
+	}
+
+	g, err := guard.NewGuard(r.Path, guard.ModeWhitelist, binaries, true, 0,
+		guard.WithBinaryEvents(events),
+		guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
+		// Root-gated self access with the minimal event set the fscrypt
+		// lifecycle needs; guarded content reads by non-root executors of
+		// this binary stay denied (see the self-key bypass regression test).
+		guard.WithSelfAllowBinary(self, daemonSelfBaselineEvents),
+		// Pin the LSM links to bpffs so a SIGKILL leaves this tree still
+		// enforced until ExecStopPost locks the vault.
+		guard.WithPinning(pin.prefix(r.Path)),
+		guard.WithBackingDevices(deviceSet))
+	if err != nil {
+		return nil, err
+	}
+	if pin.base != "" && g.PinDegraded() {
+		log.Errorf("daemon: CRITICAL: guard for %s could not pin its LSM links — it will not survive a SIGKILL", r.Path)
+	}
+	return g, nil
+}
+
+// buildConcurrency bounds how many guards buildGuards attaches at once: BPF
+// verifier work is real CPU cost per guard, so fanning out unbounded on a
+// host with dozens of catalog resources would just trade one bottleneck for
+// contention. Bounded by core count, and never more than there is work to do.
+func buildConcurrency(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if lim := runtime.NumCPU(); lim < n {
+		return lim
+	}
+	return n
+}
+
 // buildGuards creates one whitelist guard engine per resource. The daemon's
 // own executable is registered with a root-gated allow action and a minimal
 // event mask (OPEN, READ) so the fscrypt ioctls (which open the watched
 // directories by path) keep working while the guards are attached — without
 // turning the binary into a universal key that any local user could execute
-// to inherit full access to every guarded tree. On failure the partially
-// built guards (which are already attached to the kernel) are detached
-// before returning.
+// to inherit full access to every guarded tree.
+//
+// Each resource's guard is built independently (buildOneGuard touches nothing
+// but its own resource), so construction is fanned out across resources,
+// bounded by buildConcurrency. Every guard is attached in isolation regardless
+// of ordering; nothing here unlocks anything, so there is no cross-resource
+// invariant for this fan-out to disturb — that invariant lives entirely in
+// the caller, which must not unlock ANY resource until buildGuards returns
+// (i.e. every resource's guard, including every member of a shared-vault
+// `watch:` group, is attached). On failure every guard built so far (some or
+// all of them — concurrent construction means a later resource can finish
+// before an earlier one fails) is detached before returning, so no guard is
+// ever left attached across an error return.
 func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.GuardRepository, error) {
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {
@@ -956,74 +1037,54 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 	// It is enforced ONCE, daemon-wide — one guard carries the union of every
 	// resource's backing device, the rest opt out — instead of each
 	// per-resource guard redundantly stamping (and, in its denial logs,
-	// mis-attributing) the same shared device.
+	// mis-attributing) the same shared device. Computed once up front (pure
+	// function of resources), so every worker below only reads it.
 	rawDevices := backingDeviceUnion(resources)
 
-	guards := make([]repository.GuardRepository, 0, len(resources))
-	for i, r := range resources {
-		binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
-		events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
-		var deferred []daemonconfig.BinaryRule
-		for _, b := range r.Binaries {
-			entry, err := ebpf.ComputeBinaryEntry(b.Path)
-			if err != nil {
-				// The binary lives in a tree that is still locked (or is
-				// genuinely gone). Defer it so the guard can resolve it
-				// after its resource is unlocked; until then it is not
-				// whitelisted and therefore denied — fail-closed.
-				log.Warnf("binary %q for %s not readable yet, deferring: %v", b.Path, r.Path, err)
-				deferred = append(deferred, b)
-				continue
+	built := make([]*guard.Guard, len(resources))
+	errs := make([]error, len(resources))
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, buildConcurrency(len(resources)))
+	for i := range resources {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Exactly one guard carries the raw block-device union; the
+			// others pass an empty set so the device is not stamped N times.
+			// Index-keyed, not order-of-completion-keyed, so it stays
+			// deterministic under concurrency.
+			deviceSet := []uint32(nil)
+			if i == 0 {
+				deviceSet = rawDevices
 			}
-			binaries = append(binaries, entry)
-			events[b.Path] = b.Events
-		}
+			built[i], errs[i] = buildOneGuard(&resources[i], self, deviceSet, pin)
+		}(i)
+	}
+	wg.Wait()
 
-		// Exactly one guard carries the raw block-device union; the others
-		// pass an empty set so the device is not stamped N times.
-		deviceSet := []uint32(nil)
-		if i == 0 {
-			deviceSet = rawDevices
+	for i, buildErr := range errs {
+		if buildErr == nil {
+			continue
 		}
-
-		// File-vault resources (a single guarded regular file) stage a
-		// crash-recovery sidecar before every unlock/lock transform; that
-		// sidecar must already exist before THIS guard attaches — once it
-		// is live, creating a new directory entry beside a single-file
-		// watch root is denied (see fscrypt.EnsureRecoverySidecarPlaceholder
-		// and guard_path_rename's destination-parent-directory check). A
-		// no-op for directory resources.
-		if err := fscrypt.EnsureRecoverySidecarPlaceholder(r.Path); err != nil {
-			log.Warnf("daemon: could not pre-create the recovery sidecar for %s (%v) — "+
-				"a lock/unlock interrupted by a crash may not be recoverable", r.Path, err)
-		}
-
-		g, err := guard.NewGuard(r.Path, guard.ModeWhitelist, binaries, true, 0,
-			guard.WithBinaryEvents(events),
-			guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
-			// Root-gated self access with the minimal event set the fscrypt
-			// lifecycle needs; guarded content reads by non-root executors of
-			// this binary stay denied (see the self-key bypass regression test).
-			guard.WithSelfAllowBinary(self, daemonSelfBaselineEvents),
-			// Pin the LSM links to bpffs so a SIGKILL leaves this tree still
-			// enforced until ExecStopPost locks the vault.
-			guard.WithPinning(pin.prefix(r.Path)),
-			guard.WithBackingDevices(deviceSet))
-		if err != nil {
-			for _, built := range guards {
-				built.Stop()
+		for _, g := range built {
+			if g != nil {
+				g.Stop()
 			}
-			// A resource that daemon.conf declares but guard.NewGuard refuses
-			// (a symlink, a file with more than one hard link, a special
-			// file, an invalid path) fails the same way on every future run
-			// until the config or the filesystem entry is fixed — not a
-			// transient condition.
-			return nil, fmt.Errorf("%w: creating guard for %s: %w", constants.ErrCriticalStartup, r.Path, err)
 		}
-		if pin.base != "" && g.PinDegraded() {
-			log.Errorf("daemon: CRITICAL: guard for %s could not pin its LSM links — it will not survive a SIGKILL", r.Path)
-		}
-		guards = append(guards, g)
+		// A resource that daemon.conf declares but guard.NewGuard refuses
+		// (a symlink, a file with more than one hard link, a special
+		// file, an invalid path) fails the same way on every future run
+		// until the config or the filesystem entry is fixed — not a
+		// transient condition.
+		return nil, fmt.Errorf("%w: creating guard for %s: %w", constants.ErrCriticalStartup, resources[i].Path, buildErr)
+	}
+
+	guards := make([]repository.GuardRepository, len(resources))
+	for i, g := range built {
+		guards[i] = g
 	}
 	return guards, nil
 }

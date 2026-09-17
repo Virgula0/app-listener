@@ -1,6 +1,7 @@
 package integrationtests
 
 import (
+	"encoding/binary"
 	"fmt"
 	"regexp"
 	"slices"
@@ -369,6 +370,316 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleDir_DeepDestRename() {
 	// event from touch.
 	logAfter := s.readGuardLog(c)
 	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "MKNOD", "touch")
+
+	s.stopGuard(c)
+}
+
+// TestGuard_PathUnlinkEvictsInodeImmediately is the regression test for the
+// permanent fix to the Steam/Docker-overlay false-DENY bug: deleting a
+// tracked file used to leave its (dev, ino) entry in guard_inodes until the
+// next periodic ReconcileInodes sweep (up to inodeGCEvery, an hour) evicted
+// it — a long window in which the filesystem could hand the freed inode
+// number to an unrelated file elsewhere, which would then be denied by
+// root_in_chain's fail-closed handling of a chain too deep to fully walk
+// (see the TestGuard_InodeReuse_StaleEntryOutsideTree family above).
+// guard_path_unlink now evicts the entry itself, in the same hook call that
+// allows the delete, with no periodic sweep involved at all.
+//
+// A hard link keeps the exact SAME inode alive at a deep external path —
+// deterministically reproducing "a delete freed an inode number and
+// something unrelated picked it up" without depending on the filesystem
+// allocator actually recycling a number, exactly like the rename-based
+// staging above but via link(2) instead, since this fix is in the delete
+// path rather than rename. Before the fix: deleting the in-tree name left
+// its guard_inodes entry behind; accessing the surviving external
+// hard-linked name — deep enough that root_in_chain's bounded walk (16
+// steps for path_unlink's own-inode check) exhausts before it can prove the
+// path unrooted — hit that stale entry and was denied, exactly like the
+// reported production denials on unrelated golang.org/x/sys files under a
+// Docker overlay snapshot path.
+func (s *IntegrationSuite) TestGuard_PathUnlinkEvictsInodeImmediately() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"sh", "-c", "echo 'inside content' > /watch/inside.txt"})
+	s.exec(c, []string{"sh", "-c", "echo 'victim content' > /watch/victim.txt"})
+	// 19 real directory levels: comfortably exceeds path_unlink's 16-step
+	// bound on the accessed file's own inode, matching the depth class of a
+	// real Docker/containerd overlayfs snapshot path.
+	const deep = "/o/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18"
+	s.exec(c, []string{"sh", "-c", "mkdir -p " + deep})
+	// A copy of rm (a different inode, never whitelisted) isolates "is this
+	// path treated as guarded at all" from "is rm whitelisted" — rm itself
+	// IS whitelisted below, needed to delete the in-tree name.
+	s.exec(c, []string{"cp", "/usr/bin/rm", "/dup-rm"})
+
+	// /usr/bin/ln on ubuntu:latest is a symlink into the uutils-coreutils
+	// multicall binary, which also backs /usr/bin/cat: whitelisting /usr/bin/ln
+	// there would whitelist cat too (identity is inode-based, by design — see
+	// CLAUDE.md), silently defeating the positive control below. /usr/bin/gnuln
+	// is the separate, real GNU coreutils binary Ubuntu ships alongside it.
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/rm", "-w", "/usr/bin/gnuln")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: the tree is guarded.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/inside.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "cat on in-tree file should be blocked: %s", out)
+
+	// Hard-link victim.txt to the deep external path: a second name for the
+	// exact same inode, entirely outside the guarded tree.
+	code, out = s.exec(c, []string{"/usr/bin/gnuln", "/watch/victim.txt", deep + "/victim-copy.txt"})
+	s.Require().Equalf(0, code, "whitelisted gnuln should hard-link victim outside the tree: %s", out)
+
+	// Delete the in-tree name: an allowed delete (rm is whitelisted). This
+	// is the exact operation (guard_path_unlink returning 0) that must now
+	// evict the shared inode's guard_inodes entry immediately.
+	code, out = s.exec(c, []string{"rm", "/watch/victim.txt"})
+	s.Require().Equalf(0, code, "whitelisted rm should delete the in-tree name: %s", out)
+
+	// Regression capture: the surviving hard-linked name shares the exact
+	// inode victim.txt had while it was tracked. /dup-rm is not whitelisted,
+	// so if this path were (wrongly) still considered guarded by a leftover
+	// stale entry, it would be denied; the fix means it is not considered
+	// guarded at all by the time this runs.
+	code, out = s.exec(c, []string{"/dup-rm", deep + "/victim-copy.txt"})
+	s.Require().Equalf(0, code, "the surviving hard-linked name must not be denied by the deleted file's stale inode entry: %s", out)
+
+	// The in-tree positive control must still have produced a blocked OPEN
+	// event from cat.
+	logAfter := s.readGuardLog(c)
+	s.requireCatBlocked(guardDeltaEvents(logBefore, logAfter))
+
+	s.stopGuard(c)
+}
+
+// TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode is
+// TestGuard_PathUnlinkEvictsInodeImmediately's negative counterpart: a
+// DENIED delete attempt must never evict — the file is untouched, still
+// exists under the same inode, so nothing became stale. Proven by showing
+// the file survives the denied attempt and can still be legitimately
+// deleted afterward, exactly as any untouched, still-tracked file would.
+func (s *IntegrationSuite) TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"sh", "-c", "echo 'tracked content' > /watch/tracked.txt"})
+	// A copy of rm (a different inode, never whitelisted) so the FIRST delete
+	// attempt below is genuinely denied — /usr/bin/rm itself IS whitelisted,
+	// needed for the confirming delete afterward.
+	s.exec(c, []string{"cp", "/usr/bin/rm", "/dup-rm"})
+
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/rm")
+	logBefore := s.readGuardLog(c)
+
+	code, out := s.exec(c, []string{"/dup-rm", "/watch/tracked.txt"})
+	s.Require().NotEqualf(0, code, "a non-whitelisted delete must be denied: %s", out)
+
+	// The file must still be there: a whitelisted delete now must succeed
+	// exactly as it would on any untouched, still-tracked file — proving the
+	// denied attempt above neither removed the file nor evicted its
+	// guard_inodes entry.
+	code, out = s.exec(c, []string{"rm", "/watch/tracked.txt"})
+	s.Require().Equalf(0, code, "the file must have survived the denied delete attempt: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, logAfter), "DELETE", "dup-rm")
+
+	s.stopGuard(c)
+}
+
+// TestGuard_PathUnlinkKeepsGuardOnSurvivingHardlink is the regression test for
+// the eviction fix's own i_nlink check in guard_path_unlink (guard.bpf.c):
+// before that check existed, evict_inode_from_guard fired on ANY allowed
+// unlink, including one of several names pointing at a still-alive inode.
+// Since guard_inodes is keyed purely on (dev, ino), that unconditional
+// eviction stripped protection from every surviving hard-linked name too —
+// not just the one actually deleted.
+//
+// A single-file watch root makes the exposure total rather than partial: its
+// entire guard_inodes map is the one entry for the watched file's own inode
+// (guard_config[3..4] and the sole guard_inodes key are that same (dev,
+// ino)), and root_in_chain's very first check matches any hard link to that
+// inode directly by identity, with no dentry-chain walk involved — exactly
+// the "identity is inode-based" model in CLAUDE.md. So creating a second
+// hard link to the watched file, then deleting the ORIGINAL name (an
+// allowed, non-final unlink — the link count drops from 2 to 1, the inode is
+// not freed), must leave the surviving hard-linked name exactly as guarded
+// as the original was.
+func (s *IntegrationSuite) TestGuard_PathUnlinkKeepsGuardOnSurvivingHardlink() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"sh", "-c", "echo 'secret content' > /watch/secret.txt"})
+
+	// Single-file watch root: guard_inodes holds exactly one entry, the
+	// watched file's own (dev, ino) — also guard_config's root identity.
+	// gnuln creates the surviving hard link, rm performs the non-final
+	// delete; neither is the binary used for the regression check below.
+	s.startGuardStd(c, "/watch/secret.txt", "-w", "/usr/bin/rm", "-w", "/usr/bin/gnuln")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: the watched file is guarded under its original name.
+	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/secret.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "cat on the watched file should be blocked: %s", out)
+
+	// Second name for the exact same inode, created while the original name
+	// still exists — link count goes from 1 to 2.
+	code, out = s.exec(c, []string{"/usr/bin/gnuln", "/watch/secret.txt", "/watch/secret-backup.txt"})
+	s.Require().Equalf(0, code, "whitelisted gnuln should create the second hard link: %s", out)
+
+	// Delete the ORIGINAL name. This is a non-final unlink (secret-backup.txt
+	// still holds the inode alive, link count 2 -> 1) and is allowed (rm is
+	// whitelisted) — exactly the case guard_path_unlink's i_nlink check must
+	// tell apart from an actually-final delete.
+	code, out = s.exec(c, []string{"rm", "/watch/secret.txt"})
+	s.Require().Equalf(0, code, "whitelisted rm should delete the original name: %s", out)
+
+	// Regression capture: before the i_nlink check, this non-final unlink
+	// evicted the guard's only guard_inodes entry (the watch root's own), so
+	// the surviving hard-linked name — the exact same inode the guard is
+	// still supposed to be watching — would wrongly be allowed here.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/secret-backup.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "the surviving hard-linked name must stay guarded after a non-final unlink of its sibling: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	s.requireCatBlocked(guardDeltaEvents(logBefore, logAfter))
+
+	s.stopGuard(c)
+}
+
+// installBPFTool installs the standalone bpftool package (no linux-tools-generic
+// dependency, ~2s, three small packages) inside the container. Only tests that
+// must inspect live BPF map state directly need this — every other guard
+// behavior is provable through observable filesystem/process outcomes alone.
+func (s *IntegrationSuite) installBPFTool(c testcontainers.Container) {
+	code, out := s.exec(c, []string{"sh", "-c",
+		"command -v bpftool >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq --no-install-recommends bpftool)"})
+	s.Require().Equalf(0, code, "installing bpftool: %s", out)
+}
+
+// guardInodesMapID resolves the numeric BPF map ID of pid's own guard_inodes
+// map by walking that process's fd table (/proc/<pid>/fd, /proc/<pid>/fdinfo)
+// instead of asking bpftool to resolve "name guard_inodes" directly: map
+// names are not container- or namespace-scoped, so a bare name lookup
+// matches ANY loaded map called guard_inodes system-wide — including one
+// from a real app-listener daemon that happens to be running on the same
+// host outside this test, which makes bpftool refuse with "several maps
+// match this handle". Scoping through the guard process's own fd table is
+// unambiguous regardless of what else is running on the host.
+func (s *IntegrationSuite) guardInodesMapID(c testcontainers.Container, pid int) string {
+	script := fmt.Sprintf(`
+for fd in /proc/%[1]d/fd/*; do
+  t=$(readlink "$fd" 2>/dev/null) || continue
+  case "$t" in
+    anon_inode:bpf-map*) ;;
+    *) continue ;;
+  esac
+  id=$(awk '/^map_id:/{print $2}' "/proc/%[1]d/fdinfo/$(basename "$fd")" 2>/dev/null)
+  [ -n "$id" ] || continue
+  bpftool map show id "$id" -j 2>/dev/null | grep -q '"name":"guard_inodes"' && echo "$id"
+done
+exit 0
+`, pid)
+	// The loop's own exit status is whatever its LAST fd happened to match
+	// (usually not the one we want) — irrelevant here since correctness is
+	// checked below from stdout content, not this exit code.
+	code, out := s.exec(c, []string{"sh", "-c", script})
+	s.Require().Equalf(0, code, "resolving guard_inodes map id for pid %d: %s", pid, out)
+	ids := strings.Fields(out)
+	s.Require().Lenf(ids, 1, "expected exactly one guard_inodes map owned by pid %d, got: %q", pid, out)
+	return ids[0]
+}
+
+// le64HexKey renders the 16-byte little-endian struct inode_key{dev, ino}
+// (guard.bpf.c) as bpftool's "key hex <bytes...>" syntax.
+func le64HexKey(devDecimal, inoDecimal string) (string, error) {
+	dev, err := strconv.ParseUint(devDecimal, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("parsing dev %q: %w", devDecimal, err)
+	}
+	ino, err := strconv.ParseUint(inoDecimal, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("parsing ino %q: %w", inoDecimal, err)
+	}
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:8], dev)
+	binary.LittleEndian.PutUint64(buf[8:16], ino)
+	parts := make([]string, len(buf))
+	for i, b := range buf {
+		parts[i] = fmt.Sprintf("%02x", b)
+	}
+	return strings.Join(parts, " "), nil
+}
+
+// TestGuard_PathRmdirEvictsInodeImmediately is the directory counterpart to
+// TestGuard_PathUnlinkEvictsInodeImmediately: guard_path_rmdir must evict a
+// removed directory's guard_inodes entry in the same hook call that allows
+// the rmdir, closing the same staleness window path_unlink closes for files.
+//
+// This cannot be proven through ordinary black-box filesystem behavior the
+// way the file case is (hard-linking a second name to the same inode before
+// deleting the first): Linux refuses to hard-link a directory (EPERM, to
+// prevent filesystem cycles), and even a bind-mounted second reference to a
+// rmdir'd directory — which does preserve (dev, ino) as seen through stat —
+// is functionally dead: creating anything inside it fails with ENOENT, so
+// there is no way to *use* a surviving reference to observe whether it is
+// still (wrongly) considered guarded. Querying guard_inodes directly via
+// bpftool, running as root inside this already-privileged test container
+// (no host root involved), is the only way to verify the eviction is
+// immediate rather than deferred to the periodic ReconcileInodes sweep.
+func (s *IntegrationSuite) TestGuard_PathRmdirEvictsInodeImmediately() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.installBPFTool(c)
+
+	s.exec(c, []string{"sh", "-c", "echo 'inside content' > /watch/inside.txt"})
+	s.exec(c, []string{"mkdir", "-p", "/watch/trackeddir"})
+
+	// Captured before the guard starts: once whitelist enforcement is live,
+	// stat(2) itself goes through inode_getattr and would be denied to any
+	// non-whitelisted caller just like a read or write, so there is no
+	// whitelisted way to stat the directory afterward without also
+	// whitelisting a stat-capable binary. (dev, ino) do not change until the
+	// rmdir below, so capturing them now is equivalent.
+	code, out := s.exec(c, []string{"sh", "-c", "stat -c '%d %i' /watch/trackeddir"})
+	s.Require().Equalf(0, code, "stat on tracked dir failed: %s", out)
+	fields := strings.Fields(out)
+	s.Require().Lenf(fields, 2, "unexpected stat output: %q", out)
+	keyHex, err := le64HexKey(fields[0], fields[1])
+	s.Require().NoError(err)
+
+	// /usr/bin/rmdir on ubuntu:latest is, like /usr/bin/ln and /usr/bin/cat
+	// (see TestGuard_PathUnlinkEvictsInodeImmediately), a symlink into the
+	// uutils-coreutils multicall binary shared with cat: whitelisting it
+	// would silently whitelist cat too. /usr/bin/gnurmdir is the separate,
+	// real GNU coreutils binary.
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/gnurmdir")
+	logBefore := s.readGuardLog(c)
+
+	// Positive control: the tree is guarded.
+	code, out = s.exec(c, []string{"sh", "-c", "cat /watch/inside.txt > /dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "cat on in-tree file should be blocked: %s", out)
+
+	mapID := s.guardInodesMapID(c, guardPID)
+	lookupCmd := "bpftool map lookup id " + mapID + " key hex " + keyHex
+
+	// Sanity check: the key must be present before the rmdir. Without this,
+	// a broken key encoding would make the eviction assertion below pass for
+	// the wrong reason (looking up a key that was never there to begin with).
+	code, out = s.exec(c, []string{"sh", "-c", lookupCmd})
+	s.Require().Equalf(0, code, "tracked dir must be present in guard_inodes before rmdir: %s", out)
+
+	code, out = s.exec(c, []string{"/usr/bin/gnurmdir", "/watch/trackeddir"})
+	s.Require().Equalf(0, code, "whitelisted rmdir should remove the in-tree dir: %s", out)
+
+	// Regression capture: before the fix, this entry survived until the next
+	// hourly ReconcileInodes sweep.
+	code, out = s.exec(c, []string{"sh", "-c", lookupCmd})
+	s.Require().NotEqualf(0, code, "the removed directory's inode must be evicted from guard_inodes immediately: %s", out)
+
+	logAfter := s.readGuardLog(c)
+	s.requireCatBlocked(guardDeltaEvents(logBefore, logAfter))
 
 	s.stopGuard(c)
 }

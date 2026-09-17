@@ -1287,6 +1287,71 @@ func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
 	return walkInodes(dir, g.recursive, g.depth, currentDepth, g.addInode)
 }
 
+// reanchorRoot moves the watch root's identity from oldKey to newKey: it
+// re-maps the new inode via rescan (g.addInode for a single file,
+// g.scanDirInodes for a directory — the caller picks), moves the
+// kernel-side root-confinement anchor (guard_config[3..4], consulted by
+// root_in_chain in guard.bpf.c) and g.rootKey to newKey, then evicts the
+// stale oldKey entry. Shared by both SweepInodes branches (single-file and
+// directory): leaving the anchor on a freed inode would silently stop
+// guarding the real recreated resource (root_in_chain can no longer find it
+// rooted) and let an unrelated file/directory that later reuses the freed
+// inode number get denied under this resource's whitelist purely by
+// coincidence.
+func (g *Guard) reanchorRoot(oldKey, newKey GuardInodeKey, rescan func() error) error {
+	if err := rescan(); err != nil {
+		return err
+	}
+	if err := g.updateRootKey(newKey); err != nil {
+		return err
+	}
+	if delErr := g.objs.GuardInodes.Delete(oldKey); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {
+		log.Warnf("guard %s: evicting the stale root inode %+v: %v", g.path, oldKey, delErr)
+	}
+	return nil
+}
+
+// sweepDirRootRecreated checks whether a directory watch root was itself
+// deleted and recreated (a new inode for the same path — an in-place
+// fscrypt migration, a backup restore, or an app rebuilding its own config
+// directory), as opposed to merely gaining or losing a top-level entry
+// (which the mtime check below covers). Checked unconditionally, ahead of
+// the mtime/dirRescanMinGap throttle: this is the case that throttle must
+// never delay, or the false-DENY / silently-unguarded-real-resource window
+// reanchorRoot exists to close would reopen for however long the throttle
+// held it off. Reports whether it fully handled this tick (a recreation was
+// found and repaired), so SweepInodes can skip the mtime-gated re-scan.
+func (g *Guard) sweepDirRootRecreated(info os.FileInfo) (bool, error) {
+	dev, ino, statErr := ebpf.StatInode(g.path)
+	if statErr != nil {
+		return false, statErr
+	}
+	newKey := GuardInodeKey{Dev: dev, Ino: ino}
+	g.mu.Lock()
+	oldKey := g.rootKey
+	g.mu.Unlock()
+	if newKey == oldKey {
+		return false, nil
+	}
+
+	// The whole subtree under the recreated directory is new (different
+	// underlying inodes even for identically-named children), so re-scan it
+	// fully — including the root's own entry, via scanDirInodes ->
+	// walkInodes -> add(dir) — before moving the anchor. The old subtree's
+	// now-stale non-root entries are not specially protected (only
+	// g.rootKey is — see ReconcileInodes) and age out via the normal inode
+	// GC.
+	if err := g.reanchorRoot(oldKey, newKey, func() error { return g.scanDirInodes(g.path, 0) }); err != nil {
+		return false, err
+	}
+	now := time.Now()
+	g.mu.Lock()
+	g.sweepRootMtime = info.ModTime()
+	g.sweepLastFull = now
+	g.mu.Unlock()
+	return true, nil
+}
+
 // SweepInodes is the cheap periodic refresh of guard_inodes. It replaces an
 // unconditional full re-walk on every tick (which, across many guards over
 // large trees, was ~14% of the daemon's CPU):
@@ -1294,11 +1359,15 @@ func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
 //   - single-file watch root: re-map it only when its inode changed (an app
 //     that deletes and recreates the file — sqlite journals — would otherwise
 //     leave the new inode out of the fast-path map);
-//   - directory watch root: re-scan only when the directory's own mtime moved
-//     since the last sweep (a top-level entry was added or removed). Deeper
-//     additions are still guarded — new dirs are mapped by the BPF path_mkdir
-//     hook, new files fall through to the ancestor walk — so a full recursive
-//     re-scan every tick is wasted work.
+//   - directory watch root: first, unconditionally (never throttled — see
+//     below), check whether the directory ITSELF was deleted and recreated
+//     (a new inode for the same path — an in-place fscrypt migration, a
+//     backup restore, or an app that rebuilds its own config directory) and
+//     re-anchor if so; then re-scan the top level only when the directory's
+//     own mtime moved since the last sweep (an entry was added or removed).
+//     Deeper additions are still guarded — new dirs are mapped by the BPF
+//     path_mkdir hook, new files fall through to the ancestor walk — so a
+//     full recursive re-scan every tick is wasted work.
 func (g *Guard) SweepInodes() error {
 	info, err := os.Stat(g.path)
 	if err != nil {
@@ -1318,25 +1387,14 @@ func (g *Guard) SweepInodes() error {
 			return nil
 		}
 		// The watch root was deleted and recreated (sqlite journals, Steam's
-		// registry.vdf) with a new inode. Re-map the new one, then move the
-		// kernel-side root-confinement anchor (guard_config[3..4]) and
-		// g.rootKey to it: leaving them on the old, now-freed inode would
-		// silently stop guarding this file (root_in_chain can no longer find
-		// the stale root in the real file's ancestor chain) the moment the
-		// filesystem hands that freed inode number to an unrelated file
-		// elsewhere, that file's own dentry would satisfy root_in_chain's
-		// direct self-identity check and get denied under this resource's
-		// whitelist.
-		if addErr := g.addInode(g.path); addErr != nil {
-			return addErr
-		}
-		if rootErr := g.updateRootKey(newKey); rootErr != nil {
-			return rootErr
-		}
-		if delErr := g.objs.GuardInodes.Delete(oldKey); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {
-			log.Warnf("guard %s: evicting the stale root inode %+v: %v", g.path, oldKey, delErr)
-		}
-		return nil
+		// registry.vdf) with a new inode; reanchorRoot moves protection to
+		// it (see its doc comment for why leaving the anchor stale is
+		// dangerous).
+		return g.reanchorRoot(oldKey, newKey, func() error { return g.addInode(g.path) })
+	}
+
+	if handled, recreateErr := g.sweepDirRootRecreated(info); recreateErr != nil || handled {
+		return recreateErr
 	}
 
 	mtime := info.ModTime()
