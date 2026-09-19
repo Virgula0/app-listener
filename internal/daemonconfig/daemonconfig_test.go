@@ -858,3 +858,231 @@ need_encryption: true
 		t.Error("a pending path reached through a symlinked intermediate must be a hard error")
 	}
 }
+
+func TestLoadAllowLib(t *testing.T) {
+	dir := t.TempDir()
+	libDir := t.TempDir()
+	libA := filepath.Join(libDir, "liba.so")
+	libB := filepath.Join(libDir, "lib b.so") // spaces → must be quoted
+	for _, p := range []string{libA, libB} {
+		if err := os.WriteFile(p, []byte("\x7fELF"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+need_encryption: false
+/usr/bin/example
+allow_lib `+libA+`
+allow_lib: "`+libB+`"
+allow_lib `+filepath.Join(libDir, "missing.so")+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 1 {
+		t.Fatalf("want 1 resource, got %d", len(cfg.Resources))
+	}
+	r := cfg.Resources[0]
+	if len(r.AllowLibs) != 2 {
+		t.Errorf("AllowLibs = %v, want the two readable libs", r.AllowLibs)
+	}
+	if len(r.PendingLibs) != 1 || r.PendingLibs[0] != filepath.Join(libDir, "missing.so") {
+		t.Errorf("PendingLibs = %v, want the one unreadable lib deferred", r.PendingLibs)
+	}
+	// The binary line must not be swallowed by allow_lib handling.
+	found := false
+	for _, b := range append(r.Binaries, r.PendingBinaries...) {
+		if b.Path == "/usr/bin/example" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("binary /usr/bin/example missing; Binaries=%v Pending=%v", r.Binaries, r.PendingBinaries)
+	}
+}
+
+func TestParseAllowLibNotADirective(t *testing.T) {
+	// A binary path that merely starts with "allow_lib" must NOT be parsed as
+	// the directive.
+	if _, ok := parseAllowLib("/usr/bin/allow_libtool"); ok {
+		t.Errorf("parseAllowLib matched a binary path with an allow_lib prefix")
+	}
+	if p, ok := parseAllowLib("allow_lib /usr/lib/x.so"); !ok || p != "/usr/lib/x.so" {
+		t.Errorf("parseAllowLib(space) = %q,%v", p, ok)
+	}
+	if p, ok := parseAllowLib(`allow_lib: "/usr/lib/y.so"`); !ok || p != "/usr/lib/y.so" {
+		t.Errorf("parseAllowLib(colon+quotes) = %q,%v", p, ok)
+	}
+}
+
+func TestLoadLibDir(t *testing.T) {
+	dir := t.TempDir()
+	libDir := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "gone")
+
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+need_encryption: false
+/usr/bin/example
+lib_dir `+libDir+`
+lib_dir: "`+missing+`"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Two resources: the guarded section, plus the library directory as its
+	// own read-only, unencrypted resource sharing the whitelist.
+	if len(cfg.Resources) != 2 {
+		t.Fatalf("want 2 resources (section + lib_dir), got %d: %+v", len(cfg.Resources), cfg.Resources)
+	}
+	var lib *Resource
+	for i := range cfg.Resources {
+		if cfg.Resources[i].Path == libDir {
+			lib = &cfg.Resources[i]
+		}
+	}
+	if lib == nil {
+		t.Fatalf("lib_dir %s did not materialize; got %+v", libDir, cfg.Resources)
+	}
+	if !lib.ReadOnly {
+		t.Errorf("lib_dir resource must be ReadOnly (world-readable, whitelist-gated writes)")
+	}
+	if lib.NeedEncryption {
+		t.Errorf("lib_dir resource must never be encrypted")
+	}
+	if lib.EncryptionRoot != "" {
+		t.Errorf("lib_dir resource must not join the section's encryption group, got %q", lib.EncryptionRoot)
+	}
+	if len(lib.Binaries)+len(lib.PendingBinaries) == 0 {
+		t.Errorf("lib_dir resource must inherit the section whitelist")
+	}
+	// A missing lib_dir is dropped, never deferred into a phantom resource.
+	for _, r := range cfg.Resources {
+		if r.Path == missing {
+			t.Errorf("missing lib_dir %s must be ignored, not materialized", missing)
+		}
+	}
+}
+
+func TestLoadLibDirSharedBySections(t *testing.T) {
+	// One runtime tree named by two sections of the same app (Steam's two
+	// config locations) must be guarded once, not rejected as a duplicate.
+	dirA, dirB, libDir := t.TempDir(), t.TempDir(), t.TempDir()
+	cfg, err := Load(writeConfig(t, `[watch `+dirA+`]
+need_encryption: false
+/usr/bin/example
+lib_dir `+libDir+`
+
+[watch `+dirB+`]
+need_encryption: false
+/usr/bin/example
+lib_dir `+libDir+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	n := 0
+	for _, r := range cfg.Resources {
+		if r.Path == libDir {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("lib_dir named twice materialized %d resources, want exactly 1", n)
+	}
+}
+
+func TestLibDirDoesNotWidenAGuardedResource(t *testing.T) {
+	// A lib_dir pointing at a path that is already a real guarded resource
+	// must be ignored, never folded in: folding would add this section's
+	// binaries to a protected tree's whitelist.
+	secret, other := t.TempDir(), t.TempDir()
+	cfg, err := Load(writeConfig(t, `[watch `+secret+`]
+need_encryption: false
+/usr/bin/trusted
+
+[watch `+other+`]
+need_encryption: false
+/usr/bin/attacker
+lib_dir `+secret+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, r := range cfg.Resources {
+		if r.Path != secret {
+			continue
+		}
+		if r.ReadOnly {
+			t.Errorf("guarded resource %s was downgraded to read-only by a lib_dir", secret)
+		}
+		for _, b := range append(r.Binaries, r.PendingBinaries...) {
+			if b.Path == "/usr/bin/attacker" {
+				t.Errorf("lib_dir widened the whitelist of guarded resource %s", secret)
+			}
+		}
+	}
+}
+
+func TestParseLibDirNotADirective(t *testing.T) {
+	if _, ok := parseLibDir("/usr/bin/lib_dirtool"); ok {
+		t.Errorf("parseLibDir matched a binary path with a lib_dir prefix")
+	}
+	if p, ok := parseLibDir("lib_dir /opt/app/lib"); !ok || p != "/opt/app/lib" {
+		t.Errorf("parseLibDir(space) = %q,%v", p, ok)
+	}
+	if p, ok := parseLibDir(`lib_dir: "/opt/my app/lib"`); !ok || p != "/opt/my app/lib" {
+		t.Errorf("parseLibDir(colon+quotes) = %q,%v", p, ok)
+	}
+}
+
+func TestLibDirExcludesRestrictedWriters(t *testing.T) {
+	// An event-restricted binary scopes access to the SECTION tree; read-only
+	// mode cannot carry masks, so it must not become an unrestricted writer
+	// of the library directory.
+	dir, libDir := t.TempDir(), t.TempDir()
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+need_encryption: false
+/usr/bin/free
+/usr/bin/scoped READ
+lib_dir `+libDir+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, r := range cfg.Resources {
+		if r.Path != libDir {
+			continue
+		}
+		var got []string
+		for _, b := range append(r.Binaries, r.PendingBinaries...) {
+			if len(b.Events) != 0 {
+				t.Errorf("lib_dir inherited restricted binary %s %v", b.Path, b.Events)
+			}
+			got = append(got, b.Path)
+		}
+		if len(got) != 1 || got[0] != "/usr/bin/free" {
+			t.Errorf("lib_dir writers = %v, want only the unrestricted /usr/bin/free", got)
+		}
+	}
+}
+
+func TestEncryptionGroupsSkipsLibDirs(t *testing.T) {
+	dir, libDir := t.TempDir(), t.TempDir()
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+need_encryption: false
+/usr/bin/example
+lib_dir `+libDir+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, r := range cfg.EncryptionGroups() {
+		if r.Path == libDir {
+			t.Errorf("lib_dir %s must not be an encryption group (installer would ask/patch a non-section)", libDir)
+		}
+	}
+	if n := len(cfg.EncryptionGroups()); n != 1 {
+		t.Errorf("EncryptionGroups = %d, want 1 (the section only)", n)
+	}
+}

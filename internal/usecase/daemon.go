@@ -178,7 +178,13 @@ func unlockRoots(roots []string, unlockOne func(root string) error) error {
 func (d *daemonUseCase) prepareOneGuard(i int) error {
 	g := d.guards[i]
 	if err := g.PopulateInodes(); err != nil {
-		return fmt.Errorf("populating guard for %s: %w", d.resources[i].Path, err)
+		// Critical: every vault is already unlocked and every guard attached
+		// here, so a populate failure is a property of the tree on disk (an
+		// unreadable subtree, a tree the walk cannot classify) and reproduces
+		// identically on every start. Untagged, it exited 1 and systemd's
+		// Restart=on-failure crash-looped the daemon — unlocking and
+		// re-locking every vault every two seconds.
+		return fmt.Errorf("%w: populating guard for %s: %w", constants.ErrCriticalStartup, d.resources[i].Path, err)
 	}
 	if err := g.ResolvePendingBinaries(); err != nil {
 		return fmt.Errorf("resolving deferred binaries for %s: %w", d.resources[i].Path, err)
@@ -476,13 +482,13 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	// is committed yet, so the new guards are detached and the old config
 	// keeps running.
 	newByPath := make(map[string]bool, len(resources))
-	for _, r := range resources {
-		newByPath[r.Path] = true
+	for i := range resources {
+		newByPath[resources[i].Path] = true
 	}
 	var removed []string
-	for _, r := range d.resources {
-		if !newByPath[r.Path] {
-			removed = append(removed, r.Path)
+	for i := range d.resources {
+		if !newByPath[d.resources[i].Path] {
+			removed = append(removed, d.resources[i].Path)
 		}
 	}
 	if len(removed) > 0 {
@@ -491,8 +497,8 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	}
 
 	oldByPath := make(map[string]int, len(d.resources))
-	for i, r := range d.resources {
-		oldByPath[r.Path] = i
+	for i := range d.resources {
+		oldByPath[d.resources[i].Path] = i
 	}
 
 	// Phase 1 — validate and unlock resources new to the config; nothing is
@@ -638,6 +644,14 @@ func (d *daemonUseCase) rollbackReload(resources []daemonconfig.Resource, guards
 // commitReload swaps in the new configuration; new forwarders spawn before old ones
 // retire and old LSM programs detach, so the event stream never goes silent either.
 func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards []repository.GuardRepository) {
+	// Carry the memory-read taint from each old guard to the new guard for
+	// the same resource BEFORE the old ones are stopped. The new guards were
+	// built with empty guard_tainted_pids maps, so without this a reload
+	// would silently drop process_vm_readv / ptrace protection for every
+	// process that had already read a guarded file (they keep running across
+	// the reload with the secret still in memory).
+	d.carryTaintAcrossReload(resources, guards)
+
 	newStops := make([]chan struct{}, len(guards))
 	for i := range guards {
 		stop := make(chan struct{})
@@ -655,6 +669,35 @@ func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards [
 	d.resources = resources
 	d.guards = guards
 	d.stops = newStops
+}
+
+// carryTaintAcrossReload copies each old guard's tainted-pid set into the new
+// guard for the same resource path. Best-effort: a transfer failure only
+// weakens memory-read protection for already-tainted processes until they next
+// touch the guarded tree, never enforcement of any direct access.
+func (d *daemonUseCase) carryTaintAcrossReload(resources []daemonconfig.Resource, guards []repository.GuardRepository) {
+	oldByPath := make(map[string]repository.GuardRepository, len(d.guards))
+	for i := range d.resources {
+		oldByPath[d.resources[i].Path] = d.guards[i]
+	}
+	for i := range resources {
+		r := &resources[i]
+		old, ok := oldByPath[r.Path]
+		if !ok {
+			continue // resource new to this config: nothing to carry
+		}
+		pids, err := old.SnapshotTaintedPIDs()
+		if err != nil {
+			log.Warnf("daemon: reading tainted pids for %s during reload: %v", r.Path, err)
+			continue
+		}
+		if len(pids) == 0 {
+			continue
+		}
+		if err := guards[i].RestoreTaintedPIDs(pids); err != nil {
+			log.Warnf("daemon: carrying taint across reload for %s: %v", r.Path, err)
+		}
+	}
 }
 
 // Stop performs the secure lockdown: guards stay attached (denying all non-whitelisted

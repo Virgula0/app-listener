@@ -197,3 +197,47 @@ func TestSetNeedEncryptionPreservesManualEdits(t *testing.T) {
 		t.Error("manual comment was lost")
 	}
 }
+
+func TestGenerateSectionsEmitsLibDirectives(t *testing.T) {
+	out := GenerateSections([]Section{{
+		Path:    "/home/alice/.local/share/Steam/config",
+		Allow:   []BinaryRule{{Path: "/usr/bin/steam"}},
+		Libs:    []string{"/home/alice/lib/plugin.so"},
+		LibDirs: []string{"/home/alice/.local/share/Steam/ubuntu12_64"},
+	}})
+	for _, want := range []string{
+		`allow_lib "/home/alice/lib/plugin.so"`,
+		`lib_dir "/home/alice/.local/share/Steam/ubuntu12_64"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("generated config missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestSetSectionWhitelistPreservesLibDirectives(t *testing.T) {
+	// A catalog refresh rewrites the binary lines. It must leave the library
+	// directives alone: dropping lib_dir would silently unguard the tree that
+	// makes those libraries trustworthy.
+	conf := `[watch "/home/alice/.steam"]
+
+"/usr/bin/steam"
+allow_lib "/home/alice/lib/plugin.so"
+lib_dir "/home/alice/.local/share/Steam/ubuntu12_64"
+
+need_encryption: true
+`
+	out, err := SetSectionWhitelist(conf, "/home/alice/.steam", []BinaryRule{{Path: "/usr/bin/steam"}, {Path: "/usr/bin/lsof"}})
+	if err != nil {
+		t.Fatalf("SetSectionWhitelist: %v", err)
+	}
+	for _, want := range []string{
+		`allow_lib "/home/alice/lib/plugin.so"`,
+		`lib_dir "/home/alice/.local/share/Steam/ubuntu12_64"`,
+		`"/usr/bin/lsof"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("refresh dropped %q:\n%s", want, out)
+		}
+	}
+}

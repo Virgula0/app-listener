@@ -16,8 +16,11 @@ build/pprof
 internal/*/embeds/*.o
 internal/monitor/monitor_bpf.go
 internal/guard/guard_bpf.go
+internal/guard/guardtrust_bpf.go
 internal/networkmonitor/networkmonitor_bpf.go
 internal/networkguard/guardnet_bpf.go
+
+*.log
 
 # vmlinux.h is generated from BTF
 vmlinux.h

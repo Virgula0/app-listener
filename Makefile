@@ -115,6 +115,15 @@ generate-guard: bpftool-headers
 	@mv $(GEN_DIR)/guard_bpf.go internal/guard/guard_bpf.go
 	@mv $(GEN_DIR)/guard_bpf.o internal/guard/embeds/guard_bpf.o
 	@sed -i 's|guard_bpf\.o|embeds/guard_bpf.o|' internal/guard/guard_bpf.go
+	GOPACKAGE=guard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+		-cc clang \
+		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
+		-target bpf \
+		-output-dir $(GEN_DIR) \
+		GuardTrust ./internal/guard/bpf/guard_trust.bpf.c
+	@mv $(GEN_DIR)/guardtrust_bpf.go internal/guard/guardtrust_bpf.go
+	@mv $(GEN_DIR)/guardtrust_bpf.o internal/guard/embeds/guardtrust_bpf.o
+	@sed -i 's|guardtrust_bpf\.o|embeds/guardtrust_bpf.o|' internal/guard/guardtrust_bpf.go
 	@rm -rf $(GEN_DIR)
 	@echo "Guard BPF generation complete"
 .PHONY: generate-guard

@@ -767,8 +767,15 @@ func TestDaemonUseCaseStartPopulateFailure(t *testing.T) {
 		t.Fatalf("NewDaemonUseCase: %v", err)
 	}
 
-	if err := d.Start(); !errors.Is(err, errBoom) {
-		t.Fatalf("Start should propagate populate error, got %v", err)
+	startErr := d.Start()
+	if !errors.Is(startErr, errBoom) {
+		t.Fatalf("Start should propagate populate error, got %v", startErr)
+	}
+	// A populate failure reproduces on every start: it must carry the
+	// critical tag (exit 78, RestartPreventExitStatus) or systemd crash-loops
+	// the daemon, cycling every vault through unlock/lock.
+	if !errors.Is(startErr, constants.ErrCriticalStartup) {
+		t.Errorf("populate failure must be ErrCriticalStartup, got %v", startErr)
 	}
 	if !vault.unlocked["/vault"] {
 		t.Error("resource should have been unlocked before the populate attempt")

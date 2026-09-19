@@ -1429,7 +1429,19 @@ int guard_path_symlink(unsigned long long *ctx)
         return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false);
     }
 
-    // 2. Check if the symlink TARGET points INTO the guarded path
+    // 2. Check if the symlink TARGET points INTO the guarded path.
+    // Skipped in GUARD_MODE_READONLY: this check stops an alias from
+    // reaching content the creator could not read directly, but a
+    // read-only tree is readable by every process, so an alias grants
+    // nothing — while denying it breaks ordinary tooling (Steam's
+    // bootstrap atomically re-points ~/.steam/bin* with `ln -s` into its
+    // runtime directories). Symlinks created INSIDE the tree stay gated by
+    // (1) above. Secret files guarded in whitelist mode (including the
+    // daemon's own fscrypt.key / edit-auth.hash, which carry their own
+    // whitelist-mode guards) keep this check.
+    if (is_readonly_mode())
+        return 0;
+
     __u32 key = 0;
     char *oldname_buf = bpf_map_lookup_elem(&tmp_buf, &key);
     if (!oldname_buf)
@@ -1484,6 +1496,26 @@ int guard_path_link(unsigned long long *ctx)
 	if (guarded_map_hit(old_dentry, inode, 16)) {
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 	}
+
+	// Source-side confinement: link(2) needs no read access to the source,
+	// so a file created after the guard started — whose own inode is not in
+	// guard_inodes, only its parent directory is — could otherwise be
+	// hardlinked out of the tree and read through the escape name. The hook
+	// args carry no source-parent path, so walk it from old_dentry itself,
+	// mirroring path_rename's source side (parent map hit + ancestor walk).
+	struct dentry *old_parent;
+	bpf_probe_read_kernel(&old_parent, sizeof(old_parent), &old_dentry->d_parent);
+	if (old_parent && old_parent != old_dentry) {
+		struct inode *old_parent_inode;
+		bpf_probe_read_kernel(&old_parent_inode, sizeof(old_parent_inode), &old_parent->d_inode);
+		if (old_parent_inode && old_parent_inode != inode &&
+		    guarded_map_hit(old_parent, old_parent_inode, 16))
+			return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
+	}
+	// Deep-file coverage on the source side: the file may sit inside the
+	// guarded region even though its parent is not in the map.
+	if (old_parent && guarded_ancestor_within_limit(old_parent))
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
 	if (new_parent) {
@@ -1721,6 +1753,46 @@ int guard_inode_readlink(unsigned long long *ctx)
 	return 0;
 }
 
+// getxattr(2)/listxattr(2) on a guarded file leak its extended attributes
+// (names and values) — a metadata disclosure the inode_getattr STAT gate was
+// meant to close but never covered: neither operation creates a struct file
+// or calls inode_getattr, so file_open/file_permission/inode_getattr all miss
+// them. Denied like STAT here (EVENT_STAT), with the same watch-root and
+// whitelist confinement is_guarded_access already applies; the daemon's
+// root-gated self mask includes EVENT_STAT, so its own xattr/policy reads are
+// not denied.
+SEC("lsm/inode_getxattr")
+int guard_inode_getxattr(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[0];
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+
+	if (is_guarded_access(dentry, inode))
+		return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false);
+
+	return 0;
+}
+
+SEC("lsm/inode_listxattr")
+int guard_inode_listxattr(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[0];
+	if (!dentry)
+		return 0;
+
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+
+	if (is_guarded_access(dentry, inode))
+		return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false);
+
+	return 0;
+}
+
 // inode_permission handles pure inode-level may-checks — access(2),
 // faccessat(2) — which carry MAY_ACCESS.  This hook's context contains
 // only (inode, mask): there is no dentry, so the watch-root chain cannot
@@ -1915,27 +1987,36 @@ int guard_bprm_check_security(unsigned long long *ctx)
 }
 
 // When a tainted process forks, the child inherits the parent's address
-// space (including file mappings).  Mark the child as tainted too so that
-// process_vm_readv on the child is also blocked.
-SEC("lsm/task_alloc")
-int guard_task_alloc(unsigned long long *ctx)
+// space (including the guarded file content), so it must be tainted too or
+// process_vm_readv against the child would read the secret unguarded.
+//
+// This runs at sched_process_fork, NOT security_task_alloc: at task_alloc the
+// child's task_struct is a fresh copy of the parent, so its pid/tgid are still
+// the PARENT's (both are only assigned later in copy_process, after
+// security_task_alloc). Tainting from there could only re-stamp the parent's
+// own tgid, never the child's — the child was left untainted. sched_process_fork
+// fires after the child's identity is set, so child->tgid is the real one.
+// It fires for thread creation too, where child->tgid == parent->tgid, making
+// the update a harmless no-op.
+SEC("tp_btf/sched_process_fork")
+int guard_sched_process_fork(unsigned long long *ctx)
 {
-	struct task_struct *task = (struct task_struct *)ctx[0];
-
-	if (!task)
+	struct task_struct *parent = (struct task_struct *)ctx[0];
+	struct task_struct *child = (struct task_struct *)ctx[1];
+	if (!parent || !child)
 		return 0;
 
-	__u32 parent_pid = bpf_get_current_pid_tgid() >> 32;
+	__u32 parent_tgid = 0;
+	bpf_probe_read_kernel(&parent_tgid, sizeof(parent_tgid), &parent->tgid);
+	if (!bpf_map_lookup_elem(&guard_tainted_pids, &parent_tgid))
+		return 0; // parent not tainted
 
-	__u8 *val = bpf_map_lookup_elem(&guard_tainted_pids, &parent_pid);
-	if (!val)
-		return 0;  // parent not tainted
-
-	__u32 child_pid;
-	bpf_probe_read_kernel(&child_pid, sizeof(child_pid), &task->tgid);
+	__u32 child_tgid = 0;
+	bpf_probe_read_kernel(&child_tgid, sizeof(child_tgid), &child->tgid);
 
 	__u8 v = 1;
-	bpf_map_update_elem(&guard_tainted_pids, &child_pid, &v, BPF_ANY);
+	if (bpf_map_update_elem(&guard_tainted_pids, &child_tgid, &v, BPF_ANY))
+		count_degrade(1);
 	return 0;
 }
 
@@ -1949,9 +2030,18 @@ int guard_task_free(unsigned long long *ctx)
 	if (!task)
 		return 0;
 
-	__u32 pid;
-	bpf_probe_read_kernel(&pid, sizeof(pid), &task->tgid);
+	// guard_tainted_pids is keyed on the tgid (the whole process). Clear it
+	// only when the GROUP LEADER exits — i.e. the process is really gone.
+	// security_task_free fires for every task_struct, threads included, so
+	// deleting on any thread's exit (task->pid != task->tgid) would strip a
+	// still-running multithreaded process of its taint the moment a worker
+	// thread finished, re-opening process_vm_readv/ptrace against it.
+	__u32 pid, tgid;
+	bpf_probe_read_kernel(&pid, sizeof(pid), &task->pid);
+	bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
+	if (pid != tgid)
+		return 0;
 
-	bpf_map_delete_elem(&guard_tainted_pids, &pid);
+	bpf_map_delete_elem(&guard_tainted_pids, &tgid);
 	return 0;
 }

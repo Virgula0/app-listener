@@ -10,6 +10,13 @@ type Section struct {
 	Path    string
 	Allow   []BinaryRule // whitelisted binaries and their event restrictions
 	Encrypt bool
+	// Libs are extra allowed libraries for this section's binaries, emitted as
+	// `allow_lib <path>` directives (see CandidateDir.Libs).
+	Libs []string
+	// LibDirs are library directories guarded read-only for this section's
+	// binaries, emitted as `lib_dir <path>` directives (see
+	// CandidateDir.LibDirRelPaths).
+	LibDirs []string
 	// ExtraWatchPaths optionally turns the section into an encryption GROUP:
 	// the section path stays the fscrypt root (its need_encryption governs
 	// the group) while each extra path becomes its own guarded tree sharing
@@ -76,6 +83,16 @@ func GenerateSections(sections []Section) string {
 		if len(s.Allow) == 0 {
 			b.WriteString("# no binaries whitelisted: every access is denied\n")
 		}
+		for _, lib := range s.Libs {
+			b.WriteString("allow_lib ")
+			b.WriteString(quotePath(lib))
+			b.WriteString("\n")
+		}
+		for _, dir := range s.LibDirs {
+			b.WriteString("lib_dir ")
+			b.WriteString(quotePath(dir))
+			b.WriteString("\n")
+		}
 		b.WriteString("\n")
 		if s.Encrypt {
 			b.WriteString("need_encryption: true\n")
@@ -140,7 +157,7 @@ func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, 
 	for i := start + 1; i < end; i++ {
 		t := strings.TrimSpace(lines[i])
 		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "need_encryption:") ||
-			isWatchDirectiveText(t) || isPathDirectiveText(t) {
+			isWatchDirectiveText(t) || isPathDirectiveText(t) || isLibDirectiveText(t) {
 			continue
 		}
 		binaryIndices = append(binaryIndices, i)
@@ -184,6 +201,22 @@ func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, 
 // (trimmed) inside a section body.
 func isWatchDirectiveText(t string) bool {
 	return strings.HasPrefix(t, "watch:") || strings.HasPrefix(t, "watch ")
+}
+
+// isLibDirectiveText recognizes the library-trust directives `allow_lib
+// <path>` and `lib_dir <path>` (trimmed) inside a section body. They are
+// section STRUCTURE, not whitelist entries: SetSectionWhitelist must leave
+// them alone or a catalog refresh would silently strip an app's library
+// permissions and break it (or, worse, drop the write-protection that makes
+// those libraries trustworthy).
+func isLibDirectiveText(t string) bool {
+	for _, d := range [...]string{"allow_lib", "lib_dir"} {
+		rest, ok := strings.CutPrefix(t, d)
+		if ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t' || rest[0] == ':') {
+			return true
+		}
+	}
+	return false
 }
 
 // isPathDirectiveText recognizes the TUI placeholder `path = <dir>` line.

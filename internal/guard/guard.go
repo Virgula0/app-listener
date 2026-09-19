@@ -387,6 +387,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 			failedRequired)
 	}
 
+	g.attachForkTaintPropagation()
 	g.pinSelfMaps()
 
 	log.Infof("guard created \u2014 %d/%d LSM hooks attached, watching: %s (%s)",
@@ -451,6 +452,36 @@ const (
 	ExeActionsPinName = "exe-actions"
 	ExeEventsPinName  = "exe-events"
 )
+
+// attachForkTaintPropagation attaches guard_sched_process_fork, the tp_btf
+// program that copies a tainted parent's taint onto a newly forked child (see
+// its doc comment in guard.bpf.c). Best-effort, like the optional LSM hooks: a
+// failure only means a forked child of a tainted process is not itself taint-
+// tracked until it performs its own guarded access — enforcement of every
+// direct access is unaffected. Pinned with the LSM links when pinning is on,
+// so it keeps propagating taint after a SIGKILL; a pin failure drops just this
+// link rather than the guard.
+func (g *Guard) attachForkTaintPropagation() {
+	l, err := link.AttachTracing(link.TracingOptions{
+		Program:    g.objs.GuardSchedProcessFork,
+		AttachType: cilium.AttachTraceRawTp,
+	})
+	if err != nil {
+		log.Warnf("guard %s: skipping fork taint propagation (%v) — a forked child of a process that "+
+			"read guarded content is not taint-tracked until its own first guarded access; direct "+
+			"enforcement is unaffected", g.path, err)
+		return
+	}
+	if g.pinPrefix != "" {
+		if pinErr := l.Pin(g.pinPrefix + "sched-process-fork"); pinErr != nil {
+			log.Warnf("guard %s: pinning fork taint propagation failed (%v) — it will not survive a "+
+				"SIGKILL; enforcement is unaffected", g.path, pinErr)
+			_ = l.Close()
+			return
+		}
+	}
+	g.links = append(g.links, l)
+}
 
 // pinSelfMaps pins guard_exe_actions and guard_exe_events (the maps a
 // GUARD_ALLOW_ROOT self-access widen/restore touches) alongside the LSM
@@ -521,11 +552,12 @@ func guardLSMHooks(g *Guard) []struct {
 		{g.objs.GuardPathRmdir, "path_rmdir"},
 		{g.objs.GuardInodePermission, "inode_permission"},
 		{g.objs.GuardInodeGetattr, "inode_getattr"},
+		{g.objs.GuardInodeGetxattr, "inode_getxattr"},
+		{g.objs.GuardInodeListxattr, "inode_listxattr"},
 		{g.objs.GuardInodeReadlink, "inode_readlink"},
 		{g.objs.GuardSbMount, "sb_mount"},
 		{g.objs.GuardPtraceAccessCheck, "ptrace_access_check"},
 		{g.objs.GuardBprmCheckSecurity, "bprm_check_security"},
-		{g.objs.GuardTaskAlloc, "task_alloc"},
 		{g.objs.GuardTaskFree, "task_free"},
 	}
 }
@@ -862,14 +894,14 @@ func WithPinnedSelfVaultAccess(pinPrefix string, fn func() error) error {
 func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf.EventType) error {
 	for _, b := range binaries {
 		types, ok := events[b.Path]
-		if !ok {
+		// An empty list is no restriction at all (all events allowed, no
+		// mask entry), so it is valid in every mode — checking the mode
+		// first rejected every ModeReadOnly guard with a whitelist.
+		if !ok || len(types) == 0 {
 			continue
 		}
 		if g.mode != ModeWhitelist {
 			return fmt.Errorf("per-binary event restrictions are only supported in whitelist mode (binary %s)", b.Path)
-		}
-		if len(types) == 0 {
-			continue // empty list = all events allowed = no mask entry
 		}
 		mask, err := eventMask(types)
 		if err != nil {
@@ -1244,8 +1276,23 @@ func (g *Guard) updateRootKey(newKey GuardInodeKey) error {
 	return nil
 }
 
+// treeInode returns the inode a tree walk records for path. A whitelist
+// (secret) guard follows symlinks — historical behavior, which also guards an
+// in-tree link's out-of-tree target. A read-only guard (a `lib_dir`) must NOT:
+// runtime trees such as Steam's pressure-vessel are full of links into host
+// /usr/lib, and following them would put host system libraries under the
+// guard (package upgrades denied) or, when dangling — they point at
+// container-only paths — make every stat fail and trip the locked-vault
+// heuristic. There the link's own entry is what belongs to the tree.
+func (g *Guard) treeInode(path string) (dev, ino uint64, err error) {
+	if g.mode == ModeReadOnly {
+		return ebpf.LstatInode(path)
+	}
+	return ebpf.StatInode(path)
+}
+
 func (g *Guard) addInode(path string) error {
-	dev, ino, err := ebpf.StatInode(path)
+	dev, ino, err := g.treeInode(path)
 	if err != nil {
 		return err
 	}
@@ -1540,7 +1587,9 @@ func walkLiveEntries(root string, recursive bool, depthLimit int, add func(strin
 func (g *Guard) liveInodeKeys() (map[GuardInodeKey]struct{}, error) {
 	live := make(map[GuardInodeKey]struct{})
 	collect := func(path string) error {
-		dev, ino, err := ebpf.StatInode(path)
+		// Same stat flavor as addInode: populate and reconcile must agree on
+		// which inode a path contributes, or reconcile would evict/re-add it.
+		dev, ino, err := g.treeInode(path)
 		if err != nil {
 			return err
 		}
@@ -1585,6 +1634,40 @@ func (g *Guard) liveInodeKeys() (map[GuardInodeKey]struct{}, error) {
 // deletes nothing unless liveInodeKeys returns a complete, error-free walk,
 // and it never deletes the watch root's own key regardless of what the walk
 // finds.
+// SnapshotTaintedPIDs returns every tgid currently in guard_tainted_pids — the
+// processes this guard has marked as holding guarded content in memory. Used to
+// carry the taint across a reload (see RestoreTaintedPIDs); a read error is
+// returned rather than a partial set so the caller can decide, but the taint
+// map is small and lock-free to iterate.
+func (g *Guard) SnapshotTaintedPIDs() ([]uint32, error) {
+	var pids []uint32
+	var key uint32
+	var val uint8
+	it := g.objs.GuardTaintedPids.Iterate()
+	for it.Next(&key, &val) {
+		pids = append(pids, key)
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("iterating tainted pids for %s: %w", g.path, err)
+	}
+	return pids, nil
+}
+
+// RestoreTaintedPIDs stamps pids into this guard's (freshly built, empty)
+// guard_tainted_pids map, re-establishing memory-read protection for processes
+// that were already tainted under the guard this one replaces on reload. A dead
+// pid re-stamped here is harmless: guard_task_free removes it when the process
+// exits, exactly as for a live-tainted one.
+func (g *Guard) RestoreTaintedPIDs(pids []uint32) error {
+	val := uint8(1)
+	for _, p := range pids {
+		if err := g.objs.GuardTaintedPids.Put(p, val); err != nil {
+			return fmt.Errorf("restoring tainted pid %d for %s: %w", p, g.path, err)
+		}
+	}
+	return nil
+}
+
 func (g *Guard) ReconcileInodes() error {
 	live, err := g.liveInodeKeys()
 	if err != nil {

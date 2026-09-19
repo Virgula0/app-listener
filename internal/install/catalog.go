@@ -41,6 +41,27 @@ type CandidateDir struct {
 	// paths are relative to the user's home, supporting the same %HOME%
 	// expansion as whitelist entries.
 	WatchRelPaths []string
+	// Libs are extra shared libraries this entry's whitelisted binaries are
+	// allowed to load, emitted as `allow_lib` directives. They are ONLY needed
+	// for libraries that are neither root-owned system libraries (those are
+	// auto-trusted) nor inside a guarded tree (those are trusted by location):
+	// i.e. user-writable libraries at FIXED paths that an app dlopen()s. Paths
+	// support the same %HOME%/%USER% expansion as whitelist entries. Libraries
+	// at per-launch ephemeral paths (e.g. Steam's runtime) cannot be listed
+	// here — guard their containing directory instead.
+	Libs []string
+	// LibDirRelPaths are home-relative library DIRECTORIES to guard read-only
+	// (emitted as `lib_dir` directives): every process keeps reading them,
+	// only this entry's whitelisted binaries may write them. Guarding a
+	// directory — rather than listing files in Libs — is the only workable
+	// rule for trees whose contents are assembled per launch under names
+	// that change every time (Steam's pressure-vessel `var/tmp-XXXXXX`):
+	// the trust object walks a loaded library's ancestors, so one entry
+	// covers the whole subtree forever. Glob metacharacters (*, ?, [) are
+	// expanded against the filesystem; non-existent paths are dropped.
+	// Use the SHALLOWEST directory that contains only libraries and app
+	// data the whitelisted binary legitimately owns.
+	LibDirRelPaths []string
 }
 
 // IsSystem reports whether this is a system-level (AbsPaths) entry, probed
@@ -384,12 +405,41 @@ var Catalog = []CandidateDir{
 			"/usr/lib/steam/steam":                       nil,
 			"%HOME%/.local/share/Steam/*/steam":          nil,
 			"%HOME%/.local/share/Steam/*/steamwebhelper": nil,
-			"%HOME%/.local/share/Steam/steamapps/common/*/*/bin/pressure-vessel-*":               nil,
-			"%HOME%/.local/share/Steam/*/gameoverlayui":                                          nil,
-			"%HOME%/.local/share/Steam/steamapps/common/*/files/bin/wineserver":                  nil,
-			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine64-preloader":     nil,
-			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/*/wine64-preloader": nil,
+			"%HOME%/.local/share/Steam/steamapps/common/*/*/bin/pressure-vessel-*": nil,
+			// The Steam client's own container runtime (steamrt64) ships a
+			// second pressure-vessel; it takes lock files (`.ref`, opened for
+			// write) inside its runtime tree. The per-launch copies under
+			// var/tmp-XXXXXX are hardlinks of this binary — same inode, so
+			// whitelisting the stable path covers them.
+			"%HOME%/.local/share/Steam/steamrt64/pv-runtime/*/pressure-vessel/bin/pressure-vessel-*": nil,
+			"%HOME%/.local/share/Steam/*/gameoverlayui":                                              nil,
+			"%HOME%/.local/share/Steam/steamapps/common/*/files/bin/wineserver":                      nil,
+			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine64-preloader":         nil,
+			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/*/wine64-preloader":     nil,
 			"/usr/bin/lsof": nil,
+		},
+		// Steam loads hundreds of libraries that are NOT root-owned system
+		// libraries, so none of them is auto-trusted: its own shipped runtime
+		// (ubuntu12_*, linux64), the Proton/Wine builds under
+		// compatibilitytools.d, and the pressure-vessel container runtimes.
+		// They are guarded read-only — everything may still read them, only
+		// Steam may write them — which is what makes them safe to load and
+		// what blocks planting an LD_PRELOAD payload in the tree.
+		//
+		// The runtime dirs matter most: at every launch pressure-vessel
+		// assembles a merged /usr for the container under a random
+		// `var/tmp-XXXXXX` name, so no file list could ever cover them.
+		// Guarding the STABLE parent does: the trust object walks a loaded
+		// library's ancestors, so one entry covers every future random
+		// child. Deliberately not listed is steamapps/common/* at large —
+		// that is the game library (hundreds of GiB of non-library data).
+		LibDirRelPaths: []string{
+			".local/share/Steam/ubuntu12_32",
+			".local/share/Steam/ubuntu12_64",
+			".local/share/Steam/linux64",
+			".local/share/Steam/steamrt64",
+			".local/share/Steam/compatibilitytools.d",
+			".local/share/Steam/steamapps/common/SteamLinuxRuntime*",
 		}},
 
 	// --- System-level paths (probed once, not per user; ssh-guard template) ---
@@ -460,6 +510,57 @@ func (c *CandidateDir) ExpandWhitelist(user, home string) []BinaryRule {
 			Events: c.Whitelist[bin],
 		})
 	}
+	return out
+}
+
+// ExpandLibs expands %USER%/%HOME% in the entry's allow_lib paths, sorted for
+// deterministic config generation.
+func (c *CandidateDir) ExpandLibs(user, home string) []string {
+	out := make([]string, 0, len(c.Libs))
+	for _, lib := range c.Libs {
+		out = append(out, expandPlaceholders(lib, user, home))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ExpandLibDirs expands the entry's LibDirRelPaths for the given user into
+// absolute directories: %HOME%/%USER% placeholders resolved, glob
+// metacharacters matched against the filesystem, non-directories and
+// non-existent paths dropped, result sorted and de-duplicated for
+// deterministic config generation. Dropping the missing ones here (rather
+// than writing them out) keeps the generated config honest: a library tree
+// that does not exist protects nothing, and versioned runtime directories
+// come and go with every Proton/runtime update.
+func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
+	if len(c.LibDirRelPaths) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(c.LibDirRelPaths))
+	for _, rel := range c.LibDirRelPaths {
+		pattern := filepath.Join(home, expandPlaceholders(rel, user, home))
+		matches := []string{pattern}
+		if strings.ContainsAny(pattern, "*?[") {
+			m, err := filepath.Glob(pattern)
+			if err != nil {
+				continue
+			}
+			matches = m
+		}
+		for _, p := range matches {
+			if seen[p] {
+				continue
+			}
+			info, err := os.Lstat(p)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

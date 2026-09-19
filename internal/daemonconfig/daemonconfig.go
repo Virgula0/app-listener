@@ -40,6 +40,27 @@ type Resource struct {
 	// fscrypt-locked directory). Until a post-unlock pass moves them into Binaries they stay
 	// absent from the BPF whitelist — denied: fail-closed, never fail-open.
 	PendingBinaries []BinaryRule
+	// AllowLibs lists shared libraries this section's whitelisted binaries are
+	// permitted to load (`allow_lib <path>` directives) BEYOND the static
+	// dependency closure the daemon resolves automatically from each binary's
+	// ELF (DT_NEEDED + interpreter). These are the dynamic dlopen extras static
+	// analysis cannot see (NSS, gconv, GL drivers, plugins). Their inodes join
+	// the global trusted-library set (see internal/guard's trust object): a
+	// whitelisted binary may exec-map only trusted libraries, and no
+	// non-whitelisted process may overwrite one.
+	AllowLibs []string
+	// PendingLibs parks allow_lib paths unreadable at parse time, resolved by
+	// the same post-unlock pass as PendingBinaries.
+	PendingLibs []string
+	// ReadOnly guards the tree in guard.ModeReadOnly instead of
+	// guard.ModeWhitelist: every process may READ it, but every modifying
+	// operation is gated on the whitelist. It backs `lib_dir` directives —
+	// a library directory does not hold secrets, so denying reads would
+	// break every unrelated process, while write-protecting it is what
+	// makes the libraries inside trustworthy to load (nobody but the
+	// whitelisted binary can plant or alter a .so there). Read-only
+	// resources are never encrypted.
+	ReadOnly bool
 	// PathPending marks a grouped watch path that could not be validated at
 	// parse time because its encryption root is a locked fscrypt vault: the
 	// plaintext sub-path name does not resolve until the daemon unlocks the
@@ -68,10 +89,16 @@ func (r *Resource) EncryptionRootOrPath() string {
 // EncryptionRootOrPath is the shared section header the text-patching
 // helpers address). Resources are returned by pointer: grouped resources
 // must be patched through their SECTION path, never their watch sub-path.
+// Read-only (`lib_dir`) resources are excluded: they are neither an
+// encryption group nor a section header, so no fscrypt question, migration
+// or config-text patch may ever address them.
 func (c *Config) EncryptionGroups() []*Resource {
 	seen := make(map[string]bool)
 	var out []*Resource
 	for i := range c.Resources {
+		if c.Resources[i].ReadOnly {
+			continue
+		}
 		root := c.Resources[i].EncryptionRootOrPath()
 		if !seen[root] {
 			seen[root] = true
@@ -99,7 +126,10 @@ type watchGroup struct {
 	needEncryption bool
 	binaries       []BinaryRule
 	pending        []BinaryRule
+	libs           []string
+	pendingLibs    []string
 	watchPaths     []string
+	libDirs        []string
 	// skipped marks a section whose root is missing: preserved historical
 	// tolerance — its directives are warned and ignored, never fatal (the
 	// whole group is dropped at finalize).
@@ -328,7 +358,72 @@ func materializeWatchGroup(cfg *Config, g *watchGroup) {
 		}
 		res.Binaries = append(res.Binaries, g.binaries...)
 		res.PendingBinaries = append(res.PendingBinaries, g.pending...)
+		res.AllowLibs = append(res.AllowLibs, g.libs...)
+		res.PendingLibs = append(res.PendingLibs, g.pendingLibs...)
 	}
+	materializeLibDirs(cfg, g)
+}
+
+// materializeLibDirs appends one read-only, unencrypted Resource per
+// `lib_dir` directive, sharing the group's whitelist. Read-only is the whole
+// point: the tree stays world-readable (other processes keep loading the
+// same libraries) while only the section's binaries may create, replace or
+// alter a file in it. That write-monopoly is what lets the trust object
+// treat every .so under the tree as loadable without enumerating it — which
+// is the only workable rule for per-launch runtime directories whose names
+// change on every start (Steam's pressure-vessel `var/tmp-XXXXXX`).
+func materializeLibDirs(cfg *Config, g *watchGroup) {
+	for _, dir := range g.libDirs {
+		if _, statErr := os.Lstat(dir); statErr != nil {
+			log.Warnf("daemon config line %d: lib_dir not present, ignoring: %s", g.lineNo, dir)
+			continue
+		}
+		// A shared runtime tree is legitimately named by several sections
+		// (one application, several config locations; `install
+		// --diff-catalog` appending a second section for the same app).
+		// Guarding it once is the whole requirement, so a repeat is a
+		// no-op — not the duplicate-watch-path error that would refuse
+		// the config and take the daemon down.
+		// Only ever merged into another lib_dir. A lib_dir naming a path
+		// that is already a real guarded (whitelist-mode, possibly
+		// encrypted) resource must NOT fold into it: that would widen a
+		// secret directory's whitelist with this section's binaries and
+		// downgrade nothing-silently. Refuse it instead.
+		if existing := findResource(cfg, dir); existing != nil {
+			if !existing.ReadOnly {
+				log.Errorf("daemon config line %d: lib_dir %s is already a guarded resource — ignoring the directive "+
+					"(a library directory must not share a path with a protected tree)", g.lineNo, dir)
+				continue
+			}
+			existing.Binaries = append(existing.Binaries, libDirWriters(g.binaries)...)
+			existing.PendingBinaries = append(existing.PendingBinaries, libDirWriters(g.pending)...)
+			continue
+		}
+		res := addResource(cfg, dir, "", g.lineNo)
+		if res == nil {
+			continue
+		}
+		res.NeedEncryption = false
+		res.ReadOnly = true
+		res.Binaries = append(res.Binaries, libDirWriters(g.binaries)...)
+		res.PendingBinaries = append(res.PendingBinaries, libDirWriters(g.pending)...)
+	}
+}
+
+// libDirWriters returns the section binaries allowed to WRITE a lib_dir: only
+// the unrestricted ones. An event list scopes a binary's access to the
+// section's protected tree (e.g. `/usr/bin/ssh READ,WRITE,...`); it has no
+// meaning in read-only mode, which cannot carry per-binary masks. Promoting
+// such a binary to an unrestricted writer of a library tree would widen it,
+// so it is left out — it can still read the tree like every other process.
+func libDirWriters(rules []BinaryRule) []BinaryRule {
+	out := make([]BinaryRule, 0, len(rules))
+	for _, r := range rules {
+		if len(r.Events) == 0 {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // deferPendingWatchPath keeps a grouped watch path that addResource rejected
@@ -378,10 +473,21 @@ func ResolvePendingPaths(cfg *Config) error {
 	return nil
 }
 
+// findResource returns the already-materialized resource for path, or nil.
+func findResource(cfg *Config, path string) *Resource {
+	for i := range cfg.Resources {
+		if cfg.Resources[i].Path == path {
+			return &cfg.Resources[i]
+		}
+	}
+	return nil
+}
+
 // validateResources rejects duplicate watch paths across the whole config.
 func validateResources(cfg *Config) error {
 	seen := make(map[string]bool, len(cfg.Resources))
-	for _, r := range cfg.Resources {
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
 		if seen[r.Path] {
 			return fmt.Errorf("daemon config: duplicate watch path: %s", r.Path)
 		}
@@ -503,6 +609,14 @@ func applyDirective(group *watchGroup, line string, lineNo int) error {
 		return nil
 	}
 
+	if libPath, ok := parseAllowLib(line); ok {
+		return applyAllowLib(group, libPath, lineNo)
+	}
+
+	if dirPath, ok := parseLibDir(line); ok {
+		return applyLibDir(group, dirPath, lineNo)
+	}
+
 	binPath, rest, splitErr := splitPathAndRest(line)
 	if splitErr != nil {
 		return fmt.Errorf("daemon config line %d: %w", lineNo, splitErr)
@@ -531,6 +645,79 @@ func applyDirective(group *watchGroup, line string, lineNo int) error {
 		rule.Path = resolved
 	}
 	group.binaries = append(group.binaries, rule)
+	return nil
+}
+
+// parseAllowLib recognizes an `allow_lib <path>` / `allow_lib: <path>`
+// directive and returns the (unquoted) library path.
+func parseAllowLib(line string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, "allow_lib")
+	if !ok {
+		return "", false
+	}
+	// Require a separator so a binary named "/usr/bin/allow_libfoo" is not
+	// mistaken for the directive.
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
+		return "", false
+	}
+	rest = strings.TrimPrefix(rest, ":")
+	return unquotePath(strings.TrimSpace(rest)), true
+}
+
+// applyAllowLib records one allow_lib path on the open group, deferring it
+// (like a binary) when it is not yet readable so a locked-vault library is
+// resolved post-unlock rather than dropped.
+func applyAllowLib(group *watchGroup, libPath string, lineNo int) error {
+	if libPath == "" {
+		return fmt.Errorf("daemon config line %d: empty allow_lib path", lineNo)
+	}
+	if _, statErr := os.Stat(libPath); statErr != nil {
+		log.Warnf("daemon config line %d: allow_lib not readable yet, deferring: %s", lineNo, libPath)
+		group.pendingLibs = append(group.pendingLibs, libPath)
+		return nil //nolint:nilerr // deferred, not dropped — same fail-closed handling as a binary
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(libPath); resolveErr == nil && resolved != libPath {
+		libPath = resolved
+	}
+	group.libs = append(group.libs, libPath)
+	return nil
+}
+
+// parseLibDir recognizes a `lib_dir <path>` / `lib_dir: <path>` directive
+// and returns the (unquoted) directory path.
+func parseLibDir(line string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, "lib_dir")
+	if !ok {
+		return "", false
+	}
+	// Require a separator so a binary named "/usr/bin/lib_dirfoo" is not
+	// mistaken for the directive.
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
+		return "", false
+	}
+	rest = strings.TrimPrefix(rest, ":")
+	return unquotePath(strings.TrimSpace(rest)), true
+}
+
+// applyLibDir records one library directory on the open group. Unlike a
+// `watch:` path it is NOT confined to the section root and never joins the
+// section's encryption group: it is materialized as its own read-only
+// resource (see materializeLibDirs). A missing directory is warned and
+// dropped rather than deferred — an absent library directory holds no
+// secret to leak, and failing the whole config over an optional runtime
+// tree (a Proton version the user removed) would take the daemon down with
+// it.
+func applyLibDir(group *watchGroup, dirPath string, lineNo int) error {
+	if dirPath == "" {
+		return fmt.Errorf("daemon config line %d: empty lib_dir path", lineNo)
+	}
+	dirPath = filepath.Clean(dirPath)
+	for _, existing := range group.libDirs {
+		if existing == dirPath {
+			return fmt.Errorf("daemon config line %d: duplicate lib_dir path: %s", lineNo, dirPath)
+		}
+	}
+	group.libDirs = append(group.libDirs, dirPath)
 	return nil
 }
 

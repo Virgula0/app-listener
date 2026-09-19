@@ -210,14 +210,26 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 // grouped extra watch sub-paths from the catalog entry.
 func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
+	// One entry can produce several sections (an app with several config
+	// locations, e.g. Steam). Its library directives describe the
+	// APPLICATION, not the location, so they are emitted once — on the
+	// first section of each entry+user — rather than repeated per section.
+	emitted := make(map[string]bool, len(candidates))
 	for i := range candidates {
 		c := &candidates[i]
-		sections = append(sections, inst.Section{
+		key := c.Entry.Name + "\x00" + c.User.Name
+		s := inst.Section{
 			Path:            c.Path,
 			Allow:           c.FilterExistingWhitelist(),
 			Encrypt:         true,
 			ExtraWatchPaths: c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name),
-		})
+		}
+		if !emitted[key] {
+			s.Libs = c.Entry.ExpandLibs(c.User.Name, c.User.Home)
+			s.LibDirs = c.Entry.ExpandLibDirs(c.User.Name, c.User.Home)
+			emitted[key] = true
+		}
+		sections = append(sections, s)
 	}
 	return sections
 }
@@ -519,6 +531,9 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 	root := sectionPath
 
 	wasEncrypted := false
+	// The ephemeral guard the unlock attached, kept for the re-lock: a
+	// file-vault lock rewrites the file under that same guard.
+	var relockGuard *guard.Guard
 	if r.NeedEncryption {
 		encrypted, encErr := vault.IsEncrypted(root)
 		if encErr != nil {
@@ -530,11 +545,12 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 				log.Infof("re-scanning %s (daemon running: vault already unlocked and guarded) ...", sectionPath)
 			} else {
 				log.Infof("unlocking %s for whitelist re-expansion (under an ephemeral guard) ...", root)
-				release, unlockErr := unlockUnderGuard(vault, root)
+				ephemeral, unlockErr := unlockUnderGuard(vault, root)
 				if unlockErr != nil {
 					return "", false, unlockErr
 				}
-				defer release()
+				defer ephemeral.Stop()
+				relockGuard = ephemeral
 			}
 		}
 	}
@@ -554,7 +570,7 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 		// tree keeps denying every non-root reader. Retry unbounded, like
 		// the daemon's lockdown — a pinned fd must not downgrade this to a
 		// warning that leaves the vault unlocked once the process exits.
-		lockVaultFully(vault, root)
+		lockVaultFully(vault, root, relockGuard)
 	}
 
 	updated, patchErr := inst.SetSectionWhitelist(confText, sectionPath, freshWhitelist)
@@ -602,12 +618,26 @@ func parseSectionWhitelist(confText, resourcePath string) []string {
 // unlockUnderGuard attaches an ephemeral self-only whitelist guard on path
 // BEFORE provisioning the key, so the unlock window denies every reader
 // except the root installer process (GUARD_ALLOW_ROOT — the same uid-gated
-// mechanism the daemon uses for itself). The returned release func stops the
-// guard and must run only after the vault is confirmed locked back.
-func unlockUnderGuard(vault *fscrypt.Vault, path string) (release func(), err error) {
+// mechanism the daemon uses for itself). The caller must Stop the returned
+// guard only after the vault is confirmed locked back (lockVaultFully).
+//
+// A single-file resource (userspace file vault) is transformed IN PLACE —
+// the unlock truncates and rewrites the file's own bytes — which the
+// read-only self mask denies. Exactly like the daemon (vaultOpForGuard), the
+// write is granted only for the duration of the vault call via
+// WithSelfVaultAccess, and the crash-recovery sidecar is pre-staged before
+// the guard attaches, since creating it beside a guarded file is denied once
+// the guard is live. Regression guard: without both, `install
+// --update-catalog-only` failed with "truncate …: operation not permitted"
+// on any file-vault section (e.g. Steam's registry.vdf).
+func unlockUnderGuard(vault *fscrypt.Vault, path string) (*guard.Guard, error) {
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {
 		return nil, fmt.Errorf("resolving installer executable: %w", err)
+	}
+	if err := fscrypt.EnsureRecoverySidecarPlaceholder(path); err != nil {
+		log.Warnf("install: could not pre-create the recovery sidecar for %s (%v) — "+
+			"a lock/unlock interrupted by a crash may not be recoverable", path, err)
 	}
 	ephemeral, guardErr := guard.NewGuard(path, guard.ModeWhitelist, nil, true, 0,
 		guard.WithSelfAllowBinary(self, []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead}))
@@ -615,11 +645,23 @@ func unlockUnderGuard(vault *fscrypt.Vault, path string) (release func(), err er
 		// Fail-closed: without the guard there is no unlock at all.
 		return nil, fmt.Errorf("attaching ephemeral guard for %s: %w (vault left locked)", path, guardErr)
 	}
-	if unlockErr := vault.Unlock(path); unlockErr != nil {
+	if unlockErr := vaultOpUnderGuard(ephemeral, path, func() error { return vault.Unlock(path) }); unlockErr != nil {
 		ephemeral.Stop()
 		return nil, fmt.Errorf("unlocking %s: %w", path, unlockErr)
 	}
-	return ephemeral.Stop, nil
+	return ephemeral, nil
+}
+
+// vaultOpUnderGuard runs a vault Unlock/Lock on path, widening g's self mask
+// to write only when path is a file vault (a directory's fscrypt lifecycle
+// is pure kernel-keyring work and never needs it). g may be nil: op still
+// runs, so a denial surfaces as a real error rather than a silent skip.
+func vaultOpUnderGuard(g *guard.Guard, path string, op func() error) error {
+	info, statErr := os.Stat(path)
+	if statErr != nil || !info.Mode().IsRegular() || g == nil {
+		return op()
+	}
+	return g.WithSelfVaultAccess(op)
 }
 
 // lockVaultFully force-flushes the vault key until it is gone, with the same
@@ -639,9 +681,10 @@ func liveEmptyWhitelistRejected(encrypted, live bool, fresh, old int) bool {
 	return live && encrypted && fresh == 0 && old > 0
 }
 
-func lockVaultFully(vault *fscrypt.Vault, path string) {
+func lockVaultFully(vault *fscrypt.Vault, path string, g *guard.Guard) {
 	for {
-		err := vault.Lock(path, true)
+		// Widened per attempt, never across the retry sleep.
+		err := vaultOpUnderGuard(g, path, func() error { return vault.Lock(path, true) })
 		if err == nil {
 			return
 		}

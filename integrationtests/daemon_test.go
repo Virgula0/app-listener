@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -237,6 +238,196 @@ need_encryption: false
 	s.Require().True(denied, "expected a DAEMON DENIED event for the non-root app-listener access of /protected/secret, got: %s", log)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// ---------------------------------------------------------------
+// Bypass POC (finding #1): replacing a whitelisted binary at a
+// user-writable path via rename gets the REPLACEMENT re-whitelisted.
+//
+// Whitelist identity is the exe inode. The daemon re-stats whitelisted
+// binaries and re-admits whatever inode is now at the path
+// (ReSyncBinaries, triggered on any denial and by the periodic sweep),
+// with no check that the new file is the same binary, is root-owned, or
+// sits in a non-user-writable directory. The in-place (same-inode)
+// swap is caught by the hash-verify loop, but a RENAME replaces the
+// path with a NEW inode — a different code path that only compares the
+// stored inode, so the malicious replacement is admitted with full
+// whitelist rights. Any binary whitelisted from a home directory
+// (Claude Code in ~/.local/share/claude, Discord in ~/.config/discord)
+// can be swapped by malware running as the same user.
+//
+// RED now: after the rename the replacement is re-whitelisted and reads
+// the guarded secret. After the fix (re-admission must verify the
+// binary — by hash, or refuse non-root-owned / user-writable paths),
+// the replacement stays denied.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestDaemon_Bypass_BinaryRenameReplaceReWhitelisted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-RENAME-REWHITELIST-7B3D"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/swap_benign"), "/exploits/swap_benign", 0755), "copy swap_benign")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/swap_reader"), "/exploits/swap_reader", 0755), "copy swap_reader")
+
+	// The whitelisted binary lives at a user-writable path (mirrors a
+	// home-directory app), initially the benign placeholder.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/swap_benign /tmp/app && chmod 755 /tmp/app"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/tmp/app`)
+
+	// Baseline: the whitelisted benign binary runs (proves the whitelist is
+	// active for /tmp/app's current inode).
+	code, out := s.exec(c, []string{"/tmp/app"})
+	s.Require().Equalf(0, code, "baseline whitelisted binary should run: %s", out)
+	s.Require().Contains(out, "BENIGN-APP-OK")
+
+	// Attack: try to rename the malicious reader OVER the whitelisted path.
+	// The binary lives at a user-writable path (/tmp), so the trust guard's
+	// writer-attribution (#1) must deny the replacement by a non-whitelisted
+	// process (mv), leaving the inode unchanged.
+	_, inodeOut := s.exec(c, []string{"sh", "-c",
+		"i1=$(stat -c %i /tmp/app); mv -f /exploits/swap_reader /tmp/app 2>/dev/null; i2=$(stat -c %i /tmp/app); echo $i1 $i2"})
+	inodeRe := regexp.MustCompile(`(\d+)[^0-9]+(\d+)`)
+	m := inodeRe.FindStringSubmatch(inodeOut)
+	s.Require().NotNil(m, "inode probe output: %q", inodeOut)
+	s.Require().Equalf(m[1], m[2],
+		"protected whitelisted binary was replaced by a non-app process (before=%s after=%s)", m[1], m[2])
+
+	// Belt-and-suspenders: even if the swap had somehow gone through, the
+	// replacement must never be able to read the guarded secret. Poll the
+	// whole re-sync window (denial-driven + the 30s periodic sweep).
+	leaked := false
+	var lastOut string
+	deadline := time.Now().Add(50 * time.Second)
+	for time.Now().Before(deadline) {
+		code, out = s.exec(c, []string{"sh", "-c", "timeout 10 /tmp/app /protected/secret 2>&1"})
+		lastOut = out
+		if strings.Contains(out, "STOLEN|"+marker) {
+			leaked = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// Secure expectation: the renamed-in replacement never gained the
+	// whitelist entry, so the secret is never leaked.
+	s.Require().Falsef(leaked,
+		"renamed-in binary was re-whitelisted and read the guarded secret: %q", lastOut)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// TestDaemon_Bypass_LdPreloadWhitelistedBinary is the #2 regression: a
+// whitelisted binary run with LD_PRELOAD pointing at an attacker .so under a
+// user-writable path (/tmp) must NOT be able to map that code — the trust
+// guard's library-load allowlist denies it (the .so is neither an allow_lib
+// entry, an auto-trusted root-owned system library, nor inside a guarded
+// tree), so the preload constructor never runs and the secret is never
+// exfiltrated. A plain run of the same binary still works (its real libraries
+// are root-owned system libs, auto-trusted). Enforcement is always on.
+func (s *IntegrationSuite) TestDaemon_Bypass_LdPreloadWhitelistedBinary() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-LD-PRELOAD-5E7A"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_leak.so"), "/tmp/leak.so", 0755), "copy preload_leak.so")
+
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	// Positive control: the whitelisted binary runs normally — its real
+	// libraries are root-owned system libs and are auto-trusted, so
+	// enforcement does not break it.
+	code, out := s.exec(c, []string{"/usr/bin/true"})
+	s.Require().Equalf(0, code, "whitelisted binary must still run under library enforcement: %s", out)
+
+	// Attack: LD_PRELOAD an attacker .so from a user-writable path.
+	_, out = s.exec(c, []string{"sh", "-c",
+		"LD_PRELOAD=/tmp/leak.so LEAK_FILE=/protected/secret /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated through LD_PRELOAD into a whitelisted binary: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// ---------------------------------------------------------------
+// Bypass POC (finding #4c): the memory-read taint is lost across a
+// SIGHUP reload.
+//
+// A process that read a guarded file is tainted so process_vm_readv
+// against it is denied. A reload rebuilds every guard with fresh BPF
+// maps, so the tainted-pid set is emptied while the victim keeps running
+// with the secret still in memory — the attacker can then dump it.
+//
+// RED now: after the reload the attacker dumps the secret from the
+// still-live victim. After the fix (taint must survive a reload, e.g. by
+// re-seeding from the surviving map or persisting it) the dump stays
+// denied.
+// ---------------------------------------------------------------
+func (s *IntegrationSuite) TestDaemon_Bypass_TaintLostOnReload() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-TAINT-RELOAD-6C4E"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/taint_victim"), "/exploits/taint_victim", 0755), "copy taint_victim")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/process_vm_readv"), "/exploits/process_vm_readv", 0755), "copy process_vm_readv")
+	s.exec(c, []string{"sh", "-c", "cp /exploits/taint_victim /tmp/victim && chmod 755 /tmp/victim"})
+
+	config := `[watch /protected]
+need_encryption: false
+/tmp/victim`
+	s.startDaemon(c, config)
+
+	// The whitelisted victim reads the secret into its heap and stays
+	// alive, tainted, holding the fd.
+	s.exec(c, []string{"sh", "-c", "/tmp/victim hold /protected/secret & echo $! > /tmp/vpid; sleep 1"})
+
+	// Before the reload: the attacker is blocked by taint tracking and
+	// cannot see the secret. (Proves the victim is tainted.)
+	_, out := s.exec(c, []string{"sh", "-c", "/exploits/process_vm_readv /protected/secret 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"pre-reload control: taint should have blocked the dump: %s", out)
+
+	// Reload rebuilds every guard with fresh, empty taint maps. Wait for the
+	// reload to actually COMPLETE before the post-reload attempt: the
+	// "guard started" markers awaitDaemonUp watches are already present from
+	// the initial start, so only the reload-complete line proves the map
+	// swap happened (otherwise the attacker races the still-tainted old
+	// guard and the test passes for the wrong reason).
+	s.sigDaemon(c, "HUP")
+	const reloadDone = "configuration reloaded without dropping protection"
+	reloaded := false
+	deadline := time.Now().Add(daemonShutdownTimeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(s.readDaemonLog(c), reloadDone) {
+			reloaded = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Require().Truef(reloaded, "reload did not complete within %s, daemon log:\n%s", daemonShutdownTimeout, s.readDaemonLog(c))
+
+	// After the reload: the victim is still alive and holds the secret,
+	// but the new guard's taint map is empty.
+	_, out = s.exec(c, []string{"sh", "-c", "/exploits/process_vm_readv /protected/secret 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"taint was lost across the reload; attacker dumped the secret from the surviving victim: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f taint_victim 2>/dev/null; pkill -f 'app-listener daemon' || true"})
+}
+
+// daemonPinFiles lists the daemon's pin files under /sys/fs/bpf/app-listener.
+func (s *IntegrationSuite) daemonPinFiles(c testcontainers.Container) []string {
+	_, out := s.exec(c, []string{"sh", "-c", "ls -1 /sys/fs/bpf/app-listener 2>/dev/null || true"})
+	return strings.Fields(out)
 }
 
 // ---------------------------------------------------------------
