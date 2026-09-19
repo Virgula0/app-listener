@@ -16,8 +16,11 @@ build/pprof
 internal/*/embeds/*.o
 internal/monitor/monitor_bpf.go
 internal/guard/guard_bpf.go
+internal/guard/guardtrust_bpf.go
 internal/networkmonitor/networkmonitor_bpf.go
 internal/networkguard/guardnet_bpf.go
+
+*.log
 
 # vmlinux.h is generated from BTF
 vmlinux.h
@@ -35,3 +38,6 @@ integrationtests/exploits/*
 !integrationtests/exploits/*.c
 !integrationtests/exploits/Makefile
 !integrationtests/exploits/README.md
+# Denial traces from scripts/trace-app-libs.sh (contain home-directory paths)
+scripts/app-trace-*.log
+scripts/lib-trace-*.log

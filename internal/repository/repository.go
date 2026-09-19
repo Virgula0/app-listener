@@ -71,6 +71,15 @@ type GuardRepository interface {
 	// GrantSelfEditAccess/RevokeSelfEditAccess, which is a broader,
 	// session-scoped grant for interactive edit-protected use.
 	WithSelfVaultAccess(fn func() error) error
+	// SnapshotTaintedPIDs returns the tgids currently marked tainted (every
+	// process holding guarded content in memory); RestoreTaintedPIDs
+	// re-stamps a set of tgids into a freshly built guard's taint map.
+	// Together they carry the memory-read taint across a reload: the new
+	// guards start with empty maps, so without the transfer a SIGHUP would
+	// silently drop process_vm_readv / ptrace protection for every process
+	// that had already read a guarded file.
+	SnapshotTaintedPIDs() ([]uint32, error)
+	RestoreTaintedPIDs(pids []uint32) error
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

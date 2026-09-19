@@ -303,6 +303,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	defer d.Stop()
+
+	// Trusted-binary/library protection: write-protect whitelisted binaries at
+	// user-writable paths (#1) and enforce the library-load allowlist (#2).
+	// Never fatal — returns a no-op cleanup when unavailable.
+	defer startTrustGuard(cfg)()
+
 	events := mergeDaemonEvents(d.Events(), sg.Events())
 
 	// Record this run's config-guard pin generation for `daemon --lockdown`
@@ -974,7 +980,17 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 			"a lock/unlock interrupted by a crash may not be recoverable", r.Path, err)
 	}
 
-	g, err := guard.NewGuard(r.Path, guard.ModeWhitelist, binaries, true, 0,
+	// A lib_dir resource guards a library tree: every process must keep
+	// READING it (denying reads would break every unrelated binary that
+	// loads the same .so), while every modifying operation stays gated on
+	// the whitelist — the write monopoly is what makes the libraries
+	// inside trustworthy to load.
+	mode := guard.ModeWhitelist
+	if r.ReadOnly {
+		mode = guard.ModeReadOnly
+	}
+
+	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0,
 		guard.WithBinaryEvents(events),
 		guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
 		// Root-gated self access with the minimal event set the fscrypt
@@ -1097,7 +1113,8 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
 	seen := make(map[uint32]bool, len(resources))
 	out := make([]uint32, 0, len(resources))
-	for _, r := range resources {
+	for i := range resources {
+		r := &resources[i]
 		rdev, hasDevice, err := guard.BackingDevice(r.Path)
 		if err != nil {
 			log.Warnf("daemon: raw block-device gate: %v (raw access to this device is not blocked)", err)
@@ -1159,6 +1176,10 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 	resource := logging.SanitizeText(ev.Resource)
 	path := logging.SanitizeText(ev.Event.Path)
 	comm := logging.SanitizeText(ev.Event.Comm)
+	op := ev.Event.Type.String()
+	if ev.Event.Process != "" {
+		op = ev.Event.Process // PTRACE / TRACED_EXEC: no file involved
+	}
 	if ev.Event.Blocked {
 		// commFullPath is best-effort telemetry, not identity: comm/pid come
 		// straight off the kernel event and can be spoofed or recycled by the
@@ -1170,11 +1191,11 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 			commFullPath = logging.SanitizeText(target)
 		}
 		fmt.Fprintf(w, "%sDAEMON DENIED  op=%s  comm=%s  commFullPath=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
-			syslogWarning, ev.Event.Type.String(), comm, commFullPath, ev.Event.PID, who, resource, path)
+			syslogWarning, op, comm, commFullPath, ev.Event.PID, who, resource, path)
 		return true
 	}
 	fmt.Fprintf(w, "%sDAEMON ALLOWED  op=%s  comm=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
-		syslogInfo, ev.Event.Type.String(), comm, ev.Event.PID, who, resource, path)
+		syslogInfo, op, comm, ev.Event.PID, who, resource, path)
 	return true
 }
 
@@ -1243,7 +1264,8 @@ func runServedTUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, r
 
 func newDaemonModel(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config) tea.Model {
 	resources := make([]tui.DaemonResourceInfo, 0, len(cfg.Resources))
-	for _, r := range cfg.Resources {
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
 		resources = append(resources, tui.DaemonResourceInfo{
 			Path:           r.Path,
 			NeedEncryption: r.NeedEncryption,

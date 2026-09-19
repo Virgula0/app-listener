@@ -320,7 +320,7 @@ func groupedDiscordConf(t *testing.T, home string) (string, *daemonconfig.Config
 		Allow:           []inst.BinaryRule{{Path: "/usr/bin/stale-entry"}},
 		Encrypt:         true,
 		ExtraWatchPaths: []string{lsDir, cookies},
-	}})
+	}}, nil)
 	cfg, err := validateConfigText(confText)
 	if err != nil {
 		t.Fatalf("generated grouped config does not parse: %v", err)
@@ -422,7 +422,7 @@ func TestSectionsFromCandidatesSkipsMissingWatchSubPaths(t *testing.T) {
 		t.Errorf("ExtraWatchPaths = %v, want only the existing sub-path %q", sections[0].ExtraWatchPaths, existing)
 	}
 
-	confText := inst.GenerateConf(sections)
+	confText := inst.GenerateConf(sections, nil)
 	cfg, err := validateConfigText(confText)
 	if err != nil {
 		t.Fatalf("generated config does not parse: %v", err)
@@ -556,5 +556,67 @@ func TestSoftenAutomatedRefreshErr(t *testing.T) {
 	}
 	if err := softenAutomatedRefreshErr(nil, true); err != nil {
 		t.Errorf("nil in, nil out, got %v", err)
+	}
+}
+
+// TestGeneratedLibraryBlockRoundTrips feeds the installer's [libraries]
+// output through the daemon's own parser: the block's lib_dir must come out as
+// a read-only resource written by the block's lib_binary alone — never by the
+// application's watch-section whitelist, and never reaching the protected
+// section.
+func TestGeneratedLibraryBlockRoundTrips(t *testing.T) {
+	home := t.TempDir()
+	secret := filepath.Join(home, "config")
+	runtime := filepath.Join(home, "steamrt64")
+	writer := filepath.Join(runtime, "pv", "bin", "pressure-vessel-wrap")
+	client := filepath.Join(home, "steam")
+	for _, d := range []string{secret, filepath.Dir(writer)} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{writer, client} {
+		if err := os.WriteFile(f, []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	confText := inst.GenerateConf(
+		[]inst.Section{{Path: secret, Allow: []inst.BinaryRule{{Path: client}}}},
+		[]inst.LibraryBlock{{Name: "Steam (alice)", LibDirs: []string{runtime}, LibWriters: []string{writer}}},
+	)
+	cfg, err := validateConfigText(confText)
+	if err != nil {
+		t.Fatalf("generated config with a [libraries] block does not parse: %v\n%s", err, confText)
+	}
+
+	has := func(r *daemonconfig.Resource, p string) bool {
+		for _, b := range r.Binaries {
+			if b.Path == p {
+				return true
+			}
+		}
+		return false
+	}
+	var lib, sec *daemonconfig.Resource
+	for i := range cfg.Resources {
+		switch cfg.Resources[i].Path {
+		case runtime:
+			lib = &cfg.Resources[i]
+		case secret:
+			sec = &cfg.Resources[i]
+		}
+	}
+	if lib == nil || sec == nil {
+		t.Fatalf("want the protected section and the lib_dir, got %+v", cfg.Resources)
+	}
+	if !lib.ReadOnly || !has(lib, writer) {
+		t.Errorf("lib_dir must be read-only and written by its block's lib_binary: %+v", lib)
+	}
+	if has(lib, client) {
+		t.Errorf("the watch section's whitelist leaked into the [libraries] lib_dir")
+	}
+	if has(sec, writer) {
+		t.Errorf("the lib_binary leaked into the protected section's whitelist")
 	}
 }

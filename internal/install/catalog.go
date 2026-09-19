@@ -41,6 +41,38 @@ type CandidateDir struct {
 	// paths are relative to the user's home, supporting the same %HOME%
 	// expansion as whitelist entries.
 	WatchRelPaths []string
+	// Libs are extra shared libraries this entry's whitelisted binaries are
+	// allowed to load, emitted as `allow_lib` directives. They are ONLY needed
+	// for libraries that are neither root-owned system libraries (those are
+	// auto-trusted) nor inside a guarded tree (those are trusted by location):
+	// i.e. user-writable libraries at FIXED paths that an app dlopen()s. Paths
+	// support the same %HOME%/%USER% expansion as whitelist entries. Libraries
+	// at per-launch ephemeral paths (e.g. Steam's runtime) cannot be listed
+	// here — guard their containing directory instead.
+	Libs []string
+	// LibDirRelPaths are home-relative library DIRECTORIES to guard read-only
+	// (emitted as `lib_dir` directives): every process keeps reading them,
+	// only this entry's whitelisted binaries may write them. Guarding a
+	// directory — rather than listing files in Libs — is the only workable
+	// rule for trees whose contents are assembled per launch under names
+	// that change every time (Steam's pressure-vessel `var/tmp-XXXXXX`):
+	// the trust object walks a loaded library's ancestors, so one entry
+	// covers the whole subtree forever. Glob metacharacters (*, ?, [) are
+	// expanded against the filesystem; non-existent paths are dropped.
+	// Use the SHALLOWEST directory that contains only libraries and app
+	// data the whitelisted binary legitimately owns.
+	LibDirRelPaths []string
+	// LibDirWriters are binaries allowed to WRITE this entry's LibDirRelPaths
+	// — and nothing else: they are emitted as `lib_binary` directives, which
+	// never reach the entry's protected (secret) paths the way a Whitelist
+	// entry does. This is where an application's own runtime-maintenance
+	// tools belong: Steam's pressure-vessel helpers rebuild a merged /usr
+	// under `var/tmp-XXXXXX` on every launch, symlinking host GPU drivers
+	// into the guarded runtime tree, so they must write it — but they have
+	// no business reading the Steam login credentials that sit in the same
+	// catalog entry. Same %HOME%/%USER% expansion and glob support as
+	// Whitelist; only regular files survive expansion.
+	LibDirWriters []string
 }
 
 // IsSystem reports whether this is a system-level (AbsPaths) entry, probed
@@ -379,17 +411,118 @@ var Catalog = []CandidateDir{
 	// stay unprotected (dirs-only guarding, low value alone).
 	{Name: "Steam", RelPaths: []string{".local/share/Steam/config", ".local/share/Steam/userdata/*/config/localconfig.vdf", ".steam/registry.vdf"},
 		Whitelist: map[string][]string{
-			"/usr/bin/steam":                             nil,
-			"/usr/bin/steamwebhelper":                    nil,
-			"/usr/lib/steam/steam":                       nil,
-			"%HOME%/.local/share/Steam/*/steam":          nil,
-			"%HOME%/.local/share/Steam/*/steamwebhelper": nil,
-			"%HOME%/.local/share/Steam/steamapps/common/*/*/bin/pressure-vessel-*":               nil,
+			"/usr/bin/steam":                                                                     nil,
+			"/usr/bin/steamwebhelper":                                                            nil,
+			"/usr/lib/steam/steam":                                                               nil,
+			"%HOME%/.local/share/Steam/*/steam":                                                  nil,
+			"%HOME%/.local/share/Steam/*/steamwebhelper":                                         nil,
 			"%HOME%/.local/share/Steam/*/gameoverlayui":                                          nil,
 			"%HOME%/.local/share/Steam/steamapps/common/*/files/bin/wineserver":                  nil,
 			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine64-preloader":     nil,
 			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/*/wine64-preloader": nil,
+			// Wine's WoW64 mode (PROTON_USE_WOW64=1, the default of newer
+			// Proton builds) runs every process under wine-preloader instead
+			// of wine64-preloader: same role, same access.
+			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine-preloader":     nil,
+			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/*/wine-preloader": nil,
+			// Custom Proton builds (GE-Proton) ship their own wineserver, the
+			// counterpart of the steamapps/common one above. Without it a GE
+			// game — tainted because its wine64-preloader is whitelisted —
+			// cannot be reached by its own server (ptrace ATTACH denied).
+			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/bin/wineserver": nil,
 			"/usr/bin/lsof": nil,
+			"/usr/bin/ps":   nil,
+		},
+		// Steam loads hundreds of libraries that are NOT root-owned system
+		// libraries, so none of them is auto-trusted: its own shipped runtime
+		// (ubuntu12_*, linux64), the Proton/Wine builds under
+		// compatibilitytools.d, and the pressure-vessel container runtimes.
+		// They are guarded read-only — everything may still read them, only
+		// Steam may write them — which is what makes them safe to load and
+		// what blocks planting an LD_PRELOAD payload in the tree.
+		//
+		// The runtime dirs matter most: at every launch pressure-vessel
+		// assembles a merged /usr for the container under a random
+		// `var/tmp-XXXXXX` name, so no file list could ever cover them.
+		// Guarding the STABLE parent does: the trust object walks a loaded
+		// library's ancestors, so one entry covers every future random
+		// child. Deliberately not listed is steamapps/common/* at large —
+		// that is the game library (hundreds of GiB of non-library data).
+		LibDirRelPaths: []string{
+			".local/share/Steam/ubuntu12_32",
+			".local/share/Steam/ubuntu12_64",
+			".local/share/Steam/linux32",
+			".local/share/Steam/linux64",
+			".local/share/Steam/steamrt64",
+			".local/share/Steam/compatibilitytools.d",
+			// The container runtimes only (soldier, sniper, 4 — hence the
+			// underscore): their whitelisted pressure-vessel binaries load
+			// libraries from inside them. NOT the legacy scout runtime
+			// ("SteamLinuxRuntime", no suffix): it holds no program at all,
+			// only libraries for native games, which are not whitelisted and
+			// so never trust-checked — guarding it protected nothing, while
+			// its entry point must `ln -fns var/steam-runtime/amd64` on
+			// every launch, and the refusal made native scout games (Hollow
+			// Knight Silksong) exit instantly.
+			".local/share/Steam/steamapps/common/SteamLinuxRuntime_*",
+			// Valve's Proton builds (steamapps/common/Proton 11.0, Proton -
+			// Experimental, ...): their whitelisted wine64-preloader loads
+			// Wine from files/lib. ONLY files/lib — the `proton` script
+			// (python3, which cannot be whitelisted: it would let any script
+			// write the tree) rewrites dist.lock in the Proton root on every
+			// launch and builds files/share/default_pfx, so guarding the
+			// whole folder would refuse every Valve-Proton game. GE-Proton
+			// needs no entry: compatibilitytools.d is guarded above.
+			".local/share/Steam/steamapps/common/Proton*/files/lib",
+		},
+		// pressure-vessel OWNS the runtime trees above and rewrites them on
+		// every launch: it hardlinks the runtime's ~6.6k files into a fresh
+		// `var/tmp-XXXXXX`, then has capsule-capture-libs symlink the host's
+		// GPU drivers (libvdpau_nvidia.so, the Vulkan layers, libc) into
+		// `overrides/lib/*`, and pv-locale-gen build a locale archive. All of
+		// it lands INSIDE the read-only tree, so without these writers the
+		// container comes up with no GL/Vulkan and games do not start.
+		//
+		// The whole helper directories are listed, not individual tools: the
+		// set grows with every runtime update, and they are the tree's own
+		// vendor binaries — write-protected by this very guard, so they
+		// cannot be replaced without already holding write access. They are
+		// lib_binary (not Whitelist) entries precisely because they must
+		// NOT reach the Steam login credentials in this same entry.
+		// Only the tools that WRITE are listed, not every helper in the
+		// directory: pressure-vessel-wrap/-unruntime build the tmp tree and
+		// take its `.ref` locks, capsule-capture-libs symlinks the host
+		// drivers in, and the pv-*/srt-* helpers (pv-locale-gen, pv-adverb,
+		// srt-logger, srt-bwrap) run inside the container. The read-only
+		// probes next to them (check-gl, inspect-library, detect-platform,
+		// wflinfo, true) need nothing: the trees are world-readable.
+		//
+		// Steam's own binaries write these trees too: the client self-updates
+		// ubuntu12_32/64, linux64 and steamrt64; steamwebhelper keeps CEF
+		// state beside itself (.cef-initialize-sentinel, .cef-dev-tools-size.vdf
+		// in ubuntu12_64); the overlay and Proton's wine live and write inside
+		// them. In the [libraries] block form a lib_dir inherits no whitelist,
+		// so these are exactly the unrestricted Whitelist entries the old
+		// nested form let write — minus lsof, which never writes, and the
+		// shell-script launchers, which run as their interpreter's inode.
+		LibDirWriters: []string{
+			"%HOME%/.local/share/Steam/*/steam",
+			"%HOME%/.local/share/Steam/*/steamwebhelper",
+			"%HOME%/.local/share/Steam/*/gameoverlayui",
+			"%HOME%/.local/share/Steam/steamapps/common/*/files/bin/wineserver",
+			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine64-preloader",
+			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/*/wine64-preloader",
+			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine-preloader",
+			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/*/wine-preloader",
+			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/bin/wineserver",
+			"%HOME%/.local/share/Steam/steamrt64/pv-runtime/*/pressure-vessel/bin/pressure-vessel-*",
+			"%HOME%/.local/share/Steam/steamrt64/pv-runtime/*/pressure-vessel/libexec/steam-runtime-tools-0/*-capsule-capture-libs",
+			"%HOME%/.local/share/Steam/steamrt64/pv-runtime/*/pressure-vessel/libexec/steam-runtime-tools-0/pv-*",
+			"%HOME%/.local/share/Steam/steamrt64/pv-runtime/*/pressure-vessel/libexec/steam-runtime-tools-0/srt-*",
+			"%HOME%/.local/share/Steam/steamapps/common/SteamLinuxRuntime_*/pressure-vessel*/bin/pressure-vessel-*",
+			"%HOME%/.local/share/Steam/steamapps/common/SteamLinuxRuntime_*/pressure-vessel*/libexec/steam-runtime-tools-0/*-capsule-capture-libs",
+			"%HOME%/.local/share/Steam/steamapps/common/SteamLinuxRuntime_*/pressure-vessel*/libexec/steam-runtime-tools-0/pv-*",
+			"%HOME%/.local/share/Steam/steamapps/common/SteamLinuxRuntime_*/pressure-vessel*/libexec/steam-runtime-tools-0/srt-*",
 		}},
 
 	// --- System-level paths (probed once, not per user; ssh-guard template) ---
@@ -461,6 +594,115 @@ func (c *CandidateDir) ExpandWhitelist(user, home string) []BinaryRule {
 		})
 	}
 	return out
+}
+
+// ExpandLibs expands %USER%/%HOME% in the entry's allow_lib paths, sorted for
+// deterministic config generation.
+func (c *CandidateDir) ExpandLibs(user, home string) []string {
+	out := make([]string, 0, len(c.Libs))
+	for _, lib := range c.Libs {
+		out = append(out, expandPlaceholders(lib, user, home))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ExpandLibDirs expands the entry's LibDirRelPaths for the given user into
+// absolute directories: %HOME%/%USER% placeholders resolved, glob
+// metacharacters matched against the filesystem, non-directories and
+// non-existent paths dropped, result sorted and de-duplicated for
+// deterministic config generation. Dropping the missing ones here (rather
+// than writing them out) keeps the generated config honest: a library tree
+// that does not exist protects nothing, and versioned runtime directories
+// come and go with every Proton/runtime update.
+func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
+	if len(c.LibDirRelPaths) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(c.LibDirRelPaths))
+	for _, rel := range c.LibDirRelPaths {
+		pattern := filepath.Join(home, expandPlaceholders(rel, user, home))
+		matches := []string{pattern}
+		if strings.ContainsAny(pattern, "*?[") {
+			m, err := filepath.Glob(pattern)
+			if err != nil {
+				continue
+			}
+			matches = m
+		}
+		for _, p := range matches {
+			if seen[p] {
+				continue
+			}
+			info, err := os.Lstat(p)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ExpandLibDirWriters expands %USER%/%HOME% in the entry's LibDirWriters,
+// matches glob metacharacters against the filesystem and keeps only existing
+// REGULAR files, sorted and de-duplicated for deterministic config
+// generation. Globbing a whole helper directory is the intended use (a
+// runtime's tool directory gains binaries with every update), which is why
+// directories and dangling symlinks are dropped here rather than written out
+// as writers that can never match a process.
+func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
+	if len(c.LibDirWriters) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(c.LibDirWriters))
+	for _, bin := range c.LibDirWriters {
+		pattern := expandPlaceholders(bin, user, home)
+		matches := []string{pattern}
+		if strings.ContainsAny(pattern, "*?[") {
+			m, err := filepath.Glob(pattern)
+			if err != nil {
+				continue // malformed pattern: skip the whole entry
+			}
+			matches = m
+		}
+		for _, p := range matches {
+			if seen[p] {
+				continue
+			}
+			// Stat, not Lstat: a symlinked helper resolves like any other
+			// whitelisted binary (the daemon records the target's inode).
+			info, err := os.Stat(p)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// LibraryBlockFor assembles this entry's `[libraries "<name> (<user>)"]`
+// block for one user. The user is part of the name because library trees are
+// per-user (a second user's Steam runtime is a different directory with its
+// own writers) and the installer finds a block again by name on refresh.
+func (c *CandidateDir) LibraryBlockFor(user, home string) LibraryBlock {
+	name := c.Name
+	if user != "" {
+		name += " (" + user + ")"
+	}
+	return LibraryBlock{
+		Name:       name,
+		Libs:       c.ExpandLibs(user, home),
+		LibDirs:    c.ExpandLibDirs(user, home),
+		LibWriters: c.ExpandLibDirWriters(user, home),
+	}
 }
 
 func expandPlaceholders(s, user, home string) string {

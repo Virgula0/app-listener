@@ -36,6 +36,15 @@ const (
 	// file can linger and risk colliding with an unrelated inode reused
 	// elsewhere on the same filesystem, not to catch changes quickly.
 	inodeGCEvery = time.Hour
+	// fileRootFollowEvery is how quickly a SINGLE-FILE watch root replaced by
+	// an application's atomic save (write a temp, rename it over — Steam's
+	// registry.vdf on every launch) is re-anchored to its new inode. Until
+	// then the new file is neither the root nor in guard_inodes, i.e. not
+	// guarded. The kernel side cannot follow the rename itself:
+	// guard_path_rename has no verifier budget left (issue #45). For a file
+	// root the check is a single stat, so it runs far more often than the
+	// general sweep.
+	fileRootFollowEvery = time.Second
 
 	// Rollback lock-back budget: bounded (unlike Stop's infinite wait)
 	// because rollback runs on the SIGHUP handler, which must keep serving
@@ -178,7 +187,13 @@ func unlockRoots(roots []string, unlockOne func(root string) error) error {
 func (d *daemonUseCase) prepareOneGuard(i int) error {
 	g := d.guards[i]
 	if err := g.PopulateInodes(); err != nil {
-		return fmt.Errorf("populating guard for %s: %w", d.resources[i].Path, err)
+		// Critical: every vault is already unlocked and every guard attached
+		// here, so a populate failure is a property of the tree on disk (an
+		// unreadable subtree, a tree the walk cannot classify) and reproduces
+		// identically on every start. Untagged, it exited 1 and systemd's
+		// Restart=on-failure crash-looped the daemon — unlocking and
+		// re-locking every vault every two seconds.
+		return fmt.Errorf("%w: populating guard for %s: %w", constants.ErrCriticalStartup, d.resources[i].Path, err)
 	}
 	if err := g.ResolvePendingBinaries(); err != nil {
 		return fmt.Errorf("resolving deferred binaries for %s: %w", d.resources[i].Path, err)
@@ -380,9 +395,21 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 	defer sweep.Stop()
 	inodeGC := time.NewTicker(inodeGCEvery)
 	defer inodeGC.Stop()
+	// nil (never fires) unless the resource is a single file; a watch root
+	// does not change type while it is guarded.
+	var followRoot <-chan time.Time
+	if info, err := os.Lstat(resource); err == nil && !info.IsDir() {
+		follow := time.NewTicker(fileRootFollowEvery)
+		defer follow.Stop()
+		followRoot = follow.C
+	}
 	var lastResync time.Time
 	for {
 		select {
+		case <-followRoot:
+			// Errors are left to the periodic sweep, which reports them at a
+			// sane rate (a deleted root would otherwise log every second).
+			_ = g.SweepInodes()
 		case ev, ok := <-g.Events():
 			if !ok {
 				return
@@ -420,7 +447,8 @@ func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRe
 	// A denial usually means the binary was replaced in place; re-sync
 	// (throttled by resyncMinInterval) to admit the new inode instead of
 	// re-statting the whitelist per event.
-	if ev.Blocked && !ev.RawDevice && time.Since(*lastResync) >= resyncMinInterval {
+	// A process-gate denial is not an in-place binary replacement either.
+	if ev.Blocked && !ev.RawDevice && ev.Process == "" && time.Since(*lastResync) >= resyncMinInterval {
 		if _, err := g.ReSyncBinaries(); err != nil {
 			log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
 		}
@@ -476,13 +504,13 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	// is committed yet, so the new guards are detached and the old config
 	// keeps running.
 	newByPath := make(map[string]bool, len(resources))
-	for _, r := range resources {
-		newByPath[r.Path] = true
+	for i := range resources {
+		newByPath[resources[i].Path] = true
 	}
 	var removed []string
-	for _, r := range d.resources {
-		if !newByPath[r.Path] {
-			removed = append(removed, r.Path)
+	for i := range d.resources {
+		if !newByPath[d.resources[i].Path] {
+			removed = append(removed, d.resources[i].Path)
 		}
 	}
 	if len(removed) > 0 {
@@ -491,8 +519,8 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	}
 
 	oldByPath := make(map[string]int, len(d.resources))
-	for i, r := range d.resources {
-		oldByPath[r.Path] = i
+	for i := range d.resources {
+		oldByPath[d.resources[i].Path] = i
 	}
 
 	// Phase 1 — validate and unlock resources new to the config; nothing is
@@ -550,8 +578,16 @@ func (d *daemonUseCase) prepareAddedResource(r *daemonconfig.Resource, g reposit
 	if r.NeedEncryption && !encrypted {
 		return fmt.Errorf("reload: directory %s is NOT encrypted: run the fscrypt migration first or set need_encryption: false", root)
 	}
-	if !r.NeedEncryption && encrypted {
-		log.Warnf("daemon: reload: resource %s is encrypted but need_encryption: false \u2014 leaving it locked", root)
+	if !r.NeedEncryption {
+		// Nothing to unlock. Stop here for the unencrypted case too: falling
+		// through to IsProvisioned asked fscrypt for the policy of a
+		// directory that has none and failed the WHOLE reload — every lib_dir
+		// or need_encryption:false resource added by a reload (a catalog
+		// refresh) was rejected, while a restart (startGuards filters these
+		// out up front) accepted the same config.
+		if encrypted {
+			log.Warnf("daemon: reload: resource %s is encrypted but need_encryption: false \u2014 leaving it locked", root)
+		}
 		return nil
 	}
 	provisioned, err := d.vault.IsProvisioned(root)
@@ -638,6 +674,14 @@ func (d *daemonUseCase) rollbackReload(resources []daemonconfig.Resource, guards
 // commitReload swaps in the new configuration; new forwarders spawn before old ones
 // retire and old LSM programs detach, so the event stream never goes silent either.
 func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards []repository.GuardRepository) {
+	// Carry the memory-read taint from each old guard to the new guard for
+	// the same resource BEFORE the old ones are stopped. The new guards were
+	// built with empty guard_tainted_pids maps, so without this a reload
+	// would silently drop process_vm_readv / ptrace protection for every
+	// process that had already read a guarded file (they keep running across
+	// the reload with the secret still in memory).
+	d.carryTaintAcrossReload(resources, guards)
+
 	newStops := make([]chan struct{}, len(guards))
 	for i := range guards {
 		stop := make(chan struct{})
@@ -655,6 +699,35 @@ func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards [
 	d.resources = resources
 	d.guards = guards
 	d.stops = newStops
+}
+
+// carryTaintAcrossReload copies each old guard's tainted-pid set into the new
+// guard for the same resource path. Best-effort: a transfer failure only
+// weakens memory-read protection for already-tainted processes until they next
+// touch the guarded tree, never enforcement of any direct access.
+func (d *daemonUseCase) carryTaintAcrossReload(resources []daemonconfig.Resource, guards []repository.GuardRepository) {
+	oldByPath := make(map[string]repository.GuardRepository, len(d.guards))
+	for i := range d.resources {
+		oldByPath[d.resources[i].Path] = d.guards[i]
+	}
+	for i := range resources {
+		r := &resources[i]
+		old, ok := oldByPath[r.Path]
+		if !ok {
+			continue // resource new to this config: nothing to carry
+		}
+		pids, err := old.SnapshotTaintedPIDs()
+		if err != nil {
+			log.Warnf("daemon: reading tainted pids for %s during reload: %v", r.Path, err)
+			continue
+		}
+		if len(pids) == 0 {
+			continue
+		}
+		if err := guards[i].RestoreTaintedPIDs(pids); err != nil {
+			log.Warnf("daemon: carrying taint across reload for %s: %v", r.Path, err)
+		}
+	}
 }
 
 // Stop performs the secure lockdown: guards stay attached (denying all non-whitelisted
