@@ -39,7 +39,7 @@ func TestGenerateConfParses(t *testing.T) {
 			{Path: "/usr/bin/ssh-agent"},
 		}, Encrypt: true},
 		{Path: openDir, Encrypt: false},
-	})
+	}, nil)
 	cfg := mustParse(t, conf)
 	if len(cfg.Resources) != 2 {
 		t.Fatalf("resources = %d, want 2", len(cfg.Resources))
@@ -107,7 +107,7 @@ func TestGenerateConfEmitsEvents(t *testing.T) {
 			{Path: "/usr/bin/ssh", Events: []string{"READ", "WRITE"}},
 			{Path: "/usr/bin/ssh-agent"},
 		}, Encrypt: true},
-	})
+	}, nil)
 	if !strings.Contains(conf, `"/usr/bin/ssh" READ,WRITE`+"\n") {
 		t.Fatalf("config missing READ,WRITE restriction:\n%s", conf)
 	}
@@ -136,7 +136,7 @@ func TestSetNeedEncryptionReplace(t *testing.T) {
 	}
 	conf := GenerateConf([]Section{
 		{Path: dir, Allow: []BinaryRule{{Path: "/usr/bin/ssh"}}, Encrypt: true},
-	})
+	}, nil)
 	updated, err := SetNeedEncryption(conf, dir, false)
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestSetNeedEncryptionInsert(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	conf := GenerateConf([]Section{{Path: dir, Allow: nil, Encrypt: true}})
+	conf := GenerateConf([]Section{{Path: dir, Allow: nil, Encrypt: true}}, nil)
 	noDirective := strings.Replace(conf, "need_encryption: true", "", 1)
 	updated, err := SetNeedEncryption(noDirective, dir, false)
 	if err != nil {
@@ -171,7 +171,7 @@ func TestSetNeedEncryptionInsert(t *testing.T) {
 
 // TestSetNeedEncryptionMissingSection reports an error for an unknown path.
 func TestSetNeedEncryptionMissingSection(t *testing.T) {
-	conf := GenerateConf([]Section{{Path: "/srv/secret"}})
+	conf := GenerateConf([]Section{{Path: "/srv/secret"}}, nil)
 	if _, err := SetNeedEncryption(conf, "/does/not/exist", true); err == nil {
 		t.Fatal("expected error for missing section")
 	}
@@ -184,7 +184,7 @@ func TestSetNeedEncryptionPreservesManualEdits(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	conf := GenerateConf([]Section{{Path: dir, Allow: []BinaryRule{{Path: "/usr/bin/ssh"}}}})
+	conf := GenerateConf([]Section{{Path: dir, Allow: []BinaryRule{{Path: "/usr/bin/ssh"}}}}, nil)
 	withComment := strings.Replace(conf,
 		`[watch "`+dir+`"]`+"\n",
 		`[watch "`+dir+`"]`+"\n# keep this comment\n",
@@ -198,23 +198,6 @@ func TestSetNeedEncryptionPreservesManualEdits(t *testing.T) {
 	}
 }
 
-func TestGenerateSectionsEmitsLibDirectives(t *testing.T) {
-	out := GenerateSections([]Section{{
-		Path:    "/home/alice/.local/share/Steam/config",
-		Allow:   []BinaryRule{{Path: "/usr/bin/steam"}},
-		Libs:    []string{"/home/alice/lib/plugin.so"},
-		LibDirs: []string{"/home/alice/.local/share/Steam/ubuntu12_64"},
-	}})
-	for _, want := range []string{
-		`allow_lib "/home/alice/lib/plugin.so"`,
-		`lib_dir "/home/alice/.local/share/Steam/ubuntu12_64"`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("generated config missing %q:\n%s", want, out)
-		}
-	}
-}
-
 func TestSetSectionWhitelistPreservesLibDirectives(t *testing.T) {
 	// A catalog refresh rewrites the binary lines. It must leave the library
 	// directives alone: dropping lib_dir would silently unguard the tree that
@@ -224,6 +207,7 @@ func TestSetSectionWhitelistPreservesLibDirectives(t *testing.T) {
 "/usr/bin/steam"
 allow_lib "/home/alice/lib/plugin.so"
 lib_dir "/home/alice/.local/share/Steam/ubuntu12_64"
+lib_binary "/home/alice/.local/share/Steam/steamrt64/x/pressure-vessel/bin/pressure-vessel-wrap"
 
 need_encryption: true
 `
@@ -234,6 +218,7 @@ need_encryption: true
 	for _, want := range []string{
 		`allow_lib "/home/alice/lib/plugin.so"`,
 		`lib_dir "/home/alice/.local/share/Steam/ubuntu12_64"`,
+		`lib_binary "/home/alice/.local/share/Steam/steamrt64/x/pressure-vessel/bin/pressure-vessel-wrap"`,
 		`"/usr/bin/lsof"`,
 	} {
 		if !strings.Contains(out, want) {

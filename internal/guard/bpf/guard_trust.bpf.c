@@ -51,6 +51,18 @@
 #define S_IWGRP 00020
 #define S_IWOTH 00002
 
+// Open flags used for provenance. Only flags that GUARANTEE the open created
+// the file are accepted: O_CREAT|O_EXCL fails if the name already exists, and
+// __O_TMPFILE always makes a brand-new anonymous inode. A bare O_CREAT is
+// deliberately NOT enough — it succeeds on a pre-existing file, so honouring
+// it would let an attacker's planted .so acquire this process's provenance.
+#define O_CREAT 00000100
+#define O_EXCL 00000200
+#define __O_TMPFILE 020000000
+
+// IS_ERR_VALUE: the top 4 KiB of the address space is the kernel's error range.
+#define BPF_IS_ERR_PTR(p) ((unsigned long)(p) > (unsigned long)-4096)
+
 // guard_trusted_files value flags.
 #define TRUSTED_BINARY 1 // a whitelisted application binary
 #define TRUSTED_LIB 2    // a user-writable library explicitly trusted (allow_lib)
@@ -82,6 +94,55 @@ struct {
 	__type(key, struct inode_key);
 	__type(value, __u8);
 } guard_trusted_dirs SEC(".maps");
+
+// guard_jit_origin is the provenance ledger for runtime-generated code. GPU
+// drivers (NVIDIA above all) JIT shaders and kernels into a file they create
+// themselves and then map executable: a memfd, an O_TMPFILE, or an
+// mkstemp()'d file. Such an inode is anonymous, user-owned and named at
+// random, so none of the three ordinary trust sources can ever cover it —
+// but "this very process made it, and nothing else has written it" is a
+// property the kernel can attest, and it is strictly stronger than a path
+// rule: an attacker who hands a whitelisted process a memfd of their own
+// (the LD_PRELOAD=/proc/self/fd/N trick) is a DIFFERENT thread group, so the
+// mapping is refused.
+//
+// An entry is created only by a whitelisted process performing an open that
+// is guaranteed to be a creation (see the flag macros above) and is tainted
+// for good as soon as any other thread group opens that inode for writing.
+//
+// Residual risk, stated plainly: the taint is driven by file_open, so foreign
+// bytes can only slip in through a writable fd the creator itself handed out
+// (SCM_RIGHTS or a fork that outlives the record) — never through an attacker
+// opening the inode, which is the reachable shape of the attack. A whitelisted
+// binary that deliberately passes a writable fd to its own JIT arena is a
+// confused deputy in the same class as any other whitelist entry.
+//
+// The map is an LRU on purpose. Eviction loses provenance, and no provenance
+// means "deny" in every consumer, so pressure degrades towards refusing JIT
+// mappings — never towards trusting a stale inode number that the kernel has
+// since recycled for somebody else's file.
+
+// jit_origin identifies the creator by its whole process IMAGE, not just its pid.
+// execve() keeps the thread group id while replacing the program, so a thread
+// group alone would let a whitelisted process create an inode and then exec a
+// different whitelisted binary that inherits the fd — provenance would follow
+// the pid across an image it never produced. Requiring the mm (allocated
+// afresh by execve, distinct per fork) and the executable's inode as well
+// makes the check "the same program, in the same thread group, running the
+// same image that created this inode".
+struct jit_origin {
+	__u64 mm;
+	struct inode_key exe;
+	__u32 tgid;
+	__u8 tainted;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct inode_key);
+	__type(value, struct jit_origin);
+} guard_jit_origin SEC(".maps");
 
 struct trust_event {
 	__u32 pid;
@@ -245,6 +306,110 @@ static __always_inline int under_guarded_tree(struct inode *inode, struct dentry
 	return 0;
 }
 
+// --- provenance ledger for runtime-generated code (guard_jit_origin) -------
+
+// fill_current_image resolves the running process image: thread group, mm, and
+// the inode of the executable together with its trusted flags. Returns 0 when
+// any of it is unreadable (a kernel thread, an exiting task), which every
+// caller treats as "no provenance".
+struct proc_image {
+	__u64 mm;
+	struct inode_key exe;
+	__u32 tgid;
+	__u8 flags;
+};
+
+static __always_inline int fill_current_image(struct proc_image *img)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (!task)
+		return 0;
+	struct mm_struct *mm;
+	bpf_probe_read_kernel(&mm, sizeof(mm), &task->mm);
+	if (!mm)
+		return 0;
+	struct file *exe_file;
+	bpf_probe_read_kernel(&exe_file, sizeof(exe_file), &mm->exe_file);
+	if (!exe_file)
+		return 0;
+	struct inode *exe_inode;
+	bpf_probe_read_kernel(&exe_inode, sizeof(exe_inode), &exe_file->f_inode);
+	if (!fill_inode_key(exe_inode, &img->exe))
+		return 0;
+	img->mm = (__u64)mm;
+	img->tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *f = bpf_map_lookup_elem(&guard_trusted_files, &img->exe);
+	img->flags = f ? *f : 0;
+	return 1;
+}
+
+// jit_record_creation claims inode for the CURRENT process image. Called only
+// for an open/allocation that certainly created the inode, and only when the
+// creator is a whitelisted binary — an attacker's own files therefore have no
+// entry at all, which is what makes a missing entry safe to treat as "deny".
+static __always_inline void jit_record_creation(struct inode *inode)
+{
+	struct inode_key k = {};
+	if (!fill_inode_key(inode, &k))
+		return;
+	struct proc_image img = {};
+	if (!fill_current_image(&img))
+		return;
+	if (!(img.flags & TRUSTED_BINARY))
+		return;
+	struct jit_origin o = {};
+	o.mm = img.mm;
+	o.exe = img.exe;
+	o.tgid = img.tgid;
+	bpf_map_update_elem(&guard_jit_origin, &k, &o, BPF_ANY);
+}
+
+// jit_taint_foreign_write marks an inode as no longer self-produced because
+// something other than the exact image that created it opened it for writing.
+// This is what closes the /proc/<pid>/fd/N route: a same-uid attacker can
+// reach a whitelisted process's memfd through procfs, but only by opening it,
+// and the open is what poisons the mapping. The taint is permanent — an inode
+// that has held foreign bytes never becomes self-produced again.
+static __always_inline void jit_taint_foreign_write(struct inode *inode)
+{
+	struct inode_key k = {};
+	if (!fill_inode_key(inode, &k))
+		return;
+	struct jit_origin *o = bpf_map_lookup_elem(&guard_jit_origin, &k);
+	if (!o)
+		return;
+	struct proc_image img = {};
+	if (!fill_current_image(&img)) {
+		o->tainted = 1; // unattributable writer: assume the worst
+		return;
+	}
+	if (o->tgid == img.tgid && o->mm == img.mm &&
+	    o->exe.dev == img.exe.dev && o->exe.ino == img.exe.ino)
+		return; // the creator writing its own JIT output
+	o->tainted = 1;
+}
+
+// jit_self_created reports whether inode was created by the process image
+// asking to map it and has never been opened for writing by another thread
+// group. Absent provenance answers no, so an evicted entry, a file created
+// before the daemon started and anything the daemon never saw created all stay
+// denied.
+static __always_inline int jit_self_created(struct inode *inode)
+{
+	struct inode_key k = {};
+	if (!fill_inode_key(inode, &k))
+		return 0;
+	struct jit_origin *o = bpf_map_lookup_elem(&guard_jit_origin, &k);
+	if (!o || o->tainted)
+		return 0;
+	struct proc_image img = {};
+	if (!fill_current_image(&img))
+		return 0;
+	if (o->tgid != img.tgid || o->mm != img.mm)
+		return 0;
+	return o->exe.dev == img.exe.dev && o->exe.ino == img.exe.ino;
+}
+
 static __always_inline struct dentry *path_dentry(void *ctx_path)
 {
 	struct path *p = (struct path *)ctx_path;
@@ -359,6 +524,8 @@ int trust_mmap(unsigned long long *ctx)
 		return 0; // auto-trusted root-owned system library
 	if (under_guarded_tree(inode, dentry))
 		return 0; // inside a write-protected guarded tree — attacker cannot plant here
+	if (jit_self_created(inode))
+		return 0; // runtime-generated code: this process made it, nothing else wrote it
 
 	emit(dentry, TRUST_LIBLOAD);
 	return -EPERM;
@@ -435,15 +602,48 @@ int trust_file_open(unsigned long long *ctx)
 		return 0;
 	__u32 f_mode = 0;
 	bpf_probe_read_kernel(&f_mode, sizeof(f_mode), &file->f_mode);
+	struct inode *inode;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+
+	// Provenance bookkeeping for runtime-generated code. Recording comes
+	// first: a creating open is a write-open too, and the creator must not
+	// taint its own brand-new inode.
+	__u32 f_flags = 0;
+	bpf_probe_read_kernel(&f_flags, sizeof(f_flags), &file->f_flags);
+	if ((f_flags & __O_TMPFILE) || ((f_flags & O_CREAT) && (f_flags & O_EXCL)))
+		jit_record_creation(inode); // no-op unless the creator is whitelisted
+	if (f_mode & FMODE_WRITE)
+		jit_taint_foreign_write(inode);
+
 	if (!(f_mode & FMODE_WRITE))
 		return 0; // only a write-open can modify the binary in place
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
 	if (!dentry)
 		return 0;
+	return deny_if_protected(inode, dentry);
+}
+
+// memfd_create() allocates its file without ever calling security_file_open(),
+// so a memfd's provenance has to be recorded where the kernel makes it. This
+// is the first link in NVIDIA's JIT fallback chain (memfd → O_TMPFILE →
+// mkstemp), and the only one an LSM hook cannot see.
+//
+// Best-effort like every other trust program: on a kernel where the symbol is
+// inlined or renamed the attach fails, memfd exec-maps keep being denied, and
+// the driver falls through to its file-backed fallbacks, which file_open does
+// see.
+SEC("fexit/memfd_alloc_file")
+int trust_memfd_alloc(unsigned long long *ctx)
+{
+	// fexit context: the traced function's arguments, then its return value.
+	struct file *file = (struct file *)ctx[2];
+	if (!file || BPF_IS_ERR_PTR(file))
+		return 0;
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
-	return deny_if_protected(inode, dentry);
+	jit_record_creation(inode); // no-op unless the creator is whitelisted
+	return 0;
 }
 
 SEC("lsm/path_truncate")

@@ -395,6 +395,11 @@ need_encryption: false
 	_, out := s.exec(c, []string{"sh", "-c", "/exploits/process_vm_readv /protected/secret 2>&1"})
 	s.Require().NotContainsf(out, marker,
 		"pre-reload control: taint should have blocked the dump: %s", out)
+	// The refusal must be VISIBLE: the process gates used to deny silently,
+	// which once left a whole application failing with nothing in the log.
+	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'DAEMON DENIED  op=PTRACE' /tmp/daemon.log || true"})
+	s.Require().NotEqualf("0", strings.TrimSpace(logOut),
+		"the ptrace-class denial of process_vm_readv must be logged as op=PTRACE")
 
 	// Reload rebuilds every guard with fresh, empty taint maps. Wait for the
 	// reload to actually COMPLETE before the post-reload attempt: the
@@ -1838,3 +1843,268 @@ func (s *IntegrationSuite) TestDaemon_StaleRootInode_File_RecreatedRootReguarded
 // TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode in
 // integrationtests/guard_test.go, alongside the rest of the
 // TestGuard_InodeReuse_* family this fix complements.
+
+// TestDaemon_JitProvenanceTrustsOnlySelfCreatedCode covers the trust guard's
+// provenance rule for runtime-generated code (guard_jit_origin in
+// guard_trust.bpf.c). GPU drivers JIT into a file they create themselves and
+// then map executable — a memfd, an O_TMPFILE, or an mkstemp()'d file — and no
+// path or ownership rule can ever cover those inodes, so the daemon trusts an
+// exec mapping when the mapping process image created the inode and nothing
+// else has written it.
+//
+// The rule is an ALLOWANCE, so most of this test is about what it must still
+// refuse: an inode the attacker created (no provenance at all), a file that is
+// merely new, an inode handed over through execve (same pid, different image),
+// and one that a foreign writer touched after creation.
+func (s *IntegrationSuite) TestDaemon_JitProvenanceTrustsOnlySelfCreatedCode() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-JIT-PROVENANCE-9B1D"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/jit_provenance"), "/exploits/jit_provenance", 0755), "copy jit_provenance")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_leak.so"), "/exploits/leak.so", 0755), "copy preload_leak.so")
+	// The same program at two paths: only /tmp/app is whitelisted, so
+	// /tmp/attacker stands in for same-user malware.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/jit_provenance /tmp/app && cp /exploits/jit_provenance /tmp/attacker && chmod 755 /tmp/app /tmp/attacker"})
+
+	// A benign library to stand in for JIT output: what matters is that the
+	// bytes are a loadable ELF the process produced itself.
+	const benignLib = "/lib/x86_64-linux-gnu/libz.so.1"
+	code, out := s.exec(c, []string{"sh", "-c", "test -f " + benignLib})
+	s.Require().Equalf(0, code, "test fixture expects %s in the image: %s", benignLib, out)
+
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/tmp/app
+/usr/bin/true`)
+
+	// 1. FUNCTIONAL: the whitelisted app may map code it created itself with
+	//    mkstemp — the driver's file-backed JIT path, and the reason this rule
+	//    exists at all.
+	code, out = s.exec(c, []string{"/tmp/app", "self", benignLib})
+	s.Require().Containsf(out, "MAPPED",
+		"a whitelisted process must be able to exec-map code it created itself (exit %d): %s", code, out)
+
+	// 2. FUNCTIONAL: the memfd variant, the first step of the fallback chain.
+	//    It depends on the fexit attach (memfd_create never reaches
+	//    security_file_open), so tolerate a kernel where that program could
+	//    not attach — the daemon says so, and the denial is fail-closed.
+	code, out = s.exec(c, []string{"/tmp/app", "memfd", benignLib})
+	if !strings.Contains(out, "MAPPED") {
+		_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'skipping memfd provenance' /tmp/daemon.log || true"})
+		s.Require().NotEqualf("0", strings.TrimSpace(logOut),
+			"memfd-backed self-created code was denied although the memfd provenance program attached (exit %d): %s", code, out)
+	}
+
+	// 3. ATTACK: the attacker allocates the memfd and hands it to a
+	//    whitelisted victim through an inherited fd plus LD_PRELOAD. The
+	//    victim maps an inode somebody else made: no provenance, no mapping.
+	_, out = s.exec(c, []string{"/tmp/attacker", "passfd", "/exploits/leak.so", "/usr/bin/true", "/protected/secret"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated: a whitelisted binary mapped a memfd created by an unwhitelisted process: %s", out)
+
+	// 4. ATTACK: the same handover performed by a WHITELISTED creator. execve
+	//    keeps the thread group id, so a pid-only provenance check would let
+	//    the victim inherit the attacker's memfd as if it had made it itself.
+	//    The mm and exe identity are what refuse it.
+	_, out = s.exec(c, []string{"/tmp/app", "passfd", "/exploits/leak.so", "/usr/bin/true", "/protected/secret"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated: provenance followed a pid across execve into a different image: %s", out)
+
+	// 5. ATTACK: a file is not trustworthy merely for being new — the
+	//    attacker creates it and the whitelisted victim preloads it.
+	_, out = s.exec(c, []string{"sh", "-c",
+		"/tmp/attacker self /exploits/leak.so >/tmp/fresh.txt 2>&1; p=$(sed -n 's/^\\(MAPPED\\|DENIED\\) \\([^ :]*\\).*/\\2/p' /tmp/fresh.txt | head -1); " +
+			"LD_PRELOAD=$p LEAK_FILE=/protected/secret /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated through a freshly created attacker .so: %s", out)
+
+	// 6. ATTACK: a foreign write after creation poisons the inode for good.
+	//    The whitelisted app creates its JIT file, an unrelated process
+	//    write-opens it (the /proc/<pid>/fd shape of the attack), and the
+	//    app's own mapping must then be refused.
+	s.exec(c, []string{"sh", "-c", "(/tmp/app hold " + benignLib + " 6 >/tmp/hold.log 2>&1 &) ; sleep 2"})
+	_, pathOut := s.exec(c, []string{"sh", "-c", "sed -n 's/^PATH=//p' /tmp/hold.log | head -1"})
+	jitPath := strings.TrimSpace(pathOut)
+	s.Require().NotEmptyf(jitPath, "hold mode did not report its JIT file: %s", pathOut)
+	// A write-open by another process is all it takes; the bytes need not change.
+	s.exec(c, []string{"sh", "-c", "exec 3<>" + jitPath + "; exec 3>&-"})
+	s.exec(c, []string{"sh", "-c", "sleep 6"})
+	_, holdOut := s.exec(c, []string{"sh", "-c", "cat /tmp/hold.log"})
+	s.Require().Containsf(holdOut, "DENIED",
+		"a JIT file that a foreign process write-opened must no longer be mappable: %s", holdOut)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// TestDaemon_ReplacedSingleFileRootIsGuardedQuickly: an application's atomic
+// save (write a temp, rename it over the guarded file — Steam's registry.vdf
+// on every launch) gives the watch root a new inode that is neither the root
+// nor in guard_inodes, i.e. unguarded until the daemon re-anchors. That used
+// to wait for the 30 s sweep; single-file roots are now followed every second
+// (fileRootFollowEvery). The kernel cannot follow the rename itself:
+// guard_path_rename has no verifier budget left (issue #45).
+func (s *IntegrationSuite) TestDaemon_ReplacedSingleFileRootIsGuardedQuickly() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const secret = "REPLACED-ROOT-SECRET-4B7E"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /data /etc/app-listener && printf 'OLD' > /data/registry.vdf && chmod 755 /data"})
+	s.startDaemon(c, `[watch /data/registry.vdf]
+need_encryption: false
+/usr/bin/mv`)
+
+	code, out := s.exec(c, []string{"sh", "-c", "cat /data/registry.vdf 2>&1"})
+	s.Require().NotEqualf(0, code, "control: the file must be guarded before the save: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c",
+		"printf '" + secret + "' > /data/reg.tmp && /usr/bin/mv /data/reg.tmp /data/registry.vdf"})
+	s.Require().Equalf(0, code, "the whitelisted atomic save must succeed: %s", out)
+
+	// Re-anchored within a few follow ticks, not the 30 s sweep.
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		code, out = s.exec(c, []string{"sh", "-c", "cat /data/registry.vdf 2>&1"})
+		if code != 0 && !strings.Contains(out, secret) {
+			break
+		}
+		s.Require().Truef(time.Now().Before(deadline),
+			"the replaced file was still readable by a non-whitelisted process after 4s: %s", out)
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// And it stays guarded.
+	_, out = s.exec(c, []string{"sh", "-c", "sleep 2; cat /data/registry.vdf 2>&1"})
+	s.Require().NotContainsf(out, secret, "the re-anchored root must stay guarded: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// TestDaemon_ReadOnlyGuardDoesNotTaintItsWriters: running a binary that is a
+// lib_binary writer of a read-only lib_dir must not taint the process.
+// Taint shields a process holding SECRETS from ptrace-class inspection; a
+// read-only tree is world-readable code, so it has nothing to shield. The exec
+// hook tainted in every guard anyway (unlike the file-access taint sites,
+// which skip read-only guards), which left each runtime tree's writer list as
+// the only processes allowed to look at /proc/<pid> of half of Steam's
+// process tree — and it failed silently.
+func (s *IntegrationSuite) TestDaemon_ReadOnlyGuardDoesNotTaintItsWriters() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /rt /etc/app-listener && printf 'code' > /rt/lib.so && cp /usr/bin/sleep /tmp/rtwriter && chmod 755 /tmp/rtwriter"})
+	s.startDaemon(c, `[libraries "Runtime"]
+lib_dir /rt
+lib_binary /tmp/rtwriter`)
+
+	s.exec(c, []string{"sh", "-c", "(/tmp/rtwriter 30 &) ; sleep 1"})
+	_, pidOut := s.exec(c, []string{"sh", "-c", "pgrep -f '^/tmp/rtwriter 30' | head -1"})
+	pid := strings.TrimSpace(pidOut)
+	s.Require().NotEmptyf(pid, "the writer process did not start: %q", pidOut)
+
+	// /proc/<pid>/fd listing is a ptrace-class access (PTRACE_MODE_READ).
+	code, out := s.exec(c, []string{"sh", "-c", "ls /proc/" + pid + "/fd 2>&1"})
+	s.Require().Equalf(0, code,
+		"a process running a read-only tree's writer must stay inspectable by an unrelated process: %s", out)
+
+	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE' /tmp/daemon.log || true"})
+	s.Require().Equalf("0", strings.TrimSpace(logOut), "no ptrace-class denial may come from a read-only guard")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f '^/tmp/rtwriter' ; pkill -f 'app-listener daemon' || true"})
+}
+
+// TestDaemon_TaintFollowsForkButNotExec pins the taint lifecycle:
+//   - the process that read the secret is tainted (not inspectable);
+//   - a forked child that keeps the parent's memory stays tainted;
+//   - a child that execs a NON-whitelisted image is cleared: exec discards
+//     the address space, so it holds nothing read from the vault.
+// Before the exec rule every descendant of a tainted process stayed tainted
+// for life — the whole Steam process tree (Proton, audio tools, the game) —
+// and GameMode, PipeWire, the portal and Wine's own wineserver were refused
+// every look at it. The refusal must also be logged with its access mode.
+func (s *IntegrationSuite) TestDaemon_TaintFollowsForkButNotExec() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /etc/app-listener && printf 'TAINT-LIFECYCLE-SECRET' > /protected/secret && " +
+			"chmod 755 /protected && chmod 644 /protected/secret && cp /bin/bash /tmp/wsh && chmod 755 /tmp/wsh && mkfifo /tmp/idle_fifo"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/tmp/wsh`)
+
+	// The whitelisted shell reads the secret with a builtin (no exec), then
+	// starts a fork-only subshell and a fork+exec child, recording pids.
+	s.exec(c, []string{"sh", "-c", `nohup /tmp/wsh -c '
+read -r x < /protected/secret
+echo $$ > /tmp/p_reader
+( echo $BASHPID > /tmp/p_fork; while :; do read -t 1 -r _ <> /tmp/idle_fifo || true; done ) &
+/usr/bin/sleep 60 & echo $! > /tmp/p_exec
+wait' >/dev/null 2>&1 &
+sleep 2`})
+
+	pidOf := func(f string) string {
+		_, out := s.exec(c, []string{"sh", "-c", "cat " + f})
+		p := strings.TrimSpace(out)
+		s.Require().NotEmptyf(p, "missing %s", f)
+		return p
+	}
+	inspect := func(pid string) int {
+		code, _ := s.exec(c, []string{"sh", "-c", "ls /proc/" + pid + "/fd >/dev/null 2>&1"})
+		return code
+	}
+
+	s.Require().NotEqualf(0, inspect(pidOf("/tmp/p_reader")),
+		"the process that read the secret must not be inspectable by an unwhitelisted process")
+	s.Require().NotEqualf(0, inspect(pidOf("/tmp/p_fork")),
+		"a forked child sharing the reader's memory image must stay tainted")
+	s.Require().Equalf(0, inspect(pidOf("/tmp/p_exec")),
+		"a child that exec'd an unwhitelisted image holds none of the vault's memory: its taint must be cleared")
+
+	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE.*mode=READ' /tmp/daemon.log || true"})
+	s.Require().NotEqualf("0", strings.TrimSpace(logOut),
+		"a /proc/<pid>/fd denial must be logged as op=PTRACE with mode=READ")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f /tmp/wsh; pkill -f 'sleep 60'; pkill -f 'app-listener daemon' || true"})
+}
+
+// TestDaemon_OwnMetadataReadableMemoryNot: the daemon is tainted (it reads
+// what it guards) and keeps its secrets — the fscrypt key, the edit-auth hash
+// — in memory. A ptrace ATTACH-class access to it (/proc/<pid>/mem,
+// process_vm_readv) must stay denied; a READ-class one (/proc/<pid>/fd,
+// environ — what systemd-journald does to label every log line) is allowed,
+// or each denial the daemon logs makes journald look it up and fail again.
+func (s *IntegrationSuite) TestDaemon_OwnMetadataReadableMemoryNot() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected/sub /etc/app-listener && printf 'S' > /protected/secret && chmod 755 /protected"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	_, pidOut := s.exec(c, []string{"sh", "-c", "cat /run/app-listener-daemon.pid"})
+	pid := strings.TrimSpace(pidOut)
+	s.Require().NotEmpty(pid, "daemon pid")
+
+	// ATTACH-class: still refused — and this also proves the daemon IS
+	// tainted, so the READ assertion below is not vacuous (an untainted
+	// process would give an I/O error at offset 0, not EPERM).
+	_, out := s.exec(c, []string{"sh", "-c", "head -c1 /proc/" + pid + "/mem 2>&1"})
+	s.Require().Containsf(out, "not permitted",
+		"memory of the daemon must stay unreadable to an unwhitelisted process: %s", out)
+
+	// READ-class: allowed.
+	code, out := s.exec(c, []string{"sh", "-c", "ls /proc/" + pid + "/fd >/dev/null 2>&1 && cat /proc/" + pid + "/environ >/dev/null 2>&1"})
+	s.Require().Equalf(0, code, "metadata of the daemon's own process must be readable: %s", out)
+
+	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE.*comm=app-listener mode=READ' /tmp/daemon.log || true"})
+	s.Require().Equalf("0", strings.TrimSpace(logOut), "no READ-mode denial may be logged for the daemon itself")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

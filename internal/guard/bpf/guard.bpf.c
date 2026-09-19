@@ -46,6 +46,12 @@
 // watched path, so userspace must NOT attribute it to a specific resource.
 #define GUARD_REASON_NONE 0
 #define GUARD_REASON_RAW_DEVICE 1
+// Process-gate denials: no file is involved. `path` carries the OTHER task's
+// comm and `fd` its thread-group id — the tainted target of a ptrace-class
+// access, or the unwhitelisted tracer of an exec.
+#define GUARD_REASON_PTRACE 2
+#define GUARD_REASON_TRACED_EXEC 3
+#define GUARD_REASON_PROC_MEM 4
 
 enum event_type {
 	EVENT_OPEN,
@@ -593,7 +599,8 @@ static __always_inline void evict_inode_from_guard(struct inode *inode)
 // Check if the accessed file is /proc/<pid>/mem for a tainted PID.
 // The guard can't protect /proc filesystem inodes (they're not in the
 // guarded inode map), so we must explicitly detect this vector.
-static __always_inline int is_proc_mem_of_tainted(struct dentry *dentry)
+// Returns the tainted target pid when dentry is /proc/<pid>/mem of one, else 0.
+static __always_inline __u32 is_proc_mem_of_tainted(struct dentry *dentry)
 {
 	if (!dentry)
 		return 0;
@@ -645,8 +652,52 @@ static __always_inline int is_proc_mem_of_tainted(struct dentry *dentry)
 		return 0;
 
 	__u8 *val = bpf_map_lookup_elem(&guard_tainted_pids, &pid);
-	return val != NULL;
+	return val != NULL ? pid : 0;
 }
+
+// emit_process_denial reports a process-gate denial. These gates used to
+// return -EPERM silently, so a legitimate application failing on them (a
+// browser engine inspecting its own children through /proc/<pid>, Wine
+// reading a game's memory) left nothing in the log to diagnose. other is the
+// other task when it is at hand; otherwise other_tgid names it.
+// ptrace_may_access() mode bits (include/linux/ptrace.h).
+#define PTRACE_MODE_READ 0x01
+#define PTRACE_MODE_ATTACH 0x02
+
+static __always_inline int emit_process_denial(__u32 reason, __u32 type, struct task_struct *other, __u32 other_tgid, __u32 mode)
+{
+	struct guard_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	if (e) {
+		e->pid = bpf_get_current_pid_tgid() >> 32;
+		e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+		e->gid = (bpf_get_current_uid_gid() >> 32) & 0xFFFFFFFF;
+		e->type = type;
+		e->blocked = 1;
+		e->reason = reason;
+		bpf_get_current_comm(e->comm, sizeof(e->comm));
+		e->path[0] = '\0';
+		if (other) {
+			bpf_probe_read_kernel(&other_tgid, sizeof(other_tgid), &other->tgid);
+			bpf_probe_read_kernel_str(e->path, 16, &other->comm);
+		}
+		e->fd = other_tgid;
+		// dest carries the access mode: ATTACH reaches memory (ptrace,
+		// process_vm_readv, /proc/<pid>/mem); READ only metadata
+		// (/proc/<pid>/environ, fd, maps, ...).
+		if (mode & PTRACE_MODE_ATTACH) {
+			e->dest[0] = 'A'; e->dest[1] = 'T'; e->dest[2] = 'T';
+			e->dest[3] = 'A'; e->dest[4] = 'C'; e->dest[5] = 'H'; e->dest[6] = '\0';
+		} else if (mode & PTRACE_MODE_READ) {
+			e->dest[0] = 'R'; e->dest[1] = 'E'; e->dest[2] = 'A';
+			e->dest[3] = 'D'; e->dest[4] = '\0';
+		} else {
+			e->dest[0] = '\0';
+		}
+		bpf_ringbuf_submit(e, 0);
+	}
+	return -EPERM;
+}
+
 
 // Check /proc/<pid>/fd/<n> — opening it creates a file struct pointing
 // to the actual file, which goes through security_file_open with the
@@ -1145,8 +1196,9 @@ int guard_file_open(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
 	// Block /proc/<pid>/mem access when the target PID is tainted
-	if (is_proc_mem_of_tainted(dentry))
-		return -EPERM;
+	__u32 mem_pid = is_proc_mem_of_tainted(dentry);
+	if (mem_pid)
+		return emit_process_denial(GUARD_REASON_PROC_MEM, EVENT_OPEN, NULL, mem_pid, PTRACE_MODE_ATTACH);
 
 	// Lazy directory discovery, same as path_mkdir: opening a file whose
 	// parent directory is not yet in guard_inodes adds the parent one
@@ -1225,8 +1277,9 @@ int guard_file_permission(unsigned long long *ctx)
 
 	// Block read access to /proc/<pid>/mem when the target PID is tainted.
 	// This catches reads on an already-open fd (opened before taint).
-	if (is_proc_mem_of_tainted(dentry))
-		return -EPERM;
+	__u32 mem_pid = is_proc_mem_of_tainted(dentry);
+	if (mem_pid)
+		return emit_process_denial(GUARD_REASON_PROC_MEM, EVENT_READ, NULL, mem_pid, PTRACE_MODE_ATTACH);
 
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
@@ -1880,6 +1933,7 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 	// child->tgid would read far past the tiny argument struct.  Read the
 	// real args through ctx like the other hooks in this file.
 	struct task_struct *child = (struct task_struct *)ctx[0];
+	__u32 mode = (__u32)ctx[1];
 
 	if (!child)
 		return 0;
@@ -1891,14 +1945,31 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 	if (!val)
 		return 0;  // child is not tainted — allow
 
+	// The guard owner itself (the daemon: its binary is the guard's only
+	// GUARD_ALLOW_ROOT entry) is tainted because it reads what it guards,
+	// yet everything it holds lives in its MEMORY (the fscrypt key, the
+	// edit-auth hash), which only a PTRACE_MODE_ATTACH access reaches.
+	// Metadata-only access (READ: /proc/<pid>/environ, fd, maps...) is what
+	// systemd-journald does to label every line the daemon logs — denying
+	// it cost the metadata and logged a denial, which journald then looked
+	// up again. Identity is the target's exe inode, never its pid.
+	if (!(mode & PTRACE_MODE_ATTACH)) {
+		struct inode_key child_ik = {};
+		if (get_task_exe_inode(child, &child_ik)) {
+			__u8 *child_action = bpf_map_lookup_elem(&guard_exe_actions, &child_ik);
+			if (child_action && *child_action == GUARD_ALLOW_ROOT)
+				return 0;
+		}
+	}
+
 	// Child is tainted.  Check if the caller is whitelisted.
 	struct inode_key exe_ik = {};
 	if (!get_current_exe_inode(&exe_ik))
-		return -EPERM;
+		return emit_process_denial(GUARD_REASON_PTRACE, EVENT_READ, child, 0, mode);
 
 	__u8 *action = bpf_map_lookup_elem(&guard_exe_actions, &exe_ik);
 	if (!is_allow_action(action))
-		return -EPERM;
+		return emit_process_denial(GUARD_REASON_PTRACE, EVENT_READ, child, 0, mode);
 
 	return 0;
 }
@@ -1915,6 +1986,15 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	// the attach-time check could not deny it), and PEEKDATA never fires
 	// another hook. Allow the exec only when the tracer itself is
 	// whitelisted; otherwise the whitelisted image must not run traced.
+	//
+	// Read-only guards (lib_dir runtime trees, /etc/app-listener) are skipped
+	// outright, like every other taint site: their contents are world-readable
+	// code, so a process running one of their writers holds nothing of theirs
+	// worth shielding. Tainting it anyway made each runtime tree's writer list
+	// the only processes allowed to inspect half of Steam's process tree.
+	if (is_readonly_mode())
+		return 0;
+
 	struct linux_binprm *bprm = (struct linux_binprm *)ctx[0];
 	if (!bprm)
 		return 0;
@@ -1973,15 +2053,15 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	struct task_struct *tracer = NULL;
 	bpf_probe_read_kernel(&tracer, sizeof(tracer), &task->parent);
 	if (!tracer)
-		return -EPERM;
+		return emit_process_denial(GUARD_REASON_TRACED_EXEC, EVENT_OPEN, NULL, 0, 0);
 
 	struct inode_key tracer_ik = {};
 	if (!get_task_exe_inode(tracer, &tracer_ik))
-		return -EPERM;  // tracer has no resolvable identity: fail closed
+		return emit_process_denial(GUARD_REASON_TRACED_EXEC, EVENT_OPEN, tracer, 0, 0);  // no resolvable identity: fail closed
 
 	__u8 *tracer_action = bpf_map_lookup_elem(&guard_exe_actions, &tracer_ik);
 	if (!is_allow_action(tracer_action))
-		return -EPERM;
+		return emit_process_denial(GUARD_REASON_TRACED_EXEC, EVENT_OPEN, tracer, 0, 0);
 
 	return 0;
 }
@@ -1998,6 +2078,134 @@ int guard_bprm_check_security(unsigned long long *ctx)
 // fires after the child's identity is set, so child->tgid is the real one.
 // It fires for thread creation too, where child->tgid == parent->tgid, making
 // the update a harmless no-op.
+// guard_inode_free forgets an inode the moment the kernel destroys a DELETED
+// file.
+//
+// guard_inodes is keyed on (dev, ino) and filesystems recycle freed inode
+// numbers, so an entry that outlives its file will eventually match an
+// unrelated one.  The unlink/rmdir hooks evict on the final link, but a
+// rename OVER a tracked file frees the victim with no unlink at all — and
+// that is how applications save (Steam rewrites its config and registry.vdf
+// this way on every launch).  Left for the hourly ReconcileInodes, those
+// stale entries collided with Steam's freshly created runtime files: on a
+// path deeper than root_in_chain's verifier-bounded walk the collision fails
+// closed (false DENY under an unrelated resource), and a recycled watch-root
+// number exact-matched the root (`ln -sfn` beside registry.vdf denied).
+//
+// i_nlink == 0 is the load-bearing check.  inode_free_security fires for
+// EVERY inode leaving memory, including a live file merely evicted from the
+// inode cache (memory pressure, drop_caches, the fscrypt lock that evicts a
+// whole vault).  Forgetting a live file here would unguard it — and
+// forgetting a live watch root would unguard the entire tree.  Only a file
+// with no name left is really gone; the kernel's own drop decision uses the
+// same test.
+//
+// This is a separate program so it adds nothing to the verifier budget of
+// the rename/unlink/link hooks (guard_path_rename sits at the 1M-instruction
+// limit — issue #45).  Best-effort: without it, stale entries wait for
+// ReconcileInodes as before.
+SEC("lsm/inode_free_security")
+int guard_inode_free(unsigned long long *ctx)
+{
+	struct inode *inode = (struct inode *)ctx[0];
+	if (!inode)
+		return 0;
+
+	unsigned int nlink = 1;
+	bpf_probe_read_kernel(&nlink, sizeof(nlink), &inode->i_nlink);
+	if (nlink != 0)
+		return 0; // live file leaving the cache, not a deletion
+
+	struct super_block *sb = NULL;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return 0;
+	__u64 dev = 0;
+	bpf_probe_read_kernel(&dev, sizeof(dev_t), &sb->s_dev);
+	if (!bpf_map_lookup_elem(&guard_fs_sbdevs, &dev))
+		return 0;
+
+	__u64 ino = 0;
+	bpf_probe_read_kernel(&ino, sizeof(ino), &inode->i_ino);
+	struct inode_key ikey = {};
+	ikey.dev = dev;
+	ikey.ino = ino;
+	bpf_map_delete_elem(&guard_inodes, &ikey);
+
+	// A deleted watch root protects nothing, and its number is about to be
+	// handed to some other file: forget it (0 matches no inode) so that file
+	// cannot exact-match the root.  Userspace re-anchors to a recreated file
+	// on its next sweep.
+	__u32 dev_key = 3, root_key = 4;
+	__u64 *root_dev = bpf_map_lookup_elem(&guard_config, &dev_key);
+	__u64 *root_ino = bpf_map_lookup_elem(&guard_config, &root_key);
+	if (root_dev && root_ino && *root_dev == dev && *root_ino == ino) {
+		__u64 zero = 0;
+		bpf_map_update_elem(&guard_config, &root_key, &zero, BPF_ANY);
+	}
+	return 0;
+}
+
+// guard_bprm_committed clears a process's taint when it has execve'd an image
+// this guard does not whitelist.
+//
+// Taint marks a process that holds this resource's secrets in memory, so that
+// nothing unwhitelisted may inspect it. It is inherited across fork (the
+// child copies the parent's memory) but must not survive exec: exec discards
+// the whole address space. Without this, every descendant of the Steam
+// client — Proton, the runtime helpers, audio tools, the game — stayed
+// "holding credentials" for life, and every desktop process that looked at
+// one (GameMode, PipeWire, the portal, Wine's own wineserver) was refused.
+//
+// This runs at bprm_committed_creds, after the point of no return: the new
+// image is installed. Clearing any earlier (bprm_check_security) would be a
+// fail-open — an exec that then failed would leave the OLD, secret-holding
+// image running untainted.
+//
+// A whitelisted image stays tainted (bprm_check_security marked it: it may
+// read the resource from its first instruction). What still crosses an exec
+// is argv/envp and open fds: fds stay guarded, since every read through one is
+// checked against the whitelist; argv/envp are data the whitelisted parent
+// chose to hand over, outside what taint defends against.
+SEC("lsm/bprm_committed_creds")
+int guard_bprm_committed(unsigned long long *ctx)
+{
+	if (is_readonly_mode())
+		return 0; // read-only guards never taint
+
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	if (!bpf_map_lookup_elem(&guard_tainted_pids, &tgid))
+		return 0;
+
+	struct linux_binprm *bprm = (struct linux_binprm *)ctx[0];
+	if (!bprm)
+		return 0;
+	struct file *file = NULL;
+	bpf_probe_read_kernel(&file, sizeof(file), &bprm->file);
+	if (!file)
+		return 0; // unresolvable image: keep the taint (fail closed)
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+	if (!inode)
+		return 0;
+	struct inode_key ik = {};
+	bpf_probe_read_kernel(&ik.ino, sizeof(ik.ino), &inode->i_ino);
+	struct super_block *sb = NULL;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return 0;
+	dev_t dev = 0;
+	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+	ik.dev = dev;
+
+	__u8 *action = bpf_map_lookup_elem(&guard_exe_actions, &ik);
+	if (is_allow_action(action))
+		return 0; // a whitelisted image may read the resource: stays tainted
+
+	bpf_map_delete_elem(&guard_tainted_pids, &tgid);
+	return 0;
+}
+
 SEC("tp_btf/sched_process_fork")
 int guard_sched_process_fork(unsigned long long *ctx)
 {

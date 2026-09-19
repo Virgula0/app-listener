@@ -146,6 +146,7 @@ func (t *TrustGuard) Start() error {
 	if len(t.links) == 0 {
 		return errors.New("no trust programs attached")
 	}
+	t.attachMemfdProvenance()
 
 	rd, err := ringbuf.NewReader(t.objs.TrustRb)
 	if err != nil {
@@ -154,6 +155,29 @@ func (t *TrustGuard) Start() error {
 	t.rd = rd
 	go t.readLoop()
 	return nil
+}
+
+// attachMemfdProvenance attaches the one non-LSM trust program: an fexit on
+// the kernel's memfd allocation, which records that a whitelisted process
+// created this anonymous inode (see trust_memfd_alloc in guard_trust.bpf.c).
+// A memfd never reaches security_file_open, so without it the first step of a
+// GPU driver's JIT fallback chain has no provenance.
+//
+// Best-effort, and fail-closed when it fails: without the record a memfd
+// exec-map stays denied exactly as before, and the driver falls through to its
+// O_TMPFILE / mkstemp fallbacks, which the file_open program does see.
+func (t *TrustGuard) attachMemfdProvenance() {
+	l, err := link.AttachTracing(link.TracingOptions{
+		Program:    t.objs.TrustMemfdAlloc,
+		AttachType: cilium.AttachTraceFExit,
+	})
+	if err != nil {
+		log.Warnf("trust guard: skipping memfd provenance (%v) — a whitelisted process's "+
+			"memfd-backed runtime code stays denied (GPU drivers fall back to their "+
+			"file-backed JIT paths, which are covered); every other protection is unaffected", err)
+		return
+	}
+	t.links = append(t.links, l)
 }
 
 func (t *TrustGuard) readLoop() {

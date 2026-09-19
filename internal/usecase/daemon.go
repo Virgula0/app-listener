@@ -36,6 +36,15 @@ const (
 	// file can linger and risk colliding with an unrelated inode reused
 	// elsewhere on the same filesystem, not to catch changes quickly.
 	inodeGCEvery = time.Hour
+	// fileRootFollowEvery is how quickly a SINGLE-FILE watch root replaced by
+	// an application's atomic save (write a temp, rename it over — Steam's
+	// registry.vdf on every launch) is re-anchored to its new inode. Until
+	// then the new file is neither the root nor in guard_inodes, i.e. not
+	// guarded. The kernel side cannot follow the rename itself:
+	// guard_path_rename has no verifier budget left (issue #45). For a file
+	// root the check is a single stat, so it runs far more often than the
+	// general sweep.
+	fileRootFollowEvery = time.Second
 
 	// Rollback lock-back budget: bounded (unlike Stop's infinite wait)
 	// because rollback runs on the SIGHUP handler, which must keep serving
@@ -386,9 +395,21 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 	defer sweep.Stop()
 	inodeGC := time.NewTicker(inodeGCEvery)
 	defer inodeGC.Stop()
+	// nil (never fires) unless the resource is a single file; a watch root
+	// does not change type while it is guarded.
+	var followRoot <-chan time.Time
+	if info, err := os.Lstat(resource); err == nil && !info.IsDir() {
+		follow := time.NewTicker(fileRootFollowEvery)
+		defer follow.Stop()
+		followRoot = follow.C
+	}
 	var lastResync time.Time
 	for {
 		select {
+		case <-followRoot:
+			// Errors are left to the periodic sweep, which reports them at a
+			// sane rate (a deleted root would otherwise log every second).
+			_ = g.SweepInodes()
 		case ev, ok := <-g.Events():
 			if !ok {
 				return
@@ -426,7 +447,8 @@ func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRe
 	// A denial usually means the binary was replaced in place; re-sync
 	// (throttled by resyncMinInterval) to admit the new inode instead of
 	// re-statting the whitelist per event.
-	if ev.Blocked && !ev.RawDevice && time.Since(*lastResync) >= resyncMinInterval {
+	// A process-gate denial is not an in-place binary replacement either.
+	if ev.Blocked && !ev.RawDevice && ev.Process == "" && time.Since(*lastResync) >= resyncMinInterval {
 		if _, err := g.ReSyncBinaries(); err != nil {
 			log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
 		}
@@ -556,8 +578,16 @@ func (d *daemonUseCase) prepareAddedResource(r *daemonconfig.Resource, g reposit
 	if r.NeedEncryption && !encrypted {
 		return fmt.Errorf("reload: directory %s is NOT encrypted: run the fscrypt migration first or set need_encryption: false", root)
 	}
-	if !r.NeedEncryption && encrypted {
-		log.Warnf("daemon: reload: resource %s is encrypted but need_encryption: false \u2014 leaving it locked", root)
+	if !r.NeedEncryption {
+		// Nothing to unlock. Stop here for the unencrypted case too: falling
+		// through to IsProvisioned asked fscrypt for the policy of a
+		// directory that has none and failed the WHOLE reload — every lib_dir
+		// or need_encryption:false resource added by a reload (a catalog
+		// refresh) was rejected, while a restart (startGuards filters these
+		// out up front) accepted the same config.
+		if encrypted {
+			log.Warnf("daemon: reload: resource %s is encrypted but need_encryption: false \u2014 leaving it locked", root)
+		}
 		return nil
 	}
 	provisioned, err := d.vault.IsProvisioned(root)

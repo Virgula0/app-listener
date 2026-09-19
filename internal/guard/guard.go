@@ -66,10 +66,36 @@ type GuardEvent struct {
 	// the event names the device, not any resource — userspace must not
 	// attribute it to a specific watched path.
 	RawDevice bool
+	// Process names a process-gate denial ("PTRACE", "TRACED_EXEC",
+	// "PROC_MEM" — /proc/<pid>/mem of a tainted process): no file
+	// is involved, Path reads "pid=<n> comm=<name>" of the other task, and the
+	// resource is the guard whose taint set protected it. Empty for the
+	// ordinary path-keyed events.
+	Process string
 }
 
-// guardReasonRawDevice mirrors GUARD_REASON_RAW_DEVICE in guard.bpf.c.
-const guardReasonRawDevice = 1
+// guard_event.reason values — mirror GUARD_REASON_* in guard.bpf.c.
+const (
+	guardReasonRawDevice  = 1
+	guardReasonPtrace     = 2
+	guardReasonTracedExec = 3
+	guardReasonProcMem    = 4
+)
+
+// processGateLabel maps a process-gate reason to the op label it is logged
+// under; empty for path-keyed events.
+func processGateLabel(reason uint32) string {
+	switch reason {
+	case guardReasonPtrace:
+		return "PTRACE"
+	case guardReasonTracedExec:
+		return "TRACED_EXEC"
+	case guardReasonProcMem:
+		return "PROC_MEM"
+	default:
+		return ""
+	}
+}
 
 // RawDeviceResourceLabel is the resource string the daemon logs for a raw
 // block-device denial, in place of a (misleading) specific watched path.
@@ -387,11 +413,15 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 			failedRequired)
 	}
 
+	// Counted before the fork tracepoint joins g.links: it is not an LSM
+	// hook, and folding it in printed "25/24" — a line operators read to
+	// confirm that no hook was silently dropped.
+	lsmAttached := len(g.links)
 	g.attachForkTaintPropagation()
 	g.pinSelfMaps()
 
 	log.Infof("guard created \u2014 %d/%d LSM hooks attached, watching: %s (%s)",
-		len(g.links), total, path, modeString(mode))
+		lsmAttached, total, path, modeString(mode))
 	return g, nil
 }
 
@@ -559,6 +589,8 @@ func guardLSMHooks(g *Guard) []struct {
 		{g.objs.GuardPtraceAccessCheck, "ptrace_access_check"},
 		{g.objs.GuardBprmCheckSecurity, "bprm_check_security"},
 		{g.objs.GuardTaskFree, "task_free"},
+		{g.objs.GuardInodeFree, "inode_free_security"},
+		{g.objs.GuardBprmCommitted, "bprm_committed_creds"},
 	}
 }
 
@@ -1973,6 +2005,16 @@ func (g *Guard) readEvent(rd *ringbuf.Reader) (*GuardEvent, bool) {
 		FileEvent: fe,
 		Blocked:   be.Blocked != 0,
 		RawDevice: be.Reason == guardReasonRawDevice,
+		Process:   processGateLabel(be.Reason),
+	}
+	if ge.Process != "" {
+		// The kernel sends the other task's comm in path and its tgid in fd.
+		ge.Path = fmt.Sprintf("pid=%d comm=%s", be.FD, ge.Path)
+		if ge.Dest != "" {
+			// READ = /proc metadata only; ATTACH = memory access.
+			ge.Path += " mode=" + ge.Dest
+			ge.Dest = ""
+		}
 	}
 
 	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions key on exe inode).

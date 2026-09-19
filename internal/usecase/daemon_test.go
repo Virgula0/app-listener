@@ -1,6 +1,7 @@
 package usecase
 
 import (
+	"fmt"
 	"errors"
 	"os"
 	"path/filepath"
@@ -99,6 +100,9 @@ type fakeVault struct {
 	mu sync.Mutex
 
 	encrypted map[string]bool
+	// strictPlain mirrors the real vault: IsProvisioned on a path with no
+	// fscrypt policy is an error, not "not provisioned".
+	strictPlain bool
 	// unlocked is the fscrypt lock state: Unlock provisions, Lock
 	// deprovisions.
 	unlocked map[string]bool
@@ -153,6 +157,9 @@ func (f *fakeVault) IsEncrypted(path string) (bool, error) {
 func (f *fakeVault) IsProvisioned(path string) (bool, error) {
 	if f.checkErr != nil {
 		return false, f.checkErr
+	}
+	if f.strictPlain && !f.encrypted[path] {
+		return false, fmt.Errorf("get policy for %s: file or directory %q is not encrypted", path, path)
 	}
 	return f.unlocked[path], nil
 }
@@ -1227,6 +1234,36 @@ func TestDaemonUseCaseGroupedEncryptionRootsDeduplicated(t *testing.T) {
 	for i, g := range guards {
 		if !g.(*fakeGuardRepo).isStopped() {
 			t.Errorf("guards[%d] must be stopped", i)
+		}
+	}
+}
+
+// TestDaemonUseCaseReloadAddsUnencryptedResource: a reload that adds a
+// need_encryption:false resource — a lib_dir from a catalog refresh — must
+// succeed without touching fscrypt. It used to fall through to IsProvisioned,
+// which the real vault fails on a directory with no policy, so the whole
+// reload was rejected and the daemon kept the old config (a restart, which
+// filters these out up front, worked).
+func TestDaemonUseCaseReloadAddsUnencryptedResource(t *testing.T) {
+	vault := newFakeVault("/a")
+	vault.strictPlain = true
+	old := newFakeGuardRepo()
+	d := startDaemon(t, vault, []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	lib := daemonconfig.Resource{Path: "/lib", NeedEncryption: false, ReadOnly: true}
+	newA, newLib := newFakeGuardRepo(), newFakeGuardRepo()
+	if err := d.Reload(
+		[]daemonconfig.Resource{resource("/a"), lib},
+		[]repository.GuardRepository{newA, newLib},
+	); err != nil {
+		t.Fatalf("Reload adding an unencrypted resource: %v", err)
+	}
+	if !newLib.started {
+		t.Error("the added unencrypted resource's guard must be started")
+	}
+	for _, p := range vault.unlockCalls {
+		if p == "/lib" {
+			t.Error("an unencrypted resource must never be unlocked")
 		}
 	}
 }

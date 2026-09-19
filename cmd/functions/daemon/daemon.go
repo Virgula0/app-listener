@@ -1176,6 +1176,10 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 	resource := logging.SanitizeText(ev.Resource)
 	path := logging.SanitizeText(ev.Event.Path)
 	comm := logging.SanitizeText(ev.Event.Comm)
+	op := ev.Event.Type.String()
+	if ev.Event.Process != "" {
+		op = ev.Event.Process // PTRACE / TRACED_EXEC: no file involved
+	}
 	if ev.Event.Blocked {
 		// commFullPath is best-effort telemetry, not identity: comm/pid come
 		// straight off the kernel event and can be spoofed or recycled by the
@@ -1187,11 +1191,11 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 			commFullPath = logging.SanitizeText(target)
 		}
 		fmt.Fprintf(w, "%sDAEMON DENIED  op=%s  comm=%s  commFullPath=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
-			syslogWarning, ev.Event.Type.String(), comm, commFullPath, ev.Event.PID, who, resource, path)
+			syslogWarning, op, comm, commFullPath, ev.Event.PID, who, resource, path)
 		return true
 	}
 	fmt.Fprintf(w, "%sDAEMON ALLOWED  op=%s  comm=%s  pid=%d  uid=%s  resource=%s  path=%s\n",
-		syslogInfo, ev.Event.Type.String(), comm, ev.Event.PID, who, resource, path)
+		syslogInfo, op, comm, ev.Event.PID, who, resource, path)
 	return true
 }
 

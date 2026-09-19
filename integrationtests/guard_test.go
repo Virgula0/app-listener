@@ -2704,3 +2704,81 @@ func (s *IntegrationSuite) TestGuard_ReconcileInodes_EvictsStale() {
 
 	s.runGuardTest(c, "TestReconcileInodesEvictsStale")
 }
+
+// TestGuard_InodeFreeEvictsOnlyDeletedFiles covers guard_inode_free
+// (lsm/inode_free_security), which forgets a guarded inode when the kernel
+// destroys it — the only point that catches a file freed by rename-over, the
+// way applications save (Steam rewrites registry.vdf on every launch).
+//
+// The hook fires for every inode leaving memory, so the first assertion is
+// the one that matters most: a live file merely evicted from the inode cache
+// must stay in guard_inodes and stay guarded. Forgetting it would unguard it
+// (and forgetting a live watch root, the whole tree).
+//
+// Then the fix itself: the replaced root's freed number is evicted, so an
+// unrelated `ln -sfn` beside it — the likeliest taker of that number — is not
+// denied as if it were the root.
+func (s *IntegrationSuite) TestGuard_InodeFreeEvictsOnlyDeletedFiles() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.installBPFTool(c)
+
+	const dir = "/inodefree"
+	const root = dir + "/registry.vdf"
+	s.exec(c, []string{"sh", "-c", "rm -rf " + dir + " && mkdir -p " + dir + " && printf 'SECRET-CONTENT' > " + root})
+
+	// Captured before the guard starts (stat goes through inode_getattr once
+	// enforcement is live). One link, so the replace genuinely frees it.
+	code, out := s.exec(c, []string{"sh", "-c", "stat -c '%d %i %h' " + root})
+	s.Require().Equalf(0, code, "stat on the root failed: %s", out)
+	fields := strings.Fields(out)
+	s.Require().Lenf(fields, 3, "unexpected stat output: %q", out)
+	s.Require().Equalf("1", fields[2], "the root must have exactly one link for this test: %q", out)
+	keyHex, err := le64HexKey(fields[0], fields[1])
+	s.Require().NoError(err)
+
+	// mv is the whitelisted "application" performing the atomic save.
+	s.startGuardStd(c, root, "-w", "/usr/bin/mv")
+
+	mapID := s.guardInodesMapID(c, guardPID)
+	lookup := "bpftool map lookup id " + mapID + " key hex " + keyHex
+	code, out = s.exec(c, []string{"sh", "-c", lookup})
+	s.Require().Equalf(0, code, "sanity: the root must be in guard_inodes: %s", out)
+
+	// 1. CACHE EVICTION IS NOT DELETION. Drop the dentry and inode caches:
+	//    the live root leaves memory and inode_free_security fires for it.
+	code, out = s.exec(c, []string{"sh", "-c", "sync && echo 2 > /proc/sys/vm/drop_caches"})
+	s.Require().Equalf(0, code, "dropping caches (the test container is privileged): %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", lookup})
+	s.Require().Equalf(0, code,
+		"a LIVE file evicted from the inode cache was dropped from guard_inodes — that unguards it: %s", out)
+	_, out = s.exec(c, []string{"sh", "-c", "cat " + root + " 2>&1"})
+	s.Require().NotContainsf(out, "SECRET-CONTENT", "the root must stay guarded across a cache drop: %s", out)
+
+	// 2. The atomic save frees the old root; its entry goes with it. Polled:
+	//    destruction follows the rename's final dput, which a busy host may
+	//    defer briefly.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"printf 'NEW' > " + dir + "/reg.tmp && /usr/bin/mv " + dir + "/reg.tmp " + root})
+	s.Require().Equalf(0, code, "the whitelisted atomic save must succeed: %s", out)
+	evicted := false
+	for i := 0; i < 20 && !evicted; i++ {
+		code, _ = s.exec(c, []string{"sh", "-c", lookup})
+		evicted = code != 0
+		if !evicted {
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+	s.Require().Truef(evicted, "the replaced root's freed inode must be evicted from guard_inodes")
+
+	// 3. The exact field failure: an unrelated, non-whitelisted `ln -sfn`
+	//    beside the root makes a temp symlink and renames it over its target.
+	//    Repeated so a reuse of the freed number is actually exercised.
+	for i := 0; i < 5; i++ {
+		code, out = s.exec(c, []string{"sh", "-c", "ln -sfn /tmp " + dir + "/bin32 2>&1"})
+		s.Require().Equalf(0, code, "an unrelated ln -sfn beside the guarded file must not be denied (iteration %d): %s", i, out)
+	}
+
+	s.stopGuard(c)
+}

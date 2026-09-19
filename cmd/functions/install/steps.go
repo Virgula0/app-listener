@@ -210,28 +210,36 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 // grouped extra watch sub-paths from the catalog entry.
 func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
-	// One entry can produce several sections (an app with several config
-	// locations, e.g. Steam). Its library directives describe the
-	// APPLICATION, not the location, so they are emitted once — on the
-	// first section of each entry+user — rather than repeated per section.
-	emitted := make(map[string]bool, len(candidates))
 	for i := range candidates {
 		c := &candidates[i]
-		key := c.Entry.Name + "\x00" + c.User.Name
-		s := inst.Section{
+		sections = append(sections, inst.Section{
 			Path:            c.Path,
 			Allow:           c.FilterExistingWhitelist(),
 			Encrypt:         true,
 			ExtraWatchPaths: c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name),
-		}
-		if !emitted[key] {
-			s.Libs = c.Entry.ExpandLibs(c.User.Name, c.User.Home)
-			s.LibDirs = c.Entry.ExpandLibDirs(c.User.Name, c.User.Home)
-			emitted[key] = true
-		}
-		sections = append(sections, s)
+		})
 	}
 	return sections
+}
+
+// libraryBlocksFromCandidates returns one [libraries] block per catalog
+// entry and user, in candidate order. One entry can produce several watch
+// sections (Steam has three locations), but its library directives describe
+// the APPLICATION, so they are declared once, in their own block, rather
+// than nested under one of its sections.
+func libraryBlocksFromCandidates(candidates []inst.Candidate) []inst.LibraryBlock {
+	seen := make(map[string]bool, len(candidates))
+	var blocks []inst.LibraryBlock
+	for i := range candidates {
+		c := &candidates[i]
+		block := c.Entry.LibraryBlockFor(c.User.Name, c.User.Home)
+		if seen[block.Name] || block.Empty() {
+			continue
+		}
+		seen[block.Name] = true
+		blocks = append(blocks, block)
+	}
+	return blocks
 }
 
 // editConfig renders the config from the selected candidates and opens the
@@ -239,7 +247,7 @@ func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, error) {
 	return runConfigEditor(
 		"app-listener daemon.conf — review and save (Ctrl+S)",
-		inst.GenerateConf(sectionsFromCandidates(candidates)))
+		inst.GenerateConf(sectionsFromCandidates(candidates), libraryBlocksFromCandidates(candidates)))
 }
 
 // runConfigEditor opens initial in the embedded editor and validates the
@@ -577,7 +585,20 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 	if patchErr != nil {
 		return "", false, fmt.Errorf("patching section %s: %w", sectionPath, patchErr)
 	}
-	return updated, true, nil
+	// The whitelist is rewritten; the library directives are only ever ADDED
+	// to, in the application's own [libraries] block (EnsureLibraryBlock).
+	// Catalog-generated directives still nested under this watch section by
+	// an older installer are moved there first — same lines, new home;
+	// anything hand-written in the section stays put. Refreshing them
+	// matters as much as the whitelist: when the catalog moves a binary from
+	// an entry's whitelist to its library-tree writers, only this puts the
+	// writer back — the rewrite above just drops the old line.
+	block := entry.LibraryBlockFor(user.Name, user.Home)
+	migrated, migrateErr := inst.RemoveSectionLibDirectives(updated, sectionPath, block.DirectiveLines())
+	if migrateErr != nil {
+		return "", false, fmt.Errorf("moving the library directives of %s: %w", sectionPath, migrateErr)
+	}
+	return inst.EnsureLibraryBlock(migrated, &block), true, nil
 }
 
 // parseSectionWhitelist extracts the binary paths currently listed in the
@@ -588,12 +609,13 @@ func parseSectionWhitelist(confText, resourcePath string) []string {
 	inSection := false
 	for _, line := range strings.Split(confText, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[watch") {
+		if strings.HasPrefix(trimmed, "[") {
+			// Any header ends the section — a [libraries] block too.
 			headerPath, ok := inst.ParseSectionHeaderPath(trimmed)
 			inSection = ok && headerPath == resourcePath
 			continue
 		}
-		if !inSection || trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		if !inSection || trimmed == "" || strings.HasPrefix(trimmed, "#") || inst.IsLibraryDirective(trimmed) {
 			continue
 		}
 		if trimmed == "need_encryption: true" || trimmed == "need_encryption: false" {

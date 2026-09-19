@@ -19,6 +19,12 @@ import (
 // Config is a parsed daemon configuration.
 type Config struct {
 	Resources []Resource
+	// SharedAllowLibs are the allow_lib paths declared in [libraries]
+	// blocks. Library trust is daemon-wide (every whitelisted binary may load
+	// every trusted library), so these belong to no resource; readable or
+	// not at parse time, they are all handed to the trust guard, which runs
+	// after the vaults are unlocked and re-stats each one.
+	SharedAllowLibs []string
 }
 
 // Resource is one guarded tree: a directory (or the vault root) with its own
@@ -130,6 +136,19 @@ type watchGroup struct {
 	pendingLibs    []string
 	watchPaths     []string
 	libDirs        []string
+	// libBinaries / libPending are writers of this group's lib_dirs ONLY —
+	// they never join the group's own (secret, whitelist-mode) resources.
+	// A runtime tree is maintained by its own vendor tools (Steam's
+	// pressure-vessel helpers rebuild a merged /usr on every launch); those
+	// tools have no business reading the credential directory that happens
+	// to be listed in the same section.
+	libBinaries []BinaryRule
+	libPending  []BinaryRule
+	// libraryBlock marks a [libraries <name>] block: no watch root, only
+	// library directives, and its lib_dirs are writable by its own
+	// lib_binary rules alone (there is no section whitelist to inherit).
+	libraryBlock bool
+	blockName    string
 	// skipped marks a section whose root is missing: preserved historical
 	// tolerance — its directives are warned and ignored, never fatal (the
 	// whole group is dropped at finalize).
@@ -184,6 +203,11 @@ func parseConfig(cfg *Config, file *os.File) error {
 // applyConfigLine dispatches one config line: section headers close the
 // previous group and open a new one; directives mutate the open group.
 func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) error {
+	if name, ok := parseLibrariesSection(line); ok {
+		finalizeGroup(cfg, *group)
+		*group = &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
+		return nil
+	}
 	dirPath, isSection, headerErr := parseWatchSection(line)
 	if headerErr != nil {
 		return fmt.Errorf("daemon config line %d: %w", lineNo, headerErr)
@@ -200,6 +224,9 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 		return nil
 	}
 	g := *group
+	if g.libraryBlock {
+		return applyLibraryBlockDirective(g, line, lineNo)
+	}
 	if g.skipped {
 		log.Warnf("daemon config line %d: skipped section: ignoring directive %q", lineNo, line)
 		return nil
@@ -238,6 +265,12 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 // finalizeGroup materializes a closed group unless it was skipped.
 func finalizeGroup(cfg *Config, group *watchGroup) {
 	if group == nil || group.skipped {
+		return
+	}
+	if group.libraryBlock {
+		cfg.SharedAllowLibs = append(cfg.SharedAllowLibs, group.libs...)
+		cfg.SharedAllowLibs = append(cfg.SharedAllowLibs, group.pendingLibs...)
+		materializeLibDirs(cfg, group) // writers: the block's lib_binary rules only
 		return
 	}
 	materializeWatchGroup(cfg, group)
@@ -373,6 +406,12 @@ func materializeWatchGroup(cfg *Config, g *watchGroup) {
 // is the only workable rule for per-launch runtime directories whose names
 // change on every start (Steam's pressure-vessel `var/tmp-XXXXXX`).
 func materializeLibDirs(cfg *Config, g *watchGroup) {
+	// A lib_binary without any lib_dir grants nothing — say so rather than
+	// leave the author believing the binary was whitelisted somewhere.
+	if len(g.libDirs) == 0 && len(g.libBinaries)+len(g.libPending) > 0 {
+		log.Warnf("daemon config line %d: the section declares lib_binary but no lib_dir — "+
+			"those binaries grant nothing (a lib_binary is a writer of this section's library directories only)", g.lineNo)
+	}
 	for _, dir := range g.libDirs {
 		if _, statErr := os.Lstat(dir); statErr != nil {
 			log.Warnf("daemon config line %d: lib_dir not present, ignoring: %s", g.lineNo, dir)
@@ -397,6 +436,8 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 			}
 			existing.Binaries = append(existing.Binaries, libDirWriters(g.binaries)...)
 			existing.PendingBinaries = append(existing.PendingBinaries, libDirWriters(g.pending)...)
+			existing.Binaries = append(existing.Binaries, g.libBinaries...)
+			existing.PendingBinaries = append(existing.PendingBinaries, g.libPending...)
 			continue
 		}
 		res := addResource(cfg, dir, "", g.lineNo)
@@ -407,6 +448,8 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 		res.ReadOnly = true
 		res.Binaries = append(res.Binaries, libDirWriters(g.binaries)...)
 		res.PendingBinaries = append(res.PendingBinaries, libDirWriters(g.pending)...)
+		res.Binaries = append(res.Binaries, g.libBinaries...)
+		res.PendingBinaries = append(res.PendingBinaries, g.libPending...)
 	}
 }
 
@@ -617,6 +660,10 @@ func applyDirective(group *watchGroup, line string, lineNo int) error {
 		return applyLibDir(group, dirPath, lineNo)
 	}
 
+	if value, ok := parseLibBinary(line); ok {
+		return applyLibBinary(group, value, lineNo)
+	}
+
 	binPath, rest, splitErr := splitPathAndRest(line)
 	if splitErr != nil {
 		return fmt.Errorf("daemon config line %d: %w", lineNo, splitErr)
@@ -632,20 +679,27 @@ func applyDirective(group *watchGroup, line string, lineNo int) error {
 		}
 		rule.Events = events
 	}
-	if _, statErr := os.Stat(binPath); statErr != nil {
-		// Binary unreadable (locked tree or genuinely gone): defer to the post-unlock
-		// pass rather than drop — dropping would silently disable the entry; deferred
-		// stays unlisted in BPF, i.e. denied, until resolvable (fail-closed).
-		log.Warnf("daemon config line %d: binary not readable yet, deferring: %s", lineNo, binPath)
-		group.pending = append(group.pending, rule)
-		return nil //nolint:nilerr // returning nil despite statErr is the point: the unreadable rule is deliberately deferred, not dropped
-	}
-	if resolved, resolveErr := filepath.EvalSymlinks(binPath); resolveErr == nil && resolved != binPath {
-		log.Infof("daemon config line %d: binary symlink resolved: %s -> %s", lineNo, binPath, resolved)
-		rule.Path = resolved
-	}
-	group.binaries = append(group.binaries, rule)
+	recordBinaryRule(rule, &group.binaries, &group.pending, lineNo)
 	return nil
+}
+
+// recordBinaryRule stats and symlink-resolves one rule, appending it either to
+// resolved or — when the binary is not readable yet — to deferred. An
+// unreadable binary (locked tree or genuinely gone) is deferred to the
+// post-unlock pass rather than dropped: dropping would silently disable the
+// entry, while a deferred rule stays unlisted in BPF, i.e. denied, until it
+// resolves (fail-closed).
+func recordBinaryRule(rule BinaryRule, resolved, deferred *[]BinaryRule, lineNo int) {
+	if _, statErr := os.Stat(rule.Path); statErr != nil {
+		log.Warnf("daemon config line %d: binary not readable yet, deferring: %s", lineNo, rule.Path)
+		*deferred = append(*deferred, rule)
+		return
+	}
+	if target, resolveErr := filepath.EvalSymlinks(rule.Path); resolveErr == nil && target != rule.Path {
+		log.Infof("daemon config line %d: binary symlink resolved: %s -> %s", lineNo, rule.Path, target)
+		rule.Path = target
+	}
+	*resolved = append(*resolved, rule)
 }
 
 // parseAllowLib recognizes an `allow_lib <path>` / `allow_lib: <path>`
@@ -718,6 +772,84 @@ func applyLibDir(group *watchGroup, dirPath string, lineNo int) error {
 		}
 	}
 	group.libDirs = append(group.libDirs, dirPath)
+	return nil
+}
+
+// parseLibBinary recognizes a `lib_binary <path>` / `lib_binary: <path>`
+// directive and returns the raw value (path plus anything after it).
+func parseLibBinary(line string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, "lib_binary")
+	if !ok {
+		return "", false
+	}
+	// Require a separator so a binary named "/usr/bin/lib_binaryfoo" is not
+	// mistaken for the directive.
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
+		return "", false
+	}
+	rest = strings.TrimPrefix(rest, ":")
+	return strings.TrimSpace(rest), true
+}
+
+// applyLibBinary records one writer of the group's `lib_dir` trees. It is
+// deliberately NOT a whitelist entry: the rule reaches the read-only library
+// resources only, never the section's own protected tree. That separation is
+// the point — a runtime tree is maintained by its vendor's own helper tools
+// (Steam's pressure-vessel rebuilds a merged /usr under `var/tmp-XXXXXX` on
+// every launch, symlinking host GPU drivers into it), and granting those
+// tools write access to the tree they own must not also hand them the
+// credential directory listed in the same section.
+//
+// Event restrictions are rejected rather than ignored: a lib_dir is guarded
+// in read-only mode, which carries no per-binary event masks, so accepting a
+// list would silently promise a narrowing that cannot be enforced.
+// parseLibrariesSection recognizes a `[libraries]`, `[libraries <name>]` or
+// `[libraries "<name>"]` header. The name is a label — the application the
+// block belongs to — and scopes nothing but the block itself: a lib_binary
+// writes only the lib_dirs of its own block.
+func parseLibrariesSection(line string) (string, bool) {
+	if !strings.HasPrefix(line, "[libraries") || !strings.HasSuffix(line, "]") {
+		return "", false
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(line, "[libraries"), "]")
+	if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
+		return "", false // "[librariesfoo]": let parseWatchSection reject it
+	}
+	return unquotePath(strings.TrimSpace(rest)), true
+}
+
+// applyLibraryBlockDirective handles one line of a [libraries] block. Only
+// the three library directives are meaningful there; anything else — a
+// binary path above all — is refused rather than guessed at: in a watch
+// section a bare path is a whitelist entry, and silently treating it as one
+// here would grant it nothing while looking like a grant.
+func applyLibraryBlockDirective(g *watchGroup, line string, lineNo int) error {
+	if libPath, ok := parseAllowLib(line); ok {
+		return applyAllowLib(g, libPath, lineNo)
+	}
+	if dirPath, ok := parseLibDir(line); ok {
+		return applyLibDir(g, dirPath, lineNo)
+	}
+	if value, ok := parseLibBinary(line); ok {
+		return applyLibBinary(g, value, lineNo)
+	}
+	return fmt.Errorf("daemon config line %d: %q is not allowed in a [libraries] block "+
+		"(only allow_lib, lib_dir and lib_binary are)", lineNo, line)
+}
+
+func applyLibBinary(group *watchGroup, value string, lineNo int) error {
+	binPath, rest, splitErr := splitPathAndRest(value)
+	if splitErr != nil {
+		return fmt.Errorf("daemon config line %d: %w", lineNo, splitErr)
+	}
+	if binPath == "" {
+		return fmt.Errorf("daemon config line %d: empty lib_binary path", lineNo)
+	}
+	if rest != "" {
+		return fmt.Errorf("daemon config line %d: lib_binary does not accept event restrictions "+
+			"(%q): a library directory is guarded read-only, which carries no per-binary event mask", lineNo, rest)
+	}
+	recordBinaryRule(BinaryRule{Path: binPath}, &group.libBinaries, &group.libPending, lineNo)
 	return nil
 }
 

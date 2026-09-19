@@ -1086,3 +1086,247 @@ lib_dir `+libDir+`
 		t.Errorf("EncryptionGroups = %d, want 1 (the section only)", n)
 	}
 }
+
+func TestParseLibBinaryNotADirective(t *testing.T) {
+	// A binary path that merely starts with "lib_binary" must NOT be parsed
+	// as the directive.
+	if _, ok := parseLibBinary("/usr/bin/lib_binarytool"); ok {
+		t.Errorf("parseLibBinary matched a binary path with a lib_binary prefix")
+	}
+	if v, ok := parseLibBinary("lib_binary /usr/bin/x"); !ok || v != "/usr/bin/x" {
+		t.Errorf("parseLibBinary(space) = %q,%v", v, ok)
+	}
+	if v, ok := parseLibBinary(`lib_binary: "/usr/bin/y"`); !ok || v != `"/usr/bin/y"` {
+		t.Errorf("parseLibBinary(colon+quotes) = %q,%v", v, ok)
+	}
+}
+
+// TestLoadLibBinaryWritesLibDirOnly is the security property of the
+// directive: a lib_binary is a writer of the section's library directories
+// and NOTHING else. A runtime's own maintenance tools must be able to rebuild
+// the tree they own without gaining access to the credential directory that
+// happens to sit in the same section.
+func TestLoadLibBinaryWritesLibDirOnly(t *testing.T) {
+	secret, libDir := t.TempDir(), t.TempDir()
+	writer := filepath.Join(t.TempDir(), "capsule-capture-libs")
+	if err := os.WriteFile(writer, []byte("#!/bin/true\n"), 0o755); err != nil {
+		t.Fatalf("writing the fake writer: %v", err)
+	}
+
+	cfg, err := Load(writeConfig(t, `[watch `+secret+`]
+need_encryption: false
+/usr/bin/example
+lib_dir `+libDir+`
+lib_binary `+writer+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	var protectedRes, lib *Resource
+	for i := range cfg.Resources {
+		switch cfg.Resources[i].Path {
+		case secret:
+			protectedRes = &cfg.Resources[i]
+		case libDir:
+			lib = &cfg.Resources[i]
+		}
+	}
+	if protectedRes == nil || lib == nil {
+		t.Fatalf("want both the section and the lib_dir resource, got %+v", cfg.Resources)
+	}
+	if !hasBinary(lib, writer) {
+		t.Errorf("lib_binary %s must be a writer of the lib_dir; got %+v", writer, lib.Binaries)
+	}
+	if hasBinary(protectedRes, writer) {
+		t.Errorf("lib_binary %s leaked into the PROTECTED resource's whitelist — "+
+			"a library-tree writer must never reach the section's secrets", writer)
+	}
+	// The ordinary whitelist entry keeps reaching both, as before (it is
+	// deferred here — /usr/bin/example need not exist — which is still a rule
+	// on the protected resource, just an unresolved one).
+	if !hasPendingBinary(protectedRes, "/usr/bin/example") {
+		t.Errorf("the section whitelist must still apply to the protected resource")
+	}
+}
+
+// TestLoadLibBinaryDeferredWhenUnreadable keeps the fail-closed handling of a
+// binary that is not resolvable yet: deferred (denied until resolved), never
+// dropped.
+func TestLoadLibBinaryDeferredWhenUnreadable(t *testing.T) {
+	secret, libDir := t.TempDir(), t.TempDir()
+	missing := filepath.Join(t.TempDir(), "not-installed-yet")
+
+	cfg, err := Load(writeConfig(t, `[watch `+secret+`]
+need_encryption: false
+/usr/bin/example
+lib_dir `+libDir+`
+lib_binary `+missing+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for i := range cfg.Resources {
+		if cfg.Resources[i].Path != libDir {
+			continue
+		}
+		for _, p := range cfg.Resources[i].PendingBinaries {
+			if p.Path == missing {
+				return
+			}
+		}
+		t.Fatalf("an unreadable lib_binary must be deferred, got pending %+v", cfg.Resources[i].PendingBinaries)
+	}
+	t.Fatalf("lib_dir resource missing from %+v", cfg.Resources)
+}
+
+// TestLoadLibBinaryRejectsEventRestrictions: a lib_dir is guarded read-only,
+// which carries no per-binary event mask, so an event list must be refused
+// rather than silently ignored.
+func TestLoadLibBinaryRejectsEventRestrictions(t *testing.T) {
+	secret, libDir := t.TempDir(), t.TempDir()
+	_, err := Load(writeConfig(t, `[watch `+secret+`]
+need_encryption: false
+lib_dir `+libDir+`
+lib_binary /usr/bin/example READ,WRITE
+`))
+	if err == nil {
+		t.Fatalf("lib_binary with an event list must be rejected")
+	}
+	if !strings.Contains(err.Error(), "event restrictions") {
+		t.Errorf("error should name the rejected restriction, got: %v", err)
+	}
+}
+
+// hasPendingBinary reports whether the resource carries path as a deferred rule.
+func hasPendingBinary(r *Resource, path string) bool {
+	for _, b := range r.PendingBinaries {
+		if b.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// hasBinary reports whether the resource lists path as a resolved writer.
+func hasBinary(r *Resource, path string) bool {
+	for _, b := range r.Binaries {
+		if b.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func TestParseLibrariesSection(t *testing.T) {
+	for line, want := range map[string]string{
+		`[libraries]`:                 "",
+		`[libraries Steam]`:           "Steam",
+		`[libraries "Steam (alice)"]`: "Steam (alice)",
+		"[libraries\t\"Proton GE\"]":  "Proton GE",
+	} {
+		got, ok := parseLibrariesSection(line)
+		if !ok || got != want {
+			t.Errorf("parseLibrariesSection(%q) = %q,%v; want %q,true", line, got, ok, want)
+		}
+	}
+	for _, line := range []string{`[librariesfoo]`, `[watch /x]`, `libraries`} {
+		if _, ok := parseLibrariesSection(line); ok {
+			t.Errorf("parseLibrariesSection(%q) matched; want no match", line)
+		}
+	}
+	// A near-miss header must still be refused as malformed, never merged
+	// into the previous section.
+	if _, err := Load(writeConfig(t, "[librariesfoo]\n")); err == nil {
+		t.Errorf("a malformed [libraries...] header must be rejected")
+	}
+}
+
+// TestLibrariesBlockScopesWritersToItself is the security property of the
+// block form: a lib_binary writes the lib_dirs of its OWN block only. Neither
+// a watch section's whitelist nor another application's block may write them.
+func TestLibrariesBlockScopesWritersToItself(t *testing.T) {
+	secret := t.TempDir()
+	steamRuntime, otherRuntime := t.TempDir(), t.TempDir()
+	mkExe := func(name string) string {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte("#!/bin/true\n"), 0o755); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+		return p
+	}
+	sectionApp, steamWriter, otherWriter := mkExe("app"), mkExe("pressure-vessel-wrap"), mkExe("other-updater")
+
+	cfg, err := Load(writeConfig(t, `[watch `+secret+`]
+need_encryption: false
+`+sectionApp+`
+
+[libraries "Steam (alice)"]
+lib_dir `+steamRuntime+`
+lib_binary `+steamWriter+`
+
+[libraries "Other (alice)"]
+lib_dir `+otherRuntime+`
+lib_binary `+otherWriter+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	byPath := map[string]*Resource{}
+	for i := range cfg.Resources {
+		byPath[cfg.Resources[i].Path] = &cfg.Resources[i]
+	}
+	steam, other := byPath[steamRuntime], byPath[otherRuntime]
+	if steam == nil || other == nil {
+		t.Fatalf("both library blocks must materialize their lib_dir, got %+v", cfg.Resources)
+	}
+	if !steam.ReadOnly || steam.NeedEncryption {
+		t.Errorf("a [libraries] lib_dir must be read-only and unencrypted: %+v", steam)
+	}
+	if !hasBinary(steam, steamWriter) {
+		t.Errorf("the block's own lib_binary must write its lib_dir")
+	}
+	if hasBinary(steam, otherWriter) {
+		t.Errorf("another application's lib_binary leaked into this block's lib_dir")
+	}
+	if hasBinary(steam, sectionApp) {
+		t.Errorf("a watch section's whitelist leaked into a [libraries] lib_dir — blocks inherit no whitelist")
+	}
+	if hasBinary(byPath[secret], steamWriter) {
+		t.Errorf("a lib_binary leaked into a protected resource's whitelist")
+	}
+}
+
+func TestLibrariesBlockAllowLibIsShared(t *testing.T) {
+	lib := filepath.Join(t.TempDir(), "plugin.so")
+	if err := os.WriteFile(lib, []byte("ELF"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "in-a-locked-vault.so")
+	cfg, err := Load(writeConfig(t, `[libraries]
+allow_lib `+lib+`
+allow_lib `+missing+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Readable or not, both reach the trust guard: it runs after the vaults
+	// are unlocked and re-stats every path itself.
+	got := strings.Join(cfg.SharedAllowLibs, ",")
+	if !strings.Contains(got, lib) || !strings.Contains(got, missing) {
+		t.Errorf("SharedAllowLibs = %v, want both %s and %s", cfg.SharedAllowLibs, lib, missing)
+	}
+	if len(cfg.Resources) != 0 {
+		t.Errorf("an allow_lib-only block must not create resources, got %+v", cfg.Resources)
+	}
+}
+
+func TestLibrariesBlockRejectsBinaryLines(t *testing.T) {
+	_, err := Load(writeConfig(t, `[libraries "Steam"]
+/usr/bin/steam
+`))
+	if err == nil || !strings.Contains(err.Error(), "not allowed in a [libraries] block") {
+		t.Fatalf("a bare binary line in a [libraries] block must be refused, got %v", err)
+	}
+}

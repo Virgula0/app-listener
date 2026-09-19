@@ -30,6 +30,18 @@ func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string) {
 		for _, l := range cfg.Resources[i].AllowLibs {
 			libSet[l] = struct{}{}
 		}
+		// Unreadable at parse time (typically inside a vault that was still
+		// locked). The trust set is built after the unlock and SetTrusted
+		// re-stats every path, so these resolve now or are skipped with a
+		// warning — before, they were parked and never read again, so such a
+		// library silently stayed untrusted.
+		for _, l := range cfg.Resources[i].PendingLibs {
+			libSet[l] = struct{}{}
+		}
+	}
+	// [libraries] blocks: library trust is daemon-wide, not per resource.
+	for _, l := range cfg.SharedAllowLibs {
+		libSet[l] = struct{}{}
 	}
 
 	// Static dependency closure of every whitelisted binary (the auto part the

@@ -38,3 +38,6 @@ integrationtests/exploits/*
 !integrationtests/exploits/*.c
 !integrationtests/exploits/Makefile
 !integrationtests/exploits/README.md
+# Denial traces from scripts/trace-app-libs.sh (contain home-directory paths)
+scripts/app-trace-*.log
+scripts/lib-trace-*.log

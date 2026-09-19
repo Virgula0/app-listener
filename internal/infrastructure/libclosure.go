@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -26,12 +27,24 @@ import (
 //
 // A statically linked binary (no INTERP, no dynamic section) yields an empty
 // closure and no error.
+//
+// Two kinds of whitelisted file have no closure of their own and yield an
+// empty one with no error: a script (#!), which the kernel runs as its
+// interpreter — a separate binary resolved on its own — and an ELF for an
+// architecture this machine cannot execute natively (Steam ships
+// pressure-vessel-arm64 for FEX), whose interpreter is not on the host.
 func ResolveLibraryClosure(binaryPath string) ([]string, error) {
+	if isScript(binaryPath) {
+		return nil, nil
+	}
 	f, err := elf.Open(binaryPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening ELF %s: %w", binaryPath, err)
 	}
 	defer f.Close()
+	if !runsNatively(f.Machine) {
+		return nil, nil
+	}
 
 	out := make(map[string]struct{})
 
@@ -266,4 +279,32 @@ func LdSoPreloadPaths() ([]string, error) {
 		}
 	}
 	return paths, nil
+}
+
+// isScript reports whether path starts with a "#!" interpreter line.
+func isScript(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	magic := make([]byte, 2)
+	n, _ := f.Read(magic)
+	return n == 2 && bytes.Equal(magic, []byte("#!"))
+}
+
+// runsNatively reports whether an ELF for machine executes on this host
+// without emulation: the native architecture plus its 32-bit compat one
+// (i386 on amd64 — Steam's own client is a 32-bit binary). An architecture
+// this list does not know is assumed native, so the closure is still
+// resolved rather than silently skipped.
+func runsNatively(machine elf.Machine) bool {
+	switch runtime.GOARCH {
+	case "amd64":
+		return machine == elf.EM_X86_64 || machine == elf.EM_386
+	case "arm64":
+		return machine == elf.EM_AARCH64 || machine == elf.EM_ARM
+	default:
+		return true
+	}
 }

@@ -3,7 +3,6 @@ package install
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	log "github.com/sirupsen/logrus"
 
@@ -152,8 +151,10 @@ func pathCovered(p string, covered []string) bool {
 // diff the user reviews (here and again at ConfirmOverwrite) is exactly the
 // new sections.
 func appendSectionsAndEdit(oldText string, picked []inst.Candidate) (string, *daemonconfig.Config, error) {
-	merged := strings.TrimRight(oldText, "\n") + "\n" +
-		inst.GenerateSections(sectionsFromCandidates(picked)) + "\n"
+	merged := inst.InsertSectionsBeforeLibraries(oldText, inst.GenerateSections(sectionsFromCandidates(picked)))
+	for _, block := range libraryBlocksFromCandidates(picked) {
+		merged = inst.EnsureLibraryBlock(merged, &block)
+	}
 	return runConfigEditor(
 		"app-listener daemon.conf — new sections appended, review and save (Ctrl+S)",
 		merged)
