@@ -1475,15 +1475,47 @@ func (s *IntegrationSuite) TestGuard_Bypass_Mount() {
 // The victim is a whitelisted bash that opens the guarded file on
 // fd 3 (open(2) without O_CLOEXEC => the open is allowed and bash
 // becomes tainted) and reads it into a shell variable living on the
-// heap.  `sleep 30` runs as a CHILD so bash stays alive and keeps
+// heap.  `sleep 30` must run as a CHILD so bash stays alive and keeps
 // both the taint and its heap, letting the exploit find the victim
 // and attempt a dump.  If the taint/ptrace check is missing, the
 // dump succeeds (root has CAP_SYS_PTRACE) and the test fails.
+//
+// The victim must run NO external command, which is why it idles in
+// the `read` builtin on a fifo instead of calling sleep(1):
+//
+//   - bash execs the LAST command of a -c script in place instead of
+//     forking, so a trailing `sleep 30` turned the victim itself into
+//     a `sleep` image — a brand-new address space holding none of the
+//     secret;
+//   - and when `sleep` runs as a child instead, fd 3 (no O_CLOEXEC)
+//     is inherited by it, so the exploit's /proc/<pid>/fd scan finds
+//     the CHILD — untainted, since exec correctly clears taint — and
+//     happily dumps its secret-free heap, exiting 0.
+//
+// Both shapes made the test pass only for as long as nothing cleared
+// taint across exec. With the victim idling in a builtin, the sole
+// holder of the guarded fd is the tainted bash itself.
 //
 // NOTE: on hosts with kernel.yama.ptrace_scope=1 the kernel would
 // block the cross-process read anyway, making this test pass
 // trivially.  On yama=0 hosts only the guard prevents the dump.
 // ---------------------------------------------------------------
+
+// pvrSecret is the guarded content the exploit must never surface, and
+// pvrVictimAndExploit the shared victim+dump script (see the block comment
+// above for why the victim must not tail-exec).
+const (
+	pvrSecret           = "PVR-HEAP-SECRET"
+	pvrVictimAndExploit = "rm -f /tmp/pvr_idle; mkfifo /tmp/pvr_idle; " +
+		"bash -c 'exec 3< /watch/target.txt; IFS= read -r -u3 line; read -t 30 _ <> /tmp/pvr_idle' & " +
+		"pid=$!; sleep 1; " +
+		"echo \"victim_comm=$(cat /proc/$pid/comm 2>&1)\"; " +
+		"/exploits/process_vm_readv /watch/target.txt; code=$?; " +
+		// The exploit's own status, reported in-band: a docker exec exit
+		// code has come back as 0 for a command the kernel refused.
+		"echo \"exploit_rc=$code\"; " +
+		"kill $pid 2>/dev/null; exit $code"
+)
 
 func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv() {
 	c := s.guardContainer()
@@ -1492,7 +1524,7 @@ func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv() {
 	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits"})
 	// Must exist before the guard starts: files created afterwards are
 	// not in the BPF inode map and would not be protected.
-	s.exec(c, []string{"sh", "-c", "echo 'process_vm_readv target' > /watch/target.txt"})
+	s.exec(c, []string{"sh", "-c", "echo '" + pvrSecret + "' > /watch/target.txt"})
 
 	exploitHostPath := absPath("./exploits/process_vm_readv")
 	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/process_vm_readv", 0755)
@@ -1501,13 +1533,14 @@ func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv() {
 	// bash is whitelisted so it may open the guarded file.
 	s.startGuardStd(c, "/watch", "-w", "/bin/bash")
 
-	code, out := s.exec(c, []string{"sh", "-c",
-		"bash -c 'exec 3< /watch/target.txt; IFS= read -r -u3 line; sleep 30' & " +
-			"pid=$!; sleep 1; " +
-			"/exploits/process_vm_readv /watch/target.txt; code=$?; " +
-			"kill $pid 2>/dev/null; exit $code"})
-	s.Require().NotEqualf(0, code,
+	logBefore := s.readGuardLog(c)
+
+	_, out := s.exec(c, []string{"sh", "-c", pvrVictimAndExploit})
+	s.Require().NotContainsf(out, "exploit_rc=0",
 		"process_vm_readv on a whitelisted victim should be blocked: %s", out)
+	s.Require().NotContainsf(out, pvrSecret,
+		"the guarded content leaked out of the victim's memory: %s", out)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, s.readGuardLog(c)), "READ")
 
 	s.stopGuard(c)
 }

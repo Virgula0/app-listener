@@ -212,7 +212,7 @@ func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv_File() {
 	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/exploits"})
-	s.exec(c, []string{"sh", "-c", "echo 'process_vm_readv target' > /watch/target.txt"})
+	s.exec(c, []string{"sh", "-c", "echo '" + pvrSecret + "' > /watch/target.txt"})
 
 	exploitHostPath := absPath("./exploits/process_vm_readv")
 	err := c.CopyFileToContainer(s.ctx, exploitHostPath, "/exploits/process_vm_readv", 0755)
@@ -221,13 +221,14 @@ func (s *IntegrationSuite) TestGuard_Bypass_ProcessVmReadv_File() {
 	// bash is whitelisted so it may open the guarded file.
 	s.startGuardStd(c, "/watch/target.txt", "-w", "/bin/bash")
 
-	code, out := s.exec(c, []string{"sh", "-c",
-		"bash -c 'exec 3< /watch/target.txt; IFS= read -r -u3 line; sleep 30' & " +
-			"pid=$!; sleep 1; " +
-			"/exploits/process_vm_readv /watch/target.txt; code=$?; " +
-			"kill $pid 2>/dev/null; exit $code"})
-	s.Require().NotEqualf(0, code,
+	logBefore := s.readGuardLog(c)
+
+	_, out := s.exec(c, []string{"sh", "-c", pvrVictimAndExploit})
+	s.Require().NotContainsf(out, "exploit_rc=0",
 		"process_vm_readv on a whitelisted victim should be blocked against a single-file guard: %s", out)
+	s.Require().NotContainsf(out, pvrSecret,
+		"the guarded content leaked out of the victim's memory: %s", out)
+	s.requireBlockedEvent(guardDeltaEvents(logBefore, s.readGuardLog(c)), "READ")
 
 	s.stopGuard(c)
 }

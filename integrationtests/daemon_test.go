@@ -1983,6 +1983,47 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// procReadProbe asks whether a PTRACE_MODE_READ-gated /proc access against pid
+// is refused, and reports the answer in-band.
+//
+// It uses readlink(/proc/<pid>/exe): proc_pid_get_link() consults
+// proc_fd_access_allowed() -> ptrace_may_access(PTRACE_MODE_READ) and FAILS the
+// syscall when the guard refuses, which we have observed in the daemon log.
+// Two probes that look equivalent are NOT usable here:
+//
+//   - `ls /proc/<pid>/fd`: proc_fd_permission() returns as soon as
+//     generic_permission() passes, and container root passes it via
+//     CAP_DAC_OVERRIDE, so the LSM hook is never consulted;
+//   - `cat /proc/<pid>/maps`: observed reading a guarded process's maps in
+//     full WHILE the daemon logged a matching op=PTRACE mode=READ denial. That
+//     is UNEXPLAINED, not a known kernel behaviour: proc_maps_open() takes its
+//     mm from proc_mem_open(PTRACE_MODE_READ) and returns the error, and the
+//     maps read path has no advisory ptrace check, so the open should have
+//     failed. Until the raw ptrace mode bits are logged (0x04 = NOAUDIT, i.e.
+//     an advisory call site) the denial cannot be attributed to that open, so
+//     maps is unusable as a probe either way. ATTACH-class access to the same
+//     process (/proc/<pid>/mem, process_vm_readv) IS refused — see
+//     TestDaemon_OwnMetadataReadableMemoryNot and TestGuard_Bypass_ProcessVmReadv.
+//
+// rc is readlink's own status, not the exec's: a docker exec exit code has come
+// back as 0 for a command the kernel refused. state proves the target is still
+// alive, since a dead pid fails readlink too and would pass a denial assertion
+// vacuously.
+func procReadProbe(pid string) string {
+	return "exe=$(readlink /proc/" + pid + "/exe 2>&1); rc=$?; " +
+		"st=$(awk '{print $3}' /proc/" + pid + "/stat 2>/dev/null); " +
+		"echo \"rc=$rc state=$st exe=$exe\""
+}
+
+// procGateMatrix reports every /proc access class for one pid, so a failure
+// says which ptrace-gated reads this kernel actually refuses.
+func procGateMatrix(pid string) string {
+	return "for f in exe maps environ mem stat status cmdline; do " +
+		"if [ \"$f\" = exe ]; then o=$(readlink /proc/" + pid + "/exe 2>&1); " +
+		"else o=$(head -c 40 /proc/" + pid + "/$f 2>&1 | tr -d \"\\0\" | head -1); fi; " +
+		"echo \"  $f rc=$? out=$o\"; done"
+}
+
 // TestDaemon_ReadOnlyGuardDoesNotTaintItsWriters: running a binary that is a
 // lib_binary writer of a read-only lib_dir must not taint the process.
 // Taint shields a process holding SECRETS from ptrace-class inspection; a
@@ -1995,26 +2036,31 @@ func (s *IntegrationSuite) TestDaemon_ReadOnlyGuardDoesNotTaintItsWriters() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
 
+	// The writer copy must keep the basename `sleep`: ubuntu:latest ships
+	// coreutils as one multi-call binary that dispatches on argv[0], so a
+	// copy named /tmp/rtwriter dies instantly with "coreutils: unknown
+	// program 'rtwriter'" and the test found no process to inspect.
 	s.exec(c, []string{"sh", "-c",
-		"mkdir -p /rt /etc/app-listener && printf 'code' > /rt/lib.so && cp /usr/bin/sleep /tmp/rtwriter && chmod 755 /tmp/rtwriter"})
+		"mkdir -p /rt /tmp/rtw /etc/app-listener && printf 'code' > /rt/lib.so && cp /usr/bin/sleep /tmp/rtw/sleep && chmod 755 /tmp/rtw/sleep"})
 	s.startDaemon(c, `[libraries "Runtime"]
 lib_dir /rt
-lib_binary /tmp/rtwriter`)
+lib_binary /tmp/rtw/sleep`)
 
-	s.exec(c, []string{"sh", "-c", "(/tmp/rtwriter 30 &) ; sleep 1"})
-	_, pidOut := s.exec(c, []string{"sh", "-c", "pgrep -f '^/tmp/rtwriter 30' | head -1"})
+	s.exec(c, []string{"sh", "-c", "(/tmp/rtw/sleep 30 &) ; sleep 1"})
+	_, pidOut := s.exec(c, []string{"sh", "-c", "pgrep -f '^/tmp/rtw/sleep 30' | head -1"})
 	pid := strings.TrimSpace(pidOut)
 	s.Require().NotEmptyf(pid, "the writer process did not start: %q", pidOut)
 
-	// /proc/<pid>/fd listing is a ptrace-class access (PTRACE_MODE_READ).
-	code, out := s.exec(c, []string{"sh", "-c", "ls /proc/" + pid + "/fd 2>&1"})
-	s.Require().Equalf(0, code,
+	_, out := s.exec(c, []string{"sh", "-c", procReadProbe(pid)})
+	s.Require().Containsf(out, "rc=0",
 		"a process running a read-only tree's writer must stay inspectable by an unrelated process: %s", out)
+	s.Require().Containsf(out, "/tmp/rtw/sleep",
+		"the probe did not actually resolve the writer's exe, so it proves nothing: %s", out)
 
 	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE' /tmp/daemon.log || true"})
 	s.Require().Equalf("0", strings.TrimSpace(logOut), "no ptrace-class denial may come from a read-only guard")
 
-	s.exec(c, []string{"sh", "-c", "pkill -f '^/tmp/rtwriter' ; pkill -f 'app-listener daemon' || true"})
+	s.exec(c, []string{"sh", "-c", "pkill -f '^/tmp/rtw/sleep' ; pkill -f 'app-listener daemon' || true"})
 }
 
 // TestDaemon_TaintFollowsForkButNotExec pins the taint lifecycle:
@@ -2022,6 +2068,7 @@ lib_binary /tmp/rtwriter`)
 //   - a forked child that keeps the parent's memory stays tainted;
 //   - a child that execs a NON-whitelisted image is cleared: exec discards
 //     the address space, so it holds nothing read from the vault.
+//
 // Before the exec rule every descendant of a tainted process stayed tainted
 // for life — the whole Steam process tree (Proton, audio tools, the game) —
 // and GameMode, PipeWire, the portal and Wine's own wineserver were refused
@@ -2041,6 +2088,7 @@ need_encryption: false
 	// starts a fork-only subshell and a fork+exec child, recording pids.
 	s.exec(c, []string{"sh", "-c", `nohup /tmp/wsh -c '
 read -r x < /protected/secret
+printf "%s" "$x" > /tmp/p_value
 echo $$ > /tmp/p_reader
 ( echo $BASHPID > /tmp/p_fork; while :; do read -t 1 -r _ <> /tmp/idle_fifo || true; done ) &
 /usr/bin/sleep 60 & echo $! > /tmp/p_exec
@@ -2053,21 +2101,53 @@ sleep 2`})
 		s.Require().NotEmptyf(p, "missing %s", f)
 		return p
 	}
-	inspect := func(pid string) int {
-		code, _ := s.exec(c, []string{"sh", "-c", "ls /proc/" + pid + "/fd >/dev/null 2>&1"})
-		return code
+	inspect := func(pid string) (int, string) {
+		return s.exec(c, []string{"sh", "-c", procReadProbe(pid)})
+	}
+	// diagnose is printed when a denial assertion fails: the whole /proc
+	// access matrix for the target (which classes this kernel actually
+	// refuses), its identity and liveness, a control read by an
+	// unwhitelisted process, and the daemon's own log.
+	diagnose := func(pid string) string {
+		_, diag := s.exec(c, []string{"sh", "-c",
+			"echo 'proc gate matrix:'; " + procGateMatrix(pid) + "; " +
+				"echo \"comm=$(cat /proc/" + pid + "/comm)\"; " +
+				"echo \"state=$(awk '{print $3}' /proc/" + pid + "/stat) threads=$(awk '/^Threads:/{print $2}' /proc/" + pid + "/status)\"; " +
+				"echo \"whitelist-inode=$(stat -c %d:%i /tmp/wsh)\"; " +
+				"echo \"control-read: $(cat /protected/secret 2>&1)\"; " +
+				"echo '--- daemon.log ---'; tail -30 /tmp/daemon.log"})
+		return diag
+	}
+	requireDenied := func(label, pid string) {
+		_, out := inspect(pid)
+		s.Require().Regexpf(`state=[RSD]`, out,
+			"%s: the target is not a live process, so a refusal proves nothing: %s", label, out)
+		if strings.Contains(out, "rc=0") {
+			s.Require().Failf(label, "the probe was not refused: pid=%s %s\n%s", pid, out, diagnose(pid))
+		}
+	}
+	requireAllowed := func(label, pid string) {
+		_, out := inspect(pid)
+		s.Require().Containsf(out, "rc=0", "%s: %s", label, out)
+		s.Require().Containsf(out, "exe=/", "%s: the probe resolved no exe, so it proves nothing: %s", label, out)
 	}
 
-	s.Require().NotEqualf(0, inspect(pidOf("/tmp/p_reader")),
-		"the process that read the secret must not be inspectable by an unwhitelisted process")
-	s.Require().NotEqualf(0, inspect(pidOf("/tmp/p_fork")),
-		"a forked child sharing the reader's memory image must stay tainted")
-	s.Require().Equalf(0, inspect(pidOf("/tmp/p_exec")),
-		"a child that exec'd an unwhitelisted image holds none of the vault's memory: its taint must be cleared")
+	// Control first: taint is stamped when the whitelisted image execs and
+	// when it reads, so if the read itself was refused the whole test is
+	// vacuous — and the failure looks identical to a missing gate.
+	_, readValue := s.exec(c, []string{"sh", "-c", "cat /tmp/p_value 2>&1"})
+	s.Require().Equalf("TAINT-LIFECYCLE-SECRET", strings.TrimSpace(readValue),
+		"the whitelisted shell did not read the secret, so nothing tainted it: %q", readValue)
+
+	requireDenied("the process that read the secret must not be inspectable by an unwhitelisted process",
+		pidOf("/tmp/p_reader"))
+	requireDenied("a forked child sharing the reader's memory image must stay tainted", pidOf("/tmp/p_fork"))
+	requireAllowed("a child that exec'd an unwhitelisted image holds none of the vault's memory: its taint must be cleared",
+		pidOf("/tmp/p_exec"))
 
 	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE.*mode=READ' /tmp/daemon.log || true"})
 	s.Require().NotEqualf("0", strings.TrimSpace(logOut),
-		"a /proc/<pid>/fd denial must be logged as op=PTRACE with mode=READ")
+		"a /proc/<pid>/maps denial must be logged as op=PTRACE with mode=READ")
 
 	s.exec(c, []string{"sh", "-c", "pkill -f /tmp/wsh; pkill -f 'sleep 60'; pkill -f 'app-listener daemon' || true"})
 }
@@ -2075,9 +2155,19 @@ sleep 2`})
 // TestDaemon_OwnMetadataReadableMemoryNot: the daemon is tainted (it reads
 // what it guards) and keeps its secrets — the fscrypt key, the edit-auth hash
 // — in memory. A ptrace ATTACH-class access to it (/proc/<pid>/mem,
-// process_vm_readv) must stay denied; a READ-class one (/proc/<pid>/fd,
-// environ — what systemd-journald does to label every log line) is allowed,
-// or each denial the daemon logs makes journald look it up and fail again.
+// process_vm_readv) must stay denied; a READ-class one (/proc/<pid>/maps,
+// environ, exe — what systemd-journald does to label every log line) is
+// allowed, or each denial the daemon logs makes journald look it up and fail
+// again.
+//
+// Inside a pid namespace the denial can only come from ptrace_access_check,
+// which reads child->tgid (always the init-namespace tgid). The second gate,
+// is_proc_mem_of_tainted() in file_open/file_permission, parses the /proc
+// directory NAME — the pid as the container sees it — and compares it against
+// guard_tainted_pids, which mark_tainted() keys on the init-namespace tgid, so
+// in a namespace it cannot match. Both agree on the host, the product's
+// target; the namespace asymmetry only costs the secondary catch for reads on
+// a /proc/<pid>/mem fd opened before the target was tainted.
 func (s *IntegrationSuite) TestDaemon_OwnMetadataReadableMemoryNot() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -2094,14 +2184,22 @@ need_encryption: false
 
 	// ATTACH-class: still refused — and this also proves the daemon IS
 	// tainted, so the READ assertion below is not vacuous (an untainted
-	// process would give an I/O error at offset 0, not EPERM).
+	// process would open it and give an I/O error at offset 0 instead).
+	// The refusal arrives as EACCES, not the gate's own EPERM: opening
+	// /proc/<pid>/mem calls mm_access(PTRACE_MODE_ATTACH), which maps any
+	// LSM denial to -EACCES before the open can reach security_file_open.
+	// Keyed on that message rather than the exec exit code, which docker
+	// exec has reported as 0 for a command the kernel refused.
 	_, out := s.exec(c, []string{"sh", "-c", "head -c1 /proc/" + pid + "/mem 2>&1"})
-	s.Require().Containsf(out, "not permitted",
+	s.Require().Regexpf("Permission denied|not permitted", out,
 		"memory of the daemon must stay unreadable to an unwhitelisted process: %s", out)
 
 	// READ-class: allowed.
-	code, out := s.exec(c, []string{"sh", "-c", "ls /proc/" + pid + "/fd >/dev/null 2>&1 && cat /proc/" + pid + "/environ >/dev/null 2>&1"})
-	s.Require().Equalf(0, code, "metadata of the daemon's own process must be readable: %s", out)
+	_, out = s.exec(c, []string{"sh", "-c", procReadProbe(pid)})
+	s.Require().Containsf(out, "rc=0",
+		"metadata of the daemon's own process must be readable — journald resolves /proc/<pid>/exe for every line it labels: %s", out)
+	s.Require().Containsf(out, "exe=/", "the probe resolved no exe, so it proves nothing: %s", out)
+	s.Require().NotEmptyf(out, "empty maps: the daemon's address space was not really read, so the probe proves nothing")
 
 	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE.*comm=app-listener mode=READ' /tmp/daemon.log || true"})
 	s.Require().Equalf("0", strings.TrimSpace(logOut), "no READ-mode denial may be logged for the daemon itself")
