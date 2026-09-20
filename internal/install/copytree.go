@@ -9,18 +9,14 @@ import (
 	"syscall"
 )
 
-// CopyTree recursively copies the tree rooted at src into dst, preserving
-// directory and file permissions, ownership and modification times. Symbolic
-// links are recreated; sockets, FIFOs and device nodes are skipped (they
-// cannot be copied meaningfully). The destination must not exist yet.
+// CopyTree recursively copies src into dst, preserving permissions, ownership and mtimes. Symlinks
+// are recreated; sockets, FIFOs and device nodes are skipped. dst must not exist.
 func CopyTree(src, dst string) error {
 	return CopyTreeWithProgress(src, dst, nil)
 }
 
-// CopyTreeWithProgress behaves like CopyTree and additionally invokes
-// onBytes after every regular file with the bytes copied so far and the
-// total bytes to copy (a nil onBytes skips the pre-measurement walk and
-// all reporting).
+// CopyTreeWithProgress is CopyTree plus onBytes after every regular file (bytes copied so far,
+// total to copy); a nil onBytes skips the pre-measurement walk and all reporting.
 func CopyTreeWithProgress(src, dst string, onBytes func(copied, total int64)) error {
 	var total int64
 	if onBytes != nil {

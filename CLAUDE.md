@@ -184,6 +184,29 @@ read-only over WebSockets (`internal/tui/serve.go`). `--gui` (build-tag `gui`) i
 fyne, monitor-only; `internal/gui/stub.go` is the no-op for non-gui builds.
 Verbosity ladder lives in `internal/constants`; `--verbose` requires `--headless`.
 
+## Comment style
+
+Comments are read mostly by future Claude sessions, so every token counts. Be terse.
+
+- **Default to no comment.** Names and types already say *what*; don't restate the
+  signature, narrate steps, or document self-evident fields.
+- **Comment only the non-obvious *why*:** a security invariant or fail-closed reason,
+  an ordering rule (attach → unlock → populate), a TOCTOU or bypass class it closes,
+  a verifier/kernel limit (1M-insn budget, 16-step bound), a unit/encoding, a surprising
+  workaround. Keep these — they are what stops a regression.
+- **Size:** one line by default, ≤3 lines usual. A security invariant or kernel
+  constraint may take a short paragraph (≤6 lines). Wrap at ~100 cols.
+- **No history in code:** no bug stories, "used to / before the fix / RED now", or who
+  reported it. That belongs in the commit message or `memory/*`. A bare issue ref
+  (`issue #45`) is fine when it explains a constraint.
+- **Say it once:** explain a rule at its definition; elsewhere use ≤1 line ("see X").
+- **Go docs:** start with the identifier (godoc); one sentence; unexported helpers
+  usually need none.
+- **Tests:** the name says what; comment only a fixture/probe trap or the regression's
+  mechanism, in ≤3 lines. No banner separators (`-----`, `/////`).
+- Keep directives verbatim (`//go:embed`, `//nolint:…`). When you change code, fix or
+  delete the comments next to it — never leave one describing removed behavior.
+
 ## Git conventions
 
 Do not add Claude/Anthropic attribution to commits, pushes, or merges — no

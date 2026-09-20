@@ -12,82 +12,59 @@ import (
 
 // CandidateDir describes one critical directory type the installer probes.
 type CandidateDir struct {
-	// Name is a short human-readable label shown in the TUI. It identifies
-	// the resource: two locations of the same application (Steam's
-	// ".local/share/Steam/config" and ".steam") share one entry, one Name.
+	// Name is the TUI label and identifies the resource: two locations of one app (Steam's
+	// ".local/share/Steam/config" and ".steam") share one entry and Name.
 	Name string
-	// RelPaths are the home-relative locations of this resource (e.g.
-	// ".ssh"). On a given host more than one may exist; each existing one is
-	// protected as its own watch + fscrypt root, all sharing this entry's
-	// Whitelist. Set exactly one of RelPaths and AbsPaths, non-empty.
+	// RelPaths are home-relative locations. More than one may exist on a host; each existing one is
+	// its own watch + fscrypt root, all sharing this entry's Whitelist. Set exactly one of
+	// RelPaths/AbsPaths.
 	RelPaths []string
-	// AbsPaths are system-level locations (e.g. "/etc/wireguard") probed
-	// once, independent of the selected users. Same multi-location
-	// semantics as RelPaths.
+	// AbsPaths are system-level locations (e.g. "/etc/wireguard"), probed once regardless of users.
+	// Same multi-location semantics as RelPaths.
 	AbsPaths []string
-	// Whitelist maps binary paths to allowed events (nil = all events,
-	// emitted bare; otherwise "<path> EV1,EV2"); matching is by inode.
-	// Keep it minimal: each entry is a potential privilege-escalation path
-	// if abused while the directory is unlocked. When an entry has several
-	// RelPaths the whitelist is shared by all of them (the union).
+	// Whitelist maps binary paths to allowed events (nil = all, emitted bare; else "<path>
+	// EV1,EV2"); matched by inode. Keep it minimal: each entry is a potential privilege-escalation
+	// path while the directory is unlocked. Shared (union) across an entry's RelPaths.
 	Whitelist map[string][]string
-	// WatchRelPaths optionally replaces the single [watch <RelPath>] section
-	// with MULTIPLE guarded subtrees inside that RelPath, all sharing this
-	// entry's whitelist and fscrypt lifecycle (the section path stays the
-	// encryption root). Used for self-updating applications whose update
-	// workspace must stay outside the guarded set while the user data
-	// remains protected. Empty means the plain per-RelPath watch (historical
-	// behavior). Only valid together with exactly one RelPaths entry. The
-	// paths are relative to the user's home, supporting the same %HOME%
-	// expansion as whitelist entries.
+	// WatchRelPaths replaces the single [watch <RelPath>] with MULTIPLE guarded subtrees inside
+	// that RelPath, sharing the whitelist and fscrypt lifecycle (the section path stays the
+	// encryption root). For self-updating apps whose update workspace must stay outside the guarded
+	// set. Empty = plain per-RelPath watch. Only valid with exactly one RelPaths entry;
+	// home-relative, same %HOME% expansion as whitelist entries.
 	WatchRelPaths []string
-	// Libs are extra shared libraries this entry's whitelisted binaries are
-	// allowed to load, emitted as `allow_lib` directives. They are ONLY needed
-	// for libraries that are neither root-owned system libraries (those are
-	// auto-trusted) nor inside a guarded tree (those are trusted by location):
-	// i.e. user-writable libraries at FIXED paths that an app dlopen()s. Paths
-	// support the same %HOME%/%USER% expansion as whitelist entries. Libraries
-	// at per-launch ephemeral paths (e.g. Steam's runtime) cannot be listed
-	// here — guard their containing directory instead.
+	// Libs are extra libraries the entry's whitelisted binaries may load (`allow_lib`). Only needed
+	// for user-writable libraries at FIXED paths an app dlopen()s: root-owned system libs are
+	// auto-trusted and in-tree ones trusted by location. %HOME%/%USER% expand. Per-launch ephemeral
+	// paths (e.g. Steam's runtime) can't be listed; guard their containing directory instead.
 	Libs []string
-	// LibDirRelPaths are home-relative library DIRECTORIES to guard read-only
-	// (emitted as `lib_dir` directives): every process keeps reading them,
-	// only this entry's whitelisted binaries may write them. Guarding a
-	// directory — rather than listing files in Libs — is the only workable
-	// rule for trees whose contents are assembled per launch under names
-	// that change every time (Steam's pressure-vessel `var/tmp-XXXXXX`):
-	// the trust object walks a loaded library's ancestors, so one entry
-	// covers the whole subtree forever. Glob metacharacters (*, ?, [) are
-	// expanded against the filesystem; non-existent paths are dropped.
-	// Use the SHALLOWEST directory that contains only libraries and app
-	// data the whitelisted binary legitimately owns.
+	// LibDirRelPaths are home-relative library DIRECTORIES guarded read-only (`lib_dir`): everyone
+	// may read, only this entry's whitelisted binaries may write. A directory, not a Libs file
+	// list, is the only workable rule for trees assembled per launch under changing names (Steam's
+	// pressure-vessel `var/tmp-XXXXXX`): the trust object walks a loaded library's ancestors, so
+	// one entry covers the subtree forever. Globs (*, ?, [) expand against the filesystem; missing
+	// paths are dropped. Use the SHALLOWEST directory holding only libraries and app data the
+	// binary owns.
 	LibDirRelPaths []string
-	// LibDirWriters are binaries allowed to WRITE this entry's LibDirRelPaths
-	// — and nothing else: they are emitted as `lib_binary` directives, which
-	// never reach the entry's protected (secret) paths the way a Whitelist
-	// entry does. This is where an application's own runtime-maintenance
-	// tools belong: Steam's pressure-vessel helpers rebuild a merged /usr
-	// under `var/tmp-XXXXXX` on every launch, symlinking host GPU drivers
-	// into the guarded runtime tree, so they must write it — but they have
-	// no business reading the Steam login credentials that sit in the same
-	// catalog entry. Same %HOME%/%USER% expansion and glob support as
-	// Whitelist; only regular files survive expansion.
+	// LibDirWriters are binaries allowed to WRITE this entry's LibDirRelPaths and nothing else
+	// (`lib_binary`; unlike Whitelist they never reach the protected secret paths). For an app's
+	// runtime-maintenance tools: Steam's pressure-vessel helpers rebuild a merged /usr under
+	// `var/tmp-XXXXXX` each launch and symlink host GPU drivers into the runtime, but must not read
+	// Steam login credentials in the same entry. Same %HOME%/%USER%/glob expansion as Whitelist;
+	// only regular files survive.
 	LibDirWriters []string
 }
 
-// IsSystem reports whether this is a system-level (AbsPaths) entry, probed
-// once regardless of the selected users.
+// IsSystem reports a system-level (AbsPaths) entry, probed once regardless of users.
 func (c *CandidateDir) IsSystem() bool { return len(c.AbsPaths) > 0 }
 
-// Catalog is the master list of critical directories probed for each selected
-// user — tweak entries here to drive discovery. Non-existent paths are
+// Catalog is the master list of critical directories probed per selected user; missing paths are
 // simply not proposed.
 var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPaths: []string{".ssh"},
-		// ssh needs WRITE (known_hosts rotation); sshd and its helpers
-		// (sshd-auth/-session, sftp-server) only READ authorized_keys; the
-		// keysign/pkcs11/cleanup helpers are inert. git excluded: reads keys.
+		// ssh needs WRITE (known_hosts rotation); sshd and helpers (sshd-auth/-session,
+		// sftp-server) only READ authorized_keys; keysign/pkcs11/cleanup helpers are inert. git
+		// excluded: it reads keys.
 		Whitelist: map[string][]string{
 			"/usr/bin/ssh":                         {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK"},
 			"/usr/bin/ssh-add":                     nil,
@@ -128,8 +105,8 @@ var Catalog = []CandidateDir{
 			"/usr/bin/code-cli": nil, "/usr/local/bin/code-cli": nil,
 			"%HOME%/.local/bin/code-cli": nil,
 		}},
-	// One resource, two locations: the CLI state (~/.claude) and its XDG
-	// config (~/.config/claude). Same whitelist, each its own watch root.
+	// One resource, two locations (~/.claude and ~/.config/claude): same whitelist, each its own
+	// watch root.
 	{Name: "Claude Code", RelPaths: []string{".claude", ".config/claude"},
 		Whitelist: map[string][]string{
 			"/usr/local/bin/claude":    nil,
@@ -158,9 +135,8 @@ var Catalog = []CandidateDir{
 		}},
 
 	// --- IDEs and editors ---------------------------------------------------------
-	// IDE configs hold auth tokens and credentials; wrapper binaries
-	// (/usr/bin/code, firefox, ...) are shell scripts, so the whitelist
-	// matches the executed ELF under /opt and /usr/lib.
+	// IDE configs hold auth tokens; wrapper binaries (/usr/bin/code, firefox, ...) are shell
+	// scripts, so the whitelist matches the executed ELF under /opt and /usr/lib.
 	{Name: "VS Code config", RelPaths: []string{".config/Code"},
 		Whitelist: map[string][]string{
 			"/usr/bin/code": nil, "/usr/local/bin/code": nil,
@@ -168,8 +144,8 @@ var Catalog = []CandidateDir{
 			"/opt/visual-studio-code/code": nil, "/usr/share/code/code": nil, "/opt/visual-studio-code/bin/code": nil,
 			// Code's separate crash-dump writer process.
 			"/opt/visual-studio-code/chrome_crashpad_handler": nil, "/usr/share/code/chrome_crashpad_handler": nil,
-			// Code's extension-signature verifier, spawned per extension
-			// install/update to check CachedExtensionVSIXs/*.sigzip files.
+			// Code's extension-signature verifier (checks CachedExtensionVSIXs/*.sigzip on
+			// install/update).
 			"/opt/visual-studio-code/resources/app/node_modules/@vscode/vsce-sign/bin/vsce-sign": nil,
 			"/usr/share/code/resources/app/node_modules/@vscode/vsce-sign/bin/vsce-sign":         nil,
 		}},
@@ -190,9 +166,9 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/codium": nil, "/usr/local/bin/codium": nil,
 			"/opt/vscodium/chrome_crashpad_handler": nil, "/usr/share/vscodium/chrome_crashpad_handler": nil}},
 	{Name: "JetBrains IDEs", RelPaths: []string{".config/JetBrains"},
-		// IDEs run as the bundled JBR java, so the JBR and its fsnotifier
-		// helper are whitelisted (globs cover /opt installs). Toolbox apps
-		// stay unguarded: no credentials — those live in .config/JetBrains.
+		// IDEs run as the bundled JBR java, so the JBR and its fsnotifier are whitelisted (globs
+		// cover /opt installs). Toolbox apps stay unguarded (no credentials; those live in
+		// .config/JetBrains).
 		Whitelist: map[string][]string{
 			"/usr/bin/idea": nil, "/usr/bin/pycharm": nil, "/usr/bin/webstorm": nil,
 			"/usr/bin/clion": nil, "/usr/bin/goland": nil, "/usr/bin/phpstorm": nil,
@@ -203,8 +179,8 @@ var Catalog = []CandidateDir{
 			"%HOME%/.goland/jbr/bin/java":   nil,
 			"%HOME%/.goland/bin/fsnotifier": nil,
 		}},
-	// Config (~/.config/zed) and data (~/.local/share/zed, holds the auth
-	// token) — one resource, one whitelist, two watch roots.
+	// Config (~/.config/zed) and data (~/.local/share/zed, holds the auth token): one resource, two
+	// watch roots.
 	{Name: "Zed editor", RelPaths: []string{".config/zed", ".local/share/zed"},
 		Whitelist: map[string][]string{
 			"/usr/bin/zed": nil, "/usr/local/bin/zed": nil,
@@ -228,8 +204,8 @@ var Catalog = []CandidateDir{
 	{Name: "AWS credentials", RelPaths: []string{".aws"},
 		Whitelist: map[string][]string{"/usr/bin/aws": nil}},
 	{Name: "Google Cloud SDK", RelPaths: []string{".config/gcloud"},
-		// Python launchers: the exe is the interpreter (not whitelisted),
-		// so both entries are inert — kept for documentation.
+		// Python launchers: the exe is the interpreter (not whitelisted), so both entries are
+		// inert; documentation only.
 		Whitelist: map[string][]string{"/usr/bin/gcloud": nil, "/usr/bin/gsutil": nil}},
 	{Name: "Kubernetes kubeconfig", RelPaths: []string{".kube"},
 		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil,
@@ -282,13 +258,11 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/chezmoi": nil}},
 
 	// --- Legacy dot-config files --------------------------------------------------
-	// No single-file entries: the daemon guards directories only (non-dir
-	// paths are skipped at load), so files like ~/.netrc would be silently
-	// dropped. Steam below documents the same restriction for its ssfn files.
+	// No single-file entries: the daemon guards directories only (non-dir paths are skipped at
+	// load), so e.g. ~/.netrc would be silently dropped (same for Steam's ssfn files).
 
 	// --- Wallets and crypto -------------------------------------------------------
-	// Probed like any other entry: they surface only once the wallet is
-	// installed. Solana keeps its keypair as a plaintext id.json.
+	// Surface only once the wallet is installed. Solana keeps its keypair as a plaintext id.json.
 	{Name: "Bitcoin Core", RelPaths: []string{".bitcoin/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil, "/usr/bin/bitcoin-tx": nil}},
 	{Name: "Litecoin Core", RelPaths: []string{".litecoin/wallets"},
@@ -335,9 +309,9 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/wg": nil, "/usr/bin/wg-quick": nil}},
 
 	// --- Browsers and messaging -----------------------------------------------------
-	// Browser binaries are shell wrappers; the whitelist matches the
-	// executed ELF under /usr/lib and /opt. Firefox's crashhelper and the
-	// chrome_crashpad_handler family write the Crash Reports dirs separately.
+	// Browser binaries are shell wrappers, so the whitelist matches the executed ELF under /usr/lib
+	// and /opt. Firefox's crashhelper and the chrome_crashpad_handler family write Crash Reports
+	// separately.
 	{Name: "Firefox profile", RelPaths: []string{".mozilla/firefox", ".config/mozilla/firefox"},
 		Whitelist: map[string][]string{
 			"/usr/bin/firefox":             nil,
@@ -364,12 +338,10 @@ var Catalog = []CandidateDir{
 			"/usr/lib/brave-browser/chrome_crashpad_handler": nil,
 		}},
 	{Name: "Discord", RelPaths: []string{".config/discord"},
-		// The real difference with RelPaths is that it is faster.
-		// In fact it encrypted/decrypts the whole ~/.config/discord with fscrypt but
-		// watches and guards the watch rel paths, others ~/config/discord accesses are ignored.
-		// This is actually handy, because adds an extra security layer where on shutdown the whole directory
-		// is re-encrypted not only those one of the watched groups. For steam this is not feasible
-		// too big because may contain games
+		// WatchRelPaths encrypts/decrypts the whole ~/.config/discord with fscrypt but only watches
+		// and guards the listed subpaths (other accesses are ignored, and the guarded set is
+		// faster). Bonus: on shutdown the entire directory is re-encrypted, not just the watched
+		// groups. Not feasible for Steam (too big, may contain games).
 		WatchRelPaths: []string{
 			".config/discord/Local Storage",
 			".config/discord/Session Storage",
@@ -404,11 +376,10 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/element-desktop": nil}},
 
 	// --- Gaming ----------------------------------------------------------------------
-	// Steam keeps login credentials (accounts, auth tokens) in
-	// config/*.vdf under the data dir and in registry.vdf under the legacy
-	// ~/.steam home — one resource, both locations guarded, one whitelist.
-	// The rest of the Steam tree holds no secrets; legacy ssfn* sentries
-	// stay unprotected (dirs-only guarding, low value alone).
+	// Steam keeps login credentials in config/*.vdf under the data dir and registry.vdf under the
+	// legacy ~/.steam: one resource, both locations guarded, one whitelist. The rest of the tree
+	// holds no secrets; legacy ssfn* sentries stay unprotected (dirs-only guarding, low value
+	// alone).
 	{Name: "Steam", RelPaths: []string{".local/share/Steam/config", ".local/share/Steam/userdata/*/config/localconfig.vdf", ".steam/registry.vdf"},
 		Whitelist: map[string][]string{
 			"/usr/bin/steam":                                                                     nil,
@@ -420,34 +391,27 @@ var Catalog = []CandidateDir{
 			"%HOME%/.local/share/Steam/steamapps/common/*/files/bin/wineserver":                  nil,
 			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine64-preloader":     nil,
 			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/*/wine64-preloader": nil,
-			// Wine's WoW64 mode (PROTON_USE_WOW64=1, the default of newer
-			// Proton builds) runs every process under wine-preloader instead
-			// of wine64-preloader: same role, same access.
+			// Wine's WoW64 mode (PROTON_USE_WOW64=1, default in newer Proton) runs every process
+			// under wine-preloader instead of wine64-preloader: same role, same access.
 			"%HOME%/.local/share/Steam/steamapps/common/*/files/lib/wine/*/wine-preloader":     nil,
 			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/lib/wine/*/wine-preloader": nil,
-			// Custom Proton builds (GE-Proton) ship their own wineserver, the
-			// counterpart of the steamapps/common one above. Without it a GE
-			// game — tainted because its wine64-preloader is whitelisted —
-			// cannot be reached by its own server (ptrace ATTACH denied).
+			// Custom Proton builds (GE-Proton) ship their own wineserver, counterpart of the
+			// steamapps/common one above. Without it a GE game (tainted because its
+			// wine64-preloader is whitelisted) can't be reached by its own server (ptrace ATTACH
+			// denied).
 			"%HOME%/.local/share/Steam/compatibilitytools.d/*/files/bin/wineserver": nil,
 			"/usr/bin/lsof": nil,
 			"/usr/bin/ps":   nil,
 		},
-		// Steam loads hundreds of libraries that are NOT root-owned system
-		// libraries, so none of them is auto-trusted: its own shipped runtime
-		// (ubuntu12_*, linux64), the Proton/Wine builds under
-		// compatibilitytools.d, and the pressure-vessel container runtimes.
-		// They are guarded read-only — everything may still read them, only
-		// Steam may write them — which is what makes them safe to load and
-		// what blocks planting an LD_PRELOAD payload in the tree.
+		// Steam loads hundreds of libraries that aren't root-owned (so none is auto-trusted): its
+		// shipped runtime (ubuntu12_*, linux64), Proton/Wine builds under compatibilitytools.d, and
+		// the pressure-vessel container runtimes. Guarded read-only (all may read, only Steam may
+		// write), which makes them safe to load and blocks planting an LD_PRELOAD payload.
 		//
-		// The runtime dirs matter most: at every launch pressure-vessel
-		// assembles a merged /usr for the container under a random
-		// `var/tmp-XXXXXX` name, so no file list could ever cover them.
-		// Guarding the STABLE parent does: the trust object walks a loaded
-		// library's ancestors, so one entry covers every future random
-		// child. Deliberately not listed is steamapps/common/* at large —
-		// that is the game library (hundreds of GiB of non-library data).
+		// The runtime dirs matter most: pressure-vessel assembles a merged /usr under a random
+		// `var/tmp-XXXXXX` each launch, so no file list could cover it. Guarding the STABLE parent
+		// does (the trust object walks a loaded library's ancestors). steamapps/common/* at large
+		// is deliberately not listed: it's the game library (hundreds of GiB of non-library data).
 		LibDirRelPaths: []string{
 			".local/share/Steam/ubuntu12_32",
 			".local/share/Steam/ubuntu12_64",
@@ -455,56 +419,40 @@ var Catalog = []CandidateDir{
 			".local/share/Steam/linux64",
 			".local/share/Steam/steamrt64",
 			".local/share/Steam/compatibilitytools.d",
-			// The container runtimes only (soldier, sniper, 4 — hence the
-			// underscore): their whitelisted pressure-vessel binaries load
-			// libraries from inside them. NOT the legacy scout runtime
-			// ("SteamLinuxRuntime", no suffix): it holds no program at all,
-			// only libraries for native games, which are not whitelisted and
-			// so never trust-checked — guarding it protected nothing, while
-			// its entry point must `ln -fns var/steam-runtime/amd64` on
-			// every launch, and the refusal made native scout games (Hollow
-			// Knight Silksong) exit instantly.
+			// Container runtimes only (soldier, sniper, 4; hence the underscore): their whitelisted
+			// pressure-vessel binaries load libraries from inside them. NOT the legacy scout
+			// runtime ("SteamLinuxRuntime", no suffix): it holds only libraries for non-whitelisted
+			// native games, so guarding it protected nothing, while its entry point must `ln -fns
+			// var/steam-runtime/amd64` each launch and the refusal made native scout games exit
+			// instantly.
 			".local/share/Steam/steamapps/common/SteamLinuxRuntime_*",
-			// Valve's Proton builds (steamapps/common/Proton 11.0, Proton -
-			// Experimental, ...): their whitelisted wine64-preloader loads
-			// Wine from files/lib. ONLY files/lib — the `proton` script
-			// (python3, which cannot be whitelisted: it would let any script
-			// write the tree) rewrites dist.lock in the Proton root on every
-			// launch and builds files/share/default_pfx, so guarding the
-			// whole folder would refuse every Valve-Proton game. GE-Proton
-			// needs no entry: compatibilitytools.d is guarded above.
+			// Valve's Proton builds (steamapps/common/Proton 11.0, Proton - Experimental, ...):
+			// their whitelisted wine64-preloader loads Wine from files/lib. ONLY files/lib: the
+			// `proton` script (python3, which can't be whitelisted) rewrites dist.lock and builds
+			// files/share/default_pfx each launch, so guarding the whole folder would refuse every
+			// Valve-Proton game. GE-Proton needs no entry (compatibilitytools.d is guarded above).
 			".local/share/Steam/steamapps/common/Proton*/files/lib",
 		},
-		// pressure-vessel OWNS the runtime trees above and rewrites them on
-		// every launch: it hardlinks the runtime's ~6.6k files into a fresh
-		// `var/tmp-XXXXXX`, then has capsule-capture-libs symlink the host's
-		// GPU drivers (libvdpau_nvidia.so, the Vulkan layers, libc) into
-		// `overrides/lib/*`, and pv-locale-gen build a locale archive. All of
-		// it lands INSIDE the read-only tree, so without these writers the
-		// container comes up with no GL/Vulkan and games do not start.
+		// pressure-vessel OWNS the runtime trees above and rewrites them every launch: it hardlinks
+		// the runtime's ~6.6k files into a fresh `var/tmp-XXXXXX`, capsule-capture-libs symlinks
+		// host GPU drivers (libvdpau_nvidia.so, Vulkan layers, libc) into `overrides/lib/*`, and
+		// pv-locale-gen builds a locale archive, all INSIDE the read-only tree. Without these
+		// writers the container has no GL/Vulkan and games don't start.
 		//
-		// The whole helper directories are listed, not individual tools: the
-		// set grows with every runtime update, and they are the tree's own
-		// vendor binaries — write-protected by this very guard, so they
-		// cannot be replaced without already holding write access. They are
-		// lib_binary (not Whitelist) entries precisely because they must
-		// NOT reach the Steam login credentials in this same entry.
-		// Only the tools that WRITE are listed, not every helper in the
-		// directory: pressure-vessel-wrap/-unruntime build the tmp tree and
-		// take its `.ref` locks, capsule-capture-libs symlinks the host
-		// drivers in, and the pv-*/srt-* helpers (pv-locale-gen, pv-adverb,
-		// srt-logger, srt-bwrap) run inside the container. The read-only
-		// probes next to them (check-gl, inspect-library, detect-platform,
-		// wflinfo, true) need nothing: the trees are world-readable.
+		// Whole helper directories are listed, not individual tools (the set grows with every
+		// runtime update); they're the tree's own vendor binaries, write-protected by this guard.
+		// They are lib_binary (not Whitelist) entries so they can't reach the Steam credentials in
+		// this entry. Only WRITING tools are listed: pressure-vessel-wrap/-unruntime (build the tmp
+		// tree, take `.ref` locks), capsule-capture-libs, and the pv-*/srt-* helpers
+		// (pv-locale-gen, pv-adverb, srt-logger, srt-bwrap). Read-only probes (check-gl,
+		// inspect-library, detect-platform, wflinfo, true) need nothing.
 		//
-		// Steam's own binaries write these trees too: the client self-updates
-		// ubuntu12_32/64, linux64 and steamrt64; steamwebhelper keeps CEF
-		// state beside itself (.cef-initialize-sentinel, .cef-dev-tools-size.vdf
-		// in ubuntu12_64); the overlay and Proton's wine live and write inside
-		// them. In the [libraries] block form a lib_dir inherits no whitelist,
-		// so these are exactly the unrestricted Whitelist entries the old
-		// nested form let write — minus lsof, which never writes, and the
-		// shell-script launchers, which run as their interpreter's inode.
+		// Steam's own binaries write these trees too: the client self-updates ubuntu12_32/64,
+		// linux64, steamrt64; steamwebhelper keeps CEF state beside itself (ubuntu12_64); the
+		// overlay and Proton's wine live and write inside them. A [libraries] lib_dir inherits no
+		// whitelist, so these are the unrestricted Whitelist entries the old nested form let write,
+		// minus lsof (never writes) and shell-script launchers (they run as their interpreter's
+		// inode).
 		LibDirWriters: []string{
 			"%HOME%/.local/share/Steam/*/steam",
 			"%HOME%/.local/share/Steam/*/steamwebhelper",
@@ -530,9 +478,8 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/nmcli": nil}},
 }
 
-// PathsFor returns every absolute candidate path for user, expanding
-// %USER%/%HOME%; AbsPaths entries ignore the user entirely. Order follows
-// RelPaths / AbsPaths.
+// PathsFor returns every absolute candidate path for user (expanding %USER%/%HOME%; AbsPaths ignore
+// user), in RelPaths/AbsPaths order.
 func (c *CandidateDir) PathsFor(home, user string) []string {
 	if c.IsSystem() {
 		out := make([]string, len(c.AbsPaths))
@@ -548,14 +495,10 @@ func (c *CandidateDir) PathsFor(home, user string) []string {
 	return out
 }
 
-// ExtraWatchPathsFor expands the entry's WatchRelPaths into absolute paths
-// for the given user (placeholders resolved, same as PathsFor), keeping only
-// the ones that currently exist — the same existence gate Discover applies to
-// a plain RelPaths entry. A missing sub-path must never reach the generated
-// config: the daemon treats every grouped `watch:` directive as a tree that
-// must resolve once its encryption root is unlocked and fails closed
-// (fatal) if it still doesn't, so writing a non-existent one out crashes the
-// daemon instead of silently under-protecting it.
+// ExtraWatchPathsFor expands WatchRelPaths to absolute paths for user, keeping only existing ones
+// (same gate as Discover for RelPaths). A missing sub-path must never reach the generated config:
+// the daemon treats every grouped `watch:` as a tree that must resolve after unlock and fails
+// closed (fatal) otherwise, so it would crash the daemon rather than under-protect.
 func (c *CandidateDir) ExtraWatchPathsFor(home, user string) []string {
 	if len(c.WatchRelPaths) == 0 {
 		return nil
@@ -571,15 +514,14 @@ func (c *CandidateDir) ExtraWatchPathsFor(home, user string) []string {
 	return out
 }
 
-// BinaryRule is one whitelisted binary and its allowed events (empty list
-// means every event).
+// BinaryRule is one whitelisted binary and its allowed events (empty = every event).
 type BinaryRule struct {
 	Path   string
 	Events []string
 }
 
-// ExpandWhitelist expands %USER%/%HOME% and returns rules sorted by path so
-// config generation is deterministic despite map ordering.
+// ExpandWhitelist expands %USER%/%HOME% and returns rules sorted by path (deterministic config
+// generation).
 func (c *CandidateDir) ExpandWhitelist(user, home string) []BinaryRule {
 	paths := make([]string, 0, len(c.Whitelist))
 	for bin := range c.Whitelist {
@@ -596,8 +538,7 @@ func (c *CandidateDir) ExpandWhitelist(user, home string) []BinaryRule {
 	return out
 }
 
-// ExpandLibs expands %USER%/%HOME% in the entry's allow_lib paths, sorted for
-// deterministic config generation.
+// ExpandLibs expands %USER%/%HOME% in allow_lib paths, sorted.
 func (c *CandidateDir) ExpandLibs(user, home string) []string {
 	out := make([]string, 0, len(c.Libs))
 	for _, lib := range c.Libs {
@@ -607,14 +548,9 @@ func (c *CandidateDir) ExpandLibs(user, home string) []string {
 	return out
 }
 
-// ExpandLibDirs expands the entry's LibDirRelPaths for the given user into
-// absolute directories: %HOME%/%USER% placeholders resolved, glob
-// metacharacters matched against the filesystem, non-directories and
-// non-existent paths dropped, result sorted and de-duplicated for
-// deterministic config generation. Dropping the missing ones here (rather
-// than writing them out) keeps the generated config honest: a library tree
-// that does not exist protects nothing, and versioned runtime directories
-// come and go with every Proton/runtime update.
+// ExpandLibDirs expands LibDirRelPaths for user into absolute directories: placeholders resolved,
+// globs matched, non-directories and missing paths dropped (a nonexistent tree protects nothing,
+// and versioned runtime dirs come and go), sorted and de-duplicated.
 func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
 	if len(c.LibDirRelPaths) == 0 {
 		return nil
@@ -647,13 +583,10 @@ func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
 	return out
 }
 
-// ExpandLibDirWriters expands %USER%/%HOME% in the entry's LibDirWriters,
-// matches glob metacharacters against the filesystem and keeps only existing
-// REGULAR files, sorted and de-duplicated for deterministic config
-// generation. Globbing a whole helper directory is the intended use (a
-// runtime's tool directory gains binaries with every update), which is why
-// directories and dangling symlinks are dropped here rather than written out
-// as writers that can never match a process.
+// ExpandLibDirWriters expands %USER%/%HOME% in LibDirWriters, matches globs, and keeps only
+// existing REGULAR files, sorted and de-duplicated. Globbing a whole helper directory is the
+// intended use (tool dirs gain binaries each update), so directories and dangling symlinks are
+// dropped rather than written as writers that can never match.
 func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
 	if len(c.LibDirWriters) == 0 {
 		return nil
@@ -674,8 +607,8 @@ func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
 			if seen[p] {
 				continue
 			}
-			// Stat, not Lstat: a symlinked helper resolves like any other
-			// whitelisted binary (the daemon records the target's inode).
+			// Stat, not Lstat: a symlinked helper resolves like any whitelisted binary (the daemon
+			// records the target's inode).
 			info, err := os.Stat(p)
 			if err != nil || !info.Mode().IsRegular() {
 				continue
@@ -688,10 +621,9 @@ func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
 	return out
 }
 
-// LibraryBlockFor assembles this entry's `[libraries "<name> (<user>)"]`
-// block for one user. The user is part of the name because library trees are
-// per-user (a second user's Steam runtime is a different directory with its
-// own writers) and the installer finds a block again by name on refresh.
+// LibraryBlockFor builds this entry's `[libraries "<name> (<user>)"]` block for one user. The user
+// is in the name because library trees are per-user (own runtime, own writers) and the installer
+// finds the block by name on refresh.
 func (c *CandidateDir) LibraryBlockFor(user, home string) LibraryBlock {
 	name := c.Name
 	if user != "" {
@@ -717,9 +649,9 @@ type Candidate struct {
 	Path  string
 }
 
-// Discover probes the catalog for a user, returning existing per-user paths.
-// AbsPaths entries are skipped (use DiscoverSystem/DiscoverForUsers). An
-// entry with several RelPaths yields one Candidate per existing location.
+// Discover probes the catalog for a user, returning existing per-user paths (AbsPaths skipped: see
+// DiscoverSystem/DiscoverForUsers). An entry with several RelPaths yields one Candidate per
+// existing location.
 func Discover(user User) []Candidate {
 	home := user.Home
 	var out []Candidate
@@ -754,8 +686,8 @@ func DiscoverSystem() []Candidate {
 	return out
 }
 
-// DiscoverForUsers probes every selected user's catalog paths plus the
-// system-level entries, deduplicated by path.
+// DiscoverForUsers probes every selected user's paths plus system-level entries, deduplicated by
+// path.
 func DiscoverForUsers(users []User) []Candidate {
 	var out []Candidate
 	seen := make(map[string]bool)
@@ -779,9 +711,8 @@ func DiscoverForUsers(users []User) []Candidate {
 	return out
 }
 
-// FilterExistingWhitelist drops missing entries and expands globs (*, ?, [)
-// to existing matches, re-evaluated every install so relocated apps are
-// picked up; matches inherit the pattern's events.
+// FilterExistingWhitelist drops missing entries and expands globs (*, ?, [) to existing matches,
+// re-evaluated every install so relocated apps are found; matches inherit the pattern's events.
 func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
 	var out []BinaryRule
 	for _, rule := range c.Entry.ExpandWhitelist(c.User.Name, c.User.Home) {

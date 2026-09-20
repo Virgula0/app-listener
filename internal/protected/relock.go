@@ -11,20 +11,16 @@ import (
 	"github.com/Virgula0/app-listener/internal/repository"
 )
 
-// Relock retry budget for the force-flush deprovision, mirroring the daemon
-// teardown (internal/usecase) and the fscrypt migration lock
-// (internal/fscrypt): a forced deprovision can fail with EBUSY while an
-// inode is still pinned, and the key must be gone before the caller
-// returns.
+// Relock retry budget for the force-flush deprovision, mirroring the daemon teardown
+// (internal/usecase) and migration lock (internal/fscrypt): a forced deprovision can hit EBUSY
+// while an inode is pinned, and the key must be gone before returning.
 const (
 	maxRelockRetries = 100
 	relockRetryDelay = 10 * time.Millisecond
 )
 
-// RelockResources locks path with the same two-pass approach as the
-// daemon's teardown: a plain (non-forced) lock first, then a force-flush
-// with a bounded EBUSY retry. A key that is already gone (ErrKeyMissing)
-// counts as fully locked.
+// RelockResources locks path as the daemon teardown does: a plain lock first, then a force-flush
+// with bounded EBUSY retry. An already-gone key (ErrKeyMissing) counts as locked.
 func RelockResources(vault *fscrypt.Vault, path string) error {
 	if err := vault.Lock(path, false); err != nil &&
 		!errors.Is(err, repository.ErrKeyBusy) && !errors.Is(err, repository.ErrKeyMissing) {

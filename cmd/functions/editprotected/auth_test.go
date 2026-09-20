@@ -131,14 +131,10 @@ func hashFileInode(t *testing.T) uint64 {
 	return st.Ino
 }
 
-// TestWriteHashFileInPlaceOverPlaceholder is the regression test for the
-// daemon-self-denial bug: WriteHashFile must rewrite an EXISTING file (the
-// daemon's zero-length bootstrap placeholder — see
-// cmd/functions/daemon/selfguards.go ensureHashFilePlaceholder) on its SAME
-// inode, never by creating a new directory entry and renaming it over —
-// while the daemon runs, that parent directory is guarded ReadOnly and does
-// not permit the self binary to create a new entry there, only to rewrite
-// an existing one.
+// Regression for the daemon-self-denial bug: WriteHashFile must rewrite an EXISTING file (the
+// daemon's zero-length placeholder, selfguards.go ensureHashFilePlaceholder) on its SAME inode,
+// never create-and-rename: while the daemon runs, the parent is guarded ReadOnly and allows the
+// self binary to rewrite an existing entry, not create one.
 func TestWriteHashFileInPlaceOverPlaceholder(t *testing.T) {
 	dir := t.TempDir()
 	old := hashFilePath

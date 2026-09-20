@@ -13,25 +13,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// hashBufPool hands out reusable 128 KiB read buffers so hashing a binary
-// never allocates a file-sized slice. The guard's binary verifier re-hashes
-// large binaries (Electron/Chromium blobs are 100-200 MiB) on a timer across
-// many guards; os.ReadFile there was allocating — and zeroing — gigabytes per
-// minute (confirmed by heap/CPU profiles).
+// hashBufPool hands out reusable 128 KiB read buffers so hashing never allocates a file-sized
+// slice: the binary verifier re-hashes large binaries (Electron/Chromium blobs, 100-200 MiB) on a
+// timer across many guards, and os.ReadFile allocated and zeroed gigabytes per minute (heap/CPU
+// profiles).
 var hashBufPool = sync.Pool{New: func() any { b := make([]byte, 128*1024); return &b }}
 
-// BinaryEntry describes an executable the engines key on: its path, a
-// sha256 hash of its contents, and its comm (task name, truncated to the
-// kernel's 16-byte limit).
+// BinaryEntry describes an executable the engines key on: path, sha256 of contents, and comm (task
+// name, truncated to the kernel's 16 bytes).
 type BinaryEntry struct {
 	Path string
 	Hash [sha256.Size]byte
 	Comm string
 }
 
-// ComputeBinaryEntry hashes the file at path and derives its comm. It is
-// shared by the guard, network guard and network monitor engines. The file is
-// streamed through a pooled buffer, never read whole into memory.
+// ComputeBinaryEntry hashes the file at path (streamed through a pooled buffer, never read whole)
+// and derives its comm. Shared by the guard, network guard and network monitor.
 func ComputeBinaryEntry(path string) (BinaryEntry, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -92,10 +89,9 @@ func LstatInode(path string) (dev, ino uint64, err error) {
 	return uint64((unix.Major(s.Dev) << 20) | unix.Minor(s.Dev)), s.Ino, nil
 }
 
-// BinaryStat is a cheap change-detection fingerprint of a file: a hash is
-// only worth recomputing when Size, MtimeNs or CtimeNs moved (an in-place
-// overwrite always bumps mtime and ctime; ctime cannot be restored without
-// clock tampering).
+// BinaryStat is a cheap change-detection fingerprint: recompute the hash only when Size, MtimeNs or
+// CtimeNs moved (an in-place overwrite always bumps mtime and ctime; ctime can't be restored
+// without clock tampering).
 type BinaryStat struct {
 	Dev, Ino         uint64
 	Size             int64

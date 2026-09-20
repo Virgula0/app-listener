@@ -21,10 +21,9 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// pickUsers asks which local users the installation should protect. Every
-// user (root included) is preselected; root's /root is probed like any
-// other user. The per-user ssh-agent unit is offered later, and only for a
-// user whose ~/.ssh ends up guarded (see offerSSHAgentUnits).
+// pickUsers asks which local users to protect. All (root included) are preselected. The per-user
+// ssh-agent unit is offered later, only for a user whose ~/.ssh ends up guarded
+// (offerSSHAgentUnits).
 func pickUsers() ([]inst.User, error) {
 	users, err := inst.ListUsers()
 	if err != nil {
@@ -61,16 +60,15 @@ func pickUsers() ([]inst.User, error) {
 	return picked, nil
 }
 
-// catalogGroup bundles every discovered path of one resource (one catalog
-// Name, one user) behind a single TUI checkbox — a resource stored in more
-// than one location (Steam's data dir + legacy home) is selected as a unit.
+// catalogGroup bundles every discovered path of one resource (one catalog Name, one user) behind a
+// single checkbox, so a multi-location resource (Steam's data dir + legacy home) is selected as a
+// unit.
 type catalogGroup struct {
 	label      string
 	candidates []inst.Candidate
 }
 
-// groupCandidates collapses the per-path candidates into per-resource
-// groups, preserving first-seen order.
+// groupCandidates collapses per-path candidates into per-resource groups, in first-seen order.
 func groupCandidates(cands []inst.Candidate) []catalogGroup {
 	type key struct{ name, user string }
 	var order []key
@@ -105,9 +103,8 @@ func groupCandidates(cands []inst.Candidate) []catalogGroup {
 	return out
 }
 
-// pickDirectories probes the catalog for every selected user (and the
-// system-level entries) and asks which of the found critical directories
-// to protect. All are preselected.
+// pickDirectories probes the catalog for every selected user (plus system entries) and asks which
+// found directories to protect. All preselected.
 func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 	candidates := inst.DiscoverForUsers(users)
 	if len(candidates) == 0 {
@@ -126,9 +123,8 @@ func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 	return picked, nil
 }
 
-// pickFromCandidates groups the candidates per resource (one checkbox per
-// catalog Name + user) and runs the preselected multi-select, returning the
-// flattened per-path candidates of every picked group.
+// pickFromCandidates groups candidates per resource (one checkbox per catalog Name + user), runs
+// the multi-select, and returns the flattened per-path candidates of picked groups.
 func pickFromCandidates(candidates []inst.Candidate, title, description string) ([]inst.Candidate, error) {
 	groups := groupCandidates(candidates)
 	opts := make([]huh.Option[int], 0, len(groups))
@@ -159,9 +155,8 @@ func pickFromCandidates(candidates []inst.Candidate, title, description string) 
 	return picked, nil
 }
 
-// addManualDirectories asks for additional paths that were not discovered
-// by the catalog. A manually entered path that does not exist is a fatal
-// error, per the installer contract.
+// addManualDirectories asks for extra paths not found by the catalog. A manually entered path that
+// doesn't exist is a fatal error (installer contract).
 func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error) {
 	for {
 		var input string
@@ -205,9 +200,8 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 	}
 }
 
-// sectionsFromCandidates turns discovered/added candidates into config
-// sections: the filtered whitelist, encryption on by default, and any
-// grouped extra watch sub-paths from the catalog entry.
+// sectionsFromCandidates turns candidates into config sections: filtered whitelist, encryption on
+// by default, and the catalog entry's grouped extra watch sub-paths.
 func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
 	for i := range candidates {
@@ -222,11 +216,9 @@ func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	return sections
 }
 
-// libraryBlocksFromCandidates returns one [libraries] block per catalog
-// entry and user, in candidate order. One entry can produce several watch
-// sections (Steam has three locations), but its library directives describe
-// the APPLICATION, so they are declared once, in their own block, rather
-// than nested under one of its sections.
+// libraryBlocksFromCandidates returns one [libraries] block per catalog entry and user, in
+// candidate order. An entry may yield several watch sections (Steam has three locations), but its
+// library directives describe the APPLICATION, so they're declared once in their own block.
 func libraryBlocksFromCandidates(candidates []inst.Candidate) []inst.LibraryBlock {
 	seen := make(map[string]bool, len(candidates))
 	var blocks []inst.LibraryBlock
@@ -242,17 +234,15 @@ func libraryBlocksFromCandidates(candidates []inst.Candidate) []inst.LibraryBloc
 	return blocks
 }
 
-// editConfig renders the config from the selected candidates and opens the
-// embedded editor.
+// editConfig renders the config from the selected candidates and opens the embedded editor.
 func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, error) {
 	return runConfigEditor(
 		"app-listener daemon.conf — review and save (Ctrl+S)",
 		inst.GenerateConf(sectionsFromCandidates(candidates), libraryBlocksFromCandidates(candidates)))
 }
 
-// runConfigEditor opens initial in the embedded editor and validates the
-// result through the same strict parser the daemon uses; an invalid config
-// re-opens the editor until it parses or the user aborts (Esc).
+// runConfigEditor opens initial in the embedded editor and validates the result with the daemon's
+// strict parser; an invalid config re-opens the editor until it parses or the user aborts (Esc).
 func runConfigEditor(title, initial string) (string, *daemonconfig.Config, error) {
 	confText := initial
 	for {
@@ -271,8 +261,7 @@ func runConfigEditor(title, initial string) (string, *daemonconfig.Config, error
 	}
 }
 
-// validateConfigText parses the edited configuration through the same
-// strict parser the daemon uses.
+// validateConfigText parses the edited config with the daemon's strict parser.
 func validateConfigText(text string) (*daemonconfig.Config, error) {
 	tmp, err := os.CreateTemp("", "app-listener-conf-*.conf")
 	if err != nil {
@@ -290,28 +279,21 @@ func validateConfigText(text string) (*daemonconfig.Config, error) {
 	return daemonconfig.Load(tmpPath)
 }
 
-// askEncryption asks, per resource that is NOT yet encrypted and that
-// declares need_encryption: true, whether fscrypt encryption is required
-// (default yes) and records the decision back into the config text.
-// Resources declared need_encryption: false are never asked — the config
-// already says no encryption and the installer honors it. Already-encrypted
-// resources are never asked: they keep need_encryption: true and are not
-// migrated (no backup is created for them). Both directories and single
-// regular files are offered; symlinks, hardlinks and special files never
-// reach this step (the daemon config parser refuses them). It returns the
-// updated text and the list of resources that still need to be encrypted.
-// askEncryption asks the fscrypt question once per ENCRYPTION GROUP (not
-// per watch path): grouped sections share the group's vault, so the answer
-// and the in-place encryption target the group root. Regression guard for
-// the grouped-watch config: addressing sections by watch sub-path failed
-// with "section not found" (a grouped config has one section header per
-// group, not one per watch path).
+// askEncryption asks, per resource that is NOT yet encrypted and declares need_encryption: true,
+// whether fscrypt encryption is required (default yes), recording the answer in the config text.
+// Never asked: need_encryption: false resources (honored as-is) and already-encrypted ones (keep
+// need_encryption: true, not migrated, no backup). Directories and single regular files are
+// offered; symlinks, hardlinks and special files never reach here (the parser refuses them).
+// Returns the updated text and the resources still to encrypt.
+//
+// Asked once per ENCRYPTION GROUP, not per watch path: grouped sections share the group's vault, so
+// the answer and in-place encryption target the group root (addressing by watch sub-path failed
+// with "section not found": a grouped config has one header per group).
 func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Config) (text string, toEncrypt []string, err error) {
 	for _, r := range cfg.EncryptionGroups() {
-		// Grouped sections share ONE [watch <root>] header: the fscrypt
-		// lifecycle and every config-text patch address the encryption
-		// root, never a watch sub-path (which has no section header of its
-		// own — SetNeedEncryption would fail "section not found").
+		// Grouped sections share ONE [watch <root>] header: the fscrypt lifecycle and every
+		// config-text patch address the encryption root, never a watch sub-path (no header of its
+		// own; SetNeedEncryption would fail "section not found").
 		sectionPath := r.EncryptionRootOrPath()
 		if !r.NeedEncryption {
 			log.Infof("%s declares need_encryption: false: skipping the encryption question", sectionPath)
@@ -350,15 +332,11 @@ func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Confi
 	return cfgText, toEncrypt, nil
 }
 
-// resolveCatalogEntry performs a reverse lookup: given an absolute path from
-// the existing daemon.conf, finds which Catalog entry it originated from.
-// System-level entries (AbsPaths) are matched by exact path. User-level
-// entries (RelPaths) are matched by computing PathsFor for each known user —
-// any of an entry's locations matches its shared whitelist. Grouped entries
-// (WatchRelPaths) also match their watch sub-paths — e.g. ~/.config/discord/
-// Local Storage resolves to the Discord entry — so a refresh re-expands the
-// whitelist of every grouped section. Returns nil when the section was
-// user-added and has no catalog origin.
+// resolveCatalogEntry reverse-looks-up which Catalog entry an absolute path from the existing
+// daemon.conf came from. AbsPaths entries match exactly; RelPaths entries via PathsFor for each
+// known user (any location matches the shared whitelist); WatchRelPaths entries also match their
+// watch sub-paths (~/.config/discord/Local Storage -> Discord), so a refresh re-expands every
+// grouped section. Returns nil for a user-added section.
 func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
 	if entry, user := findCatalogRoot(resourcePath, users); entry != nil {
 		return entry, user
@@ -366,8 +344,8 @@ func resolveCatalogEntry(resourcePath string, users []inst.User) (*inst.Candidat
 	return findCatalogWatchSubPath(resourcePath, users)
 }
 
-// catalogEntryMatch returns the user whose expansion of entry contains a
-// path satisfying match, or nil. System entries yield the zero user.
+// catalogEntryMatch returns the user whose expansion of entry contains a path satisfying match, or
+// nil. System entries yield the zero user.
 func catalogEntryMatch(entry *inst.CandidateDir, users []inst.User, match func(catalogPath string) bool) *inst.User {
 	if entry.IsSystem() {
 		for _, p := range entry.PathsFor("", "") {
@@ -399,9 +377,8 @@ func findCatalogRoot(resourcePath string, users []inst.User) (*inst.CandidateDir
 	return nil, nil
 }
 
-// findCatalogWatchSubPath matches grouped watch sub-paths: a resource path
-// strictly inside a catalog root resolves to that entry (the `watch:` group),
-// so refreshes re-expand the whitelist of every grouped section.
+// findCatalogWatchSubPath matches grouped watch sub-paths: a resource path strictly inside a
+// catalog root resolves to that entry, so refreshes re-expand every grouped section.
 func findCatalogWatchSubPath(resourcePath string, users []inst.User) (*inst.CandidateDir, *inst.User) {
 	for i := range inst.Catalog {
 		entry := &inst.Catalog[i]
@@ -417,21 +394,17 @@ func isInsidePath(path, dir string) bool {
 	return path != dir && strings.HasPrefix(path+"/", dir+"/")
 }
 
-// errNoCatalogMatch means the installed config has no section that maps to a
-// catalog entry (an all-manual config). Interactive callers surface it as an
-// error; automated ones (`--yes`, the package hooks and the boot unit) treat
-// it as "nothing to refresh".
+// errNoCatalogMatch: the installed config has no section mapping to a catalog entry (all-manual).
+// Interactive callers surface it as an error; automated ones (`--yes`, package hooks, boot unit)
+// treat it as "nothing to refresh".
 var errNoCatalogMatch = errors.New("no catalog entries match any configured directory")
 
-// updateCatalogConfig reads the installed daemon.conf, re-expands the
-// catalog whitelist for every matched section and shows a diff for
-// confirmation. Unmatched (user-added) sections are preserved verbatim.
-// When autoConfirm is true the diff is logged and the config is overwritten
-// without prompting. In live mode the daemon keeps running: its vaults are
-// already unlocked and guarded, so sections are re-scanned without touching
-// lock state, and the caller applies the patched config via SIGHUP reload.
-// Returns whether the config file was actually written (the caller must
-// deliver the change to the daemon only then).
+// updateCatalogConfig reads the installed daemon.conf, re-expands the catalog whitelist for every
+// matched section and shows a diff for confirmation; unmatched (user-added) sections are kept
+// verbatim. autoConfirm logs the diff and overwrites without prompting. In live mode the daemon
+// keeps running (vaults already unlocked and guarded), so sections are re-scanned without touching
+// lock state and the caller applies the config via SIGHUP. Returns whether the file was written
+// (deliver to the daemon only then).
 func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm, live bool) (changed bool, err error) {
 	oldText, err := os.ReadFile(systemd.SystemConfigPath)
 	if err != nil {
@@ -453,11 +426,9 @@ func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm, live bool) (changed 
 
 	confText := string(oldText)
 	patched := 0
-	// Grouped configs: iterate ENCRYPTION GROUPS, not resources — a grouped
-	// section is one [watch <root>] header shared by all its watch paths,
-	// so the whitelist is re-expanded and written exactly once per group.
-	// Regression guard for the first grouped implementation: patching by
-	// watch sub-path failed with "section not found in configuration".
+	// Iterate ENCRYPTION GROUPS, not resources: a grouped section is one [watch <root>] header
+	// shared by its watch paths, so the whitelist is re-expanded once per group (patching by watch
+	// sub-path failed with "section not found in configuration").
 	for _, r := range cfg.EncryptionGroups() {
 		text, ok, patchErr := patchCatalogSection(vault, confText, r, users, live)
 		if patchErr != nil {
@@ -499,31 +470,22 @@ func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm, live bool) (changed 
 	return true, nil
 }
 
-// patchCatalogSection re-expands the whitelist for one config resource
-// if it matches a catalog entry. Returns the updated text and true when
-// patched, or the original text and false when the section is user-added.
+// patchCatalogSection re-expands the whitelist for one config resource if it matches a catalog
+// entry. Returns the updated text and true, or the original and false for a user-added section.
 //
-// Encrypted resources are unlocked for the re-scan under an EPHEMERAL
-// self-only guard attached BEFORE the key is provisioned: the unlock window
-// then denies every reader except the root installer process — the same
-// protection discipline as the running daemon — instead of leaving the tree
-// readable with no LSM attached. The guard stays attached through the
-// re-lock and is dropped only once the vault is keyless; a vault that
-// cannot be re-locked is a hard error, so the hook fails visibly and the
-// config write / daemon restart never proceed on an unresolved vault.
+// Encrypted resources are unlocked for the re-scan under an EPHEMERAL self-only guard attached
+// BEFORE the key is provisioned, so the unlock window denies every reader except the root installer
+// (same discipline as the daemon). The guard stays attached through the re-lock and drops only once
+// the vault is keyless; a vault that can't be re-locked is a hard error, so the config write /
+// daemon restart never proceed on an unresolved vault.
 //
-// In live mode (live=true) the daemon keeps running: its vaults are already
-// unlocked and guarded, so the re-scan touches no lock state at all and no
-// ephemeral guard is needed (the running guards + the installer's
-// GUARD_ALLOW_ROOT identity already protect the tree). A resource whose
-// fresh whitelist comes back EMPTY while the section previously had entries
-// is a hard error: that state means the vault is locked or this installer
-// is not the running daemon's binary — persisting it would silently shrink
-// the whitelist.
+// Live mode (live=true): the vaults are already unlocked and guarded, so the re-scan touches no
+// lock state and needs no ephemeral guard. A fresh whitelist that comes back EMPTY while the
+// section had entries is a hard error (vault locked, or this installer isn't the running daemon's
+// binary): persisting it would silently shrink the whitelist.
 func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.Resource, users []inst.User, live bool) (updated string, patched bool, err error) {
-	// The SECTION path is what the text helpers address: the group root for
-	// grouped sections (`watch:` directives — one [watch <root>] header
-	// shared by all watch paths), the resource path otherwise.
+	// The SECTION path is what the text helpers address: the group root for grouped sections
+	// (`watch:` directives), the resource path otherwise.
 	sectionPath := r.EncryptionRootOrPath()
 
 	entry, user := resolveCatalogEntry(sectionPath, users)
@@ -532,15 +494,14 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 		return confText, false, nil
 	}
 
-	// Grouped sections (watch: directives) share one encryption root AND one
-	// [watch <root>] header carrying one shared whitelist: the vault-level
-	// lifecycle (ephemeral-guarded unlock, re-lock) and the whitelist text
-	// patch both address that root, never a watch sub-path.
+	// Grouped sections share one encryption root AND one [watch <root>] header with one shared
+	// whitelist: the vault lifecycle (ephemeral-guarded unlock, re-lock) and the whitelist patch
+	// both address that root, never a watch sub-path.
 	root := sectionPath
 
 	wasEncrypted := false
-	// The ephemeral guard the unlock attached, kept for the re-lock: a
-	// file-vault lock rewrites the file under that same guard.
+	// The ephemeral guard from the unlock, kept for the re-lock (a file-vault lock rewrites the
+	// file under that guard).
 	var relockGuard *guard.Guard
 	if r.NeedEncryption {
 		encrypted, encErr := vault.IsEncrypted(root)
@@ -574,10 +535,9 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 
 	if wasEncrypted && !live {
 		log.Infof("re-locking %s ...", root)
-		// The ephemeral guard is still attached: until the key is gone the
-		// tree keeps denying every non-root reader. Retry unbounded, like
-		// the daemon's lockdown — a pinned fd must not downgrade this to a
-		// warning that leaves the vault unlocked once the process exits.
+		// Ephemeral guard still attached: until the key is gone the tree denies every non-root
+		// reader. Retry unbounded like the daemon's lockdown: a pinned fd must not downgrade this
+		// to a warning that leaves the vault unlocked after exit.
 		lockVaultFully(vault, root, relockGuard)
 	}
 
@@ -585,14 +545,11 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 	if patchErr != nil {
 		return "", false, fmt.Errorf("patching section %s: %w", sectionPath, patchErr)
 	}
-	// The whitelist is rewritten; the library directives are only ever ADDED
-	// to, in the application's own [libraries] block (EnsureLibraryBlock).
-	// Catalog-generated directives still nested under this watch section by
-	// an older installer are moved there first — same lines, new home;
-	// anything hand-written in the section stays put. Refreshing them
-	// matters as much as the whitelist: when the catalog moves a binary from
-	// an entry's whitelist to its library-tree writers, only this puts the
-	// writer back — the rewrite above just drops the old line.
+	// Whitelist rewritten; library directives are only ever ADDED to, in the app's own [libraries]
+	// block (EnsureLibraryBlock). Catalog-generated directives nested under this watch section by
+	// an older installer are moved there first (hand-written ones stay). Refreshing them matters as
+	// much as the whitelist: when the catalog moves a binary from an entry's whitelist to its lib
+	// writers, only this re-adds the writer (the rewrite above just drops the old line).
 	block := entry.LibraryBlockFor(user.Name, user.Home)
 	migrated, migrateErr := inst.RemoveSectionLibDirectives(updated, sectionPath, block.DirectiveLines())
 	if migrateErr != nil {
@@ -601,9 +558,8 @@ func patchCatalogSection(vault *fscrypt.Vault, confText string, r *daemonconfig.
 	return inst.EnsureLibraryBlock(migrated, &block), true, nil
 }
 
-// parseSectionWhitelist extracts the binary paths currently listed in the
-// [watch <path>] section of confText, for the live empty-whitelist safety
-// check. Returns nil when the section is absent.
+// parseSectionWhitelist extracts the binary paths listed in the [watch <path>] section of confText
+// (for the live empty-whitelist check). nil when the section is absent.
 func parseSectionWhitelist(confText, resourcePath string) []string {
 	var out []string
 	inSection := false
@@ -621,9 +577,8 @@ func parseSectionWhitelist(confText, resourcePath string) []string {
 		if trimmed == "need_encryption: true" || trimmed == "need_encryption: false" {
 			continue
 		}
-		// A binary line's path may be double-quoted (spaces and all, like the
-		// installer always emits); take it whole rather than splitting on
-		// whitespace, exactly like the real daemon config parser.
+		// A binary line's path may be double-quoted (spaces included, as the installer emits): take
+		// it whole, like the daemon's parser.
 		if strings.HasPrefix(trimmed, `"`) {
 			if end := strings.IndexByte(trimmed[1:], '"'); end != -1 {
 				out = append(out, trimmed[1:1+end])
@@ -637,21 +592,17 @@ func parseSectionWhitelist(confText, resourcePath string) []string {
 	return out
 }
 
-// unlockUnderGuard attaches an ephemeral self-only whitelist guard on path
-// BEFORE provisioning the key, so the unlock window denies every reader
-// except the root installer process (GUARD_ALLOW_ROOT — the same uid-gated
-// mechanism the daemon uses for itself). The caller must Stop the returned
-// guard only after the vault is confirmed locked back (lockVaultFully).
+// unlockUnderGuard attaches an ephemeral self-only whitelist guard on path BEFORE provisioning the
+// key, so the unlock window denies every reader except the root installer (GUARD_ALLOW_ROOT, same
+// uid-gated mechanism as the daemon). The caller must Stop the guard only after the vault is
+// confirmed locked (lockVaultFully).
 //
-// A single-file resource (userspace file vault) is transformed IN PLACE —
-// the unlock truncates and rewrites the file's own bytes — which the
-// read-only self mask denies. Exactly like the daemon (vaultOpForGuard), the
-// write is granted only for the duration of the vault call via
-// WithSelfVaultAccess, and the crash-recovery sidecar is pre-staged before
-// the guard attaches, since creating it beside a guarded file is denied once
-// the guard is live. Regression guard: without both, `install
-// --update-catalog-only` failed with "truncate …: operation not permitted"
-// on any file-vault section (e.g. Steam's registry.vdf).
+// A single-file resource (userspace file vault) is transformed IN PLACE (the unlock truncates and
+// rewrites its own bytes), which the read-only self mask denies. As in the daemon
+// (vaultOpForGuard), write is granted only for the vault call via WithSelfVaultAccess, and the
+// recovery sidecar is pre-staged before the guard attaches (creating it beside a guarded file is
+// denied once live). Without both, `install --update-catalog-only` failed with "truncate ...:
+// operation not permitted" on file-vault sections (e.g. Steam's registry.vdf).
 func unlockUnderGuard(vault *fscrypt.Vault, path string) (*guard.Guard, error) {
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {
@@ -674,10 +625,9 @@ func unlockUnderGuard(vault *fscrypt.Vault, path string) (*guard.Guard, error) {
 	return ephemeral, nil
 }
 
-// vaultOpUnderGuard runs a vault Unlock/Lock on path, widening g's self mask
-// to write only when path is a file vault (a directory's fscrypt lifecycle
-// is pure kernel-keyring work and never needs it). g may be nil: op still
-// runs, so a denial surfaces as a real error rather than a silent skip.
+// vaultOpUnderGuard runs a vault Unlock/Lock on path, widening g's self mask to write only for a
+// file vault (a directory's lifecycle is pure keyring work). g may be nil: op still runs so a
+// denial surfaces as an error, not a silent skip.
 func vaultOpUnderGuard(g *guard.Guard, path string, op func() error) error {
 	info, statErr := os.Stat(path)
 	if statErr != nil || !info.Mode().IsRegular() || g == nil {
@@ -686,23 +636,18 @@ func vaultOpUnderGuard(g *guard.Guard, path string, op func() error) error {
 	return g.WithSelfVaultAccess(op)
 }
 
-// lockVaultFully force-flushes the vault key until it is gone, with the same
-// never-give-up discipline as the daemon's lockdown: the caller keeps the
-// ephemeral guard attached, so the tree stays guarded for as long as this
-// retry loop runs. A persistent pin blocks the pacman hook with a loud log
-// instead of silently leaving the vault unlocked.
-// liveEmptyWhitelistRejected is the live refresh's fail-closed contract: a
-// re-scan that comes back empty for a previously-populated encrypted
-// resource must be refused. That state means the vault is locked (stat on
-// plaintext names fails) or this installer binary is not the running
-// daemon's (reads denied) — persisting it would silently shrink the
-// whitelist. Non-encrypted resources are exempt: an empty re-scan there is
-// a legitimately uninstalled binary ("empty whitelists still deny
-// everything").
+// liveEmptyWhitelistRejected is the live refresh's fail-closed contract: a re-scan that is empty
+// for a previously-populated encrypted resource is refused (vault locked, or this installer isn't
+// the running daemon's binary); persisting it would silently shrink the whitelist. Non-encrypted
+// resources are exempt: empty there is a legitimately uninstalled binary.
 func liveEmptyWhitelistRejected(encrypted, live bool, fresh, old int) bool {
 	return live && encrypted && fresh == 0 && old > 0
 }
 
+// lockVaultFully force-flushes the vault key until it is gone, never giving up (like the daemon's
+// lockdown): the caller keeps the ephemeral guard attached, so the tree stays guarded while this
+// retries. A persistent pin blocks the pacman hook with a loud log rather than leaving the vault
+// unlocked.
 func lockVaultFully(vault *fscrypt.Vault, path string, g *guard.Guard) {
 	for {
 		// Widened per attempt, never across the retry sleep.

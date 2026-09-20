@@ -27,12 +27,10 @@ const (
 	trustWriteblock uint32 = 1
 )
 
-// TrustGuard owns guard_trusted_files and the daemon-wide trusted-binary /
-// trusted-library protections (see guard_trust.bpf.c). It is created and
-// attached ONCE for the whole daemon, independent of the per-resource guards.
-//
-// Both protections (#1 writer attribution and #2 the library-load allowlist)
-// are always enforced once the programs attach.
+// TrustGuard owns guard_trusted_files and the daemon-wide trusted-binary/library protections
+// (guard_trust.bpf.c). Created and attached ONCE for the whole daemon, independent of the
+// per-resource guards. Both protections (#1 writer attribution, #2 library-load allowlist) are
+// always enforced once attached.
 type TrustGuard struct {
 	objs  GuardTrustObjects
 	links []link.Link
@@ -62,9 +60,8 @@ func NewTrustGuard() (*TrustGuard, error) {
 	return t, nil
 }
 
-// SetTrusted (re)populates guard_trusted_files from the resolved binary and
-// library paths. A path present as both a binary and a library carries both
-// flags. Unresolvable paths are skipped with a warning.
+// SetTrusted (re)populates guard_trusted_files from resolved binary and library paths. A path that
+// is both carries both flags. Unresolvable paths are skipped with a warning.
 func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	flags := make(map[GuardInodeKey]uint8)
 	add := func(path string, flag uint8) {
@@ -91,9 +88,8 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	return nil
 }
 
-// SetGuardedDirs records the (dev, ino) of every guarded resource root, so a
-// library loaded from inside one of those write-protected trees is trusted
-// without an explicit allow_lib entry (see under_guarded_tree in
+// SetGuardedDirs records the (dev, ino) of every guarded resource root so a library loaded from
+// inside a write-protected tree is trusted without allow_lib (under_guarded_tree in
 // guard_trust.bpf.c). Unresolvable paths are skipped with a warning.
 func (t *TrustGuard) SetGuardedDirs(roots []string) error {
 	v := uint8(1)
@@ -129,10 +125,8 @@ func (t *TrustGuard) hooks() []trustHook {
 	}
 }
 
-// Start attaches every trust LSM program and begins draining events. Each
-// attach is best-effort: a failure logs and that one protection is skipped,
-// never blocking the daemon. Enforcement of the per-resource guards is
-// unaffected regardless.
+// Start attaches every trust LSM program and drains events. Each attach is best-effort: a failure
+// logs and skips that protection, never blocking the daemon or the per-resource guards.
 func (t *TrustGuard) Start() error {
 	for _, h := range t.hooks() {
 		l, err := link.AttachLSM(link.LSMOptions{Program: h.prog})
@@ -157,15 +151,13 @@ func (t *TrustGuard) Start() error {
 	return nil
 }
 
-// attachMemfdProvenance attaches the one non-LSM trust program: an fexit on
-// the kernel's memfd allocation, which records that a whitelisted process
-// created this anonymous inode (see trust_memfd_alloc in guard_trust.bpf.c).
-// A memfd never reaches security_file_open, so without it the first step of a
-// GPU driver's JIT fallback chain has no provenance.
+// attachMemfdProvenance attaches the one non-LSM trust program: an fexit on the kernel's memfd
+// allocation, recording that a whitelisted process created this anonymous inode (trust_memfd_alloc
+// in guard_trust.bpf.c). A memfd never reaches security_file_open, so without it the first step of
+// a GPU driver's JIT fallback chain has no provenance.
 //
-// Best-effort, and fail-closed when it fails: without the record a memfd
-// exec-map stays denied exactly as before, and the driver falls through to its
-// O_TMPFILE / mkstemp fallbacks, which the file_open program does see.
+// Best-effort and fail-closed: without the record a memfd exec-map stays denied and the driver
+// falls through to O_TMPFILE/mkstemp, which file_open sees.
 func (t *TrustGuard) attachMemfdProvenance() {
 	l, err := link.AttachTracing(link.TracingOptions{
 		Program:    t.objs.TrustMemfdAlloc,

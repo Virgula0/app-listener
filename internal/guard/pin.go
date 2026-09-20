@@ -24,17 +24,14 @@ const pinFilePrefix = "al-"
 // keep its pins tidy; a pre-existing one is reused only when dirIsRootOwnedSafe.
 const pinSubdir = "app-listener"
 
-// ResolvePinBase makes link pinning usable and returns the directory pin
-// files go in — or "" when this host cannot support pinning, in which case
-// the caller runs with live-only enforcement (no SIGKILL survival) and should
-// say so loudly. mountpoint must be a bpffs mount (link pins only survive
-// process death on bpffs); a systemd host has /sys/fs/bpf mounted very early,
-// so this mounts it only where it is missing (a container, a minimal init).
+// ResolvePinBase makes link pinning usable and returns the directory for pin files, or "" when the
+// host can't pin (the caller then runs live-only, no SIGKILL survival, and should say so loudly).
+// mountpoint must be bpffs (pins survive process death only there); systemd hosts mount /sys/fs/bpf
+// early, so this mounts it only where missing (containers, minimal init).
 //
-// Pin files are kept FLAT — at most one shallow subdirectory, names limited
-// to [a-z0-9-]: some hardened kernels reject deep mkdir or unusual characters
-// on bpffs, and a flat BPF_OBJ_PIN is the lowest common denominator every
-// bpffs supports.
+// Pin files are FLAT (at most one shallow subdirectory, names [a-z0-9-]): some hardened kernels
+// reject deep mkdir or unusual characters on bpffs, and a flat BPF_OBJ_PIN is the lowest common
+// denominator.
 func ResolvePinBase(mountpoint string) string {
 	onBpffs, err := isBpffs(mountpoint)
 	if err != nil {
@@ -49,11 +46,10 @@ func ResolvePinBase(mountpoint string) string {
 			return ""
 		}
 	}
-	// Prefer one tidy subdirectory; fall back to the mount root (kernel-created,
-	// not adoptable by a local user) if the kernel refuses even a single mkdir
-	// on bpffs, or if a subdirectory is already there but is not a plain
-	// root-owned, non-world-writable directory — a local user who reached the
-	// bpffs mount must not be able to seed or observe our pins.
+	// Prefer one subdirectory; fall back to the mount root (kernel-created, not adoptable by a
+	// local user) if the kernel refuses even one mkdir, or a subdirectory exists that isn't a plain
+	// root-owned, non-world-writable directory: a local user reaching the bpffs mount must not seed
+	// or observe our pins.
 	sub := filepath.Join(mountpoint, pinSubdir)
 	switch mkErr := os.Mkdir(sub, 0o700); {
 	case mkErr == nil:
@@ -121,12 +117,10 @@ func isBpffs(path string) (bool, error) {
 	return st.Type == unix.BPF_FS_MAGIC, nil
 }
 
-// PinPrefix returns the flat pin-file prefix for one guard: every hook of
-// that guard is pinned at PinPrefix(...)+<hook>. The name encodes the daemon
-// generation (so CleanupStalePins can tell live pins from a killed
-// predecessor's) and a hash of the resource path (so two guards never
-// collide). Deliberately all lowercase [a-z0-9-]: no dots, no underscores,
-// no nesting — shapes some hardened bpffs implementations reject.
+// PinPrefix returns the flat pin prefix for one guard (every hook pinned at PinPrefix(...)+<hook>).
+// The name encodes the daemon generation (CleanupStalePins tells live from a killed predecessor's)
+// and a hash of the resource path (no collisions). Lowercase [a-z0-9-] only: no dots, underscores
+// or nesting, which some hardened bpffs reject.
 func PinPrefix(base, generation, resourcePath string) string {
 	if base == "" {
 		return "" // pinning disabled on this host
@@ -161,10 +155,9 @@ func sanitizeGen(g string) string {
 	return b.String()
 }
 
-// CleanupStalePins removes every pin file this daemon left in base whose
-// generation is not in keep: it unpins each (detaching the still-running LSM
-// program a killed predecessor left attached) and closes it. Used at daemon
-// start and after a reload. A missing or empty base is not an error.
+// CleanupStalePins removes every pin in base whose generation isn't in keep: unpins each (detaching
+// the LSM program a killed predecessor left attached) and closes it. Used at start and after a
+// reload. A missing or empty base isn't an error.
 func CleanupStalePins(base string, keep map[string]bool) (removed int, err error) {
 	if base == "" {
 		return 0, nil
@@ -207,13 +200,11 @@ func CleanupStalePins(base string, keep map[string]bool) (removed int, err error
 	return removed, nil
 }
 
-// foreignPinnedLink returns a short description when l is demonstrably NOT one
-// of this guard's LSM links — a non-LSM program, or an LSM program outside our
-// guard_* namespace — so CleanupStalePins leaves it untouched even though its
-// file name matched the al- pattern. It is deliberately conservative: when the
-// link or its program cannot be introspected (older kernel, missing
-// capability) it returns "" and the caller falls back to the file-name match,
-// which is already app-listener specific.
+// foreignPinnedLink returns a short description when l is demonstrably NOT one of this guard's LSM
+// links (a non-LSM program, or an LSM program outside our guard_* namespace), so CleanupStalePins
+// leaves it alone even if its file name matched. Conservative: if the link/program can't be
+// introspected (older kernel, missing capability) it returns "" and the file-name match (already
+// app-listener specific) decides.
 func foreignPinnedLink(l link.Link) string {
 	info, err := l.Info()
 	if err != nil {

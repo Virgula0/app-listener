@@ -28,12 +28,9 @@ var (
 	fscryptTestAmd64Bin string
 )
 
-// hostInfraBindPaths are host binaries that the LSM network guard blocks in
-// whitelist mode because its programs attach globally (they affect host
-// processes too, not just the container). Bind-mounting them into the
-// container at a private path lets the guard allowlist them by their real
-// dev/ino, keeping docker and the host resolver functional while a whitelist
-// guard is active.
+// hostInfraBindPaths are host binaries the LSM network guard blocks in whitelist mode because its
+// programs attach globally (host processes too). Bind-mounting them into the container at a private
+// path lets the guard allowlist them by real dev/ino, keeping docker and the host resolver working.
 var hostInfraBindPaths = []string{
 	"/usr/bin/dockerd",
 	"/usr/bin/containerd",
@@ -74,13 +71,10 @@ func TestMain(m *testing.M) {
 	guardTestAmd64Bin = absPath("../build/test/guard-amd64")
 	fscryptTestAmd64Bin = absPath("../build/test/fscrypt-amd64")
 
-	// The daemon mode links fscrypt, which needs cgo (mlock), so a pure-Go
-	// CGO_ENABLED=0 build no longer compiles. The binary must stay static
-	// anyway: it runs inside ubuntu:latest containers whose glibc (2.39)
-	// is older than the host's, so dynamic linking would be rejected at
-	// load time. osusergo+netgo keep it free of glibc NSS dependencies,
-	// and the build output is buffered so the benign static-link warnings
-	// do not clutter the test run (it is printed only on failure).
+	// Daemon mode links fscrypt, which needs cgo (mlock): CGO_ENABLED=0 no longer compiles. The
+	// binary must still be static: it runs in ubuntu:latest containers whose glibc (2.39) is older
+	// than the host's. osusergo+netgo avoid glibc NSS; output is buffered so benign static-link
+	// warnings show only on failure.
 	cmd := exec.Command("go", "build", "-tags", "ci,osusergo,netgo",
 		"-ldflags", "-linkmode external -extldflags -static",
 		"-o", amd64Bin, "..")
@@ -115,14 +109,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// The fscrypt TOCTOU tests need root plus real kernel fscrypt (a
-	// directory target) or the file-vault AEAD (a regular-file target) —
-	// production code the daemon itself links, exercised directly instead of
-	// reimplemented, exactly like guardTestAmd64Bin above. It links
-	// google/fscrypt, which needs cgo (mlock) — see CLAUDE.md's Build
-	// section — so unlike the guard test binary this one is built the same
-	// way as the main amd64 binary: CGO_ENABLED=1, statically linked so it
-	// runs against the container's older glibc.
+	// The fscrypt TOCTOU tests need root plus real kernel fscrypt (directory) or the file-vault
+	// AEAD (regular file): the production code, exercised directly like guardTestAmd64Bin. It links
+	// google/fscrypt (cgo, mlock; see CLAUDE.md Build), so it's built like the main amd64 binary:
+	// CGO_ENABLED=1, static for the container's older glibc.
 	cmdFscryptTest := exec.Command("go", "test", "-tags", "ci", "-c",
 		"-ldflags", "-linkmode external -extldflags -static",
 		"-o", fscryptTestAmd64Bin, "../internal/fscrypt/")

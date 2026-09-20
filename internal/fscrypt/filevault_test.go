@@ -1,9 +1,6 @@
-// Package fscrypt file-vault tests. One test file per production source
-// file is the convention here (see migrate_test.go's header): EVERY test
-// for filevault.go lives in this one — crypto primitives, the recurring
-// in-place unlock/lock cycle, and the Vault-method dispatch alike. Do not
-// spawn variant files such as *_inplace_test.go or *_dispatch_test.go;
-// append new cases below so related coverage stays together.
+// Package fscrypt file-vault tests. One test file per production source file (see migrate_test.go):
+// EVERY filevault.go test lives here (crypto primitives, in-place unlock/lock cycle, Vault-method
+// dispatch). No variant files like *_inplace_test.go; append new cases below.
 package fscrypt
 
 import (
@@ -223,14 +220,11 @@ func TestUnlockLockFileInPlaceRoundTrip(t *testing.T) {
 	}
 }
 
-// TestUnlockLockFileInPlacePreservesInode is the load-bearing regression
-// test for the whole design: the guard's guard_inodes map is keyed by
-// (dev,ino) and is populated once, before this ever runs. If a future
-// change swaps in-place transform for a rename-based one, the inode WILL
-// change and this test WILL catch it — that change would silently reopen
-// the exact TOCTOU window this design exists to close (a freshly renamed-in
-// inode is unrecognized by the guard until the next populate/sweep, and the
-// LSM hooks default to allow what they do not recognize).
+// The load-bearing regression test for the whole design: guard_inodes is keyed by (dev,ino) and
+// populated once, before this runs. If a change swaps in-place transform for a rename-based one the
+// inode WILL change and this catches it: that would reopen the TOCTOU window (a renamed-in inode is
+// unrecognized by the guard until the next populate/sweep, and the LSM hooks default to allow what
+// they don't recognize).
 func TestUnlockLockFileInPlacePreservesInode(t *testing.T) {
 	withMasterKey(t)
 	v := New()
@@ -366,13 +360,10 @@ func TestUnlockFileInPlaceRecoversFromInterruptedTransform(t *testing.T) {
 	}
 }
 
-// TestStageRecoverySealsContentAndStaysInPlace is the regression test for
-// the bug this replaced: the recovery sidecar must never be created via a
-// temp-file + rename once it already exists (the guard for a single-file
-// watch root denies create/rename/delete beside it — see
-// fileVaultRecoverSuffix), and it must hold a sealed record, never the raw
-// plaintext bytes, so a leftover sidecar is never a second unguarded
-// plaintext copy of protected content.
+// Regression: the recovery sidecar must never be created via temp-file + rename once it exists (a
+// single-file watch root's guard denies create/rename/delete beside it; fileVaultRecoverSuffix),
+// and must hold a sealed record, never raw plaintext, so a leftover sidecar is never a second
+// unguarded plaintext copy.
 func TestStageRecoverySealsContentAndStaysInPlace(t *testing.T) {
 	withMasterKey(t)
 	path := filepath.Join(t.TempDir(), "registry.vdf")
@@ -457,12 +448,9 @@ func TestEnsureRecoverySidecarPlaceholder(t *testing.T) {
 	}
 }
 
-////////////////////////////////////////////////////////////////////////////
-// Vault method dispatch: IsEncrypted/IsProvisioned/VerifyKey/Unlock/Lock
-// route a regular-file target to the file vault instead of the kernel-
-// fscrypt (directory) path, which would error out on a file with no
-// kernel policy.
-////////////////////////////////////////////////////////////////////////////
+// Vault method dispatch: IsEncrypted/IsProvisioned/VerifyKey/Unlock/Lock route a regular-file
+// target to the file vault instead of the kernel-fscrypt directory path (which errors on a file
+// with no kernel policy).
 
 func TestIsEncryptedDispatchesToFileVaultForRegularFiles(t *testing.T) {
 	withMasterKey(t)

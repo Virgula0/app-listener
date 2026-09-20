@@ -359,12 +359,10 @@ func (s *IntegrationSuite) TestNetworkGuard_NoThrottle() {
 	s.exec(c, []string{"sh", "-c", "/other_tester udp-send-loop 127.0.0.1 9095 /tmp/go 50 > /tmp/send.log 2>&1 &"})
 	s.startNetworkGuardStd(c, "-w", guardBinaryFlag("/net_tester"), "-e", "SEND", "--no-throttle")
 
-	// The sender dials before the guard attaches, then sends 10 datagrams at
-	// 50ms once the marker appears. With --no-throttle every blocked send is
-	// logged; the default 250ms per-(type, comm) throttle would log ~2. The
-	// 10 sends only take ~500ms, but under host/scheduler load the count can
-	// lag well past that — give it more room than the other (single-event)
-	// waits in this file rather than the same 8s.
+	// The sender dials before the guard attaches, then sends 10 datagrams at 50ms once the marker
+	// appears. With --no-throttle every blocked send is logged (the default 250ms per-(type, comm)
+	// throttle would log ~2). The sends take ~500ms but under load the count can lag well past
+	// that: allow more room than the file's other single-event waits (8s).
 	s.exec(c, []string{"touch", "/tmp/go"})
 	s.waitForNetGuardEventCount(c, "other_tester", "SEND", 6, 20*time.Second)
 	s.stopNetGuard(c)

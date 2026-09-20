@@ -1,6 +1,6 @@
-// Package daemonconfig parses the daemon mode configuration file, following ssh-guard.conf
-// grammar: each [watch <dir>] section protects one resource and lists allowed binaries with
-// optional event types; chattr/exclude_chattr are deliberately unsupported (the LSM guard engine replaces them).
+// Package daemonconfig parses the daemon config (ssh-guard.conf grammar): each [watch <dir>]
+// section protects one resource and lists allowed binaries with optional event types.
+// chattr/exclude_chattr are deliberately unsupported (the LSM guard replaces them).
 package daemonconfig
 
 import (
@@ -19,70 +19,55 @@ import (
 // Config is a parsed daemon configuration.
 type Config struct {
 	Resources []Resource
-	// SharedAllowLibs are the allow_lib paths declared in [libraries]
-	// blocks. Library trust is daemon-wide (every whitelisted binary may load
-	// every trusted library), so these belong to no resource; readable or
-	// not at parse time, they are all handed to the trust guard, which runs
-	// after the vaults are unlocked and re-stats each one.
+	// SharedAllowLibs are the allow_lib paths from [libraries] blocks. Library trust is
+	// daemon-wide, so they belong to no resource; all go to the trust guard, which re-stats each
+	// after the vaults unlock.
 	SharedAllowLibs []string
 }
 
-// Resource is one guarded tree: a directory (or the vault root) with its own
-// guard, whitelist and — through EncryptionRoot — a shared fscrypt lifecycle.
-// Symlinks, hard-linked files and special files are refused at parse time.
+// Resource is one guarded tree (directory or vault root) with its own guard, whitelist and, via
+// EncryptionRoot, a shared fscrypt lifecycle. Symlinks, hard-linked files and special files are
+// refused at parse time.
 type Resource struct {
 	Path string
-	// NeedEncryption selects the fscrypt lifecycle; defaults to true. An encrypted-marked
-	// resource without an fscrypt policy aborts the daemon at startup.
+	// NeedEncryption selects the fscrypt lifecycle (default true). An encrypted-marked resource
+	// without an fscrypt policy aborts startup.
 	NeedEncryption bool
-	// EncryptionRoot is the vault root whose fscrypt key lifecycle governs this
-	// resource, set by `watch:` directives inside a [watch <root>] group (the
-	// section path is the encryption root, the watch paths are the guarded
-	// trees). Empty means the resource path is its own encryption root — the
-	// historical, ungrouped behavior.
+	// EncryptionRoot is the vault root governing this resource, set by `watch:` directives in a
+	// [watch <root>] group (section path = encryption root, watch paths = guarded trees). Empty =
+	// the resource path is its own root.
 	EncryptionRoot string
 	Binaries       []BinaryRule
 	// PendingBinaries parks whitelisted binaries unreadable at parse time (typically an
-	// fscrypt-locked directory). Until a post-unlock pass moves them into Binaries they stay
-	// absent from the BPF whitelist — denied: fail-closed, never fail-open.
+	// fscrypt-locked dir). Until the post-unlock pass moves them to Binaries they stay out of the
+	// BPF whitelist: denied (fail-closed).
 	PendingBinaries []BinaryRule
-	// AllowLibs lists shared libraries this section's whitelisted binaries are
-	// permitted to load (`allow_lib <path>` directives) BEYOND the static
-	// dependency closure the daemon resolves automatically from each binary's
-	// ELF (DT_NEEDED + interpreter). These are the dynamic dlopen extras static
-	// analysis cannot see (NSS, gconv, GL drivers, plugins). Their inodes join
-	// the global trusted-library set (see internal/guard's trust object): a
-	// whitelisted binary may exec-map only trusted libraries, and no
-	// non-whitelisted process may overwrite one.
+	// AllowLibs (`allow_lib <path>`) are extra libraries this section's whitelisted binaries may
+	// load, beyond the static ELF closure (DT_NEEDED + interpreter): dlopen extras static analysis
+	// can't see (NSS, gconv, GL drivers, plugins). Their inodes join the global trusted-library set
+	// (internal/guard trust object): a whitelisted binary may exec-map only trusted libraries, and
+	// no non-whitelisted process may overwrite one.
 	AllowLibs []string
-	// PendingLibs parks allow_lib paths unreadable at parse time, resolved by
-	// the same post-unlock pass as PendingBinaries.
+	// PendingLibs parks allow_lib paths unreadable at parse time (same post-unlock pass as
+	// PendingBinaries).
 	PendingLibs []string
-	// ReadOnly guards the tree in guard.ModeReadOnly instead of
-	// guard.ModeWhitelist: every process may READ it, but every modifying
-	// operation is gated on the whitelist. It backs `lib_dir` directives —
-	// a library directory does not hold secrets, so denying reads would
-	// break every unrelated process, while write-protecting it is what
-	// makes the libraries inside trustworthy to load (nobody but the
-	// whitelisted binary can plant or alter a .so there). Read-only
-	// resources are never encrypted.
+	// ReadOnly guards the tree in guard.ModeReadOnly: every process may READ, modifications are
+	// whitelist-gated. Backs `lib_dir`: a library dir holds no secrets (denying reads would break
+	// unrelated processes), and the write monopoly is what makes its libraries trustworthy to load.
+	// Never encrypted.
 	ReadOnly bool
-	// PathPending marks a grouped watch path that could not be validated at
-	// parse time because its encryption root is a locked fscrypt vault: the
-	// plaintext sub-path name does not resolve until the daemon unlocks the
-	// vault. The daemon unlocks the root under an ephemeral guard and then
-	// calls ResolvePendingPaths, which runs the same symlink / hard-link /
-	// type refusal addResource applies and clears this flag. A path still
-	// missing after the unlock is a hard error — never silently dropped.
+	// PathPending marks a grouped watch path unvalidated at parse time because its encryption root
+	// is a locked vault (the sub-path doesn't resolve until unlock). After unlocking under an
+	// ephemeral guard the daemon calls ResolvePendingPaths (same symlink/hard-link/type refusals as
+	// addResource), which clears this flag. Still missing afterwards = hard error, never silently
+	// dropped.
 	PathPending bool
 }
 
-// EncryptionRootOrPath returns the vault root whose fscrypt key lifecycle
-// governs this resource: the `watch:` group's section path when set, the
-// resource path itself otherwise (ungrouped resources are their own
-// encryption root). Installer flows that patch the config text or drive the
-// fscrypt lifecycle must address this path — grouped resources share ONE
-// section ([watch <encryption root>]) and must be deduplicated by it.
+// EncryptionRootOrPath returns the vault root governing this resource: the `watch:` group's section
+// path if set, else the resource path. Installer flows patching config text or driving fscrypt must
+// address this path; grouped resources share ONE section ([watch <encryption root>]) and must be
+// deduplicated by it.
 func (r *Resource) EncryptionRootOrPath() string {
 	if r.EncryptionRoot != "" {
 		return r.EncryptionRoot
@@ -90,14 +75,11 @@ func (r *Resource) EncryptionRootOrPath() string {
 	return r.Path
 }
 
-// EncryptionGroups returns the resources deduplicated by encryption root,
-// preserving config order and keeping the FIRST resource of each group (its
-// EncryptionRootOrPath is the shared section header the text-patching
-// helpers address). Resources are returned by pointer: grouped resources
-// must be patched through their SECTION path, never their watch sub-path.
-// Read-only (`lib_dir`) resources are excluded: they are neither an
-// encryption group nor a section header, so no fscrypt question, migration
-// or config-text patch may ever address them.
+// EncryptionGroups returns resources deduplicated by encryption root, in config order, keeping the
+// FIRST of each group (its EncryptionRootOrPath is the shared section header text-patching helpers
+// address). Returned by pointer: patch grouped resources via their SECTION path, never a watch
+// sub-path. Read-only (`lib_dir`) resources are excluded: no fscrypt question, migration or config
+// patch may address them.
 func (c *Config) EncryptionGroups() []*Resource {
 	seen := make(map[string]bool)
 	var out []*Resource
@@ -121,12 +103,10 @@ type BinaryRule struct {
 	Events []ebpf.EventType
 }
 
-// watchGroup is the in-progress parse state of one [watch <root>] section:
-// the section path is the ENCRYPTION ROOT (fscrypt lifecycle), optional
-// `watch: <path>` directives are the GUARDED trees (each becomes its own
-// Resource sharing the group's whitelist and lifecycle), and the binary
-// directives are the shared whitelist. Without `watch:` directives the
-// section path itself is the guarded tree — the historical behavior.
+// watchGroup is the parse state of one [watch <root>] section: the section path is the ENCRYPTION
+// ROOT, `watch: <path>` directives are the GUARDED trees (each a Resource sharing the group's
+// whitelist and lifecycle), binary directives are the shared whitelist. Without `watch:` the
+// section path itself is the guarded tree.
 type watchGroup struct {
 	root           string
 	needEncryption bool
@@ -136,29 +116,25 @@ type watchGroup struct {
 	pendingLibs    []string
 	watchPaths     []string
 	libDirs        []string
-	// libBinaries / libPending are writers of this group's lib_dirs ONLY —
-	// they never join the group's own (secret, whitelist-mode) resources.
-	// A runtime tree is maintained by its own vendor tools (Steam's
-	// pressure-vessel helpers rebuild a merged /usr on every launch); those
-	// tools have no business reading the credential directory that happens
-	// to be listed in the same section.
+	// libBinaries/libPending are writers of this group's lib_dirs ONLY, never of its own (secret,
+	// whitelist-mode) resources: a runtime tree is maintained by vendor tools (Steam's
+	// pressure-vessel rebuilds /usr each launch) that have no business reading the credential
+	// directory in the same section.
 	libBinaries []BinaryRule
 	libPending  []BinaryRule
-	// libraryBlock marks a [libraries <name>] block: no watch root, only
-	// library directives, and its lib_dirs are writable by its own
-	// lib_binary rules alone (there is no section whitelist to inherit).
+	// libraryBlock marks a [libraries <name>] block: no watch root, only library directives; its
+	// lib_dirs are writable by its own lib_binary rules alone.
 	libraryBlock bool
 	blockName    string
-	// skipped marks a section whose root is missing: preserved historical
-	// tolerance — its directives are warned and ignored, never fatal (the
-	// whole group is dropped at finalize).
+	// skipped marks a section whose root is missing: its directives are warned and ignored, never
+	// fatal (the group is dropped at finalize).
 	skipped bool
 	lineNo  int
 }
 
-// Load parses the configuration file at path. Missing watch paths are skipped with a warning,
-// as are directives outside any [watch] section; unreadable binaries are parked in
-// PendingBinaries for post-unlock resolution. Malformed directives in valid sections fail fast.
+// Load parses the config at path. Missing watch paths and directives outside any [watch] section
+// are skipped with a warning; unreadable binaries go to PendingBinaries for post-unlock resolution.
+// Malformed directives in valid sections fail fast.
 func Load(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -176,8 +152,8 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// parseConfig reads the whole file into cfg, materializing one Resource per
-// guarded tree (watch groups emit one Resource per `watch:` path).
+// parseConfig reads the file into cfg, one Resource per guarded tree (a watch group emits one per
+// `watch:` path).
 func parseConfig(cfg *Config, file *os.File) error {
 	var group *watchGroup
 
@@ -200,8 +176,8 @@ func parseConfig(cfg *Config, file *os.File) error {
 	return nil
 }
 
-// applyConfigLine dispatches one config line: section headers close the
-// previous group and open a new one; directives mutate the open group.
+// applyConfigLine dispatches one line: section headers close the previous group and open a new one;
+// directives mutate the open group.
 func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) error {
 	if name, ok := parseLibrariesSection(line); ok {
 		finalizeGroup(cfg, *group)
@@ -218,8 +194,8 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 		return nil
 	}
 	if *group == nil {
-		// Tolerated like ssh-guard, but warned: a silently dropped
-		// security directive must be spottable.
+		// Tolerated like ssh-guard, but warned: a silently dropped security directive must be
+		// spottable.
 		log.Warnf("daemon config line %d: ignoring directive outside any [watch] section: %q", lineNo, line)
 		return nil
 	}
@@ -234,8 +210,7 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	if isWatchDirective(line) {
 		return g.addWatchPath(line, lineNo)
 	}
-	// The TUI's placeholder form: a bare [watch] header followed by
-	// `path = <dir>` setting the section root before the directives.
+	// TUI placeholder form: a bare [watch] header, then `path = <dir>` sets the section root.
 	if g.root == "" {
 		if p, ok := parsePathDirective(line); ok {
 			g.root = p
@@ -250,8 +225,8 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	return applyDirective(g, line, lineNo)
 }
 
-// newWatchGroup probes the section root: a missing root skips the group
-// wholesale (historical tolerance — its directives are warned, never fatal).
+// newWatchGroup probes the section root: a missing root skips the whole group (directives warned,
+// never fatal).
 func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 	g := &watchGroup{root: dirPath, needEncryption: true, lineNo: lineNo}
 	if dirPath != "" {
@@ -276,24 +251,22 @@ func finalizeGroup(cfg *Config, group *watchGroup) {
 	materializeWatchGroup(cfg, group)
 }
 
-// isWatchDirective recognizes the `watch: <path>` directive (optional space
-// after the colon), which adds an additional guarded tree to the section's
-// encryption group.
+// isWatchDirective recognizes `watch: <path>` (optional space after the colon), adding a guarded
+// tree to the section's encryption group.
 func isWatchDirective(line string) bool {
 	return strings.HasPrefix(line, "watch:") || strings.HasPrefix(line, "watch ")
 }
 
-// addWatchPath validates and records one additional guarded tree of the
-// group: it must live INSIDE the section path (the encryption root — the
-// fscrypt lifecycle is per master key, vault-wide) and must not duplicate
-// the section path or another watch path.
+// addWatchPath validates and records one extra guarded tree: it must live INSIDE the section path
+// (the encryption root; fscrypt is vault-wide) and not duplicate the section path or another watch
+// path.
 func (g *watchGroup) addWatchPath(line string, lineNo int) error {
 	path := unquotePath(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "watch:"), "watch")))
 	if path == "" {
 		return fmt.Errorf("daemon config line %d: empty watch path", lineNo)
 	}
-	// Resolve lexical traversal before confinement: dir/../escape must not
-	// pass the inside-root check while resolving outside the vault.
+	// Resolve lexical traversal before confinement: dir/../escape must not pass the inside-root
+	// check.
 	path = filepath.Clean(path)
 	if !isInsidePath(path, g.root) {
 		return fmt.Errorf("daemon config line %d: watch path %q must be inside the section directory %q", lineNo, path, g.root)
@@ -312,12 +285,9 @@ func isInsidePath(path, dir string) bool {
 	return path != dir && strings.HasPrefix(path+"/", dir+"/")
 }
 
-// unquotePath strips a surrounding pair of double quotes from s, if present.
-// Quoting is optional: a path with no spaces or other special characters may
-// be written bare (the historical, still-supported form); a path containing
-// them must be quoted since the directives that follow a path on the same
-// line (event types) are otherwise ambiguous with it. The installer always
-// quotes the paths it generates.
+// unquotePath strips a surrounding pair of double quotes. Quoting is optional for paths without
+// spaces/special characters (legacy form); otherwise required, since event types following a path
+// on the same line would be ambiguous. The installer always quotes.
 func unquotePath(s string) string {
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
 		return s[1 : len(s)-1]
@@ -325,11 +295,9 @@ func unquotePath(s string) string {
 	return s
 }
 
-// splitPathAndRest extracts a leading path from a directive line: either a
-// double-quoted path (may contain spaces or other whitespace) terminated by
-// a matching closing quote, or, for backward compatibility with hand-written
-// configs, the first whitespace-delimited token (which cannot contain a
-// space). Returns the unquoted path and the trimmed remainder of the line.
+// splitPathAndRest extracts a leading path: a double-quoted path (may contain whitespace) or, for
+// hand-written legacy configs, the first whitespace-delimited token. Returns the unquoted path and
+// the trimmed rest of the line.
 func splitPathAndRest(line string) (path, rest string, err error) {
 	if strings.HasPrefix(line, `"`) {
 		closeIdx := strings.IndexByte(line[1:], '"')
@@ -346,8 +314,8 @@ func splitPathAndRest(line string) (path, rest string, err error) {
 	return path, strings.TrimSpace(line[len(path):]), nil
 }
 
-// parsePathDirective recognizes the TUI placeholder form `path = <dir>`,
-// which sets the root of a bare [watch] section before its directives.
+// parsePathDirective recognizes the TUI placeholder `path = <dir>` (sets the root of a bare [watch]
+// section).
 func parsePathDirective(line string) (string, bool) {
 	for _, prefix := range []string{"path = ", "path="} {
 		if strings.HasPrefix(line, prefix) {
@@ -359,12 +327,11 @@ func parsePathDirective(line string) (string, bool) {
 	return "", false
 }
 
-// materializeWatchGroup appends one Resource per guarded tree, sharing the
-// group's whitelist, need_encryption and encryption root. Unguardable paths
-// (missing, symlinks, …) are skipped with a warning by addResource — except a
-// grouped watch path that is merely invisible because its encryption root is
-// a locked fscrypt vault, which is kept as a PathPending resource for the
-// daemon to re-validate after the unlock (see deferPendingWatchPath).
+// materializeWatchGroup appends one Resource per guarded tree, sharing the group's whitelist,
+// need_encryption and encryption root. Unguardable paths (missing, symlinks, ...) are skipped with
+// a warning by addResource, except a grouped watch path merely invisible because its encryption
+// root is a locked vault: kept as PathPending for the daemon to re-validate after unlock
+// (deferPendingWatchPath).
 func materializeWatchGroup(cfg *Config, g *watchGroup) {
 	paths := g.watchPaths
 	if len(paths) == 0 {
@@ -397,17 +364,14 @@ func materializeWatchGroup(cfg *Config, g *watchGroup) {
 	materializeLibDirs(cfg, g)
 }
 
-// materializeLibDirs appends one read-only, unencrypted Resource per
-// `lib_dir` directive, sharing the group's whitelist. Read-only is the whole
-// point: the tree stays world-readable (other processes keep loading the
-// same libraries) while only the section's binaries may create, replace or
-// alter a file in it. That write-monopoly is what lets the trust object
-// treat every .so under the tree as loadable without enumerating it — which
-// is the only workable rule for per-launch runtime directories whose names
-// change on every start (Steam's pressure-vessel `var/tmp-XXXXXX`).
+// materializeLibDirs appends one read-only, unencrypted Resource per `lib_dir`, sharing the group's
+// whitelist. The tree stays world-readable while only the section's binaries may
+// create/replace/alter files; that write monopoly lets the trust object treat every .so under it as
+// loadable without enumerating it, the only workable rule for per-launch runtime dirs (Steam's
+// pressure-vessel `var/tmp-XXXXXX`).
 func materializeLibDirs(cfg *Config, g *watchGroup) {
-	// A lib_binary without any lib_dir grants nothing — say so rather than
-	// leave the author believing the binary was whitelisted somewhere.
+	// A lib_binary without any lib_dir grants nothing: say so rather than let the author believe it
+	// was whitelisted.
 	if len(g.libDirs) == 0 && len(g.libBinaries)+len(g.libPending) > 0 {
 		log.Warnf("daemon config line %d: the section declares lib_binary but no lib_dir — "+
 			"those binaries grant nothing (a lib_binary is a writer of this section's library directories only)", g.lineNo)
@@ -417,17 +381,12 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 			log.Warnf("daemon config line %d: lib_dir not present, ignoring: %s", g.lineNo, dir)
 			continue
 		}
-		// A shared runtime tree is legitimately named by several sections
-		// (one application, several config locations; `install
-		// --diff-catalog` appending a second section for the same app).
-		// Guarding it once is the whole requirement, so a repeat is a
-		// no-op — not the duplicate-watch-path error that would refuse
-		// the config and take the daemon down.
-		// Only ever merged into another lib_dir. A lib_dir naming a path
-		// that is already a real guarded (whitelist-mode, possibly
-		// encrypted) resource must NOT fold into it: that would widen a
-		// secret directory's whitelist with this section's binaries and
-		// downgrade nothing-silently. Refuse it instead.
+		// A shared runtime tree may be named by several sections (one app, several config
+		// locations; `install --diff-catalog` appending a second section). Guarding it once is
+		// enough, so a repeat is a no-op, not a duplicate-watch-path error that would take the
+		// daemon down. Only merge into another lib_dir: a lib_dir naming an already-guarded real
+		// (whitelist-mode, possibly encrypted) resource must NOT fold into it (it would widen a
+		// secret directory's whitelist); refuse.
 		if existing := findResource(cfg, dir); existing != nil {
 			if !existing.ReadOnly {
 				log.Errorf("daemon config line %d: lib_dir %s is already a guarded resource — ignoring the directive "+
@@ -453,12 +412,10 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 	}
 }
 
-// libDirWriters returns the section binaries allowed to WRITE a lib_dir: only
-// the unrestricted ones. An event list scopes a binary's access to the
-// section's protected tree (e.g. `/usr/bin/ssh READ,WRITE,...`); it has no
-// meaning in read-only mode, which cannot carry per-binary masks. Promoting
-// such a binary to an unrestricted writer of a library tree would widen it,
-// so it is left out — it can still read the tree like every other process.
+// libDirWriters returns the section binaries allowed to WRITE a lib_dir: only unrestricted ones. An
+// event list scopes a binary to the section's protected tree and is meaningless in read-only mode
+// (no per-binary masks); promoting such a binary to an unrestricted writer would widen it, so it's
+// left out (it can still read).
 func libDirWriters(rules []BinaryRule) []BinaryRule {
 	out := make([]BinaryRule, 0, len(rules))
 	for _, r := range rules {
@@ -469,20 +426,17 @@ func libDirWriters(rules []BinaryRule) []BinaryRule {
 	return out
 }
 
-// deferPendingWatchPath keeps a grouped watch path that addResource rejected
-// ONLY when the rejection is "invisible while the vault is locked": the group
-// declares need_encryption, the watch path currently fails to stat, and the
-// encryption root is a real directory (an unlocked, locked-name fscrypt
-// tree). Any other rejection — a symlink, a hard-linked file, a genuinely
-// missing path under an unencrypted group — stays dropped. Returns nil when
-// the path must not be resurrected.
+// deferPendingWatchPath keeps a grouped watch path addResource rejected ONLY when it's "invisible
+// while the vault is locked": the group declares need_encryption, the path fails to stat, and the
+// encryption root is a real directory. Any other rejection (symlink, hard-linked file, missing path
+// under an unencrypted group) stays dropped. Returns nil when the path must not be resurrected.
 func deferPendingWatchPath(cfg *Config, g *watchGroup, watchPath string) *Resource {
 	if !g.needEncryption {
 		return nil
 	}
 	if _, statErr := os.Lstat(watchPath); statErr == nil {
-		// The path resolves: addResource rejected it on its merits
-		// (symlink / hard link / special file), not on visibility.
+		// The path resolves: addResource rejected it on merit (symlink/hard link/special file), not
+		// visibility.
 		return nil
 	}
 	rootInfo, rootErr := os.Lstat(g.root)
@@ -495,13 +449,10 @@ func deferPendingWatchPath(cfg *Config, g *watchGroup, watchPath string) *Resour
 	return &cfg.Resources[len(cfg.Resources)-1]
 }
 
-// ResolvePendingPaths re-validates every PathPending resource after its
-// encryption root has been unlocked by the daemon: the plaintext sub-path
-// must now resolve to a directory or a unique regular file — symlinks,
-// hard-linked files and special files are refused exactly as addResource
-// does at parse time. A path still missing is a hard error: the config named
-// a guarded tree that does not exist inside the vault, and silently dropping
-// it would leave a declared-protected directory unguarded.
+// ResolvePendingPaths re-validates every PathPending resource after its encryption root is
+// unlocked: the sub-path must now resolve to a directory or unique regular file (symlinks,
+// hard-linked and special files refused as in addResource). A still-missing path is a hard error:
+// dropping it would leave a declared-protected directory unguarded.
 func ResolvePendingPaths(cfg *Config) error {
 	for i := range cfg.Resources {
 		r := &cfg.Resources[i]
@@ -543,27 +494,24 @@ func parseWatchSection(line string) (path string, isSection bool, err error) {
 	if !strings.HasPrefix(line, "[") {
 		return "", false, nil
 	}
-	// Bare "[watch]" is the installer's placeholder header (path filled in
-	// later); accept it with an empty path — the empty resource is skipped
-	// as unguardable by addResource.
+	// Bare "[watch]" is the installer's placeholder header (path filled in later); accept it with
+	// an empty path (skipped as unguardable by addResource).
 	if line == "[watch]" {
 		return "", true, nil
 	}
-	// Any other bracketed line is a section header: accepting malformed
-	// ones as "directives" silently merged the following binaries into the
-	// PREVIOUS section (a cross-resource whitelist contamination on manual
-	// edits).
+	// Any other bracketed line is a section header: treating malformed ones as directives silently
+	// merged following binaries into the PREVIOUS section (cross-resource whitelist contamination
+	// on manual edits).
 	if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
 		return "", false, fmt.Errorf("malformed section header %q: expected \"[watch <path>]\"", line)
 	}
 	return unquotePath(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))), true, nil
 }
 
-// addResource creates a resource for watchPath, returning nil for unguardable targets:
-// missing paths, symlinks, hard-linked regular files (the inode-based guard would
-// implicitly cover another path) and anything not a directory or unique regular file.
-// encRoot is the encryption root for a grouped watch sub-path ("" when ungrouped),
-// used to reject a symlinked intermediate component between the two.
+// addResource creates a resource for watchPath, or nil for unguardable targets: missing paths,
+// symlinks, hard-linked regular files (the inode-based guard would implicitly cover another path),
+// anything not a directory or unique regular file. encRoot (grouped sub-path, "" otherwise) is used
+// to reject a symlinked intermediate component.
 func addResource(cfg *Config, watchPath, encRoot string, lineNo int) *Resource {
 	if err := validateWatchTarget(watchPath, encRoot); err != nil {
 		log.Warnf("daemon config line %d: skipping %s: %v", lineNo, watchPath, err)
@@ -573,14 +521,11 @@ func addResource(cfg *Config, watchPath, encRoot string, lineNo int) *Resource {
 	return &cfg.Resources[len(cfg.Resources)-1]
 }
 
-// validateWatchTarget refuses a watch target that would make the inode-based
-// guard ambiguous or meaningless: an unreadable/missing path, a symlink, a
-// hard-linked regular file (the inode also names another path) and anything
-// that is not a directory or a unique regular file. When encRoot is set (a
-// grouped watch sub-path), an existing symlinked path component between the
-// encryption root and watchPath is refused too — it could otherwise redirect
-// the guard onto a tree outside the vault that would silently share the
-// group's whitelist and fscrypt lifecycle.
+// validateWatchTarget refuses a target that would make the inode-based guard ambiguous or
+// meaningless: unreadable/missing, symlink, hard-linked regular file, or not a directory/unique
+// regular file. With encRoot set, an existing symlinked component between encRoot and watchPath is
+// refused too (it could redirect the guard outside the vault while sharing the group's whitelist
+// and lifecycle).
 func validateWatchTarget(watchPath, encRoot string) error {
 	if encRoot != "" {
 		if err := rejectSymlinkedComponents(encRoot, watchPath); err != nil {
@@ -605,14 +550,10 @@ func validateWatchTarget(watchPath, encRoot string) error {
 	return nil
 }
 
-// rejectSymlinkedComponents refuses any existing path component strictly
-// between encRoot and target that is a symbolic link. validateWatchTarget
-// only Lstats the final component, so without this an intermediate symlink
-// (e.g. a `watch: <root>/link/sub` where <root>/link points outside the
-// vault) would redirect the inode-based guard onto a tree the group never
-// meant to protect. Components that do not exist yet are left to the leaf
-// validation and the deferred-resolution pass — a locked fscrypt vault hides
-// its sub-path names until the daemon unlocks it.
+// rejectSymlinkedComponents refuses any existing component strictly between encRoot and target that
+// is a symlink (validateWatchTarget Lstats only the final one, so `watch: <root>/link/sub` with
+// link pointing outside the vault would redirect the guard). Components that don't exist yet are
+// left to leaf validation and the deferred pass (a locked vault hides sub-path names).
 func rejectSymlinkedComponents(encRoot, target string) error {
 	rel, relErr := filepath.Rel(encRoot, target)
 	if relErr != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
@@ -636,9 +577,9 @@ func rejectSymlinkedComponents(encRoot, target string) error {
 	return nil
 }
 
-// applyDirective handles one [watch]-group directive: need_encryption, binary rules
-// and (deliberately unsupported) chattr lines. Directives are group-scoped: they
-// apply to every guarded tree materialized from the section.
+// applyDirective handles one [watch]-group directive: need_encryption, binary rules and
+// (unsupported) chattr lines. Directives are group-scoped: they apply to every tree materialized
+// from the section.
 func applyDirective(group *watchGroup, line string, lineNo int) error {
 	if value, ok := parseNeedEncryption(line); ok {
 		switch value {
@@ -683,12 +624,9 @@ func applyDirective(group *watchGroup, line string, lineNo int) error {
 	return nil
 }
 
-// recordBinaryRule stats and symlink-resolves one rule, appending it either to
-// resolved or — when the binary is not readable yet — to deferred. An
-// unreadable binary (locked tree or genuinely gone) is deferred to the
-// post-unlock pass rather than dropped: dropping would silently disable the
-// entry, while a deferred rule stays unlisted in BPF, i.e. denied, until it
-// resolves (fail-closed).
+// recordBinaryRule stats and symlink-resolves one rule into resolved or, if unreadable (locked tree
+// or gone), deferred. Deferring rather than dropping: a dropped rule silently disables the entry,
+// while a deferred one stays out of the BPF whitelist (denied) until it resolves (fail-closed).
 func recordBinaryRule(rule BinaryRule, resolved, deferred *[]BinaryRule, lineNo int) {
 	if _, statErr := os.Stat(rule.Path); statErr != nil {
 		log.Warnf("daemon config line %d: binary not readable yet, deferring: %s", lineNo, rule.Path)
@@ -702,15 +640,13 @@ func recordBinaryRule(rule BinaryRule, resolved, deferred *[]BinaryRule, lineNo 
 	*resolved = append(*resolved, rule)
 }
 
-// parseAllowLib recognizes an `allow_lib <path>` / `allow_lib: <path>`
-// directive and returns the (unquoted) library path.
+// parseAllowLib recognizes `allow_lib <path>` / `allow_lib: <path>` and returns the unquoted path.
 func parseAllowLib(line string) (string, bool) {
 	rest, ok := strings.CutPrefix(line, "allow_lib")
 	if !ok {
 		return "", false
 	}
-	// Require a separator so a binary named "/usr/bin/allow_libfoo" is not
-	// mistaken for the directive.
+	// Require a separator so "/usr/bin/allow_libfoo" isn't mistaken for the directive.
 	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
 		return "", false
 	}
@@ -718,9 +654,8 @@ func parseAllowLib(line string) (string, bool) {
 	return unquotePath(strings.TrimSpace(rest)), true
 }
 
-// applyAllowLib records one allow_lib path on the open group, deferring it
-// (like a binary) when it is not yet readable so a locked-vault library is
-// resolved post-unlock rather than dropped.
+// applyAllowLib records one allow_lib path on the open group, deferring it (like a binary) if not
+// yet readable.
 func applyAllowLib(group *watchGroup, libPath string, lineNo int) error {
 	if libPath == "" {
 		return fmt.Errorf("daemon config line %d: empty allow_lib path", lineNo)
@@ -737,15 +672,13 @@ func applyAllowLib(group *watchGroup, libPath string, lineNo int) error {
 	return nil
 }
 
-// parseLibDir recognizes a `lib_dir <path>` / `lib_dir: <path>` directive
-// and returns the (unquoted) directory path.
+// parseLibDir recognizes `lib_dir <path>` / `lib_dir: <path>` and returns the unquoted path.
 func parseLibDir(line string) (string, bool) {
 	rest, ok := strings.CutPrefix(line, "lib_dir")
 	if !ok {
 		return "", false
 	}
-	// Require a separator so a binary named "/usr/bin/lib_dirfoo" is not
-	// mistaken for the directive.
+	// Require a separator so "/usr/bin/lib_dirfoo" isn't mistaken for the directive.
 	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
 		return "", false
 	}
@@ -753,14 +686,11 @@ func parseLibDir(line string) (string, bool) {
 	return unquotePath(strings.TrimSpace(rest)), true
 }
 
-// applyLibDir records one library directory on the open group. Unlike a
-// `watch:` path it is NOT confined to the section root and never joins the
-// section's encryption group: it is materialized as its own read-only
-// resource (see materializeLibDirs). A missing directory is warned and
-// dropped rather than deferred — an absent library directory holds no
-// secret to leak, and failing the whole config over an optional runtime
-// tree (a Proton version the user removed) would take the daemon down with
-// it.
+// applyLibDir records one library directory on the open group. Unlike `watch:` it is NOT confined
+// to the section root and never joins its encryption group: it becomes its own read-only resource
+// (materializeLibDirs). A missing directory is warned and dropped, not deferred: it holds no
+// secret, and failing the config over an optional runtime tree (a removed Proton version) would
+// take the daemon down.
 func applyLibDir(group *watchGroup, dirPath string, lineNo int) error {
 	if dirPath == "" {
 		return fmt.Errorf("daemon config line %d: empty lib_dir path", lineNo)
@@ -775,15 +705,14 @@ func applyLibDir(group *watchGroup, dirPath string, lineNo int) error {
 	return nil
 }
 
-// parseLibBinary recognizes a `lib_binary <path>` / `lib_binary: <path>`
-// directive and returns the raw value (path plus anything after it).
+// parseLibBinary recognizes `lib_binary <path>` / `lib_binary: <path>` and returns the raw value
+// (path plus rest).
 func parseLibBinary(line string) (string, bool) {
 	rest, ok := strings.CutPrefix(line, "lib_binary")
 	if !ok {
 		return "", false
 	}
-	// Require a separator so a binary named "/usr/bin/lib_binaryfoo" is not
-	// mistaken for the directive.
+	// Require a separator so "/usr/bin/lib_binaryfoo" isn't mistaken for the directive.
 	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
 		return "", false
 	}
@@ -791,22 +720,9 @@ func parseLibBinary(line string) (string, bool) {
 	return strings.TrimSpace(rest), true
 }
 
-// applyLibBinary records one writer of the group's `lib_dir` trees. It is
-// deliberately NOT a whitelist entry: the rule reaches the read-only library
-// resources only, never the section's own protected tree. That separation is
-// the point — a runtime tree is maintained by its vendor's own helper tools
-// (Steam's pressure-vessel rebuilds a merged /usr under `var/tmp-XXXXXX` on
-// every launch, symlinking host GPU drivers into it), and granting those
-// tools write access to the tree they own must not also hand them the
-// credential directory listed in the same section.
-//
-// Event restrictions are rejected rather than ignored: a lib_dir is guarded
-// in read-only mode, which carries no per-binary event masks, so accepting a
-// list would silently promise a narrowing that cannot be enforced.
-// parseLibrariesSection recognizes a `[libraries]`, `[libraries <name>]` or
-// `[libraries "<name>"]` header. The name is a label — the application the
-// block belongs to — and scopes nothing but the block itself: a lib_binary
-// writes only the lib_dirs of its own block.
+// parseLibrariesSection recognizes a `[libraries]`, `[libraries <name>]` or `[libraries "<name>"]`
+// header. The name is only a label for the application; it scopes nothing but the block itself (a
+// lib_binary writes only its own block's lib_dirs).
 func parseLibrariesSection(line string) (string, bool) {
 	if !strings.HasPrefix(line, "[libraries") || !strings.HasSuffix(line, "]") {
 		return "", false
@@ -818,11 +734,10 @@ func parseLibrariesSection(line string) (string, bool) {
 	return unquotePath(strings.TrimSpace(rest)), true
 }
 
-// applyLibraryBlockDirective handles one line of a [libraries] block. Only
-// the three library directives are meaningful there; anything else — a
-// binary path above all — is refused rather than guessed at: in a watch
-// section a bare path is a whitelist entry, and silently treating it as one
-// here would grant it nothing while looking like a grant.
+// applyLibraryBlockDirective handles one line of a [libraries] block. Only the three library
+// directives are meaningful; anything else, a binary path above all, is refused: in a watch section
+// a bare path is a whitelist entry, and treating it as one here would look like a grant while
+// granting nothing.
 func applyLibraryBlockDirective(g *watchGroup, line string, lineNo int) error {
 	if libPath, ok := parseAllowLib(line); ok {
 		return applyAllowLib(g, libPath, lineNo)
@@ -837,6 +752,13 @@ func applyLibraryBlockDirective(g *watchGroup, line string, lineNo int) error {
 		"(only allow_lib, lib_dir and lib_binary are)", lineNo, line)
 }
 
+// applyLibBinary records one writer of the group's `lib_dir` trees. Deliberately NOT a whitelist
+// entry: it reaches the read-only library resources only, never the section's own protected tree
+// (vendor helpers such as Steam's pressure-vessel that own a runtime tree must not also get the
+// credential directory listed in the same section).
+//
+// Event restrictions are rejected, not ignored: a lib_dir is read-only guarded, which has no
+// per-binary masks, so accepting a list would promise a narrowing that can't be enforced.
 func applyLibBinary(group *watchGroup, value string, lineNo int) error {
 	binPath, rest, splitErr := splitPathAndRest(value)
 	if splitErr != nil {

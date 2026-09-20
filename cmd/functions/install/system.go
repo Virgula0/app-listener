@@ -29,9 +29,9 @@ func mustCwd() string {
 	return cwd
 }
 
-// installServices copies the embedded system unit files from daemon-samples
-// into place, skipping anything that already exists, offers the per-user
-// ssh-agent units, and drops the package-manager catalog-refresh hooks.
+// installServices copies the embedded unit files from daemon-samples into place (skipping
+// existing), offers the per-user ssh-agent units, and drops the package-manager catalog-refresh
+// hooks.
 func installServices(cfg *daemonconfig.Config) error {
 	files, err := inst.SampleFiles()
 	if err != nil {
@@ -59,11 +59,9 @@ func installServices(cfg *daemonconfig.Config) error {
 	return installReloadHooks()
 }
 
-// installReloadHooks drops the catalog-refresh post-transaction hook for every
-// package manager present on the host. Package managers without a shipped hook
-// (dnf, zypper) are reported: the boot-time app-listener-catalog-refresh unit
-// still covers reboots, and `app-listener install --update-catalog-only` can
-// be run by hand otherwise.
+// installReloadHooks drops the catalog-refresh post-transaction hook for every package manager
+// present. Managers without a hook (dnf, zypper) are reported: the boot-time catalog-refresh unit
+// still covers reboots, and `install --update-catalog-only` works by hand.
 func installReloadHooks() error {
 	managers := systemd.DetectPackageManagers()
 	if len(managers) == 0 {
@@ -121,10 +119,8 @@ func installFileAs(sample, dest string, mode os.FileMode) error {
 	return upsertFile(dest, dest, data, mode, -1)
 }
 
-// upsertFile writes data to path unless it already matches. An existing
-// file with different content is diffed and the user is asked whether to
-// overwrite it; identical files are skipped silently. When uid is
-// non-negative the file is chowned afterwards (used for per-user units).
+// upsertFile writes data to path unless identical. Differing content is diffed and the user asked
+// before overwriting. A non-negative uid chowns the file afterwards (per-user units).
 func upsertFile(path, label string, data []byte, mode os.FileMode, uid int) error {
 	existing, statErr := os.ReadFile(path)
 	newFile := false
@@ -161,13 +157,10 @@ func upsertFile(path, label string, data []byte, mode os.FileMode, uid int) erro
 	return nil
 }
 
-// offerSSHAgentUnits installs the per-user ssh-agent systemd unit — but only
-// for a user whose ~/.ssh is guarded by this config, and only after asking.
-// The unit is per-user (it lives under ~/.config/systemd/user and runs in
-// that user's session, not system-wide), so there is one question per such
-// user and it names the user and the exact path. Users without a guarded
-// ~/.ssh are skipped silently; root is always skipped (no interactive
-// session); an already-installed matching unit is kept without a prompt.
+// offerSSHAgentUnits installs the per-user ssh-agent unit (~/.config/systemd/user, that user's
+// session) only for a user whose ~/.ssh is guarded by this config, and only after asking (one
+// question per user, naming user and path). Others are skipped silently; root is always skipped (no
+// interactive session); an already-installed matching unit is kept without prompting.
 func offerSSHAgentUnits(cfg *daemonconfig.Config) error {
 	users, err := inst.ListUsers()
 	if err != nil {
@@ -218,11 +211,9 @@ func offerSSHAgentUnits(cfg *daemonconfig.Config) error {
 	return nil
 }
 
-// installSSHAgent installs the ssh-agent user unit for one user, hands it
-// to the user and enables it for that user's session. An existing unit is
-// compared with the bundled one: identical units are skipped, differing
-// ones show a diff and ask whether to overwrite. Root is skipped: it
-// normally has no interactive user session.
+// installSSHAgent installs the ssh-agent user unit for one user, hands it to them and enables it
+// for their session. An existing unit is compared with the bundled one: identical skipped,
+// differing shown as a diff and asked. Root is skipped.
 func installSSHAgent(u inst.User) error {
 	if u.UID == 0 {
 		log.Debugf("skipping ssh-agent unit for root (no interactive user session)")
@@ -253,13 +244,11 @@ func installSSHAgent(u inst.User) error {
 	return nil
 }
 
-// installConfig writes the final daemon config to its system path and
-// ensures the PATH symlink. The binary is deployed separately (the
-// one-line installer or `install --binary-only`); the wizard only checks
-// it is present (see ensureInstalledBinary). An existing config with
-// different content is diffed and the user is asked whether to overwrite
-// it; identical configs are left alone. It reports whether the installed
-// config differs from what the daemon was running with.
+// installConfig writes the final config to its system path and ensures the PATH symlink. The binary
+// is deployed separately (one-line installer or `install --binary-only`); the wizard only checks
+// it's present (ensureInstalledBinary). A differing existing config is diffed and the user asked;
+// identical is left alone. Reports whether the installed config differs from what the daemon was
+// running with.
 func installConfig(cfgText string) (configChanged bool, err error) {
 	if err := systemd.EnsureBinSymlink(); err != nil {
 		return false, err

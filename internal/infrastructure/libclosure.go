@@ -12,27 +12,19 @@ import (
 	"sync"
 )
 
-// ResolveLibraryClosure returns the absolute paths of every shared object a
-// dynamically linked binary loads at startup by STATIC analysis only — the
-// program interpreter (ld-linux*.so) plus the transitive DT_NEEDED closure —
-// without executing the binary. It never runs the target (unlike ldd, which
-// invokes the loader), so it is safe to call on any whitelisted binary.
+// ResolveLibraryClosure returns the absolute paths of every shared object a dynamically linked
+// binary loads at startup, by STATIC analysis only: the program interpreter (ld-linux*.so) plus the
+// transitive DT_NEEDED closure. It never runs the target (unlike ldd), so it's safe on any
+// whitelisted binary.
 //
-// It is deliberately NOT complete: libraries a program brings in later via
-// dlopen (NSS, gconv, GL drivers, plugins) are invisible to static analysis
-// and must be supplied out of band (the daemon's allow_lib list, populated
-// with help from the observe pass). The result is the automatic base the
-// daemon trusts for every whitelisted binary so an operator never has to list
-// libc/the loader by hand.
+// Deliberately NOT complete: dlopen'd libraries (NSS, gconv, GL drivers, plugins) are invisible
+// here and must come from allow_lib. The result is the automatic base the daemon trusts for every
+// whitelisted binary (libc, the loader) so operators needn't list them.
 //
-// A statically linked binary (no INTERP, no dynamic section) yields an empty
-// closure and no error.
-//
-// Two kinds of whitelisted file have no closure of their own and yield an
-// empty one with no error: a script (#!), which the kernel runs as its
-// interpreter — a separate binary resolved on its own — and an ELF for an
-// architecture this machine cannot execute natively (Steam ships
-// pressure-vessel-arm64 for FEX), whose interpreter is not on the host.
+// Empty closure, no error, for: a statically linked binary (no INTERP/dynamic section); a script
+// (#!), which runs as its interpreter, a separate binary resolved on its own; an ELF for an
+// architecture this machine can't run natively (Steam ships pressure-vessel-arm64 for FEX), whose
+// interpreter isn't on the host.
 func ResolveLibraryClosure(binaryPath string) ([]string, error) {
 	if isScript(binaryPath) {
 		return nil, nil
@@ -64,9 +56,8 @@ func ResolveLibraryClosure(binaryPath string) ([]string, error) {
 	return paths, nil
 }
 
-// walkNeeded resolves this object's DT_NEEDED entries to absolute paths and
-// recurses into each, guarding against cycles with visited (keyed by resolved
-// path).
+// walkNeeded resolves this object's DT_NEEDED entries to absolute paths and recurses, guarding
+// cycles with visited (keyed by resolved path).
 func walkNeeded(objPath string, f *elf.File, out map[string]struct{}, visited map[string]bool) {
 	needed, err := f.ImportedLibraries()
 	if err != nil {
@@ -77,9 +68,9 @@ func walkNeeded(objPath string, f *elf.File, out map[string]struct{}, visited ma
 	for _, soname := range needed {
 		resolved := resolveSoname(soname, search)
 		if resolved == "" {
-			// A soname we cannot place statically (unusual layout, or it is
-			// itself dlopen-resolved). Leave it out rather than guess; the
-			// operator can add it via allow_lib if a load is later denied.
+			// A soname we can't place statically (odd layout, or itself dlopen-resolved): leave it
+			// out rather than guess; the operator can add it via allow_lib if a load is later
+			// denied.
 			continue
 		}
 		if visited[resolved] {
@@ -116,11 +107,9 @@ func elfInterp(f *elf.File) (string, error) {
 	return "", nil
 }
 
-// searchDirs is the ordered library search path for objPath: its DT_RPATH /
-// DT_RUNPATH (with $ORIGIN expanded), then the directories configured in
-// /etc/ld.so.conf (the same set ldconfig builds its cache from), then the
-// conventional defaults. RPATH/RUNPATH first matches the loader's own
-// precedence closely enough for the static closure.
+// searchDirs is objPath's ordered library search path: its DT_RPATH/DT_RUNPATH ($ORIGIN expanded),
+// then the /etc/ld.so.conf directories (the set ldconfig uses), then conventional defaults.
+// RPATH/RUNPATH first approximates the loader's precedence well enough for the static closure.
 func searchDirs(objPath string, f *elf.File) []string {
 	var dirs []string
 	origin := filepath.Dir(objPath)
@@ -144,10 +133,8 @@ func searchDirs(objPath string, f *elf.File) []string {
 	return dirs
 }
 
-// resolveSoname places a DT_NEEDED soname on disk: an absolute soname is used
-// as-is; otherwise each search dir is tried in order (RPATH/RUNPATH, the
-// ld.so.conf directories, then the defaults). A soname is itself the on-disk
-// filename (libc.so.6), so a plain directory search resolves it.
+// resolveSoname places a DT_NEEDED soname on disk: an absolute one is used as-is, else each search
+// dir is tried in order (a soname is itself the filename, e.g. libc.so.6).
 func resolveSoname(soname string, search []string) string {
 	if filepath.IsAbs(soname) {
 		if fileExists(soname) {
@@ -187,11 +174,8 @@ var (
 	ldSoConfList []string
 )
 
-// ldSoConfDirs returns the library directories configured in /etc/ld.so.conf
-// (and everything its `include` globs pull in) — the same directory set
-// ldconfig builds its cache from — parsed in pure Go, once, with no external
-// process. On any error it yields nil and resolution falls back to the
-// conventional defaults.
+// ldSoConfDirs returns the library dirs from /etc/ld.so.conf (including `include` globs), parsed in
+// pure Go once, no external process. On any error it yields nil and resolution uses the defaults.
 func ldSoConfDirs() []string {
 	ldSoConfOnce.Do(func() {
 		p := &ldConfParser{seen: make(map[string]bool), visited: make(map[string]bool)}
@@ -257,10 +241,9 @@ func ldConfInclude(line, fromPath string) (string, bool) {
 	return glob, true
 }
 
-// LdSoPreloadPaths returns the absolute library paths listed in
-// /etc/ld.so.preload, which the loader force-loads into EVERY dynamically
-// linked process. They must be trusted or nothing runs; the daemon adds them
-// to the trusted-library set unconditionally. A missing file yields nil.
+// LdSoPreloadPaths returns the paths in /etc/ld.so.preload, which the loader force-loads into EVERY
+// dynamically linked process: they must be trusted or nothing runs, so the daemon adds them to the
+// trusted set unconditionally. nil if the file is missing.
 func LdSoPreloadPaths() ([]string, error) {
 	data, err := os.ReadFile("/etc/ld.so.preload")
 	if err != nil {
@@ -293,11 +276,9 @@ func isScript(path string) bool {
 	return n == 2 && bytes.Equal(magic, []byte("#!"))
 }
 
-// runsNatively reports whether an ELF for machine executes on this host
-// without emulation: the native architecture plus its 32-bit compat one
-// (i386 on amd64 — Steam's own client is a 32-bit binary). An architecture
-// this list does not know is assumed native, so the closure is still
-// resolved rather than silently skipped.
+// runsNatively reports whether an ELF for machine runs here without emulation: the native
+// architecture plus its 32-bit compat one (i386 on amd64; Steam's client is 32-bit). An unknown
+// architecture is assumed native, so the closure is still resolved rather than silently skipped.
 func runsNatively(machine elf.Machine) bool {
 	switch runtime.GOARCH {
 	case "amd64":

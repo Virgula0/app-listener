@@ -252,10 +252,9 @@ var infraBinaries = []string{
 	"/usr/lib/systemd/systemd-networkd",
 }
 
-// DiscoverInfraBinaries returns the paths of essential system networking daemons
-// that are currently running. In whitelist mode (especially with --auto-infra)
-// these must be allowed so that name resolution and connection management keep
-// working on behalf of whitelisted applications.
+// DiscoverInfraBinaries returns the paths of running essential system networking daemons. In
+// whitelist mode (especially --auto-infra) they must be allowed so name resolution and connection
+// management keep working for whitelisted apps.
 func DiscoverInfraBinaries() ([]string, error) {
 	running, err := runningExecutables()
 	if err != nil {

@@ -1,11 +1,8 @@
 //go:build gui
 
-// Package gui is the optional fyne desktop window for `monitor --gui`. It is
-// behind the `gui` build tag: fyne pulls in X11/OpenGL/font/image
-// dependencies (~15 MiB of binary) and runs package-init background
-// goroutines, none of which belong in the security daemon or the other
-// subcommands that share the single app-listener binary. Build with
-// `-tags gui` (or `make build-linux GUI=1`) for the desktop viewer.
+// Package gui is the optional fyne desktop window for `monitor --gui`, behind the `gui` build tag:
+// fyne adds X11/OpenGL/font/image dependencies (~15 MiB) and package-init goroutines that don't
+// belong in the daemon sharing this binary. Build with `-tags gui` (or `make build-linux GUI=1`).
 package gui
 
 import (

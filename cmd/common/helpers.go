@@ -69,9 +69,9 @@ func ParseServeFlags(cmd *cobra.Command) (ServeConfig, error) {
 	return config, nil
 }
 
-// validateEnabledServe enforces every rule that only applies when --serve was
-// actually given: presentation conflicts, credential pairing, address syntax
-// and the interactive-terminal requirement of the dual local+browser TUI.
+// validateEnabledServe enforces the rules that apply only with --serve: presentation conflicts,
+// credential pairing, address syntax, and the interactive-terminal requirement of the dual
+// local+browser TUI.
 func validateEnabledServe(cmd *cobra.Command, config ServeConfig) error {
 	if requestedBoolFlag(cmd, "headless") {
 		return errors.New("--serve and --headless are mutually exclusive")
@@ -256,10 +256,8 @@ func CheckEBPF() error {
 	return nil
 }
 
-// CheckBPFLSM verifies that the active kernel LSM stack includes the BPF
-// LSM. Required by every mode that relies on LSM hooks (guard,
-// network-guard, daemon); monitor and network-monitor are kprobe-based and
-// must not call it.
+// CheckBPFLSM verifies the active LSM stack includes BPF LSM. Required by every LSM-hook mode
+// (guard, network-guard, daemon); kprobe-based monitor and network-monitor must not call it.
 func CheckBPFLSM() error {
 	if err := ebpf.CheckBPFLSM(); err != nil {
 		log.Errorf("BPF LSM check failed: %v", err)

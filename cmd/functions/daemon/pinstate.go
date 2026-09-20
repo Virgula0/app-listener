@@ -11,21 +11,15 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// pinStateFile records which pin generation (and PID) this daemon process's
-// CONFIG guards (the [watch] sections, built by buildGuards — never the
-// self-guards in selfguards.go, whose generation never rotates) are
-// currently pinned under. A later, separate process with no live *guard.Guard
-// object — `daemon --lockdown`, the systemd ExecStopPost safety net — reads
-// it to recompute the exact bpffs pin paths (see guard.PinPrefix /
-// guard.WithPinnedSelfVaultAccess) a crashed daemon left behind, and to tell
-// whether the daemon that owns them might still be alive before ever
-// touching them.
+// pinStateFile records which pin generation (and PID) this process's CONFIG guards (the [watch]
+// sections from buildGuards, never selfguards.go's, whose generation never rotates) are pinned
+// under. A separate process with no live *guard.Guard (`daemon --lockdown`, the ExecStopPost safety
+// net) reads it to recompute the bpffs pin paths (guard.PinPrefix / WithPinnedSelfVaultAccess) a
+// crashed daemon left, and to tell whether the owner might still be alive before touching them.
 //
-// Lives next to fscrypt.key and edit-auth.hash inside the daemon's
-// self-guarded /etc/app-listener (ModeReadOnly — see selfProtectSpecs).
-// pid+gen are not secrets, so this file's confidentiality does not matter;
-// its INTEGRITY does, which the ReadOnly self-guard already provides once a
-// daemon is running (only the app-listener binary may overwrite it).
+// Lives beside fscrypt.key and edit-auth.hash in the self-guarded /etc/app-listener (ModeReadOnly,
+// selfProtectSpecs). pid+gen aren't secret, but their INTEGRITY matters, which the RO self-guard
+// provides once a daemon runs (only the app-listener binary may overwrite it).
 const pinStateFileProd = "/etc/app-listener/pin-state.json"
 
 // pinStateFile is pinStateFileProd in production; tests point it at a temp
@@ -39,24 +33,17 @@ type pinStateRecord struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// errNoPinState means there is no trustworthy pin-generation record to act
-// on — a pre-upgrade daemon, a fresh install that never started, or a
-// malformed/empty file. `daemon --lockdown` treats this exactly like "cannot
-// recover the generation" and falls back to a plain, unwidened lock attempt.
+// errNoPinState: no trustworthy pin-generation record (pre-upgrade daemon, fresh install never
+// started, malformed/empty file). `daemon --lockdown` then does a plain, unwidened lock attempt.
 var errNoPinState = errors.New("no usable pin-state record found")
 
-// writePinState records pin's generation for the config guards this process
-// just brought up (startup) or rotated to (a successful reload), IN PLACE on
-// pinStateFile's existing inode once it exists — mirroring
-// cmd/functions/editprotected/auth.go's WriteHashFile, and for the identical
-// reason: once the daemon's own ModeReadOnly self-guard on /etc/app-listener
-// is attached, only rewriting an EXISTING directory entry is permitted, not
-// creating a new one. The very first call in a host's lifetime always runs
-// before that guard exists (see runDaemon: this is called right after
-// startGuardedDaemonAbortable succeeds, before `go sg.attach(pin)`), so the
-// create-fallback below is exercised at most once per host. Best-effort: a
-// failure here only means `--lockdown` cannot recover this generation later,
-// never that startup/reload itself should fail.
+// writePinState records pin's generation for the config guards just brought up or rotated to
+// (reload), IN PLACE on the file's existing inode (like editprotected/auth.go's WriteHashFile, same
+// reason): once the RO self-guard on /etc/app-listener is attached, only rewriting an EXISTING
+// entry is permitted. The first call per host runs before that guard exists (runDaemon: right after
+// startGuardedDaemonAbortable succeeds, before `go sg.attach(pin)`), so the create fallback runs at
+// most once. Best-effort: failure only means `--lockdown` can't recover this generation, never that
+// startup/reload fails.
 func writePinState(pin pinCfg) error {
 	dir := filepath.Dir(pinStateFile)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -90,14 +77,11 @@ func writePinState(pin pinCfg) error {
 	return f.Sync()
 }
 
-// ensurePinStateFilePlaceholder makes sure pinStateFile exists (even
-// zero-length) before self-guards attach — same reason as selfguards.go's
-// ensureHashFilePlaceholder: once the /etc/app-listener ReadOnly self-guard
-// is live, its self-allow permits rewriting an EXISTING directory entry but
-// not creating a new one. Self guards now attach before writePinState's own
-// first-ever-run create fallback would otherwise run, so that fallback would
-// fight the RO guard on a fresh host without this. A no-op when
-// /etc/app-listener does not exist yet or the file is already there.
+// ensurePinStateFilePlaceholder makes sure pinStateFile exists (even empty) before self guards
+// attach, for the reason in selfguards.go's ensureHashFilePlaceholder: the live RO guard allows
+// rewriting an existing entry but not creating one, and self guards now attach before
+// writePinState's create fallback would run. No-op if /etc/app-listener is missing or the file
+// exists.
 func ensurePinStateFilePlaceholder() error {
 	if _, err := os.Stat(pinStateFile); err == nil {
 		return nil
@@ -117,9 +101,8 @@ func ensurePinStateFilePlaceholder() error {
 	return f.Close()
 }
 
-// readPinState loads the last-recorded pin generation. Absent, empty, or
-// malformed content all map to errNoPinState: a record this process cannot
-// trust is no better than a missing one.
+// readPinState loads the last pin generation. Absent, empty or malformed all map to errNoPinState:
+// an untrustworthy record is no better than none.
 func readPinState() (pinStateRecord, error) {
 	data, err := os.ReadFile(pinStateFile)
 	if err != nil {
@@ -138,16 +121,12 @@ func readPinState() (pinStateRecord, error) {
 	return rec, nil
 }
 
-// pinOwnerLikelyAlive reports whether rec.PID names a still-running process
-// whose own executable is this same binary — i.e. a live app-listener daemon
-// still owns pin generation rec.Gen, and nothing should touch (or even load)
-// any pin under it: doing so would race that daemon's own concurrent access
-// to the resources it guards. A dead, gone, or PID-recycled-by-an-unrelated-
-// process reads as "not alive". In the normal ExecStopPost flow this always
-// reads false: systemd runs ExecStopPost only once the unit's main process
-// has fully exited. The check exists for every OTHER way `--lockdown` (or
-// relockStaleVaults's reuse of the same recovery path at the next startup)
-// can be invoked — manually, twice, or racing a slow-to-exit process.
+// pinOwnerLikelyAlive reports whether rec.PID is a running process whose exe is this same binary,
+// i.e. a live daemon still owns rec.Gen and nothing may touch (or load) its pins (that would race
+// its access to the guarded resources). Dead, gone or PID-recycled reads as not alive. In the
+// normal ExecStopPost flow this is always false (systemd runs it after the main process exits); the
+// check covers manual, repeated or racing --lockdown invocations and relockStaleVaults' reuse of
+// this path.
 func pinOwnerLikelyAlive(rec pinStateRecord) bool {
 	if rec.PID <= 0 {
 		return false
@@ -163,16 +142,11 @@ func pinOwnerLikelyAlive(rec pinStateRecord) bool {
 	return target == self
 }
 
-// recoverPinState reads the last-recorded pin generation for lockRootRecovering
-// to widen a file-vault root's self-access with. Returns a zero
-// pinStateRecord (Gen == "") — meaning "cannot recover, do not attempt any
-// widening" — when there is no usable record, or when the record's PID still
-// looks like a live app-listener daemon (touching its pins would race it).
-// logPrefix tags the log lines with the caller's context ("lockdown" or
-// "daemon"); base is the caller's already-resolved bpffs pin base
-// (guard.ResolvePinBase), passed in rather than re-resolved here so a caller
-// that already has it (prepareDaemonStart's pin.base) does not redundantly
-// re-probe bpffs.
+// recoverPinState reads the last pin generation for lockRootRecovering to widen a file-vault root's
+// self-access. Returns a zero record (Gen == "": do not widen) when there's no usable record or its
+// PID still looks like a live daemon. logPrefix tags logs ("lockdown" or "daemon"); base is the
+// caller's already-resolved bpffs pin base (guard.ResolvePinBase), passed in to avoid re-probing
+// bpffs.
 func recoverPinState(logPrefix string) (rec pinStateRecord) {
 	got, err := readPinState()
 	switch {

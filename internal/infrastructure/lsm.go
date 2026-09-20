@@ -11,10 +11,9 @@ import (
 const (
 	lsmPath = "/sys/kernel/security/lsm"
 
-	// assumeBpfLsmEnv bypasses the BPF LSM preflight check entirely. It is
-	// only meant for environments where securityfs is not mounted inside
-	// the process's mount namespace (privileged containers used by the
-	// integration suite) while the host kernel itself is verified.
+	// assumeBpfLsmEnv bypasses the BPF LSM preflight entirely: only for environments where
+	// securityfs isn't mounted in the process's mount namespace (the integration suite's privileged
+	// containers) while the host kernel is verified.
 	assumeBpfLsmEnv = "APPLISTENER_ASSUME_BPF_LSM"
 )
 
@@ -33,13 +32,10 @@ func bpfLsmListed(file string) (bool, error) {
 	return false, nil
 }
 
-// CheckBPFLSM verifies that the kernel's active LSM stack includes the BPF
-// LSM before any LSM-hook-based mode (guard, network guard, daemon) starts.
-//
-// A successful hook attach is NOT proof of enforcement: on kernels where
-// bpf is absent from the LSM list the hooks attach but never fire, leaving
-// the program silently inert. Refusing to start is safer than a guard that
-// denies nothing.
+// CheckBPFLSM verifies the active LSM stack includes BPF LSM before any LSM-hook mode (guard,
+// network guard, daemon) starts. A successful attach is NOT proof of enforcement: without bpf in
+// the LSM list the hooks attach but never fire, leaving the program silently inert. Refusing to
+// start beats a guard that denies nothing.
 func CheckBPFLSM() error {
 	return CheckBPFLSMAt(lsmPath)
 }
@@ -47,9 +43,8 @@ func CheckBPFLSM() error {
 // CheckBPFLSMAt is CheckBPFLSM with an injectable lsm file path (for tests).
 func CheckBPFLSMAt(file string) error {
 	if os.Getenv(assumeBpfLsmEnv) == "1" {
-		// The escape hatch is intentional (privileged containers cannot
-		// read securityfs), but it silently disables the enforcement
-		// preflight — make the degraded check visible in the logs.
+		// The escape hatch is intentional (privileged containers can't read securityfs) but
+		// silently disables the preflight: make the degraded check visible in the logs.
 		log.Warnf("%s=1: skipping the BPF LSM availability preflight — guards may silently not enforce if the host kernel lacks BPF LSM", assumeBpfLsmEnv)
 		return nil
 	}

@@ -15,14 +15,11 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// revertSystemFiles removes every file the installer deployed: the systemd
-// daemon unit, the boot-time catalog-refresh unit, the pacman/apt
-// catalog-refresh hook, the binary at /usr/local/sbin, the PATH symlink, the
-// config at /etc/app-listener/daemon.conf and the edit-protected password
-// hash. Both units are disabled first (best effort — they may already be
-// disabled), and systemd is reloaded so the removal is visible to the
-// manager. The /etc/app-listener directory itself is kept: the fscrypt
-// master key lives there and is removed only by removeMasterKey.
+// revertSystemFiles removes every file the installer deployed: the daemon unit, boot-time
+// catalog-refresh unit, pacman/apt hook, the binary at /usr/local/sbin, the PATH symlink,
+// /etc/app-listener/daemon.conf and the edit-protected password hash. Both units are disabled first
+// (best effort) and systemd reloaded. /etc/app-listener itself stays: the master key lives there
+// and only removeMasterKey deletes it.
 func revertSystemFiles() error {
 	for _, unit := range []string{systemd.DaemonServiceName, systemd.CatalogRefreshServiceName} {
 		if err := systemd.RunCmd("systemctl", "disable", unit); err != nil {
@@ -78,11 +75,9 @@ type userSSHAgentUnit struct {
 	Path string
 }
 
-// detectSSHAgentUnits finds the per-user ssh-agent systemd units the
-// installer deployed: the unit file at ~/.config/systemd/user/ssh-agent.service
-// whose content matches the bundled sample. Root is skipped (the installer
-// never installed one for root), and a unit whose content differs from the
-// bundled sample is not ours — the user's own unit is never touched.
+// detectSSHAgentUnits finds per-user ssh-agent units the installer deployed:
+// ~/.config/systemd/user/ssh-agent.service whose content matches the bundled sample. Root is
+// skipped (never installed for it); a differing unit isn't ours and is never touched.
 func detectSSHAgentUnits() ([]userSSHAgentUnit, error) {
 	sample, err := inst.SampleContent("ssh-agent.service")
 	if err != nil {
@@ -106,10 +101,8 @@ func detectSSHAgentUnits() ([]userSSHAgentUnit, error) {
 	return units, nil
 }
 
-// isInstallerSSHAgentUnit reports whether the ssh-agent unit at path was
-// installed by the installer, i.e. its content matches the bundled sample.
-// A missing file or a modified unit is not ours; the user's own unit is
-// never touched.
+// isInstallerSSHAgentUnit: the unit at path matches the bundled sample. A missing or modified unit
+// isn't ours; the user's own unit is never touched.
 func isInstallerSSHAgentUnit(sample []byte, path string) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -118,9 +111,8 @@ func isInstallerSSHAgentUnit(sample []byte, path string) bool {
 	return bytes.Equal(data, sample)
 }
 
-// revertSSHAgents reverts the per-user ssh-agent units installed by the
-// installer. A single TUI confirmation (default: no) precedes the removal
-// of every detected unit and its default.target.wants symlink.
+// revertSSHAgents reverts the installer's per-user ssh-agent units: one TUI confirmation (default
+// no) precedes removing every detected unit and its default.target.wants symlink.
 func revertSSHAgents() error {
 	units, err := detectSSHAgentUnits()
 	if err != nil {
@@ -150,9 +142,8 @@ func revertSSHAgents() error {
 	return nil
 }
 
-// removeSSHAgentUnit reverts one per-user ssh-agent unit: the
-// default.target.wants symlink (created by the installer instead of
-// `systemctl --user enable`) and the unit file itself.
+// removeSSHAgentUnit reverts one per-user unit: the default.target.wants symlink (created by the
+// installer instead of `systemctl --user enable`) and the unit file.
 func removeSSHAgentUnit(u userSSHAgentUnit) error {
 	wants := filepath.Join(filepath.Dir(u.Path), "default.target.wants", "ssh-agent.service")
 	if err := os.Remove(wants); err != nil && !os.IsNotExist(err) {
@@ -165,18 +156,14 @@ func removeSSHAgentUnit(u userSSHAgentUnit) error {
 	return nil
 }
 
-// removeMasterKey deletes the fscrypt master key and, when the parent
-// directory becomes empty, the directory itself. The key must only be
-// deleted after every intended decryption completed and only when
-// --delete-key was passed.
+// removeMasterKey deletes the fscrypt master key and the directory if it becomes empty. Only after
+// every intended decryption completed and only with --delete-key.
 func removeMasterKey() error {
 	return removeKeyAndEmptyDir(fscrypt.MasterKeyFile, systemd.SystemConfigDir)
 }
 
-// removeKeyAndEmptyDir deletes the key file and, when dir becomes empty,
-// dir itself. A key that is already gone is a success (nothing left to
-// clean); a dir that is not empty (e.g. a stray file the operator keeps) is
-// left alone.
+// removeKeyAndEmptyDir deletes the key file and, if dir becomes empty, dir. An already-gone key is
+// success; a non-empty dir (a stray operator file) is left.
 func removeKeyAndEmptyDir(keyFile, dir string) error {
 	if err := os.Remove(keyFile); err != nil {
 		if os.IsNotExist(err) {

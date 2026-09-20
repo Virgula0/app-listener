@@ -20,16 +20,12 @@ const gateLogWindow = time.Minute
 // folding new keys and lets them log in full — never the other way round.
 const gateLogMaxKeys = 4096
 
-// gateLogLimiter folds repeated metadata-only process-gate denials in the
-// daemon's LOG. Desktop services re-inspect the same process every few
-// seconds (Hyprland maps each window to its process, pipewire names each
-// audio client), and every refused look used to be its own journal line.
-//
-// It is presentation only: the kernel still denies every attempt. And it is
-// deliberately narrow — only a blocked PTRACE with mode=READ (/proc/<pid>
-// metadata) is ever folded. Memory access (mode=ATTACH), PROC_MEM,
-// TRACED_EXEC and every file-level denial are always logged in full, because
-// those are the ones that matter when something is actually under attack.
+// gateLogLimiter folds repeated metadata-only process-gate denials in the daemon's LOG (desktop
+// services like Hyprland and pipewire re-inspect the same process every few seconds, each refusal
+// used to be a journal line). Presentation only: the kernel still denies every attempt.
+// Deliberately narrow: only a blocked PTRACE with mode=READ (/proc/<pid> metadata) is folded;
+// memory access (mode=ATTACH), PROC_MEM, TRACED_EXEC and every file-level denial are always logged
+// in full, since those matter under real attack.
 type gateLogLimiter struct {
 	now     func() time.Time
 	entries map[string]*gateLogEntry
@@ -54,9 +50,8 @@ func foldable(ev *usecase.DaemonEvent) bool {
 	return ev.Event.Blocked && ev.Event.Process == "PTRACE" && strings.HasSuffix(ev.Event.Path, " mode=READ")
 }
 
-// admitEvent is the headless log filter: with dropMetadata set, a foldable
-// (metadata-only process-gate) denial is never written, not even summarized;
-// otherwise the limiter decides.
+// admitEvent is the headless log filter: with dropMetadata set, a foldable denial is never written
+// (not even summarized); otherwise the limiter decides.
 func admitEvent(l *gateLogLimiter, ev *usecase.DaemonEvent, dropMetadata bool) bool {
 	if dropMetadata && foldable(ev) {
 		return false
@@ -64,19 +59,16 @@ func admitEvent(l *gateLogLimiter, ev *usecase.DaemonEvent, dropMetadata bool) b
 	return l.Admit(ev)
 }
 
-// Admit reports whether ev should be written in full. The first occurrence of
-// a (resource, caller pid, caller comm, target) denial within a window is
-// admitted; repeats are counted for the next Flush.
+// Admit reports whether ev should be written in full. The first (resource, caller pid, caller comm,
+// target) denial in a window is admitted; repeats are counted for the next Flush.
 func (l *gateLogLimiter) Admit(ev *usecase.DaemonEvent) bool {
 	if !foldable(ev) {
 		return true
 	}
-	// Grouped by resource, caller PROCESS and target PROGRAM. Not the caller's
-	// comm: that names the thread, and a thread-pool service (the portal's
-	// pool-37, pool-38, ...) would count each worker as a new caller. Not the
-	// target pid either: every newly started Steam or Wine process would be a
-	// "first occurrence" again. The first line of a window keeps the full
-	// event, pid included, as the example.
+	// Grouped by resource, caller PROCESS and target PROGRAM. Not caller comm (it names the thread;
+	// a thread pool would count every worker as new) and not target pid (every new Steam/Wine
+	// process would be a "first occurrence"). A window's first line keeps the full event, pid
+	// included, as the example.
 	key := fmt.Sprintf("%s\x00%d\x00%s", ev.Resource, ev.Event.PID, targetProgram(ev.Event.Path))
 	if e, ok := l.entries[key]; ok {
 		e.suppressed++
@@ -93,9 +85,8 @@ func (l *gateLogLimiter) Admit(ev *usecase.DaemonEvent) bool {
 	return true
 }
 
-// targetProgram drops the "pid=N " prefix of a process-gate path
-// ("pid=46804 comm=steamwebhelper mode=READ" -> "comm=steamwebhelper
-// mode=READ"), leaving the target's name and the access mode.
+// targetProgram drops the "pid=N " prefix of a process-gate path ("pid=46804 comm=steamwebhelper
+// mode=READ" -> "comm=steamwebhelper mode=READ").
 func targetProgram(path string) string {
 	if i := strings.Index(path, " comm="); i >= 0 {
 		return path[i+1:]
@@ -103,10 +94,9 @@ func targetProgram(path string) string {
 	return path
 }
 
-// Flush writes one summary line for every key whose window has elapsed with
-// suppressed repeats, and forgets elapsed keys so the next occurrence is
-// logged in full again (a still-active pair reappears once per window).
-// force flushes every key regardless of age (shutdown).
+// Flush writes one summary per key whose window elapsed with suppressed repeats, and forgets
+// elapsed keys (a still-active pair reappears once per window). force flushes every key regardless
+// of age (shutdown).
 func (l *gateLogLimiter) Flush(w io.Writer, force bool) {
 	now := l.now()
 	keys := make([]string, 0, len(l.entries))

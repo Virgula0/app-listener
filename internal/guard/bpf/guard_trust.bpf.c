@@ -1,45 +1,21 @@
-// guard_trust.bpf.c — the trusted-binary / trusted-library object.
+// guard_trust.bpf.c: the trusted-binary / trusted-library object.
 //
-// A single, daemon-wide object (attached ONCE, not per watched resource) that
-// owns guard_trusted_files: the inodes of every whitelisted application binary
-// (TRUSTED_BINARY) and every user-writable library the operator explicitly
-// trusts for them (TRUSTED_LIB, via allow_lib). Keeping it separate from the
-// per-resource guards means it never adds to their verifier-tight programs
-// (issue #45) and its handful of programs attach just once, well under the
+// One daemon-wide object (attached ONCE, not per resource) owning guard_trusted_files: inodes of
+// every whitelisted application binary (TRUSTED_BINARY) and every user-writable library the
+// operator trusts for them (TRUSTED_LIB, via allow_lib). Kept separate so it adds nothing to the
+// per-resource guards' verifier-tight programs (issue #45) and attaches once, under the
 // per-function trampoline limit.
 //
-// It closes two gaps that inode-keyed access control cannot, because both act
-// on files that live OUTSIDE every guarded tree:
+// It closes two gaps inode-keyed access control can't, both on files OUTSIDE every guarded tree:
+//   #1 writer attribution: a whitelisted binary at a USER-WRITABLE path (home-directory apps: Claude, Discord) may only be replaced/modified by another whitelisted binary (the app's updater), never by same-user malware. Root-owned system binaries (/usr/bin/...) are deliberately NOT protected: users can't modify them, and protecting them would break package upgrades.
+//   #2 library load allowlist: a whitelisted process may map executable code only from a library a non-whitelisted process couldn't have written. A library qualifies if it is:
+//     - an explicit TRUSTED_LIB (allow_lib), or
+//     - a root-owned file in a root-only-writable directory (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
+//     - inside a GUARDED resource tree (whitelist mode: only whitelisted binaries create/modify files there, so nothing can be planted). This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
+//   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused.
 //
-//   #1 writer attribution — a whitelisted binary that lives at a USER-WRITABLE
-//      path (a home-directory app: Claude, Discord) may only be replaced or
-//      modified by another whitelisted binary (the app's own updater), never
-//      by unrelated same-user malware. Root-owned system binaries (/usr/bin/…)
-//      are deliberately NOT protected: a normal user cannot modify them anyway,
-//      and protecting them would break the package manager's own upgrades.
-//
-//   #2 library load allowlist — a whitelisted process may only map executable
-//      code from a library that a non-whitelisted process could not have
-//      written, because that is exactly what makes the library trustworthy. A
-//      library qualifies when it is:
-//        - an explicit TRUSTED_LIB (allow_lib), or
-//        - a root-owned file in a root-only-writable directory — an ordinary
-//          system library under /usr/lib, /opt, … (auto-trusted; no operator
-//          config, and it survives package updates), or
-//        - inside a GUARDED resource tree — a directory the daemon watches in
-//          whitelist mode, where only whitelisted binaries may create or modify
-//          files. A library there cannot have been planted by an attacker, so
-//          it is safe to load even though the path is user-writable in the
-//          filesystem sense. This is how self-contained apps with bundled,
-//          per-launch libraries (Steam/Proton/Wine) are handled: guard their
-//          library directories like any other resource and their libraries
-//          become loadable with no per-file allow_lib and no exceptions.
-//      LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is
-//      refused: it is neither system-owned nor inside a guarded tree.
-//
-// Both #1 and #2 are ALWAYS enforced once the programs attach — there is no
-// observe/enforce toggle. They are best-effort to attach; a rejected program
-// never affects the per-resource enforcement guards.
+// Both are ALWAYS enforced once attached (no observe/enforce toggle). Attach is best-effort; a
+// rejected program never affects the per-resource guards.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
@@ -51,11 +27,10 @@
 #define S_IWGRP 00020
 #define S_IWOTH 00002
 
-// Open flags used for provenance. Only flags that GUARANTEE the open created
-// the file are accepted: O_CREAT|O_EXCL fails if the name already exists, and
-// __O_TMPFILE always makes a brand-new anonymous inode. A bare O_CREAT is
-// deliberately NOT enough — it succeeds on a pre-existing file, so honouring
-// it would let an attacker's planted .so acquire this process's provenance.
+// Open flags for provenance. Only flags that GUARANTEE creation are accepted: O_CREAT|O_EXCL fails
+// if the name exists, __O_TMPFILE always makes a new anonymous inode. Bare O_CREAT is NOT enough:
+// it succeeds on an existing file, so an attacker's planted .so could acquire this process's
+// provenance.
 #define O_CREAT 00000100
 #define O_EXCL 00000200
 #define __O_TMPFILE 020000000
@@ -83,11 +58,10 @@ struct {
 	__type(value, __u8);
 } guard_trusted_files SEC(".maps");
 
-// guard_trusted_dirs holds the (dev, ino) of every guarded resource ROOT (the
-// directories the daemon watches in whitelist mode). A library whose path
-// passes through one of these roots lives in a write-protected tree — only
-// whitelisted binaries may create or modify files there — so it is trustworthy
-// to load. Populated by userspace from the daemon's resource list.
+// guard_trusted_dirs holds (dev, ino) of every guarded resource ROOT (dirs watched in whitelist
+// mode). A library whose path passes through one lives in a write-protected tree (only whitelisted
+// binaries may create/modify there), so it is trustworthy. Populated by userspace from the daemon's
+// resource list.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
@@ -95,41 +69,29 @@ struct {
 	__type(value, __u8);
 } guard_trusted_dirs SEC(".maps");
 
-// guard_jit_origin is the provenance ledger for runtime-generated code. GPU
-// drivers (NVIDIA above all) JIT shaders and kernels into a file they create
-// themselves and then map executable: a memfd, an O_TMPFILE, or an
-// mkstemp()'d file. Such an inode is anonymous, user-owned and named at
-// random, so none of the three ordinary trust sources can ever cover it —
-// but "this very process made it, and nothing else has written it" is a
-// property the kernel can attest, and it is strictly stronger than a path
-// rule: an attacker who hands a whitelisted process a memfd of their own
-// (the LD_PRELOAD=/proc/self/fd/N trick) is a DIFFERENT thread group, so the
-// mapping is refused.
+// guard_jit_origin is the provenance ledger for runtime-generated code. GPU drivers (NVIDIA above
+// all) JIT into a file they create themselves (memfd, O_TMPFILE, mkstemp) and map it executable.
+// Such an inode is anonymous, user-owned and randomly named, so no ordinary trust source covers it,
+// but "this very process made it and nothing else has written it" is kernel-attestable and stronger
+// than a path rule: an attacker handing a whitelisted process their own memfd
+// (LD_PRELOAD=/proc/self/fd/N) is a DIFFERENT thread group, so the mapping is refused.
 //
-// An entry is created only by a whitelisted process performing an open that
-// is guaranteed to be a creation (see the flag macros above) and is tainted
-// for good as soon as any other thread group opens that inode for writing.
+// An entry is created only by a whitelisted process doing a guaranteed-creation open (flag macros
+// above) and is tainted for good once any other thread group opens the inode for writing.
 //
-// Residual risk, stated plainly: the taint is driven by file_open, so foreign
-// bytes can only slip in through a writable fd the creator itself handed out
-// (SCM_RIGHTS or a fork that outlives the record) — never through an attacker
-// opening the inode, which is the reachable shape of the attack. A whitelisted
-// binary that deliberately passes a writable fd to its own JIT arena is a
-// confused deputy in the same class as any other whitelist entry.
+// Residual risk: taint is driven by file_open, so foreign bytes can only arrive through a writable
+// fd the creator itself handed out (SCM_RIGHTS, or a fork outliving the record), never by an
+// attacker opening the inode. A whitelisted binary that passes a writable fd to its own JIT arena
+// is a confused deputy, like any other whitelist entry.
 //
-// The map is an LRU on purpose. Eviction loses provenance, and no provenance
-// means "deny" in every consumer, so pressure degrades towards refusing JIT
-// mappings — never towards trusting a stale inode number that the kernel has
-// since recycled for somebody else's file.
+// LRU on purpose: eviction loses provenance, and no provenance means "deny" everywhere, so pressure
+// degrades toward refusing JIT mappings, never toward trusting a recycled inode number.
 
-// jit_origin identifies the creator by its whole process IMAGE, not just its pid.
-// execve() keeps the thread group id while replacing the program, so a thread
-// group alone would let a whitelisted process create an inode and then exec a
-// different whitelisted binary that inherits the fd — provenance would follow
-// the pid across an image it never produced. Requiring the mm (allocated
-// afresh by execve, distinct per fork) and the executable's inode as well
-// makes the check "the same program, in the same thread group, running the
-// same image that created this inode".
+// jit_origin identifies the creator by its whole process IMAGE, not just pid: execve() keeps the
+// thread group id while replacing the program, so a tgid alone would let provenance follow the pid
+// into a different whitelisted binary that inherits the fd. Requiring the mm (fresh per execve,
+// distinct per fork) and the exe inode too means "the same program, thread group and image that
+// created this inode".
 struct jit_origin {
 	__u64 mm;
 	struct inode_key exe;
@@ -166,8 +128,8 @@ struct {
 
 char LICENSE[] SEC("license") = "GPL";
 
-// fill_inode_key resolves inode's (dev, ino) with the SAME encoding the rest of
-// the guard uses (dev from sb->s_dev). Returns 0 if unreadable.
+// fill_inode_key resolves inode's (dev, ino) with the same encoding as the rest of the guard (dev
+// from sb->s_dev). 0 if unreadable.
 static __always_inline int fill_inode_key(struct inode *inode, struct inode_key *k)
 {
 	if (!inode)
@@ -192,8 +154,8 @@ static __always_inline __u8 trusted_flags_of(struct inode *inode)
 	return f ? *f : 0;
 }
 
-// current_exe_flags returns the trusted-file flags of the current process's
-// main executable (mm->exe_file), 0 for kernel threads or an unresolvable exe.
+// current_exe_flags returns the trusted-file flags of the current process's main exe
+// (mm->exe_file); 0 for kernel threads or an unresolvable exe.
 static __always_inline __u8 current_exe_flags(void)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -212,18 +174,16 @@ static __always_inline __u8 current_exe_flags(void)
 	return trusted_flags_of(inode);
 }
 
-// caller_is_app reports whether the current process's executable is one of the
-// whitelisted application binaries (a valid modifier/updater for #1).
+// caller_is_app: the current exe is a whitelisted application binary (a valid modifier/updater for
+// #1).
 static __always_inline int caller_is_app(void)
 {
 	return (current_exe_flags() & TRUSTED_BINARY) != 0;
 }
 
-// inode_is_root_ro reports whether inode is owned by root and cannot be
-// modified in place by a normal user: not other-writable, and group-writable
-// only when the group is root itself (0775 root:root is common in shipped
-// packages — e.g. VS Code's bundled .node modules — and a member of group
-// root is already root-equivalent, so it grants no non-root user anything).
+// inode_is_root_ro: owned by root and not modifiable in place by a normal user: not other-writable,
+// and group-writable only if the group is root (0775 root:root is common in packages, e.g. VS
+// Code's .node modules, and group root is already root-equivalent).
 static __always_inline int inode_is_root_ro(struct inode *inode)
 {
 	if (!inode)
@@ -245,12 +205,10 @@ static __always_inline int inode_is_root_ro(struct inode *inode)
 	return 1;
 }
 
-// is_system_trusted reports whether the file at dentry is a trusted system file:
-// root-owned and not group/other-writable, AND sitting directly in a directory
-// that is likewise root-owned and not group/other-writable. That two-level
-// check is enough to distinguish /usr/lib, /opt/… (auto-trusted) from anything
-// a non-root user could replace — a user-writable directory lets its owner swap
-// even a root-owned file by unlink+create, so the parent must be root-owned too.
+// is_system_trusted: the file is root-owned and not group/other-writable AND sits directly in a
+// directory that is likewise. Two levels are enough to tell /usr/lib, /opt/... (auto-trusted) from
+// anything a non-root user could replace: a user-writable directory lets its owner swap even a
+// root-owned file by unlink+create, so the parent must be root-owned too.
 static __always_inline int is_system_trusted(struct inode *inode, struct dentry *dentry)
 {
 	if (!inode_is_root_ro(inode))
@@ -266,12 +224,9 @@ static __always_inline int is_system_trusted(struct inode *inode, struct dentry 
 	return inode_is_root_ro(pinode);
 }
 
-// under_guarded_tree reports whether the file at dentry sits inside a guarded
-// resource tree: an ancestor (or the file itself) is a guarded root in
-// guard_trusted_dirs. The whole tree shares the file's device (a guarded root
-// is an ancestor on the same filesystem), so the device is read once and only
-// the inode number is compared per ancestor — the same shape as the
-// per-resource guard's root_in_chain walk.
+// under_guarded_tree: an ancestor (or the file itself) is a guarded root in guard_trusted_dirs. The
+// tree shares the file's device, so the device is read once and only inode numbers are compared per
+// ancestor (same shape as root_in_chain).
 static __always_inline int under_guarded_tree(struct inode *inode, struct dentry *dentry)
 {
 	if (!inode || !dentry)
@@ -308,10 +263,8 @@ static __always_inline int under_guarded_tree(struct inode *inode, struct dentry
 
 // --- provenance ledger for runtime-generated code (guard_jit_origin) -------
 
-// fill_current_image resolves the running process image: thread group, mm, and
-// the inode of the executable together with its trusted flags. Returns 0 when
-// any of it is unreadable (a kernel thread, an exiting task), which every
-// caller treats as "no provenance".
+// fill_current_image resolves the running image: tgid, mm, and exe inode with its trusted flags. 0
+// if any is unreadable (kernel thread, exiting task); every caller treats that as "no provenance".
 struct proc_image {
 	__u64 mm;
 	struct inode_key exe;
@@ -343,10 +296,9 @@ static __always_inline int fill_current_image(struct proc_image *img)
 	return 1;
 }
 
-// jit_record_creation claims inode for the CURRENT process image. Called only
-// for an open/allocation that certainly created the inode, and only when the
-// creator is a whitelisted binary — an attacker's own files therefore have no
-// entry at all, which is what makes a missing entry safe to treat as "deny".
+// jit_record_creation claims inode for the CURRENT image. Called only for a certain creation and
+// only by a whitelisted creator, so an attacker's files have no entry, which is why a missing entry
+// safely means "deny".
 static __always_inline void jit_record_creation(struct inode *inode)
 {
 	struct inode_key k = {};
@@ -364,12 +316,10 @@ static __always_inline void jit_record_creation(struct inode *inode)
 	bpf_map_update_elem(&guard_jit_origin, &k, &o, BPF_ANY);
 }
 
-// jit_taint_foreign_write marks an inode as no longer self-produced because
-// something other than the exact image that created it opened it for writing.
-// This is what closes the /proc/<pid>/fd/N route: a same-uid attacker can
-// reach a whitelisted process's memfd through procfs, but only by opening it,
-// and the open is what poisons the mapping. The taint is permanent — an inode
-// that has held foreign bytes never becomes self-produced again.
+// jit_taint_foreign_write marks an inode no longer self-produced because something other than the
+// exact creating image opened it for writing. This closes the /proc/<pid>/fd/N route: a same-uid
+// attacker can reach a whitelisted process's memfd via procfs only by opening it, and the open
+// poisons the mapping. Permanent.
 static __always_inline void jit_taint_foreign_write(struct inode *inode)
 {
 	struct inode_key k = {};
@@ -389,11 +339,9 @@ static __always_inline void jit_taint_foreign_write(struct inode *inode)
 	o->tainted = 1;
 }
 
-// jit_self_created reports whether inode was created by the process image
-// asking to map it and has never been opened for writing by another thread
-// group. Absent provenance answers no, so an evicted entry, a file created
-// before the daemon started and anything the daemon never saw created all stay
-// denied.
+// jit_self_created: inode was created by the image asking to map it and never opened for writing by
+// another thread group. Absent provenance answers no (evicted entries, files predating the daemon,
+// anything never seen created stay denied).
 static __always_inline int jit_self_created(struct inode *inode)
 {
 	struct inode_key k = {};
@@ -495,11 +443,10 @@ static __always_inline void emit(struct dentry *dentry, __u32 kind)
 	bpf_ringbuf_submit(e, 0);
 }
 
-// #2 — library load allowlist. A whitelisted binary may map executable code
-// only from a trusted library (explicit allow_lib) or an auto-trusted system
-// file (root-owned, root-only-writable dir). An untrusted exec-map is the exact
-// shape of an LD_PRELOAD / dlopen of attacker code; it is logged always and
-// denied when enforce_libs is set.
+// #2 library load allowlist: a whitelisted binary may map executable code only from a trusted
+// library (allow_lib) or an auto-trusted system file (root-owned, root-only-writable dir). An
+// untrusted exec-map is the shape of an LD_PRELOAD/dlopen of attacker code: always logged, denied
+// when enforce_libs is set.
 SEC("lsm/mmap_file")
 int trust_mmap(unsigned long long *ctx)
 {
@@ -531,14 +478,11 @@ int trust_mmap(unsigned long long *ctx)
 	return -EPERM;
 }
 
-// --- #1: writer attribution for user-writable whitelisted binaries ---------
-// A protected target is a TRUSTED_BINARY/TRUSTED_LIB inode that is NOT an
-// auto-trusted system file — i.e. it lives at a user-writable path, where
-// same-user malware could otherwise replace it and have the daemon re-admit
-// the replacement. Only another whitelisted binary (the app's own updater) may
-// modify it; every other caller is denied. Root-owned system binaries are not
-// protected here (the package manager must be able to upgrade them, and a
-// non-root attacker cannot touch them anyway).
+// --- #1: writer attribution for user-writable whitelisted binaries ---
+// A protected target is a TRUSTED_BINARY/TRUSTED_LIB inode that is NOT an auto-trusted system file,
+// i.e. at a user-writable path where same-user malware could replace it and have the daemon
+// re-admit the replacement. Only another whitelisted binary (the app's updater) may modify it.
+// Root-owned system binaries are exempt (package manager upgrades; non-root can't touch them).
 static __always_inline int protected_writable_target(struct inode *inode, struct dentry *dentry)
 {
 	if (!(trusted_flags_of(inode) & (TRUSTED_BINARY | TRUSTED_LIB)))
@@ -572,8 +516,8 @@ int trust_path_unlink(unsigned long long *ctx)
 SEC("lsm/path_rename")
 int trust_path_rename(unsigned long long *ctx)
 {
-	// Deny renaming a protected binary AWAY (old_dentry) and renaming anything
-	// OVER a protected binary (new_dentry victim) by a non-app caller.
+	// Deny a non-app caller renaming a protected binary AWAY (old_dentry) or anything OVER one
+	// (new_dentry victim).
 	struct dentry *old_dentry = (struct dentry *)ctx[1];
 	struct dentry *new_dentry = (struct dentry *)ctx[3];
 
@@ -605,9 +549,8 @@ int trust_file_open(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
-	// Provenance bookkeeping for runtime-generated code. Recording comes
-	// first: a creating open is a write-open too, and the creator must not
-	// taint its own brand-new inode.
+	// Provenance bookkeeping first: a creating open is also a write-open, and the creator must not
+	// taint its own new inode.
 	__u32 f_flags = 0;
 	bpf_probe_read_kernel(&f_flags, sizeof(f_flags), &file->f_flags);
 	if ((f_flags & __O_TMPFILE) || ((f_flags & O_CREAT) && (f_flags & O_EXCL)))
@@ -624,14 +567,12 @@ int trust_file_open(unsigned long long *ctx)
 	return deny_if_protected(inode, dentry);
 }
 
-// memfd_create() allocates its file without ever calling security_file_open(),
-// so a memfd's provenance has to be recorded where the kernel makes it. This
-// is the first link in NVIDIA's JIT fallback chain (memfd → O_TMPFILE →
-// mkstemp), and the only one an LSM hook cannot see.
+// memfd_create() allocates its file without security_file_open(), so a memfd's provenance is
+// recorded where the kernel makes it: the first link in NVIDIA's JIT fallback chain (memfd,
+// O_TMPFILE, mkstemp) and the only one an LSM hook can't see.
 //
-// Best-effort like every other trust program: on a kernel where the symbol is
-// inlined or renamed the attach fails, memfd exec-maps keep being denied, and
-// the driver falls through to its file-backed fallbacks, which file_open does
+// Best-effort like every trust program: if the symbol is inlined/renamed the attach fails, memfd
+// exec-maps stay denied, and the driver falls through to file-backed fallbacks that file_open does
 // see.
 SEC("fexit/memfd_alloc_file")
 int trust_memfd_alloc(unsigned long long *ctx)

@@ -189,13 +189,10 @@ func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	}
 }
 
-// TestBuildxWhitelistedInKubeAndDocker verifies that docker-buildx (the
-// CLI plugin at /usr/lib/docker/cli-plugins) is whitelisted in both the
-// .kube and .docker entries: buildx reads ~/.kube/config for its
-// kubernetes driver and ~/.docker/config.json plus the buildx store
-// (buildx/.lock, instance state) for its own bookkeeping. Without these
-// entries, every docker buildx invocation is denied while the dirs are
-// guarded.
+// docker-buildx (CLI plugin at /usr/lib/docker/cli-plugins) must be whitelisted in both .kube and
+// .docker entries: it reads ~/.kube/config (kubernetes driver) and ~/.docker/config.json plus the
+// buildx store (buildx/.lock, instance state). Otherwise every docker buildx invocation is denied
+// while the dirs are guarded.
 func TestBuildxWhitelistedInKubeAndDocker(t *testing.T) {
 	const buildx = "/usr/lib/docker/cli-plugins/docker-buildx"
 	seen := map[string]bool{}
@@ -567,18 +564,12 @@ func TestDiscordNarrowedWatches(t *testing.T) {
 	}
 }
 
-// TestExtraWatchPathsForSkipsMissing is the regression test for a daemon
-// startup crash: a fresh Discord install only creates some of the catalog's
-// WatchRelPaths sub-directories (e.g. "IndexedDB" may not exist yet), and
-// ExtraWatchPathsFor used to return every one of them unconditionally. The
-// generated config then declared a `watch:` path that never resolves, and
-// the daemon's ResolvePendingPaths pass (daemonconfig.go) treats a grouped
-// watch path still missing after its encryption root is available as a
-// fatal error — by design, per ResolvePendingPaths' doc comment, "silently
-// dropping it would leave a declared-protected directory unguarded". A
-// non-existent sub-path must therefore never reach the generated config in
-// the first place, exactly like a plain (non-grouped) RelPaths candidate
-// that Discover simply does not propose when missing.
+// Regression for a daemon startup crash: a fresh Discord install creates only some WatchRelPaths
+// (e.g. "IndexedDB" may be missing) and ExtraWatchPathsFor returned all unconditionally. The config
+// then declared a `watch:` that never resolves, and ResolvePendingPaths (daemonconfig.go) treats a
+// grouped watch path missing after unlock as fatal by design ("silently dropping it would leave a
+// declared-protected directory unguarded"). A missing sub-path must never reach the generated
+// config, like a plain RelPaths candidate Discover doesn't propose.
 func TestExtraWatchPathsForSkipsMissing(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".config", "discord")

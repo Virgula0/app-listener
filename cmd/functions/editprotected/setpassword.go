@@ -9,10 +9,8 @@ import (
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
-// runSetPassword sets a first edit-protected password or rotates a
-// cli-managed one. A password chosen during `app-listener install` cannot be
-// rotated here (the installer owns it) — that is refused with a clear
-// pointer.
+// runSetPassword sets a first edit-protected password or rotates a cli-managed one. A password
+// chosen during `install` is owned by the installer and refused here with a pointer.
 func runSetPassword() error {
 	encoded, err := LoadHashFile()
 	switch {
@@ -108,9 +106,9 @@ func PromptNewPassword() (string, error) {
 	return first, nil
 }
 
-// reloadDaemonForPasswordChange asks a running daemon to reconcile its
-// control socket with the new password state (SIGHUP; the reload handler
-// calls control.refresh). A stopped daemon picks it up on next start.
+// reloadDaemonForPasswordChange asks a running daemon (SIGHUP; the reload handler calls
+// control.refresh) to reconcile its control socket with the new password state. A stopped daemon
+// picks it up on next start.
 func reloadDaemonForPasswordChange() error {
 	if !systemd.IsDaemonActive() {
 		return nil

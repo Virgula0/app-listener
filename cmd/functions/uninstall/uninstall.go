@@ -1,8 +1,7 @@
-// The `app-listener uninstall` command reverts the installer: refuses while
-// the daemon runs, re-scans the catalog (not daemon.conf) for encrypted dirs,
-// verifies the master key, asks per dir to decrypt permanently (default: no),
-// removes units/hook/binary/symlink/config, reverts sample-matching ssh-agent
-// units after a separate confirmation, and deletes the key only with
+// The `app-listener uninstall` command reverts the installer: refuses while the daemon runs,
+// re-scans the catalog (not daemon.conf) for encrypted dirs, verifies the master key, asks per dir
+// to decrypt permanently (default no), removes units/hook/binary/symlink/config, reverts
+// sample-matching ssh-agent units after a separate confirmation, and deletes the key only with
 // --delete-key.
 package uninstall
 
@@ -93,9 +92,8 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Scan for migration backups while daemon.conf still exists (it names
-	// manually added directories the catalog does not); the prompt runs at
-	// the end, after revertSystemFiles.
+	// Scan for migration backups while daemon.conf still exists (it names manual dirs the catalog
+	// doesn't); the prompt runs at the end, after revertSystemFiles.
 	backupEntries, err := backups.Find()
 	if err != nil {
 		return err
@@ -125,11 +123,9 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// offerBackupCleanup asks, at the end of the uninstall, whether to delete the
-// .app_listener.backup directories the install-time fscrypt migration left
-// behind. They are plain, unencrypted copies of the original directories —
-// keeping them after an uninstall is usually pointless but harmless, so the
-// user chooses (all preselected, one confirmation).
+// offerBackupCleanup asks at the end whether to delete the .app_listener.backup dirs the migration
+// left. They're plain unencrypted copies, usually pointless but harmless to keep, so the user
+// chooses (all preselected, one confirmation).
 func offerBackupCleanup(entries []backups.Backup) error {
 	if len(entries) == 0 {
 		return nil
@@ -159,10 +155,9 @@ func offerBackupCleanup(entries []backups.Backup) error {
 	return nil
 }
 
-// decryptStep scans for fscrypt-encrypted catalog directories, verifies the
-// master key against each, asks per directory whether to permanently
-// decrypt, decrypts the confirmed ones, and cleans the fscrypt metadata
-// they orphan. A no-op when nothing is encrypted.
+// decryptStep scans for fscrypt-encrypted catalog dirs, verifies the master key against each, asks
+// per dir whether to decrypt permanently, decrypts the confirmed ones and cleans the fscrypt
+// metadata they orphan. No-op when nothing is encrypted.
 func decryptStep(vault *fscrypt.Vault) error {
 	encrypted, scanErr := protected.ScanEncryptedCatalogDirs(vault)
 	if scanErr != nil {
@@ -248,9 +243,9 @@ func decryptDirectories(vault *fscrypt.Vault, toDecrypt []string) error {
 	return nil
 }
 
-// cleanOrphanedMetadata removes policy/protector metadata orphaned by the
-// just-decrypted dirs, scoped like the installer (catalog watch dirs for all
-// local users plus system entries); only app-listener-key-* pairs are deleted.
+// cleanOrphanedMetadata removes policy/protector metadata orphaned by the just-decrypted dirs,
+// scoped like the installer (catalog watch dirs for all users plus system entries); only
+// app-listener-key-* pairs are deleted.
 func cleanOrphanedMetadata() error {
 	users, err := inst.ListUsers()
 	if err != nil {

@@ -18,9 +18,8 @@ func defaultNewFileMode(isDir bool) os.FileMode {
 	return 0o666 &^ mask
 }
 
-// applyNewFileMeta gives fresh entries the ownership/mode the invoking user
-// would have gotten: under sudo it chowns to SUDO_UID/SUDO_GID natively;
-// non-root callers only get the defaultNewFileMode mode.
+// applyNewFileMeta gives fresh entries the ownership/mode the invoking user would have gotten:
+// under sudo it chowns to SUDO_UID/SUDO_GID; non-root callers only get defaultNewFileMode.
 func applyNewFileMeta(path string, isDir bool) error {
 	mode := defaultNewFileMode(isDir)
 	if os.Geteuid() == 0 {
@@ -119,9 +118,8 @@ func isBinaryContent(data []byte) bool {
 	return bytes.IndexByte(data[:n], 0) >= 0
 }
 
-// writeFileKeepMeta atomically replaces path with data (temp sibling +
-// rename after fsync), preserving mode and owner; symlinks are refused so
-// writes never follow links. Owner restoration requires root.
+// writeFileKeepMeta atomically replaces path with data (temp sibling + rename after fsync),
+// preserving mode and owner (needs root); symlinks are refused so writes never follow links.
 func writeFileKeepMeta(path string, data []byte) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -167,17 +165,12 @@ func writeFileKeepMeta(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
-// writeFileInPlace rewrites path's EXISTING inode directly — open, truncate,
-// write, fsync — never a temp file or a rename. Used only for a single-file
-// edit-protected resource (fileEditModel.singleFile): unlike a file nested
-// inside a guarded directory, a single-file watch root's own guard also
-// protects its parent directory against anything created or renamed beside
-// it (see guard_path_rename's destination-parent-directory check in
-// guard.bpf.c — the same "rename-over-watchroot" defense CLAUDE.md calls
-// out), so writeFileKeepMeta's temp-sibling dance is denied there. Mode and
-// ownership are left exactly as they are — there is no separate temp file
-// whose metadata could ever need copying onto the live one, unlike the
-// create-then-rename path.
+// writeFileInPlace rewrites path's EXISTING inode (open, truncate, write, fsync), never a temp file
+// or rename. Only for a single-file edit-protected resource (fileEditModel.singleFile): a
+// single-file watch root's guard also protects its parent directory against anything
+// created/renamed beside it (guard_path_rename's destination-parent check, the
+// rename-over-watchroot defense), so writeFileKeepMeta's temp-sibling dance is denied. Mode and
+// ownership stay as they are (no temp file whose metadata needs copying).
 func writeFileInPlace(path string, data []byte) error {
 	info, err := os.Lstat(path)
 	if err != nil {

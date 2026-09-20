@@ -17,38 +17,29 @@ import (
 )
 
 const (
-	// maxLockRetries bounds the EBUSY retry loop when force-flushing an
-	// fscrypt lock during key deprovisioning.
+	// maxLockRetries bounds the EBUSY retry loop when force-flushing an fscrypt lock.
 	maxLockRetries = 100
 	lockRetryDelay = 10 * time.Millisecond
-	// resyncMinInterval throttles post-denial re-syncs: a denial storm must
-	// not re-stat every whitelisted binary on each event.
+	// resyncMinInterval throttles post-denial re-syncs so a denial storm doesn't re-stat every
+	// binary per event.
 	resyncMinInterval = 2 * time.Second
-	// resyncSweepEvery is the background sweep interval, catching binary
-	// replacements that never produced a denied access (swapped while the old
-	// binary was still running) and recreated single-file watch roots. The
-	// sweep is fingerprint-gated (SweepInodes) so each tick is cheap when
-	// nothing changed.
+	// resyncSweepEvery is the background sweep interval, catching binary replacements that never
+	// produced a denial and recreated single-file roots. Fingerprint-gated (SweepInodes), so cheap
+	// when nothing changed.
 	resyncSweepEvery = 30 * time.Second
-	// inodeGCEvery is the guard_inodes eviction cadence (ReconcileInodes): a
-	// full, complete tree walk, much coarser than resyncSweepEvery — it
-	// exists to bound how long a stale (dev, ino) entry for a long-deleted
-	// file can linger and risk colliding with an unrelated inode reused
-	// elsewhere on the same filesystem, not to catch changes quickly.
+	// inodeGCEvery is the ReconcileInodes cadence (full tree walk), much coarser than
+	// resyncSweepEvery: it only bounds how long a stale (dev, ino) entry can linger and collide
+	// with a reused inode.
 	inodeGCEvery = time.Hour
-	// fileRootFollowEvery is how quickly a SINGLE-FILE watch root replaced by
-	// an application's atomic save (write a temp, rename it over — Steam's
-	// registry.vdf on every launch) is re-anchored to its new inode. Until
-	// then the new file is neither the root nor in guard_inodes, i.e. not
-	// guarded. The kernel side cannot follow the rename itself:
-	// guard_path_rename has no verifier budget left (issue #45). For a file
-	// root the check is a single stat, so it runs far more often than the
-	// general sweep.
+	// fileRootFollowEvery is how quickly a SINGLE-FILE watch root replaced by an atomic save (temp
+	// + rename over; Steam's registry.vdf) is re-anchored to its new inode. Until then the new file
+	// is unguarded. The kernel side can't follow the rename (guard_path_rename has no verifier
+	// budget left, issue #45); for a file root the check is one stat, so it runs far more often
+	// than the general sweep.
 	fileRootFollowEvery = time.Second
 
-	// Rollback lock-back budget: bounded (unlike Stop's infinite wait)
-	// because rollback runs on the SIGHUP handler, which must keep serving
-	// signals.
+	// Rollback lock-back budget is bounded (unlike Stop's infinite wait): rollback runs on the
+	// SIGHUP handler, which must keep serving signals.
 	maxRollbackLockRounds  = 3
 	rollbackLockRetryDelay = 500 * time.Millisecond
 )
@@ -59,19 +50,18 @@ type DaemonEvent struct {
 	Event    guard.GuardEvent
 }
 
-// DaemonUseCase orchestrates the daemon lifecycle: verify encryption, unlock, run guards,
-// apply atomic SIGHUP reloads and a secure lockdown. Ordering is attach → unlock → populate
-// → resolve → re-sync, so resources are never readable without live protection (no TOCTOU window).
+// DaemonUseCase orchestrates the daemon lifecycle: verify encryption, unlock, run guards, atomic
+// SIGHUP reloads, secure lockdown. Order is attach → unlock → populate → resolve → re-sync, so
+// resources are never readable without live protection.
 type DaemonUseCase interface {
 	Start() error
 	Reload(resources []daemonconfig.Resource, guards []repository.GuardRepository) error
 	Stop()
 	Events() <-chan DaemonEvent
 	Resources() []daemonconfig.Resource
-	// GrantEditAccess widens the guard of one configured resource so the
-	// app-listener binary (uid 0 only) may modify it for an authenticated
-	// live edit-protected session. Only one grant may be active at a time.
-	// The returned revoke restores the read-only baseline; it is idempotent.
+	// GrantEditAccess widens one resource's guard so the app-listener binary (uid 0 only) may
+	// modify it for an authenticated live edit-protected session. One grant at a time. The returned
+	// revoke restores the read-only baseline; idempotent.
 	GrantEditAccess(resourcePath string) (revoke func() error, err error)
 }
 
@@ -80,8 +70,8 @@ type daemonUseCase struct {
 	resources []daemonconfig.Resource
 	vault     repository.Vault
 	guards    []repository.GuardRepository
-	// stops holds one close-channel per guard to retire its event forwarder
-	// on reload (guard event channels themselves are never closed).
+	// stops: one close-channel per guard to retire its event forwarder on reload (guard event
+	// channels are never closed).
 	stops []chan struct{}
 
 	events chan DaemonEvent
@@ -90,16 +80,15 @@ type daemonUseCase struct {
 	start   sync.Once
 	stop    sync.Once
 	started bool
-	// stopping is set once lockdown begins; Reload refuses when set, so a
-	// SIGHUP mid-shutdown can never attach guards or unlock resources.
+	// stopping is set once lockdown begins; Reload refuses when set, so a SIGHUP mid-shutdown never
+	// attaches or unlocks.
 	stopping bool
-	// orphans holds not-yet-committed guards from an aborted reload whose
-	// freshly unlocked resources could not be locked back within the
-	// bounded rollback budget: they stay attached denying access and are
-	// retired by Stop after its own lockdown (see rollbackReload).
+	// orphans: not-yet-committed guards from an aborted reload whose freshly unlocked resources
+	// couldn't be locked back within the rollback budget. They stay attached (denying) and are
+	// retired by Stop after its lockdown (rollbackReload).
 	orphans []repository.GuardRepository
-	// editGrantActive is set while a live edit-protected session holds a
-	// write grant on one resource (see GrantEditAccess); only one at a time.
+	// editGrantActive is set while a live edit-protected session holds a write grant
+	// (GrantEditAccess); one at a time.
 	editGrantActive bool
 }
 
@@ -116,9 +105,8 @@ func NewDaemonUseCase(resources []daemonconfig.Resource, vault repository.Vault,
 	}, nil
 }
 
-// concurrencyLimit bounds a resource-indexed fan-out to core count, and never
-// higher than there is work to do — avoids a thundering herd of concurrent
-// tree walks / BPF syscalls on hosts with many configured resources.
+// concurrencyLimit bounds a resource-indexed fan-out to core count and never more than the work
+// (avoids a thundering herd of tree walks/BPF syscalls).
 func concurrencyLimit(n int) int {
 	if n < 1 {
 		return 1
@@ -129,22 +117,14 @@ func concurrencyLimit(n int) int {
 	return n
 }
 
-// unlockRoots unlocks every root in roots via unlockOne, fanned out with
-// bounded concurrency. Safe because: (1) roots is always already deduplicated
-// by the caller (uniqueEncryptionRoots) — a shared `watch:` group root never
-// appears twice, so no two goroutines ever race to unlock the SAME vault;
-// (2) every guard for every resource — including every member of a
-// shared-root group — is attached before startGuards ever calls this (guards
-// are built by buildGuards, which returns before Start() runs), so no root
-// unlocked here can expose a sibling resource whose own guard is not yet
-// live. Each Vault.Unlock call only touches its own root's kernel keyring
-// state (or, for a file-vault target, decrypts that one file); the only
-// shared mutable state in the Vault (the collateral map) is already
-// mutex-protected for concurrent access. On any failure every already-issued
-// unlock still runs to completion (no early cancellation) — they are all for
-// resources whose guards are already attached and denying, so letting them
-// finish is not a protection gap, just possibly-unneeded work that the
-// caller's error path locks back down.
+// unlockRoots unlocks every root via unlockOne with bounded concurrency. Safe because: (1) roots is
+// already deduplicated (uniqueEncryptionRoots), so no two goroutines unlock the SAME vault; (2)
+// every guard of every resource, including all members of a shared-root group, is attached before
+// this runs (buildGuards returns before Start()), so no unlock exposes a sibling whose guard isn't
+// live. Each Vault.Unlock touches only its own root's keyring state (or decrypts that one file);
+// the collateral map is mutex-protected. On failure already-issued unlocks still finish (their
+// guards are attached and denying, so this is no protection gap); the caller's error path locks
+// them back.
 func unlockRoots(roots []string, unlockOne func(root string) error) error {
 	if len(roots) == 0 {
 		return nil
@@ -170,29 +150,20 @@ func unlockRoots(roots []string, unlockOne func(root string) error) error {
 	return nil
 }
 
-// prepareOneGuard runs one guard's post-unlock startup: populate its inode
-// map, resolve whitelist entries deferred while its resource was locked,
-// re-sync replaced binaries, then start its ringbuf reader. Every guard is
-// already attached and every vault is already unlocked before this is called
-// (startGuards' two barriers above it), and each guard owns its own inode map
-// and BPF objects — no shared mutable state across resources — so
-// prepareAndStartGuards runs this concurrently across resources.
+// prepareOneGuard runs one guard's post-unlock startup: populate its inode map, resolve entries
+// deferred while locked, re-sync replaced binaries, start its ringbuf reader. All guards are
+// attached and vaults unlocked before this (startGuards' two barriers) and each guard owns its
+// maps, so prepareAndStartGuards runs it concurrently.
 //
-// The one behavior this trades away versus a fully sequential pass: a
-// whitelist entry naming a binary that lives inside a DIFFERENT resource's
-// tree may not resolve on this call if that other resource's populate hasn't
-// landed yet. It stays deferred — still fail-closed, never falls open — and
-// is picked up by the periodic re-sync (forwardEvents/periodicSweep) shortly
-// after, same as a binary replaced in place after startup already is.
+// Trade-off vs a sequential pass: an entry naming a binary inside a DIFFERENT resource's tree may
+// not resolve if that resource's populate hasn't landed. It stays deferred (fail-closed) and is
+// picked up by the periodic re-sync (forwardEvents/periodicSweep).
 func (d *daemonUseCase) prepareOneGuard(i int) error {
 	g := d.guards[i]
 	if err := g.PopulateInodes(); err != nil {
-		// Critical: every vault is already unlocked and every guard attached
-		// here, so a populate failure is a property of the tree on disk (an
-		// unreadable subtree, a tree the walk cannot classify) and reproduces
-		// identically on every start. Untagged, it exited 1 and systemd's
-		// Restart=on-failure crash-looped the daemon — unlocking and
-		// re-locking every vault every two seconds.
+		// Critical: vaults are unlocked and guards attached, so a populate failure is a property of
+		// the tree on disk and reproduces on every start. Untagged, Restart=on-failure would
+		// crash-loop the daemon, re-locking every vault every two seconds.
 		return fmt.Errorf("%w: populating guard for %s: %w", constants.ErrCriticalStartup, d.resources[i].Path, err)
 	}
 	if err := g.ResolvePendingBinaries(); err != nil {
@@ -207,8 +178,8 @@ func (d *daemonUseCase) prepareOneGuard(i int) error {
 	return nil
 }
 
-// prepareAndStartGuards fans prepareOneGuard out across every guard, bounded
-// by concurrencyLimit, and waits for all of them before returning.
+// prepareAndStartGuards fans prepareOneGuard out across guards (bounded by concurrencyLimit) and
+// waits for all.
 func (d *daemonUseCase) prepareAndStartGuards() error {
 	n := len(d.guards)
 	errs := make([]error, n)
@@ -240,9 +211,8 @@ func (d *daemonUseCase) Start() error {
 	return startErr
 }
 
-// encryptionRootOf returns the vault root whose fscrypt key lifecycle governs
-// resource r: the `watch:`-group's section path when set, the resource path
-// itself otherwise (ungrouped resources are their own encryption root).
+// encryptionRootOf returns the vault root governing r: the `watch:` group's section path, else r's
+// own path.
 func encryptionRootOf(r *daemonconfig.Resource) string {
 	if r.EncryptionRoot != "" {
 		return r.EncryptionRoot
@@ -250,9 +220,8 @@ func encryptionRootOf(r *daemonconfig.Resource) string {
 	return r.Path
 }
 
-// uniqueEncryptionRoots deduplicates the encryption roots of the encrypted
-// resources: grouped watch paths share one vault root, and the fscrypt key
-// lifecycle must run exactly once per root.
+// uniqueEncryptionRoots deduplicates encryption roots of encrypted resources (grouped watch paths
+// share one vault); the key lifecycle must run once per root.
 func uniqueEncryptionRoots(resources []daemonconfig.Resource) []string {
 	seen := make(map[string]bool)
 	var roots []string
@@ -270,17 +239,11 @@ func uniqueEncryptionRoots(resources []daemonconfig.Resource) []string {
 	return roots
 }
 
-// partitionEncryptionRoots splits roots into fscrypt directories and
-// file-vault regular files. Used only to sequence startGuards' unlock pass
-// into two explicit phases — directories (unchanged kernel-keyring cycle)
-// then files (in-place, same-inode cycle, see internal/fscrypt/filevault.go)
-// — so the two different unlock mechanisms, and that neither can affect the
-// other's guard state, is visible by inspection. Each Vault.Unlock call is
-// independently safe regardless of interleaving; this split is a clarity
-// and auditability choice, not a correctness requirement. A stat failure
-// (e.g. the root does not exist yet) falls into dirs, matching the
-// pre-partition behavior of just calling Unlock and letting it report the
-// real error.
+// partitionEncryptionRoots splits roots into fscrypt directories and file-vault regular files, so
+// startGuards' unlock runs as two visible phases: directories (kernel-keyring cycle), then files
+// (in-place same-inode cycle, filevault.go). A clarity/auditability split, not correctness: each
+// Unlock is independently safe. A stat failure (e.g. root missing) falls into dirs so Unlock
+// reports the real error.
 func partitionEncryptionRoots(roots []string) (dirs, files []string) {
 	for _, root := range roots {
 		if info, err := os.Stat(root); err == nil && info.Mode().IsRegular() {
@@ -292,12 +255,10 @@ func partitionEncryptionRoots(roots []string) (dirs, files []string) {
 	return dirs, files
 }
 
-// vaultOpForGuard runs a Vault.Unlock/Lock call on root, temporarily
-// widening g's self-access when root is a file-vault target (see
-// guard.WithSelfVaultAccess) — a directory root's fscrypt lifecycle never
-// touches file content (pure kernel-keyring operations), so it always runs
-// unwidened. g may be nil (no guard found for root): op still runs, so the
-// real (denied) error surfaces instead of a silent skip.
+// vaultOpForGuard runs a Vault.Unlock/Lock on root, widening g's self-access
+// (guard.WithSelfVaultAccess) only when root is a file-vault (directory roots touch only the
+// keyring, so run unwidened). g may be nil (no guard for root): op still runs so the real (denied)
+// error surfaces instead of a silent skip.
 func vaultOpForGuard(g repository.GuardRepository, root string, op func() error) error {
 	info, statErr := os.Stat(root)
 	if statErr != nil || !info.Mode().IsRegular() || g == nil {
@@ -306,11 +267,9 @@ func vaultOpForGuard(g repository.GuardRepository, root string, op func() error)
 	return g.WithSelfVaultAccess(op)
 }
 
-// vaultOpOnRoot is vaultOpForGuard, looking the guard up by encryption root
-// in resources/guards (index-aligned — Reload enforces this, and
-// d.resources/d.guards always are). A regular-file resource is never
-// grouped (WatchRelPaths targets directories only), so exactly one
-// resource/guard matches a file root — no ambiguity to resolve.
+// vaultOpOnRoot is vaultOpForGuard, finding the guard by encryption root in resources/guards
+// (index-aligned; Reload enforces this). A regular-file resource is never grouped, so exactly one
+// resource/guard matches a file root.
 func vaultOpOnRoot(resources []daemonconfig.Resource, guards []repository.GuardRepository, root string, op func() error) error {
 	for i := range resources {
 		if encryptionRootOf(&resources[i]) == root {
@@ -320,9 +279,8 @@ func vaultOpOnRoot(resources []daemonconfig.Resource, guards []repository.GuardR
 	return vaultOpForGuard(nil, root, op)
 }
 
-// verifyEncryptionStates checks every resource's encryption state against its
-// need_encryption setting before anything is unlocked or protected: a misconfigured
-// resource aborts the start.
+// verifyEncryptionStates checks each resource's encryption state against need_encryption before
+// anything is unlocked or protected; a mismatch aborts the start.
 func (d *daemonUseCase) verifyEncryptionStates() error {
 	for i := range d.resources {
 		r := &d.resources[i]
@@ -345,22 +303,16 @@ func (d *daemonUseCase) startGuards() error {
 		return err
 	}
 
-	// Grouped watch paths share one encryption root: the key is provisioned
-	// exactly once per vault (unlock is vault-wide by fscrypt semantics).
-	// Directories and file-vault regular files are unlocked in two explicit
-	// passes (see partitionEncryptionRoots) — guards for BOTH kinds are
-	// already attached at this point (built before Start), so there is no
-	// unlocked-and-unprotected window for either. Within each pass, the
-	// per-root unlocks are independent of one another (see unlockRoots) and
-	// run concurrently. A file root's guard self access is widened only for
-	// the call itself (vaultOpOnRoot -> guard.WithSelfVaultAccess): the
-	// in-place unlock reads+rewrites the file's own bytes, which the guard's
-	// baseline self mask (open/read/stat only) does not permit.
-	// An Unlock failure here means the master key/policy pairing itself is
-	// wrong (missing key file, wrong key, unsupported filesystem) — the same
-	// key, same policy and same filesystem will fail identically on every
-	// restart, so this is the same "administrator action required" class as
-	// verifyEncryptionStates' mismatch, not a transient condition.
+	// Grouped watch paths share one encryption root: the key is provisioned once per vault.
+	// Directories and file-vault files unlock in two passes (partitionEncryptionRoots); guards for
+	// BOTH kinds are already attached, so there is no unlocked-and-unprotected window. Within a
+	// pass, unlocks are independent and concurrent (unlockRoots). A file root's self access is
+	// widened only for the call itself (vaultOpOnRoot -> guard.WithSelfVaultAccess), since the
+	// in-place unlock rewrites the file's bytes, beyond the baseline open/read/stat mask.
+	//
+	// An Unlock failure means the key/policy pairing is wrong (missing key, wrong key, unsupported
+	// fs) and fails identically on every restart: the same "administrator action required" class as
+	// verifyEncryptionStates, not transient.
 	dirRoots, fileRoots := partitionEncryptionRoots(uniqueEncryptionRoots(d.resources))
 	if err := unlockRoots(dirRoots, d.vault.Unlock); err != nil {
 		return err
@@ -371,12 +323,9 @@ func (d *daemonUseCase) startGuards() error {
 		return err
 	}
 
-	// Every vault is now unlocked and every guard is already attached
-	// (built before Start): for each resource, populate its inode map, resolve
-	// deferred whitelist entries, re-sync replaced binaries and start its
-	// ringbuf reader — fail-closed contract preserved (attach → unlock →
-	// populate → resolve), just fanned out across resources instead of run
-	// one at a time (see prepareOneGuard for why this is safe to parallelize).
+	// Vaults unlocked, guards attached (built before Start): per resource, populate the inode map,
+	// resolve deferred entries, re-sync replaced binaries, start the ringbuf reader. Fail-closed
+	// order preserved, just fanned out (see prepareOneGuard).
 	if err := d.prepareAndStartGuards(); err != nil {
 		return err
 	}
@@ -395,8 +344,8 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 	defer sweep.Stop()
 	inodeGC := time.NewTicker(inodeGCEvery)
 	defer inodeGC.Stop()
-	// nil (never fires) unless the resource is a single file; a watch root
-	// does not change type while it is guarded.
+	// nil (never fires) unless the resource is a single file; a watch root doesn't change type
+	// while guarded.
 	var followRoot <-chan time.Time
 	if info, err := os.Lstat(resource); err == nil && !info.IsDir() {
 		follow := time.NewTicker(fileRootFollowEvery)
@@ -407,8 +356,7 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 	for {
 		select {
 		case <-followRoot:
-			// Errors are left to the periodic sweep, which reports them at a
-			// sane rate (a deleted root would otherwise log every second).
+			// Errors are left to the periodic sweep, which reports them at a sane rate.
 			_ = g.SweepInodes()
 		case ev, ok := <-g.Events():
 			if !ok {
@@ -432,22 +380,17 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 	}
 }
 
-// dispatchGuardEvent re-syncs the binary whitelist on a throttled denial and
-// forwards ev to the daemon's event channel, reporting whether the forward
-// loop should keep running (false means the daemon or this resource's guard
-// is shutting down).
+// dispatchGuardEvent re-syncs the binary whitelist on a throttled denial and forwards ev to the
+// event channel; false = the daemon or this guard is shutting down.
 func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRepository, ev *guard.GuardEvent, stop <-chan struct{}, lastResync *time.Time) bool {
-	// The raw block-device gate names a device, not this resource: label it
-	// as such and skip the re-sync (it is never an in-place binary
-	// replacement).
+	// The raw block-device gate names a device, not this resource: label it so and skip the re-sync
+	// (never an in-place binary replacement).
 	label := resource
 	if ev.RawDevice {
 		label = guard.RawDeviceResourceLabel
 	}
-	// A denial usually means the binary was replaced in place; re-sync
-	// (throttled by resyncMinInterval) to admit the new inode instead of
-	// re-statting the whitelist per event.
-	// A process-gate denial is not an in-place binary replacement either.
+	// A denial usually means an in-place binary replacement: re-sync (throttled by
+	// resyncMinInterval) to admit the new inode. A process-gate denial is not one.
 	if ev.Blocked && !ev.RawDevice && ev.Process == "" && time.Since(*lastResync) >= resyncMinInterval {
 		if _, err := g.ReSyncBinaries(); err != nil {
 			log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
@@ -464,12 +407,10 @@ func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRe
 	}
 }
 
-// periodicSweep re-syncs the binary whitelist (catching replacements that
-// never produced a denial) and refreshes the inode map. SweepInodes only does
-// real work when the watch root's fingerprint moved (a recreated single-file
-// root — sqlite journals — or a directory that gained/lost a top-level
-// entry); an unconditional full re-walk every tick was a large share of the
-// daemon's steady-state CPU.
+// periodicSweep re-syncs the binary whitelist (catching replacements that never produced a denial)
+// and refreshes the inode map. SweepInodes only works when the root's fingerprint moved (recreated
+// single-file root, or a directory that gained/lost a top-level entry); an unconditional re-walk
+// per tick was a large share of steady-state CPU.
 func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardRepository) {
 	if _, err := g.ReSyncBinaries(); err != nil {
 		log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
@@ -479,10 +420,10 @@ func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardReposit
 	}
 }
 
-// Reload atomically applies a new configuration: old and new LSM programs run concurrently
-// and ANY deny wins, so protection is never weaker than either configuration; on error the
-// old config keeps running and the new guards are detached. Removing a resource is refused —
-// it would be left unlocked and unguarded; dropping protection requires stop/edit/start.
+// Reload atomically applies a new configuration: old and new LSM programs run concurrently and ANY
+// deny wins, so protection is never weaker than either; on error the old config keeps running and
+// new guards are detached. Removing a resource is refused (it would be left unlocked and
+// unguarded); dropping protection requires stop/edit/start.
 func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repository.GuardRepository) error {
 	if len(resources) != len(guards) {
 		return fmt.Errorf("daemon: %d resources but %d guard engines", len(resources), len(guards))
@@ -500,9 +441,8 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 		return fmt.Errorf("daemon: reload refused: shutdown in progress — restart the daemon to apply the new configuration")
 	}
 
-	// Phase 0 — refuse to drop any protected resource (see Reload). Nothing
-	// is committed yet, so the new guards are detached and the old config
-	// keeps running.
+	// Phase 0: refuse to drop any protected resource (see Reload). Nothing is committed: new guards
+	// detach, old config keeps running.
 	newByPath := make(map[string]bool, len(resources))
 	for i := range resources {
 		newByPath[resources[i].Path] = true
@@ -523,18 +463,17 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 		oldByPath[d.resources[i].Path] = i
 	}
 
-	// Phase 1 — validate and unlock resources new to the config; nothing is
-	// committed yet, so errors roll back (detach new guards, re-lock unlocks).
-	// Guards were attached by the caller: unlocks always have live protection.
+	// Phase 1: validate and unlock resources new to the config. Nothing is committed, so errors
+	// roll back (detach new guards, re-lock). Guards are already attached, so unlocks always have
+	// live protection.
 	var unlocked []string
 	if err := d.prepareNewResources(resources, guards, oldByPath, &unlocked); err != nil {
 		d.rollbackReload(resources, guards, unlocked)
 		return err
 	}
 
-	// Phase 2 — populate the new guards' inode maps (hooks live, plaintext
-	// readable — no protection gap), then resolve deferred entries and
-	// re-sync: same fail-closed ordering as startup.
+	// Phase 2: populate the new guards' inode maps (hooks live, plaintext readable, no gap), then
+	// resolve deferred entries and re-sync: same fail-closed order as startup.
 	if err := d.prepareGuards(resources, guards); err != nil {
 		d.rollbackReload(resources, guards, unlocked)
 		return err
@@ -552,9 +491,9 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	return nil
 }
 
-// prepareNewResources validates and unlocks resources new to the configuration; kept
-// resources are untouched. Each unlock is recorded so rollback can lock it back.
-// resources/guards are index-aligned (Reload enforces this).
+// prepareNewResources validates and unlocks resources new to the config (kept ones untouched),
+// recording each unlock so rollback can lock it back. resources/guards are index-aligned (Reload
+// enforces this).
 func (d *daemonUseCase) prepareNewResources(resources []daemonconfig.Resource, guards []repository.GuardRepository, oldByPath map[string]int, unlocked *[]string) error {
 	for i := range resources {
 		if _, existed := oldByPath[resources[i].Path]; existed {
@@ -568,8 +507,8 @@ func (d *daemonUseCase) prepareNewResources(resources []daemonconfig.Resource, g
 }
 
 func (d *daemonUseCase) prepareAddedResource(r *daemonconfig.Resource, g repository.GuardRepository, unlocked *[]string) error {
-	// Grouped watch paths share the group's encryption root: the vault-level
-	// checks and the unlock target the root, and the rollback re-locks roots.
+	// Grouped watch paths share the group's encryption root: vault-level checks, unlock and
+	// rollback all target the root.
 	root := encryptionRootOf(r)
 	encrypted, err := d.vault.IsEncrypted(root)
 	if err != nil {
@@ -579,12 +518,10 @@ func (d *daemonUseCase) prepareAddedResource(r *daemonconfig.Resource, g reposit
 		return fmt.Errorf("reload: directory %s is NOT encrypted: run the fscrypt migration first or set need_encryption: false", root)
 	}
 	if !r.NeedEncryption {
-		// Nothing to unlock. Stop here for the unencrypted case too: falling
-		// through to IsProvisioned asked fscrypt for the policy of a
-		// directory that has none and failed the WHOLE reload — every lib_dir
-		// or need_encryption:false resource added by a reload (a catalog
-		// refresh) was rejected, while a restart (startGuards filters these
-		// out up front) accepted the same config.
+		// Nothing to unlock. Stop here for the unencrypted case: falling through to IsProvisioned
+		// asked fscrypt for the policy of a directory that has none and failed the WHOLE reload
+		// (any lib_dir/need_encryption:false resource added by a catalog refresh), while a restart
+		// accepted the same config.
 		if encrypted {
 			log.Warnf("daemon: reload: resource %s is encrypted but need_encryption: false \u2014 leaving it locked", root)
 		}
@@ -613,9 +550,8 @@ func (d *daemonUseCase) startNewGuards(guards []repository.GuardRepository) erro
 	return nil
 }
 
-// prepareGuards fills the freshly attached guards' inode maps, resolves deferred
-// whitelist entries and re-syncs replaced binaries; it runs post-unlock, so scans
-// see plaintext while hooks are live.
+// prepareGuards fills the new guards' inode maps, resolves deferred entries and re-syncs replaced
+// binaries; runs post-unlock, so scans see plaintext while hooks are live.
 func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards []repository.GuardRepository) error {
 	for i := range guards {
 		if err := guards[i].PopulateInodes(); err != nil {
@@ -631,18 +567,14 @@ func (d *daemonUseCase) prepareGuards(resources []daemonconfig.Resource, guards 
 	return nil
 }
 
-// rollbackReload aborts a reload without ever leaving a resource unlocked
-// and unguarded: while the not-yet-committed guards are still attached
-// (denying every non-whitelisted access), the freshly unlocked resources
-// are locked back with bounded retries, and the guards detach only once
-// every vault is keyless — the same ordering discipline as Stop. If a pin
-// outlasts the retry budget, the new guards are kept attached as orphans
-// (registered for the daemon's Stop) so the resource remains guarded;
-// an unlocked-and-unguarded state is unreachable by construction.
+// rollbackReload aborts a reload without leaving a resource unlocked and unguarded: with the
+// uncommitted guards still attached (denying), the freshly unlocked resources are locked back with
+// bounded retries, and guards detach only once every vault is keyless (same discipline as Stop). If
+// a pin outlasts the budget, the new guards stay attached as orphans (retired by Stop), so
+// unlocked-and-unguarded is unreachable.
 //
-// Called only from Reload while holding d.mu, so the orphan registration
-// needs no extra locking. The retry budget is bounded — unlike Stop —
-// because rollback runs on the SIGHUP handler, which must keep serving
+// Called only from Reload holding d.mu, so orphan registration needs no extra locking. The budget
+// is bounded (unlike Stop) because rollback runs on the SIGHUP handler, which must keep serving
 // signals.
 func (d *daemonUseCase) rollbackReload(resources []daemonconfig.Resource, guards []repository.GuardRepository, unlocked []string) {
 	if len(unlocked) > 0 {
@@ -671,15 +603,13 @@ func (d *daemonUseCase) rollbackReload(resources []daemonconfig.Resource, guards
 	}
 }
 
-// commitReload swaps in the new configuration; new forwarders spawn before old ones
-// retire and old LSM programs detach, so the event stream never goes silent either.
+// commitReload swaps in the new config; new forwarders spawn before old ones retire and old LSM
+// programs detach, so the event stream never goes silent.
 func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards []repository.GuardRepository) {
-	// Carry the memory-read taint from each old guard to the new guard for
-	// the same resource BEFORE the old ones are stopped. The new guards were
-	// built with empty guard_tainted_pids maps, so without this a reload
-	// would silently drop process_vm_readv / ptrace protection for every
-	// process that had already read a guarded file (they keep running across
-	// the reload with the secret still in memory).
+	// Carry the memory-read taint from each old guard to the new one for the same resource BEFORE
+	// the old ones stop: new guards start with empty guard_tainted_pids, so otherwise a reload
+	// would drop process_vm_readv/ptrace protection for processes already holding a secret in
+	// memory.
 	d.carryTaintAcrossReload(resources, guards)
 
 	newStops := make([]chan struct{}, len(guards))
@@ -701,10 +631,9 @@ func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards [
 	d.stops = newStops
 }
 
-// carryTaintAcrossReload copies each old guard's tainted-pid set into the new
-// guard for the same resource path. Best-effort: a transfer failure only
-// weakens memory-read protection for already-tainted processes until they next
-// touch the guarded tree, never enforcement of any direct access.
+// carryTaintAcrossReload copies each old guard's tainted-pid set into the new guard for the same
+// resource path. Best-effort: a failure only weakens memory-read protection for already-tainted
+// processes until they next touch the tree, never direct-access enforcement.
 func (d *daemonUseCase) carryTaintAcrossReload(resources []daemonconfig.Resource, guards []repository.GuardRepository) {
 	oldByPath := make(map[string]repository.GuardRepository, len(d.guards))
 	for i := range d.resources {
@@ -730,16 +659,16 @@ func (d *daemonUseCase) carryTaintAcrossReload(resources []daemonconfig.Resource
 	}
 }
 
-// Stop performs the secure lockdown: guards stay attached (denying all non-whitelisted
-// access) until every resource is keyless; only then are LSM hooks detached. A resource
-// whose key cannot be deprovisioned blocks shutdown indefinitely — the tree is never
-// left unlocked and unguarded, and the daemon logs how to find the pinning process.
+// Stop performs the secure lockdown: guards stay attached (denying all non-whitelisted access)
+// until every resource is keyless; only then do LSM hooks detach. A resource whose key can't be
+// deprovisioned blocks shutdown indefinitely (the daemon logs how to find the pinning process):
+// never unlocked and unguarded.
 func (d *daemonUseCase) Stop() {
 	d.stop.Do(func() {
 		log.Info("daemon: initiating secure lockdown")
 
-		// Hold the write lock through lockdown: Reload serializes behind it and
-		// refuses once stopping is set — no SIGHUP attaches/unlocks mid-shutdown.
+		// Hold the write lock through lockdown: Reload serializes behind it and refuses once
+		// stopping is set.
 		d.mu.Lock()
 		defer d.mu.Unlock()
 

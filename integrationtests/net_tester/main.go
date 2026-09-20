@@ -54,9 +54,8 @@ func tcpServer(port string) {
 	l.Close()
 }
 
-// tcpServerDelayed binds first, then listens once the marker file appears.
-// Used to observe a LISTEN denied by the guard on a socket that was already
-// bound (and therefore allowed) before the guard attached.
+// tcpServerDelayed binds first, then listens once the marker file appears: observes a LISTEN denied
+// by the guard on a socket already bound (allowed) before the guard attached.
 func tcpServerDelayed(port, waitFile string) error {
 	sock, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {

@@ -60,11 +60,10 @@ struct {
 	__type(key, __u32);
 	__type(value, __u64);
 } guard_net_config SEC(".maps");
-/* config[0] = default_action (0=allow, 1=block)
- * config[1] = blocking_enabled (0=events only, 1=real blocking)
- * config[2] = unsafe_families (0=AF_INET/AF_INET6 only, 1=all families)
- * config[3] = throttle_enabled (0=emit every event, 1=rate-limit per (type, comm))
- */
+// config[0] = default_action (0=allow, 1=block)
+// config[1] = blocking_enabled (0=events only, 1=real blocking)
+// config[2] = unsafe_families (0=AF_INET/AF_INET6 only, 1=all families)
+// config[3] = throttle_enabled (0=emit every event, 1=rate-limit per (type, comm))
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -78,11 +77,9 @@ struct throttle_key {
 	char comm[16];
 };
 
-/* Per-(type, comm) throttle: the LSM hooks are global, so in whitelist mode
- * every blocked socket op of noisy host processes would otherwise flood the
- * ring buffer (and drop important events when it overflows). Only one event
- * per (type, comm) per interval is emitted.
- */
+// Per-(type, comm) throttle: the LSM hooks are global, so in whitelist mode every blocked socket op
+// of noisy host processes would flood the ring buffer (dropping important events on overflow). One
+// event per (type, comm) per interval.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 512);
@@ -200,9 +197,8 @@ static __always_inline int is_event_type_allowed(__u32 type)
 
 static __always_inline long emit_event(struct net_guard_event *e)
 {
-	/* Rate-limit per (type, comm) so a busy host cannot overflow the ring
-	 * buffer and drop events of interest. Disabled via config[3] when full
-	 * event fidelity is required (--no-throttle). */
+	// Rate-limit per (type, comm) so a busy host can't overflow the ring buffer and drop events of
+	// interest. Disabled via config[3] for full fidelity (--no-throttle).
 	__u32 ckey = 3;
 	__u64 *throttle_on = bpf_map_lookup_elem(&guard_net_config, &ckey);
 	if (!throttle_on || *throttle_on != 0) {

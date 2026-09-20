@@ -22,10 +22,9 @@ import (
 )
 
 const (
-	// controlHandshakeTimeout bounds the AUTH exchange. The client sends AUTH
-	// immediately after connecting (it prompts for the password first), so
-	// this only needs headroom for scheduling / a slow disk read of the hash
-	// file, not for a human typing.
+	// controlHandshakeTimeout bounds the AUTH exchange. The client sends AUTH right after
+	// connecting (password prompted first), so it only needs headroom for scheduling and a slow
+	// hash-file read, not a human typing.
 	controlHandshakeTimeout = 30 * time.Second
 	// controlSelectTimeout is how long the client has, after AUTH, to pick a
 	// resource and send SELECT (it is navigating the picker in that window).
@@ -40,26 +39,23 @@ const (
 // Control protocol, two phases on one connection:
 //
 //	client -> AUTH\n<password>\n
-//	server -> OK <n>\n<resource-1>\n…<resource-n>\n   (authenticated; the
-//	                                                   configured watch paths)
+//	server -> OK <n>\n<resource-1>\n...<resource-n>\n   (authenticated; the configured watch paths)
 //	       -> ERR <reason>\n                          (refused; closed)
 //	client -> SELECT <resource>\n
-//	server -> OK\n | ERR <reason>\n                   (grant activated)
+//	server -> OK\n | ERR <reason>\n                    (grant activated)
 //	client -> END\n                                   (or EOF / 30-min cap)
 //
-// The password is verified BEFORE any resource path is disclosed, so an
-// unauthenticated caller learns nothing about the protected directories.
+// The password is verified BEFORE any resource path is disclosed, so an unauthenticated caller
+// learns nothing about the protected directories.
 const (
 	ctrlAuth   = "AUTH"
 	ctrlSelect = "SELECT"
 )
 
-// controlServer answers the local edit-protected control socket: it
-// authenticates a live edit request (peer uid 0, peer executable == this
-// daemon's binary, password matches the configured hash), discloses the
-// configured watch paths only after that, and on SELECT asks the use case to
-// widen the target resource's guard for the duration of the session. Only one
-// session is served at a time.
+// controlServer answers the local edit-protected control socket: authenticates a live edit request
+// (peer uid 0, peer exe == this daemon's binary, password matches the hash), discloses the watch
+// paths only after that, and on SELECT asks the use case to widen the target resource's guard for
+// the session. One session at a time.
 type controlServer struct {
 	uc       usecase.DaemonUseCase
 	ln       net.Listener
@@ -93,11 +89,10 @@ func (s *editControlSession) end() {
 	})
 }
 
-// controlManager owns the (optional) control socket across the daemon's life:
-// it is created when an edit-protected password exists and torn down when the
-// password is removed. The reload handler calls refresh() so a password added
-// or cleared via `edit-protected --set-password/--clear-password` on a
-// running daemon takes effect on the next SIGHUP without a restart.
+// controlManager owns the optional control socket across the daemon's life: created when an
+// edit-protected password exists, torn down when removed. The reload handler calls refresh(), so
+// `edit-protected --set-password/--clear-password` on a running daemon takes effect on the next
+// SIGHUP.
 type controlManager struct {
 	uc usecase.DaemonUseCase
 	mu sync.Mutex
@@ -296,9 +291,8 @@ func (cs *controlServer) resourcePaths() []string {
 	return out
 }
 
-// runSession blocks until the client sends END, disconnects, or the hard cap
-// elapses — then the session's grant is revoked (session.end, also reachable
-// from reload/shutdown).
+// runSession blocks until the client sends END, disconnects, or the hard cap elapses, then revokes
+// the grant (session.end, also reachable from reload/shutdown).
 func (cs *controlServer) runSession(conn net.Conn, reader *bufio.Reader, session *editControlSession) {
 	_ = conn.SetDeadline(time.Time{})
 	deadline := time.NewTimer(editprotected.EditSessionMaxDuration)
@@ -336,9 +330,8 @@ func (cs *controlServer) clearActive(session *editControlSession) {
 	cs.mu.Unlock()
 }
 
-// authPeer enforces that the connecting process runs as uid 0 and executes
-// this very daemon binary (same dev/ino) — a grant on the shared exe inode is
-// only useful to a caller that is that binary.
+// authPeer requires the peer to run as uid 0 and execute this very daemon binary (same dev/ino): a
+// grant on the shared exe inode is only useful to a caller that is that binary.
 func (cs *controlServer) authPeer(conn net.Conn) error {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {

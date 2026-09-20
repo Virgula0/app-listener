@@ -10,13 +10,13 @@ import (
 
 // buildTrustedSet computes the daemon-wide trusted sets from the config:
 //   - binaries: every whitelisted binary (TRUSTED_BINARY);
-//   - libs: each binary's statically resolved library closure, the operator's
-//     allow_lib entries, and /etc/ld.so.preload (TRUSTED_LIB);
-//   - dirs: every guarded resource root, so a library loaded from inside one
-//     of those write-protected trees is trusted without an allow_lib entry.
+//   - libs: each binary's static library closure, the allow_lib entries and /etc/ld.so.preload
+//     (TRUSTED_LIB);
+//   - dirs: every guarded resource root, so libraries inside those write-protected trees are
+//     trusted without allow_lib.
 //
-// A currently-unresolvable binary/library is skipped; the periodic re-sync
-// picks it up later. It is only ever a coverage gap, never a protection gap.
+// A currently-unresolvable binary/library is skipped and picked up by the periodic re-sync: a
+// coverage gap, never a protection gap.
 func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string) {
 	binSet := make(map[string]struct{})
 	libSet := make(map[string]struct{})
@@ -30,11 +30,10 @@ func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string) {
 		for _, l := range cfg.Resources[i].AllowLibs {
 			libSet[l] = struct{}{}
 		}
-		// Unreadable at parse time (typically inside a vault that was still
-		// locked). The trust set is built after the unlock and SetTrusted
-		// re-stats every path, so these resolve now or are skipped with a
-		// warning — before, they were parked and never read again, so such a
-		// library silently stayed untrusted.
+		// Unreadable at parse time (typically a still-locked vault). The trust set is built after
+		// unlock and SetTrusted re-stats every path, so these resolve now or are skipped with a
+		// warning (previously they were parked and never re-read, leaving such libraries
+		// untrusted).
 		for _, l := range cfg.Resources[i].PendingLibs {
 			libSet[l] = struct{}{}
 		}
@@ -78,12 +77,10 @@ func keys(m map[string]struct{}) []string {
 	return out
 }
 
-// startTrustGuard brings up the daemon-wide trust guard: binary
-// write-protection (#1) and the library-load allowlist (#2), both always
-// enforced. It returns a cleanup func (a no-op when nothing started) so the
-// caller defers a single statement. Best-effort — any failure logs and starts
-// nothing, never blocking daemon startup; per-resource enforcement is
-// unaffected regardless.
+// startTrustGuard brings up the daemon-wide trust guard: binary write-protection (#1) and the
+// library-load allowlist (#2), both always enforced. Returns a cleanup func (no-op if nothing
+// started). Best-effort: a failure logs and starts nothing, never blocking startup or per-resource
+// enforcement.
 func startTrustGuard(cfg *daemonconfig.Config) func() {
 	noop := func() {}
 	binaries, libs, dirs := buildTrustedSet(cfg)

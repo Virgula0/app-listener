@@ -5,17 +5,14 @@ import (
 	"strings"
 )
 
-// LibraryBlock is one `[libraries "<name>"]` block of the generated config:
-// the library-trust directives of ONE application, declared once instead of
-// under one of its watch sections.
+// LibraryBlock is one `[libraries "<name>"]` block: the library-trust directives of ONE
+// application, declared once rather than under one of its watch sections.
 //
-// Library trust is daemon-wide — every allow_lib and every lib_dir is trusted
-// for every whitelisted binary, whichever section named it — so nesting these
-// directives under a watch path suggested a per-resource scoping that never
-// existed. The one thing that IS scoped is who may WRITE a lib_dir, and that is
-// why there is a block per application rather than a single global one: a
-// block's lib_binary rules write that block's lib_dirs only, so one
-// application's updater can never write another application's runtime tree.
+// Library trust is daemon-wide (every allow_lib and lib_dir is trusted for every whitelisted
+// binary, whichever section named it), so nesting under a watch path implied a per-resource scoping
+// that never existed. What IS scoped is who may WRITE a lib_dir, hence one block per application: a
+// block's lib_binary rules write only that block's lib_dirs, so one app's updater can't write
+// another's runtime tree.
 type LibraryBlock struct {
 	// Name labels the application ("Steam (alice)"); the daemon scopes the
 	// block by position, the installer finds it again by this name.
@@ -30,10 +27,9 @@ func (b *LibraryBlock) Empty() bool {
 	return len(b.Libs)+len(b.LibDirs)+len(b.LibWriters) == 0
 }
 
-// DirectiveLines renders the block's directives in documented order — the
-// allowed library files, the library directories, then their writers —
-// exactly as GenerateLibraryBlocks writes them (the installer matches config
-// lines against this text).
+// DirectiveLines renders the block's directives in documented order (allowed library files, library
+// dirs, then their writers), exactly as GenerateLibraryBlocks writes them (the installer matches
+// config lines against this text).
 func (b *LibraryBlock) DirectiveLines() []string {
 	out := make([]string, 0, len(b.Libs)+len(b.LibDirs)+len(b.LibWriters))
 	for _, d := range [...]struct {
@@ -95,16 +91,13 @@ func parseLibrariesHeaderName(line string) (string, bool) {
 	return rest, true
 }
 
-// EnsureLibraryBlock merges block into confText: the block is appended when no
-// `[libraries <name>]` header exists yet, otherwise only its missing directive
-// lines are added. Never removes or reorders a line — an operator's hand edits
-// inside the block survive every catalog refresh.
+// EnsureLibraryBlock merges block into confText: appended if no `[libraries <name>]` header exists,
+// otherwise only its missing directive lines are added. Never removes or reorders a line, so
+// operator hand edits survive catalog refreshes.
 //
-// Presence is checked within the block only: a lib_binary writes the lib_dirs
-// of its OWN block, so a lib_dir that happens to be declared elsewhere (a
-// legacy config nesting it under a watch section) is still added here, or
-// this block's writers would not reach it. The daemon guards a lib_dir named
-// twice once.
+// Presence is checked within the block only: a lib_binary writes its OWN block's lib_dirs, so a
+// lib_dir declared elsewhere (legacy nesting under a watch section) is still added here or this
+// block's writers wouldn't reach it. The daemon guards a lib_dir named twice once.
 func EnsureLibraryBlock(confText string, block *LibraryBlock) string {
 	if block.Empty() {
 		return confText
@@ -149,12 +142,10 @@ func EnsureLibraryBlock(confText string, block *LibraryBlock) string {
 	return strings.Join(result, "\n")
 }
 
-// RemoveSectionLibDirectives deletes, from the [watch path] section body, the
-// library directive lines listed in drop (compared on trimmed text). It moves
-// a legacy config — which nested these directives under a watch section — to
-// the [libraries] layout: the installer drops the catalog-generated lines
-// here and EnsureLibraryBlock re-adds them in the application's block. Lines
-// not in drop (hand-written ones) are left exactly where they are.
+// RemoveSectionLibDirectives deletes the library directive lines in drop (trimmed comparison) from
+// the [watch path] section body, migrating legacy configs (directives nested under a watch section)
+// to the [libraries] layout: the installer drops the catalog-generated lines and EnsureLibraryBlock
+// re-adds them in the app's block. Hand-written lines stay.
 func RemoveSectionLibDirectives(confText, path string, drop []string) (string, error) {
 	lines := strings.Split(confText, "\n")
 	start := findSectionStart(lines, path)
@@ -176,17 +167,14 @@ func RemoveSectionLibDirectives(confText, path string, drop []string) (string, e
 	return strings.Join(result, "\n"), nil
 }
 
-// IsLibraryDirective reports whether a trimmed config line is one of the
-// library-trust directives (allow_lib, lib_dir, lib_binary) — section
-// structure, never a whitelist entry.
+// IsLibraryDirective: a trimmed config line is a library-trust directive (allow_lib, lib_dir,
+// lib_binary): section structure, never a whitelist entry.
 func IsLibraryDirective(trimmed string) bool {
 	return isLibDirectiveText(trimmed)
 }
 
-// InsertSectionsBeforeLibraries adds rendered watch sections to confText
-// ahead of its first [libraries] block (or at the end when there is none), so
-// an appended application keeps the generated layout: every watch section
-// first, the library blocks after them.
+// InsertSectionsBeforeLibraries adds rendered watch sections before the first [libraries] block (or
+// at the end), keeping the layout: all watch sections first, library blocks after.
 func InsertSectionsBeforeLibraries(confText, sections string) string {
 	lines := strings.Split(confText, "\n")
 	for i, l := range lines {

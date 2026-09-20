@@ -1,7 +1,6 @@
-// Package install implements the `app-listener install` wizard: deploys the
-// binary if missing (copying the running executable, never recompiling),
-// ensures the fscrypt master key, picks users and critical dirs, migrates to
-// fscrypt with backups, installs units/hook, enables the daemon.
+// Package install implements the `app-listener install` wizard: deploys the binary if missing
+// (copies the running executable, never recompiles), ensures the fscrypt master key, picks users
+// and dirs, migrates to fscrypt with backups, installs units/hook, enables the daemon.
 package install
 
 import (
@@ -163,9 +162,8 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// The daemon holds open the files being reconfigured and would keep
-	// guarding the dirs being moved: stop it first; outside-systemd daemons
-	// are fatally refused (the installer cannot control them).
+	// Stop the daemon first: it holds the files being reconfigured and would keep guarding the dirs
+	// being moved. Outside-systemd daemons are fatally refused (can't be controlled).
 	if err := systemd.StopDaemonIfRunning(); err != nil {
 		return err
 	}
@@ -188,9 +186,8 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Collected now, persisted inside deploy() — only once every step that
-	// could still abort the install has succeeded, and only just before the
-	// daemon's first start (see writeEditPasswordHash).
+	// Collected now, persisted in deploy() only after every step that could still abort has
+	// succeeded, just before the daemon's first start (writeEditPasswordHash).
 	editPassword, err := promptEditPassword(cfg)
 	if err != nil {
 		return err
@@ -207,10 +204,8 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	return cleanupBackups(cfg)
 }
 
-// runMaintenanceMode dispatches the mutually exclusive maintenance flags,
-// reporting whether one ran so the caller skips the installer body.
-// maintenanceFlags holds the parsed CLI flags for the install command's
-// mutually exclusive maintenance modes.
+// maintenanceFlags holds the parsed CLI flags of the install command's mutually exclusive
+// maintenance modes.
 type maintenanceFlags struct {
 	restore       bool
 	deleteBackup  bool
@@ -248,6 +243,8 @@ func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
 	return f, nil
 }
 
+// runMaintenanceMode dispatches the mutually exclusive maintenance flags, reporting whether one
+// ran so the caller skips the installer body.
 func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 	f, err := parseMaintenanceFlags(cmd)
 	if err != nil {
@@ -271,9 +268,8 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 	return false, nil
 }
 
-// validateMaintenanceFlags rejects flag combinations the maintenance modes
-// do not support: --yes / --live outside their owning modes, and more than
-// one mutually exclusive mode at once.
+// validateMaintenanceFlags rejects unsupported combinations: --yes/--live outside their owning
+// modes, and more than one mode at once.
 func validateMaintenanceFlags(f maintenanceFlags) error {
 	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
 		return errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
@@ -293,11 +289,9 @@ func validateMaintenanceFlags(f maintenanceFlags) error {
 	return nil
 }
 
-// installBinaryOnly deploys only the freshly built binary (see
-// systemd.DeployInstalledBinary); config, fscrypt and units stay untouched.
-// When the daemon service is installed, it asks whether to restart the
-// daemon now (the historical, automatic behavior) or leave it running the
-// old binary until a manual restart.
+// installBinaryOnly deploys only the freshly built binary (systemd.DeployInstalledBinary); config,
+// fscrypt and units are untouched. If the service is installed, asks whether to restart the daemon
+// now or leave it on the old binary until a manual restart.
 func installBinaryOnly() error {
 	if err := buildBinaryIfNeeded(); err != nil {
 		return err
@@ -338,22 +332,18 @@ func installBinaryOnly() error {
 	return nil
 }
 
-// deliverReload applies a patched config to the daemon: SIGHUP reload
-// (atomic — new guards attach before old detach) with a restart fallback
-// when running, or a start after the stopped flow. Package-level
-// indirection so tests can observe the delivery.
+// deliverReload applies a patched config to the daemon: SIGHUP reload (atomic; new guards attach
+// before old detach) with a restart fallback when running, or a start after the stopped flow. A
+// package var so tests can observe delivery.
 var deliverReload = systemd.EnableAndVerify
 
-// runUpdateCatalogOnly re-scans the catalog whitelist for every guarded
-// directory in the existing daemon.conf. Encrypted vaults are unlocked
-// for stat access, glob patterns are re-expanded, and the diff is shown
-// for confirmation. User-added sections are preserved verbatim.
+// runUpdateCatalogOnly re-scans the catalog whitelist for every guarded directory in daemon.conf:
+// encrypted vaults are unlocked for stat, globs re-expanded, the diff shown for confirmation;
+// user-added sections kept verbatim.
 //
-// In live mode the daemon keeps running: its vaults are already unlocked
-// and its guards attached, so the re-scan needs no unlock/lock cycle and
-// no daemon stop — a changed config is delivered via SIGHUP reload. A
-// stopped daemon cannot support live mode (locked vaults hide plaintext
-// names), so the caller is told to use the stopped flow instead.
+// Live mode: the daemon keeps running (vaults unlocked, guards attached), so no unlock/lock cycle
+// or stop is needed and a changed config is delivered via SIGHUP. A stopped daemon can't support it
+// (locked vaults hide plaintext names), so the caller is told to use the stopped flow.
 func runUpdateCatalogOnly(autoConfirm, live bool) error {
 	if live {
 		if !systemd.IsDaemonActive() {
@@ -373,11 +363,10 @@ func runUpdateCatalogOnly(autoConfirm, live bool) error {
 	}
 	vault := fscrypt.New()
 	if _, err := updateCatalogConfig(vault, autoConfirm, false); err != nil {
-		// updateCatalogConfig writes the config only after every section
-		// patched successfully, so on error the on-disk config is unchanged.
-		// The daemon was stopped by this flow (StopDaemonIfRunning) — bring
-		// it back on the existing config so a failed refresh never silently
-		// leaves protection off, then surface the original error.
+		// updateCatalogConfig writes the config only after every section patched, so an error
+		// leaves the on-disk config unchanged. The flow stopped the daemon: bring it back on the
+		// existing config so a failed refresh never leaves protection off, then surface the
+		// original error.
 		if wasActive {
 			if restartErr := deliverReload(true); restartErr != nil {
 				log.Errorf("catalog refresh failed AND the daemon could not be restarted: %v", restartErr)
@@ -385,16 +374,13 @@ func runUpdateCatalogOnly(autoConfirm, live bool) error {
 		}
 		return softenAutomatedRefreshErr(err, autoConfirm)
 	}
-	// The daemon was stopped by this flow: it must run again regardless of
-	// whether the config changed.
+	// The flow stopped the daemon: it must run again whether or not the config changed.
 	return deliverReload(true)
 }
 
-// softenAutomatedRefreshErr turns the "all-manual config, nothing matched the
-// catalog" outcome into a no-op for automated callers (--yes: the pacman/apt
-// hooks and the boot-time refresh unit). A package transaction or a boot must
-// not be reported as failed just because the config has no catalog-managed
-// section. Interactive callers still see the error.
+// softenAutomatedRefreshErr turns "all-manual config, nothing matched the catalog" into a no-op for
+// automated callers (--yes: pacman/apt hooks, boot refresh unit): a package transaction or boot
+// must not fail because no section is catalog-managed. Interactive callers still see the error.
 func softenAutomatedRefreshErr(err error, autoConfirm bool) error {
 	if err != nil && autoConfirm && errors.Is(err, errNoCatalogMatch) {
 		log.Infof("catalog refresh: %v — nothing to do", err)
@@ -403,14 +389,10 @@ func softenAutomatedRefreshErr(err error, autoConfirm bool) error {
 	return err
 }
 
-// applyLiveRefresh delivers a patched config to the running daemon: SIGHUP
-// reload (atomic — new guards attach before old detach), restart fallback.
-// A refresh whose result matches the running config is a no-op.
-//
-// Regression guard for the first live implementation: the config was
-// patched on disk but never delivered to the running daemon, which kept
-// enforcing the old whitelist while journalctl stayed silent — the
-// delivery is the mandatory last step of live mode.
+// applyLiveRefresh delivers a patched config to the running daemon: SIGHUP reload (atomic), restart
+// fallback. A result matching the running config is a no-op. Delivery is the mandatory last step of
+// live mode (an earlier version patched the file but never delivered it, so the daemon kept the old
+// whitelist silently).
 func applyLiveRefresh(changed bool) error {
 	if !changed {
 		log.Info("nothing to reload: the refreshed config matches the running daemon")
@@ -419,8 +401,8 @@ func applyLiveRefresh(changed bool) error {
 	return deliverReload(true)
 }
 
-// prepareInstallation deploys the binary if it is missing (copying the
-// running executable — never recompiling) and ensures the master key exists.
+// prepareInstallation deploys the binary if missing (copying the running executable, never
+// recompiling) and ensures the master key exists.
 func prepareInstallation() error {
 	if err := ensureInstalledBinary(); err != nil {
 		return err
@@ -428,33 +410,22 @@ func prepareInstallation() error {
 	return ensureMasterKey()
 }
 
-// installedBinaryPath is the service path ensureInstalledBinary manages; a
-// package var so tests can point it at a temp file.
+// installedBinaryPath is the service path ensureInstalledBinary manages; a package var so tests can
+// use a temp file.
 var installedBinaryPath = systemd.InstallBinaryPath
 
-// checkRunningBinaryMatchesInstalled fails fast, before the interactive
-// wizard runs, when this executable is not the one already deployed at
-// installedBinaryPath (identity is inode-based, exactly what the daemon's
-// self-guard checks — see ensureInstalledBinary below and
-// internal/guard.WithSelfAllowBinary).
+// checkRunningBinaryMatchesInstalled fails fast, before the wizard, when this executable isn't the
+// one already deployed at installedBinaryPath (inode identity, as the daemon's self-guard checks;
+// see ensureInstalledBinary and guard.WithSelfAllowBinary).
 //
-// Why this matters: when a binary is already installed, the full wizard
-// deliberately leaves it untouched (see ensureInstalledBinary) and, at
-// deploy(), restarts the daemon on that SAME already-installed binary — every
-// self-guard decision downstream (config, fscrypt key, edit-auth hash) trusts
-// the exact on-disk file the daemon exec'd, never a same-name/same-content
-// binary running elsewhere (that would be a bypass of the "identity is
-// dev:ino, never path/name" invariant). Running the wizard from a freshly
-// rebuilt standalone binary on a machine that already has a (older, or just
-// different) binary installed is a real and easy-to-hit case of this — the
-// two are different files even though they're "the same app-listener" — and
-// it used to surface only at the very end, as a confusing "operation not
-// permitted" writing the edit-protected password hash after backups, fscrypt
-// migration and the config editor had already run (that specific write now
-// happens before the daemon's first start — see writeEditPasswordHash — but
-// the identity mismatch is still a real footgun for other self-guarded
-// writes, so this check stays). os.SameFile compares dev:ino, matching the
-// guard's own notion of identity exactly.
+// Why: with a binary already installed the wizard leaves it untouched and deploy() restarts the
+// daemon on that SAME binary; every self-guard decision (config, fscrypt key, edit-auth hash)
+// trusts the exact on-disk file the daemon exec'd, never a same-name/same-content binary elsewhere
+// (that would bypass the "identity is dev:ino, never path/name" invariant). Running the wizard from
+// a freshly rebuilt standalone binary is an easy-to-hit mismatch that used to surface only at the
+// end as "operation not permitted" writing the password hash, after backups and migration had run.
+// That write now happens before first start, but the mismatch is still a footgun for other
+// self-guarded writes. os.SameFile compares dev:ino like the guard.
 func checkRunningBinaryMatchesInstalled() error {
 	installedInfo, err := os.Stat(installedBinaryPath)
 	if err != nil {
@@ -487,13 +458,10 @@ func checkRunningBinaryMatchesInstalled() error {
 		self, installedBinaryPath, self)
 }
 
-// ensureInstalledBinary makes sure the app-listener binary is deployed at its
-// service path. An existing binary is left untouched — upgrades go through
-// `install --binary-only` or `app-listener update`, which also restart the
-// daemon. A missing binary (the common first run straight after `make build`,
-// or after the one-line installer) is filled in by copying the currently
-// running executable into place as-is: no recompilation, and no separate
-// --binary-only step needed for a one-time install.
+// ensureInstalledBinary makes sure the binary is deployed at its service path. An existing one is
+// left untouched (upgrades go through `install --binary-only` or `app-listener update`, which
+// restart the daemon). A missing one (first run after `make build` or the one-line installer) is
+// filled by copying the running executable as-is: no recompilation, no separate --binary-only step.
 func ensureInstalledBinary() error {
 	if _, err := os.Stat(installedBinaryPath); err == nil {
 		log.Infof("binary is installed: %s", installedBinaryPath)
@@ -539,9 +507,9 @@ func selectAndEditConfig() (string, *daemonconfig.Config, error) {
 	return editConfig(candidates)
 }
 
-// secureResources verifies encryption state (fatal: encrypted dir declared
-// need_encryption: false, or master-key mismatch), asks only unencrypted
-// dirs with need_encryption: true and migrates them; text reflects decisions.
+// secureResources verifies encryption state (fatal: encrypted dir declared need_encryption: false,
+// or master-key mismatch), asks only unencrypted need_encryption: true dirs and migrates them; the
+// text reflects decisions.
 func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Config) (string, error) {
 	if err := verifyEncryptionState(vault, cfg); err != nil {
 		return "", err
@@ -559,15 +527,12 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 	return updated, nil
 }
 
-// deploy installs services/hook, copies binary+config, enables the daemon.
-// Existing files are diffed: identical ones stay, differing ones show the
-// diff and ask; a changed config reaches a running daemon via SIGHUP. cfg is
-// the parsed config (its resource paths drive the ssh-agent-unit question).
-// editPassword (possibly "") is persisted via writeEditPasswordHash right
-// before EnableAndVerify's first start on a fresh install: every step above
-// that could still abort has already succeeded, and the daemon is not
-// running yet, so that first start already self-guards the hash file and
-// opens the control socket — no follow-up SIGHUP reload needed.
+// deploy installs services/hook, copies binary+config, enables the daemon. Existing files are
+// diffed: identical stay, differing ones show the diff and ask; a changed config reaches a running
+// daemon via SIGHUP. cfg (parsed) drives the ssh-agent-unit question. editPassword (maybe "") is
+// persisted via writeEditPasswordHash right before EnableAndVerify's first start on a fresh
+// install: everything that could abort has succeeded and the daemon isn't running, so that first
+// start already self-guards the hash and opens the control socket (no follow-up reload).
 func deploy(cfgText string, cfg *daemonconfig.Config, editPassword string) error {
 	if err := installServices(cfg); err != nil {
 		return err
@@ -588,13 +553,11 @@ func deploy(cfgText string, cfg *daemonconfig.Config, editPassword string) error
 	return systemd.EnableCatalogRefresh()
 }
 
-// preflightDeployedBinary runs `<installed binary> daemon --check` against the
-// just-deployed binary and config BEFORE the service is enabled. It verifies
-// the BPF-LSM stack is active and that every guard eBPF program is accepted by
-// this kernel's verifier (attaching nothing). A failure here means the daemon
-// would crash-loop — or, with a prebuilt object too complex for a newer
-// kernel, panic — so the install aborts now, having changed only the on-disk
-// binary/config, rather than leaving an enabled unit that never runs.
+// preflightDeployedBinary runs `<installed binary> daemon --check` on the just-deployed binary and
+// config BEFORE enabling the service: BPF-LSM active and every guard eBPF program accepted by this
+// kernel's verifier (nothing attached). A failure means the daemon would crash-loop (or panic, with
+// a prebuilt object too complex for a newer kernel), so the install aborts having changed only the
+// on-disk binary/config.
 func preflightDeployedBinary() error {
 	log.Info("preflight: verifying the guard eBPF loads on this kernel ...")
 	if err := systemd.RunCmd(systemd.InstallBinaryPath, "daemon", "--check", "--config", systemd.SystemConfigPath); err != nil {
@@ -609,9 +572,8 @@ func preflightDeployedBinary() error {
 	return nil
 }
 
-// buildBinaryIfNeeded compiles build/linux/app-listener when it is missing;
-// without a source tree it refuses. Only the --binary-only path uses it —
-// the full wizard never builds (see ensureInstalledBinary).
+// buildBinaryIfNeeded compiles build/linux/app-listener if missing; refuses without a source tree.
+// Only the --binary-only path uses it (the full wizard never builds).
 func buildBinaryIfNeeded() error {
 	if _, err := os.Stat(buildBinaryPath); err == nil {
 		log.Infof("binary already built: %s", buildBinaryPath)
@@ -629,8 +591,7 @@ func buildBinaryIfNeeded() error {
 	return nil
 }
 
-// ensureMasterKey keeps an existing master key (with a warning) and
-// creates a fresh one otherwise.
+// ensureMasterKey keeps an existing master key (with a warning), else creates one.
 func ensureMasterKey() error {
 	exists, err := fscrypt.MasterKeyExists()
 	if err != nil {
@@ -647,11 +608,9 @@ func ensureMasterKey() error {
 	return nil
 }
 
-// verifyEncryptionState checks every resource: encrypted while declared
-// need_encryption: false is fatal (unmanaged encryption), and encrypted
-// dirs must unlock with the current master key (fatal on mismatch).
-// Grouped sections are verified once per encryption root — the fscrypt
-// policy is per vault root and every watch sub-path inherits it.
+// verifyEncryptionState checks every resource: encrypted while need_encryption: false is fatal
+// (unmanaged encryption), and encrypted dirs must unlock with the current master key. Grouped
+// sections are verified once per encryption root (the policy is per vault root).
 func verifyEncryptionState(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
 	for _, r := range cfg.EncryptionGroups() {
 		root := r.EncryptionRootOrPath()
@@ -673,8 +632,8 @@ func verifyEncryptionState(vault *fscrypt.Vault, cfg *daemonconfig.Config) error
 	return nil
 }
 
-// encryptDirectories migrates the selected dirs behind a progress bar,
-// failing fatally on the first error (prior backups deliberately kept).
+// encryptDirectories migrates the selected dirs behind a progress bar, fatal on the first error
+// (prior backups kept).
 func encryptDirectories(vault *fscrypt.Vault, toEncrypt []string) error {
 	if len(toEncrypt) == 0 {
 		return nil
@@ -701,10 +660,9 @@ func encryptDirectories(vault *fscrypt.Vault, toEncrypt []string) error {
 	return nil
 }
 
-// cleanupBackups asks per backup whether to delete it (final step, post-verify).
-// The migration backup is created at the encryption root (the whole vault is
-// renamed aside, not each watch sub-path), so grouped sections are handled
-// once, at that root.
+// cleanupBackups asks per backup whether to delete it (final step, post-verify). The backup is made
+// at the encryption root (the whole vault is renamed aside), so grouped sections are handled once,
+// at that root.
 func cleanupBackups(cfg *daemonconfig.Config) error {
 	for _, r := range cfg.EncryptionGroups() {
 		backup := r.EncryptionRootOrPath() + fscrypt.BackupSuffix

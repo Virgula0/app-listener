@@ -1,9 +1,6 @@
-// Package fscrypt migration tests. One test file per production source
-// file is the convention here: EVERY test for migrate.go lives in this
-// file — directory migrations, single-file migrations and rollback cases
-// alike. Do not spawn variant files such as *_file_test.go or
-// *_rollback_test.go; append new cases below so related coverage stays
-// together.
+// Package fscrypt migration tests. One test file per production source file: EVERY migrate.go test
+// lives here (directory, single-file, rollback). No variant files like *_file_test.go; append new
+// cases below.
 package fscrypt
 
 import (
@@ -265,13 +262,10 @@ func TestDecryptMissingPath(t *testing.T) {
 	}
 }
 
-// TestEncryptRollbackOnUnsupportedFilesystem exercises the migration on a
-// filesystem without fscrypt support (t.TempDir usually lives on tmpfs).
-// The policy application is expected to fail and the original directory
-// must be restored with all contents — no data left in the backup-only
-// staging state. When the filesystem happens to support fscrypt (and the
-// environment has the privileges), the migration may actually succeed and
-// the test skips.
+// Migration on a filesystem without fscrypt support (t.TempDir is usually tmpfs): the policy
+// application is expected to fail and the original directory must be restored with all contents (no
+// backup-only staging state). If the filesystem does support fscrypt (and privileges allow) the
+// migration may succeed and the test skips.
 func TestEncryptRollbackOnUnsupportedFilesystem(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "vault")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -388,18 +382,11 @@ func TestEncryptFileRefusesSpecialFile(t *testing.T) {
 	}
 }
 
-// TestEncryptFileRollbackOnUnsupportedFilesystem mirrors the directory
-// rollback test: on a filesystem without fscrypt support (t.TempDir is
-// usually tmpfs) the migration fails before any rename and the original
-// file plus its metadata must be untouched, with no staging leftovers.
-// TestEncryptFileRollbackOnUnsupportedFilesystem: single-file encryption no
-// longer depends on the kernel fscrypt ioctl (the kernel never supported it
-// for a standalone regular file — see filevault.go), so unlike the
-// directory case above, there is no "unsupported filesystem" escape hatch
-// left to exercise here: given a valid master key, Encrypt must succeed on
-// any filesystem, including tmpfs. See TestFileMigrationRoundTrip and
-// TestRestoreBackupWorksOnFileVaultCiphertext below for the full
-// backup-first, temp-cleanup rollback contract on the new implementation.
+// Single-file counterpart of the directory rollback test. Single-file encryption no longer uses the
+// kernel ioctl (the kernel never supported it for a standalone file; filevault.go), so there's no
+// "unsupported filesystem" escape hatch: with a valid master key Encrypt must succeed on any
+// filesystem, tmpfs included. The backup-first, temp-cleanup rollback contract is covered by
+// TestFileMigrationRoundTrip and TestRestoreBackupWorksOnFileVaultCiphertext below.
 func TestEncryptFileRollbackOnUnsupportedFilesystem(t *testing.T) {
 	withMasterKey(t)
 	path := filepath.Join(t.TempDir(), "secret.env")

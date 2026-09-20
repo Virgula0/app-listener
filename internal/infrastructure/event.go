@@ -80,15 +80,13 @@ type BpfEvent struct {
 	Dest [256]byte
 }
 
-// BpfEventSize is the wire size of BpfEvent as the BPF side lays it out:
-// 6 x u32 header, then the three fixed byte arrays. Kept in sync with the C
-// struct event {} in monitor.bpf.c.
+// BpfEventSize is BpfEvent's wire size as laid out by the BPF side: 6 x u32 header, then the three
+// fixed byte arrays. Keep in sync with C struct event {} in monitor.bpf.c.
 const BpfEventSize = 6*4 + 16 + 256 + 256
 
-// DecodeBpfEvent fills e from a raw ring-buffer record without reflection or
-// a per-record bytes.Reader allocation (binary.Read does both, which adds up
-// on the monitor's unfiltered VFS firehose). Reports false for a short
-// record.
+// DecodeBpfEvent fills e from a raw ring-buffer record without reflection or a per-record
+// bytes.Reader (binary.Read does both, which adds up on the monitor's unfiltered VFS firehose).
+// False for a short record.
 func DecodeBpfEvent(raw []byte, e *BpfEvent) bool {
 	if len(raw) < BpfEventSize {
 		return false

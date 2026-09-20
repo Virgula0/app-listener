@@ -86,14 +86,11 @@ func TestEnsureInstalledBinary(t *testing.T) {
 	}
 }
 
-// TestCheckRunningBinaryMatchesInstalled covers the three outcomes of the
-// wizard's binary-identity preflight: nothing installed yet (defer to
-// ensureInstalledBinary), the installed binary IS this process's own exe
-// (same inode — the normal "install via the deployed symlink" case), and a
-// DIFFERENT file at the install path (a freshly rebuilt standalone binary
-// run against an existing install) — the exact scenario that used to fail
-// only at the very last wizard step, writing the edit-protected password
-// hash, with a confusing "operation not permitted".
+// Covers the binary-identity preflight's three outcomes: nothing installed (defer to
+// ensureInstalledBinary), the installed binary IS this process's exe (same inode; the normal
+// deployed-symlink case), and a DIFFERENT file at the install path (a rebuilt standalone binary
+// against an existing install), which used to fail only at the last step (writing the password
+// hash) with a confusing "operation not permitted".
 func TestCheckRunningBinaryMatchesInstalled(t *testing.T) {
 	orig := installedBinaryPath
 	defer func() { installedBinaryPath = orig }()
@@ -164,12 +161,9 @@ func TestAskEncryptionSkipsNeedEncryptionFalse(t *testing.T) {
 	}
 }
 
-// TestCollectFilesystemPrereqsNoPanic is a regression test for the preflight
-// added with the fscrypt setup check: statting a real directory must not
-// panic (os.Stat returns *syscall.Stat_t, and the preflight must accept
-// exactly that type). The pure collector must return either no prerequisites
-// (host filesystem is already ready), a slice of runnable Prereq commands,
-// or a terminal classified error — never panic.
+// Regression for the fscrypt-setup preflight: statting a real directory must not panic (os.Stat
+// returns *syscall.Stat_t, which the preflight must accept). The collector returns no
+// prerequisites, runnable Prereq commands, or a terminal classified error, never a panic.
 func TestCollectFilesystemPrereqsNoPanic(t *testing.T) {
 	dir := t.TempDir()
 
@@ -265,12 +259,10 @@ func TestLiveEmptyWhitelistRejected(t *testing.T) {
 	}
 }
 
-// TestApplyLiveRefreshDeliversReload is the regression test for the missing
-// SIGHUP delivery: the first live implementation patched daemon.conf on
-// disk and returned WITHOUT delivering the change to the running daemon,
-// which kept enforcing the old whitelist while journalctl stayed silent.
-// Live mode must deliver the reload exactly when the config was written,
-// and skip it when the refreshed config matches the running one.
+// Regression for the missing SIGHUP delivery: the first live implementation patched daemon.conf and
+// returned without delivering it, so the daemon kept the old whitelist silently. Live mode must
+// deliver the reload exactly when the config was written, and skip it when the refreshed config
+// matches.
 func TestApplyLiveRefreshDeliversReload(t *testing.T) {
 	orig := deliverReload
 	defer func() { deliverReload = orig }()
@@ -328,13 +320,10 @@ func groupedDiscordConf(t *testing.T, home string) (string, *daemonconfig.Config
 	return confText, cfg
 }
 
-// TestPatchCatalogSectionGroupedConfig is the regression test for the
-// pacman-hook breaker: `install --update-catalog-only` addressed a grouped
-// section's whitelist by its first watch sub-path, which has no [watch]
-// header — SetSectionWhitelist failed "section not found" and, in the
-// non-live flow, left the daemon stopped. The refresh must address the
-// section by its encryption root, re-expand the shared whitelist, and
-// preserve the `watch:` group structure.
+// Regression (pacman-hook breaker): `install --update-catalog-only` addressed a grouped section's
+// whitelist by its first watch sub-path, which has no [watch] header, so SetSectionWhitelist failed
+// "section not found" and (non-live) left the daemon stopped. It must address the section by its
+// encryption root, re-expand the shared whitelist and keep the `watch:` structure.
 func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
 	home := t.TempDir()
 	confText, cfg := groupedDiscordConf(t, home)
@@ -390,17 +379,11 @@ func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
 	}
 }
 
-// TestSectionsFromCandidatesSkipsMissingWatchSubPaths is the regression test
-// for a daemon startup crash: a fresh Discord config directory only creates
-// some of the catalog's WatchRelPaths sub-directories, and the installer used
-// to emit a `watch:` directive for every one of them regardless of whether it
-// existed. The daemon's ResolvePendingPaths pass (internal/daemonconfig)
-// treats a grouped watch path still missing once its encryption root is
-// available as a HARD, FATAL error by design (fail-closed: a declared but
-// unresolvable protected directory must not be silently dropped at runtime).
-// The fix has to happen earlier, at config-generation time, mirroring how a
-// plain (non-grouped) candidate is simply never proposed when its path does
-// not exist.
+// Regression for a daemon startup crash: a fresh Discord config dir creates only some of the
+// catalog's WatchRelPaths, and the installer emitted a `watch:` for every one. ResolvePendingPaths
+// (internal/daemonconfig) treats a grouped watch path still missing after unlock as FATAL by design
+// (fail closed), so the fix belongs at config-generation time: a missing path is never proposed, as
+// for a plain candidate.
 func TestSectionsFromCandidatesSkipsMissingWatchSubPaths(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".config", "discord")
@@ -471,12 +454,9 @@ func TestGroupedSectionAddressedByEncryptionRoot(t *testing.T) {
 	}
 }
 
-// TestSetSectionWhitelistPreservesGroupStructure is the regression test for
-// grouped-section refreshes: SetSectionWhitelist must replace ONLY the
-// whitelist-entry lines, preserving the `watch:` group directives — a
-// refresh that erased them would silently unwatch the grouped trees. The
-// refreshed config must also parse back into the grouped resources with
-// their shared whitelist and encryption root intact.
+// SetSectionWhitelist must replace ONLY whitelist-entry lines and preserve `watch:` group
+// directives (erasing them would silently unwatch the grouped trees); the refreshed config must
+// parse back into the grouped resources with shared whitelist and encryption root intact.
 func TestSetSectionWhitelistPreservesGroupStructure(t *testing.T) {
 	vault := t.TempDir()
 	lsDir := filepath.Join(vault, "Local Storage")

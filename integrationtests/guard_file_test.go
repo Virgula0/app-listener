@@ -8,25 +8,16 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------
-// File-target counterparts of the guard_test.go bypass corpus.
+// File-target counterparts of the guard_test.go bypass corpus. Those regressions prove a bypass
+// class closed for a DIRECTORY watch root; a single-file root (fscrypt file vault, edit-protected
+// single-file resources) walks different BPF paths: GUARD_ALLOW_ROOT is the file's own inode, no
+// directory inode in guard_inodes, and guard_path_rename's parent-directory rename-over-watchroot
+// check special-cases exactly this shape (TestGuard_Bypass_RenameOverGuardedFile). Each bypass
+// class is re-run with the watch root on the file itself.
 //
-// Every regression above proves a bypass class is closed when the guard's
-// watch root is a DIRECTORY. A single-file watch root (fscrypt's file vault,
-// edit-protected's single-file resources) walks different BPF code paths —
-// GUARD_ALLOW_ROOT is the file's own inode, there is no directory inode in
-// guard_inodes, and the parent-directory rename-over-watchroot check in
-// guard_path_rename special-cases exactly this shape (see
-// TestGuard_Bypass_RenameOverGuardedFile). This file re-runs each bypass
-// class from guard_test.go with the guard's watch root pointed directly at
-// the file, instead of a directory containing it, so the same guarantee is
-// proven for both watch-root shapes.
-//
-// TestGuard_BlocksAll_File, TestGuard_Whitelist_Binary_File,
-// TestGuard_Blacklist_Binary_File, TestGuard_Bypass_OpenByHandleAt and
-// TestGuard_Bypass_RenameOverGuardedFile already exercise a single-file
-// watch root in guard_test.go and are not duplicated here.
-// ---------------------------------------------------------------
+// TestGuard_BlocksAll_File, Whitelist_Binary_File, Blacklist_Binary_File, Bypass_OpenByHandleAt and
+// Bypass_RenameOverGuardedFile already use a single-file root in guard_test.go and aren't
+// duplicated.
 
 // TestGuard_Exploits_File is the file-target counterpart of
 // TestGuard_Exploits: every kprobe/LSM-adjacent read bypass (copy_file_range,
@@ -53,12 +44,10 @@ func (s *IntegrationSuite) TestGuard_Exploits_File() {
 
 	for _, et := range guardExploitTests {
 		if et.name == "execve" {
-			// execve needs its own executable watch root (below): the
-			// single-file guard here watches exploit_target.txt, a plain
-			// data file with no +x bit, so running execve against it would
-			// be denied by the ordinary MAY_EXEC permission check before
-			// ever reaching a guard hook — a false-passing, event-less
-			// "block" that isn't actually exercising the guard.
+			// execve needs its own executable watch root (below): the single-file guard here
+			// watches exploit_target.txt, a data file without +x, so execve against it is denied by
+			// the ordinary MAY_EXEC check before any guard hook (a false-passing event-less
+			// "block").
 			continue
 		}
 		if et.name == "io_uring" && !s.checkKernelSupport(c) {
@@ -175,13 +164,10 @@ func (s *IntegrationSuite) TestGuard_Bypass_SCMRights_File() {
 	s.stopGuard(c)
 }
 
-// TestGuard_Bypass_Mount_File is the file-target counterpart of
-// TestGuard_Bypass_Mount: mount_bypass.c binds a directory over a directory,
-// which does not apply to a single-file watch root, so this uses a plain
-// `mount --bind` of an attacker-controlled FILE over the guarded file's own
-// path — the same "rename/mount-over-watchroot" bypass class CLAUDE.md calls
-// out, via mount(2) instead of rename(2). The guard's sb_mount hook checks
-// the mount point dentry against guard_config's watch-root inode.
+// File counterpart of TestGuard_Bypass_Mount: mount_bypass.c binds a directory over a directory,
+// which doesn't apply to a single-file root, so this `mount --bind`s an attacker FILE over the
+// guarded file's path (the mount-over-watchroot class, via mount(2) not rename(2)). The sb_mount
+// hook checks the mount point dentry against guard_config's watch-root inode.
 func (s *IntegrationSuite) TestGuard_Bypass_Mount_File() {
 	c := s.guardContainer()
 	// pooled: terminated at suite end
@@ -392,14 +378,9 @@ printf 'LOOPDEV=%s\n' "$LOOP"
 	s.stopGuard(c)
 }
 
-// ---------------------------------------------------------------
-// File-target counterpart of TestGuard_BypassVectors: ATTR-class ops that
-// never create a struct file (truncate, chmod, chown, utimes, setxattr),
-// run directly against a single-file watch root. Mknod and Rmdir are
-// directory-creation operations with no equivalent on a single-file watch
-// root (there is no parent guarded directory to create/remove an entry in)
-// and are intentionally not duplicated here.
-// ---------------------------------------------------------------
+// File counterpart of TestGuard_BypassVectors: ATTR-class ops that create no struct file (truncate,
+// chmod, chown, utimes, setxattr) against a single-file root. Mknod and Rmdir have no equivalent
+// here (no guarded parent directory) and aren't duplicated.
 
 func (s *IntegrationSuite) runAttrOpFile(binary, expect string) {
 	exploitHostPath := absPath(fmt.Sprintf("./exploits/%s", binary))
@@ -461,12 +442,9 @@ func (s *IntegrationSuite) TestGuard_BypassVectors_File() {
 	}
 }
 
-// TestGuard_Bypass_StatMetadata_File is the file-target counterpart of
-// TestGuard_Bypass_StatMetadata. Unlike the directory case — where the
-// watch-root DIRECTORY node itself is a deliberate stat exception — a
-// single-file watch root's own inode IS the protected resource, so stat of
-// the root file itself must be denied; there is no "root node" exception
-// to carve out here.
+// File counterpart of TestGuard_Bypass_StatMetadata. Unlike the directory case (root DIRECTORY stat
+// is a deliberate exception), a single-file root's inode IS the secret, so its stat must be denied;
+// no root-node exception.
 func (s *IntegrationSuite) TestGuard_Bypass_StatMetadata_File() {
 	c := s.guardContainer()
 	// pooled: terminated at suite end
@@ -508,23 +486,14 @@ func (s *IntegrationSuite) TestGuard_Bypass_StatMetadata_File() {
 	s.stopGuard(c)
 }
 
-// ---------------------------------------------------------------
-// Hardlink / symlink / rename-out coverage for a single-file watch root.
-//
-// TestGuard_BlocksAll_File already renames/hardlinks the watch root to a
-// sibling path with plain mv/ln, but those coreutils lstat() their source
-// first (see rawfsop.c's header comment) and are denied at the STAT hook
-// before path_rename/path_link is ever reached — the same masking
-// TestGuard_Bypass_RenameOverGuardedFile calls out for the destination
-// side. The tests below use rawfsop's bare syscalls to drive straight into
-// path_rename's and path_link's SOURCE-side checks (guard.bpf.c's
-// read_inode_guard/guarded_map_hit on old_dentry), proving the hooks
-// themselves — not just the STAT hook — deny moving or aliasing the
-// watch root's inode out to an unguarded name. A dedicated symlink test
-// covers the third bypass class this hook set defends: path_symlink's
-// target-content match, which denies creating a symlink ANYWHERE (even
-// outside the guarded path) whose link content names the watch root.
-// ---------------------------------------------------------------
+// Hardlink / symlink / rename-out coverage for a single-file root. TestGuard_BlocksAll_File already
+// mv/ln's the root, but those coreutils lstat() the source first (rawfsop.c's header) and are
+// denied at STAT before path_rename/path_link (the same masking
+// TestGuard_Bypass_RenameOverGuardedFile notes for the destination). These use rawfsop's bare
+// syscalls to reach path_rename's and path_link's SOURCE-side checks (guard.bpf.c's
+// read_inode_guard/guarded_map_hit on old_dentry), proving the hooks themselves deny moving or
+// aliasing the root inode out. A symlink test covers path_symlink's target-content match, which
+// denies a symlink ANYWHERE naming the root.
 
 // TestGuard_Bypass_RenameOutOfWatchRoot_File proves path_rename's
 // source-side check (guard.bpf.c ~line 1292: read_inode_guard(inode) &&
@@ -589,13 +558,10 @@ func (s *IntegrationSuite) TestGuard_Bypass_HardlinkOutOfWatchRoot_File() {
 	s.Require().NotEqualf(0, code, "no alias of the watch root's inode may exist at the unguarded destination")
 }
 
-// TestGuard_Bypass_SymlinkTargetMatch_File proves path_symlink's second
-// check (guard.bpf.c: the prefix match against the stored guard_path) denies
-// creating a symlink ANYWHERE — even entirely outside the guarded area —
-// whose link content names the single-file watch root. Unlike the
-// destination-side symlink-creation check (creating a link INSIDE a guarded
-// directory), this one has nothing to do with where the new dentry lives;
-// it is keyed on what the symlink POINTS TO.
+// path_symlink's second check (guard.bpf.c: prefix match against the stored guard_path) denies
+// creating a symlink ANYWHERE, even outside the guarded area, whose content names the single-file
+// root. Unlike the destination-side check (a link INSIDE a guarded dir), it's keyed on what the
+// symlink POINTS TO.
 func (s *IntegrationSuite) TestGuard_Bypass_SymlinkTargetMatch_File() {
 	c := s.guardContainer()
 	// pooled: terminated at suite end
@@ -625,12 +591,9 @@ func (s *IntegrationSuite) TestGuard_Bypass_SymlinkTargetMatch_File() {
 	s.stopGuard(c)
 }
 
-// TestGuard_Bypass_SymlinkAliasAccess_File proves that a symlink pointing at
-// the single-file watch root, created BEFORE the guard ever attached (so
-// path_symlink's target-content check never saw it), still cannot be used to
-// read the guarded content: file_open resolves the symlink and checks the
-// FINAL inode, so enforcement is inode-keyed and independent of the path
-// used to reach it.
+// A symlink to the single-file root created BEFORE the guard attached (path_symlink never saw it)
+// still can't read the content: file_open resolves it and checks the FINAL inode, so enforcement is
+// inode-keyed regardless of the path used.
 func (s *IntegrationSuite) TestGuard_Bypass_SymlinkAliasAccess_File() {
 	c := s.guardContainer()
 	// pooled: terminated at suite end

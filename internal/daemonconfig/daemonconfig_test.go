@@ -357,12 +357,10 @@ func TestLoadDuplicateWatchFails(t *testing.T) {
 	}
 }
 
-// TestLoadQuotedPathWithSpaces is the regression test for the installer bug:
-// a binary whose path contains spaces (e.g. Steam/Proton's
-// ".../Proton - Experimental/files/bin/wineserver") used to have its event
-// list parsed from the wrong field ("- Experimental/..." looked like an
-// unknown event type) because the binary-rule line was split on whitespace.
-// A double-quoted path must be taken whole, spaces and all.
+// Regression for the installer bug: a binary path with spaces (Steam/Proton's ".../Proton -
+// Experimental/files/bin/wineserver") had its event list parsed from the wrong field ("-
+// Experimental/..." looked like an event type) because the rule line was split on whitespace. A
+// double-quoted path must be taken whole.
 func TestLoadQuotedPathWithSpaces(t *testing.T) {
 	dir := t.TempDir()
 	binDir := filepath.Join(t.TempDir(), "Proton - Experimental", "files", "bin")
@@ -664,12 +662,10 @@ func TestLoadMissingSectionRootSkipsDirectives(t *testing.T) {
 	}
 }
 
-// TestLoadGroupedEncryptedWatchPathsDeferred: a grouped need_encryption: true
-// section whose encryption root exists (an unlocked-name locked fscrypt tree)
-// but whose watch sub-paths do not resolve yet must NOT be dropped — the
-// sub-path names only appear once the daemon unlocks the vault. Each is kept
-// as a PathPending resource carrying the shared whitelist and encryption
-// root, so the daemon can unlock the root and re-validate.
+// A grouped need_encryption: true section whose encryption root exists (locked fscrypt tree) but
+// whose watch sub-paths don't resolve yet must NOT be dropped (names appear only after unlock):
+// each is kept as a PathPending resource with the shared whitelist and root so the daemon can
+// unlock and re-validate.
 func TestLoadGroupedEncryptedWatchPathsDeferred(t *testing.T) {
 	root := t.TempDir() // exists; the sub-paths deliberately do not
 	sshPath := filepath.Join(t.TempDir(), "ssh")
@@ -795,12 +791,10 @@ need_encryption: false
 	}
 }
 
-// TestLoadGroupedWatchPathRejectsSymlinkedIntermediate: a grouped watch
-// sub-path whose intermediate component is a symlink is dropped at parse time
-// — validateWatchTarget only Lstats the leaf, so without the component walk an
-// intermediate symlink pointing outside the vault would redirect the
-// inode-based guard onto an unrelated tree that would inherit the group's
-// whitelist and fscrypt lifecycle.
+// A grouped watch sub-path with a symlinked intermediate component is dropped at parse time:
+// validateWatchTarget Lstats only the leaf, so an intermediate symlink pointing outside the vault
+// would redirect the inode-based guard onto an unrelated tree inheriting the group's whitelist and
+// lifecycle.
 func TestLoadGroupedWatchPathRejectsSymlinkedIntermediate(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

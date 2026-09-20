@@ -76,16 +76,13 @@ func (s *IntegrationSuite) TestMonitorAllEvents() {
 	s.stopMonitor(c)
 }
 
-// ---------------------------------------------------------------
-// Metadata-operation coverage: path-based ops that never create a
-// struct file (no vfs_open) must still be observable by monitor:
-//   - truncate(2), chmod(2), chown(2), utimes, setxattr/removexattr
-//     -> ATTR (notify_change / vfs_setxattr / vfs_removexattr)
-//   - mknod(2)                      -> MKNOD (vfs_mknod)
-//   - stat(2), access(2), readlink  -> STAT (vfs_statx,
-//     security_inode_permission [MAY_ACCESS], vfs_readlink)
-//
-// ---------------------------------------------------------------
+// Metadata-operation coverage: path-based ops with no struct file (no vfs_open) must still be
+// observable by monitor:
+//   - truncate/chmod/chown/utimes/setxattr/removexattr -> ATTR (notify_change / vfs_setxattr /
+//     vfs_removexattr)
+//   - mknod(2)                     -> MKNOD (vfs_mknod)
+//   - stat/access/readlink         -> STAT (vfs_statx, security_inode_permission [MAY_ACCESS],
+//     vfs_readlink)
 func (s *IntegrationSuite) TestMonitor_MetadataEvents() {
 	c := s.monitorContainer()
 	// pooled: terminated at suite end
@@ -675,13 +672,10 @@ func (s *IntegrationSuite) TestExploit_execve() {
 	s.stopMonitor(c)
 }
 
-// TestExploit_io_uring verifies the monitor sees an io_uring READV, not just
-// the plain open() that precedes it. io_uring's data path
-// (io_read -> call_read_iter -> f_op->read_iter) never touches vfs_read /
-// vfs_readv / vfs_iter_read, so before the dedicated io_read/io_write kprobes
-// the READ was invisible and this test could only ever skip. It still skips
-// on a kernel where io_uring is unavailable entirely (io_uring_setup fails,
-// so not even the OPEN lands).
+// The monitor must see an io_uring READV, not just the preceding open(). io_uring's path (io_read
+// -> call_read_iter -> f_op->read_iter) skips vfs_read/vfs_readv/vfs_iter_read, so before the
+// io_read/io_write kprobes the READ was invisible and this could only skip. Still skips where
+// io_uring is unavailable (io_uring_setup fails, so not even OPEN lands).
 func (s *IntegrationSuite) TestExploit_io_uring() {
 	et := exploitTests[7]
 
@@ -721,14 +715,11 @@ func (s *IntegrationSuite) TestExploit_io_uring() {
 	s.stopMonitor(c)
 }
 
-// TestExploit_open_by_handle_at verifies the monitor sees an open (and read)
-// that came in via open_by_handle_at(2) rather than a pathname. /watch is a
-// tmpfs mount: the container root is overlayfs, which does not implement
-// name_to_handle_at, and the exploit needs CAP_DAC_READ_SEARCH (root — the
-// privileged container has it). The monitor watches the single file rather
-// than the dir: a fresh mount terminates the kprobe dentry walk at the mount
-// root, so events carry the mount-relative path (/test_file.txt) which only
-// the single-file suffix match catches.
+// The monitor must see an open (and read) via open_by_handle_at(2). /watch is tmpfs: the
+// container's overlayfs root lacks name_to_handle_at, and the exploit needs CAP_DAC_READ_SEARCH
+// (privileged root has it). The monitor watches the single file, not the dir: a fresh mount ends
+// the kprobe dentry walk at the mount root, so events carry the mount-relative path
+// (/test_file.txt), caught only by the single-file suffix match.
 func (s *IntegrationSuite) TestExploit_open_by_handle_at() {
 	et := exploitTests[8]
 

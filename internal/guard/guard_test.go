@@ -676,17 +676,13 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	s.Require().NoError(g.SweepInodes())
 	s.Require().True(inMap(fileRoot), "SweepInodes must map the recreated file root")
 
-	// Regression coverage for the false-DENY-on-unrelated-files /
-	// silently-unguarded-real-file bug: SweepInodes must move BOTH the
-	// kernel-side root-confinement anchor (guard_config[3..4], consulted by
-	// root_in_chain in guard.bpf.c) and g.rootKey to the new inode, and evict
-	// the old one from guard_inodes — otherwise the old, now-freed inode
-	// number stays "protected" forever (ReconcileInodes refuses to evict
-	// g.rootKey) and, once the filesystem hands that number to an unrelated
-	// file anywhere else, that file gets denied under this resource's
-	// whitelist purely by inode-number coincidence, while the real
-	// recreated file silently stops being guarded (its ancestor chain no
-	// longer contains the stale configured root).
+	// Regression for the false-DENY-on-unrelated-files / silently-unguarded-real-file bug:
+	// SweepInodes must move BOTH the kernel root-confinement anchor (guard_config[3..4],
+	// root_in_chain) and g.rootKey to the new inode and evict the old one from guard_inodes.
+	// Otherwise the old freed number stays "protected" forever (ReconcileInodes won't evict
+	// g.rootKey) and, once the filesystem gives it to an unrelated file elsewhere, that file is
+	// denied under this whitelist by coincidence while the real recreated file silently loses
+	// protection (its chain no longer contains the stale root).
 	var gotDev, gotIno uint64
 	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
 	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
@@ -702,15 +698,11 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
-// TestSweepInodesRecreatedDirRoot is TestSweepInodesRecreatedFileRoot's
-// directory-root counterpart: the regression test for the SAME bug class
-// (stale root-confinement anchor -> false DENY on an unrelated file
-// elsewhere + the real resource silently losing protection), for a
-// DIRECTORY watch root deleted and recreated wholesale (e.g. an in-place
-// fscrypt migration, a backup restore, or an app rebuilding its own config
-// directory) rather than a single guarded file. Before this fix, only the
-// single-file branch of SweepInodes re-anchored on a root-inode change; the
-// directory branch only tracked mtime and never re-checked its own inode.
+// Directory-root counterpart of TestSweepInodesRecreatedFileRoot (same bug class: stale anchor ->
+// false DENY + silently unguarded resource) for a DIRECTORY root deleted and recreated wholesale
+// (in-place fscrypt migration, backup restore, app rebuilding its config dir). Before the fix only
+// the single-file branch re-anchored; the directory branch tracked mtime and never re-checked its
+// own inode.
 func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	if os.Getuid() != 0 {
 		s.T().Skip("Skipping BPF test: requires root")
@@ -756,15 +748,11 @@ func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	s.Require().True(inMap(watchDir), "SweepInodes must map the recreated directory root")
 	s.Require().True(inMap(newFile), "SweepInodes must map the recreated directory's new content")
 
-	// Same regression coverage as TestSweepInodesRecreatedFileRoot: the
-	// kernel-side root-confinement anchor (guard_config[3..4], consulted by
-	// root_in_chain in guard.bpf.c) and g.rootKey must both move to the new
-	// inode, and the old one must be evicted from guard_inodes — otherwise
-	// it stays "protected" forever (ReconcileInodes refuses to evict
-	// g.rootKey) and, once the filesystem hands that freed inode number to
-	// an unrelated file/directory anywhere else, that gets denied under
-	// this resource's whitelist purely by inode-number coincidence, while
-	// the real recreated directory silently stops being guarded.
+	// Same coverage as TestSweepInodesRecreatedFileRoot: the root-confinement anchor
+	// (guard_config[3..4]) and g.rootKey must move to the new inode and the old one be evicted from
+	// guard_inodes, else it stays "protected" forever and, once reused by an unrelated
+	// file/directory elsewhere, that gets denied by inode-number coincidence while the real
+	// recreated directory silently loses protection.
 	var gotDev, gotIno uint64
 	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
 	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
@@ -780,13 +768,10 @@ func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
-// The guard_path_rmdir eviction fix itself (guard.bpf.c) is exercised at the
-// guard level, not here: see TestGuard_PathRmdirEvictsInodeImmediately in
-// integrationtests/guard_test.go, which queries the live guard_inodes map via
-// bpftool running as root inside the privileged test container — a directory
-// has no hard-link equivalent to prove eviction through ordinary black-box
-// filesystem behavior (Linux refuses to hard-link a directory), so that test
-// verifies the map directly instead of via a surviving second name.
+// The guard_path_rmdir eviction fix is tested at guard level
+// (TestGuard_PathRmdirEvictsInodeImmediately in integrationtests/guard_test.go): it queries the
+// live guard_inodes map via bpftool as root in the privileged container, since a directory has no
+// hard-link equivalent to prove eviction black-box (Linux refuses to hard-link a directory).
 
 // TestSweepInodesDirRootGated verifies a directory root whose mtime has not
 // moved is not re-walked (the expensive path the sweep avoids).
@@ -816,13 +801,10 @@ func (s *guardUnitTest) TestSweepInodesDirRootGated() {
 	g.mu.Unlock()
 }
 
-// TestWalkLiveEntriesRootFailureIsHardError verifies the one behavior that
-// distinguishes walkLiveEntries from walkInodes: unlike PopulateInodes'
-// tolerant root-vanish handling (safe there — the BPF ancestor walk and
-// fail-closed defenses still cover under-collection), ReconcileInodes must
-// never read "the root was briefly unreadable" as "the guarded tree is
-// empty" — that would license evicting every entry, including the watch
-// root's own protection.
+// The one behavior distinguishing walkLiveEntries from walkInodes: unlike PopulateInodes' tolerant
+// root-vanish handling (safe there: the ancestor walk and fail-closed defenses cover
+// under-collection), ReconcileInodes must never read "root briefly unreadable" as "tree empty",
+// which would license evicting every entry, including the root's own protection.
 func (s *guardUnitTest) TestWalkLiveEntriesRootFailureIsHardError() {
 	err := walkLiveEntries("/some/path", false, 0, func(p string) error {
 		if p == "/some/path" {
@@ -853,14 +835,11 @@ func (s *guardUnitTest) TestWalkLiveEntriesToleratesVanishingChild() {
 	s.Require().Equal(3, seen, "root + both children must be visited")
 }
 
-// TestReconcileInodesEvictsStale verifies the periodic inode GC removes a
-// guard_inodes entry once its file is genuinely gone, while leaving the
-// watch root's own entry untouched. Nothing else in the guard ever deletes
-// from guard_inodes (PopulateInodes/SweepInodes/the BPF mkdir/rename
-// auto-discovery hooks only add), so a long-lived guard otherwise
-// accumulates one stale (dev, ino) per deleted file — and on a filesystem
-// that reuses freed inode numbers, a stale entry can later collide with an
-// unrelated file elsewhere on the same device and trigger a false DENY.
+// The periodic inode GC removes a guard_inodes entry once its file is gone, leaving the watch
+// root's entry untouched. Nothing else deletes from guard_inodes (PopulateInodes/SweepInodes/BPF
+// mkdir-rename discovery only add), so a long-lived guard accumulates a stale (dev, ino) per
+// deleted file, and on filesystems that reuse inode numbers one can collide with an unrelated file
+// and false-DENY.
 func (s *guardUnitTest) TestReconcileInodesEvictsStale() {
 	if os.Getuid() != 0 {
 		s.T().Skip("Skipping BPF test: requires root")

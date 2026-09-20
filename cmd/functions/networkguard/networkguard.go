@@ -163,9 +163,8 @@ func runNetworkGuard(cmd *cobra.Command, args []string) error {
 	return runTUI(ucase, mode, binaries)
 }
 
-// resolveGuardMode determines the guard mode from the CLI flags. When neither
-// -b nor -w is given, whitelist mode with no allowed binaries is assumed
-// (every network operation is blocked).
+// resolveGuardMode picks the guard mode from the flags. Neither -b nor -w = whitelist with no
+// allowed binaries (all network operations blocked).
 func resolveGuardMode() (networkguard.Mode, []string, error) {
 	switch {
 	case len(blacklistPaths) > 0 && len(whitelistPaths) > 0:
@@ -230,16 +229,14 @@ Continue? [y/N] `)
 	return nil
 }
 
-// runHeadless prints guard events to the log. When throttle is enabled, the
-// BPF layer already rate-limits per (type, comm); this printer additionally
-// deduplicates repeats within 1s. With --no-throttle every event is printed.
+// runHeadless prints guard events. With throttle on, the BPF layer already rate-limits per (type,
+// comm) and this printer also dedupes repeats within 1s; --no-throttle prints every event.
 func runHeadless(uc usecase.NetworkGuardUseCase, throttle bool) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	// Rate-limit repeated events per (type, comm): the LSM hooks are global,
-	// so in whitelist mode every blocked socket op of noisy host processes
-	// (mDNS, IDE workers, …) would otherwise flood the log.
+	// Rate-limit per (type, comm): the LSM hooks are global, so in whitelist mode every blocked
+	// socket op of noisy host processes (mDNS, IDE workers) would flood the log.
 	type eventKey struct {
 		typ  string
 		comm string

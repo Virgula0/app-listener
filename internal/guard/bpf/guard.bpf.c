@@ -4,10 +4,9 @@
 #include <errno.h>
 
 #define MAX_PATH 256
-// VFS access-mask bits as passed to bpf_lsm_inode_permission /
-// bpf_lsm_file_permission.  NOTE: this kernel (7.0-hardened) reshuffled
-// the mainline layout — MAY_OPEN is 0x20 here (not 0x40) and MAY_ACCESS
-// is 0x10.  Keep in sync with include/linux/fs.h of the target kernel.
+// VFS access-mask bits for bpf_lsm_inode_permission/file_permission. This kernel (7.0-hardened)
+// differs from mainline: MAY_OPEN is 0x20 (not 0x40), MAY_ACCESS 0x10. Keep in sync with the target
+// kernel's include/linux/fs.h.
 #define MAY_EXEC   0x00000001
 #define MAY_WRITE  0x00000002
 #define MAY_READ   0x00000004
@@ -19,36 +18,28 @@
 #define ATTR_FILE 0x00002000
 #define GUARD_BLOCK 1
 #define GUARD_ALLOW 2
-// Root-gated allow: honored only when the current user is root (uid 0).
-// Used for the guard owner's own binary (the daemon), so its fscrypt
-// ioctls keep working without making the binary a universal key that any
-// local user can execute to inherit full access to guarded trees.
+// Root-gated allow: honored only for uid 0. For the owner's own binary (the daemon), so it isn't a
+// universal key any local user could execute.
 #define GUARD_ALLOW_ROOT 3
 #define __FMODE_EXEC 0x20 // set in file->f_flags by kernel exec opens (do_open_execat)
 #define FMODE_WRITE 0x2   // file->f_mode: file is open for write (stable across kernels)
 #define PROT_WRITE 0x2    // mmap prot
 #define MAP_SHARED 0x1    // mmap flags
 
-// guard_config[0] mode values.  0/1 are the historical blacklist/whitelist.
-// GUARD_MODE_READONLY (2): every process may READ the guarded tree, but only
-// a whitelisted binary may modify it (write, truncate, rename, unlink, chmod,
-// mkdir, mknod, xattr, writable mmap, mount-over).  Used for /etc/app-listener,
-// whose daemon.conf stays world-readable while only the app-listener binary
-// can change it.
+// guard_config[0] modes: 0/1 = blacklist/whitelist. GUARD_MODE_READONLY (2): every process may
+// READ, only whitelisted binaries may modify (write, truncate, rename, unlink, chmod, mkdir, mknod,
+// xattr, writable mmap, mount-over). For /etc/app-listener (world-readable daemon.conf).
 #define GUARD_MODE_BLACKLIST 0
 #define GUARD_MODE_WHITELIST 1
 #define GUARD_MODE_READONLY 2
 
-// guard_event.reason: why an event was emitted. GUARD_REASON_NONE is the
-// ordinary path-keyed decision (the event belongs to the watched resource).
-// GUARD_REASON_RAW_DEVICE marks a denial from the raw block-device gate
-// (is_guarded_block_device): the target is the backing block device, not a
-// watched path, so userspace must NOT attribute it to a specific resource.
+// guard_event.reason: GUARD_REASON_NONE = ordinary path-keyed decision. GUARD_REASON_RAW_DEVICE =
+// raw block-device gate denial (is_guarded_block_device): the target is the backing device, not a
+// watched path; userspace must NOT attribute it to a resource.
 #define GUARD_REASON_NONE 0
 #define GUARD_REASON_RAW_DEVICE 1
-// Process-gate denials: no file is involved. `path` carries the OTHER task's
-// comm and `fd` its thread-group id — the tainted target of a ptrace-class
-// access, or the unwhitelisted tracer of an exec.
+// Process-gate denials: no file. `path` = the OTHER task's comm, `fd` = its tgid (tainted ptrace
+// target, or unwhitelisted exec tracer).
 #define GUARD_REASON_PTRACE 2
 #define GUARD_REASON_TRACED_EXEC 3
 #define GUARD_REASON_PROC_MEM 4
@@ -108,10 +99,8 @@ struct {
 	__type(value, __u8);
 } guard_exe_actions SEC(".maps");
 
-// Per-binary allowed-event bitmask (bit i = enum event_type i). Only
-// consulted in whitelist mode; a missing entry means all events are
-// allowed, so the plain guard mode (which never populates this map)
-// behaves exactly as before.
+// Per-binary allowed-event bitmask (bit i = enum event_type i). Whitelist mode only; a missing
+// entry = all events allowed (plain guard mode never populates this map).
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 64);
@@ -140,12 +129,9 @@ struct {
 	__type(value, __u8);
 } guard_fs_devices SEC(".maps"); // block devices hosting guarded filesystems
 
-// Degradation counters — pure observability, read and logged by userspace,
-// never consulted by any decision path:
-//   [0] guard_inodes map full: runtime inode discovery dropped an add
-//       (coverage degrades to the ancestor walk beyond this point)
-//   [1] guard_tainted_pids map full: a taint stamp was lost (the process
-//       keeps working; its future ptrace/process_vm_readv is not denied)
+// Degradation counters: observability only, never consulted by a decision.
+//   [0] guard_inodes full: runtime discovery dropped an add (falls back to the ancestor walk)
+//   [1] guard_tainted_pids full: a taint stamp was lost (future ptrace/process_vm_readv on it isn't denied)
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 2);
@@ -165,9 +151,8 @@ static __always_inline void count_degrade(__u32 slot)
 	__sync_fetch_and_add(cell, one);
 }
 
-// Tracks processes that have guarded file content in their address space.
-// Once tainted, process_vm_readv, ptrace, and /proc/<pid>/mem access
-// against this PID are blocked unless the caller is whitelisted.
+// Processes holding guarded file content in memory. Once tainted, process_vm_readv, ptrace and
+// /proc/<pid>/mem against them are blocked unless the caller is whitelisted.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
@@ -184,11 +169,8 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	// 2 MiB (~3.5k events). The reader drains continuously on a dedicated
-	// goroutine and enforcement is synchronous in the LSM hook, so an
-	// overflow only drops a telemetry record, never a decision. The old
-	// 16 MiB ring cost ~32 MiB of double-mapped user memory *per guard*
-	// (dozens of guards on a grouped config) for headroom nothing needs.
+	// 2 MiB (~3.5k events). Enforcement is synchronous, so overflow drops only telemetry, never a
+	// decision. Per guard, so size matters with dozens of guards.
 	__uint(max_entries, 1 << 21);
 } rb SEC(".maps");
 
@@ -229,10 +211,8 @@ static __always_inline int get_current_exe_inode(struct inode_key *ik)
 	return 1;
 }
 
-// get_task_exe_inode resolves the executable identity of an ARBITRARY task
-// (not just current), used to protect whitelisted victims in
-// ptrace_access_check. Returns 0 for tasks without a userspace mm (kernel
-// threads), which carry no enforceable exe identity.
+// get_task_exe_inode resolves the exe identity of an ARBITRARY task (protects whitelisted victims
+// in ptrace_access_check). 0 for kernel threads (no mm, no exe identity).
 static __always_inline int get_task_exe_inode(struct task_struct *task, struct inode_key *ik)
 {
 	if (!task)
@@ -309,8 +289,7 @@ static __always_inline struct dentry *get_dentry_from_path(void *ctx_path)
 	return d;
 }
 
-// Check if a newly created directory should be auto-added to guard_inodes
-// based on the guard's recursive setting.
+// Auto-add a newly created directory to guard_inodes per the guard's recursive setting.
 static __always_inline int should_add_new_dir(void)
 {
 	__u32 key = 1;
@@ -320,10 +299,9 @@ static __always_inline int should_add_new_dir(void)
 	return 1;
 }
 
-// is_readonly_mode reports whether this guard runs in GUARD_MODE_READONLY.
-// Callers use it to skip taint-tracking on an allowed read: RO mode guards
-// world-readable content (a config file), not secrets, so tainting every
-// reader would only bloat guard_tainted_pids and over-restrict ptrace.
+// is_readonly_mode: callers skip taint-tracking on allowed reads in GUARD_MODE_READONLY
+// (world-readable content, not secrets; tainting readers would bloat guard_tainted_pids and
+// over-restrict ptrace).
 static __always_inline int is_readonly_mode(void)
 {
 	__u32 key = 0;
@@ -331,11 +309,9 @@ static __always_inline int is_readonly_mode(void)
 	return mode != NULL && *mode == GUARD_MODE_READONLY;
 }
 
-// event_is_read_class reports whether, in GUARD_MODE_READONLY, this event
-// leaks no modification and is therefore allowed for every process (only
-// non-read-class events are gated on the whitelist).  OPEN and MMAP count as
-// read-class only without write intent (FMODE_WRITE / MAP_SHARED|PROT_WRITE),
-// which check_and_emit_ex receives as write_intent.
+// event_is_read_class: in GUARD_MODE_READONLY, events that leak no modification are allowed for
+// everyone. OPEN and MMAP count only without write intent (FMODE_WRITE / MAP_SHARED|PROT_WRITE,
+// passed as write_intent to check_and_emit_ex).
 static __always_inline int event_is_read_class(__u32 type, bool write_intent)
 {
 	switch (type) {
@@ -350,29 +326,22 @@ static __always_inline int event_is_read_class(__u32 type, bool write_intent)
 	}
 }
 
-// Walk up from `parent` toward the root and report whether the subtree
-// under it lies inside the guarded region.  The guarded region is the
-// subtree rooted at the farthest (closest-to-root) inode present in
-// guard_inodes, bounded by the configured depth limit; a parent that sits
-// exactly at the limit boundary is not guarded, which mirrors the eager
-// inode scan and discover_guarded_parent exactly.  This makes the guarded
-// root in the map protect the entire subtree at any depth: it closes the
-// window between LSM hook attach and the eager inode scan, keeps deep
-// files (deeper than the discovery bound) protected, and preserves open/
-// read/write enforcement even when the inode map fills up mid-scan.
-// One step of the ancestor walk: advance to the parent dentry, then test
-// that level for guard membership and watch-root reachability.  This is
-// written directly into the walk loop below (not as a separate helper) so
-// the verifier sees a single convergent loop: a ref-parameter helper and
-// per-iteration early-exit branches kept the loop head from converging and
-// blew past the 1M-instruction complexity budget even at a 16-step bound.
+// Walk up from `parent` and report whether its subtree lies in the guarded region: rooted at the
+// farthest inode present in guard_inodes, bounded by the depth limit (a parent exactly at the limit
+// is NOT guarded, mirroring the eager scan and discover_guarded_parent). Protects the whole subtree
+// at any depth: covers the window between hook attach and the eager scan, deep files, and a full
+// inode map.
+//
+// Each step (advance to parent, test guard membership and watch-root reachability) is written
+// inline in the loop, not as a helper: a ref-parameter helper plus per-iteration early exits kept
+// the loop head from converging and blew the 1M-insn verifier budget even at 16 steps.
 static __always_inline int guarded_ancestor_within_limit(struct dentry *parent)
 {
 	if (!parent)
 		return 0;
 
-	// Non-recursive guards only ever add the guarded root and its direct
-	// children to the map; deeper levels are deliberately unprotected.
+	// Non-recursive guards map only the root and its direct children; deeper levels are
+	// deliberately unguarded.
 	if (!should_add_new_dir())
 		return 0;
 
@@ -381,12 +350,9 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent)
 	if (!parent_inode)
 		return 0;
 
-	// Performance gate: only files on a filesystem that hosts a guarded
-	// root can have a guarded ancestor.  guard_fs_sbdevs holds the
-	// filesystem device of the guarded path (populated unconditionally by
-	// the Go side, including anonymous tmpfs/overlayfs devices); every
-	// other filesystem skips the walk entirely, keeping the per-access
-	// cost at a single hash lookup.
+	// Perf gate: only files on a filesystem hosting a guarded root can have a guarded ancestor.
+	// guard_fs_sbdevs (populated unconditionally by Go, incl. anon tmpfs/overlayfs devs) lets other
+	// filesystems skip the walk with one lookup.
 	struct super_block *sb;
 	bpf_probe_read_kernel(&sb, sizeof(sb), &parent_inode->i_sb);
 	if (sb) {
@@ -400,13 +366,10 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent)
 	__u64 *depth = bpf_map_lookup_elem(&guard_config, &depth_key);
 	bool has_limit = depth != NULL && *depth > 0;
 
-	// Root confinement: a guarded ancestor only counts when the chain
-	// also reaches the watch root inode (guard_config[4]); an inode
-	// number reused outside the tree carries no root in its chain.  The
-	// device is implied: the filesystem gate above has already scoped the
-	// walk to the guard's own filesystem (the watch root is an ancestor
-	// of every in-tree parent and therefore lives on the same superblock).
-	// Fails closed when the root is not configured (legacy pairing).
+	// Root confinement: a guarded ancestor counts only if the chain also reaches the watch root
+	// inode (guard_config[4]); an inode number reused outside the tree has no root in its chain.
+	// The device is implied by the gate above (the root shares the superblock of every in-tree
+	// parent). Fails closed if the root isn't configured (legacy pairing).
 	bool root_configured = false;
 	__u64 root_ino = 0;
 	{
@@ -418,19 +381,11 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent)
 		}
 	}
 
-	// Walk the dentry chain up to 16 levels.  This is the largest bound
-	// the verifier accepts for this loop body (the legacy 128-step loop
-	// passed only because its body was lighter; 20+ steps with this
-	// heavier per-iteration body exceed the 1M-instruction complexity
-	// budget).  Depth coverage beyond the bound comes from lazy
-	// discovery at mkdir/open time: every runtime-created chain is mapped
-	// one level at a time (see discover_guarded_parent), so any real path
-	// depth is decided by a direct inode-map hit plus the root chain
-	// walk, and this loop only needs to bridge the last few hops.
-	// With a depth limit the outcome is decided as in discover: a guarded
-	// ancestor at or beyond the limit means the subtree is NOT guarded
-	// (a farther one would only be more distant), and finding none at all
-	// decides the same.
+	// Walk up to 16 levels: the largest bound the verifier accepts for this loop body (20+ steps
+	// exceed the 1M-insn budget). Deeper coverage comes from lazy discovery at mkdir/open
+	// (discover_guarded_parent maps every runtime-created chain a level at a time), so this loop
+	// only bridges the last hops. With a depth limit: a guarded ancestor at/beyond the limit means
+	// NOT guarded (a farther one is only more distant); finding none decides the same.
 	struct dentry *ancestor = parent;
 	__u64 farthest_steps = 0;
 	bool found_guarded = false;
@@ -455,9 +410,8 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent)
 		if (root_configured && anc_ino == root_ino)
 			rooted = true;
 
-		// The depth decision is made once after the loop; a guarded
-		// ancestor at/beyond the limit boundary means NOT guarded, which
-		// also matches the lazy-discovery boundary rule.
+		// Depth decision once after the loop: an ancestor at/beyond the limit = NOT guarded (same
+		// as lazy discovery).
 		if (read_inode_guard(anc_inode)) {
 			farthest_steps = i + 1;
 			found_guarded = true;
@@ -471,15 +425,13 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent)
 	return 1;
 }
 
-// Check whether the operation targets a guarded path by examining
-// both the file's own inode and its parent directory's inode.
+// Checks the file's own inode and its parent directory's.
 #define S_IFMT  00170000
 #define S_IFBLK 0060000
 #define S_IFDIR 0040000
 
-// Check if the inode is a block device whose dev_t matches a
-// guarded filesystem.  This catches debugfs, dd, and any raw
-// block device reader that bypasses VFS access control.
+// Is the inode a block device whose dev_t matches a guarded filesystem (debugfs/dd raw reads bypass
+// VFS)?
 static __always_inline int is_guarded_block_device(struct inode *inode)
 {
 	if (!inode)
@@ -499,13 +451,10 @@ static __always_inline int is_guarded_block_device(struct inode *inode)
 	return val != NULL;
 }
 
-// inode_is_watch_root reports whether inode is exactly the guard's watch
-// root (guard_config[3] = dev, [4] = ino).  A direct identity check with no
-// dentry walk: root_in_chain already treats this same (dev, ino) equality as
-// decisive, so nothing weaker is trusted here.  Used by path_rename to deny a
-// rename that would clobber the watch root itself — its parent directory is
-// not in guard_inodes for a single-file watch, so the destination-parent
-// check cannot see it.
+// inode_is_watch_root: exact (dev, ino) match with guard_config[3]/[4], no dentry walk (the same
+// equality root_in_chain treats as decisive). Used by path_rename to deny clobbering the watch
+// root, which the destination-parent check can't see for a single-file watch (its parent isn't in
+// guard_inodes).
 static __always_inline int inode_is_watch_root(struct inode *inode)
 {
 	if (!inode)
@@ -532,9 +481,8 @@ static __always_inline int inode_is_watch_root(struct inode *inode)
 	return (__u64)dev == *root_dev;
 }
 
-// Mark the current process as tainted — it now has guarded file content
-// in its address space.  Subsequent ptrace/process_vm_readv attempts
-// from non-whitelisted processes will be blocked.
+// Mark the current process tainted (it holds guarded content in memory): non-whitelisted
+// ptrace/process_vm_readv against it is blocked.
 static __always_inline void mark_tainted(void)
 {
 	__u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -543,8 +491,7 @@ static __always_inline void mark_tainted(void)
 		count_degrade(1);
 }
 
-// Add an inode to guard_inodes.  Used by inode_mkdir and path_rename
-// to auto-discover new directories at runtime.
+// Add an inode to guard_inodes (runtime discovery from inode_mkdir/path_rename).
 static __always_inline void add_inode_to_guard(struct inode *inode)
 {
 	if (!inode)
@@ -567,15 +514,10 @@ static __always_inline void add_inode_to_guard(struct inode *inode)
 		count_degrade(0);
 }
 
-// Evict an inode from guard_inodes.  Used by path_unlink/path_rmdir the
-// moment a delete of a tracked inode is actually let through: the kernel
-// frees the inode right after the hook returns, and once it does, an
-// unrelated file/directory anywhere else can be handed that same number —
-// this closes that window at the instant it opens, instead of leaving the
-// stale entry for the periodic ReconcileInodes sweep (up to inodeGCEvery,
-// currently an hour) to eventually clean up. A miss (the inode was never a
-// member — the overwhelmingly common case, since most deletes are of files
-// the guard never scanned) is silent; there is nothing to report.
+// Evict an inode from guard_inodes when path_unlink/path_rmdir lets a delete through: the kernel
+// frees the inode right after, and its number can go to an unrelated file. Evicting now (not
+// waiting for ReconcileInodes, up to inodeGCEvery ~1h) closes that window. A miss (never a member)
+// is silent.
 static __always_inline void evict_inode_from_guard(struct inode *inode)
 {
 	if (!inode)
@@ -596,10 +538,8 @@ static __always_inline void evict_inode_from_guard(struct inode *inode)
 	bpf_map_delete_elem(&guard_inodes, &ikey);
 }
 
-// Check if the accessed file is /proc/<pid>/mem for a tainted PID.
-// The guard can't protect /proc filesystem inodes (they're not in the
-// guarded inode map), so we must explicitly detect this vector.
-// Returns the tainted target pid when dentry is /proc/<pid>/mem of one, else 0.
+// Returns the tainted target pid if dentry is /proc/<pid>/mem of one, else 0. Needed explicitly:
+// /proc inodes aren't in guard_inodes.
 static __always_inline __u32 is_proc_mem_of_tainted(struct dentry *dentry)
 {
 	if (!dentry)
@@ -655,15 +595,12 @@ static __always_inline __u32 is_proc_mem_of_tainted(struct dentry *dentry)
 	return val != NULL ? pid : 0;
 }
 
-// emit_process_denial reports a process-gate denial. These gates used to
-// return -EPERM silently, so a legitimate application failing on them (a
-// browser engine inspecting its own children through /proc/<pid>, Wine
-// reading a game's memory) left nothing in the log to diagnose. other is the
-// other task when it is at hand; otherwise other_tgid names it.
 // ptrace_may_access() mode bits (include/linux/ptrace.h).
 #define PTRACE_MODE_READ 0x01
 #define PTRACE_MODE_ATTACH 0x02
 
+// emit_process_denial reports a process-gate denial (formerly a silent -EPERM, undiagnosable for
+// e.g. browser engines or Wine). `other` is the other task if at hand, else other_tgid names it.
 static __always_inline int emit_process_denial(__u32 reason, __u32 type, struct task_struct *other, __u32 other_tgid, __u32 mode)
 {
 	struct guard_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
@@ -681,9 +618,8 @@ static __always_inline int emit_process_denial(__u32 reason, __u32 type, struct 
 			bpf_probe_read_kernel_str(e->path, 16, &other->comm);
 		}
 		e->fd = other_tgid;
-		// dest carries the access mode: ATTACH reaches memory (ptrace,
-		// process_vm_readv, /proc/<pid>/mem); READ only metadata
-		// (/proc/<pid>/environ, fd, maps, ...).
+		// dest = access mode: ATTACH reaches memory (ptrace, process_vm_readv, /proc/<pid>/mem);
+		// READ only metadata (environ, fd, maps).
 		if (mode & PTRACE_MODE_ATTACH) {
 			e->dest[0] = 'A'; e->dest[1] = 'T'; e->dest[2] = 'T';
 			e->dest[3] = 'A'; e->dest[4] = 'C'; e->dest[5] = 'H'; e->dest[6] = '\0';
@@ -699,30 +635,19 @@ static __always_inline int emit_process_denial(__u32 reason, __u32 type, struct 
 }
 
 
-// Check /proc/<pid>/fd/<n> — opening it creates a file struct pointing
-// to the actual file, which goes through security_file_open with the
-// real file's dentry/inode, so is_guarded_access catches it.
-// We only need to explicitly guard /proc/<pid>/mem here.
+// /proc/<pid>/fd/<n>: opening it goes through file_open with the real file's dentry, so
+// is_guarded_access already catches it; only /proc/<pid>/mem needs an explicit check.
 
-// True when the dentry chain of the accessed file (its own inode included)
-// reaches the guard's watch root inode (guard_config[3..4]).  An inode map
-// entry only guards an access when the chain is rooted: an entry learned
-// from a file inside the guarded tree whose inode number was later reused
-// by a file elsewhere (ext4 inode reuse) has no root in its chain and must
-// not deny.
+// True when the accessed file's dentry chain (own inode included) reaches the watch root
+// (guard_config[3..4]). A map entry only guards an access when the chain is rooted: a stale entry
+// whose inode number was reused elsewhere (ext4) has no root in its chain and must not deny.
 //
-// Fails closed in both ambiguous cases: when the root is not configured
-// (legacy pairing) and when the 128-step bound is exhausted without
-// reaching the filesystem root (a chain deeper than the walk can inspect),
-// the access is treated as rooted so the guard never weakens.
+// Fails closed in both ambiguous cases (root not configured; bound exhausted before the fs root):
+// the access is treated as rooted.
 //
-// The device is read once from the file's own superblock and reused for the
-// whole walk: the watch root is always an ancestor of an in-tree file and
-// therefore lives on the same superblock; a file on any other device cannot
-// have the root in its chain at all, so the whole chain check is skipped.
-// Per-ancestor probes are then only the inode number (the module's parent
-// chase already visits the same chain this walk visits, and probing the
-// superblock of every ancestor is what blew the verifier budget).
+// The device is read once from the file's superblock; the watch root shares it, so a file on
+// another device can't have the root in its chain and the check is skipped. Per-ancestor probes are
+// inode-number only (probing every ancestor's superblock blew the verifier budget).
 static __always_inline int root_in_chain(struct dentry *dentry, struct inode *file_inode, int bound)
 {
 	__u32 dev_key = 3;
@@ -749,24 +674,17 @@ static __always_inline int root_in_chain(struct dentry *dentry, struct inode *fi
 			on_dev = ((__u64)dev == want_dev);
 		}
 	}
-	// A chain reachable from a file on a different device can never
-	// contain the watch root; the ancestors are all on the file's device.
+	// A chain from a file on a different device can never contain the watch root.
 	if (file_inode && !on_dev)
 		return 0;
 	if (!dentry)
 		return 0;
 
-	// Walk up the chain; the file's own inode was checked above.  Every
-	// ancestor is on the file's device (established by on_dev above), so
-	// only the inode number needs probing here.  The bound is chosen per
-	// hook: single-walk hooks take the full 32 (matching the file_open
-	// root checks), the verifier-tight two-walk hooks (unlink, link,
-	// rename) hold 16.  Both comfortably exceed real path depth — the
-	// deepest sandbox/application leaf sits ~12 levels under / — so a
-	// rooted chain always reaches the root node within the bound.  If the
-	// bound is still exhausted, the final ancestor's parent is probed for
-	// the filesystem root, so a chain at exactly the bound still resolves
-	// correctly; only a chain deeper than the bound fails closed.
+	// Walk up the chain (the file's own inode was checked above). All ancestors share the file's
+	// device, so only inodes are probed. Bound per hook: 32 for single-walk hooks (matching
+	// file_open), 16 for the verifier-tight two-walk hooks (unlink, link, rename); both exceed real
+	// path depth (deepest seen ~12). If exhausted, the final ancestor's parent is probed for the fs
+	// root, so a chain exactly at the bound still resolves; only deeper chains fail closed.
 	struct dentry *ancestor = dentry;
 	for (int i = 0; i < bound; i++) {
 		struct dentry *next;
@@ -788,11 +706,9 @@ static __always_inline int root_in_chain(struct dentry *dentry, struct inode *fi
 			return 1;
 	}
 
-	// A chain exactly `bound` levels deep lands the final ancestor on the
-	// filesystem root at the last iteration; the self-parent probe that
-	// recognizes the root happens on the next hop.  Do that probe once
-	// here: a root whose parent is NULL/itself ends the walk without the
-	// watch root inode, so the access is not rooted.
+	// A chain exactly `bound` deep lands on the fs root at the last iteration; recognizing it
+	// (parent NULL/itself) needs one more hop, done here. Such a root ends the walk without the
+	// watch root: not rooted.
 	struct dentry *final_next;
 	bpf_probe_read_kernel(&final_next, sizeof(final_next), &ancestor->d_parent);
 	if (!final_next || final_next == ancestor)
@@ -802,12 +718,9 @@ static __always_inline int root_in_chain(struct dentry *dentry, struct inode *fi
 	return 1;
 }
 
-// Shared gate for the direct map-hit deny checks in the path_*/inode_*
-// hooks: a guard_inodes entry only denies when the dentry chain also
-// reaches the watch root.  This is the same stale-entry containment as
-// is_guarded_access: an inode number reused by a file/dir outside the
-// tree (ext4 inode reuse) carries no root-node in its chain and must not
-// be denied by its stale map entry.
+// Shared gate for direct map-hit denies in path_*/inode_* hooks: an entry only denies when the
+// chain reaches the watch root (same stale-entry containment as is_guarded_access, for inode
+// numbers reused outside the tree).
 static __always_inline int guarded_map_hit(struct dentry *dentry, struct inode *inode, int bound)
 {
 	if (!dentry || !read_inode_guard(inode))
@@ -818,13 +731,9 @@ static __always_inline int guarded_map_hit(struct dentry *dentry, struct inode *
 static __always_inline int is_guarded_access(struct dentry *dentry, struct inode *file_inode)
 {
 	if (read_inode_guard(file_inode)) {
-		// The file's own inode is in the map.  That entry was learned
-		// from a file inside the guarded tree; if the inode number was
-		// reused by a file outside the tree, the stale entry must not
-		// deny it.  Confine the decision to the watch root: a chain
-		// without the root inode is outside the tree (or the entry is
-		// stale), and no ancestor of an unrooted chain can be genuinely
-		// guarded either, so this is decisive.
+		// Own inode in the map. A stale entry (number reused outside the tree) must not deny, so
+		// confine to the watch root. An unrooted chain is outside the tree and none of its
+		// ancestors can be genuinely guarded either, so this is decisive.
 		if (root_in_chain(dentry, file_inode, 32))
 			return 1;
 		return 0;
@@ -841,19 +750,15 @@ static __always_inline int is_guarded_access(struct dentry *dentry, struct inode
 	struct inode *parent_inode;
 	bpf_probe_read_kernel(&parent_inode, sizeof(parent_inode), &parent->d_inode);
 	if (parent_inode && parent_inode != file_inode && read_inode_guard(parent_inode)) {
-		// Same stale-entry reasoning for the direct parent: only a
-		// rooted chain counts.
+		// Same stale-entry rule for the direct parent: only a rooted chain counts.
 		if (root_in_chain(dentry, file_inode, 32))
 			return 1;
 		return 0;
 	}
 
-	// The file's own inode and its direct parent are not in the map (a
-	// runtime-created directory, a file deeper than the eager-scan depth,
-	// or the inode map filled up mid-scan).  Walk up the dentry chain: if
-	// the subtree lies inside the guarded region, the access is guarded.
-	// guarded_ancestor_within_limit enforces the same root confinement
-	// internally.
+	// Neither the file nor its parent is in the map (runtime-created dir, file deeper than the
+	// eager scan, or map filled mid-scan): walk the dentry chain; inside the guarded region =
+	// guarded. guarded_ancestor_within_limit applies root confinement itself.
 	return guarded_ancestor_within_limit(parent);
 }
 
@@ -867,8 +772,6 @@ static __always_inline long read_path(struct dentry *dentry, char *buf, int buf_
 
     struct dentry *d = dentry;
 
-    // Notice we removed #pragma unroll. Modern verifiers handle bounded loops
-    // beautifully without exploding the instruction limit.
     for (int i = 0; i < 32; i++) {
         if (!d)
             break;
@@ -940,9 +843,8 @@ static void fill_path(struct dentry *dentry, char *out)
     }
 }
 
-// is_allow_action evaluates an exe-action entry under the current user:
-// GUARD_ALLOW always allows; GUARD_ALLOW_ROOT allows only for uid 0 (the
-// guard owner). NULL denies in whitelist mode.
+// is_allow_action: GUARD_ALLOW always allows; GUARD_ALLOW_ROOT only for uid 0 (the guard owner).
+// NULL denies in whitelist mode.
 static __always_inline int is_allow_action(const __u8 *action)
 {
 	if (!action)
@@ -964,9 +866,8 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 	// Save mode value early to avoid verifier pointer-tracking concerns
 	__u64 mode_val = *mode;
 
-	// Detect kernel threads (no userspace mm).  These execute on behalf of
-	// user processes (e.g., io_uring workers, SQPOLL threads) and cannot be
-	// identified via exe inode.  Block them unconditionally.
+	// Kernel threads (no userspace mm) act for user processes (io_uring workers, SQPOLL) and have
+	// no exe inode: block unconditionally.
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct mm_struct *current_mm = NULL;
 	if (task)
@@ -984,10 +885,8 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 		if (mode_val == GUARD_MODE_BLACKLIST) {
 			is_blocked = action != NULL && *action == GUARD_BLOCK;
 		} else if (mode_val == GUARD_MODE_READONLY) {
-			// Read-only guard: every process may read the tree (and
-			// the allow is not logged — a config file is read
-			// constantly); every modifying operation is gated on the
-			// whitelist exactly like whitelist mode.
+			// Read-only guard: every process may read (allow not logged: a config file is read
+			// constantly); modifying ops are gated on the whitelist as in whitelist mode.
 			if (event_is_read_class(type, write_intent)) {
 				is_blocked = 0;
 				quiet_allow = true;
@@ -997,29 +896,19 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 		} else {
 			is_blocked = !is_allow_action(action);
 
-			// Exec-open attribution (whitelist mode only): executing a
-			// binary is an OPEN of that binary performed by the
-			// *launcher*, not by the binary itself — a shell wrapper
-			// runs through its interpreter (/bin/sh), whose exe inode
-			// the whitelist deliberately does not list. Attribute
-			// exec-opens to the binary being executed: allowlist the
-			// *target*. The exec fd is never exposed to the caller
-			// (execve destroys the caller's address space), so this
-			// grants the launcher no way to read guarded content;
-			// afterwards the process identity IS the target, so every
-			// later access is checked against the whitelist as usual.
-			// Blacklist mode keeps caller attribution (blocking listed
-			// binaries from exec'ing guarded files).
+			// Exec-open attribution (whitelist mode only): executing a binary is an OPEN performed
+			// by the *launcher* (a shell wrapper runs via /bin/sh, whose exe inode isn't
+			// whitelisted), so attribute exec-opens to the *target* and allowlist that. The exec fd
+			// is never exposed to the caller (execve destroys its address space) and afterwards the
+			// process IS the target, so later accesses are checked normally. Blacklist mode keeps
+			// caller attribution.
 			//
-			// Two discriminator sources cover the full exec chain:
-			//  - the exec target's own open carries __FMODE_EXEC in
-			//    file->f_flags (task->in_execve is set only afterwards,
-			//    in bprm_execve);
-			//  - the kernel's load-time accesses of the exec file
-			//    (prepare_binprm's kernel_read, binfmt mmap, in-tree
-			//    interpreter opens) happen with task->in_execve set.
-			// Both are attributed by the *accessed file's* inode: only
-			// a file that is itself whitelisted passes.
+			// Two discriminators cover the exec chain, both attributed by the *accessed file's*
+			// inode (only a whitelisted file passes):
+			//   - the target's own open carries __FMODE_EXEC in f_flags (task->in_execve is set
+			//     only later, in bprm_execve);
+			//   - the kernel's load-time accesses (prepare_binprm kernel_read, binfmt mmap, in-tree
+			//     interpreter opens) run with task->in_execve set.
 			if (is_blocked &&
 			    ((type == EVENT_OPEN && is_exec_open) ||
 			     BPF_CORE_READ_BITFIELD_PROBED(task, in_execve))) {
@@ -1047,9 +936,8 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 				}
 			}
 
-			// Per-binary event restriction: if the binary has an allowed
-			// event mask, only the listed event types are permitted. A
-			// missing mask entry means all events are allowed.
+			// Per-binary event mask: only listed event types are permitted; no mask entry = all
+			// events.
 			if (!is_blocked) {
 				__u32 *mask = bpf_map_lookup_elem(&guard_exe_events, &exe_ik);
 				if (mask && type < 32 && !(*mask & (1U << type)))
@@ -1058,10 +946,8 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 		}
 	}
 
-	// Allowed accesses with quiet_allow set are not reported: this is
-	// used by inode_permission, which fires for every access to a
-	// guarded file and would otherwise flood the log with allowed-STAT
-	// events. Denied accesses are always reported.
+	// quiet_allow: allowed accesses aren't reported (inode_permission fires on every guarded access
+	// and would flood the log with allowed STATs). Denials are always reported.
 	if (!is_blocked && quiet_allow)
 		return 0;
 
@@ -1096,20 +982,15 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 	return is_blocked ? -EPERM : 0;
 }
 
-// Back-compat wrapper: every ordinary call site keeps the 7-arg form and
-// gets GUARD_REASON_NONE. The raw block-device gate calls check_and_emit_ex
-// directly with GUARD_REASON_RAW_DEVICE.
+// Wrapper for ordinary call sites: GUARD_REASON_NONE. The raw block-device gate calls
+// check_and_emit_ex with GUARD_REASON_RAW_DEVICE.
 #define check_and_emit(type, dentry, dest_str, dest_is_user, dest_dentry, is_exec_open, quiet_allow) \
 	check_and_emit_ex((type), (dentry), (dest_str), (dest_is_user), (dest_dentry), (is_exec_open), (quiet_allow), false, GUARD_REASON_NONE)
 
-// Lazy directory discovery for file_open.
-// When a file is accessed inside a newly-created directory whose inode is
-// not yet in guard_inodes, walk up the dentry tree to find the farthest
-// guarded ancestor (closest to root) and add the immediate parent of the
-// file to guard_inodes — but only if the parent is strictly within the
-// configured depth limit.  Boundary directories (those at the exact depth
-// limit) are not added, which prevents the guard from extending a level
-// deeper than the user specified.
+// Lazy directory discovery for file_open: for a file in a directory not yet in guard_inodes, find
+// the farthest guarded ancestor and add the file's immediate parent, only if strictly within the
+// depth limit (a boundary directory at exactly the limit is not added, so the guard never extends a
+// level deeper than configured).
 static __always_inline void discover_guarded_parent(struct dentry *dentry)
 {
 	if (!dentry)
@@ -1138,10 +1019,8 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 	bool has_limit = depth != NULL && *depth > 0;
 	__u64 max_steps = has_limit ? *depth : 16;
 
-	// Walk up from parent, tracking the farthest (closest to root) guarded
-	// ancestor found.  We continue walking even after finding a guarded
-	// ancestor because we need the farthest one to correctly compute the
-	// absolute depth of the parent directory.
+	// Walk up tracking the farthest guarded ancestor; keep going after the first hit, since the
+	// farthest one gives the parent's absolute depth.
 	struct dentry *ancestor = parent;
 	__u64 farthest_steps = 0;
 	bool found_guarded = false;
@@ -1166,15 +1045,11 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 		}
 	}
 
-	// Only add the parent if we found a guarded ancestor and the parent is
-	// strictly within the depth limit.  A parent at exactly `depth` levels
-	// from the farthest guarded ancestor is a boundary directory that should
-	// NOT be added — otherwise files one level deeper become guarded.
-	// Learning is additionally confined to the watch root: a stale map
-	// entry (inode number reused outside the tree) must not teach the guard
-	// inodes of another tree (root_in_chain fails closed on truncation,
-	// which merely preserves legacy learning — deny-side confinement still
-	// applies).
+	// Add the parent only if a guarded ancestor was found and the parent is strictly within the
+	// depth limit (a parent at exactly `depth` is a boundary dir; adding it would guard one level
+	// too deep). Learning is also confined to the watch root so a stale entry (inode reused outside
+	// the tree) can't teach the guard another tree's inodes (root_in_chain fails closed on
+	// truncation, which just preserves legacy learning; deny-side confinement still applies).
 	if (found_guarded && (!has_limit || farthest_steps < *depth) &&
 	    root_in_chain(parent, parent_inode, 32))
 		add_inode_to_guard(parent_inode);
@@ -1200,12 +1075,9 @@ int guard_file_open(unsigned long long *ctx)
 	if (mem_pid)
 		return emit_process_denial(GUARD_REASON_PROC_MEM, EVENT_OPEN, NULL, mem_pid, PTRACE_MODE_ATTACH);
 
-	// Lazy directory discovery, same as path_mkdir: opening a file whose
-	// parent directory is not yet in guard_inodes adds the parent one
-	// level at a time.  Together with the mkdir-time discovery this maps
-	// any runtime-created chain all the way down to the file's own
-	// parent, so a 16-step ancestor walk plus an inode-map hit covers
-	// paths of any real depth.
+	// Lazy discovery as in path_mkdir: opening a file whose parent isn't in guard_inodes adds the
+	// parent one level at a time. With mkdir-time discovery this maps any runtime-created chain
+	// down to the file's parent, so a 16-step walk plus a map hit covers any real depth.
 	discover_guarded_parent(dentry);
 
 	if (is_guarded_access(dentry, inode)) {
@@ -1221,13 +1093,9 @@ int guard_file_open(unsigned long long *ctx)
 		return ret;
 	}
 
-	// Block access to the block device that hosts a guarded filesystem.
-	// Without this, tools like debugfs, dd, and fsck can read guarded
-	// files by opening the raw block device and interpreting filesystem
-	// metadata directly (bypassing VFS entirely). This gate is coarse by
-	// nature — a block device is the whole filesystem, so the target is
-	// the device, not a watched path; the RAW_DEVICE reason tells
-	// userspace not to blame a specific resource.
+	// Block access to the block device hosting a guarded filesystem (debugfs, dd, fsck read files
+	// via raw metadata, bypassing VFS). Coarse by nature: the target is the whole device, hence
+	// GUARD_REASON_RAW_DEVICE so userspace doesn't blame a resource.
 	if (is_guarded_block_device(inode))
 		return check_and_emit_ex(EVENT_OPEN, dentry, NULL, false, NULL, false, false, false, GUARD_REASON_RAW_DEVICE);
 
@@ -1275,8 +1143,7 @@ int guard_file_permission(unsigned long long *ctx)
 	if (!dentry)
 		return 0;
 
-	// Block read access to /proc/<pid>/mem when the target PID is tainted.
-	// This catches reads on an already-open fd (opened before taint).
+	// Block reads of /proc/<pid>/mem of a tainted PID (catches fds opened before the taint).
 	__u32 mem_pid = is_proc_mem_of_tainted(dentry);
 	if (mem_pid)
 		return emit_process_denial(GUARD_REASON_PROC_MEM, EVENT_READ, NULL, mem_pid, PTRACE_MODE_ATTACH);
@@ -1294,11 +1161,9 @@ int guard_file_permission(unsigned long long *ctx)
 	return ret;
 }
 
-// ftruncate(2) on an fd that predates the guard (opened before the hooks
-// attached, or dup'ed into the process) never passes through file_open,
-// and the kernel does not invoke file_permission for it either — without
-// this hook a blacklisted process holding such an fd could truncate
-// guarded files.  path-based truncate(2) is already caught by file_open.
+// ftruncate(2) on an fd that predates the guard (or was dup'ed in) passes neither file_open nor
+// file_permission; without this hook a blacklisted process holding such an fd could truncate
+// guarded files. Path-based truncate(2) is caught by file_open.
 SEC("lsm/file_truncate")
 int guard_file_truncate(unsigned long long *ctx)
 {
@@ -1334,20 +1199,14 @@ int guard_path_unlink(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
-	// Captured up front, before any decision below: guarded_map_hit's own
-	// first check already computes this, so reusing it here costs nothing
-	// extra and lets the single evict-on-allow call at the bottom avoid a
-	// second guard_inodes lookup.
+	// Captured up front: guarded_map_hit already computes this, and reusing it lets the single
+	// evict-on-allow at the bottom skip a second guard_inodes lookup.
 	bool inode_was_guarded = read_inode_guard(inode);
 
-	// i_nlink as seen by this pre-hook is the count BEFORE this unlink
-	// decrements it: 1 means this is the last name and the kernel is about
-	// to free the inode; anything higher means another hardlink survives,
-	// still pointing at this exact (dev, ino).  guard_inodes is keyed on
-	// (dev, ino) alone, so the entry also protects every surviving name —
-	// evicting on a non-final unlink would strip that protection from
-	// links this call never touches, open until the next periodic re-scan
-	// happens to rediscover them.
+	// i_nlink in this pre-hook is the count BEFORE the unlink: 1 = last name, inode about to be
+	// freed; more = another hardlink survives at this exact (dev, ino). guard_inodes is keyed on
+	// (dev, ino) alone, so the entry also protects surviving names; evicting on a non-final unlink
+	// would strip them until the next re-scan.
 	unsigned int nlink = 0;
 	if (inode)
 		bpf_probe_read_kernel(&nlink, sizeof(nlink), &inode->i_nlink);
@@ -1361,19 +1220,15 @@ int guard_path_unlink(unsigned long long *ctx)
 	} else if (parent_inode && parent_inode != inode && guarded_map_hit(parent, parent_inode, 12)) {
 		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 	} else if (parent && guarded_ancestor_within_limit(parent)) {
-		// Deep-file coverage: the parent is not in the map but the file may
-		// still be inside the guarded region (ancestor walk).
+		// Deep-file coverage: parent not in the map but the file may be inside the guarded region
+		// (ancestor walk).
 		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false);
 	} else {
 		ret = 0;
 	}
 
-	// The delete is actually going through (never on a denied one — the
-	// file, and its map entry, are untouched then): evict this inode from
-	// guard_inodes right now instead of leaving a stale entry for the
-	// periodic sweep. See evict_inode_from_guard's doc comment. Only on the
-	// final link, per the nlink note above — a surviving hardlink must stay
-	// covered by this same entry.
+	// Delete is going through (never on a denied one): evict the inode now rather than wait for the
+	// periodic sweep (see evict_inode_from_guard). Final link only, per the nlink note.
 	if (ret == 0 && inode_was_guarded && nlink <= 1)
 		evict_inode_from_guard(inode);
 	return ret;
@@ -1390,10 +1245,9 @@ int guard_path_rename(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
-	// Source side, one rooted walk: the file's own inode and its parent
-	// directory both sit on old_dentry's chain, so a single root check
-	// confines both map hits (and stays within the verifier budget that
-	// two separate 32-step walks would exceed).
+	// Source side, one rooted walk: the file and its parent are both on old_dentry's chain, so a
+	// single root check confines both map hits (two 32-step walks would exceed the verifier
+	// budget).
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
 	struct dentry *old_parent = get_dentry_from_path((void *)ctx[0]);
 	if ((read_inode_guard(inode) ||
@@ -1402,19 +1256,15 @@ int guard_path_rename(unsigned long long *ctx)
 		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 	}
 
-	// Deep-file coverage on the source side: the file may be inside the
-	// guarded region even though its parent is not in the map.
+	// Deep-file coverage, source side.
 	if (old_parent && guarded_ancestor_within_limit(old_parent))
 		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 
-	// Destination-target side: a rename onto an existing file silently
-	// unlinks that victim (security_path_unlink never fires for a rename
-	// target).  When the victim IS the guard's watch root, the rename swaps
-	// guarded content for an unguarded inode — a bypass for a single-file
-	// watch root, whose parent directory is not in guard_inodes, so the
-	// destination-parent checks below cannot catch it.  Deny on identity
-	// with the configured watch root; RENAME_EXCHANGE with the root on the
-	// destination side lands here too.
+	// Destination-target side: a rename onto an existing file silently unlinks the victim
+	// (security_path_unlink never fires for a rename target). If the victim IS the watch root, the
+	// rename swaps guarded content for an unguarded inode, a bypass for a single-file watch whose
+	// parent isn't in guard_inodes. Deny on identity with the watch root; RENAME_EXCHANGE with the
+	// root as destination lands here too.
 	if (new_dentry) {
 		struct inode *victim;
 		bpf_probe_read_kernel(&victim, sizeof(victim), &new_dentry->d_inode);
@@ -1422,10 +1272,8 @@ int guard_path_rename(unsigned long long *ctx)
 			return check_and_emit(EVENT_RENAME, new_dentry, NULL, false, NULL, false, false);
 	}
 
-	// Also check the destination parent directory.  This prevents renaming
-	// files from outside the guarded area INTO a guarded directory, and
-	// blocks renames into depth-boundary directories that were added to
-	// the guard_inodes map.
+	// Also check the destination parent: blocks renaming files from outside INTO a guarded dir, and
+	// into depth-boundary directories added to guard_inodes.
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[2]);
 	if (new_parent) {
 		struct inode *new_parent_inode = get_inode_from_path((void *)ctx[2]);
@@ -1433,8 +1281,8 @@ int guard_path_rename(unsigned long long *ctx)
 			int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 			if (ret != 0)
 				return ret;  // blocked — reject the rename
-			// Allowed — if the source is a directory, add its inode
-			// to guard_inodes so its new location is guarded.
+			// Allowed: a renamed directory's inode is added to guard_inodes so its new location is
+			// guarded.
 			if (should_add_new_dir()) {
 				umode_t old_mode;
 				bpf_probe_read_kernel(&old_mode, sizeof(old_mode), &inode->i_mode);
@@ -1445,8 +1293,8 @@ int guard_path_rename(unsigned long long *ctx)
 		}
 	}
 
-	// Deep-file coverage on the destination side: moving INTO a guarded
-	// region whose parent is not in the map (runtime-created deep dir).
+	// Deep-file coverage, destination side: moving INTO a guarded region whose parent isn't in the
+	// map.
 	if (new_parent && guarded_ancestor_within_limit(new_parent)) {
 		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false);
 		if (ret != 0)
@@ -1476,22 +1324,16 @@ int guard_path_symlink(unsigned long long *ctx)
         return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false);
     }
 
-    // Deep-file coverage: the symlink may be created inside a guarded
-    // region whose parent is not in the map.
+    // Deep-file coverage: symlink created inside a guarded region whose parent isn't in the map.
     if (parent && guarded_ancestor_within_limit(parent)) {
         return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false);
     }
 
-    // 2. Check if the symlink TARGET points INTO the guarded path.
-    // Skipped in GUARD_MODE_READONLY: this check stops an alias from
-    // reaching content the creator could not read directly, but a
-    // read-only tree is readable by every process, so an alias grants
-    // nothing — while denying it breaks ordinary tooling (Steam's
-    // bootstrap atomically re-points ~/.steam/bin* with `ln -s` into its
-    // runtime directories). Symlinks created INSIDE the tree stay gated by
-    // (1) above. Secret files guarded in whitelist mode (including the
-    // daemon's own fscrypt.key / edit-auth.hash, which carry their own
-    // whitelist-mode guards) keep this check.
+    // 2. Symlink TARGET into the guarded path. Skipped in GUARD_MODE_READONLY: the check stops an
+    // alias reaching content the creator couldn't read, but a read-only tree is world-readable, and
+    // denying breaks tooling (Steam re-points ~/.steam/bin* with `ln -s`). Symlinks created INSIDE
+    // the tree stay gated by (1). Secret files in whitelist mode (incl. fscrypt.key,
+    // edit-auth.hash) keep this check.
     if (is_readonly_mode())
         return 0;
 
@@ -1512,9 +1354,8 @@ int guard_path_symlink(unsigned long long *ctx)
     bool match = true;
     for (int i = 0; i < MAX_PATH; i++) {
         if (stored_path[i] == '\0') {
-            // We reached the end of the guarded path.
-            // It is a match if the symlink target ends here exactly,
-            // continues as a sub-directory, or if the stored path had a trailing slash.
+            // End of the guarded path: a match if the symlink target ends here, continues as a
+            // sub-directory, or the stored path had a trailing slash.
             if (oldname_buf[i] == '\0' || oldname_buf[i] == '/' || (i > 0 && stored_path[i-1] == '/')) {
                 break;
             }
@@ -1550,12 +1391,10 @@ int guard_path_link(unsigned long long *ctx)
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 	}
 
-	// Source-side confinement: link(2) needs no read access to the source,
-	// so a file created after the guard started — whose own inode is not in
-	// guard_inodes, only its parent directory is — could otherwise be
-	// hardlinked out of the tree and read through the escape name. The hook
-	// args carry no source-parent path, so walk it from old_dentry itself,
-	// mirroring path_rename's source side (parent map hit + ancestor walk).
+	// Source-side confinement: link(2) needs no read access to the source, so a file created after
+	// guard start (only its parent in guard_inodes) could be hardlinked out and read via the escape
+	// name. Hook args carry no source parent, so walk from old_dentry, as path_rename's source side
+	// does.
 	struct dentry *old_parent;
 	bpf_probe_read_kernel(&old_parent, sizeof(old_parent), &old_dentry->d_parent);
 	if (old_parent && old_parent != old_dentry) {
@@ -1565,8 +1404,7 @@ int guard_path_link(unsigned long long *ctx)
 		    guarded_map_hit(old_parent, old_parent_inode, 16))
 			return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 	}
-	// Deep-file coverage on the source side: the file may sit inside the
-	// guarded region even though its parent is not in the map.
+	// Deep-file coverage, source side.
 	if (old_parent && guarded_ancestor_within_limit(old_parent))
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 
@@ -1578,8 +1416,8 @@ int guard_path_link(unsigned long long *ctx)
 		}
 	}
 
-	// Deep-file coverage on the destination side: linking INTO a guarded
-	// region whose parent is not in the map.
+	// Deep-file coverage, destination side: linking INTO a guarded region whose parent isn't in the
+	// map.
 	if (new_parent && guarded_ancestor_within_limit(new_parent))
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false);
 
@@ -1591,12 +1429,8 @@ int guard_path_mkdir(unsigned long long *ctx)
 {
 	struct dentry *dentry = (struct dentry *)ctx[1];
 
-	// Lazy directory discovery, same as file_open: a directory created at
-	// runtime becomes guarded by adding its parent one level at a time.
-	// The first mkdir inside a guarded tree adds the tree root's child,
-	// each further mkdir adds one more level, and the final file_open
-	// adds the deepest directory — so any runtime-created chain is fully
-	// mapped no matter how deep, with only a short ancestor walk.
+	// Lazy discovery as in file_open: each runtime mkdir adds the parent one level at a time, so
+	// any runtime-created chain is fully mapped at any depth with a short ancestor walk.
 	discover_guarded_parent(dentry);
 
 	struct inode *parent_inode = get_inode_from_path((void *)ctx[0]);
@@ -1607,23 +1441,20 @@ int guard_path_mkdir(unsigned long long *ctx)
 		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL, false, false);
 	}
 
-	// Deep-file coverage: mkdir inside a guarded region whose parent is
-	// not in the map.
+	// Deep-file coverage: mkdir inside a guarded region whose parent isn't in the map.
 	if (parent && guarded_ancestor_within_limit(parent))
 		return check_and_emit(EVENT_MKDIR, dentry, NULL, false, NULL, false, false);
 
 	return 0;
 }
 
-// ------------------------------------------------------------------
-// Path/attribute-based bypass coverage.  These operations never
-// create a struct file, so file_open / file_permission never fire:
-//   - truncate(2)            -> security_path_truncate (path_truncate)
-//   - chmod/chown/utimes     -> notify_change -> inode_setattr
-//   - setxattr/removexattr   -> inode_setxattr / inode_removexattr
-//   - mknod(2)               -> security_path_mknod (path_mknod)
-//   - rmdir(2)               -> security_path_rmdir (path_rmdir)
-// ------------------------------------------------------------------
+// Path/attribute bypass coverage: these ops create no struct file, so file_open/file_permission
+// don't fire:
+//   - truncate(2) -> path_truncate
+//   - chmod/chown/utimes -> notify_change -> inode_setattr
+//   - setxattr/removexattr -> inode_setxattr/inode_removexattr
+//   - mknod(2) -> path_mknod
+//   - rmdir(2) -> path_rmdir
 
 SEC("lsm/path_truncate")
 int guard_path_truncate(unsigned long long *ctx)
@@ -1642,11 +1473,9 @@ int guard_path_truncate(unsigned long long *ctx)
 SEC("lsm/inode_setattr")
 int guard_inode_setattr(unsigned long long *ctx)
 {
-	// ctx[0] = mnt_idmap, ctx[1] = dentry, ctx[2] = iattr.
-	// Skip size changes: truncate events are owned by path_truncate /
-	// file_truncate, which run before notify_change and already deny;
-	// emitting again would duplicate events (ATTR_FILE follows
-	// ftruncate(2), also covered by file_truncate).
+	// ctx[0]=mnt_idmap, [1]=dentry, [2]=iattr. Size changes are skipped:
+	// path_truncate/file_truncate own them and already deny (ATTR_FILE follows ftruncate(2));
+	// re-emitting would duplicate events.
 	struct dentry *dentry = (struct dentry *)ctx[1];
 	if (!dentry)
 		return 0;
@@ -1725,11 +1554,8 @@ int guard_path_rmdir(unsigned long long *ctx)
 	if (!dentry)
 		return 0;
 
-	// rmdir only ever succeeds on an EMPTY directory, so evicting this
-	// dentry's own entry on allow (below) is complete — there are no
-	// descendant entries left to worry about; each would already have been
-	// evicted by its own path_unlink/path_rmdir call to get the directory
-	// empty in the first place.
+	// rmdir only succeeds on an EMPTY directory, so evicting this dentry's own entry on allow is
+	// complete: descendants were each evicted by their own unlink/rmdir.
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 	bool inode_was_guarded = read_inode_guard(inode);
@@ -1751,18 +1577,13 @@ int guard_path_rmdir(unsigned long long *ctx)
 	return ret;
 }
 
-// stat(2)/statx(2)/lstat(2) on a guarded path.  A stat leaks file size,
-// mtime, mode, owner, link count and existence — for a guarded tree that is
-// itself a disclosure, so it is denied like every other access.  The hook
-// receives a `struct path *` (ctx[0]), so is_guarded_access can confine the
-// decision to the watch root exactly like inode_readlink / path_truncate;
-// an inode number reused outside the tree is not denied.
+// stat/statx/lstat on a guarded path leaks size, mtime, mode, owner, nlink and existence: denied
+// like any access. The hook gets a `struct path *` (ctx[0]), so is_guarded_access confines to the
+// watch root like inode_readlink/path_truncate.
 //
-// A tool that stats a guarded file before its real syscall (cp, rm, mv, ls)
-// is now denied here first — the blocked event is STAT rather than the later
-// OPEN/DELETE/RENAME.  The guard owner's own binary keeps working: the
-// daemon registers EVENT_STAT in its root-gated self-allow mask so the
-// post-attach inode scan and the fscrypt lifecycle stats are not denied.
+// Tools that stat before their real syscall (cp, rm, mv, ls) are now denied here first (event STAT,
+// not OPEN/DELETE/RENAME). The daemon's root-gated self mask includes EVENT_STAT so its inode scan
+// and fscrypt lifecycle keep working.
 SEC("lsm/inode_getattr")
 int guard_inode_getattr(unsigned long long *ctx)
 {
@@ -1775,11 +1596,9 @@ int guard_inode_getattr(unsigned long long *ctx)
 	if (!is_guarded_access(dentry, inode))
 		return 0;
 
-	// Allow stat of the watch-root DIRECTORY node itself: its metadata
-	// leaks almost nothing (the path is known — it is in the config), and
-	// denying it breaks `mkdir -p`, path probes and `ls` of the parent
-	// directory.  A single-file watch root IS the protected secret, so its
-	// stat stays denied.
+	// Allow stat of the watch-root DIRECTORY itself: leaks almost nothing (the path is in the
+	// config) and denying breaks `mkdir -p`, path probes and `ls` of the parent. A single-file
+	// watch root IS the secret, so its stat stays denied.
 	if (inode && inode_is_watch_root(inode)) {
 		umode_t mode = 0;
 		bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode);
@@ -1806,14 +1625,10 @@ int guard_inode_readlink(unsigned long long *ctx)
 	return 0;
 }
 
-// getxattr(2)/listxattr(2) on a guarded file leak its extended attributes
-// (names and values) — a metadata disclosure the inode_getattr STAT gate was
-// meant to close but never covered: neither operation creates a struct file
-// or calls inode_getattr, so file_open/file_permission/inode_getattr all miss
-// them. Denied like STAT here (EVENT_STAT), with the same watch-root and
-// whitelist confinement is_guarded_access already applies; the daemon's
-// root-gated self mask includes EVENT_STAT, so its own xattr/policy reads are
-// not denied.
+// getxattr/listxattr on a guarded file leak its xattrs; neither creates a struct file or calls
+// inode_getattr, so file_open/file_permission/inode_getattr all miss them. Denied like STAT
+// (EVENT_STAT) with is_guarded_access's watch-root and whitelist confinement; the daemon's self
+// mask includes EVENT_STAT.
 SEC("lsm/inode_getxattr")
 int guard_inode_getxattr(unsigned long long *ctx)
 {
@@ -1846,23 +1661,13 @@ int guard_inode_listxattr(unsigned long long *ctx)
 	return 0;
 }
 
-// inode_permission handles pure inode-level may-checks — access(2),
-// faccessat(2) — which carry MAY_ACCESS.  This hook's context contains
-// only (inode, mask): there is no dentry, so the watch-root chain cannot
-// be walked like every other direct site does.  A raw inode-map hit here
-// therefore cannot be confined, and denying on it produced false
-// positives: an inode number reused by a file in another tree (ext4
-// inode reuse) was denied even though the file was never guarded.  The
-// audit-denial for those probes was a log lie as well — the syscall was
-// never blocked, only reported.  access(2)/faccessat(2) leak no content
-// (they are pure may-checks), so the hook now passes everything through:
-// real reads/writes/execs/deletes are enforced in file_open and the
-// dedicated path_*/inode_* hooks, which do carry a dentry and confine
-// against the watch root.  An X_OK probe (MAY_EXEC without MAY_OPEN)
-// leaks no content and is deliberately not denied — it must not shadow
-// open/exec handling.  The MAY_ACCESS selection below stays as the
-// pass-through gate so this hook never intercepts opens, execs,
-// truncates or setxattr, which have their own event identity.
+// inode_permission handles pure may-checks (access(2)/faccessat(2), MAY_ACCESS). Its context is
+// only (inode, mask): no dentry, so the watch-root chain can't be walked and a raw map hit can't be
+// confined (it false-denied inode numbers reused in other trees, and the audit denial was a log lie
+// since the syscall was never blocked). access/faccessat leak no content, so it passes everything
+// through; real reads/writes/execs/deletes are enforced in file_open and the path_*/inode_* hooks,
+// which carry a dentry. An X_OK probe (MAY_EXEC without MAY_OPEN) is deliberately not denied. The
+// MAY_ACCESS selection below keeps this hook from intercepting opens, execs, truncates or setxattr.
 SEC("lsm/inode_permission")
 int guard_inode_permission(unsigned long long *ctx)
 {
@@ -1906,32 +1711,25 @@ int guard_sb_mount(unsigned long long *ctx)
 		return 0;
 
 	if (guarded_map_hit(dentry, inode, 32)) {
-		// Not marked write_intent: in GUARD_MODE_READONLY a mount over the
-		// guarded directory is left to pass. Blocking it broke systemd's
-		// own mount-namespace setup for helper processes of the daemon
-		// unit (ExecReload=/bin/kill …, run with ReadWritePaths=/etc/app-listener
-		// → a bind mount of the guarded dir → 226/NAMESPACE, reload fails).
-		// mount(2) needs CAP_SYS_ADMIN, which is already outside what an
-		// LSM file guard can contain; whitelist/blacklist mode still deny
-		// here (the mount-shadow bypass regression test covers that path).
+		// Not write_intent: in GUARD_MODE_READONLY a mount over the guarded dir passes. Blocking it
+		// broke systemd's namespace setup for the daemon unit's helpers (ExecReload=/bin/kill with
+		// ReadWritePaths=/etc/app-listener bind-mounts the dir, giving 226/NAMESPACE). mount(2)
+		// needs CAP_SYS_ADMIN, outside what an LSM file guard can contain; whitelist/blacklist
+		// still deny (mount-shadow regression test).
 		return check_and_emit(EVENT_OPEN, dentry, NULL, false, NULL, false, false);
 	}
 
 	return 0;
 }
 
-// Block ptrace / process_vm_readv / process_vm_writev against any process
-// that has guarded file content in its address space (tainted PID).
-// Once a process opens/reads a guarded file, no non-whitelisted process
-// can ptrace it or read its memory via process_vm_readv.
+// Block ptrace/process_vm_readv/writev against any tainted process (one holding guarded content in
+// memory) unless the caller is whitelisted.
 SEC("lsm/ptrace_access_check")
 int guard_ptrace_access_check(unsigned long long *ctx)
 {
-	// LSM hooks pass a pointer to the argument struct in r1; the
-	// declared-args form (struct task_struct *child, unsigned int mode)
-	// maps child to r1 and mode to r2, but the kernel only fills r1, so
-	// child->tgid would read far past the tiny argument struct.  Read the
-	// real args through ctx like the other hooks in this file.
+	// LSM hooks pass a pointer to the arg struct in r1; the declared-args form maps child to r1 and
+	// mode to r2, but the kernel only fills r1, so child->tgid would read past the struct. Read
+	// args through ctx like the other hooks.
 	struct task_struct *child = (struct task_struct *)ctx[0];
 	__u32 mode = (__u32)ctx[1];
 
@@ -1945,14 +1743,11 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 	if (!val)
 		return 0;  // child is not tainted — allow
 
-	// The guard owner itself (the daemon: its binary is the guard's only
-	// GUARD_ALLOW_ROOT entry) is tainted because it reads what it guards,
-	// yet everything it holds lives in its MEMORY (the fscrypt key, the
-	// edit-auth hash), which only a PTRACE_MODE_ATTACH access reaches.
-	// Metadata-only access (READ: /proc/<pid>/environ, fd, maps...) is what
-	// systemd-journald does to label every line the daemon logs — denying
-	// it cost the metadata and logged a denial, which journald then looked
-	// up again. Identity is the target's exe inode, never its pid.
+	// The owner's process (the daemon: the guard's only GUARD_ALLOW_ROOT entry) is tainted because
+	// it reads what it guards, but its secrets (fscrypt key, edit-auth hash) live in MEMORY,
+	// reached only by PTRACE_MODE_ATTACH. Metadata-only access (READ: /proc/<pid>/environ, fd,
+	// maps), which journald does to label every log line, is allowed. Identity is the target's exe
+	// inode, never its pid.
 	if (!(mode & PTRACE_MODE_ATTACH)) {
 		struct inode_key child_ik = {};
 		if (get_task_exe_inode(child, &child_ik)) {
@@ -1974,24 +1769,17 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 	return 0;
 }
 
-// When a tainted process forks, the child inherits the parent's address
-// space (including file mappings).  Mark the child as tainted too so that
-// process_vm_readv on the child is also blocked.
 SEC("lsm/bprm_check_security")
 int guard_bprm_check_security(unsigned long long *ctx)
 {
-	// Executing a whitelisted binary while ptraced hands the tracer the
-	// victim's entire memory: the tracer may have attached BEFORE the
-	// victim ever ran (when its exe identity was not yet whitelisted and
-	// the attach-time check could not deny it), and PEEKDATA never fires
-	// another hook. Allow the exec only when the tracer itself is
-	// whitelisted; otherwise the whitelisted image must not run traced.
+	// Executing a whitelisted binary while ptraced hands the tracer the victim's whole memory: the
+	// tracer may have attached BEFORE the victim's exe identity was whitelisted (so the attach
+	// check couldn't deny) and PEEKDATA fires no further hook. Allow the exec only if the tracer is
+	// whitelisted.
 	//
-	// Read-only guards (lib_dir runtime trees, /etc/app-listener) are skipped
-	// outright, like every other taint site: their contents are world-readable
-	// code, so a process running one of their writers holds nothing of theirs
-	// worth shielding. Tainting it anyway made each runtime tree's writer list
-	// the only processes allowed to inspect half of Steam's process tree.
+	// Read-only guards (lib_dir trees, /etc/app-listener) are skipped like every other taint site:
+	// their contents are world-readable code, and tainting their writers would lock most of e.g.
+	// Steam's process tree out of inspection.
 	if (is_readonly_mode())
 		return 0;
 
@@ -2025,10 +1813,8 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	if (!is_allow_action(taction))
 		return 0;  // target is not whitelisted: not our concern
 
-	// Executing a whitelisted image taints the process IMMEDIATELY: from
-	// this instant the existing tainted-pid ptrace protection applies, so
-	// a tracer attaching after the exec is denied even though the victim
-	// has not touched the guarded tree yet. (The exec-open attribution in
+	// Executing a whitelisted image taints the process IMMEDIATELY, so a tracer attaching after
+	// exec is denied even before the victim touches the tree. (Exec-open attribution in
 	// check_and_emit handles the open itself.)
 	mark_tainted();
 
@@ -2036,20 +1822,17 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	if (!task)
 		return 0;
 
-	// Only TRACED processes are the race: an untraced exec is the normal
-	// exec-open attribution path (a non-whitelisted launcher executing a
-	// whitelisted in-tree binary must keep working — the exec fd is never
-	// exposed to the launcher).
+	// Only TRACED processes race: an untraced exec is the normal exec-open attribution path (a
+	// non-whitelisted launcher may run a whitelisted in-tree binary; the exec fd is never exposed
+	// to it).
 	__u32 ptrace_flags = 0;
 	bpf_probe_read_kernel(&ptrace_flags, sizeof(ptrace_flags), &task->ptrace);
 	if (!ptrace_flags)
 		return 0;
 
-	// For a traced task, ->parent points at the tracer (real_parent keeps
-	// the biological parent). If the tracer is not itself whitelisted, it
-	// must not gain a whitelisted image's memory through exec: it attached
-	// before the victim's identity existed and can PEEKDATA the guarded
-	// content out of the victim's memory once it reads.
+	// For a traced task ->parent is the tracer (real_parent is the biological parent). A
+	// non-whitelisted tracer must not gain a whitelisted image's memory via exec (it attached
+	// before the victim's identity existed and can PEEKDATA the content once read).
 	struct task_struct *tracer = NULL;
 	bpf_probe_read_kernel(&tracer, sizeof(tracer), &task->parent);
 	if (!tracer)
@@ -2066,44 +1849,21 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	return 0;
 }
 
-// When a tainted process forks, the child inherits the parent's address
-// space (including the guarded file content), so it must be tainted too or
-// process_vm_readv against the child would read the secret unguarded.
+// guard_inode_free forgets an inode the moment the kernel destroys a DELETED file. guard_inodes is
+// keyed on (dev, ino) and filesystems recycle inode numbers, so a stale entry eventually matches an
+// unrelated file. unlink/rmdir evict on the final link, but a rename OVER a tracked file frees the
+// victim with no unlink (how apps save, e.g. Steam's registry.vdf). Waiting for the hourly
+// ReconcileInodes caused false DENYs: past root_in_chain's bounded walk a collision fails closed,
+// and a recycled watch-root number exact-matched the root.
 //
-// This runs at sched_process_fork, NOT security_task_alloc: at task_alloc the
-// child's task_struct is a fresh copy of the parent, so its pid/tgid are still
-// the PARENT's (both are only assigned later in copy_process, after
-// security_task_alloc). Tainting from there could only re-stamp the parent's
-// own tgid, never the child's — the child was left untainted. sched_process_fork
-// fires after the child's identity is set, so child->tgid is the real one.
-// It fires for thread creation too, where child->tgid == parent->tgid, making
-// the update a harmless no-op.
-// guard_inode_free forgets an inode the moment the kernel destroys a DELETED
-// file.
+// i_nlink == 0 is the load-bearing check. inode_free_security fires for EVERY inode leaving memory,
+// incl. live files evicted from the cache (memory pressure, drop_caches, fscrypt lock). Forgetting
+// a live file would unguard it, and a live watch root the entire tree. Only a nameless file is
+// really gone.
 //
-// guard_inodes is keyed on (dev, ino) and filesystems recycle freed inode
-// numbers, so an entry that outlives its file will eventually match an
-// unrelated one.  The unlink/rmdir hooks evict on the final link, but a
-// rename OVER a tracked file frees the victim with no unlink at all — and
-// that is how applications save (Steam rewrites its config and registry.vdf
-// this way on every launch).  Left for the hourly ReconcileInodes, those
-// stale entries collided with Steam's freshly created runtime files: on a
-// path deeper than root_in_chain's verifier-bounded walk the collision fails
-// closed (false DENY under an unrelated resource), and a recycled watch-root
-// number exact-matched the root (`ln -sfn` beside registry.vdf denied).
-//
-// i_nlink == 0 is the load-bearing check.  inode_free_security fires for
-// EVERY inode leaving memory, including a live file merely evicted from the
-// inode cache (memory pressure, drop_caches, the fscrypt lock that evicts a
-// whole vault).  Forgetting a live file here would unguard it — and
-// forgetting a live watch root would unguard the entire tree.  Only a file
-// with no name left is really gone; the kernel's own drop decision uses the
-// same test.
-//
-// This is a separate program so it adds nothing to the verifier budget of
-// the rename/unlink/link hooks (guard_path_rename sits at the 1M-instruction
-// limit — issue #45).  Best-effort: without it, stale entries wait for
-// ReconcileInodes as before.
+// Separate program so it adds nothing to the verifier budget of rename/unlink/link
+// (guard_path_rename sits at the 1M-insn limit, issue #45). Best-effort: without it stale entries
+// wait for ReconcileInodes.
 SEC("lsm/inode_free_security")
 int guard_inode_free(unsigned long long *ctx)
 {
@@ -2132,10 +1892,9 @@ int guard_inode_free(unsigned long long *ctx)
 	ikey.ino = ino;
 	bpf_map_delete_elem(&guard_inodes, &ikey);
 
-	// A deleted watch root protects nothing, and its number is about to be
-	// handed to some other file: forget it (0 matches no inode) so that file
-	// cannot exact-match the root.  Userspace re-anchors to a recreated file
-	// on its next sweep.
+	// A deleted watch root protects nothing and its number is about to be reused: forget it (0
+	// matches no inode) so another file can't exact-match the root. Userspace re-anchors on its
+	// next sweep.
 	__u32 dev_key = 3, root_key = 4;
 	__u64 *root_dev = bpf_map_lookup_elem(&guard_config, &dev_key);
 	__u64 *root_ino = bpf_map_lookup_elem(&guard_config, &root_key);
@@ -2146,27 +1905,20 @@ int guard_inode_free(unsigned long long *ctx)
 	return 0;
 }
 
-// guard_bprm_committed clears a process's taint when it has execve'd an image
-// this guard does not whitelist.
+// guard_bprm_committed clears taint when the process exec'd an image this guard doesn't whitelist.
+// Taint = holds this resource's secrets in memory; it's inherited across fork but must not survive
+// exec (the address space is discarded), else every descendant of e.g. the Steam client (Proton,
+// helpers, the game) stays "holding credentials" and desktop tools (GameMode, PipeWire, Wine's
+// wineserver) are refused.
 //
-// Taint marks a process that holds this resource's secrets in memory, so that
-// nothing unwhitelisted may inspect it. It is inherited across fork (the
-// child copies the parent's memory) but must not survive exec: exec discards
-// the whole address space. Without this, every descendant of the Steam
-// client — Proton, the runtime helpers, audio tools, the game — stayed
-// "holding credentials" for life, and every desktop process that looked at
-// one (GameMode, PipeWire, the portal, Wine's own wineserver) was refused.
+// Runs at bprm_committed_creds, after the point of no return: clearing earlier
+// (bprm_check_security) would fail open, since a failed exec leaves the OLD secret-holding image
+// running untainted.
 //
-// This runs at bprm_committed_creds, after the point of no return: the new
-// image is installed. Clearing any earlier (bprm_check_security) would be a
-// fail-open — an exec that then failed would leave the OLD, secret-holding
-// image running untainted.
-//
-// A whitelisted image stays tainted (bprm_check_security marked it: it may
-// read the resource from its first instruction). What still crosses an exec
-// is argv/envp and open fds: fds stay guarded, since every read through one is
-// checked against the whitelist; argv/envp are data the whitelisted parent
-// chose to hand over, outside what taint defends against.
+// A whitelisted image stays tainted (marked in bprm_check_security; it may read the resource from
+// its first instruction). What still crosses an exec: open fds (stay guarded; each read is
+// whitelist-checked) and argv/envp (data the whitelisted parent chose to pass, outside taint's
+// scope).
 SEC("lsm/bprm_committed_creds")
 int guard_bprm_committed(unsigned long long *ctx)
 {
@@ -2206,6 +1958,11 @@ int guard_bprm_committed(unsigned long long *ctx)
 	return 0;
 }
 
+// guard_sched_process_fork taints the child of a tainted parent (it inherits the address space,
+// incl. guarded content; else process_vm_readv on the child reads the secret). Runs at
+// sched_process_fork, NOT security_task_alloc: at task_alloc the child's pid/tgid are still the
+// PARENT's (assigned later in copy_process), so only the parent would be re-stamped. Also fires for
+// thread creation (child->tgid == parent->tgid): a harmless no-op.
 SEC("tp_btf/sched_process_fork")
 int guard_sched_process_fork(unsigned long long *ctx)
 {
@@ -2228,8 +1985,7 @@ int guard_sched_process_fork(unsigned long long *ctx)
 	return 0;
 }
 
-// Clean up the tainted PID entry when the process exits, preventing
-// stale entries when the PID is reused by a different process.
+// Clear the tainted-PID entry on exit so a reused PID isn't stale-tainted.
 SEC("lsm/task_free")
 int guard_task_free(unsigned long long *ctx)
 {
@@ -2238,12 +1994,9 @@ int guard_task_free(unsigned long long *ctx)
 	if (!task)
 		return 0;
 
-	// guard_tainted_pids is keyed on the tgid (the whole process). Clear it
-	// only when the GROUP LEADER exits — i.e. the process is really gone.
-	// security_task_free fires for every task_struct, threads included, so
-	// deleting on any thread's exit (task->pid != task->tgid) would strip a
-	// still-running multithreaded process of its taint the moment a worker
-	// thread finished, re-opening process_vm_readv/ptrace against it.
+	// guard_tainted_pids is keyed on tgid: clear only when the GROUP LEADER exits.
+	// security_task_free fires per task incl. threads; deleting on any thread's exit (pid != tgid)
+	// would strip a running multithreaded process's taint and reopen process_vm_readv/ptrace.
 	__u32 pid, tgid;
 	bpf_probe_read_kernel(&pid, sizeof(pid), &task->pid);
 	bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);

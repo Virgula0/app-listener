@@ -57,9 +57,9 @@ Use --gui to launch the graphical interface instead of the terminal TUI
 // (the only one that currently supports a GUI backend).
 var guiFlag bool
 
-// verboseFlag backs the global --verbose knob (constants.VerboseLevel ladder) governing the
-// headless console stream and --dump-log threshold. Omitted preserves today's display; any
-// explicit value — including 0 — requires --headless. TUI/GUI presentation never changes.
+// verboseFlag backs the global --verbose (constants.VerboseLevel ladder) for the headless console
+// and --dump-log threshold. Omitted keeps the current display; any explicit value, even 0, requires
+// --headless. TUI/GUI is unaffected.
 var verboseFlag int
 
 // dumpLogFile backs the global --dump-log flag: every log line is mirrored
@@ -118,9 +118,8 @@ func init() {
 	rootCmd.AddCommand(editprotected.EditProtectedCmd)
 }
 
-// validateVerbose enforces the --verbose contract: any explicit value — including 0, the
-// errors-only quiet mode — demands --headless (verbosity applies only to the headless
-// console stream), and the value must be a defined VerboseLevel.
+// validateVerbose enforces the --verbose contract: any explicit value (even 0, errors-only) demands
+// --headless, and the value must be a defined VerboseLevel.
 func validateVerbose(cmd *cobra.Command) error {
 	flag := cmd.Flags().Lookup("verbose")
 	if flag == nil || !flag.Changed {
@@ -168,9 +167,9 @@ func effectiveVerbose(cmd *cobra.Command) constants.VerboseLevel {
 	return logging.DefaultVerbose
 }
 
-// setupDumpLog opens the --dump-log file and installs the mirroring hook. An existing file is
-// never destroyed silently: interactive runs ask; under --headless the run refuses so the
-// operator can clear the file deliberately.
+// setupDumpLog opens the --dump-log file and installs the mirroring hook. An existing file is never
+// silently destroyed: interactive runs ask; --headless refuses so the operator clears it
+// deliberately.
 func setupDumpLog(cmd *cobra.Command) error {
 	if dumpLogFile == "" {
 		return nil
@@ -205,9 +204,9 @@ func setupDumpLog(cmd *cobra.Command) error {
 	return nil
 }
 
-// closeDumpFile flushes state after the command completed; the hook itself syncs on every
-// write, so abrupt exits never lose emitted lines anyway. Replacing the whole hook set is a
-// precise removal: it's the only hook this CLI installs.
+// closeDumpFile flushes after the command completes (the hook syncs every write, so abrupt exits
+// lose nothing). Replacing the whole hook set is a precise removal: it's the only hook this CLI
+// installs.
 func closeDumpFile() {
 	if dumpFileHandle == nil {
 		return

@@ -16,12 +16,10 @@ func main() {
 
 	if err := cmd.Execute(); err != nil {
 		log.Error(err.Error())
-		// A critical startup failure (see constants.ErrCriticalStartup) will
-		// reproduce identically on every restart: exit with a distinct
-		// status instead of log.Fatal's generic 1, so the systemd unit's
-		// RestartPreventExitStatus can tell systemd to stop retrying instead
-		// of crash-looping forever. Every other error keeps exiting 1, so
-		// Restart=on-failure still retries transient failures as before.
+		// A critical startup failure (constants.ErrCriticalStartup) reproduces on every restart:
+		// exit with a distinct status (not log.Fatal's 1) so the unit's RestartPreventExitStatus
+		// stops systemd retrying. Every other error still exits 1, so Restart=on-failure keeps
+		// retrying transient failures.
 		if errors.Is(err, constants.ErrCriticalStartup) {
 			os.Exit(constants.CriticalExitCode)
 		}
