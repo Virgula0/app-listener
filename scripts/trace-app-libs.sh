@@ -135,9 +135,15 @@ paste -d'\t' \
 
 # --- DAEMON DENIED: op, comm, exe, uid, resource, path as TSV --------------
 DENY="${RAW}.deny"
-{ grep 'DAEMON DENIED' "${RAW}" || true; } |
-	sed -n 's/.*DAEMON DENIED  op=\([A-Z_]*\)  comm=\(.*\)  commFullPath=\(.*\)  pid=[0-9]*  uid=\([^ ]*\)  resource=\(.*\)  path=\(.*\)$/\1\t\2\t\3\t\4\t\5\t\6/p' \
-	> "${DENY}"
+# Columns: op comm exe uid resource path count. A DAEMON DENIED-REPEAT line is
+# the daemon folding N repeats of a metadata-only process-gate denial into one
+# summary; it carries its count so the totals below stay exact.
+{
+	{ grep 'DAEMON DENIED  op=' "${RAW}" || true; } |
+		sed -n 's/.*DAEMON DENIED  op=\([A-Z_]*\)  comm=\(.*\)  commFullPath=\(.*\)  pid=[0-9]*  uid=\([^ ]*\)  resource=\(.*\)  path=\(.*\)$/\1\t\2\t\3\t\4\t\5\t\6\t1/p'
+	{ grep 'DAEMON DENIED-REPEAT  op=' "${RAW}" || true; } |
+		sed -n 's/.*DAEMON DENIED-REPEAT  op=\([A-Z_]*\)  comm=\(.*\)  commFullPath=\(.*\)  pid=[0-9]*  resource=\(.*\)  path=\(.*\)  repeats=\([0-9]*\)  window=.*$/\1\t\2\t\3\t-\t\4\t\5\t\6/p'
+} > "${DENY}"
 
 {
 	echo "# app-listener denial trace — ${STAMP}"
@@ -166,7 +172,7 @@ DENY="${RAW}.deny"
 		BEGIN { while ((getline d < libdirs) > 0) if (d != "") isLib[d] = 1 }
 		function inside(p, r) { return p == r || index(p, r "/") == 1 }
 		{
-			op = $1; comm = $2; exe = $3; uid = $4; res = $5; path = $6
+			op = $1; comm = $2; exe = $3; uid = $4; res = $5; path = $6; cnt = ($7 == "" ? 1 : $7 + 0)
 			who = (exe == "~" || exe == "") ? "comm:" comm : exe
 			if (op == "PTRACE" || op == "TRACED_EXEC" || op == "PROC_MEM") {
 				# path: "pid=N comm=NAME[ mode=READ|ATTACH]" — group by target
@@ -174,7 +180,7 @@ DENY="${RAW}.deny"
 				tcomm = path; sub(/^pid=[0-9]+ comm=/, "", tcomm)
 				tmode = "-"
 				if (match(tcomm, / mode=[A-Z]+$/)) { tmode = substr(tcomm, RSTART + 6); tcomm = substr(tcomm, 1, RSTART - 1) }
-				gate[res SUBSEP who SUBSEP op SUBSEP tmode SUBSEP tcomm]++
+				gate[res SUBSEP who SUBSEP op SUBSEP tmode SUBSEP tcomm] += cnt
 				next
 			}
 			if (!inside(path, res)) {

@@ -85,6 +85,9 @@ func validateEnabledServe(cmd *cobra.Command, config ServeConfig) error {
 	if requestedBoolFlag(cmd, "blocked-only") {
 		return errors.New("--blocked-only is only available with --headless")
 	}
+	if requestedBoolFlag(cmd, "no-log-metadata-blocks") {
+		return errors.New("--no-log-metadata-blocks is only available with --headless")
+	}
 	credentialsSet, mixedCredentials := credentialFlagState(cmd)
 	if credentialsSet && (mixedCredentials || config.Username == "" || config.Password == "") {
 		return errors.New("--user and --password must be non-empty and specified together")

@@ -106,6 +106,9 @@ var (
 	headless     bool
 	blockedOnly  bool
 	pprofAddr    string
+	// noLogMetadataBlocks drops metadata-only process-gate denials from the
+	// log entirely (see gatelog.go); enforcement is unchanged.
+	noLogMetadataBlocks bool
 )
 
 var DaemonCmd = &cobra.Command{
@@ -137,6 +140,10 @@ run as a systemd service), like ssh-guard's syslog output. Lines carry a
 syslog priority marker (<4> warning, <6> info), so journald colors denied
 events in yellow exactly like ssh-guard. With --blocked-only, only
 denied (blocked) attempts are printed; allowed events are suppressed.
+With --no-log-metadata-blocks, denied metadata-only process inspections
+(op=PTRACE mode=READ) are not printed at all; without it they are printed
+once per caller/target pair and folded into one DAEMON DENIED-REPEAT
+summary per minute.
 The guard itself never changes behavior — filtering is purely presentational.
 
 SIGHUP reloads the configuration: every resource's binary whitelist is
@@ -156,6 +163,11 @@ func init() {
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	DaemonCmd.Flags().BoolVarP(&blockedOnly, "blocked-only", "", false,
 		"Only print blocked (denied) events, skip allowed ones (headless only)")
+	DaemonCmd.Flags().BoolVarP(&noLogMetadataBlocks, "no-log-metadata-blocks", "", false,
+		"Do not log metadata-only process inspections that were denied (op=PTRACE mode=READ: another process "+
+			"reading /proc/<pid> metadata of one holding guarded secrets — desktop services like the compositor, "+
+			"audio server and portal do this constantly). They are still DENIED; only the log line is dropped. "+
+			"Memory access (mode=ATTACH), /proc/<pid>/mem and every file denial are always logged (headless only)")
 	DaemonCmd.Flags().BoolVarP(&genKeyFlag, "genkey", "", false,
 		"Generate the fscrypt master key file and exit")
 	DaemonCmd.Flags().BoolVarP(&checkFlag, "check", "", false,
@@ -1201,12 +1213,23 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 
 func runHeadless(events <-chan usecase.DaemonEvent, reload func(), termSig, hup <-chan os.Signal) {
 	uidr := common.NewUIDResolver()
+	// Folds repeated metadata-only process-gate denials into one summary
+	// line per window (see gatelog.go); enforcement is unaffected.
+	limiter := newGateLogLimiter()
+	flush := time.NewTicker(gateLogWindow / 4)
+	defer flush.Stop()
+	defer limiter.Flush(os.Stderr, true)
 
 	for {
 		select {
+		case <-flush.C:
+			limiter.Flush(os.Stderr, false)
 		case ev, ok := <-events:
 			if !ok {
 				return
+			}
+			if !admitEvent(limiter, &ev, noLogMetadataBlocks) {
+				continue
 			}
 			if !writeEvent(os.Stderr, blockedOnly, uidr, &ev) {
 				continue

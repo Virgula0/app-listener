@@ -234,7 +234,7 @@ pprof:
 		echo "    sudo systemctl edit app-listener-daemon"; \
 		echo "      [Service]"; \
 		echo "      ExecStart="; \
-		echo "      ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only --pprof $(PPROF_ADDR)"; \
+		echo "      ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only --no-log-metadata-blocks --pprof $(PPROF_ADDR)"; \
 		echo "      Environment=GODEBUG=gctrace=1"; \
 		echo "    sudo systemctl restart app-listener-daemon"; \
 		exit 1; \

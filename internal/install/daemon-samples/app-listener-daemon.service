@@ -9,7 +9,7 @@ After=sys-fs-bpf.mount
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only
+ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only --no-log-metadata-blocks
 ExecReload=/bin/kill -HUP $MAINPID
 # Safety net for a SIGKILL / crash / startup timeout: the guard's LSM links
 # are pinned to /sys/fs/bpf, so the guarded trees stay ENFORCED even after

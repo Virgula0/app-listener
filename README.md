@@ -70,7 +70,7 @@ sudo app-listener guard /tmp -w /usr/bin/cat                       # block all b
 sudo app-listener network-monitor /usr/bin/bash                    # watch bash network ops
 sudo app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
 sudo app-listener daemon --genkey                                  # fscrypt master key
-sudo app-listener daemon --headless --blocked-only                 # protected daemon
+sudo app-listener daemon --headless --blocked-only --no-log-metadata-blocks   # protected daemon
 sudo systemctl reload app-listener-daemon                          # re-resolve whitelist inodes
 sudo app-listener update --yes                                     # self-update from GitHub
 ```
@@ -193,6 +193,7 @@ sudo ./build/linux/app-listener daemon            # /etc/app-listener/daemon.con
 | `--config <path>` | — | Config resolution: flag → `/etc/app-listener/daemon.conf` → `daemon-samples/daemon.conf` |
 | `--headless` | `false` | Log `DAEMON …` to stderr (journald when a systemd service) |
 | `--blocked-only` | `false` | Print only denied attempts (presentational) |
+| `--no-log-metadata-blocks` | `false` | Don't log denied metadata-only process inspections (`op=PTRACE mode=READ`, e.g. the compositor or audio server reading `/proc/<pid>` of Steam); still denied. Without it they are logged once per caller/target and summarized per minute. Memory and file denials are always logged. Used by the systemd unit |
 | `--genkey` | `false` | Generate `/etc/app-listener/fscrypt.key` and exit (regeneration asks for confirmation) |
 | `--pprof <addr>` | — | Serve `net/http/pprof` on a loopback address for profiling |
 
