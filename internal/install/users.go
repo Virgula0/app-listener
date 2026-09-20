@@ -9,10 +9,19 @@ import (
 
 // User is a login account that may have directories worth protecting.
 type User struct {
-	Name string
-	UID  uint32
-	GID  uint32
-	Home string
+	Name  string
+	UID   uint32
+	GID   uint32
+	Home  string
+	Shell string
+}
+
+// shell returns the login shell field of a parsed passwd line ("" when absent).
+func shell(fields []string) string {
+	if len(fields) > 6 {
+		return fields[6]
+	}
+	return ""
 }
 
 // minLoginUID is the lower bound for "real" users (system accounts below are skipped). Root (UID 0)
@@ -56,7 +65,7 @@ func parsePasswd(data []byte) ([]User, error) {
 		if _, err := os.Stat(home); err != nil {
 			continue
 		}
-		users = append(users, User{Name: fields[0], UID: uint32(uid), GID: uint32(gid), Home: home})
+		users = append(users, User{Name: fields[0], UID: uint32(uid), GID: uint32(gid), Home: home, Shell: shell(fields)})
 	}
 	return users, nil
 }

@@ -30,9 +30,9 @@ func mustCwd() string {
 }
 
 // installServices copies the embedded unit files from daemon-samples into place (skipping
-// existing), offers the per-user ssh-agent units, and drops the package-manager catalog-refresh
-// hooks.
-func installServices(cfg *daemonconfig.Config) error {
+// existing), installs the per-user ssh-agent units for sshUsers, and drops the package-manager
+// catalog-refresh hooks.
+func installServices(sshUsers []inst.User) error {
 	files, err := inst.SampleFiles()
 	if err != nil {
 		return err
@@ -44,8 +44,10 @@ func installServices(cfg *daemonconfig.Config) error {
 			// once per detected manager (see installReloadHooks).
 			continue
 		case name == "ssh-agent.service":
-			if err := offerSSHAgentUnits(cfg); err != nil {
-				return err
+			for i := range sshUsers {
+				if err := installSSHAgent(sshUsers[i]); err != nil {
+					return err
+				}
 			}
 		case strings.HasSuffix(name, ".service"):
 			if err := installFile(name, filepath.Join(systemd.SystemdDir, name), 0o644); err != nil {
@@ -157,20 +159,21 @@ func upsertFile(path, label string, data []byte, mode os.FileMode, uid int) erro
 	return nil
 }
 
-// offerSSHAgentUnits installs the per-user ssh-agent unit (~/.config/systemd/user, that user's
-// session) only for a user whose ~/.ssh is guarded by this config, and only after asking (one
-// question per user, naming user and path). Others are skipped silently; root is always skipped (no
-// interactive session); an already-installed matching unit is kept without prompting.
-func offerSSHAgentUnits(cfg *daemonconfig.Config) error {
+// askSSHAgentUsers returns the users to set the ssh-agent up for: non-root users whose ~/.ssh is
+// guarded by cfg, after one question per user (naming user and unit path). A user whose matching
+// unit is already installed is included without asking. Asked before encryption, because the
+// ~/.ssh/config edit must land in the tree that gets migrated.
+func askSSHAgentUsers(cfg *daemonconfig.Config) ([]inst.User, error) {
 	users, err := inst.ListUsers()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sample, err := inst.SampleContent("ssh-agent.service")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	covered := configPaths(cfg)
+	var accepted []inst.User
 	for i := range users {
 		u := users[i]
 		if u.UID == 0 {
@@ -183,29 +186,46 @@ func offerSSHAgentUnits(cfg *daemonconfig.Config) error {
 		unitPath := filepath.Join(u.Home, ".config", "systemd", "user", "ssh-agent.service")
 		if cur, rerr := os.ReadFile(unitPath); rerr == nil && bytes.Equal(cur, sample) {
 			log.Infof("ssh-agent unit for %s already installed — keeping it", u.Name)
+			accepted = append(accepted, u)
 			continue
 		}
 
 		install := true
 		if ferr := huh.NewForm(huh.NewGroup(
 			huh.NewConfirm().
-				Title(fmt.Sprintf("Install the ssh-agent unit for user %s?", u.Name)).
+				Title(fmt.Sprintf("Set up ssh-agent for user %s?", u.Name)).
 				Description(fmt.Sprintf(
 					"%s is guarded, so ssh-agent must run as a known service to keep reading the keys.\n"+
-						"This installs and enables a per-user systemd unit (that user's session only) at:\n    %s",
-					sshDir, unitPath)).
-				Affirmative("Install it").
+						"This will:\n"+
+						"  - install and enable a per-user systemd unit (that user's session only) at %s\n"+
+						"  - add an SSH_AUTH_SOCK block to the user's shell startup file (.zshrc / .bashrc / fish conf.d)\n"+
+						"  - put `AddKeysToAgent yes` at the top of %s so ssh loads a key into the agent on first use\n"+
+						"    (a loaded key can be used through the agent socket by any process of that user)",
+					sshDir, unitPath, filepath.Join(sshDir, "config"))).
+				Affirmative("Set it up").
 				Negative("Skip").
 				Value(&install),
 		)).Run(); ferr != nil {
-			return ferr
+			return nil, ferr
 		}
 		if !install {
-			log.Infof("skipping the ssh-agent unit for %s — start ssh-agent another way, or guarded ~/.ssh access from it will be denied", u.Name)
+			log.Infof("skipping the ssh-agent setup for %s — start ssh-agent another way, or guarded ~/.ssh access from it will be denied", u.Name)
 			continue
 		}
-		if err := installSSHAgent(u); err != nil {
-			return err
+		accepted = append(accepted, u)
+	}
+	return accepted, nil
+}
+
+// addKeysToAgent edits each accepted user's ~/.ssh/config; runs before that ~/.ssh is encrypted.
+func addKeysToAgent(users []inst.User) error {
+	for i := range users {
+		path, changed, err := inst.EnsureAddKeysToAgent(users[i])
+		if err != nil {
+			return fmt.Errorf("setting AddKeysToAgent for %s: %w", users[i].Name, err)
+		}
+		if changed {
+			log.Infof("added AddKeysToAgent yes to %s", path)
 		}
 	}
 	return nil
@@ -241,6 +261,18 @@ func installSSHAgent(u inst.User) error {
 		return err
 	}
 	log.Infof("ssh-agent enabled for %s (relogin or start manually: systemctl --user start ssh-agent)", u.Name)
+	return installSSHAgentEnv(u)
+}
+
+// installSSHAgentEnv points u's shells at the unit's socket; without it git/ssh never see the agent.
+func installSSHAgentEnv(u inst.User) error {
+	files, err := inst.EnsureSSHAgentEnv(u)
+	for _, f := range files {
+		log.Infof("added SSH_AUTH_SOCK to %s (open a new shell to pick it up)", f)
+	}
+	if err != nil {
+		return fmt.Errorf("setting SSH_AUTH_SOCK for %s: %w", u.Name, err)
+	}
 	return nil
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
+	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
@@ -59,6 +60,11 @@ The wizard walks through the whole installation:
      verifies every already-encrypted directory unlocks with the master
      key (a directory encrypted while declared need_encryption: false is
      a fatal error)
+  6a. for every user whose ~/.ssh ends up guarded, asks once (naming the
+     user and paths) whether to set up ssh-agent: unit + shell SSH_AUTH_SOCK
+     block (installed in step 8) and "AddKeysToAgent yes" at the top of
+     ~/.ssh/config (created if missing, an existing AddKeysToAgent is kept),
+     done before encryption so the file is part of the migrated tree
   6b. checks each backing filesystem is fscrypt-ready; for a fixable gap
      (missing 'encrypt' feature flag, no 'fscrypt setup') it shows the
      exact command and its reason and offers to run it now as root —
@@ -80,9 +86,9 @@ The wizard walks through the whole installation:
      boot-time refresh. Already-installed files and an existing config are
      compared with the bundled ones: identical files are left alone,
      differing ones show the diff in the TUI and ask whether to overwrite.
-     For every user whose ~/.ssh ends up guarded it asks (once per user,
-     naming the user and path) whether to install that user's per-user
-     ssh-agent systemd unit — declined or skipped when no ~/.ssh is guarded
+     The per-user ssh-agent systemd unit (and the SSH_AUTH_SOCK block in the
+     user's shell rc file) is installed for the users who accepted it in
+     step 6a
   9. enables the daemon across reboots and ensures it is running, and
      enables app-listener-catalog-refresh.service — a boot-time --live
      catalog refresh that catches package changes made while no hook ran
@@ -180,6 +186,14 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return errors.New("config contains no [watch] sections")
 	}
 
+	sshUsers, err := askSSHAgentUsers(cfg)
+	if err != nil {
+		return err
+	}
+	if keysErr := addKeysToAgent(sshUsers); keysErr != nil {
+		return keysErr
+	}
+
 	vault := fscrypt.New()
 	cfgText, err = secureResources(vault, cfgText, cfg)
 	if err != nil {
@@ -193,7 +207,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := deploy(cfgText, cfg, editPassword); err != nil {
+	if err := deploy(cfgText, sshUsers, editPassword); err != nil {
 		return err
 	}
 
@@ -529,12 +543,12 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 
 // deploy installs services/hook, copies binary+config, enables the daemon. Existing files are
 // diffed: identical stay, differing ones show the diff and ask; a changed config reaches a running
-// daemon via SIGHUP. cfg (parsed) drives the ssh-agent-unit question. editPassword (maybe "") is
+// daemon via SIGHUP. sshUsers (asked before encryption) get the ssh-agent unit. editPassword (maybe "") is
 // persisted via writeEditPasswordHash right before EnableAndVerify's first start on a fresh
 // install: everything that could abort has succeeded and the daemon isn't running, so that first
 // start already self-guards the hash and opens the control socket (no follow-up reload).
-func deploy(cfgText string, cfg *daemonconfig.Config, editPassword string) error {
-	if err := installServices(cfg); err != nil {
+func deploy(cfgText string, sshUsers []inst.User, editPassword string) error {
+	if err := installServices(sshUsers); err != nil {
 		return err
 	}
 	configChanged, err := installConfig(cfgText)

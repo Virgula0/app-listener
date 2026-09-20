@@ -111,34 +111,82 @@ func isInstallerSSHAgentUnit(sample []byte, path string) bool {
 	return bytes.Equal(data, sample)
 }
 
-// revertSSHAgents reverts the installer's per-user ssh-agent units: one TUI confirmation (default
-// no) precedes removing every detected unit and its default.target.wants symlink.
+// revertSSHAgents reverts the installer's per-user ssh-agent setup: one TUI confirmation (default
+// no) precedes removing every detected unit, its default.target.wants symlink and the shell-rc
+// SSH_AUTH_SOCK block. Blocks left for a user with no unit at all are dangling and go too.
 func revertSSHAgents() error {
 	units, err := detectSSHAgentUnits()
 	if err != nil {
 		return err
 	}
-	if len(units) == 0 {
-		log.Info("no installer-provided ssh-agent units found")
-		return nil
-	}
-
-	ok, err := wizard.ConfirmOnce(
-		fmt.Sprintf("Remove the per-user ssh-agent units installed by the installer for %d user(s)?", len(units)),
-		"Remove units")
+	users, err := inst.ListUsers()
 	if err != nil {
 		return err
 	}
-	if !ok {
-		log.Info("ssh-agent units kept")
-		return nil
+	removing := map[string]bool{}
+	for _, u := range units {
+		removing[u.User.Name] = true
+	}
+	stale := staleRCUsers(users, removing)
+	if len(units) > 0 {
+		ok, err := wizard.ConfirmOnce(
+			fmt.Sprintf("Remove the per-user ssh-agent units and shell SSH_AUTH_SOCK lines installed by the installer for %d user(s)?", len(units)),
+			"Remove units")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			log.Info("ssh-agent units kept")
+			return nil
+		}
 	}
 	for _, u := range units {
 		if err := removeSSHAgentUnit(u); err != nil {
 			return err
 		}
 	}
+	for i := range users {
+		if removing[users[i].Name] || stale[users[i].Name] {
+			if err := removeSSHAgentEnv(users[i]); err != nil {
+				return err
+			}
+		}
+	}
+	if len(units) == 0 {
+		log.Info("no installer-provided ssh-agent units found")
+		return nil
+	}
 	log.Infof("reverted %d ssh-agent unit(s)", len(units))
+	return nil
+}
+
+// staleRCUsers returns the non-root users with no ssh-agent unit file at all and not being
+// removed now: any SSH_AUTH_SOCK block of ours in their shell rc points at nothing. A user with a
+// custom (non-sample) unit is excluded — the block may still serve it.
+func staleRCUsers(users []inst.User, removing map[string]bool) map[string]bool {
+	stale := map[string]bool{}
+	for i := range users {
+		u := users[i]
+		if u.UID == 0 || removing[u.Name] {
+			continue
+		}
+		unit := filepath.Join(u.Home, ".config", "systemd", "user", "ssh-agent.service")
+		if _, err := os.Lstat(unit); os.IsNotExist(err) {
+			stale[u.Name] = true
+		}
+	}
+	return stale
+}
+
+// removeSSHAgentEnv strips the installer's SSH_AUTH_SOCK block from u's shell startup files.
+func removeSSHAgentEnv(u inst.User) error {
+	files, err := inst.RemoveSSHAgentEnv(u)
+	for _, f := range files {
+		log.Infof("removed SSH_AUTH_SOCK block from %s", f)
+	}
+	if err != nil {
+		return fmt.Errorf("reverting SSH_AUTH_SOCK for %s: %w", u.Name, err)
+	}
 	return nil
 }
 

@@ -56,7 +56,8 @@ The wizard reverts everything the installer installed:
      refresh), the pacman/apt catalog-refresh hook, binary, PATH symlink
      and config, and — after a final confirmation (default: no) and only
      for units whose content matches the bundled sample — the per-user
-     ssh-agent systemd units
+     ssh-agent systemd units and the SSH_AUTH_SOCK / AddKeysToAgent blocks
+     the installer added to the users' shell startup files and ~/.ssh/config
   6. deletes the fscrypt master key ONLY when --delete-key is passed; the
      default keeps it, because without it every still-encrypted directory
      can never be unlocked again

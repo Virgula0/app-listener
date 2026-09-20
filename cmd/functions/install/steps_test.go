@@ -13,16 +13,17 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
-// TestOfferSSHAgentUnitsNoGuardedSSH: when no user's ~/.ssh is in the
+// TestAskSSHAgentUsersNoGuardedSSH: when no user's ~/.ssh is in the
 // config, the ssh-agent step is a silent no-op — no prompt, no error.
-func TestOfferSSHAgentUnitsNoGuardedSSH(t *testing.T) {
+func TestAskSSHAgentUsersNoGuardedSSH(t *testing.T) {
 	cfgText := "[watch]\npath = " + t.TempDir() + "\nneed_encryption: false\n"
 	cfg, err := validateConfigText(cfgText)
 	if err != nil {
 		t.Fatalf("parsing config: %v", err)
 	}
-	if err := offerSSHAgentUnits(cfg); err != nil {
-		t.Errorf("offerSSHAgentUnits must be a no-op when no ~/.ssh is guarded: %v", err)
+	users, err := askSSHAgentUsers(cfg)
+	if err != nil || len(users) != 0 {
+		t.Errorf("askSSHAgentUsers must be a no-op when no ~/.ssh is guarded: users=%v err=%v", users, err)
 	}
 }
 

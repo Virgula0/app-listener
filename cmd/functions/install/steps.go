@@ -22,8 +22,8 @@ import (
 )
 
 // pickUsers asks which local users to protect. All (root included) are preselected. The per-user
-// ssh-agent unit is offered later, only for a user whose ~/.ssh ends up guarded
-// (offerSSHAgentUnits).
+// ssh-agent setup is asked afterwards, only for a user whose ~/.ssh ends up guarded
+// (askSSHAgentUsers).
 func pickUsers() ([]inst.User, error) {
 	users, err := inst.ListUsers()
 	if err != nil {

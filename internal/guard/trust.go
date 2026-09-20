@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -13,6 +14,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/logging"
 )
 
 // guard_trusted_files value flags — must match guard_trust.bpf.c.
@@ -185,16 +187,24 @@ func (t *TrustGuard) readLoop() {
 		if err := binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, &ev); err != nil {
 			continue
 		}
+		comm, path := logging.SanitizeText(cStr(ev.Comm[:])), logging.SanitizeText(cStr(ev.Path[:]))
 		switch ev.Kind {
 		case trustWriteblock:
-			log.Warnf("TRUST DENIED  op=WRITE  comm=%s  pid=%d  uid=%d  path=%s — a non-whitelisted process "+
-				"tried to modify a protected binary", cStr(ev.Comm[:]), ev.PID, ev.UID, cStr(ev.Path[:]))
+			logTrustDenied("WRITE", comm, ev.PID, ev.UID, path,
+				"a non-whitelisted process tried to modify a protected binary")
 		default:
-			log.Warnf("TRUST DENIED  op=LIBLOAD  comm=%s  pid=%d  uid=%d  path=%s — a whitelisted binary tried to "+
-				"exec-map an untrusted file (not root-owned, not in a guarded tree, not allow_lib)",
-				cStr(ev.Comm[:]), ev.PID, ev.UID, cStr(ev.Path[:]))
+			logTrustDenied("LIBLOAD", comm, ev.PID, ev.UID, path,
+				"a whitelisted binary tried to exec-map an untrusted file "+
+					"(not root-owned, not in a guarded tree, not allow_lib)")
 		}
 	}
+}
+
+// logTrustDenied prints a denial with the syslog <4> (warning) marker so journald colors it
+// yellow like DAEMON DENIED. Callers must pass sanitized comm/path (event-controlled).
+func logTrustDenied(op, comm string, pid, uid uint32, path, reason string) {
+	fmt.Fprintf(os.Stderr, "<4>TRUST DENIED  op=%s  comm=%s  pid=%d  uid=%d  path=%s — %s\n",
+		op, comm, pid, uid, path, reason)
 }
 
 // Stop detaches the trust programs and stops the reader. Safe to call once.
