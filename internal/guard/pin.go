@@ -227,3 +227,14 @@ func foreignPinnedLink(l link.Link) string {
 	}
 	return ""
 }
+
+// SharedPinPrefix is where the one shared set of LSM links and the shared whitelist maps are
+// pinned for a generation. The programs are attached once for every resource (see engine), so
+// their pins are per generation, not per resource; PinPrefix still gives each resource its own
+// prefix for the small per-resource pins. Both carry the generation field CleanupStalePins retires.
+func SharedPinPrefix(base, generation string) string {
+	if base == "" {
+		return "" // pinning disabled on this host
+	}
+	return filepath.Join(base, pinFilePrefix+sanitizeGen(generation)+"-shared-")
+}

@@ -614,17 +614,20 @@ func (s *guardUnitTest) TestPopulateInodesFillsMap() {
 	defer g.Stop()
 
 	for _, p := range nodes {
-		var v uint8
-		s.Require().Truef(g.objs.GuardInodes.Lookup(keys[p], &v) == nil,
+		var v uint32
+		s.Require().Truef(g.objs().GuardInodes.Lookup(keys[p], &v) == nil,
 			"inode of %s missing from guard_inodes", p)
 	}
 
 	count := 0
-	it := g.objs.GuardInodes.Iterate()
+	it := g.objs().GuardInodes.Iterate()
 	var k GuardInodeKey
-	var v uint8
+	var v uint32
 	for it.Next(&k, &v) {
-		count++
+		// guard_inodes is shared by every resource; count only this guard's rows.
+		if v == g.resID {
+			count++
+		}
 	}
 	s.Require().Equal(len(nodes), count, "guard_inodes must contain exactly the tree nodes")
 }
@@ -654,8 +657,8 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	inMap := func(path string) bool {
 		dev, ino, err := ebpf.StatInode(path)
 		s.Require().NoError(err)
-		var v uint8
-		return g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
+		var v uint32
+		return g.objs().GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
 	}
 	s.Require().True(inMap(fileRoot), "the file root must be mapped at build")
 
@@ -677,25 +680,25 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	s.Require().True(inMap(fileRoot), "SweepInodes must map the recreated file root")
 
 	// Regression for the false-DENY-on-unrelated-files / silently-unguarded-real-file bug:
-	// SweepInodes must move BOTH the kernel root-confinement anchor (guard_config[3..4],
+	// SweepInodes must move BOTH the kernel root-confinement anchor (the resource slot,
 	// root_in_chain) and g.rootKey to the new inode and evict the old one from guard_inodes.
 	// Otherwise the old freed number stays "protected" forever (ReconcileInodes won't evict
 	// g.rootKey) and, once the filesystem gives it to an unrelated file elsewhere, that file is
 	// denied under this whitelist by coincidence while the real recreated file silently loses
 	// protection (its chain no longer contains the stale root).
-	var gotDev, gotIno uint64
-	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
-	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
-	s.Require().Equal(newIno, gotIno, "guard_config root ino must follow the recreated file")
+	cfg, cfgErr := g.resConfig()
+	s.Require().NoError(cfgErr)
+	gotDev, gotIno := cfg.RootDev, cfg.RootIno
+	s.Require().Equal(newIno, gotIno, "the resource slot's root ino must follow the recreated file")
 
 	g.mu.Lock()
 	gotRootKey := g.rootKey
 	g.mu.Unlock()
-	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match guard_config")
+	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match the resource slot")
 
-	var v uint8
+	var v uint32
 	oldKey := GuardInodeKey{Dev: gotDev, Ino: oldIno}
-	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
+	s.Require().Error(g.objs().GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
 // Directory-root counterpart of TestSweepInodesRecreatedFileRoot (same bug class: stale anchor ->
@@ -725,8 +728,8 @@ func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	inMap := func(path string) bool {
 		dev, ino, err := ebpf.StatInode(path)
 		s.Require().NoError(err)
-		var v uint8
-		return g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
+		var v uint32
+		return g.objs().GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
 	}
 	s.Require().True(inMap(watchDir), "the directory root must be mapped at build")
 
@@ -749,23 +752,23 @@ func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	s.Require().True(inMap(newFile), "SweepInodes must map the recreated directory's new content")
 
 	// Same coverage as TestSweepInodesRecreatedFileRoot: the root-confinement anchor
-	// (guard_config[3..4]) and g.rootKey must move to the new inode and the old one be evicted from
+	// (the resource slot) and g.rootKey must move to the new inode and the old one be evicted from
 	// guard_inodes, else it stays "protected" forever and, once reused by an unrelated
 	// file/directory elsewhere, that gets denied by inode-number coincidence while the real
 	// recreated directory silently loses protection.
-	var gotDev, gotIno uint64
-	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
-	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
-	s.Require().Equal(newIno, gotIno, "guard_config root ino must follow the recreated directory")
+	cfg, cfgErr := g.resConfig()
+	s.Require().NoError(cfgErr)
+	gotDev, gotIno := cfg.RootDev, cfg.RootIno
+	s.Require().Equal(newIno, gotIno, "the resource slot's root ino must follow the recreated directory")
 
 	g.mu.Lock()
 	gotRootKey := g.rootKey
 	g.mu.Unlock()
-	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match guard_config")
+	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match the resource slot")
 
-	var v uint8
+	var v uint32
 	oldKey := GuardInodeKey{Dev: gotDev, Ino: oldIno}
-	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
+	s.Require().Error(g.objs().GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
 // The guard_path_rmdir eviction fix is tested at guard level
@@ -862,18 +865,18 @@ func (s *guardUnitTest) TestReconcileInodesEvictsStale() {
 	s.Require().NoError(err)
 	staleKey := GuardInodeKey{Dev: dev, Ino: ino}
 
-	var v uint8
-	s.Require().NoError(g.objs.GuardInodes.Lookup(staleKey, &v), "the file must be mapped at build")
+	var v uint32
+	s.Require().NoError(g.objs().GuardInodes.Lookup(staleKey, &v), "the file must be mapped at build")
 
 	s.Require().NoError(os.Remove(stale))
 	s.Require().NoError(g.ReconcileInodes())
 
-	s.Require().Error(g.objs.GuardInodes.Lookup(staleKey, &v),
+	s.Require().Error(g.objs().GuardInodes.Lookup(staleKey, &v),
 		"the deleted file's stale inode entry must be evicted")
 
 	rootDev, rootIno, err := ebpf.StatInode(root)
 	s.Require().NoError(err)
-	s.Require().NoError(g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: rootDev, Ino: rootIno}, &v),
+	s.Require().NoError(g.objs().GuardInodes.Lookup(GuardInodeKey{Dev: rootDev, Ino: rootIno}, &v),
 		"ReconcileInodes must never evict the watch root's own entry")
 }
 

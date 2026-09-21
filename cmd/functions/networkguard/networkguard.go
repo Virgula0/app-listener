@@ -76,7 +76,8 @@ func init() {
 	NetworkGuardCmd.Flags().StringSliceVarP(&whitelistPaths, "whitelist", "w", nil,
 		"Binary paths to whitelist (allow AF_INET/AF_INET6, block everything else)")
 	NetworkGuardCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
-		"Event types to intercept (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all)")
+		"Event types to REPORT (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all). "+
+			"Display filter only — enforcement always covers every operation regardless of this set")
 	NetworkGuardCmd.Flags().BoolVarP(&headless, "headless", "", false,
 		"Run without TUI, print events to stderr (for testing/scripting)")
 	NetworkGuardCmd.Flags().BoolVarP(&unsafeFlag, "unsafe", "", false,

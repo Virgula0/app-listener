@@ -385,6 +385,28 @@ func (s *IntegrationSuite) TestNetworkGuard_EventFilter() {
 	s.stopNetGuard(c)
 }
 
+// TestNetworkGuard_EventFilter_StillEnforces pins that -e selects what is REPORTED, never what is
+// enforced. Every hook currently returns 0 (an LSM allow) when the event type is not in the filter,
+// BEFORE consulting the whitelist, so an operator narrowing the display silently unblocks every
+// omitted operation.
+//
+// sendto(2) on an unconnected UDP socket never calls security_socket_connect, only
+// security_socket_sendmsg: with `-e CONNECT` that hook bails at the filter and a non-whitelisted
+// binary gets full outbound UDP while the operator believes only CONNECT is permitted.
+func (s *IntegrationSuite) TestNetworkGuard_EventFilter_StillEnforces() {
+	c := s.newNetGuardContainer([]string{"/other_tester"})
+	// pooled: terminated at suite end
+
+	s.startNetworkGuardStd(c, "-w", guardBinaryFlag("/net_tester"), "-e", "CONNECT")
+
+	code, out := s.exec(c, []string{"sh", "-c", "/other_tester udp-sendto 127.0.0.1 9099"})
+	s.Require().NotEqualf(0, code,
+		"non-whitelisted binary exfiltrated over unconnected UDP in whitelist mode because SEND "+
+			"was outside -e: the display filter must not disable enforcement: %s", out)
+
+	s.stopNetGuard(c)
+}
+
 func (s *IntegrationSuite) TestNetworkGuard_AutoInfra() {
 	c := s.newNetGuardContainer(nil)
 	// pooled: terminated at suite end

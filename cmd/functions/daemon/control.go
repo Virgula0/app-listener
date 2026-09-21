@@ -103,6 +103,14 @@ func newControlManager(uc usecase.DaemonUseCase) *controlManager {
 	return &controlManager{uc: uc}
 }
 
+// startControlManager creates the control manager and immediately reconciles the socket with the
+// current password state.
+func startControlManager(uc usecase.DaemonUseCase) *controlManager {
+	m := newControlManager(uc)
+	m.refresh()
+	return m
+}
+
 // refresh brings the control socket in line with whether a password is
 // configured: start it if it should run and does not, stop it otherwise.
 func (m *controlManager) refresh() {

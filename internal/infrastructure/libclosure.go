@@ -10,7 +10,42 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
+
+	log "github.com/sirupsen/logrus"
 )
+
+// rootOwnedSafe reports why path is not safe to auto-trust as a system library, or nil when it is:
+// the file AND its parent directory must be owned by root (uid 0) and not writable by group (unless
+// the group is root) or other. A user-writable parent lets its owner replace even a root-owned file
+// by unlink+create, so both levels are checked — the same rule as guard_trust.bpf.c's
+// is_system_trusted. Symlinks are resolved by the caller (resolveSoname), so path is a real file.
+func rootOwnedSafe(path string) error {
+	if err := rootOwnedInode(path); err != nil {
+		return err
+	}
+	if err := rootOwnedInode(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("parent %s", err)
+	}
+	return nil
+}
+
+func rootOwnedInode(path string) error {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return fmt.Errorf("cannot stat %s: %w", path, err)
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("%s is not root-owned (uid %d)", path, st.Uid)
+	}
+	if st.Mode&syscall.S_IWOTH != 0 {
+		return fmt.Errorf("%s is world-writable", path)
+	}
+	if st.Mode&syscall.S_IWGRP != 0 && st.Gid != 0 {
+		return fmt.Errorf("%s is group-writable by non-root gid %d", path, st.Gid)
+	}
+	return nil
+}
 
 // ResolveLibraryClosure returns the absolute paths of every shared object a dynamically linked
 // binary loads at startup, by STATIC analysis only: the program interpreter (ld-linux*.so) plus the
@@ -49,8 +84,18 @@ func ResolveLibraryClosure(binaryPath string) ([]string, error) {
 	visited := make(map[string]bool)
 	walkNeeded(binaryPath, f, out, visited)
 
+	// Trust only root-owned, non-user-writable libraries. The resolved set is fed to the daemon-wide
+	// TRUSTED_LIB map, an unconditional pass in trust_mmap, so a library reachable through the
+	// binary's own RPATH/$ORIGIN under a user-writable directory (many catalog apps live in $HOME and
+	// ship RUNPATH=$ORIGIN) would otherwise let same-user malware plant an LD_PRELOAD payload that
+	// gets trusted into every whitelisted process. This mirrors the kernel's is_system_trusted
+	// auto-trust rule; a legitimate non-root library must be listed via allow_lib after review.
 	paths := make([]string, 0, len(out))
 	for p := range out {
+		if err := rootOwnedSafe(p); err != nil {
+			log.Warnf("library closure: not trusting %s (%v) — add it via allow_lib if a load is denied", p, err)
+			continue
+		}
 		paths = append(paths, p)
 	}
 	return paths, nil

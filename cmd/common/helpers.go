@@ -88,8 +88,16 @@ func validateEnabledServe(cmd *cobra.Command, config ServeConfig) error {
 	if requestedBoolFlag(cmd, "no-log-metadata-blocks") {
 		return errors.New("--no-log-metadata-blocks is only available with --headless")
 	}
+	// Credentials are mandatory: the browser TUI mirrors the root daemon's live event stream
+	// (guarded paths, comms, PIDs, peers) over a loopback TCP socket, which carries no OS-level uid
+	// restriction, so any local user could otherwise connect with a non-browser WebSocket client
+	// (the Origin/Host checks only constrain browsers) and read it. Require --user/--password.
 	credentialsSet, mixedCredentials := credentialFlagState(cmd)
-	if credentialsSet && (mixedCredentials || config.Username == "" || config.Password == "") {
+	if !credentialsSet {
+		return errors.New("--serve requires --user and --password: the browser TUI exposes the daemon's " +
+			"event stream to any local user without them")
+	}
+	if mixedCredentials || config.Username == "" || config.Password == "" {
 		return errors.New("--user and --password must be non-empty and specified together")
 	}
 	if err := validateServeAddress(config.Address); err != nil {

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -658,7 +660,13 @@ func (m *fileEditModel) createEntry() {
 	var err error
 	switch m.inputKind {
 	case createFile:
-		err = os.WriteFile(target, nil, 0o600)
+		// O_EXCL|O_NOFOLLOW: os.WriteFile follows an existing symlink at target and would truncate
+		// the link's victim; refuse instead. The editor runs as root over a user-owned tree.
+		var fd int
+		fd, err = unix.Open(target, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+		if err == nil {
+			err = unix.Close(fd)
+		}
 	case createDir:
 		err = os.Mkdir(target, 0o750)
 	}
@@ -744,12 +752,23 @@ func (m *fileEditModel) applyChmod() {
 		m.status = "invalid mode: must not exceed 07777"
 		return
 	}
+	// Re-validate at apply time with O_NOFOLLOW: beginChmod's Lstat check is seconds stale, and
+	// os.Chmod by path follows a symlink, so a swap in that window would chmod an arbitrary file.
 	// The value is a unix mode: convert via the converter, or setuid/setgid/sticky are lost (a raw
 	// os.FileMode cast maps them onto bits chmod ignores).
-	if err := os.Chmod(m.chmodPath, unixModeToFileMode(uint32(perm))); err != nil {
+	fd, err := unix.Open(m.chmodPath, unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_PATH, 0)
+	if err != nil {
 		m.status = err.Error()
 		return
 	}
+	// O_PATH descriptors can't fchmod directly; chmod via /proc/self/fd resolves the pinned inode
+	// without re-walking the (swappable) path.
+	if err := os.Chmod(fmt.Sprintf("/proc/self/fd/%d", fd), unixModeToFileMode(uint32(perm))); err != nil {
+		_ = unix.Close(fd)
+		m.status = err.Error()
+		return
+	}
+	_ = unix.Close(fd)
 	m.status = "chmod " + m.chmodPath + " = " + v
 }
 

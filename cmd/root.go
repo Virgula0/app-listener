@@ -15,6 +15,7 @@ import (
 	"github.com/Virgula0/app-listener/cmd/functions/update"
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/logging"
+	"github.com/Virgula0/app-listener/internal/safeio"
 	"github.com/Virgula0/app-listener/internal/wizard"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -175,7 +176,15 @@ func setupDumpLog(cmd *cobra.Command) error {
 		return nil
 	}
 
-	if _, err := os.Stat(dumpLogFile); err == nil {
+	// Lstat, not Stat: setupDumpLog runs as root in PersistentPreRunE (before the daemon's
+	// self-guards attach), so a symlink planted at an operator-chosen path in a user-writable dir
+	// must never be followed — a symlink whose target does not exist yet would slip past a Stat-based
+	// existence check and have root create the target, and one pointing at an existing file would
+	// truncate it. Refuse any symlink outright; the open below adds O_NOFOLLOW for the race.
+	if lst, err := os.Lstat(dumpLogFile); err == nil {
+		if lst.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to use a symlink as the --dump-log target: %s", dumpLogFile)
+		}
 		if headlessRequested(cmd) {
 			return fmt.Errorf("refusing to overwrite existing dump file %s under --headless: remove it first", dumpLogFile)
 		}
@@ -190,7 +199,7 @@ func setupDumpLog(cmd *cobra.Command) error {
 		return fmt.Errorf("checking dump file %s: %w", dumpLogFile, err)
 	}
 
-	f, err := os.OpenFile(dumpLogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := safeio.OpenRegularNoFollow(dumpLogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("opening dump file %s: %w", dumpLogFile, err)
 	}

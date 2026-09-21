@@ -78,6 +78,60 @@ generated files and `internal/bpf/vmlinux.h` are gitignored — regenerate, don'
 `internal/constants.Version` is overwritten at release time via `-ldflags -X`; leave the
 `dev` default in the source.
 
+## The verifier complexity budget — read before touching any `*.bpf.c`
+
+`BPF program is too large. Processed 1000001 insn` (reported as `E2BIG`, "argument list
+too long") is the single most common way a BPF change fails here. It is **not** memory
+and **not** program size. `BPF_COMPLEXITY_LIMIT_INSNS` (1,000,000, `kernel/bpf/verifier.c`)
+caps how many instruction-steps the *verifier* walks while proving the program safe. It
+exists because the verifier runs in-kernel inside the `bpf()` syscall: without a cap, a
+program could hang the kernel.
+
+**Why a 2k-instruction program costs ~1M steps.** The verifier symbolically executes
+*every path*, tracking each register's state. Every `if`, and every
+`bpf_map_lookup_elem` (returns NULL-or-valid = a branch), multiplies the paths after it;
+a fixed-bound `for` is unrolled, and each copy branches again. `guard_path_rename` is
+~2,253 real instructions and costs **959,231 processed** — a ~400x amplification, i.e.
+96% of budget with nothing to spare. The guard hooks walk dentry chains with a map
+lookup per step, and `path_rename`/`path_link` run those walks four times, so they are
+always the first to blow.
+
+**Why unrelated-looking edits break it.** The verifier prunes: reaching an instruction
+in a state it already proved safe from stops re-exploration. Pruning is heuristic and
+brittle — make two states differ in any tracked detail and a whole subtree is re-walked.
+Two calls with *identical* arguments prune; threading a differing argument through them
+does not, which can add 200k+ steps while the code grows 1%. Same reason clang 14 and
+clang 22 disagree on the same source (issue #45): different instruction order, different
+pruning.
+
+**Measure, never guess.** Code size does not predict verifier cost (a 22%-smaller object
+still blew the budget). `tools/bpfstats` loads each program separately and prints the
+real `processed N insns`, and diffs two objects per program:
+
+```sh
+sudo ./build/bpfstats new.o base.o   # go build -o build/bpfstats ./tools/bpfstats/
+```
+
+Keep a pre-change `.o` to diff against; `make build` regenerates over the old one.
+
+**Rules of thumb**
+- Budget before adding: `path_rename` and `path_link` have almost none. Check with
+  `bpfstats` *first*.
+- Don't carry extra live state through a bounded walk; decide it once after the loop.
+- Keep repeated helper calls argument-identical so they prune, or restructure so the
+  expensive walk is expanded once.
+- `__always_inline` duplicates the body per call site. `static __noinline` makes it one
+  BPF-to-BPF call but each frame takes its own stack (512 B total across the chain), and
+  it can make pruning *worse* — it cut `path_link` by 55k while adding 209k to
+  `path_unlink`, and hit `stack depth 152+96+104+48`. Measure both ways.
+- Shrinking a map's value type helps: it is copied at every walk step.
+- The structural fix for an unrolled walk is `bpf_loop()` (kernel 5.17+): the callback is
+  verified **once** instead of per unrolled iteration. Prefer it over shaving bounds,
+  which trades traversal coverage for headroom.
+- `daemon --check` is the gate: it loads every guard program into this kernel's verifier.
+  Rootless Docker **cannot** load BPF at all (capabilities do not cross the user
+  namespace), so verifier work needs host root or rootful Docker.
+
 ## Test
 
 - `make test` → `CGO_ENABLED=1 go test $(go list ./... | grep -v /integrationtests) --count=1 -p 1`.

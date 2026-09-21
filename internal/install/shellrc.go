@@ -11,6 +11,9 @@ import (
 	"syscall"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
+
+	"github.com/Virgula0/app-listener/internal/safeio"
 )
 
 const (
@@ -125,7 +128,7 @@ func ensureRCBlock(t rcTarget, u User) (bool, error) {
 		if !t.Create {
 			return false, nil
 		}
-		f, err = createOwned(t.Path, u.UID, u.GID, t.Mode)
+		f, err = createOwned(u.Home, t.Path, u.UID, u.GID, t.Mode)
 	}
 	if err != nil {
 		return false, err
@@ -256,31 +259,31 @@ func openOwnedRegular(path string, uid uint32) (*os.File, error) {
 	return f, nil
 }
 
-func createOwned(path string, uid, gid uint32, mode os.FileMode) (*os.File, error) {
-	if err := mkdirAllOwned(filepath.Dir(path), uid, gid); err != nil {
-		return nil, err
+// createOwned creates path (owned by uid/gid, missing parents made 0755) as root inside the user's
+// home. The descent is symlink-safe: home is the trusted anchor, and every component below it is
+// opened O_NOFOLLOW, so a parent directory the user has replaced with a symlink (e.g.
+// ~/.config/fish/conf.d -> /etc/systemd/system) is refused instead of letting root create and chown
+// a file outside the home. The final component is created O_EXCL|O_NOFOLLOW.
+func createOwned(home, path string, uid, gid uint32, mode os.FileMode) (*os.File, error) {
+	rel, err := filepath.Rel(home, filepath.Clean(path))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return nil, fmt.Errorf("%s is not inside %s", path, home)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode)
+	comps := strings.Split(rel, string(os.PathSeparator))
+
+	dirfd, err := unix.Open(home, unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening %s: %w", home, err)
+	}
+	defer func() {
+		if dirfd >= 0 {
+			_ = unix.Close(dirfd)
+		}
+	}()
+
+	dirfd, err = safeio.DescendCreateOwned(dirfd, comps[:len(comps)-1], int(uid), int(gid))
 	if err != nil {
 		return nil, err
 	}
-	if err := f.Chown(int(uid), int(gid)); err != nil {
-		f.Close()
-		_ = os.Remove(path)
-		return nil, err
-	}
-	return f, nil
-}
-
-func mkdirAllOwned(dir string, uid, gid uint32) error {
-	if _, err := os.Stat(dir); err == nil {
-		return nil
-	}
-	if err := mkdirAllOwned(filepath.Dir(dir), uid, gid); err != nil {
-		return err
-	}
-	if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
-		return err
-	}
-	return os.Lchown(dir, int(uid), int(gid))
+	return safeio.CreateExclNoFollow(dirfd, comps[len(comps)-1], mode, int(uid), int(gid))
 }

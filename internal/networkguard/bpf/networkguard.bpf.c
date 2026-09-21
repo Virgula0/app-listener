@@ -267,9 +267,8 @@ int guard_net_socket_connect(unsigned long long *ctx)
 		return 0;
 
 	__u32 type = NET_CONNECT;
-	if (!is_event_type_allowed(type))
-		return 0;
-
+	// The -e event filter is presentation only: it must gate what is REPORTED, never whether the
+	// operation is enforced. Run the watch/allow decision unconditionally; filter emit_event below.
 	int action = check_watched();
 	if (action == WATCH_NONE)
 		return 0;
@@ -312,7 +311,8 @@ int guard_net_socket_connect(unsigned long long *ctx)
 	int addrlen = (int)(long)ctx[2];
 	read_inet_addr(addr, addrlen, &e.af, e.daddr, &e.dport);
 
-	emit_event(&e);
+	if (is_event_type_allowed(type))
+		emit_event(&e);
 	if (action == WATCH_BLOCK && should_block())
 		return -EPERM;
 	return 0;
@@ -329,9 +329,8 @@ int guard_net_socket_bind(unsigned long long *ctx)
 		return 0;
 
 	__u32 type = NET_BIND;
-	if (!is_event_type_allowed(type))
-		return 0;
-
+	// The -e event filter is presentation only: it must gate what is REPORTED, never whether the
+	// operation is enforced. Run the watch/allow decision unconditionally; filter emit_event below.
 	int action = check_watched();
 	if (action == WATCH_NONE)
 		return 0;
@@ -374,7 +373,8 @@ int guard_net_socket_bind(unsigned long long *ctx)
 	int addrlen = (int)(long)ctx[2];
 	read_inet_addr(addr, addrlen, &e.af, e.saddr, &e.sport);
 
-	emit_event(&e);
+	if (is_event_type_allowed(type))
+		emit_event(&e);
 	if (action == WATCH_BLOCK && should_block())
 		return -EPERM;
 	return 0;
@@ -391,9 +391,8 @@ int guard_net_socket_listen(unsigned long long *ctx)
 		return 0;
 
 	__u32 type = NET_LISTEN;
-	if (!is_event_type_allowed(type))
-		return 0;
-
+	// The -e event filter is presentation only: it must gate what is REPORTED, never whether the
+	// operation is enforced. Run the watch/allow decision unconditionally; filter emit_event below.
 	int action = check_watched();
 	if (action == WATCH_NONE)
 		return 0;
@@ -433,7 +432,8 @@ int guard_net_socket_listen(unsigned long long *ctx)
 		}
 	}
 
-	emit_event(&e);
+	if (is_event_type_allowed(type))
+		emit_event(&e);
 	if (action == WATCH_BLOCK && should_block())
 		return -EPERM;
 	return 0;
@@ -466,9 +466,8 @@ int guard_net_socket_sendmsg(unsigned long long *ctx)
 		type = NET_SEND;
 	}
 
-	if (!is_event_type_allowed(type))
-		return 0;
-
+	// The -e event filter is presentation only: it must gate what is REPORTED, never whether the
+	// operation is enforced. Run the watch/allow decision unconditionally; filter emit_event below.
 	int action = check_watched();
 	if (action == WATCH_NONE)
 		return 0;
@@ -516,7 +515,8 @@ int guard_net_socket_sendmsg(unsigned long long *ctx)
 		}
 	}
 
-	emit_event(&e);
+	if (is_event_type_allowed(type))
+		emit_event(&e);
 	if (action == WATCH_BLOCK && should_block())
 		return -EPERM;
 	return 0;
@@ -533,9 +533,8 @@ int guard_net_socket_recvmsg(unsigned long long *ctx)
 		return 0;
 
 	__u32 type = NET_RECV;
-	if (!is_event_type_allowed(type))
-		return 0;
-
+	// The -e event filter is presentation only: it must gate what is REPORTED, never whether the
+	// operation is enforced. Run the watch/allow decision unconditionally; filter emit_event below.
 	int action = check_watched();
 	if (action == WATCH_NONE)
 		return 0;
@@ -574,7 +573,8 @@ int guard_net_socket_recvmsg(unsigned long long *ctx)
 		}
 	}
 
-	emit_event(&e);
+	if (is_event_type_allowed(type))
+		emit_event(&e);
 	if (action == WATCH_BLOCK && should_block())
 		return -EPERM;
 	return 0;

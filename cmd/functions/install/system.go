@@ -2,16 +2,20 @@ package install
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/safeio"
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
@@ -239,29 +243,133 @@ func installSSHAgent(u inst.User) error {
 		log.Debugf("skipping ssh-agent unit for root (no interactive user session)")
 		return nil
 	}
-	unitDir := filepath.Join(u.Home, ".config", "systemd", "user")
-	unitPath := filepath.Join(unitDir, "ssh-agent.service")
+	unitPath := filepath.Join(u.Home, ".config", "systemd", "user", "ssh-agent.service")
 	data, err := inst.SampleContent("ssh-agent.service")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(unitDir, 0o755); err != nil {
-		return err
+
+	// Symlink-safe: root writes into the user's home, so the whole ~/.config/systemd/user chain is
+	// resolved O_NOFOLLOW anchored at home. A parent the user has swapped for a symlink (e.g. `user`
+	// -> /etc/systemd/system) is refused, instead of root creating and chowning a unit outside the
+	// home and systemd later running it as root.
+	homeFD, err := unix.Open(u.Home, unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", u.Home, err)
 	}
-	if err := upsertFile(unitPath, fmt.Sprintf("ssh-agent unit for %s", u.Name), data, 0o600, int(u.UID)); err != nil {
-		return err
+	defer unix.Close(homeFD)
+	unitDirFD, err := safeio.DescendCreateOwned(homeFD, []string{".config", "systemd", "user"}, int(u.UID), int(u.GID))
+	if err != nil {
+		return fmt.Errorf("resolving the ssh-agent unit dir for %s: %w", u.Name, err)
 	}
-	wantsDir := filepath.Join(unitDir, "default.target.wants")
-	if err := os.MkdirAll(wantsDir, 0o755); err != nil {
-		return err
+	defer unix.Close(unitDirFD)
+
+	if uErr := upsertUnitAt(unitDirFD, "ssh-agent.service", fmt.Sprintf("ssh-agent unit for %s", u.Name),
+		data, 0o600, int(u.UID), int(u.GID)); uErr != nil {
+		return uErr
 	}
-	// Equivalent of `systemctl --user enable ssh-agent` without requiring
-	// the user's session bus: a symlink in default.target.wants.
-	if err := os.Symlink(unitPath, filepath.Join(wantsDir, "ssh-agent.service")); err != nil && !os.IsExist(err) {
-		return err
+
+	// Equivalent of `systemctl --user enable ssh-agent` without the user's session bus: a symlink in
+	// default.target.wants, created relative to the no-follow-resolved unit dir fd.
+	wantsFD, err := safeio.DescendCreateOwned(dupFD(unitDirFD), []string{"default.target.wants"}, int(u.UID), int(u.GID))
+	if err != nil {
+		return fmt.Errorf("resolving default.target.wants for %s: %w", u.Name, err)
+	}
+	defer unix.Close(wantsFD)
+	if err := unix.Symlinkat(unitPath, wantsFD, "ssh-agent.service"); err != nil && !errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("enabling ssh-agent for %s: %w", u.Name, err)
 	}
 	log.Infof("ssh-agent enabled for %s (relogin or start manually: systemctl --user start ssh-agent)", u.Name)
 	return installSSHAgentEnv(u)
+}
+
+// dupFD duplicates fd (DescendCreateOwned consumes/closes the fd it is handed, but the caller still
+// needs the unit-dir fd afterwards). Returns -1 on failure, which DescendCreateOwned reports as an
+// open error.
+func dupFD(fd int) int {
+	n, err := unix.Dup(fd)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// upsertUnitAt writes data to name under dirFD unless identical; a differing existing unit is diffed
+// and the user asked. Every access is O_NOFOLLOW: an existing symlink at name is refused, never
+// followed. uid/gid >= 0 chowns the file.
+func upsertUnitAt(dirFD int, name, label string, data []byte, mode os.FileMode, uid, gid int) error {
+	existing, present, err := readAtNoFollow(dirFD, name)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", label, err)
+	}
+	switch {
+	case present && bytes.Equal(existing, data):
+		log.Infof("%s already up to date: skipping", label)
+		return nil
+	case present:
+		overwrite, cErr := inst.ConfirmOverwrite(name, existing, data)
+		if cErr != nil {
+			return cErr
+		}
+		if !overwrite {
+			log.Warnf("keeping existing %s", label)
+			return nil
+		}
+		log.Infof("overwrote %s", label)
+	default:
+		log.Infof("installed %s", label)
+	}
+	return writeAtNoFollow(dirFD, name, data, mode, uid, gid)
+}
+
+// readAtNoFollow reads name under dirFD without following a symlink; a symlink at name is refused.
+func readAtNoFollow(dirFD int, name string) (content []byte, present bool, err error) {
+	fd, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		switch {
+		case errors.Is(err, unix.ENOENT):
+			return nil, false, nil
+		case errors.Is(err, unix.ELOOP):
+			return nil, false, fmt.Errorf("%w: %s", safeio.ErrSymlink, name)
+		default:
+			return nil, false, err
+		}
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	return b, true, err
+}
+
+// writeAtNoFollow creates or truncates name under dirFD (never following a symlink) and chowns it.
+func writeAtNoFollow(dirFD int, name string, data []byte, mode os.FileMode, uid, gid int) error {
+	fd, err := unix.Openat(dirFD, name,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode))
+	if errors.Is(err, unix.EEXIST) {
+		var st unix.Stat_t
+		if serr := unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); serr != nil {
+			return serr
+		}
+		if st.Mode&unix.S_IFMT == unix.S_IFLNK {
+			return fmt.Errorf("%w: %s", safeio.ErrSymlink, name)
+		}
+		fd, err = unix.Openat(dirFD, name, unix.O_WRONLY|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	}
+	if err != nil {
+		return fmt.Errorf("installing %s: %w", name, err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	if _, werr := f.Write(data); werr != nil {
+		_ = f.Close()
+		return werr
+	}
+	if uid >= 0 && gid >= 0 {
+		if cerr := f.Chown(uid, gid); cerr != nil {
+			_ = f.Close()
+			return fmt.Errorf("chown %s: %w", name, cerr)
+		}
+	}
+	return f.Close()
 }
 
 // installSSHAgentEnv points u's shells at the unit's socket; without it git/ssh never see the agent.

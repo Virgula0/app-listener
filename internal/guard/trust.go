@@ -63,8 +63,12 @@ func NewTrustGuard() (*TrustGuard, error) {
 }
 
 // SetTrusted (re)populates guard_trusted_files from resolved binary and library paths. A path that
-// is both carries both flags. Unresolvable paths are skipped with a warning.
+// is both carries both flags. Unresolvable paths are skipped with a warning. Idempotent: the map is
+// cleared first, so a reload that dropped a binary also drops its trust entry (no stale over-trust).
 func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
+	if err := clearInodeMap(t.objs.GuardTrustedFiles); err != nil {
+		return fmt.Errorf("clearing trusted files: %w", err)
+	}
 	flags := make(map[GuardInodeKey]uint8)
 	add := func(path string, flag uint8) {
 		dev, ino, err := ebpf.StatInode(path)
@@ -92,8 +96,11 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 
 // SetGuardedDirs records the (dev, ino) of every guarded resource root so a library loaded from
 // inside a write-protected tree is trusted without allow_lib (under_guarded_tree in
-// guard_trust.bpf.c). Unresolvable paths are skipped with a warning.
+// guard_trust.bpf.c). Unresolvable paths are skipped with a warning. Idempotent (cleared first).
 func (t *TrustGuard) SetGuardedDirs(roots []string) error {
+	if err := clearInodeMap(t.objs.GuardTrustedDirs); err != nil {
+		return fmt.Errorf("clearing guarded dirs: %w", err)
+	}
 	v := uint8(1)
 	n := 0
 	for _, r := range roots {
@@ -111,28 +118,60 @@ func (t *TrustGuard) SetGuardedDirs(roots []string) error {
 	return nil
 }
 
-// trustHook pairs an LSM program with a human name for logging.
+// clearInodeMap deletes every entry of a GuardInodeKey-keyed hash map so SetTrusted/SetGuardedDirs
+// can be re-applied on reload as a true replace, not an add-only merge.
+func clearInodeMap(m *cilium.Map) error {
+	var keys []GuardInodeKey
+	var k GuardInodeKey
+	var v uint8
+	it := m.Iterate()
+	for it.Next(&k, &v) {
+		keys = append(keys, k)
+	}
+	if err := it.Err(); err != nil {
+		return err
+	}
+	for i := range keys {
+		if err := m.Delete(keys[i]); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// trustHook pairs an LSM program with a human name for logging; required marks a hook whose attach
+// failure must fail the whole trust guard.
 type trustHook struct {
-	prog *cilium.Program
-	name string
+	prog     *cilium.Program
+	name     string
+	required bool
 }
 
 func (t *TrustGuard) hooks() []trustHook {
 	return []trustHook{
-		{t.objs.TrustMmap, "mmap_file"},
-		{t.objs.TrustFileOpen, "file_open"},
-		{t.objs.TrustPathUnlink, "path_unlink"},
-		{t.objs.TrustPathRename, "path_rename"},
-		{t.objs.TrustPathTruncate, "path_truncate"},
+		// mmap_file is protection #2 — the library-load allowlist that stops LD_PRELOAD of attacker
+		// code into a whitelisted process. It is REQUIRED: without it the trust guard denies nothing
+		// meaningful, so if it can't attach (e.g. the per-attach-point trampoline cap
+		// BPF_MAX_TRAMP_LINKS is exhausted) the guard must fail rather than report success.
+		{t.objs.TrustMmap, "mmap_file", true},
+		{t.objs.TrustFileOpen, "file_open", false},
+		{t.objs.TrustPathUnlink, "path_unlink", false},
+		{t.objs.TrustPathRename, "path_rename", false},
+		{t.objs.TrustPathTruncate, "path_truncate", false},
 	}
 }
 
-// Start attaches every trust LSM program and drains events. Each attach is best-effort: a failure
-// logs and skips that protection, never blocking the daemon or the per-resource guards.
+// Start attaches every trust LSM program and drains events. A required hook (mmap_file) that cannot
+// attach fails the start; other hooks are best-effort. It never blocks the per-resource guards.
 func (t *TrustGuard) Start() error {
 	for _, h := range t.hooks() {
 		l, err := link.AttachLSM(link.LSMOptions{Program: h.prog})
 		if err != nil {
+			if h.required {
+				t.detachLinks()
+				return fmt.Errorf("required trust hook %s failed to attach: %w — the LD_PRELOAD "+
+					"library allowlist would be unenforced", h.name, err)
+			}
 			log.Warnf("trust guard: skipping %s (%v) — that protection is unavailable; "+
 				"per-resource enforcement is unaffected", h.name, err)
 			continue
@@ -218,11 +257,17 @@ func (t *TrustGuard) Stop() {
 	if t.rd != nil {
 		_ = t.rd.Close()
 	}
+	t.detachLinks()
+	_ = t.objs.Close()
+}
+
+// detachLinks closes every attached LSM link (used both by Stop and by a failed Start that must not
+// leave a partial attach behind).
+func (t *TrustGuard) detachLinks() {
 	for _, l := range t.links {
 		_ = l.Close()
 	}
 	t.links = nil
-	_ = t.objs.Close()
 }
 
 func cStr(b []byte) string {

@@ -331,6 +331,75 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// The trust guard's trusted set is built once at daemon start and is never rebuilt on SIGHUP, but
+// SIGHUP is the normal way the whitelist changes: the pacman PostTransaction and apt
+// DPkg::Post-Invoke catalog-refresh hooks reload rather than restart. A binary whitelisted by a
+// reload is therefore attached to its per-resource guard while being ABSENT from
+// guard_trusted_files, and trust_mmap returns early unless the mapping process's exe carries
+// TRUSTED_BINARY — so it gets no library allowlist at all and LD_PRELOAD works against it, even
+// though the identical binary whitelisted at startup is protected.
+func (s *IntegrationSuite) TestDaemon_Bypass_LdPreloadBinaryWhitelistedByReload() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-RELOAD-TRUST-9C3F"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_leak.so"), "/tmp/leak.so", 0755), "copy preload_leak.so")
+
+	// The config lives OUTSIDE /etc/app-listener so this test can rewrite it: once the daemon runs,
+	// /etc/app-listener is self-guarded read-only and only the app-listener binary may write it (the
+	// real catalog refresh does so via `install --update-catalog-only`). /usr/bin/true is
+	// whitelisted at startup; /usr/bin/cat is added only by the SIGHUP reload below, mirroring a
+	// catalog refresh picking up a new binary.
+	const cfgPath = "/tmp/poc-daemon.conf"
+	writeCfg := func(body string) {
+		code, out := s.exec(c, []string{"sh", "-c",
+			fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF", cfgPath, body)})
+		s.Require().Equalf(0, code, "writing %s: %s", cfgPath, out)
+	}
+	writeCfg("[watch /protected]\nneed_encryption: false\n/usr/bin/true")
+
+	launch := "nohup /app-listener daemon --config " + cfgPath + " --headless > /tmp/daemon.log 2>&1 &"
+	code, out := s.exec(c, []string{"sh", "-c", launch})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, "[watch /protected]")
+
+	// Baseline: LD_PRELOAD into the startup-whitelisted binary is denied (trust set has it).
+	_, out = s.exec(c, []string{"sh", "-c",
+		"LD_PRELOAD=/tmp/leak.so LEAK_FILE=/protected/secret /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, marker, "baseline: startup-whitelisted binary must be preload-protected: %s", out)
+
+	writeCfg("[watch /protected]\nneed_encryption: false\n/usr/bin/true\n/usr/bin/cat")
+	s.sigDaemon(c, "HUP")
+
+	const reloadDone = "configuration reloaded without dropping protection"
+	done := false
+	for deadline := time.Now().Add(daemonShutdownTimeout); time.Now().Before(deadline); {
+		if strings.Contains(s.readDaemonLog(c), reloadDone) {
+			done = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	s.Require().Truef(done, "reload did not complete within %s, daemon log:\n%s", daemonShutdownTimeout, s.readDaemonLog(c))
+
+	// Positive control: the reload-added binary really is whitelisted now (per-resource access).
+	code, out = s.exec(c, []string{"sh", "-c", "cat /protected/secret"})
+	s.Require().Equalf(0, code, "reload-added binary should be whitelisted for the resource: %s", out)
+	s.Require().Containsf(out, marker, "reload-added binary should read the secret normally: %s", out)
+
+	// Attack: LD_PRELOAD an attacker .so into the reload-added whitelisted binary. Identical to the
+	// baseline that was denied, only the binary was whitelisted by reload instead of at startup.
+	_, out = s.exec(c, []string{"sh", "-c",
+		"LD_PRELOAD=/tmp/leak.so LEAK_FILE=/protected/secret /usr/bin/cat /dev/null 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated through LD_PRELOAD into a binary whitelisted by SIGHUP: "+
+			"the trust set was not rebuilt on reload: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Bypass (finding #4c): memory-read taint lost across a SIGHUP reload. A reload rebuilds every
 // guard with fresh BPF maps, emptying the tainted-pid set while the victim keeps the secret in
 // memory. Taint must survive a reload (re-seed from the surviving map or persist it): the
@@ -1951,6 +2020,52 @@ need_encryption: false
 
 	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE.*comm=app-listener mode=READ' /tmp/daemon.log || true"})
 	s.Require().Equalf("0", strings.TrimSpace(logOut), "no READ-mode denial may be logged for the daemon itself")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// daemonScaleResources exceeds BPF_MAX_TRAMP_LINKS (38), the kernel's cap on trampoline links at a
+// single attach point. A real install guards ~34 catalog resources plus the daemon's two
+// self-guards, so production already sits just under it.
+const daemonScaleResources = 48
+
+// Every guarded resource used to attach its own copy of all 26 LSM programs, so each one added a
+// link to each attach point and usage on security_file_open was O(resources). Past the cap the
+// kernel returns E2BIG and the daemon refuses to start, which made the number of [watch] sections a
+// hard ceiling — and, because BPF-LSM links are global to the kernel rather than namespaced, a
+// daemon near the cap also starved every other BPF-LSM user on the host, containers included.
+//
+// Enforcement state is keyed by dev:ino, so one attached program set serves every resource by
+// resolving the accessed inode to its resource in-kernel, keeping attach usage O(1).
+func (s *IntegrationSuite) TestDaemon_ManyResources_AttachStaysWithinTrampolineCap() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	var mkdirs, config strings.Builder
+	mkdirs.WriteString("mkdir -p /etc/app-listener")
+	for i := range daemonScaleResources {
+		dir := fmt.Sprintf("/protected%02d", i)
+		fmt.Fprintf(&mkdirs, " %s", dir)
+		fmt.Fprintf(&config, "[watch %s]\nneed_encryption: false\n/usr/bin/sleep\n\n", dir)
+	}
+	s.exec(c, []string{"sh", "-c", mkdirs.String()})
+	s.exec(c, []string{"sh", "-c",
+		"echo TOP-SECRET-CONTENT > /protected00/secret && chmod 755 /protected00 && chmod 644 /protected00/secret"})
+
+	// startDaemon fails the test if any resource's guard never reports "guard started", which is
+	// what an exhausted attach point (E2BIG) causes.
+	s.startDaemon(c, config.String())
+
+	log := s.readDaemonLog(c)
+	s.Require().NotContainsf(log, "argument list too long",
+		"the daemon hit the per-attach-point trampoline cap with %d resources: %s", daemonScaleResources, log)
+
+	// All 48 attached — now prove enforcement still works, so the shared attach did not trade the
+	// cap for a guard that denies nothing.
+	const nobody = "setpriv --reuid=65534 --regid=65534 --clear-groups"
+	code, out := s.exec(c, []string{"sh", "-c", nobody + " grep -c TOP-SECRET /protected00/secret"})
+	s.Require().NotEqualf(0, code, "non-whitelisted reader must still be denied with %d resources, got: %s",
+		daemonScaleResources, out)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

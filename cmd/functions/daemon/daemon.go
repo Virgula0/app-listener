@@ -269,9 +269,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	defer d.Stop()
 
 	// Trusted-binary/library protection: write-protect whitelisted binaries at user-writable paths
-	// (#1) and enforce the library-load allowlist (#2). Never fatal; returns a no-op cleanup when
-	// unavailable.
-	defer startTrustGuard(cfg)()
+	// (#1) and enforce the library-load allowlist (#2). Never fatal. Held across the daemon's
+	// lifetime so the SIGHUP reload can rebuild its trusted set (reload-added binaries otherwise get
+	// no library allowlist).
+	trust := startTrustGuard(cfg)
+	defer trust.stop()
 
 	events := mergeDaemonEvents(d.Events(), sg.Events())
 
@@ -291,11 +293,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// edit-protected control socket (only with a password configured). Best-effort: a bind failure
 	// disables live editing, never the daemon.
-	control := newControlManager(d)
-	control.refresh()
+	control := startControlManager(d)
 	defer control.close()
 
-	reload := makeReloadHandler(d, configPath, vault, pin, sg, control)
+	reload := makeReloadHandler(d, configPath, vault, pin, sg, control, trust)
 	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
 }
 
@@ -383,7 +384,11 @@ func prepareDaemonStart() (configPath string, cfg *daemonconfig.Config, pin pinC
 		log.Error("daemon: CRITICAL: LSM link pinning is UNAVAILABLE on this host — the guards enforce " +
 			"while the daemon runs but will NOT survive a SIGKILL. Fix bpffs to restore the kill-safety guarantee.")
 	}
-	return configPath, cfg, pinCfg{base: base, gen: newPinGeneration()}, nil
+	pin = pinCfg{base: base, gen: newPinGeneration()}
+	// The LSM programs attach once for every resource, so their pins belong to the generation
+	// rather than to any one resource. Must be set before the first guard is built.
+	guard.ConfigureSharedPinning(guard.SharedPinPrefix(pin.base, pin.gen))
+	return configPath, cfg, pin, nil
 }
 
 // Plain log lines (no ANSI colors) for journald.
@@ -417,7 +422,7 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 // makeReloadHandler returns the SIGHUP handler: re-parse the config, rebuild every guard
 // (re-statting binaries so updated ones get new inodes) and hand the batch to the usecase, which
 // swaps without dropping protection. Any failure keeps the previous config running.
-func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, sg *selfGuards, control *controlManager) func() {
+func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, sg *selfGuards, control *controlManager, trust *trustManager) func() {
 	return func() {
 		// A reload rebuilds every guard, so end any live edit-protected grant first (its client
 		// gets EOF; the tree is read-only again before the swap).
@@ -431,12 +436,16 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		// (best effort) after the swap, on both success and keep-previous paths.
 		sg.detach()
 
-		liveGen, err := reloadOnce(d, configPath, vault, pin.base)
+		liveGen, cfg, err := reloadOnce(d, configPath, vault, pin.base)
 		if err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
 			sg.attach(pin)
 			return
 		}
+		// Rebuild the daemon-wide trusted set from the new config: a binary added by this reload
+		// must gain its library allowlist (#2) and write-protection (#1), or LD_PRELOAD works
+		// against it while it holds full access to the secrets.
+		trust.reload(cfg)
 		// The usecase's commit already unpinned the old generation's guards; sweep every other
 		// generation, keeping the live batch. Self guards are detached here, so their pins are gone
 		// and can't look stale.
@@ -459,39 +468,40 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 // ephemeral guard (only after a manual edit; install restarts the daemon), rebuild the guards under
 // a fresh pin generation and hand them to the usecase. On failure the freshly unlocked vaults are
 // locked back and the previous config keeps running. Returns the live pin generation.
-func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pinBase string) (string, error) {
+func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pinBase string) (string, *daemonconfig.Config, error) {
 	cfg, err := daemonconfig.Load(configPath)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if len(cfg.Resources) == 0 {
-		return "", fmt.Errorf("config contains no [watch] sections")
+		return "", nil, fmt.Errorf("config contains no [watch] sections")
 	}
 
 	pin := pinCfg{base: pinBase, gen: newPinGeneration()}
+	guard.ConfigureSharedPinning(guard.SharedPinPrefix(pin.base, pin.gen))
 
 	pending, err := unlockPendingGroupRoots(cfg, vault, pin)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer pending.stop()
 
 	if resolveErr := daemonconfig.ResolvePendingPaths(cfg); resolveErr != nil {
 		pending.lockRoots(vault)
-		return "", resolveErr
+		return "", nil, resolveErr
 	}
 	newGuards, buildErr := buildGuards(cfg.Resources, pin)
 	if buildErr != nil {
 		pending.lockRoots(vault)
-		return "", buildErr
+		return "", nil, buildErr
 	}
 	if reloadErr := d.Reload(cfg.Resources, newGuards); reloadErr != nil {
 		pending.lockRoots(vault)
-		return "", reloadErr
+		return "", nil, reloadErr
 	}
 	// Reload committed: the usecase now owns the new roots (locked on Stop); the deferred
 	// pending.stop retires the ephemeral guards.
-	return pin.gen, nil
+	return pin.gen, cfg, nil
 }
 
 // startGuardedDaemon brings the engine up in fail-closed order: unlock locked grouped vaults under
@@ -722,7 +732,8 @@ func lockRootRecovering(vault *fscrypt.Vault, root, resourcePath, pinBase string
 
 	var ok bool
 	pinPrefix := guard.PinPrefix(pinBase, rec.Gen, resourcePath)
-	if widenErr := guard.WithPinnedSelfVaultAccess(pinPrefix, func() error {
+	sharedPrefix := guard.SharedPinPrefix(pinBase, rec.Gen)
+	if widenErr := guard.WithPinnedSelfVaultAccess(pinPrefix, sharedPrefix, func() error {
 		ok = lockOneRoot(vault, root)
 		return nil
 	}); widenErr != nil {
