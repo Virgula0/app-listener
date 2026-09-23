@@ -21,6 +21,7 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/logging"
 )
 
 type Mode int
@@ -159,6 +160,8 @@ type Guard struct {
 	// (WithBackingDevices).
 	rawDevices    []uint32
 	rawDevicesSet bool
+	// dropAllowed: no consumer wants allowed events (WithoutAllowedEvents).
+	dropAllowed bool
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -212,6 +215,14 @@ func WithBackingDevices(rdevs []uint32) GuardOption {
 	return func(g *Guard) {
 		g.rawDevices = rdevs
 		g.rawDevicesSet = true
+	}
+}
+
+// WithoutAllowedEvents discards allowed events before they are queued, for a consumer that prints
+// only denials: a whitelisted app's normal I/O (Steam's CEF cache) otherwise floods the queue.
+func WithoutAllowedEvents() GuardOption {
+	return func(g *Guard) {
+		g.dropAllowed = true
 	}
 }
 
@@ -1744,6 +1755,9 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 func (g *Guard) dispatch(ev *GuardEvent) {
 	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions
 	// key on exe inode).
+	if g.dropAllowed && !ev.Blocked {
+		return
+	}
 	local := *ev
 	g.checkCommSpoof(&local)
 
@@ -1751,11 +1765,31 @@ func (g *Guard) dispatch(ev *GuardEvent) {
 	case g.events <- local:
 	case <-g.done:
 	default:
+		if local.Blocked {
+			logBacklogDenial(g.path, &local) // audit data: never lost behind a flood of allowed events
+			return
+		}
 		if dropped := g.eventsDropped.Add(1); dropped == 1 || dropped%1000 == 0 {
-			log.Warnf("guard %s: event consumer is not keeping up, %d event(s) dropped — "+
+			log.Warnf("guard %s: event consumer is not keeping up, %d allowed event(s) dropped — "+
 				"enforcement is unaffected, only reporting", g.path, dropped)
 		}
 	}
+}
+
+// logBacklogDenial prints ev in the daemon's DAEMON DENIED layout (scripts/trace-app-libs.sh
+// parses it); commFullPath is best-effort telemetry, "~" when unresolved.
+func logBacklogDenial(resource string, ev *GuardEvent) {
+	op := ev.Type.String()
+	if ev.Process != "" {
+		op = ev.Process
+	}
+	exe := "~"
+	if target, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", ev.PID)); err == nil {
+		exe = logging.SanitizeText(target)
+	}
+	fmt.Fprintf(os.Stderr, "<4>DAEMON DENIED  op=%s  comm=%s  commFullPath=%s  pid=%d  uid=%d  resource=%s  path=%s\n",
+		op, logging.SanitizeText(ev.Comm), exe, ev.PID, ev.UID, logging.SanitizeText(resource),
+		logging.SanitizeText(ev.Path))
 }
 
 // checkCommSpoof warns when an event's comm claims a guarded binary's name but the real binary

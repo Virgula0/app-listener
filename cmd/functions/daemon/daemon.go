@@ -562,6 +562,8 @@ func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinC
 type pendingGroupUnlock struct {
 	guards []*guard.Guard
 	roots  []string
+	// drained closes to retire the drainEphemeral readers.
+	drained chan struct{}
 }
 
 // stop retires the ephemeral guards. Idempotent (guard.Stop is).
@@ -570,6 +572,34 @@ func (p *pendingGroupUnlock) stop() {
 		g.Stop()
 	}
 	p.guards = nil
+	if p.drained != nil {
+		close(p.drained)
+		p.drained = nil
+	}
+}
+
+// drainEphemeral consumes an ephemeral guard's events: the shared reader routes them to it, and
+// with no consumer the channel fills on the daemon's own startup walk and every later event, a
+// denial included, is dropped. Self-allowed events are noise; denials are logged.
+func drainEphemeral(root string, g *guard.Guard, done <-chan struct{}) {
+	for {
+		select {
+		case ev := <-g.Events():
+			de := usecase.DaemonEvent{Resource: root, Event: ev}
+			if !ev.Blocked || (noLogMetadataBlocks && foldable(&de)) {
+				continue
+			}
+			op := ev.Type.String()
+			if ev.Process != "" {
+				op = ev.Process
+			}
+			log.Warnf("daemon: ephemeral guard %s DENIED op=%s comm=%s pid=%d uid=%d path=%s",
+				logging.SanitizeText(root), op, logging.SanitizeText(ev.Comm), ev.PID, ev.UID,
+				logging.SanitizeText(ev.Path))
+		case <-done:
+			return
+		}
+	}
 }
 
 // lockRoots force-flushes every root this unlock provisioned; the ephemeral guards stay attached
@@ -606,6 +636,7 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 	if len(roots) == 0 {
 		return p, nil
 	}
+	p.drained = make(chan struct{})
 
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {
@@ -626,6 +657,7 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 			return nil, fmt.Errorf("attaching ephemeral guard for locked vault %s: %w (vault left locked)", root, guardErr)
 		}
 		p.guards = append(p.guards, g)
+		go drainEphemeral(root, g, p.drained)
 		if unlockErr := vault.Unlock(root); unlockErr != nil {
 			p.lockRoots(vault)
 			p.stop()
@@ -884,7 +916,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		mode = guard.ModeReadOnly
 	}
 
-	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0,
+	opts := []guard.GuardOption{
 		guard.WithBinaryEvents(events),
 		guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
 		// Root-gated self access with the minimal event set the fscrypt lifecycle needs; non-root
@@ -892,7 +924,12 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		guard.WithSelfAllowBinary(self, daemonSelfBaselineEvents),
 		// Pin LSM links so a SIGKILL leaves the tree enforced until ExecStopPost locks the vault.
 		guard.WithPinning(pin.prefix(r.Path)),
-		guard.WithBackingDevices(deviceSet))
+		guard.WithBackingDevices(deviceSet),
+	}
+	if headless && blockedOnly {
+		opts = append(opts, guard.WithoutAllowedEvents())
+	}
+	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0, opts...)
 	if err != nil {
 		return nil, err
 	}

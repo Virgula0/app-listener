@@ -34,15 +34,37 @@ func TestTrustGlobs_SplitsFixedRootAndName(t *testing.T) {
 	}
 }
 
+func TestReservedLibGlobs(t *testing.T) {
+	e := CandidateDir{ReservedLibs: []string{"%HOME%/.config/app/*.so", "%HOME%/.config/app/lib*", "/opt/app/*.so"}}
+	got := e.ReservedLibGlobs("u", "/home/u")
+	want := []TrustGlob{
+		{Home: "/home/u", Fixed: []string{".config", "app"}, Name: "*.so", Lib: true},
+		{Home: "/home/u", Fixed: []string{".config", "app"}, Name: "lib*", Lib: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReservedLibGlobs:\n got %+v\nwant %+v", got, want)
+	}
+	if len(e.TrustGlobs("u", "/home/u")) != 0 {
+		t.Fatal("library patterns must not become whitelist trust globs")
+	}
+}
+
 // Every catalog glob that grants trust from outside its own guarded tree must be enforceable by
 // the trust object, and the whole set must fit its fixed-size maps.
 func TestCatalogTrustGlobsAreReservable(t *testing.T) {
 	const home = "/home/u"
 	names := make(map[string]bool)
+	bits := make(map[string]bool) // mirrors globBuilder's keys: library bits are per entry
 	affixes := make(map[string]bool)
 	for i := range Catalog {
 		e := &Catalog[i]
-		for _, g := range e.TrustGlobs("u", home) {
+		for _, p := range e.ReservedLibs {
+			// A wildcard dir would silently widen the root to its fixed prefix.
+			if !strings.HasPrefix(p, "%HOME%/") || strings.ContainsAny(filepath.Dir(p), "*?[") {
+				t.Errorf("%s: library pattern %s needs a wildcard-free %%HOME%% directory", e.Name, p)
+			}
+		}
+		for _, g := range append(e.TrustGlobs("u", home), e.ReservedLibGlobs("u", home)...) {
 			if inOwnTree(e, g.Root()) {
 				continue
 			}
@@ -55,6 +77,11 @@ func TestCatalogTrustGlobsAreReservable(t *testing.T) {
 				}
 			}
 			names[g.Name] = true
+			if g.Lib {
+				bits[e.Name+"\x00"+g.Name] = true
+			} else {
+				bits[g.Name] = true
+			}
 			if strings.HasPrefix(g.Name, "*") {
 				affixes["s"+string(rune(len(g.Name)-1))] = true
 			} else if strings.HasSuffix(g.Name, "*") {
@@ -62,13 +89,13 @@ func TestCatalogTrustGlobsAreReservable(t *testing.T) {
 			}
 		}
 	}
-	if len(names) > 64 {
-		t.Errorf("%d reserved names; guard_trust.bpf.c has 64 bits", len(names))
+	if len(bits) > 64 {
+		t.Errorf("%d reserved name bits; guard_trust.bpf.c has 64", len(bits))
 	}
 	if len(affixes) > 8 {
 		t.Errorf("%d prefix/suffix shapes; guard_trust.bpf.c probes at most 8", len(affixes))
 	}
-	if !names["wineserver"] || !names["Discord"] {
+	if !names["wineserver"] || !names["Discord"] || !names["*.node"] {
 		t.Errorf("expected the Steam and Discord globs to be reserved, got %v", names)
 	}
 }

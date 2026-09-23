@@ -17,9 +17,10 @@ import (
 const GuardMaxRes = 512
 
 // resGlobal mirrors GUARD_RES_GLOBAL: the reserved slot for decisions that belong to no single
-// resource (the raw block-device gate, and a process tainted by more than one resource). Its
-// whitelist is the intersection of every resource's, so it is never weaker than the separate
-// per-resource guards it replaced. Real resources are allocated from 1.
+// resource (the raw block-device gate, and a process tainted by resources no taint set covers).
+// Its whitelist is the intersection of every resource's, so it is never weaker than the separate
+// per-resource guards it replaced. Real resources are allocated from 1, taint sets from the top
+// (taintset.go).
 const resGlobal uint32 = 0
 
 // engine owns the single loaded copy of the guard BPF objects and the single set of LSM links that
@@ -52,6 +53,12 @@ type engine struct {
 	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
 	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).
 	allows map[uint32]map[GuardInodeKey]uint8
+	// Taint sets (taintset.go): key -> slot and back, and the rows last written to the kernel.
+	sets       map[string]uint32
+	setAt      map[uint32]string
+	setRows    map[uint32]map[GuardInodeKey]uint8
+	unionRows  map[GuardInodeKey]uint32
+	memberRows map[GuardTaintMemberKey]struct{}
 	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
 	// that registered the backing devices, whose consumer labels them as such. Delivering them to
 	// every guard duplicated each denial and let the self-guards label it with their own path.
@@ -258,10 +265,11 @@ func (e *engine) attachForkTaintLocked() {
 	e.linkNames = append(e.linkNames, "sched-process-fork")
 }
 
-// allocSlotLocked reserves a resource id for g. Slot 0 is reserved (resGlobal).
+// allocSlotLocked reserves a resource id for g. Slot 0 is reserved (resGlobal), and so is every
+// taint-set slot.
 func (e *engine) allocSlotLocked(g *Guard) (uint32, error) {
 	for id := 1; id < GuardMaxRes; id++ {
-		if e.slots[id] == nil {
+		if e.slots[id] == nil && e.setAt[uint32(id)] == "" { //nolint:gosec // id < GuardMaxRes
 			e.slots[id] = g
 			return uint32(id), nil //nolint:gosec // id < GuardMaxRes
 		}
@@ -281,6 +289,11 @@ func (e *engine) release(id uint32) {
 		if e.started {
 			if err := e.objs.GuardResConfig.Put(id, GuardResConfig{}); err != nil {
 				log.Warnf("guard: clearing resource slot %d: %v", id, err)
+			}
+			// Drop the id from every taint set now: a later resource reusing it must not be
+			// judged as a member of a set it never joined.
+			if err := e.syncTaintLocked(); err != nil {
+				log.Warnf("guard: refreshing taint sets after retiring slot %d: %v", id, err)
 			}
 		}
 		e.refs--
@@ -317,6 +330,7 @@ func (e *engine) stopLocked() {
 	e.started = false
 	e.refs = 0
 	e.done = nil
+	e.sets, e.setAt, e.setRows, e.unionRows, e.memberRows = nil, nil, nil, nil, nil
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.
@@ -347,6 +361,8 @@ func (e *engine) deliver(resID uint32, ev *GuardEvent) {
 	switch {
 	case resID == resGlobal:
 		target = e.globalOwnerLocked()
+	case e.setAt[resID] != "":
+		target = e.setOwnerLocked(resID)
 	case resID < GuardMaxRes:
 		target = e.slots[resID]
 	}
@@ -383,13 +399,12 @@ func (e *engine) claimRawDevices(g *Guard) {
 	e.rawOwner = g
 }
 
-// noteAllow records that res permits exe, and refreshes the two cross-resource views:
+// noteAllow records that res permits exe, and refreshes the cross-resource views:
 //
-//   - guard_exe_union ("allowed by at least one resource") answers bprm_committed_creds, which
-//     sees an exec with no guarded inode to resolve a resource from;
-//   - the reserved resGlobal whitelist holds the INTERSECTION, used where a decision belongs to no
-//     single resource. N separate guards each vetoed such an access independently, so anything
-//     short of the intersection would be weaker than the model this replaced.
+//   - guard_exe_union (the slot judging an exe's taint: its resource, or its taint set) answers
+//     bprm_check/bprm_committed_creds, which see an exec with no guarded inode to resolve;
+//   - the taint sets' whitelists and the reserved resGlobal whitelist, which holds the
+//     INTERSECTION of every resource's for decisions that belong to no single resource.
 func (e *engine) noteAllow(res uint32, exe GuardInodeKey, action uint8) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -401,22 +416,7 @@ func (e *engine) noteAllow(res uint32, exe GuardInodeKey, action uint8) error {
 		e.allows[res] = make(map[GuardInodeKey]uint8)
 	}
 	e.allows[res][exe] = action
-
-	owner := res
-	var cur uint32
-	switch err := e.objs.GuardExeUnion.Lookup(exe, &cur); {
-	case err == nil:
-		if cur != res {
-			owner = resGlobal // allowed by several resources
-		}
-	case errors.Is(err, cilium.ErrKeyNotExist):
-	default:
-		return fmt.Errorf("reading exe union: %w", err)
-	}
-	if err := e.objs.GuardExeUnion.Put(exe, owner); err != nil {
-		return fmt.Errorf("writing exe union: %w", err)
-	}
-	return e.refreshGlobalLocked()
+	return e.syncSharedLocked()
 }
 
 // noteDeny withdraws an allow (a whitelisted binary demoted after in-place tampering, or an entry
@@ -432,10 +432,7 @@ func (e *engine) noteDeny(res uint32, exe GuardInodeKey) error {
 		return nil
 	}
 	delete(e.allows[res], exe)
-	if err := e.rebuildUnionLocked(); err != nil {
-		return err
-	}
-	return e.refreshGlobalLocked()
+	return e.syncSharedLocked()
 }
 
 // forgetResource drops res from the cross-resource views when its guard goes away.
@@ -446,30 +443,16 @@ func (e *engine) forgetResource(res uint32) {
 		return
 	}
 	delete(e.allows, res)
-	if !e.started {
-		return
-	}
-	if err := e.rebuildUnionLocked(); err != nil {
-		log.Warnf("guard: rebuilding exe union after dropping resource %d: %v", res, err)
-	}
-	if err := e.refreshGlobalLocked(); err != nil {
-		log.Warnf("guard: refreshing shared whitelist after dropping resource %d: %v", res, err)
+	if err := e.syncSharedLocked(); err != nil {
+		log.Warnf("guard: refreshing shared views after dropping resource %d: %v", res, err)
 	}
 }
 
-// rebuildUnionLocked rewrites guard_exe_union from the live per-resource allow sets.
-func (e *engine) rebuildUnionLocked() error {
-	want := make(map[GuardInodeKey]uint32)
-	for res, set := range e.allows {
-		for exe := range set {
-			if prev, seen := want[exe]; seen && prev != res {
-				want[exe] = resGlobal
-				continue
-			}
-			want[exe] = res
-		}
+func (e *engine) syncSharedLocked() error {
+	if err := e.syncTaintLocked(); err != nil {
+		return err
 	}
-	return replaceInodeU32Map(e.objs.GuardExeUnion, want)
+	return e.refreshGlobalLocked()
 }
 
 // refreshGlobalLocked rewrites the reserved slot's whitelist with the intersection of every live
@@ -490,31 +473,15 @@ func (e *engine) refreshGlobalLocked() error {
 	return nil
 }
 
-// allowIntersectionLocked is the set of exe inodes every live resource allows, with the stricter
-// action where they differ: GUARD_ALLOW_ROOT (uid 0 only) wins over GUARD_ALLOW. Flattening to
-// GUARD_ALLOW would both widen a root-only grant and break the checks that look for the root-gated
-// self entry specifically (ptrace_access_check's metadata exception for the daemon's own process).
+// allowIntersectionLocked is the set of exe inodes every live resource allows (intersectAllows).
+// Flattening GUARD_ALLOW_ROOT to GUARD_ALLOW would both widen a root-only grant and break the
+// checks that look for the root-gated self entry (ptrace_access_check's metadata exception).
 func (e *engine) allowIntersectionLocked() map[GuardInodeKey]uint8 {
-	var inter map[GuardInodeKey]uint8
+	sets := make([]map[GuardInodeKey]uint8, 0, len(e.allows))
 	for _, set := range e.allows {
-		if inter == nil {
-			inter = make(map[GuardInodeKey]uint8, len(set))
-			for k, a := range set {
-				inter[k] = a
-			}
-			continue
-		}
-		for k, a := range inter {
-			other, ok := set[k]
-			switch {
-			case !ok:
-				delete(inter, k)
-			case other == uint8(GUARD_ALLOW_ROOT) || a == uint8(GUARD_ALLOW_ROOT):
-				inter[k] = uint8(GUARD_ALLOW_ROOT)
-			}
-		}
+		sets = append(sets, set)
 	}
-	return inter
+	return intersectAllows(sets)
 }
 
 // clearGlobalAllowsLocked drops every row of the reserved slot's whitelist.
@@ -534,33 +501,6 @@ func (e *engine) clearGlobalAllowsLocked() error {
 	for i := range stale {
 		if err := e.objs.GuardExeActions.Delete(stale[i]); err != nil &&
 			!errors.Is(err, cilium.ErrKeyNotExist) {
-			return err
-		}
-	}
-	return nil
-}
-
-// replaceInodeU32Map makes m hold exactly want.
-func replaceInodeU32Map(m *cilium.Map, want map[GuardInodeKey]uint32) error {
-	var stale []GuardInodeKey
-	var k GuardInodeKey
-	var v uint32
-	it := m.Iterate()
-	for it.Next(&k, &v) {
-		if _, keep := want[k]; !keep {
-			stale = append(stale, k)
-		}
-	}
-	if err := it.Err(); err != nil {
-		return err
-	}
-	for i := range stale {
-		if err := m.Delete(stale[i]); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
-			return err
-		}
-	}
-	for key, val := range want {
-		if err := m.Put(key, val); err != nil {
 			return err
 		}
 	}

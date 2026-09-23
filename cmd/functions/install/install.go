@@ -33,6 +33,8 @@ func init() {
 		"Diff the catalog against the installed daemon.conf: list the critical directories that exist on the host but are not yet guarded, let you pick which to add, then append them to the config and encrypt them like a fresh install (existing sections untouched; stops the daemon for the cycle; requires a previous installation)")
 	InstallCmd.Flags().Bool("live", false,
 		"With --update-catalog-only: refresh the whitelists WITHOUT stopping the daemon (vaults are already unlocked and guarded by the running daemon; the config change is applied via SIGHUP reload). Requires the daemon to be running")
+	InstallCmd.Flags().BoolVar(&allowMetadataOutput, "allow-metadata-output", false,
+		"Install the daemon unit WITHOUT --no-log-metadata-blocks, so denied metadata-only process inspections (op=PTRACE mode=READ) are logged; useful to diagnose an app that breaks with nothing logged")
 	InstallCmd.Flags().BoolP("yes", "y", false,
 		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. the pacman/apt hooks and the boot-time refresh unit)")
 }

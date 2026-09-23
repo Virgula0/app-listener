@@ -33,6 +33,26 @@ func mustCwd() string {
 	return cwd
 }
 
+// allowMetadataOutput is install --allow-metadata-output.
+var allowMetadataOutput bool
+
+// daemonUnitWithMetadataOutput drops --no-log-metadata-blocks from the daemon unit's ExecStart.
+func daemonUnitWithMetadataOutput(unit []byte) []byte {
+	return bytes.ReplaceAll(unit, []byte(" --no-log-metadata-blocks"), nil)
+}
+
+func installUnit(name string) error {
+	dest := filepath.Join(systemd.SystemdDir, name)
+	if name != systemd.DaemonServiceName+".service" || !allowMetadataOutput {
+		return installFile(name, dest, 0o644)
+	}
+	data, err := inst.SampleContent(name)
+	if err != nil {
+		return err
+	}
+	return upsertFile(dest, dest, daemonUnitWithMetadataOutput(data), 0o644, -1)
+}
+
 // installServices copies the embedded unit files from daemon-samples into place (skipping
 // existing), installs the per-user ssh-agent units for sshUsers, and drops the package-manager
 // catalog-refresh hooks.
@@ -54,7 +74,7 @@ func installServices(sshUsers []inst.User) error {
 				}
 			}
 		case strings.HasSuffix(name, ".service"):
-			if err := installFile(name, filepath.Join(systemd.SystemdDir, name), 0o644); err != nil {
+			if err := installUnit(name); err != nil {
 				return err
 			}
 		default:

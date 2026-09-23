@@ -56,29 +56,43 @@ func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
 		return
 	}
 	for _, g := range e.TrustGlobs(u.Name, u.Home) {
-		if underResource(b.cfg, g.Root()) {
-			continue // that resource's own guard already gates every write below it
-		}
-		if _, _, ok := guard.ParseGlobName(g.Name); !ok {
-			log.Warnf("trust guard: %s/%s cannot be reserved (only exact, prefix* and *suffix names): "+
-				"a same-user plant matching it would be trusted at the next catalog refresh", g.Root(), g.Name)
-			continue
-		}
-		mask := b.bit(g.Name)
-		reserveChain(g, mask, b.r.Roots, b.children)
-		for _, w := range writers {
-			b.r.Writers[w] |= mask
-		}
+		b.reserve(g, g.Name, writers)
+	}
+	// Library bits are per entry: the bit also grants loading (trust_mmap), and a "*.so" shared
+	// across entries would let one app's writers plant, and load, below another app's root.
+	for _, g := range e.ReservedLibGlobs(u.Name, u.Home) {
+		b.reserve(g, e.Name+"\x00"+g.Name, writers)
 	}
 }
 
-// bit returns name's mask, assigning the next bit on first use. Past 64 names the masks wrap, and
-// SetGlobReservations refuses the set.
-func (b *globBuilder) bit(name string) uint64 {
-	i, ok := b.bitOf[name]
+func (b *globBuilder) reserve(g install.TrustGlob, key string, writers []string) {
+	if underResource(b.cfg, g.Root()) {
+		return // that resource's own guard already gates every write below it
+	}
+	if _, _, ok := guard.ParseGlobName(g.Name); !ok {
+		if g.Lib {
+			log.Warnf("trust guard: library pattern %s/%s cannot be reserved (only exact, prefix* and "+
+				"*suffix names): those libraries stay untrusted", g.Root(), g.Name)
+		} else {
+			log.Warnf("trust guard: %s/%s cannot be reserved (only exact, prefix* and *suffix names): "+
+				"a same-user plant matching it would be trusted at the next catalog refresh", g.Root(), g.Name)
+		}
+		return
+	}
+	mask := b.bit(key, g.Name)
+	reserveChain(g, mask, b.r.Roots, b.children)
+	for _, w := range writers {
+		b.r.Writers[w] |= mask
+	}
+}
+
+// bit returns key's mask for pattern name, assigning the next bit on first use. Past 64 keys the
+// masks wrap, and SetGlobReservations refuses the set.
+func (b *globBuilder) bit(key, name string) uint64 {
+	i, ok := b.bitOf[key]
 	if !ok {
 		i = len(b.r.Patterns)
-		b.bitOf[name] = i
+		b.bitOf[key] = i
 		b.r.Patterns = append(b.r.Patterns, name)
 	}
 	return uint64(1) << (i % 64)
@@ -87,7 +101,8 @@ func (b *globBuilder) bit(name string) uint64 {
 // reserveChain reserves g.Name below the deepest existing directory on the way to g.Root, so a root
 // created later is covered from its parent until the next reload. Each existing fixed component is
 // also reserved in its parent: roots are inode-keyed, and a renamed-away root recreated by a
-// non-writer would otherwise be unregistered.
+// non-writer would otherwise be unregistered. A library root never falls back: "lib*" below all
+// of ~/.config would lock every other app out of those names.
 func reserveChain(g install.TrustGlob, mask uint64, roots map[string]uint64, children map[[2]string]uint64) {
 	dir := g.Home
 	for _, c := range g.Fixed {
@@ -102,6 +117,10 @@ func reserveChain(g install.TrustGlob, mask uint64, roots map[string]uint64, chi
 				"would unregister the glob root until the next reload", c, g.Root())
 		}
 		dir = next
+	}
+	if g.Lib && dir != g.Root() {
+		log.Infof("trust guard: %s is missing, its %s libraries are not reserved", g.Root(), g.Name)
+		return
 	}
 	roots[dir] |= mask
 }

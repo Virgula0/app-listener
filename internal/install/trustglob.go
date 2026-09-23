@@ -9,10 +9,12 @@ import (
 // TrustGlob is a Whitelist/LibDirWriters glob under a home whose matches the catalog refresh turns
 // into trust grants. Fixed are the wildcard-free components between Home and the first wildcard
 // one; Name is the last component. The daemon reserves Name below Root (guard_trust.bpf.c #3).
+// Lib marks a ReservedLibs pattern.
 type TrustGlob struct {
 	Home  string
 	Fixed []string
 	Name  string
+	Lib   bool
 }
 
 // Root is the glob's leading wildcard-free directory.
@@ -39,17 +41,34 @@ func (c *CandidateDir) TrustGlobs(user, home string) []TrustGlob {
 			continue
 		}
 		seen[p] = true
-		parts := strings.Split(expandPlaceholders(rel, user, home), "/")
-		g := TrustGlob{Home: home, Name: parts[len(parts)-1]}
-		for _, part := range parts[:len(parts)-1] {
-			if strings.ContainsAny(part, "*?[") {
-				break
-			}
-			g.Fixed = append(g.Fixed, part)
-		}
-		out = append(out, g)
+		out = append(out, splitTrustGlob(home, expandPlaceholders(rel, user, home)))
 	}
 	return out
+}
+
+// ReservedLibGlobs returns the entry's %HOME% ReservedLibs patterns for one user, with Lib set.
+func (c *CandidateDir) ReservedLibGlobs(user, home string) []TrustGlob {
+	out := make([]TrustGlob, 0, len(c.ReservedLibs))
+	for _, p := range c.ReservedLibs {
+		if rel, ok := strings.CutPrefix(p, "%HOME%/"); ok {
+			g := splitTrustGlob(home, expandPlaceholders(rel, user, home))
+			g.Lib = true
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+func splitTrustGlob(home, rel string) TrustGlob {
+	parts := strings.Split(rel, "/")
+	g := TrustGlob{Home: home, Name: parts[len(parts)-1]}
+	for _, part := range parts[:len(parts)-1] {
+		if strings.ContainsAny(part, "*?[") {
+			break
+		}
+		g.Fixed = append(g.Fixed, part)
+	}
+	return g
 }
 
 // OwnsPath reports whether path is one of the entry's guarded locations for this user: a RelPaths,

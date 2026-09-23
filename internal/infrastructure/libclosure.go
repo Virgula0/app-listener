@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-
-	log "github.com/sirupsen/logrus"
 )
 
 // rootOwnedSafe reports why path is not safe to auto-trust as a system library, or nil when it is:
@@ -61,16 +59,23 @@ func rootOwnedInode(path string) error {
 // architecture this machine can't run natively (Steam ships pressure-vessel-arm64 for FEX), whose
 // interpreter isn't on the host.
 func ResolveLibraryClosure(binaryPath string) ([]string, error) {
+	trusted, _, err := LibraryClosure(binaryPath)
+	return trusted, err
+}
+
+// LibraryClosure is ResolveLibraryClosure plus the closure members it refused to auto-trust, with
+// why. The kernel may still accept those (guarded tree, reserved name); the caller decides.
+func LibraryClosure(binaryPath string) (trusted []string, rejected map[string]error, err error) {
 	if isScript(binaryPath) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	f, err := elf.Open(binaryPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening ELF %s: %w", binaryPath, err)
+		return nil, nil, fmt.Errorf("opening ELF %s: %w", binaryPath, err)
 	}
 	defer f.Close()
 	if !runsNatively(f.Machine) {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	out := make(map[string]struct{})
@@ -90,15 +95,18 @@ func ResolveLibraryClosure(binaryPath string) ([]string, error) {
 	// ship RUNPATH=$ORIGIN) would otherwise let same-user malware plant an LD_PRELOAD payload that
 	// gets trusted into every whitelisted process. This mirrors the kernel's is_system_trusted
 	// auto-trust rule; a legitimate non-root library must be listed via allow_lib after review.
-	paths := make([]string, 0, len(out))
+	trusted = make([]string, 0, len(out))
 	for p := range out {
-		if err := rootOwnedSafe(p); err != nil {
-			log.Warnf("library closure: not trusting %s (%v) — add it via allow_lib if a load is denied", p, err)
+		if rerr := rootOwnedSafe(p); rerr != nil {
+			if rejected == nil {
+				rejected = make(map[string]error)
+			}
+			rejected[p] = rerr
 			continue
 		}
-		paths = append(paths, p)
+		trusted = append(trusted, p)
 	}
-	return paths, nil
+	return trusted, rejected, nil
 }
 
 // walkNeeded resolves this object's DT_NEEDED entries to absolute paths and recurses, guarding

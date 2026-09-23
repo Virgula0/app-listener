@@ -94,9 +94,15 @@ struct inode_key {
 
 // GUARD_RES_GLOBAL is a reserved slot for the gates that are not attributable to one resource: the
 // raw block-device gate (the device backs every resource on that filesystem) and a process tainted
-// by more than one resource. Userspace fills its whitelist with the INTERSECTION of every
+// by resources no taint set covers. Userspace fills its whitelist with the INTERSECTION of every
 // resource's, so a decision taken here is never weaker than the per-resource guards it stands in
 // for: when N separate guards were attached, each vetoed independently and any veto denied.
+//
+// A taint set (res_config.taint_set) is a slot userspace allocates for one set of resources that
+// whitelist a common binary (Steam's client: config + registry.vdf). Its whitelist is the
+// intersection of only those resources', which is exactly the per-guard model: every guard whose
+// content the process holds vetoes, no other. GLOBAL would also make ~/.ssh veto Steam's own
+// processes inspecting each other.
 #define GUARD_RES_GLOBAL 0
 
 struct res_config {
@@ -106,6 +112,7 @@ struct res_config {
 	__u64 depth;
 	__u64 root_dev;
 	__u64 root_ino;
+	__u64 taint_set; // nonzero: a taint-set slot (no tree; only judges tainted processes)
 };
 
 struct {
@@ -168,6 +175,20 @@ struct {
 	__type(value, char[MAX_PATH]);
 } path_key_buf SEC(".maps");
 
+// guard_taint_members: (taint set, member) rows, the member a resource or a smaller taint set.
+// Lets mark_tainted keep a set when a process gains content the set already covers.
+struct taint_member_key {
+	__u32 set;
+	__u32 member;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct taint_member_key);
+	__type(value, __u8);
+} guard_taint_members SEC(".maps");
+
 // Union of every resource's whitelist: which resource allows this binary at all, or
 // GUARD_RES_GLOBAL when several do. bprm_committed_creds needs "whitelisted anywhere" to taint an
 // exec'd image, and scanning all resources per exec is not affordable in-kernel.
@@ -220,8 +241,8 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
 	__type(key, __u32);    // PID (TGID) of the tainted process
-	__type(value, __u32);  // res_id whose content it holds: the ptrace check applies that
-	                       // resource's whitelist, as a per-resource guard did
+	__type(value, __u32);  // res_id (or taint set) whose content it holds: the ptrace check
+	                       // applies that slot's whitelist, as the per-resource guards did
 } guard_tainted_pids SEC(".maps");
 
 struct {
@@ -555,21 +576,39 @@ static __always_inline int inode_is_watch_root(struct inode *inode, __u32 *out_r
 	return 1;
 }
 
+// taint_merge: the slot judging a process that held cur's content and gains res's. A tracer had to
+// satisfy every guard whose content it holds, so the result must cover both: the covering set if
+// one of them is, else GLOBAL. Out of line: only the mismatch path pays for it.
+static __noinline __u32 taint_merge(__u32 cur, __u32 res)
+{
+	struct taint_member_key k = {};
+	k.set = cur;
+	k.member = res;
+	if (bpf_map_lookup_elem(&guard_taint_members, &k))
+		return cur;
+	k.set = res;
+	k.member = cur;
+	if (bpf_map_lookup_elem(&guard_taint_members, &k))
+		return res;
+	return GUARD_RES_GLOBAL;
+}
+
 // Mark the current process tainted (it holds guarded content in memory): non-whitelisted
-// ptrace/process_vm_readv against it is blocked, judged by the whitelist of the resource the
-// content came from.
+// ptrace/process_vm_readv against it is blocked, judged by the whitelist of the resource (or taint
+// set) the content came from.
 static __always_inline void mark_tainted(__u32 res_id)
 {
 	__u32 pid = bpf_get_current_pid_tgid() >> 32;
 
-	// Holding content from two resources means a tracer had to satisfy both guards before; record
-	// the intersection slot rather than the newest resource, which would drop the other's veto.
 	__u32 *cur = bpf_map_lookup_elem(&guard_tainted_pids, &pid);
 	__u32 val = res_id;
 	if (cur) {
-		if (*cur == res_id)
+		__u32 c = *cur;
+		if (c == res_id)
 			return;
-		val = GUARD_RES_GLOBAL;
+		val = taint_merge(c, res_id);
+		if (val == c)
+			return;
 	}
 	if (bpf_map_update_elem(&guard_tainted_pids, &pid, &val, BPF_ANY))
 		count_degrade(1);
@@ -2080,8 +2119,8 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	// Read-only guards (lib_dir trees, /etc/app-listener) are skipped like every other taint site:
 	// their contents are world-readable code, and tainting their writers would lock most of e.g.
 	// Steam's process tree out of inspection. Must come AFTER the union lookup — the mode belongs
-	// to a resource, and the exe only resolves to one here. GUARD_RES_GLOBAL (several resources
-	// allow this exe) taints: over-restricting beats dropping a non-read-only resource's veto.
+	// to a resource, and the exe only resolves to one here. An exe several non-read-only resources
+	// allow resolves to their taint set (GLOBAL if none could be allocated).
 	if (is_readonly_mode(res))
 		return 0;
 
@@ -2225,10 +2264,11 @@ int guard_bprm_committed(unsigned long long *ctx)
 	ik.dev = dev;
 
 	// Keep the taint while the new image may still read what the process holds: judged by the
-	// owning resource's whitelist, or — for content from several resources — by whether ANY of them
-	// allows it. Clearing on the narrower test would drop protection a separate per-resource guard
-	// kept.
-	if (res == GUARD_RES_GLOBAL) {
+	// owning resource's whitelist, or — for content from several resources (GLOBAL, a taint set) —
+	// by whether ANY resource allows it. A set's whitelist is an intersection: clearing on it would
+	// drop protection a separate per-resource guard kept.
+	struct res_config *tcfg = bpf_map_lookup_elem(&guard_res_config, &res);
+	if (res == GUARD_RES_GLOBAL || (tcfg && tcfg->taint_set)) {
 		if (bpf_map_lookup_elem(&guard_exe_union, &ik))
 			return 0;
 	} else {

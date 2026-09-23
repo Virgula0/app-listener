@@ -238,11 +238,11 @@ func (t *TrustGuard) readLoop() {
 				"a non-whitelisted process tried to modify a protected binary")
 		case trustPlant:
 			logTrustDenied("PLANT", comm, ev.PID, ev.UID, path,
-				"only the owning app's binaries may create or modify a file a catalog whitelist glob would trust")
+				"only the owning app's binaries may create or modify a file a catalog glob reserves")
 		default:
 			logTrustDenied("LIBLOAD", comm, ev.PID, ev.UID, path,
 				"a whitelisted binary tried to exec-map an untrusted file "+
-					"(not root-owned, not in a guarded tree, not allow_lib)")
+					"(not root-owned, not in a guarded tree, not allow_lib, not its app's reserved library)")
 		}
 	}
 }

@@ -3,6 +3,7 @@ package guard
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -22,9 +23,10 @@ const (
 	globMaxBits        = 64
 )
 
-// GlobReservations is protection #3 (guard_trust.bpf.c): names a catalog whitelist glob fixes,
-// reserved below the glob's fixed root so that only the owning entry's binaries may bind them.
-// Bit i of every mask stands for Patterns[i].
+// GlobReservations is protection #3 (guard_trust.bpf.c): names a catalog whitelist glob or library
+// pattern fixes, reserved below its fixed root so that only the owning entry's binaries may bind
+// them (and load them, for writers of the bit). Bit i of every mask stands for Patterns[i]; a
+// pattern may repeat under distinct bits.
 type GlobReservations struct {
 	// Patterns are last glob components: "wineserver", "pv-*" or "*-capsule-capture-libs".
 	Patterns []string
@@ -197,4 +199,33 @@ func syncMap[K comparable](m *cilium.Map, want map[K]uint64) error {
 		}
 	}
 	return nil
+}
+
+// LibTrusted mirrors trust_mmap's glob_lib_trusted for a path: lib's name is reserved below one of
+// its ancestors for a bit bin writes. Advisory (startup diagnostics); the kernel decides by inode.
+func (r GlobReservations) LibTrusted(bin, lib string) bool {
+	name := filepath.Base(lib)
+	var nameBits uint64
+	for i, p := range r.Patterns {
+		kind, text, ok := ParseGlobName(p)
+		if !ok || i >= globMaxBits {
+			continue
+		}
+		if (kind == globExact && name == text) || (kind == globPrefix && strings.HasPrefix(name, text)) ||
+			(kind == globSuffix && strings.HasSuffix(name, text)) {
+			nameBits |= uint64(1) << i
+		}
+	}
+	bits := nameBits & r.Writers[bin]
+	if bits == 0 {
+		return false
+	}
+	for dir := filepath.Dir(lib); ; dir = filepath.Dir(dir) {
+		if r.Roots[dir]&bits != 0 {
+			return true
+		}
+		if dir == "/" || dir == "." {
+			return false
+		}
+	}
 }

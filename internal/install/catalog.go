@@ -52,6 +52,11 @@ type CandidateDir struct {
 	// Steam login credentials in the same entry. Same %HOME%/%USER%/glob expansion as Whitelist;
 	// only regular files survive.
 	LibDirWriters []string
+	// ReservedLibs are %HOME% library patterns "<dir>/<name>" (name exact, prefix* or *suffix) for
+	// apps that install their own code outside every guarded tree. The name is reserved at any depth
+	// below dir for the entry's whitelisted binaries (guard_trust.bpf.c #3), which may then load such
+	// files with no allow_lib. dir must exist when the daemon (re)loads, or nothing is reserved.
+	ReservedLibs []string
 }
 
 // IsSystem reports a system-level (AbsPaths) entry, probed once regardless of users.
@@ -359,6 +364,12 @@ var Catalog = []CandidateDir{
 			// Versioned app dir; the wildcard covers every release.
 			"%HOME%/.config/discord/*/chrome-sandbox":          nil,
 			"%HOME%/.config/discord/*/chrome_crashpad_handler": nil,
+		},
+		// Self-updated native modules (discord_voice.node, ...) and bundled libs (libffmpeg.so).
+		ReservedLibs: []string{
+			"%HOME%/.config/discord/*.so",
+			"%HOME%/.config/discord/lib*",
+			"%HOME%/.config/discord/*.node",
 		}},
 	{Name: "Discord Canary", RelPaths: []string{".config/discord-canary"},
 		Whitelist: map[string][]string{"/usr/bin/discord-canary": nil}},

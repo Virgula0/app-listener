@@ -95,3 +95,81 @@ func TestBuildGlobReservations_InTreeRootSkipped(t *testing.T) {
 		t.Fatalf("foundry's bin/* is inside its guarded tree, nothing to reserve: %v", r.Patterns)
 	}
 }
+
+func discordLibConfig(home string) (*daemonconfig.Config, string) {
+	bin := filepath.Join(home, ".config/discord/0.0.1/Discord")
+	return &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: filepath.Join(home, ".config/discord/sentry"), Binaries: []daemonconfig.BinaryRule{{Path: bin}}},
+		{Path: filepath.Join(home, ".ssh"), Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/ssh"}}},
+	}}, bin
+}
+
+func TestBuildGlobReservations_DiscordLibs(t *testing.T) {
+	home := t.TempDir()
+	discord := filepath.Join(home, ".config/discord")
+	mkdirs(t, discord)
+	cfg, bin := discordLibConfig(home)
+	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+
+	for _, name := range []string{"*.so", "lib*", "*.node"} {
+		bit := bitOf(t, r, name)
+		if r.Roots[discord]&bit == 0 {
+			t.Errorf("%s not reserved below %s: %v", name, discord, r.Roots)
+		}
+		if r.Writers[bin]&bit == 0 {
+			t.Errorf("Discord must be a writer of %s: %v", name, r.Writers)
+		}
+		if r.Writers["/usr/bin/ssh"]&bit != 0 {
+			t.Errorf("another entry's binary must not write (or load) Discord's %s", name)
+		}
+	}
+	lib := bitOf(t, r, "lib*")
+	found := false
+	for _, c := range r.Children {
+		if c.Parent == filepath.Join(home, ".config") && c.Name == "discord" && c.Bits&lib != 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the library root must be reserved in its parent: %+v", r.Children)
+	}
+}
+
+// Falling back to ~/.config would reserve lib* for every app there.
+func TestBuildGlobReservations_MissingLibRootNotWidened(t *testing.T) {
+	home := t.TempDir()
+	mkdirs(t, filepath.Join(home, ".config"))
+	cfg, _ := discordLibConfig(home)
+	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	lib := bitOf(t, r, "lib*")
+	for root, bits := range r.Roots {
+		if bits&lib != 0 {
+			t.Errorf("lib* reserved below %s although %s/.config/discord is missing", root, home)
+		}
+	}
+}
+
+func TestGlobBuilder_LibBitsPerEntry(t *testing.T) {
+	home := t.TempDir()
+	mkdirs(t, filepath.Join(home, "a"), filepath.Join(home, "b"))
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: filepath.Join(home, ".a"), Binaries: []daemonconfig.BinaryRule{{Path: "/bin/a"}}},
+		{Path: filepath.Join(home, ".b"), Binaries: []daemonconfig.BinaryRule{{Path: "/bin/b"}}},
+	}}
+	b := globBuilder{
+		cfg:      cfg,
+		r:        guard.GlobReservations{Roots: map[string]uint64{}, Writers: map[string]uint64{}},
+		bitOf:    map[string]int{},
+		children: map[[2]string]uint64{},
+	}
+	u := install.User{Name: "u", Home: home}
+	b.addEntry(&install.CandidateDir{Name: "A", RelPaths: []string{".a"}, ReservedLibs: []string{"%HOME%/a/*.so"}}, u)
+	b.addEntry(&install.CandidateDir{Name: "B", RelPaths: []string{".b"}, ReservedLibs: []string{"%HOME%/b/*.so"}}, u)
+
+	if len(b.r.Patterns) != 2 {
+		t.Fatalf("each entry's *.so needs its own bit: %v", b.r.Patterns)
+	}
+	if b.r.Writers["/bin/a"]&b.r.Roots[filepath.Join(home, "b")] != 0 {
+		t.Errorf("A's writer may plant or load *.so below B's root: writers %v roots %v", b.r.Writers, b.r.Roots)
+	}
+}

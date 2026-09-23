@@ -26,7 +26,7 @@ func TestBuildTrustedSetIncludesPendingBinaries(t *testing.T) {
 		}},
 	}
 
-	binaries, _, _ := buildTrustedSet(cfg)
+	binaries, _, _, _ := buildTrustedSet(cfg)
 
 	if !slices.Contains(binaries, "/usr/bin/forge") {
 		t.Fatalf("resolved binary missing from the trusted set: %v", binaries)

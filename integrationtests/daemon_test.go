@@ -2258,3 +2258,232 @@ func (s *IntegrationSuite) TestDaemon_GlobPlant_OwnWriterAllowed() {
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
+
+// discordLibConfig guards a Discord watch path so the catalog's ReservedLibs are reserved below
+// root's ~/.config/discord, with a dash copy standing in for the Discord client (a writer).
+// /usr/bin/bash is whitelisted for an unrelated resource: whitelisted, but not a writer.
+const (
+	discordDir       = "/root/.config/discord"
+	discordModules   = discordDir + "/0.0.1/modules"
+	discordClient    = discordDir + "/0.0.1/Discord"
+	libProbe         = "/exploits/lib_probe.so"
+	libProbeMarker   = "LIB_PROBE_LOADED"
+	discordLibConfig = `[watch ` + discordDir + `/sentry]
+need_encryption: false
+` + discordClient + `
+
+[watch /protected]
+need_encryption: false
+/usr/bin/bash`
+)
+
+// startDiscordLibDaemon hands modules/ to nobody: a root-owned dir would make every file in it an
+// auto-trusted system library (is_system_trusted) and the load tests vacuous.
+func (s *IntegrationSuite) startDiscordLibDaemon(c testcontainers.Container) {
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener " + discordDir + "/sentry " + discordModules +
+			"/discord_voice && cp /usr/bin/dash " + discordClient + " && chown -R 65534 " + discordModules})
+	for _, f := range []string{"lib_probe.so", "glob_plant"} {
+		s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/"+f), "/exploits/"+f, 0755), "copy "+f)
+	}
+	s.startDaemon(c, discordLibConfig)
+	s.Require().Contains(s.readDaemonLog(c), "reserved glob name(s)", "trust guard #3 was not populated")
+}
+
+// writeAsDiscord creates path with lib_probe's bytes; dash's redirection opens it as the client.
+func (s *IntegrationSuite) writeAsDiscord(c testcontainers.Container, path string) {
+	code, out := s.exec(c, []string{discordClient, "-c", "cat " + libProbe + " > " + shQuote(path)})
+	s.Require().Equalf(0, code, "Discord's own binary must write %s: %s", path, out)
+}
+
+// preload runs bin with lib LD_PRELOADed and reports whether lib's constructor ran.
+func (s *IntegrationSuite) preload(c testcontainers.Container, bin, lib string) (bool, string) {
+	_, out := s.exec(c, []string{"sh", "-c", "LD_PRELOAD=" + shQuote(lib) + " " + bin + " -c true 2>&1"})
+	return strings.Contains(out, libProbeMarker), out
+}
+
+func (s *IntegrationSuite) requireDenialLogged(c testcontainers.Container, op, name string) {
+	for _, line := range strings.Split(s.readDaemonLog(c), "\n") {
+		if strings.Contains(line, "TRUST DENIED  op="+op) && strings.Contains(line, name) {
+			return
+		}
+	}
+	s.Failf("denial not logged", "no op=%s line for %s in:\n%s", op, name, s.readDaemonLog(c))
+}
+
+// Discord's self-updated native code under ~/.config/discord is outside every guarded tree and
+// not root-owned; a reserved name its own binary wrote there must load, at any depth.
+func (s *IntegrationSuite) TestDaemon_ReservedLib_WriterLibraryLoads() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startDiscordLibDaemon(c)
+
+	for _, lib := range []string{
+		discordModules + "/probe.so",
+		discordModules + "/libprobe.so.1",
+		discordModules + "/discord_voice/discord_voice.node",
+	} {
+		s.writeAsDiscord(c, lib)
+		loaded, out := s.preload(c, discordClient, lib)
+		s.Require().Truef(loaded, "Discord must load its own reserved library %s: %s", lib, out)
+	}
+	s.Require().NotContains(s.readDaemonLog(c), "op=LIBLOAD", "no load may have been refused")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Loading a reserved name is sound only if nothing but Discord can bind or rewrite one: every
+// other process, including a binary whitelisted for another resource, is refused with op=PLANT.
+func (s *IntegrationSuite) TestDaemon_ReservedLib_NonWriterPlantDenied() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startDiscordLibDaemon(c)
+
+	deep := discordModules + "/a/b"
+	code, out := s.exec(c, []string{"mkdir", "-p", deep})
+	s.Require().Equalf(0, code, "unreserved directories must stay writable: %s", out)
+	s.exec(c, []string{"cp", libProbe, "/tmp/evil.so"})
+
+	s.assertNotPlanted(c, "create *.so", discordModules+"/evil.so",
+		[]string{"cp", libProbe, discordModules + "/evil.so"})
+	s.assertNotPlanted(c, "create lib*", discordModules+"/libevil.so.1",
+		[]string{"sh", "-c", "cat " + libProbe + " > " + discordModules + "/libevil.so.1"})
+	s.assertNotPlanted(c, "create at depth", deep+"/evil.node",
+		[]string{"sh", "-c", "cat " + libProbe + " > " + deep + "/evil.node"})
+	s.assertNotPlanted(c, "rename", deep+"/evil.so", []string{"mv", "/tmp/evil.so", deep + "/evil.so"})
+	s.assertNotPlanted(c, "hardlink", deep+"/evil.so", []string{"ln", "/tmp/evil.so", deep + "/evil.so"})
+	s.assertNotPlanted(c, "symlink", deep+"/evil.so", []string{"ln", "-s", "/tmp/evil.so", deep + "/evil.so"})
+	s.assertNotPlanted(c, "O_TMPFILE+linkat", deep+"/evil.so",
+		[]string{"/exploits/glob_plant", "tmpfile", deep, deep + "/evil.so"})
+	s.assertNotPlanted(c, "confused deputy", deep+"/evil.node",
+		[]string{"/usr/bin/bash", "-c", "cat " + libProbe + " > " + deep + "/evil.node"})
+	s.exec(c, []string{"sh", "-c", "mkdir -p /tmp/pkg && cp " + libProbe + " /tmp/pkg/evil.so"})
+	s.assertNotPlanted(c, "directory move", discordModules+"/pkg", []string{"mv", "/tmp/pkg", discordModules + "/pkg"})
+
+	lib := discordModules + "/libgood.so"
+	s.writeAsDiscord(c, lib)
+	for _, tc := range []struct {
+		what string
+		cmd  []string
+	}{
+		{"overwrite", []string{"sh", "-c", "cat /usr/bin/true > " + lib}},
+		{"append", []string{"sh", "-c", "echo evil >> " + lib}},
+		{"truncate", []string{"truncate", "-s", "0", lib}},
+		{"rename over", []string{"sh", "-c", "cp " + libProbe + " /tmp/over && mv -f /tmp/over " + lib}},
+		{"exchange", []string{"sh", "-c", "cp " + libProbe + " /tmp/swap && /exploits/glob_plant exchange /tmp/swap " + lib}},
+		{"hardlink alias", []string{"ln", lib, "/tmp/alias.so"}},
+	} {
+		code, out = s.exec(c, tc.cmd)
+		s.Require().NotEqualf(0, code, "%s of Discord's library by a non-writer must be denied: %s", tc.what, out)
+		code, _ = s.exec(c, []string{"cmp", "-s", libProbe, lib})
+		s.Require().Equalf(0, code, "%s altered Discord's library", tc.what)
+	}
+	s.requireDenialLogged(c, "PLANT", "evil.so")
+	s.requireDenialLogged(c, "PLANT", "libgood.so")
+
+	for _, p := range []string{deep + "/settings.json", "/tmp/free.so"} {
+		code, out = s.exec(c, []string{"sh", "-c", "echo x > " + p})
+		s.Require().Equalf(0, code, "%s is not reserved and must stay writable: %s", p, out)
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// The reservation trusts names, not the tree: an unreserved name in the same dir, a reserved name
+// outside the root, and Discord's own library mapped into a whitelisted non-writer stay refused.
+func (s *IntegrationSuite) TestDaemon_ReservedLib_UnreservedNameRefused() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startDiscordLibDaemon(c)
+
+	good := discordModules + "/probe.so"
+	s.writeAsDiscord(c, good)
+	loaded, out := s.preload(c, discordClient, good)
+	s.Require().Truef(loaded, "control: the reserved library must load: %s", out)
+
+	unreserved := discordModules + "/probe.dat"
+	s.writeAsDiscord(c, unreserved)
+	loaded, out = s.preload(c, discordClient, unreserved)
+	s.Require().Falsef(loaded, "an unreserved name below the root must not load: %s", out)
+	s.requireDenialLogged(c, "LIBLOAD", "probe.dat")
+
+	s.exec(c, []string{"sh", "-c", "mkdir -p /root/.config/other && chown 65534 /root/.config/other"})
+	outside := "/root/.config/other/probe.so"
+	s.writeAsDiscord(c, outside)
+	loaded, out = s.preload(c, discordClient, outside)
+	s.Require().Falsef(loaded, "a reserved name outside the root must not load: %s", out)
+
+	loaded, out = s.preload(c, "/usr/bin/bash", good)
+	s.Require().Falsef(loaded, "a whitelisted non-writer must not load Discord's library: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// probeExeAs reads /proc/<pid>/exe with a copy of readlink at bin (its inode is the caller's
+// identity), reporting the command's own status: docker-exec exit codes lie about denials.
+func probeExeAs(bin, pid string) string {
+	return "exe=$(" + bin + " /proc/" + pid + "/exe 2>&1); echo \"rc=$? exe=$exe\""
+}
+
+// A binary two resources whitelist (Steam's client: config + registry.vdf) taints its process with
+// the set of exactly those two: a caller both whitelist may inspect it, a caller only one does may
+// not. Judging it by every resource's intersection instead let no Steam process inspect another
+// and Steam's UI never came up.
+func (s *IntegrationSuite) TestDaemon_TaintSet_JudgedByItsOwnResources() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	// readlink copies keep their basename: ubuntu's coreutils is one multi-call binary.
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /r1 /r2 /r3 /etc/app-listener /opt/app /opt/y /opt/pboth /opt/pone /opt/pnone" +
+			" && echo s1 > /r1/secret && echo s2 > /r2/secret && echo s3 > /r3/secret" +
+			" && cp /usr/bin/dash /opt/app/app && cp /usr/bin/dash /opt/y/y" +
+			" && for p in pboth pone pnone; do cp /usr/bin/readlink /opt/$p/readlink; done" +
+			" && mkfifo /tmp/f /tmp/g"})
+	s.startDaemon(c, `[watch /r1]
+need_encryption: false
+/opt/app/app
+/opt/pboth/readlink
+/opt/pone/readlink
+
+[watch /r2]
+need_encryption: false
+/opt/app/app
+/opt/pboth/readlink
+
+[watch /r3]
+need_encryption: false
+/opt/y/y`)
+
+	// The victim reads both resources (each read must keep the set, not widen it to GLOBAL), then
+	// idles in a builtin so its image stays /opt/app/app.
+	s.exec(c, []string{"sh", "-c",
+		"(/opt/app/app -c 'read a < /r1/secret; read b < /r2/secret; read y < /tmp/f; exit 0' &); sleep 1"})
+	_, pidOut := s.exec(c, []string{"sh", "-c", "pgrep -f 'app -c read a' | head -1"})
+	pid := strings.TrimSpace(pidOut)
+	s.Require().NotEmptyf(pid, "the victim did not start: %q", pidOut)
+
+	_, out := s.exec(c, []string{"sh", "-c", probeExeAs("/opt/pboth/readlink", pid)})
+	s.Require().Containsf(out, "rc=0 exe=/opt/app/app",
+		"a caller every tainting resource whitelists must inspect the process: %s", out)
+	for _, p := range []string{"/opt/pone/readlink", "/opt/pnone/readlink"} {
+		_, out = s.exec(c, []string{"sh", "-c", probeExeAs(p, pid)})
+		s.Require().NotContainsf(out, "exe=/opt/app/app",
+			"%s is not whitelisted by every resource the process holds: %s", p, out)
+		s.Require().Containsf(out, "rc=1", "%s: the probe must report its own refusal: %s", p, out)
+	}
+
+	// Content from a resource outside the set (/r3, read before exec'ing the set's binary) can't
+	// be covered by it: the merge must fall back to GLOBAL, where pboth is not enough.
+	s.exec(c, []string{"sh", "-c",
+		"(/opt/y/y -c 'read z < /r3/secret; exec /opt/app/app -c \"read y < /tmp/g; exit 0\"' &); sleep 1"})
+	_, pidOut = s.exec(c, []string{"sh", "-c", "pgrep -f 'app -c read y < /tmp/g' | head -1"})
+	mixed := strings.TrimSpace(pidOut)
+	s.Require().NotEmptyf(mixed, "the mixed victim did not start: %q", pidOut)
+	_, out = s.exec(c, []string{"sh", "-c", probeExeAs("/opt/pboth/readlink", mixed)})
+	s.Require().NotContainsf(out, "exe=/opt/app/app",
+		"content from a resource outside the set must not be inspectable by the set's callers: %s", out)
+
+	s.Require().Contains(s.readDaemonLog(c), "op=PTRACE", "the refusals must be logged")
+	s.exec(c, []string{"sh", "-c", "echo > /tmp/f; echo > /tmp/g; pkill -f 'app-listener daemon' || true"})
+}

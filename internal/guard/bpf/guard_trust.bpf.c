@@ -12,10 +12,13 @@
 //     - an explicit TRUSTED_LIB (allow_lib), or
 //     - a root-owned file in a root-only-writable directory (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
 //     - inside a GUARDED resource tree (whitelist mode: only whitelisted binaries create/modify files there, so nothing can be planted). This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
+//     - a #3 reserved name below its root, mapped by one of that name's writers (glob_lib_trusted).
 //   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused.
 //   #3 reserved glob names: the catalog refresh turns whitelist globs with user-writable wildcard
 //     dirs (Steam's common/*/files/bin/wineserver) into trust grants, so only the entry's own
 //     binaries may bind a name such a glob fixes anywhere below its fixed root (see glob_denied).
+//     Catalog library patterns (Discord's *.so, lib*, *.node) reuse it to make an app's
+//     self-updated libraries loadable (#2).
 //
 // Both are ALWAYS enforced once attached (no observe/enforce toggle). Attach is best-effort; a
 // rejected program never affects the per-resource guards.
@@ -674,6 +677,31 @@ static __noinline int glob_move_denied(struct dentry *from_dir, struct dentry *t
 	return (fresh & ~current_writer_bits()) != 0;
 }
 
+// glob_lib_trusted: dentry's name is reserved below one of its ancestors for a bit the current exe
+// writes, so only that app's own binaries could have bound or rewritten it (glob_denied). Limited to
+// the app's writers so a pre-daemon plant under one app's root never loads into another app.
+static __noinline int glob_lib_trusted(struct dentry *dentry)
+{
+	if (!dentry)
+		return 0;
+	const unsigned char *name = NULL;
+	__u32 n = 0;
+	bpf_probe_read_kernel(&name, sizeof(name), &dentry->d_name.name);
+	bpf_probe_read_kernel(&n, sizeof(n), &dentry->d_name.len);
+	if (!name || !n)
+		return 0;
+	__u64 bits = glob_name_bits(name, n);
+	if (!bits)
+		return 0;
+	bits &= current_writer_bits();
+	if (!bits)
+		return 0;
+	struct dentry *dir = dentry_parent(dentry);
+	if (!dir || dir == dentry)
+		return 0;
+	return (glob_root_bits(dir) & bits) != 0;
+}
+
 static __always_inline int deny_plant(struct dentry *dentry)
 {
 	emit(dentry, TRUST_PLANT);
@@ -681,7 +709,8 @@ static __always_inline int deny_plant(struct dentry *dentry)
 }
 
 // #2 library load allowlist: a whitelisted binary may map executable code only from a trusted
-// library (allow_lib) or an auto-trusted system file (root-owned, root-only-writable dir). An
+// library (allow_lib), an auto-trusted system file (root-owned, root-only-writable dir), a guarded
+// tree, its own JIT output or one of its app's reserved library names. An
 // untrusted exec-map is the shape of an LD_PRELOAD/dlopen of attacker code: always logged, denied
 // when enforce_libs is set.
 SEC("lsm/mmap_file")
@@ -710,6 +739,8 @@ int trust_mmap(unsigned long long *ctx)
 		return 0; // inside a write-protected guarded tree — attacker cannot plant here
 	if (jit_self_created(inode))
 		return 0; // runtime-generated code: this process made it, nothing else wrote it
+	if (glob_lib_trusted(dentry))
+		return 0; // reserved name below its root: only this app's binaries could write it
 
 	emit(dentry, TRUST_LIBLOAD);
 	return -EPERM;

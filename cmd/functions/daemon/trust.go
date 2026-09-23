@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"fmt"
+	"slices"
+	"sort"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 
@@ -19,8 +22,9 @@ import (
 //     trusted without allow_lib.
 //
 // A currently-unresolvable binary/library is skipped and picked up by the periodic re-sync: a
-// coverage gap, never a protection gap.
-func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string) {
+// coverage gap, never a protection gap. rejected maps each closure library that is not safe to
+// auto-trust to why and to the binaries loading it (warnUntrustedLibs).
+func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string, rejected map[string]*libRejection) {
 	binSet := make(map[string]struct{})
 	libSet := make(map[string]struct{})
 	dirSet := make(map[string]struct{})
@@ -56,16 +60,7 @@ func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string) {
 
 	// Static dependency closure of every whitelisted binary (the auto part the
 	// operator never has to list).
-	for b := range binSet {
-		closure, err := ebpf.ResolveLibraryClosure(b)
-		if err != nil {
-			log.Warnf("trust guard: could not resolve library closure of %s: %v", b, err)
-			continue
-		}
-		for _, l := range closure {
-			libSet[l] = struct{}{}
-		}
-	}
+	rejected = addLibraryClosures(binSet, libSet)
 
 	// Global force-preloads: everything in /etc/ld.so.preload is loaded into
 	// every dynamically linked process and must be trusted.
@@ -77,7 +72,63 @@ func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string) {
 		}
 	}
 
-	return keys(binSet), keys(libSet), keys(dirSet)
+	return keys(binSet), keys(libSet), keys(dirSet), rejected
+}
+
+// addLibraryClosures adds every binary's auto-trustable library closure to libSet and returns the
+// members it refused.
+func addLibraryClosures(binSet, libSet map[string]struct{}) map[string]*libRejection {
+	rejected := make(map[string]*libRejection)
+	for b := range binSet {
+		closure, refused, err := ebpf.LibraryClosure(b)
+		if err != nil {
+			log.Warnf("trust guard: could not resolve library closure of %s: %v", b, err)
+			continue
+		}
+		for _, l := range closure {
+			libSet[l] = struct{}{}
+		}
+		for l, why := range refused {
+			if rejected[l] == nil {
+				rejected[l] = &libRejection{why: why}
+			}
+			rejected[l].bins = append(rejected[l].bins, b)
+		}
+	}
+	return rejected
+}
+
+type libRejection struct {
+	why  error
+	bins []string
+}
+
+// warnUntrustedLibs reports closure libraries trust_mmap will refuse: not root-owned, and neither
+// inside a guarded tree nor a reserved name loaded by one of its writers. One line per library.
+func warnUntrustedLibs(rejected map[string]*libRejection, dirs []string, r guard.GlobReservations) {
+	libs := make([]string, 0, len(rejected))
+	for l := range rejected {
+		libs = append(libs, l)
+	}
+	sort.Strings(libs)
+	for _, l := range libs {
+		rej := rejected[l]
+		if inGuardedTree(l, dirs) || slices.ContainsFunc(rej.bins, func(b string) bool { return r.LibTrusted(b, l) }) {
+			continue
+		}
+		log.Warnf("library closure: %s will be refused (%v; not in a guarded tree, not a reserved "+
+			"library of its app) — loaded by %d whitelisted binary(ies); add it via allow_lib or a "+
+			"lib_dir if a load is denied", l, rej.why, len(rej.bins))
+	}
+}
+
+func inGuardedTree(path string, dirs []string) bool {
+	for _, d := range dirs {
+		if path == d || strings.HasPrefix(path, d+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func keys(m map[string]struct{}) []string {
@@ -101,7 +152,7 @@ type trustManager struct {
 // library-load allowlist (#2) and reserved glob names (#3), all always enforced. Best-effort: a failure logs and starts
 // nothing, never blocking startup or per-resource enforcement.
 func startTrustGuard(cfg *daemonconfig.Config) *trustManager {
-	binaries, libs, dirs := buildTrustedSet(cfg)
+	binaries, libs, dirs, rejected := buildTrustedSet(cfg)
 	if len(binaries) == 0 {
 		return &trustManager{} // no whitelisted binaries: nothing to protect
 	}
@@ -111,7 +162,7 @@ func startTrustGuard(cfg *daemonconfig.Config) *trustManager {
 			"unavailable; per-resource enforcement is unaffected", err)
 		return &trustManager{}
 	}
-	if err := applyTrustSet(tg, cfg, binaries, libs, dirs); err != nil {
+	if err := applyTrustSet(tg, cfg, binaries, libs, dirs, rejected); err != nil {
 		log.Warnf("trust guard: %v — not started", err)
 		tg.Stop()
 		return &trustManager{}
@@ -131,8 +182,8 @@ func (m *trustManager) reload(cfg *daemonconfig.Config) {
 	if m == nil || m.tg == nil {
 		return
 	}
-	binaries, libs, dirs := buildTrustedSet(cfg)
-	if err := applyTrustSet(m.tg, cfg, binaries, libs, dirs); err != nil {
+	binaries, libs, dirs, rejected := buildTrustedSet(cfg)
+	if err := applyTrustSet(m.tg, cfg, binaries, libs, dirs, rejected); err != nil {
 		log.Warnf("trust guard: reload could not re-apply the trusted set (%v) — keeping the previous set", err)
 		return
 	}
@@ -145,7 +196,8 @@ func (m *trustManager) stop() {
 	}
 }
 
-func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, libs, dirs []string) error {
+func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, libs, dirs []string,
+	rejected map[string]*libRejection) error {
 	if err := tg.SetGuardedDirs(dirs); err != nil {
 		return fmt.Errorf("recording guarded roots: %w", err)
 	}
@@ -156,8 +208,10 @@ func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, lib
 	if err != nil {
 		return fmt.Errorf("listing users for reserved glob names: %w", err)
 	}
-	if err := tg.SetGlobReservations(buildGlobReservations(cfg, users)); err != nil {
+	reservations := buildGlobReservations(cfg, users)
+	if err := tg.SetGlobReservations(reservations); err != nil {
 		return fmt.Errorf("reserving glob names: %w", err)
 	}
+	warnUntrustedLibs(rejected, dirs, reservations)
 	return nil
 }
