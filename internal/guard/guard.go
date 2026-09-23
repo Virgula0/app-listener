@@ -243,21 +243,34 @@ func eventMask(types []ebpf.EventType) (uint32, error) {
 	return mask, nil
 }
 
-// VerifyLoad loads every guard eBPF program into this kernel's verifier and releases them; it
-// attaches nothing.
+// VerifyLoad loads every guard and trust eBPF program into this kernel's verifier and releases
+// them; it attaches nothing.
 //
 // A non-nil error means a program was rejected (verifier complexity budget or CO-RE relocation):
 // enforcement is impossible, so callers MUST treat it as fatal (daemon refuses to start; install
 // aborts before enabling the service). CO-RE fixes offsets but not verifier complexity, so a
-// prebuilt binary can fail on a newer kernel.
+// prebuilt binary can fail on a newer kernel. The trust object is best-effort at runtime, but a
+// rejection there silently drops every trust protection, so the preflight refuses it too.
 func VerifyLoad() error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("removing memlock rlimit (need CAP_SYS_RESOURCE / root): %w", err)
 	}
-	spec, err := LoadGuard()
-	if err != nil {
-		return fmt.Errorf("reading embedded guard objects: %w", err)
+	for _, obj := range []struct {
+		name string
+		load func() (*cilium.CollectionSpec, error)
+	}{{"guard", LoadGuard}, {"trust", LoadGuardTrust}} {
+		spec, err := obj.load()
+		if err != nil {
+			return fmt.Errorf("reading embedded %s objects: %w", obj.name, err)
+		}
+		if err := verifyCollection(spec); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func verifyCollection(spec *cilium.CollectionSpec) error {
 	coll, err := cilium.NewCollection(spec)
 	if err != nil {
 		// Dump the FULL verifier log (%+v) to a file; the wrapped error is truncated.

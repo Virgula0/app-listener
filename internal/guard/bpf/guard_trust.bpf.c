@@ -13,6 +13,9 @@
 //     - a root-owned file in a root-only-writable directory (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
 //     - inside a GUARDED resource tree (whitelist mode: only whitelisted binaries create/modify files there, so nothing can be planted). This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
 //   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused.
+//   #3 reserved glob names: the catalog refresh turns whitelist globs with user-writable wildcard
+//     dirs (Steam's common/*/files/bin/wineserver) into trust grants, so only the entry's own
+//     binaries may bind a name such a glob fixes anywhere below its fixed root (see glob_denied).
 //
 // Both are ALWAYS enforced once attached (no observe/enforce toggle). Attach is best-effort; a
 // rejected program never affects the per-resource guards.
@@ -26,6 +29,9 @@
 #define FMODE_WRITE 0x2
 #define S_IWGRP 00020
 #define S_IWOTH 00002
+#define S_IFMT 00170000
+#define S_IFDIR 0040000
+#define RENAME_EXCHANGE (1 << 1)
 
 // Open flags for provenance. Only flags that GUARANTEE creation are accepted: O_CREAT|O_EXCL fails
 // if the name exists, __O_TMPFILE always makes a new anonymous inode. Bare O_CREAT is NOT enough:
@@ -45,6 +51,7 @@
 // trust_event.kind
 #define TRUST_LIBLOAD 0    // a whitelisted binary mapped an untrusted library
 #define TRUST_WRITEBLOCK 1 // a non-app tried to modify a protected binary
+#define TRUST_PLANT 2      // a non-writer tried to bind a reserved glob name
 
 struct inode_key {
 	__u64 dev;
@@ -106,6 +113,75 @@ struct {
 	__type(value, struct jit_origin);
 } guard_jit_origin SEC(".maps");
 
+// #3 maps. A bit is one reserved name pattern (userspace assigns them, at most 64): a name is
+// reserved below a root when both carry the bit, and a writer may bind it when the writer does.
+#define GLOB_NAME_MAX 32
+#define GLOB_EXACT 1
+#define GLOB_PREFIX 2
+#define GLOB_SUFFIX 3
+#define GLOB_AFFIX_MAX 8
+
+struct glob_name_key {
+	__u8 kind;
+	__u8 len;
+	__u8 pad[6];
+	char s[GLOB_NAME_MAX];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, struct glob_name_key);
+	__type(value, __u64);
+} guard_glob_names SEC(".maps");
+
+// guard_glob_affixes lists the distinct (kind, len) prefix/suffix shapes in guard_glob_names, so a
+// name is probed with one lookup per shape. kind 0 ends the list.
+struct glob_affix {
+	__u8 kind;
+	__u8 len;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, GLOB_AFFIX_MAX);
+	__type(key, __u32);
+	__type(value, struct glob_affix);
+} guard_glob_affixes SEC(".maps");
+
+// guard_glob_roots: a glob's fixed root (or its deepest existing ancestor) -> bits reserved at any
+// depth below it. Any depth over-approximates the glob, never under-approximates it.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_glob_roots SEC(".maps");
+
+// guard_glob_children: each existing fixed component between $HOME and a root, as (parent, name).
+// Roots are keyed by inode, so renaming one away and recreating it would yield an unregistered
+// root; reserving the name in its parent makes the recreation need a writer too.
+struct glob_child_key {
+	struct inode_key parent;
+	char s[GLOB_NAME_MAX];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct glob_child_key);
+	__type(value, __u64);
+} guard_glob_children SEC(".maps");
+
+// guard_glob_writers: exe inode -> bits it may bind. Only the owning catalog entry's binaries, not
+// every whitelisted one: git whitelisted for ~/.config/git must not `git clone` a wineserver.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_glob_writers SEC(".maps");
+
 struct trust_event {
 	__u32 pid;
 	__u32 uid;
@@ -154,24 +230,29 @@ static __always_inline __u8 trusted_flags_of(struct inode *inode)
 	return f ? *f : 0;
 }
 
-// current_exe_flags returns the trusted-file flags of the current process's main exe
-// (mm->exe_file); 0 for kernel threads or an unresolvable exe.
-static __always_inline __u8 current_exe_flags(void)
+// current_exe_inode returns the current process's main exe inode (mm->exe_file); NULL for kernel
+// threads or an unresolvable exe.
+static __always_inline struct inode *current_exe_inode(void)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	if (!task)
-		return 0;
+		return NULL;
 	struct mm_struct *mm;
 	bpf_probe_read_kernel(&mm, sizeof(mm), &task->mm);
 	if (!mm)
-		return 0;
+		return NULL;
 	struct file *exe_file;
 	bpf_probe_read_kernel(&exe_file, sizeof(exe_file), &mm->exe_file);
 	if (!exe_file)
-		return 0;
-	struct inode *inode;
+		return NULL;
+	struct inode *inode = NULL;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &exe_file->f_inode);
-	return trusted_flags_of(inode);
+	return inode;
+}
+
+static __always_inline __u8 current_exe_flags(void)
+{
+	return trusted_flags_of(current_exe_inode());
 }
 
 // caller_is_app: the current exe is a whitelisted application binary (a valid modifier/updater for
@@ -443,6 +524,162 @@ static __always_inline void emit(struct dentry *dentry, __u32 kind)
 	bpf_ringbuf_submit(e, 0);
 }
 
+// --- #3: reserved glob names ---
+
+static __always_inline int dentry_is_dir(struct dentry *d)
+{
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &d->d_inode);
+	if (!inode)
+		return 0;
+	umode_t mode = 0;
+	bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode);
+	return (mode & S_IFMT) == S_IFDIR;
+}
+
+static __always_inline struct dentry *dentry_parent(struct dentry *d)
+{
+	struct dentry *parent = NULL;
+	bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
+	return parent;
+}
+
+static __always_inline __u64 current_writer_bits(void)
+{
+	struct inode_key k = {};
+	if (!fill_inode_key(current_exe_inode(), &k))
+		return 0;
+	__u64 *v = bpf_map_lookup_elem(&guard_glob_writers, &k);
+	return v ? *v : 0;
+}
+
+// glob_name_bits: the reserved patterns matching name (exact, then one probe per affix shape).
+static __always_inline __u64 glob_name_bits(const unsigned char *name, __u32 n)
+{
+	struct glob_name_key k = {};
+	__u64 bits = 0;
+	__u64 *v;
+	if (n < GLOB_NAME_MAX) {
+		k.kind = GLOB_EXACT;
+		k.len = n;
+		bpf_probe_read_kernel(k.s, n & (GLOB_NAME_MAX - 1), name);
+		v = bpf_map_lookup_elem(&guard_glob_names, &k);
+		if (v)
+			bits |= *v;
+	}
+	for (__u32 i = 0; i < GLOB_AFFIX_MAX; i++) {
+		__u32 idx = i;
+		struct glob_affix *a = bpf_map_lookup_elem(&guard_glob_affixes, &idx);
+		if (!a || !a->kind)
+			break;
+		__u32 l = a->len;
+		if (!l || l >= GLOB_NAME_MAX || l > n)
+			continue;
+		__builtin_memset(&k, 0, sizeof(k));
+		k.kind = a->kind;
+		k.len = l;
+		const unsigned char *src = name;
+		if (a->kind == GLOB_SUFFIX)
+			src += n - l;
+		bpf_probe_read_kernel(k.s, l & (GLOB_NAME_MAX - 1), src);
+		v = bpf_map_lookup_elem(&guard_glob_names, &k);
+		if (v)
+			bits |= *v;
+	}
+	return bits;
+}
+
+// glob_root_bits: the reservations of dir and its ancestors. 32 steps cover any glob: a match sits
+// a fixed, shallow distance below its root.
+static __always_inline __u64 glob_root_bits(struct dentry *dir)
+{
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dir->d_inode);
+	if (!inode)
+		return 0;
+	struct super_block *sb;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return 0;
+	dev_t dev = 0;
+	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+
+	struct inode_key k = {};
+	k.dev = dev;
+	__u64 bits = 0;
+	struct dentry *d = dir;
+	for (int i = 0; i < 32; i++) {
+		struct inode *di = NULL;
+		bpf_probe_read_kernel(&di, sizeof(di), &d->d_inode);
+		if (di) {
+			bpf_probe_read_kernel(&k.ino, sizeof(k.ino), &di->i_ino);
+			__u64 *v = bpf_map_lookup_elem(&guard_glob_roots, &k);
+			if (v)
+				bits |= *v;
+		}
+		struct dentry *parent = dentry_parent(d);
+		if (!parent || parent == d)
+			break;
+		d = parent;
+	}
+	return bits;
+}
+
+// glob_denied: binding dentry's name in dir would create a path a catalog glob can match, and the
+// current exe is not a writer for it. Covers create/mkdir/symlink/link/rename-to and write-opens
+// of a matched file the refresh has not whitelisted yet.
+static __noinline int glob_denied(struct dentry *dir, struct dentry *dentry)
+{
+	if (!dir || !dentry)
+		return 0;
+	const unsigned char *name = NULL;
+	__u32 n = 0;
+	bpf_probe_read_kernel(&name, sizeof(name), &dentry->d_name.name);
+	bpf_probe_read_kernel(&n, sizeof(n), &dentry->d_name.len);
+	if (!name || !n)
+		return 0;
+
+	__u64 reserved = 0;
+	if (n < GLOB_NAME_MAX) {
+		struct inode *dino = NULL;
+		bpf_probe_read_kernel(&dino, sizeof(dino), &dir->d_inode);
+		struct glob_child_key ck = {};
+		if (fill_inode_key(dino, &ck.parent)) {
+			bpf_probe_read_kernel(ck.s, n & (GLOB_NAME_MAX - 1), name);
+			__u64 *v = bpf_map_lookup_elem(&guard_glob_children, &ck);
+			if (v)
+				reserved |= *v;
+		}
+	}
+	__u64 bits = glob_name_bits(name, n);
+	if (bits)
+		reserved |= glob_root_bits(dir) & bits;
+	if (!reserved)
+		return 0;
+	return (reserved & ~current_writer_bits()) != 0;
+}
+
+// glob_move_denied: a directory moved under roots it was not already under carries its whole
+// subtree past glob_denied's per-name check (plant outside, mv in).
+static __noinline int glob_move_denied(struct dentry *from_dir, struct dentry *to_dir)
+{
+	if (!from_dir || !to_dir)
+		return 0;
+	__u64 fresh = glob_root_bits(to_dir);
+	if (!fresh)
+		return 0;
+	fresh &= ~glob_root_bits(from_dir);
+	if (!fresh)
+		return 0;
+	return (fresh & ~current_writer_bits()) != 0;
+}
+
+static __always_inline int deny_plant(struct dentry *dentry)
+{
+	emit(dentry, TRUST_PLANT);
+	return -EPERM;
+}
+
 // #2 library load allowlist: a whitelisted binary may map executable code only from a trusted
 // library (allow_lib) or an auto-trusted system file (root-owned, root-only-writable dir). An
 // untrusted exec-map is the shape of an LD_PRELOAD/dlopen of attacker code: always logged, denied
@@ -535,6 +772,24 @@ int trust_path_rename(unsigned long long *ctx)
 		if (r)
 			return r;
 	}
+	if (!old_dentry || !new_dentry)
+		return 0;
+
+	// #3: the new name, and a directory arriving under roots it wasn't under. RENAME_EXCHANGE also
+	// moves new_dentry's inode to the old name, so it is checked both ways.
+	struct dentry *old_dir = path_dentry((void *)ctx[0]);
+	struct dentry *new_dir = path_dentry((void *)ctx[2]);
+	unsigned int flags = (unsigned int)ctx[4];
+	if (glob_denied(new_dir, new_dentry))
+		return deny_plant(new_dentry);
+	if (dentry_is_dir(old_dentry) && glob_move_denied(old_dir, new_dir))
+		return deny_plant(new_dentry);
+	if (flags & RENAME_EXCHANGE) {
+		if (glob_denied(old_dir, old_dentry))
+			return deny_plant(old_dentry);
+		if (dentry_is_dir(new_dentry) && glob_move_denied(new_dir, old_dir))
+			return deny_plant(old_dentry);
+	}
 	return 0;
 }
 
@@ -564,7 +819,54 @@ int trust_file_open(unsigned long long *ctx)
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
 	if (!dentry)
 		return 0;
-	return deny_if_protected(inode, dentry);
+	int r = deny_if_protected(inode, dentry);
+	if (r)
+		return r;
+	// A match the refresh hasn't whitelisted yet (fresh Proton download) is not TRUSTED_BINARY.
+	if (glob_denied(dentry_parent(dentry), dentry))
+		return deny_plant(dentry);
+	return 0;
+}
+
+SEC("lsm/path_mknod")
+int trust_path_mknod(unsigned long long *ctx)
+{
+	// Also regular-file creation: open(O_CREAT) reaches it via may_o_create().
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (glob_denied(path_dentry((void *)ctx[0]), dentry))
+		return deny_plant(dentry);
+	return 0;
+}
+
+SEC("lsm/path_mkdir")
+int trust_path_mkdir(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (glob_denied(path_dentry((void *)ctx[0]), dentry))
+		return deny_plant(dentry);
+	return 0;
+}
+
+SEC("lsm/path_symlink")
+int trust_path_symlink(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (glob_denied(path_dentry((void *)ctx[0]), dentry))
+		return deny_plant(dentry);
+	return 0;
+}
+
+SEC("lsm/path_link")
+int trust_path_link(unsigned long long *ctx)
+{
+	struct dentry *old_dentry = (struct dentry *)ctx[0];
+	struct dentry *new_dentry = (struct dentry *)ctx[2];
+	if (glob_denied(path_dentry((void *)ctx[1]), new_dentry))
+		return deny_plant(new_dentry);
+	// A second name for a not-yet-whitelisted match would let it be rewritten under that name.
+	if (old_dentry && glob_denied(dentry_parent(old_dentry), old_dentry))
+		return deny_plant(old_dentry);
+	return 0;
 }
 
 // memfd_create() allocates its file without security_file_open(), so a memfd's provenance is
@@ -595,5 +897,10 @@ int trust_path_truncate(unsigned long long *ctx)
 		return 0;
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
-	return deny_if_protected(inode, dentry);
+	int r = deny_if_protected(inode, dentry);
+	if (r)
+		return r;
+	if (glob_denied(dentry_parent(dentry), dentry))
+		return deny_plant(dentry);
+	return 0;
 }

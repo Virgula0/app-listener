@@ -2129,3 +2129,132 @@ need_encryption: false
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
+
+// steamGlobConfig guards a Steam location so the catalog's Steam globs are reserved for root's
+// home, with a dash copy standing in for the Steam client (its builtins write as its own inode).
+// /usr/bin/bash is whitelisted for an unrelated resource: the confused deputy.
+const (
+	steamDir        = "/root/.local/share/Steam"
+	steamCommon     = steamDir + "/steamapps/common"
+	steamClient     = steamDir + "/ubuntu12_32/steam"
+	steamGlobConfig = `[watch ` + steamDir + `/config]
+need_encryption: false
+` + steamClient + `
+
+[watch /protected]
+need_encryption: false
+/usr/bin/bash`
+)
+
+// steamTools holds pressure-vessel's pv-*/srt-*/*-capsule-capture-libs helpers. Created before the
+// daemon starts: pv-runtime itself matches pv-*, so only a Steam binary may create it afterwards.
+const steamTools = steamDir + "/steamrt64/pv-runtime/x/pressure-vessel/libexec/steam-runtime-tools-0"
+
+func (s *IntegrationSuite) startSteamGlobDaemon(c testcontainers.Container) {
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener " + steamDir + "/config " + steamCommon + " " + steamTools +
+			" $(dirname " + steamClient + ") && cp /usr/bin/dash " + steamClient +
+			" && cp /usr/bin/true /tmp/stealer"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/glob_plant"), "/exploits/glob_plant", 0755),
+		"copy glob_plant")
+	s.startDaemon(c, steamGlobConfig)
+	s.Require().Contains(s.readDaemonLog(c), "reserved glob name(s)", "trust guard #3 was not populated")
+}
+
+// assertNotPlanted runs cmd (a plant attempt) and requires it to fail with path left absent.
+func (s *IntegrationSuite) assertNotPlanted(c testcontainers.Container, what, path string, cmd []string) {
+	code, out := s.exec(c, cmd)
+	s.Require().NotEqualf(0, code, "%s: planting %s must be denied: %s", what, path, out)
+	code, _ = s.exec(c, []string{"sh", "-c", "test -e " + shQuote(path) + " || test -L " + shQuote(path)})
+	s.Require().NotEqualf(0, code, "%s: %s exists after a denied plant", what, path)
+}
+
+// Vuln 3: a same-user process must not be able to create any path a catalog whitelist glob
+// matches (it would be whitelisted at the next refresh), by any route, while the wildcard dirs stay
+// otherwise writable.
+func (s *IntegrationSuite) TestDaemon_GlobPlant_NonWriterDenied() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startSteamGlobDaemon(c)
+
+	bin := steamCommon + "/exploit/files/bin"
+	ws := bin + "/wineserver"
+	code, out := s.exec(c, []string{"mkdir", "-p", bin})
+	s.Require().Equalf(0, code, "the wildcard dirs must stay writable: %s", out)
+
+	s.assertNotPlanted(c, "create", ws, []string{"sh", "-c", "echo x > " + ws})
+	s.assertNotPlanted(c, "symlink", ws, []string{"ln", "-s", "/tmp/stealer", ws})
+	s.assertNotPlanted(c, "hardlink", ws, []string{"ln", "/tmp/stealer", ws})
+	s.assertNotPlanted(c, "rename", ws, []string{"mv", "/tmp/stealer", ws})
+	s.assertNotPlanted(c, "mkdir", ws, []string{"mkdir", ws})
+	s.assertNotPlanted(c, "O_TMPFILE+linkat", ws, []string{"/exploits/glob_plant", "tmpfile", bin, ws})
+
+	// A directory assembled outside and moved in carries its content past the per-name check.
+	s.exec(c, []string{"sh", "-c", "mkdir -p /tmp/evil/files/bin && cp /usr/bin/true /tmp/evil/files/bin/wineserver"})
+	s.assertNotPlanted(c, "directory move", steamCommon+"/evil", []string{"mv", "/tmp/evil", steamCommon + "/evil"})
+
+	// Wildcard names: prefix (pv-*) and suffix (*-capsule-capture-libs).
+	s.assertNotPlanted(c, "prefix name", steamTools+"/pv-adverb", []string{"sh", "-c", "echo x > " + steamTools + "/pv-adverb"})
+	s.assertNotPlanted(c, "suffix name", steamTools+"/x86_64-linux-gnu-capsule-capture-libs",
+		[]string{"sh", "-c", "echo x > " + steamTools + "/x86_64-linux-gnu-capsule-capture-libs"})
+
+	// Negative controls: games keep writing their dirs, and only the fixed name is reserved.
+	for _, p := range []string{steamCommon + "/exploit/save.dat", bin + "/wineserver2", "/tmp/wineserver"} {
+		code, out = s.exec(c, []string{"sh", "-c", "echo x > " + p})
+		s.Require().Equalf(0, code, "%s is not a glob match and must stay writable: %s", p, out)
+	}
+
+	s.Require().Contains(s.readDaemonLog(c), "TRUST DENIED  op=PLANT", "denials must be logged")
+
+	// Renaming the root away is allowed, but recreating it would give an unregistered root.
+	code, out = s.exec(c, []string{"mv", steamCommon, steamCommon + ".old"})
+	s.Require().Equalf(0, code, "renaming the root away is harmless: %s", out)
+	s.assertNotPlanted(c, "root recreation", steamCommon, []string{"mkdir", steamCommon})
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Vuln 3: the owning app still installs new versions (the wildcard dir is new, the reserved name
+// is written by its own binary), and until the refresh whitelists that fresh match, nothing else,
+// not even a binary whitelisted for another resource, may rewrite or alias it.
+func (s *IntegrationSuite) TestDaemon_GlobPlant_OwnWriterAllowed() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startSteamGlobDaemon(c)
+
+	bin := steamCommon + "/newVersion/files/bin"
+	ws := bin + "/wineserver"
+	s.exec(c, []string{"mkdir", "-p", bin})
+	code, out := s.exec(c, []string{steamClient, "-c", "printf STEAM > " + ws})
+	s.Require().Equalf(0, code, "Steam's own binary must create %s: %s", ws, out)
+
+	for _, tc := range []struct {
+		what string
+		cmd  []string
+	}{
+		{"append", []string{"sh", "-c", "echo evil >> " + ws}},
+		{"truncate", []string{"truncate", "-s", "0", ws}},
+		{"hardlink alias", []string{"ln", ws, "/tmp/alias"}},
+		{"rename over", []string{"sh", "-c", "cp /usr/bin/true /tmp/over && mv -f /tmp/over " + ws}},
+		{"exchange onto it", []string{"sh", "-c", "cp /usr/bin/true /tmp/swap && /exploits/glob_plant exchange /tmp/swap " + ws}},
+		{"exchange from it", []string{"sh", "-c", "cp /usr/bin/true /tmp/swap && /exploits/glob_plant exchange " + ws + " /tmp/swap"}},
+	} {
+		code, out = s.exec(c, tc.cmd)
+		s.Require().NotEqualf(0, code, "%s of the fresh match by a non-writer must be denied: %s", tc.what, out)
+		_, content := s.exec(c, []string{"cat", ws})
+		s.Require().Equalf("STEAM", content, "%s altered the fresh match", tc.what)
+	}
+
+	// Confused deputy: whitelisted, but for another resource.
+	deputy := steamCommon + "/deputy/files/bin"
+	s.exec(c, []string{"mkdir", "-p", deputy})
+	code, out = s.exec(c, []string{"/usr/bin/bash", "-c", "echo x > " + deputy + "/wineserver"})
+	s.Require().NotEqualf(0, code, "a binary whitelisted for another resource must not plant: %s", out)
+
+	code, out = s.exec(c, []string{steamClient, "-c", "printf UPDATED >> " + ws})
+	s.Require().Equalf(0, code, "Steam's own binary must keep updating it: %s", out)
+	_, out = s.exec(c, []string{"cat", ws})
+	s.Require().Equal("STEAMUPDATED", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

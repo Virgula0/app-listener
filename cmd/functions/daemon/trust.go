@@ -8,6 +8,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/install"
 )
 
 // buildTrustedSet computes the daemon-wide trusted sets from the config:
@@ -96,8 +97,8 @@ type trustManager struct {
 	tg *guard.TrustGuard
 }
 
-// startTrustGuard brings up the daemon-wide trust guard: binary write-protection (#1) and the
-// library-load allowlist (#2), both always enforced. Best-effort: a failure logs and starts
+// startTrustGuard brings up the daemon-wide trust guard: binary write-protection (#1), the
+// library-load allowlist (#2) and reserved glob names (#3), all always enforced. Best-effort: a failure logs and starts
 // nothing, never blocking startup or per-resource enforcement.
 func startTrustGuard(cfg *daemonconfig.Config) *trustManager {
 	binaries, libs, dirs := buildTrustedSet(cfg)
@@ -110,7 +111,7 @@ func startTrustGuard(cfg *daemonconfig.Config) *trustManager {
 			"unavailable; per-resource enforcement is unaffected", err)
 		return &trustManager{}
 	}
-	if err := applyTrustSet(tg, binaries, libs, dirs); err != nil {
+	if err := applyTrustSet(tg, cfg, binaries, libs, dirs); err != nil {
 		log.Warnf("trust guard: %v — not started", err)
 		tg.Stop()
 		return &trustManager{}
@@ -131,7 +132,7 @@ func (m *trustManager) reload(cfg *daemonconfig.Config) {
 		return
 	}
 	binaries, libs, dirs := buildTrustedSet(cfg)
-	if err := applyTrustSet(m.tg, binaries, libs, dirs); err != nil {
+	if err := applyTrustSet(m.tg, cfg, binaries, libs, dirs); err != nil {
 		log.Warnf("trust guard: reload could not re-apply the trusted set (%v) — keeping the previous set", err)
 		return
 	}
@@ -144,12 +145,19 @@ func (m *trustManager) stop() {
 	}
 }
 
-func applyTrustSet(tg *guard.TrustGuard, binaries, libs, dirs []string) error {
+func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, libs, dirs []string) error {
 	if err := tg.SetGuardedDirs(dirs); err != nil {
 		return fmt.Errorf("recording guarded roots: %w", err)
 	}
 	if err := tg.SetTrusted(binaries, libs); err != nil {
 		return fmt.Errorf("loading the trusted set: %w", err)
+	}
+	users, err := install.ListUsers()
+	if err != nil {
+		return fmt.Errorf("listing users for reserved glob names: %w", err)
+	}
+	if err := tg.SetGlobReservations(buildGlobReservations(cfg, users)); err != nil {
+		return fmt.Errorf("reserving glob names: %w", err)
 	}
 	return nil
 }

@@ -27,6 +27,7 @@ const (
 const (
 	trustLibload    uint32 = 0
 	trustWriteblock uint32 = 1
+	trustPlant      uint32 = 2
 )
 
 // TrustGuard owns guard_trusted_files and the daemon-wide trusted-binary/library protections
@@ -158,6 +159,10 @@ func (t *TrustGuard) hooks() []trustHook {
 		{t.objs.TrustPathUnlink, "path_unlink", false},
 		{t.objs.TrustPathRename, "path_rename", false},
 		{t.objs.TrustPathTruncate, "path_truncate", false},
+		{t.objs.TrustPathMknod, "path_mknod", false},
+		{t.objs.TrustPathMkdir, "path_mkdir", false},
+		{t.objs.TrustPathSymlink, "path_symlink", false},
+		{t.objs.TrustPathLink, "path_link", false},
 	}
 }
 
@@ -231,6 +236,9 @@ func (t *TrustGuard) readLoop() {
 		case trustWriteblock:
 			logTrustDenied("WRITE", comm, ev.PID, ev.UID, path,
 				"a non-whitelisted process tried to modify a protected binary")
+		case trustPlant:
+			logTrustDenied("PLANT", comm, ev.PID, ev.UID, path,
+				"only the owning app's binaries may create or modify a file a catalog whitelist glob would trust")
 		default:
 			logTrustDenied("LIBLOAD", comm, ev.PID, ev.UID, path,
 				"a whitelisted binary tried to exec-map an untrusted file "+
