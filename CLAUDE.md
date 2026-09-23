@@ -90,44 +90,86 @@ program could hang the kernel.
 **Why a 2k-instruction program costs ~1M steps.** The verifier symbolically executes
 *every path*, tracking each register's state. Every `if`, and every
 `bpf_map_lookup_elem` (returns NULL-or-valid = a branch), multiplies the paths after it;
-a fixed-bound `for` is unrolled, and each copy branches again. `guard_path_rename` is
-~2,253 real instructions and costs **959,231 processed** — a ~400x amplification, i.e.
-96% of budget with nothing to spare. The guard hooks walk dentry chains with a map
-lookup per step, and `path_rename`/`path_link` run those walks four times, so they are
-always the first to blow.
+a fixed-bound `for` is unrolled, and each copy branches again. The guard hooks walk
+dentry chains with a map lookup per step, and `path_rename`/`path_link` run those walks
+several times, so they are always the first to blow.
 
 **Why unrelated-looking edits break it.** The verifier prunes: reaching an instruction
 in a state it already proved safe from stops re-exploration. Pruning is heuristic and
 brittle — make two states differ in any tracked detail and a whole subtree is re-walked.
 Two calls with *identical* arguments prune; threading a differing argument through them
-does not, which can add 200k+ steps while the code grows 1%. Same reason clang 14 and
-clang 22 disagree on the same source (issue #45): different instruction order, different
-pruning.
+does not. Same reason clang 14 and clang 22 disagree on the same source (issue #45):
+different instruction order, different pruning.
 
-**Measure, never guess.** Code size does not predict verifier cost (a 22%-smaller object
-still blew the budget). `tools/bpfstats` loads each program separately and prints the
-real `processed N insns`, and diffs two objects per program:
+**The dominant cost is `__always_inline` on a big helper, not loop bounds.** A helper
+marked `__always_inline` is re-explored at every call site. `check_and_emit_ex` (the
+decision + ringbuf emit) was inlined at 43 sites, five inside `path_rename` alone;
+making it one shared body took `path_rename` from 959,231 to 704,352 processed insns
+(96% -> 70% of budget) and cut `path_link` and `path_symlink` by ~68%. By contrast,
+shrinking the ancestor-walk bound from 16 to 4 changed `path_link` by ~1% and nothing
+else at all. **Look at inlined helper expansions before touching traversal bounds** —
+bounds cost real coverage and, here, bought nothing.
+
+**Measure, never guess.** Neither object size nor intuition predicts verifier cost (a
+22%-smaller object still blew the budget). `tools/bpfstats` loads each program
+separately, prints the real `processed N insns`, diffs two objects per program, and
+dumps the full verifier log for rejects:
 
 ```sh
-sudo ./build/bpfstats new.o base.o   # go build -o build/bpfstats ./tools/bpfstats/
+go build -o build/bpfstats ./tools/bpfstats/
+sudo ./build/bpfstats new.o base.o      # keep a pre-change .o; make build overwrites it
 ```
 
-Keep a pre-change `.o` to diff against; `make build` regenerates over the old one.
+Read the FULL log, not the one-line tail: the tail is usually the verifier's stats
+line (`stack depth ...`), not the rejection. `%+v` on a `*ebpf.VerifierError` prints
+everything; `%v` truncates.
 
-**Rules of thumb**
-- Budget before adding: `path_rename` and `path_link` have almost none. Check with
-  `bpfstats` *first*.
+When the log doesn't say *which* part is expensive (low `total_states` with
+`processed 1000001` = one long re-walk, not a state explosion), **bisect by ablation**:
+build one `.o` per candidate piece removed, keep them outside `build/` (`make generate-guard`
+wipes `build/generated`), and measure them in one sweep. The first that loads names the cost.
+One trap: deleting a call whose results feed a later branch lets clang store-forward through
+the scratch map and fold that branch away, silently deleting more than intended — an ablation
+that gets *much* cheaper than its neighbours is usually that, not a finding.
+
+**Making a helper out-of-line**
+- `static __noinline` turns it into a BPF-to-BPF call: one body, explored per call site
+  but with far less duplication. It is the biggest single lever here.
+- BPF passes at most **5 arguments in registers** — a helper with more fails to compile
+  (`stack arguments are not supported`). Pack them in a `struct` and pass a pointer, with
+  an `__always_inline` filler so call sites keep their argument list (see `emit_with`).
+- Give each hook **one** args struct and reuse it. A compound literal per call site adds
+  its size to the caller's frame every time: five sites took `path_rename` to 336 bytes
+  and blew the limit.
+- Stack is capped at **512 bytes across the whole call chain**, not per function
+  (`stack depth 336+168+96` = 600 = rejected). Frames of callees add up.
+- It is not free: out-of-lining the ancestor walk cut `path_link` by 55k while adding
+  209k to `path_unlink`. Measure both ways.
+- **Two calls to it back-to-back on one path cost far more than two in sibling branches.**
+  The second is re-explored from every state the first one forked. `path_symlink` ran three
+  `check_and_emit` sites at 105k; adding a fourth *after* one of them on the same path went
+  over 1M. Branches are cheap, sequences are not — emit one decision per path.
+
+**Changing a map's key or value type: grep every access.** The verifier checks that a
+`bpf_map_lookup/update_elem` argument points at initialized stack of *at least* the map's
+key/value size — not that it *is* that type. A 16-byte `struct inode_key` passed to a map
+keyed by a 24-byte struct, or a `__u8` written into a `__u32`-valued map, loads fine
+whenever the neighbouring stack happens to be initialized, then silently reads garbage:
+lookups never match, stored values are random. Both happened here and both passed
+`daemon --check`. Userspace has the same trap — `cilium/ebpf` iteration with a wrong
+value type fails at the first row. After changing a layout, `grep -n '(&<map>,'` every
+site and check each argument's declared type.
+
+**Other levers**
 - Don't carry extra live state through a bounded walk; decide it once after the loop.
-- Keep repeated helper calls argument-identical so they prune, or restructure so the
-  expensive walk is expanded once.
-- `__always_inline` duplicates the body per call site. `static __noinline` makes it one
-  BPF-to-BPF call but each frame takes its own stack (512 B total across the chain), and
-  it can make pruning *worse* — it cut `path_link` by 55k while adding 209k to
-  `path_unlink`, and hit `stack depth 152+96+104+48`. Measure both ways.
 - Shrinking a map's value type helps: it is copied at every walk step.
-- The structural fix for an unrolled walk is `bpf_loop()` (kernel 5.17+): the callback is
-  verified **once** instead of per unrolled iteration. Prefer it over shaving bounds,
-  which trades traversal coverage for headroom.
+- `bpf_loop()` replaces an unrolled loop's per-iteration cost with one callback body — but
+  it does **not** verify that body once: since kernel 6.7 the verifier re-simulates the
+  callback until its state converges. Precisely tracked stack scalars in the callback's
+  context may never converge; keep carried state in a per-CPU map and re-look it up inside
+  the callback (see `symlink_scan_step`). It sets the guard's kernel floor at **5.17**.
+  A `bpf_loop` that won't verify is usually *not* why a program is over budget — measure
+  before assuming it is, which here was wrong twice.
 - `daemon --check` is the gate: it loads every guard program into this kernel's verifier.
   Rootless Docker **cannot** load BPF at all (capabilities do not cross the user
   namespace), so verifier work needs host root or rootful Docker.

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -60,6 +61,10 @@ func measure(path string) map[string]int {
 		case loadErr != nil:
 			out[name] = -1
 			fmt.Printf("  %-32s REJECTED  %s\n", name, short(loadErr))
+			dumpFullLog(name, loadErr)
+			if os.Getenv("BPFSTATS_TRACE") != "" {
+				dumpTrace(spec, name)
+			}
 		default:
 			out[name] = insns
 			fmt.Printf("  %-32s %9d insns\n", name, insns)
@@ -109,6 +114,61 @@ func compare(newer, older map[string]int) {
 	fmt.Printf("\n== delta (arg1 vs arg2), worst first\n")
 	for _, r := range rows {
 		fmt.Printf("  %-32s %9d -> %9d  %+d\n", r.name, r.oldVal, r.newVal, r.delta)
+	}
+}
+
+// dumpFullLog writes the COMPLETE verifier log for a rejected program. The one-line form is the
+// log's tail, which is usually not the line naming the actual rejection.
+func dumpFullLog(name string, err error) {
+	var ve *cilium.VerifierError
+	if !errors.As(err, &ve) {
+		return
+	}
+	path := fmt.Sprintf("/tmp/bpfstats-%s.log", name)
+	_ = os.Remove(path) // a previous run's copy belongs to the sudo user; sticky /tmp blocks rewriting it
+	if werr := os.WriteFile(path, []byte(fmt.Sprintf("%+v\n", ve)), 0o600); werr != nil {
+		fmt.Fprintf(os.Stderr, "    writing %s: %v\n", path, werr)
+		return
+	}
+	chownToSudoUser(path)
+	fmt.Printf("    full log -> %s\n", path)
+}
+
+// dumpTrace reloads a rejected program with the instruction-level log and keeps its last lines:
+// they show which code the verifier was walking when it hit the budget. The full trace of a
+// 1M-step walk is hundreds of MiB, so only the tail is written.
+func dumpTrace(spec *cilium.CollectionSpec, name string) {
+	one := &cilium.CollectionSpec{
+		Maps:     spec.Maps,
+		Programs: map[string]*cilium.ProgramSpec{name: spec.Programs[name]},
+	}
+	_, err := cilium.NewCollectionWithOptions(one, cilium.CollectionOptions{
+		Programs: cilium.ProgramOptions{LogLevel: cilium.LogLevelInstruction},
+	})
+	var ve *cilium.VerifierError
+	if !errors.As(err, &ve) {
+		fmt.Printf("    trace: %v\n", err)
+		return
+	}
+	lines := ve.Log
+	if len(lines) > 400 {
+		lines = lines[len(lines)-400:]
+	}
+	path := fmt.Sprintf("/tmp/bpfstats-%s.trace", name)
+	_ = os.Remove(path)
+	if werr := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); werr != nil {
+		fmt.Fprintf(os.Stderr, "    writing %s: %v\n", path, werr)
+		return
+	}
+	chownToSudoUser(path)
+	fmt.Printf("    trace tail -> %s\n", path)
+}
+
+// chownToSudoUser hands a file written as root back to the user who ran sudo.
+func chownToSudoUser(path string) {
+	if uid, err := strconv.Atoi(os.Getenv("SUDO_UID")); err == nil {
+		gid, _ := strconv.Atoi(os.Getenv("SUDO_GID"))
+		_ = os.Chown(path, uid, gid)
 	}
 }
 

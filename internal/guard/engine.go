@@ -49,9 +49,13 @@ type engine struct {
 	done    chan struct{}
 	started bool
 
-	// allows tracks each resource's whitelisted exe inodes, the source for the union and
-	// intersection views (noteAllow).
-	allows map[uint32]map[GuardInodeKey]struct{}
+	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
+	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).
+	allows map[uint32]map[GuardInodeKey]uint8
+	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
+	// that registered the backing devices, whose consumer labels them as such. Delivering them to
+	// every guard duplicated each denial and let the self-guards label it with their own path.
+	rawOwner *Guard
 
 	// pinPrefix is where the shared links are pinned (ConfigureSharedPinning). Empty = no pinning.
 	pinPrefix   string
@@ -169,6 +173,18 @@ func (e *engine) startLocked() error {
 	lsmAttached := len(e.links)
 	e.attachForkTaintLocked()
 
+	// The reserved slot must exist before any decision can land on it: res_cfg() treats an
+	// inactive slot as unknown and denies, which would make the raw block-device gate refuse
+	// everyone (and a process tainted by two resources un-ptraceable) rather than consult the
+	// intersection whitelist refreshGlobalLocked maintains.
+	if err := e.objs.GuardResConfig.Put(resGlobal, GuardResConfig{
+		Active: 1,
+		Mode:   uint64(ModeWhitelist),
+	}); err != nil {
+		e.stopLocked()
+		return fmt.Errorf("initializing the shared resource slot: %w", err)
+	}
+
 	rd, err := ringbuf.NewReader(e.objs.Rb)
 	if err != nil {
 		e.stopLocked()
@@ -176,7 +192,7 @@ func (e *engine) startLocked() error {
 	}
 	e.rd = rd
 	e.started = true
-	go e.readLoop()
+	go e.readLoop(rd)
 
 	log.Infof("guard engine — %d/%d LSM hooks attached once for every resource", lsmAttached, total)
 	return nil
@@ -304,13 +320,15 @@ func (e *engine) stopLocked() {
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.
-func (e *engine) readLoop() {
+// Takes the reader as an argument: stopLocked clears e.rd, which this goroutine outlives.
+func (e *engine) readLoop(rd *ringbuf.Reader) {
 	for {
-		rec, err := e.rd.Read()
+		rec, err := rd.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return
 			}
+			log.Errorf("guard: ringbuf read error: %v", err)
 			continue
 		}
 		ev, resID, ok := parseGuardEvent(rec.RawSample)
@@ -321,25 +339,48 @@ func (e *engine) readLoop() {
 	}
 }
 
-// deliver hands an event to its owning Guard. An event from the reserved slot has no single owner
-// (raw block-device gate), so it goes to every live Guard: dropping it would hide a denial.
+// deliver hands an event to its owning Guard. An event from the reserved slot belongs to no
+// resource; it goes to exactly one guard (see rawOwner), as the gate used to live in one guard.
 func (e *engine) deliver(resID uint32, ev *GuardEvent) {
 	e.mu.Lock()
-	var targets []*Guard
-	if resID == resGlobal {
-		for _, g := range &e.slots {
-			if g != nil {
-				targets = append(targets, g)
-			}
-		}
-	} else if resID < GuardMaxRes && e.slots[resID] != nil {
-		targets = append(targets, e.slots[resID])
+	var target *Guard
+	switch {
+	case resID == resGlobal:
+		target = e.globalOwnerLocked()
+	case resID < GuardMaxRes:
+		target = e.slots[resID]
 	}
 	e.mu.Unlock()
 
-	for _, g := range targets {
-		g.dispatch(ev)
+	if target != nil {
+		target.dispatch(ev)
 	}
+}
+
+// globalOwnerLocked is the guard that reports reserved-slot events: the raw-device owner while it
+// lives, else the lowest live slot so a denial is never silently dropped.
+func (e *engine) globalOwnerLocked() *Guard {
+	if e.rawOwner != nil {
+		for _, g := range &e.slots {
+			if g == e.rawOwner {
+				return g
+			}
+		}
+		e.rawOwner = nil
+	}
+	for _, g := range &e.slots {
+		if g != nil {
+			return g
+		}
+	}
+	return nil
+}
+
+// claimRawDevices makes g the reporter of raw block-device denials (it registered the devices).
+func (e *engine) claimRawDevices(g *Guard) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.rawOwner = g
 }
 
 // noteAllow records that res permits exe, and refreshes the two cross-resource views:
@@ -349,17 +390,17 @@ func (e *engine) deliver(resID uint32, ev *GuardEvent) {
 //   - the reserved resGlobal whitelist holds the INTERSECTION, used where a decision belongs to no
 //     single resource. N separate guards each vetoed such an access independently, so anything
 //     short of the intersection would be weaker than the model this replaced.
-func (e *engine) noteAllow(res uint32, exe GuardInodeKey) error {
+func (e *engine) noteAllow(res uint32, exe GuardInodeKey, action uint8) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.allows == nil {
-		e.allows = make(map[uint32]map[GuardInodeKey]struct{})
+		e.allows = make(map[uint32]map[GuardInodeKey]uint8)
 	}
 	if e.allows[res] == nil {
-		e.allows[res] = make(map[GuardInodeKey]struct{})
+		e.allows[res] = make(map[GuardInodeKey]uint8)
 	}
-	e.allows[res][exe] = struct{}{}
+	e.allows[res][exe] = action
 
 	owner := res
 	var cur uint32
@@ -440,29 +481,36 @@ func (e *engine) refreshGlobalLocked() error {
 	if err := e.clearGlobalAllowsLocked(); err != nil {
 		return err
 	}
-	for exe := range e.allowIntersectionLocked() {
+	for exe, action := range e.allowIntersectionLocked() {
 		k := GuardResInodeKey{ResId: resGlobal, Ino: exe}
-		if err := e.objs.GuardExeActions.Put(k, uint8(GUARD_ALLOW)); err != nil {
+		if err := e.objs.GuardExeActions.Put(k, action); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// allowIntersectionLocked is the set of exe inodes every live resource allows.
-func (e *engine) allowIntersectionLocked() map[GuardInodeKey]struct{} {
-	var inter map[GuardInodeKey]struct{}
+// allowIntersectionLocked is the set of exe inodes every live resource allows, with the stricter
+// action where they differ: GUARD_ALLOW_ROOT (uid 0 only) wins over GUARD_ALLOW. Flattening to
+// GUARD_ALLOW would both widen a root-only grant and break the checks that look for the root-gated
+// self entry specifically (ptrace_access_check's metadata exception for the daemon's own process).
+func (e *engine) allowIntersectionLocked() map[GuardInodeKey]uint8 {
+	var inter map[GuardInodeKey]uint8
 	for _, set := range e.allows {
 		if inter == nil {
-			inter = make(map[GuardInodeKey]struct{}, len(set))
-			for k := range set {
-				inter[k] = struct{}{}
+			inter = make(map[GuardInodeKey]uint8, len(set))
+			for k, a := range set {
+				inter[k] = a
 			}
 			continue
 		}
-		for k := range inter {
-			if _, ok := set[k]; !ok {
+		for k, a := range inter {
+			other, ok := set[k]
+			switch {
+			case !ok:
 				delete(inter, k)
+			case other == uint8(GUARD_ALLOW_ROOT) || a == uint8(GUARD_ALLOW_ROOT):
+				inter[k] = uint8(GUARD_ALLOW_ROOT)
 			}
 		}
 	}

@@ -8,7 +8,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -94,11 +96,13 @@ type deferredBinary struct {
 type Guard struct {
 	// resID is this resource's slot in the shared engine's kernel tables; every per-resource map
 	// key carries it. See engine.
-	resID   uint32
-	events  chan GuardEvent
-	done    chan struct{}
-	mu      sync.Mutex
-	stopped bool
+	resID uint32
+	// eventsDropped counts events discarded because this guard's consumer stalled (dispatch).
+	eventsDropped atomic.Uint64
+	events        chan GuardEvent
+	done          chan struct{}
+	mu            sync.Mutex
+	stopped       bool
 
 	path      string
 	mode      Mode
@@ -1015,10 +1019,8 @@ func (g *Guard) populateMaps() error {
 		}
 	}
 
-	// Store the guarded path for symlink target matching
-	var pathBuf [256]byte
-	copy(pathBuf[:], g.path)
-	if putErr := g.objs().GuardPath.Put(g.resID, pathBuf); putErr != nil {
+	// Register the watch root for path_symlink's target check (guard_path: path -> resource).
+	if putErr := g.objs().GuardPath.Put(g.pathKey(), g.resID); putErr != nil {
 		return fmt.Errorf("storing guarded path: %w", putErr)
 	}
 
@@ -1086,6 +1088,9 @@ func (g *Guard) addBackingBlockDevice() error {
 }
 
 func (g *Guard) putBackingDevices(rdevs []uint32) error {
+	if len(rdevs) > 0 {
+		sharedEngine.claimRawDevices(g)
+	}
 	var val uint8 = 1
 	for _, rdev := range rdevs {
 		if err := g.objs().GuardFsDevices.Put(rdev, val); err != nil {
@@ -1717,8 +1722,12 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 	return ge, be.ResID, true
 }
 
-// dispatch delivers one decoded event to this guard's consumer. Non-blocking against Stop so a
-// stopped guard never wedges the shared reader.
+// dispatch delivers one decoded event to this guard's consumer.
+//
+// Never blocks: one reader now serves every resource, so waiting on a slow or absent consumer
+// would stall event delivery for ALL of them (the daemon runs dozens). A full channel drops the
+// event and counts it, which costs only telemetry — enforcement already happened in the kernel,
+// synchronously, and the BPF ringbuf itself drops on overflow for the same reason.
 func (g *Guard) dispatch(ev *GuardEvent) {
 	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions
 	// key on exe inode).
@@ -1728,6 +1737,11 @@ func (g *Guard) dispatch(ev *GuardEvent) {
 	select {
 	case g.events <- local:
 	case <-g.done:
+	default:
+		if dropped := g.eventsDropped.Add(1); dropped == 1 || dropped%1000 == 0 {
+			log.Warnf("guard %s: event consumer is not keeping up, %d event(s) dropped — "+
+				"enforcement is unaffected, only reporting", g.path, dropped)
+		}
 	}
 }
 
@@ -1830,8 +1844,13 @@ func (g *Guard) dropResourceState() {
 	if err := deleteResKeys(g.objs().GuardExeEvents, g.resID); err != nil {
 		log.Warnf("guard %s: clearing event masks: %v", g.path, err)
 	}
-	if err := g.objs().GuardPath.Delete(g.resID); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
-		log.Warnf("guard %s: clearing watch path: %v", g.path, err)
+	// Only if still ours: a reload registers the same path for the replacement guard before this
+	// one stops, and deleting it then would drop that guard's symlink-target check.
+	var owner uint32
+	if g.objs().GuardPath.Lookup(g.pathKey(), &owner) == nil && owner == g.resID {
+		if err := g.objs().GuardPath.Delete(g.pathKey()); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			log.Warnf("guard %s: clearing watch path: %v", g.path, err)
+		}
 	}
 }
 
@@ -1860,21 +1879,26 @@ func (g *Guard) deleteInodesOfResource() error {
 	return nil
 }
 
-// deleteResKeys drops every row of a (res_id, inode)-keyed map belonging to res.
+// deleteResKeys drops every row of a (res_id, inode)-keyed map belonging to res. It walks keys only
+// (NextKey): the maps it serves have different value types, and a mismatched value makes Iterate
+// fail on the first row — leaving the rows behind for whichever resource reuses the slot id.
 func deleteResKeys(m *cilium.Map, res uint32) error {
-	var (
-		key   GuardResInodeKey
-		val   uint64
-		stale []GuardResInodeKey
-	)
-	it := m.Iterate()
-	for it.Next(&key, &val) {
-		if key.ResId == res {
-			stale = append(stale, key)
+	var stale []GuardResInodeKey
+	var cur, next GuardResInodeKey
+	var prev any // nil starts from the first key
+	for {
+		err := m.NextKey(prev, &next)
+		if errors.Is(err, cilium.ErrKeyNotExist) {
+			break
 		}
-	}
-	if err := it.Err(); err != nil {
-		return err
+		if err != nil {
+			return err
+		}
+		if next.ResId == res {
+			stale = append(stale, next)
+		}
+		cur = next
+		prev = cur
 	}
 	for i := range stale {
 		if err := m.Delete(stale[i]); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
@@ -1929,7 +1953,7 @@ func (g *Guard) putExeAction(ik GuardInodeKey, action uint8) error {
 		return err
 	}
 	if action == GUARD_ALLOW || action == GUARD_ALLOW_ROOT {
-		return sharedEngine.noteAllow(g.resID, ik)
+		return sharedEngine.noteAllow(g.resID, ik, action)
 	}
 	return sharedEngine.noteDeny(g.resID, ik)
 }
@@ -1969,4 +1993,16 @@ func requirePinnedSelfAllowRoot(sharedPrefix, pinPrefix string, key GuardResInod
 		return fmt.Errorf("refusing to widen: self key is not GUARD_ALLOW_ROOT in the pinned guard at %s (got action %d)", pinPrefix, action)
 	}
 	return nil
+}
+
+// pathKey is this watch root as a guard_path key: no trailing slash (path_symlink matches at '/'
+// boundaries), zero-padded to MAX_PATH.
+func (g *Guard) pathKey() [256]byte {
+	var key [256]byte
+	p := g.path
+	if len(p) > 1 {
+		p = strings.TrimRight(p, "/")
+	}
+	copy(key[:], p)
+	return key
 }

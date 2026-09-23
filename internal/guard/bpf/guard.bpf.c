@@ -84,12 +84,9 @@ struct inode_key {
 // points, and the kernel caps those at BPF_MAX_TRAMP_LINKS (38).
 #define GUARD_MAX_RES 512
 
-// Ancestor-walk bounds. The walk only bridges the hops between a file and the nearest mapped
-// ancestor; deeper coverage comes from lazy discovery at open/mkdir. The two-walk hooks
-// (path_rename, path_link) run it twice and already carry the most expensive programs, so they use
-// the tighter bound to stay inside the verifier's 1M-insn budget.
+// Ancestor-walk bound: the walk only bridges the hops between a file and the nearest mapped
+// ancestor; deeper coverage comes from lazy discovery at open/mkdir.
 #define ANCESTOR_WALK 16
-#define ANCESTOR_WALK_TIGHT 8
 
 // GUARD_RES_NONE marks "no resource resolved". Decisions never run with it: helpers return 0
 // (not guarded) instead, and check_and_emit_ex denies if it ever reaches them.
@@ -152,12 +149,24 @@ struct {
 	__type(value, __u32);
 } guard_exe_events SEC(".maps");
 
+// Watch-root path -> owning res_id, for path_symlink's target check. Keyed by the path so one
+// lookup per '/'-boundary of the target covers every resource; comparing the target against each
+// resource's path in turn would not fit the verifier budget. Userspace stores paths without a
+// trailing slash, zero-padded to MAX_PATH.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, GUARD_MAX_RES);
-	__type(key, __u32);  // res_id
-	__type(value, char[MAX_PATH]);
+	__type(key, char[MAX_PATH]);
+	__type(value, __u32);
 } guard_path SEC(".maps");
+
+// Zero-padded prefix of a symlink target, built one byte at a time as a guard_path key.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, char[MAX_PATH]);
+} path_key_buf SEC(".maps");
 
 // Union of every resource's whitelist: which resource allows this binary at all, or
 // GUARD_RES_GLOBAL when several do. bprm_committed_creds needs "whitelisted anywhere" to taint an
@@ -717,7 +726,7 @@ static __always_inline int emit_process_denial(__u32 reason, __u32 type, struct 
 // The device is read once from the file's superblock; the watch root shares it, so a file on
 // another device can't have the root in its chain and the check is skipped. Per-ancestor probes are
 // inode-number only (probing every ancestor's superblock blew the verifier budget).
-static __always_inline int root_in_chain(struct dentry *dentry, struct inode *file_inode, int bound,
+static __noinline int root_in_chain(struct dentry *dentry, struct inode *file_inode, int bound,
 					 __u32 res_id)
 {
 	struct res_config *cfg = res_cfg(res_id);
@@ -937,8 +946,38 @@ static __always_inline int is_allow_action(const __u8 *action)
 	return 0;
 }
 
-static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, const char *dest_str, bool dest_is_user, struct dentry *dest_dentry, bool is_exec_open, bool quiet_allow, bool write_intent, __u32 reason, __u32 res_id)
+// emit_args bundles what a decision needs. BPF passes at most 5 arguments in registers, and this
+// carries ten — but more importantly it lets check_and_emit_args be ONE shared body instead of an
+// inline expansion per call site. path_rename alone has five, and each expansion re-explores the
+// whole decision for the verifier.
+struct emit_args {
+	struct dentry *dentry;
+	struct dentry *dest_dentry;
+	const char *dest_str;
+	__u32 type;
+	__u32 reason;
+	__u32 res_id;
+	bool dest_is_user;
+	bool is_exec_open;
+	bool quiet_allow;
+	bool write_intent;
+};
+
+static __noinline int check_and_emit_args(struct emit_args *a)
 {
+	if (!a)
+		return -EPERM;
+	__u32 type = a->type;
+	struct dentry *dentry = a->dentry;
+	const char *dest_str = a->dest_str;
+	bool dest_is_user = a->dest_is_user;
+	struct dentry *dest_dentry = a->dest_dentry;
+	bool is_exec_open = a->is_exec_open;
+	bool quiet_allow = a->quiet_allow;
+	bool write_intent = a->write_intent;
+	__u32 reason = a->reason;
+	__u32 res_id = a->res_id;
+
 	// An unresolved or retired resource must never reach a policy decision: deny.
 	struct res_config *cfg = res_cfg(res_id);
 	if (!cfg)
@@ -1066,10 +1105,40 @@ static __always_inline int check_and_emit_ex(__u32 type, struct dentry *dentry, 
 	return is_blocked ? -EPERM : 0;
 }
 
-// Wrapper for ordinary call sites: GUARD_REASON_NONE. The raw block-device gate calls
-// check_and_emit_ex with GUARD_REASON_RAW_DEVICE.
-#define check_and_emit(type, dentry, dest_str, dest_is_user, dest_dentry, is_exec_open, quiet_allow, res_id) \
-	check_and_emit_ex((type), (dentry), (dest_str), (dest_is_user), (dest_dentry), (is_exec_open), (quiet_allow), false, GUARD_REASON_NONE, (res_id))
+// check_and_emit_ex keeps the original argument list at the call sites and packs it for the shared
+// body. The raw block-device gate passes GUARD_REASON_RAW_DEVICE; every other site uses
+// check_and_emit, which defaults reason and write_intent.
+// emit_with fills the hook's single args slot and calls the shared body. Inlined, so it is not
+// bound by BPF's five-register argument limit; only check_and_emit_args is a real call.
+static __always_inline int emit_with(struct emit_args *a, __u32 type, struct dentry *dentry,
+				     const char *dest_str, bool dest_is_user,
+				     struct dentry *dest_dentry, bool is_exec_open,
+				     bool quiet_allow, bool write_intent, __u32 reason,
+				     __u32 res_id)
+{
+	a->type = type;
+	a->dentry = dentry;
+	a->dest_str = dest_str;
+	a->dest_is_user = dest_is_user;
+	a->dest_dentry = dest_dentry;
+	a->is_exec_open = is_exec_open;
+	a->quiet_allow = quiet_allow;
+	a->write_intent = write_intent;
+	a->reason = reason;
+	a->res_id = res_id;
+	return check_and_emit_args(a);
+}
+
+// Every hook that decides declares one `struct emit_args ea`: a compound literal per call site
+// costs the caller's frame ~35 bytes each, and path_rename has five — enough to blow the 512-byte
+// limit shared across the whole call chain.
+#define check_and_emit_ex(_type, _dentry, _dstr, _duser, _ddentry, _exec, _quiet, _wintent, _reason, _res) \
+	emit_with(ea, (_type), (_dentry), (_dstr), (_duser), (_ddentry), (_exec), (_quiet), \
+		  (_wintent), (_reason), (_res))
+
+#define check_and_emit(_type, _dentry, _dstr, _duser, _ddentry, _exec, _quiet, _res) \
+	check_and_emit_ex((_type), (_dentry), (_dstr), (_duser), (_ddentry), (_exec), (_quiet), \
+			  false, GUARD_REASON_NONE, (_res))
 
 // Lazy directory discovery for file_open: for a file in a directory not yet in guard_inodes, find
 // the farthest guarded ancestor and add the file's immediate parent, only if strictly within the
@@ -1147,6 +1216,8 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 SEC("lsm/file_open")
 int guard_file_open(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct file *file = (struct file *)ctx[0];
 	if (!file)
@@ -1196,6 +1267,8 @@ int guard_file_open(unsigned long long *ctx)
 SEC("lsm/mmap_file")
 int guard_mmap_file(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct file *file = (struct file *)ctx[0];
 	if (!file)
@@ -1225,6 +1298,8 @@ int guard_mmap_file(unsigned long long *ctx)
 SEC("lsm/file_permission")
 int guard_file_permission(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct file *file = (struct file *)ctx[0];
 	int mask = (int)ctx[1];
@@ -1261,6 +1336,8 @@ int guard_file_permission(unsigned long long *ctx)
 SEC("lsm/file_truncate")
 int guard_file_truncate(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct file *file = (struct file *)ctx[0];
 	if (!file)
@@ -1287,6 +1364,8 @@ int guard_file_truncate(unsigned long long *ctx)
 SEC("lsm/path_unlink")
 int guard_path_unlink(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[1];
 	if (!dentry)
@@ -1334,6 +1413,8 @@ int guard_path_unlink(unsigned long long *ctx)
 SEC("lsm/path_rename")
 int guard_path_rename(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *old_dentry = (struct dentry *)ctx[1];
 	struct dentry *new_dentry = (struct dentry *)ctx[3];
@@ -1359,7 +1440,7 @@ int guard_path_rename(unsigned long long *ctx)
 	}
 
 	// Deep-file coverage, source side.
-	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK_TIGHT))
+	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK))
 		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
 
 	// Destination-target side: a rename onto an existing file silently unlinks the victim
@@ -1397,7 +1478,7 @@ int guard_path_rename(unsigned long long *ctx)
 
 	// Deep-file coverage, destination side: moving INTO a guarded region whose parent isn't in the
 	// map.
-	if (new_parent && guarded_ancestor_within_limit(new_parent, &res, ANCESTOR_WALK_TIGHT)) {
+	if (new_parent && guarded_ancestor_within_limit(new_parent, &res, ANCESTOR_WALK)) {
 		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
 		if (ret != 0)
 			return ret;
@@ -1413,9 +1494,66 @@ int guard_path_rename(unsigned long long *ctx)
 	return 0;
 }
 
+// symlink_scan / symlink_scan_step find which watch roots a symlink target names, for
+// path_symlink's check (2).
+//
+// A root P matches when the target is P itself or lies below it (P followed by '/'): path_key_buf
+// holds target[0..i) zero-padded, so at every '/' or end it is an exact guard_path key, and a
+// similarly named sibling (/bypasses_fake for /bypasses) never forms it. Roots nest, and the
+// innermost (deepest) match wins — the same nearest-guarded-ancestor rule every other hook applies
+// via guarded_ancestor_within_limit, and guard_inodes likewise records one owning res_id per inode.
+// Exactly one decision may be emitted here: two sequential check_and_emit calls cost >1M insns
+// because the second re-explores the shared body from every state the first one forked (a single
+// call is ~105k). Read-only roots are skipped: the check stops an alias reaching content the
+// creator couldn't read, but a read-only tree is world-readable, and denying breaks tooling (Steam
+// re-points ~/.steam/bin* with `ln -s`).
+//
+// Run under bpf_loop, so the verifier checks this body once: unrolled, a map lookup per step with
+// the match result carried along pushed path_symlink past the 1M-insn budget.
+// Kept in a per-CPU map, not in the callback's stack context: since kernel 6.7 the verifier
+// re-simulates a bpf_loop callback until its state converges, and precisely tracked stack scalars
+// (compared against GUARD_RES_NONE) never do. Map contents are not tracked, so this converges.
+struct symlink_scan {
+	__u32 res;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct symlink_scan);
+} symlink_scan_buf SEC(".maps");
+
+static long symlink_scan_step(__u64 i, void *unused)
+{
+	__u32 key = 0;
+	char *target = bpf_map_lookup_elem(&tmp_buf, &key);
+	char *prefix = bpf_map_lookup_elem(&path_key_buf, &key);
+	struct symlink_scan *scan = bpf_map_lookup_elem(&symlink_scan_buf, &key);
+	if (!target || !prefix || !scan || i >= MAX_PATH)
+		return 1;
+	__u32 idx = (__u32)i;
+
+	char c = target[idx];
+	if ((c == '/' || c == '\0') && idx > 0) {
+		__u32 *hit = bpf_map_lookup_elem(&guard_path, prefix);
+		if (hit) {
+			__u32 owner = *hit;
+			if (!is_readonly_mode(owner))
+				scan->res = owner;
+		}
+	}
+	if (c == '\0')
+		return 1;
+	prefix[idx] = c;
+	return 0;
+}
+
 SEC("lsm/path_symlink")
 int guard_path_symlink(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
     struct dentry *dentry = (struct dentry *)ctx[1];
     const char *old_name = (const char *)ctx[2];
@@ -1432,56 +1570,38 @@ int guard_path_symlink(unsigned long long *ctx)
         return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false, res);
     }
 
-    // 2. Symlink TARGET into the guarded path. Skipped in GUARD_MODE_READONLY: the check stops an
-    // alias reaching content the creator couldn't read, but a read-only tree is world-readable, and
-    // denying breaks tooling (Steam re-points ~/.steam/bin* with `ln -s`). Symlinks created INSIDE
-    // the tree stay gated by (1). Secret files in whitelist mode (incl. fscrypt.key,
-    // edit-auth.hash) keep this check.
-    if (is_readonly_mode(res))
-        return 0;
-
     __u32 key = 0;
     char *oldname_buf = bpf_map_lookup_elem(&tmp_buf, &key);
     if (!oldname_buf)
+        return 0;
+    char *prefix = bpf_map_lookup_elem(&path_key_buf, &key);
+    if (!prefix)
         return 0;
 
     long ret = bpf_probe_read_kernel_str(oldname_buf, MAX_PATH, old_name);
     if (ret <= 0)
         return 0;
 
-    char *stored_path = bpf_map_lookup_elem(&guard_path, &key);
-    if (!stored_path)
+    for (int i = 0; i < MAX_PATH; i += 8)
+        *(__u64 *)(prefix + i) = 0;
+
+    struct symlink_scan *scan = bpf_map_lookup_elem(&symlink_scan_buf, &key);
+    if (!scan)
+        return 0;
+    scan->res = GUARD_RES_NONE;
+    bpf_loop(MAX_PATH, symlink_scan_step, NULL, 0);
+    __u32 target_res = scan->res;
+    if (target_res == GUARD_RES_NONE)
         return 0;
 
-    // Prefix match logic to protect contents of a watched directory
-    bool match = true;
-    for (int i = 0; i < MAX_PATH; i++) {
-        if (stored_path[i] == '\0') {
-            // End of the guarded path: a match if the symlink target ends here, continues as a
-            // sub-directory, or the stored path had a trailing slash.
-            if (oldname_buf[i] == '\0' || oldname_buf[i] == '/' || (i > 0 && stored_path[i-1] == '/')) {
-                break;
-            }
-            // Otherwise, it's just a similarly named folder (e.g., /bypasses_fake)
-            match = false;
-            break;
-        }
-        if (oldname_buf[i] != stored_path[i]) {
-            match = false;
-            break;
-        }
-    }
-
-    if (match) {
-        return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false, res);
-    }
-
-    return 0;
+    return check_and_emit(EVENT_SYMLINK, dentry, old_name, false, NULL, false, false, target_res);
 }
 
 SEC("lsm/path_link")
 int guard_path_link(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *old_dentry = (struct dentry *)ctx[0];
 	struct dentry *new_dentry = (struct dentry *)ctx[2];
@@ -1509,7 +1629,7 @@ int guard_path_link(unsigned long long *ctx)
 			return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 	}
 	// Deep-file coverage, source side.
-	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK_TIGHT))
+	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK))
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
@@ -1522,7 +1642,7 @@ int guard_path_link(unsigned long long *ctx)
 
 	// Deep-file coverage, destination side: linking INTO a guarded region whose parent isn't in the
 	// map.
-	if (new_parent && guarded_ancestor_within_limit(new_parent, &res, ANCESTOR_WALK_TIGHT))
+	if (new_parent && guarded_ancestor_within_limit(new_parent, &res, ANCESTOR_WALK))
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 
 	return 0;
@@ -1531,6 +1651,8 @@ int guard_path_link(unsigned long long *ctx)
 SEC("lsm/path_mkdir")
 int guard_path_mkdir(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[1];
 
@@ -1564,6 +1686,8 @@ int guard_path_mkdir(unsigned long long *ctx)
 SEC("lsm/path_truncate")
 int guard_path_truncate(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = get_dentry_from_path((void *)ctx[0]);
 	if (!dentry)
@@ -1579,6 +1703,8 @@ int guard_path_truncate(unsigned long long *ctx)
 SEC("lsm/inode_setattr")
 int guard_inode_setattr(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	// ctx[0]=mnt_idmap, [1]=dentry, [2]=iattr. Size changes are skipped:
 	// path_truncate/file_truncate own them and already deny (ATTR_FILE follows ftruncate(2));
@@ -1607,6 +1733,8 @@ int guard_inode_setattr(unsigned long long *ctx)
 SEC("lsm/inode_setxattr")
 int guard_inode_setxattr(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[1];
 	if (!dentry)
@@ -1624,6 +1752,8 @@ int guard_inode_setxattr(unsigned long long *ctx)
 SEC("lsm/inode_removexattr")
 int guard_inode_removexattr(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[1];
 	if (!dentry)
@@ -1641,6 +1771,8 @@ int guard_inode_removexattr(unsigned long long *ctx)
 SEC("lsm/path_mknod")
 int guard_path_mknod(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[1];
 	if (!dentry)
@@ -1660,6 +1792,8 @@ int guard_path_mknod(unsigned long long *ctx)
 SEC("lsm/path_rmdir")
 int guard_path_rmdir(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[1];
 	if (!dentry)
@@ -1699,6 +1833,8 @@ int guard_path_rmdir(unsigned long long *ctx)
 SEC("lsm/inode_getattr")
 int guard_inode_getattr(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = get_dentry_from_path((void *)ctx[0]);
 	if (!dentry)
@@ -1725,6 +1861,8 @@ int guard_inode_getattr(unsigned long long *ctx)
 SEC("lsm/inode_readlink")
 int guard_inode_readlink(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[0];
 	if (!dentry)
@@ -1746,6 +1884,8 @@ int guard_inode_readlink(unsigned long long *ctx)
 SEC("lsm/inode_getxattr")
 int guard_inode_getxattr(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[0];
 	if (!dentry)
@@ -1763,6 +1903,8 @@ int guard_inode_getxattr(unsigned long long *ctx)
 SEC("lsm/inode_listxattr")
 int guard_inode_listxattr(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = (struct dentry *)ctx[0];
 	if (!dentry)
@@ -1811,6 +1953,8 @@ int guard_inode_permission(unsigned long long *ctx)
 SEC("lsm/sb_mount")
 int guard_sb_mount(unsigned long long *ctx)
 {
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
 	__u32 res = GUARD_RES_NONE;
 	// ctx[1] is the mount point path (struct path *)
 	struct path *mount_path = (struct path *)ctx[1];
@@ -1900,13 +2044,6 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	// tracer may have attached BEFORE the victim's exe identity was whitelisted (so the attach
 	// check couldn't deny) and PEEKDATA fires no further hook. Allow the exec only if the tracer is
 	// whitelisted.
-	//
-	// Read-only guards (lib_dir trees, /etc/app-listener) are skipped like every other taint site:
-	// their contents are world-readable code, and tainting their writers would lock most of e.g.
-	// Steam's process tree out of inspection.
-	if (is_readonly_mode(res))
-		return 0;
-
 	struct linux_binprm *bprm = (struct linux_binprm *)ctx[0];
 	if (!bprm)
 		return 0;
@@ -1939,6 +2076,14 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	if (!union_res)
 		return 0;  // target is not whitelisted anywhere: not our concern
 	res = *union_res;
+
+	// Read-only guards (lib_dir trees, /etc/app-listener) are skipped like every other taint site:
+	// their contents are world-readable code, and tainting their writers would lock most of e.g.
+	// Steam's process tree out of inspection. Must come AFTER the union lookup — the mode belongs
+	// to a resource, and the exe only resolves to one here. GUARD_RES_GLOBAL (several resources
+	// allow this exe) taints: over-restricting beats dropping a non-read-only resource's veto.
+	if (is_readonly_mode(res))
+		return 0;
 
 	// Executing a whitelisted image taints the process IMMEDIATELY, so a tracer attaching after
 	// exec is denied even before the victim touches the tree. (Exec-open attribution in
@@ -2052,13 +2197,11 @@ int guard_inode_free(unsigned long long *ctx)
 SEC("lsm/bprm_committed_creds")
 int guard_bprm_committed(unsigned long long *ctx)
 {
-	__u32 res = GUARD_RES_NONE;
-	if (is_readonly_mode(res))
-		return 0; // read-only guards never taint
-
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
-	if (!bpf_map_lookup_elem(&guard_tainted_pids, &tgid))
+	__u32 *taint_res = bpf_map_lookup_elem(&guard_tainted_pids, &tgid);
+	if (!taint_res)
 		return 0;
+	__u32 res = *taint_res;
 
 	struct linux_binprm *bprm = (struct linux_binprm *)ctx[0];
 	if (!bprm)
@@ -2081,9 +2224,21 @@ int guard_bprm_committed(unsigned long long *ctx)
 	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
 	ik.dev = dev;
 
-	__u8 *action = bpf_map_lookup_elem(&guard_exe_actions, &ik);
-	if (is_allow_action(action))
-		return 0; // a whitelisted image may read the resource: stays tainted
+	// Keep the taint while the new image may still read what the process holds: judged by the
+	// owning resource's whitelist, or — for content from several resources — by whether ANY of them
+	// allows it. Clearing on the narrower test would drop protection a separate per-resource guard
+	// kept.
+	if (res == GUARD_RES_GLOBAL) {
+		if (bpf_map_lookup_elem(&guard_exe_union, &ik))
+			return 0;
+	} else {
+		struct res_inode_key rik = {};
+		rik.res_id = res;
+		rik.ino = ik;
+		__u8 *action = bpf_map_lookup_elem(&guard_exe_actions, &rik);
+		if (is_allow_action(action))
+			return 0; // a whitelisted image may read the resource: stays tainted
+	}
 
 	bpf_map_delete_elem(&guard_tainted_pids, &tgid);
 	return 0;
@@ -2104,13 +2259,15 @@ int guard_sched_process_fork(unsigned long long *ctx)
 
 	__u32 parent_tgid = 0;
 	bpf_probe_read_kernel(&parent_tgid, sizeof(parent_tgid), &parent->tgid);
-	if (!bpf_map_lookup_elem(&guard_tainted_pids, &parent_tgid))
+	__u32 *parent_res = bpf_map_lookup_elem(&guard_tainted_pids, &parent_tgid);
+	if (!parent_res)
 		return 0; // parent not tainted
 
 	__u32 child_tgid = 0;
 	bpf_probe_read_kernel(&child_tgid, sizeof(child_tgid), &child->tgid);
 
-	__u8 v = 1;
+	// The child holds the same content, so it inherits the same resource's judgement.
+	__u32 v = *parent_res;
 	if (bpf_map_update_elem(&guard_tainted_pids, &child_tgid, &v, BPF_ANY))
 		count_degrade(1);
 	return 0;

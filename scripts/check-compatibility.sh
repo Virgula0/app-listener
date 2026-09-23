@@ -147,9 +147,14 @@ else
 		fail "kernel $KERNEL_RELEASE is too old — monitor needs >= 5.8 (BPF ring buffer)"
 	fi
 	if version_at_least "5.10" "$KVER"; then
-		pass "kernel $KERNEL_RELEASE (>= 5.10, guard / network-guard / daemon)"
+		pass "kernel $KERNEL_RELEASE (>= 5.10, network-guard)"
 	else
-		fail "kernel $KERNEL_RELEASE < 5.10 — guard / network-guard / daemon need BPF-LSM bpf_link"
+		fail "kernel $KERNEL_RELEASE < 5.10 — network-guard needs BPF-LSM bpf_link"
+	fi
+	if version_at_least "5.17" "$KVER"; then
+		pass "kernel $KERNEL_RELEASE (>= 5.17, guard / daemon)"
+	else
+		fail "kernel $KERNEL_RELEASE < 5.17 — guard / daemon need the bpf_loop helper (their eBPF would not load)"
 	fi
 	version_at_least "6.2" "$KVER" || warn "kernel < 6.2 — the file_truncate LSM hook is unavailable (ftruncate on a pre-opened fd is not denied; path truncate still is)"
 fi

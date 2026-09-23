@@ -433,10 +433,20 @@ func (s *IntegrationSuite) TestGuard_PathUnlinkEvictsInodeImmediately() {
 // dependency, ~2s, three small packages) inside the container. Only tests that
 // must inspect live BPF map state directly need this — every other guard
 // behavior is provable through observable filesystem/process outcomes alone.
+// installBPFTool makes bpftool available for the tests that read a live BPF map. The install needs
+// the network, so each step is bounded: without a timeout an unreachable apt mirror blocks the
+// docker exec forever and the whole suite hangs with no output. A container that cannot get
+// bpftool skips the test rather than hanging or failing as if the guard were broken.
 func (s *IntegrationSuite) installBPFTool(c testcontainers.Container) {
-	code, out := s.exec(c, []string{"sh", "-c",
-		"command -v bpftool >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq --no-install-recommends bpftool)"})
-	s.Require().Equalf(0, code, "installing bpftool: %s", out)
+	_, out := s.exec(c, []string{"sh", "-c",
+		"command -v bpftool >/dev/null 2>&1 || " +
+			"(timeout 120 apt-get update -qq && timeout 120 apt-get install -y -qq --no-install-recommends bpftool)"})
+
+	code, _ := s.exec(c, []string{"sh", "-c", "command -v bpftool >/dev/null 2>&1"})
+	if code != 0 {
+		s.T().Skipf("bpftool could not be installed in the container (no network or apt mirror "+
+			"unreachable) — this test reads the live guard_inodes map and needs it: %s", out)
+	}
 }
 
 // guardInodesMapID resolves the BPF map ID of pid's own guard_inodes map via its fd table
@@ -2414,6 +2424,15 @@ func (s *IntegrationSuite) runGuardTest(c testcontainers.Container, subtest stri
 		"/guard.test", "-test.run", "TestGuardUnitTest/" + subtest, "-test.v",
 	})
 	s.Require().Equalf(0, code, "guard.test %s failed: %s", subtest, out)
+}
+
+// Resource ids in the shared guard engine are reused; a stopped resource's whitelist must not carry
+// over to the next resource that takes its slot.
+func (s *IntegrationSuite) TestGuard_SlotReuse_DoesNotInheritWhitelist() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestStoppedResourceWhitelistNotInheritedBySlotReuse")
 }
 
 // Deferred-whitelist flow (the Discord startup fix): a binary unreadable at guard-build time stays

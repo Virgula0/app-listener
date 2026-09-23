@@ -941,3 +941,40 @@ func TestMain(m *testing.M) {
 	}
 	os.Exit(m.Run())
 }
+
+// A stopped resource's whitelist rows must leave the shared maps: resource ids are reused, so a
+// surviving row would let the next resource in that slot inherit a binary it never allowed.
+func (s *guardUnitTest) TestStoppedResourceWhitelistNotInheritedBySlotReuse() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-slot-tool-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+	entry, err := ComputeBinaryEntry(tool)
+	s.Require().NoError(err)
+	dev, ino, err := ebpf.StatInode(tool)
+	s.Require().NoError(err)
+	exe := GuardInodeKey{Dev: dev, Ino: ino}
+
+	// Keeps the shared engine (and its maps) alive across the other guard's stop.
+	holder := s.newGuardedTree(s.T().TempDir(), nil, nil)
+	defer holder.Stop()
+
+	allowing := s.newGuardedTree(s.T().TempDir(), []BinaryEntry{entry}, nil)
+	slot := allowing.resID
+	var action uint8
+	s.Require().NoError(allowing.objs().GuardExeActions.Lookup(allowing.resKey(exe), &action),
+		"the whitelisted binary must be registered for its resource")
+	allowing.Stop()
+
+	s.Require().Error(holder.objs().GuardExeActions.Lookup(GuardResInodeKey{ResId: slot, Ino: exe}, &action),
+		"a stopped resource's whitelist row must be removed from the shared map")
+
+	reuser := s.newGuardedTree(s.T().TempDir(), nil, nil)
+	defer reuser.Stop()
+	s.Require().Equal(slot, reuser.resID, "fixture: the freed slot id is reused")
+	s.Require().Error(reuser.objs().GuardExeActions.Lookup(reuser.resKey(exe), &action),
+		"the resource reusing the slot must not inherit the previous resource's whitelist")
+}

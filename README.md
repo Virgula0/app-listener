@@ -30,9 +30,9 @@ Run `make check-compatibility` first — it performs every static check (kernel 
 |---|---|---|---|
 | **Arch Linux** | rolling (6.x) | ✅ **Fully supported** — all 23 LSM hooks attach | Add `bpf` to the `lsm=` list on your boot entry's kernel cmdline, reboot |
 | **Ubuntu 24.04 LTS** | 6.8 | ✅ **Fully supported** | Append `lsm=landlock,lockdown,yama,integrity,apparmor,bpf` to `GRUB_CMDLINE_LINUX_DEFAULT`, `sudo update-grub`, reboot |
-| **Ubuntu 22.04 LTS** | 5.15 (GA) | 🟡 **Partially supported** on the 5.15 GA kernel — a few later-kernel LSM hooks (notably `file_truncate`) are absent, so `ftruncate(2)` on a pre-opened fd is not denied (path `truncate(2)` still is); every other hook works. Install the HWE kernel (`linux-generic-hwe-22.04`, 6.x) for full support | same as 24.04 |
+| **Ubuntu 22.04 LTS** | 6.x (HWE) | 🟡 **HWE kernel only** — on the 5.15 GA kernel `guard` / `daemon` do not load (they need `bpf_loop`, kernel ≥ 5.17); `monitor` and `network-guard` still work there. Install the HWE kernel (`linux-generic-hwe-22.04`, 6.x) for full support | same as 24.04 |
 
-**Kernel floor:** `monitor` needs ≥ 5.8 (BPF ring buffer); `guard` / `network-guard` / `daemon` need ≥ 5.10 (BPF-LSM). Ubuntu 20.04 (kernel 5.4) is not supported. Only the two hooks `file_open` and `file_permission` are mandatory — every other LSM hook is best-effort: a kernel that lacks one logs a warning and keeps enforcing the rest.
+**Kernel floor:** `monitor` needs ≥ 5.8 (BPF ring buffer); `network-guard` needs ≥ 5.10 (BPF-LSM); `guard` / `daemon` need ≥ 5.17 (BPF-LSM plus the `bpf_loop` helper). Ubuntu 20.04 (kernel 5.4) is not supported. Only the two hooks `file_open` and `file_permission` are mandatory — every other LSM hook is best-effort: a kernel that lacks one logs a warning and keeps enforcing the rest.
 
 **Stock Ubuntu and cloud images compile `CONFIG_BPF_LSM=y` but do not activate it** — without the cmdline change the LSM hooks attach but never deny. `linux/amd64` is the released target; `linux/arm64` cross-compiles but is untested.
 
