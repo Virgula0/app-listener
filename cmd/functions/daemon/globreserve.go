@@ -58,6 +58,9 @@ func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
 	for _, g := range e.TrustGlobs(u.Name, u.Home) {
 		b.reserve(g, g.Name, writers)
 	}
+	for _, g := range e.LibDirGlobs(u.Name, u.Home) {
+		b.reserve(g, g.Name, writers)
+	}
 	// Library bits are per entry: the bit also grants loading (trust_mmap), and a "*.so" shared
 	// across entries would let one app's writers plant, and load, below another app's root.
 	for _, g := range e.ReservedLibGlobs(u.Name, u.Home) {

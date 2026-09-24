@@ -11,7 +11,7 @@
 //   #2 library load allowlist: a whitelisted process may map executable code only from a library a non-whitelisted process couldn't have written. A library qualifies if it is:
 //     - an explicit TRUSTED_LIB (allow_lib), or
 //     - a root-owned file in a root-only-writable directory (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
-//     - inside a GUARDED resource tree (whitelist mode: only whitelisted binaries create/modify files there, so nothing can be planted). This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
+//     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
 //     - a #3 reserved name below its root, mapped by one of that name's writers (glob_lib_trusted).
 //   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused.
 //   #3 reserved glob names: the catalog refresh turns whitelist globs with user-writable wildcard
@@ -68,16 +68,29 @@ struct {
 	__type(value, __u8);
 } guard_trusted_files SEC(".maps");
 
-// guard_trusted_dirs holds (dev, ino) of every guarded resource ROOT (dirs watched in whitelist
-// mode). A library whose path passes through one lives in a write-protected tree (only whitelisted
-// binaries may create/modify there), so it is trustworthy. Populated by userspace from the daemon's
-// resource list.
+// guard_trusted_dirs maps (dev, ino) of every guarded resource ROOT to who may load libraries from
+// below it. A whitelist-mode root (TRUSTED_DIR_ANY) is write-protected from everyone but its own
+// whitelist and unreadable to the rest, so any whitelisted binary may load from it. A read-only
+// lib_dir root is readable by all and written by its lib_binary writers only, so its libraries
+// are trusted only for exes carrying one of its bits in guard_libdir_users: a directory planted
+// before it became guarded must not load into another app (ssh, gpg). Populated by userspace from
+// the daemon's resource list.
+#define TRUSTED_DIR_ANY (1ULL << 63)
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
 	__type(key, struct inode_key);
-	__type(value, __u8);
+	__type(value, __u64);
 } guard_trusted_dirs SEC(".maps");
+
+// guard_libdir_users: exe inode -> the lib_dir bits (guard_trusted_dirs) it may load from.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_libdir_users SEC(".maps");
 
 // guard_jit_origin is the provenance ledger for runtime-generated code. GPU drivers (NVIDIA above
 // all) JIT into a file they create themselves (memfd, O_TMPFILE, mkstemp) and map it executable.
@@ -308,9 +321,9 @@ static __always_inline int is_system_trusted(struct inode *inode, struct dentry 
 	return inode_is_root_ro(pinode);
 }
 
-// under_guarded_tree: an ancestor (or the file itself) is a guarded root in guard_trusted_dirs. The
-// tree shares the file's device, so the device is read once and only inode numbers are compared per
-// ancestor (same shape as root_in_chain).
+// under_guarded_tree: the innermost guarded root at or above the file (guard_trusted_dirs) admits
+// the current exe. The tree shares the file's device, so the device is read once and only inode
+// numbers are compared per ancestor (same shape as root_in_chain).
 static __always_inline int under_guarded_tree(struct inode *inode, struct dentry *dentry)
 {
 	if (!inode || !dentry)
@@ -333,8 +346,16 @@ static __always_inline int under_guarded_tree(struct inode *inode, struct dentry
 		bpf_probe_read_kernel(&di, sizeof(di), &d->d_inode);
 		if (di) {
 			bpf_probe_read_kernel(&k.ino, sizeof(k.ino), &di->i_ino);
-			if (bpf_map_lookup_elem(&guard_trusted_dirs, &k))
-				return 1;
+			__u64 *users = bpf_map_lookup_elem(&guard_trusted_dirs, &k);
+			if (users) {
+				if (*users & TRUSTED_DIR_ANY)
+					return 1;
+				struct inode_key ek = {};
+				if (!fill_inode_key(current_exe_inode(), &ek))
+					return 0;
+				__u64 *bits = bpf_map_lookup_elem(&guard_libdir_users, &ek);
+				return bits && (*bits & *users);
+			}
 		}
 		struct dentry *parent;
 		bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
@@ -736,7 +757,7 @@ int trust_mmap(unsigned long long *ctx)
 	if (is_system_trusted(inode, dentry))
 		return 0; // auto-trusted root-owned system library
 	if (under_guarded_tree(inode, dentry))
-		return 0; // inside a write-protected guarded tree — attacker cannot plant here
+		return 0; // inside a write-protected guarded tree this exe may load from
 	if (jit_self_created(inode))
 		return 0; // runtime-generated code: this process made it, nothing else wrote it
 	if (glob_lib_trusted(dentry))

@@ -2041,11 +2041,23 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 	bpf_probe_read_kernel(&pid, sizeof(pid), &child->tgid);
 
 	__u32 *val = bpf_map_lookup_elem(&guard_tainted_pids, &pid);
-	if (!val)
-		return 0;  // child is not tainted — allow
-
-	// Judge the caller by the whitelist of the resource whose content the target holds.
-	res = *val;
+	if (val) {
+		// Judge the caller by the whitelist of the resource whose content the target holds.
+		res = *val;
+	} else {
+		// A read-only tree's writer is never tainted, but its image is what may write that tree
+		// (and the tree is trusted code): memory access needs a caller that tree also allows.
+		// Metadata-only inspection stays open.
+		if (!(mode & PTRACE_MODE_ATTACH))
+			return 0;
+		struct inode_key child_ino = {};
+		if (!get_task_exe_inode(child, &child_ino))
+			return 0;
+		__u32 *writer_res = bpf_map_lookup_elem(&guard_exe_union, &child_ino);
+		if (!writer_res || !is_readonly_mode(*writer_res))
+			return 0;
+		res = *writer_res;
+	}
 
 	// The owner's process (the daemon: the guard's only GUARD_ALLOW_ROOT entry) is tainted because
 	// it reads what it guards, but its secrets (fscrypt key, edit-auth hash) live in MEMORY,
@@ -2116,18 +2128,18 @@ int guard_bprm_check_security(unsigned long long *ctx)
 		return 0;  // target is not whitelisted anywhere: not our concern
 	res = *union_res;
 
-	// Read-only guards (lib_dir trees, /etc/app-listener) are skipped like every other taint site:
+	// Read-only guards (lib_dir trees, /etc/app-listener) don't taint, like every other taint site:
 	// their contents are world-readable code, and tainting their writers would lock most of e.g.
 	// Steam's process tree out of inspection. Must come AFTER the union lookup — the mode belongs
 	// to a resource, and the exe only resolves to one here. An exe several non-read-only resources
-	// allow resolves to their taint set (GLOBAL if none could be allocated).
-	if (is_readonly_mode(res))
-		return 0;
-
+	// allow resolves to their taint set (GLOBAL if none could be allocated). The traced-exec check
+	// below still applies to them: their image may write the tree.
+	//
 	// Executing a whitelisted image taints the process IMMEDIATELY, so a tracer attaching after
 	// exec is denied even before the victim touches the tree. (Exec-open attribution in
 	// check_and_emit handles the open itself.)
-	mark_tainted(res);
+	if (!is_readonly_mode(res))
+		mark_tainted(res);
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	if (!task)

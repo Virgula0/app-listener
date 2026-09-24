@@ -173,3 +173,27 @@ func TestGlobBuilder_LibBitsPerEntry(t *testing.T) {
 		t.Errorf("A's writer may plant or load *.so below B's root: writers %v roots %v", b.r.Writers, b.r.Roots)
 	}
 }
+
+// A lib_dir glob match is guarded by the next catalog refresh with whatever it already holds, so
+// its wildcard component must be reserved for the entry's writers like a whitelist glob.
+func TestBuildGlobReservations_SteamLibDirGlobs(t *testing.T) {
+	home := t.TempDir()
+	steam := filepath.Join(home, ".local/share/Steam")
+	common := filepath.Join(steam, "steamapps/common")
+	mkdirs(t, filepath.Join(steam, "config"), common)
+	client := filepath.Join(steam, "ubuntu12_32/steam")
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: filepath.Join(steam, "config"), Binaries: []daemonconfig.BinaryRule{{Path: client}}},
+	}}
+	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+
+	for _, name := range []string{"Proton*", "SteamLinuxRuntime_*"} {
+		bit := bitOf(t, r, name)
+		if r.Roots[common]&bit == 0 {
+			t.Errorf("%s not reserved below %s: %v", name, common, r.Roots)
+		}
+		if r.Writers[client]&bit == 0 {
+			t.Errorf("the Steam client must be a writer of %s: %v", name, r.Writers)
+		}
+	}
+}

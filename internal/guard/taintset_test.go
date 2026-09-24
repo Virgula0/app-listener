@@ -82,3 +82,38 @@ func TestIsSubset(t *testing.T) {
 		t.Fatal("isSubset")
 	}
 }
+
+// Guards are added one at a time, each minting a larger set; only the sets an exe still maps to
+// may carry rows, or guard_taint_members (4096) overflows past ~38 resources.
+func TestPlanMemberRows_SupersededSetsHaveNoRows(t *testing.T) {
+	const n = 48
+	info := make(map[uint32]resInfo, n)
+	var paths []string
+	sets := make(map[string]uint32)
+	for i := uint32(1); i <= n; i++ {
+		info[i] = resInfo{path: string(rune('A'+i/26)) + string(rune('a'+i%26))}
+		paths = append(paths, info[i].path)
+		if i >= 2 {
+			sets[setKeyOf(append([]string(nil), paths...))] = GuardMaxRes - i
+		}
+	}
+	last := uint32(GuardMaxRes - n)
+	rows := planMemberRows(sets, info, map[uint32]struct{}{last: {}})
+	if len(rows) != n {
+		t.Fatalf("got %d rows, want %d (one per member of the only used set)", len(rows), n)
+	}
+	for k := range rows {
+		if k.Set != last {
+			t.Fatalf("row for superseded set %d", k.Set)
+		}
+	}
+
+	small := sets[setKeyOf(paths[:2])]
+	rows = planMemberRows(sets, info, map[uint32]struct{}{last: {}, small: {}})
+	if _, ok := rows[GuardTaintMemberKey{Set: last, Member: small}]; !ok {
+		t.Fatal("a used set must list the used sets it covers")
+	}
+	if len(rows) != n+1+2 {
+		t.Fatalf("got %d rows, want %d", len(rows), n+1+2)
+	}
+}

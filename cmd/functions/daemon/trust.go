@@ -19,18 +19,18 @@ import (
 //   - libs: each binary's static library closure, the allow_lib entries and /etc/ld.so.preload
 //     (TRUSTED_LIB);
 //   - dirs: every guarded resource root, so libraries inside those write-protected trees are
-//     trusted without allow_lib.
+//     trusted without allow_lib (a read-only lib_dir only for its own writers).
 //
 // A currently-unresolvable binary/library is skipped and picked up by the periodic re-sync: a
 // coverage gap, never a protection gap. rejected maps each closure library that is not safe to
 // auto-trust to why and to the binaries loading it (warnUntrustedLibs).
-func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string, rejected map[string]*libRejection) {
+func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs []string, dirs []guard.TrustedDir,
+	rejected map[string]*libRejection) {
 	binSet := make(map[string]struct{})
 	libSet := make(map[string]struct{})
-	dirSet := make(map[string]struct{})
 
 	for i := range cfg.Resources {
-		dirSet[cfg.Resources[i].Path] = struct{}{}
+		dirs = append(dirs, trustedDirOf(&cfg.Resources[i]))
 		for _, b := range cfg.Resources[i].Binaries {
 			binSet[b.Path] = struct{}{}
 		}
@@ -72,7 +72,22 @@ func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs, dirs []string, r
 		}
 	}
 
-	return keys(binSet), keys(libSet), keys(dirSet), rejected
+	return keys(binSet), keys(libSet), dirs, rejected
+}
+
+// trustedDirOf is res's root for the library allowlist: a read-only lib_dir is loadable only by
+// its writers, since its contents may predate the guard.
+func trustedDirOf(res *daemonconfig.Resource) guard.TrustedDir {
+	d := guard.TrustedDir{Path: res.Path}
+	if res.ReadOnly {
+		d.Loaders = []string{}
+		for _, list := range [][]daemonconfig.BinaryRule{res.Binaries, res.PendingBinaries} {
+			for _, b := range list {
+				d.Loaders = append(d.Loaders, b.Path)
+			}
+		}
+	}
+	return d
 }
 
 // addLibraryClosures adds every binary's auto-trustable library closure to libSet and returns the
@@ -105,7 +120,7 @@ type libRejection struct {
 
 // warnUntrustedLibs reports closure libraries trust_mmap will refuse: not root-owned, and neither
 // inside a guarded tree nor a reserved name loaded by one of its writers. One line per library.
-func warnUntrustedLibs(rejected map[string]*libRejection, dirs []string, r guard.GlobReservations) {
+func warnUntrustedLibs(rejected map[string]*libRejection, dirs []guard.TrustedDir, r guard.GlobReservations) {
 	libs := make([]string, 0, len(rejected))
 	for l := range rejected {
 		libs = append(libs, l)
@@ -113,7 +128,8 @@ func warnUntrustedLibs(rejected map[string]*libRejection, dirs []string, r guard
 	sort.Strings(libs)
 	for _, l := range libs {
 		rej := rejected[l]
-		if inGuardedTree(l, dirs) || slices.ContainsFunc(rej.bins, func(b string) bool { return r.LibTrusted(b, l) }) {
+		if slices.ContainsFunc(rej.bins, func(b string) bool { return inGuardedTree(l, b, dirs) }) ||
+			slices.ContainsFunc(rej.bins, func(b string) bool { return r.LibTrusted(b, l) }) {
 			continue
 		}
 		log.Warnf("library closure: %s will be refused (%v; not in a guarded tree, not a reserved "+
@@ -122,13 +138,16 @@ func warnUntrustedLibs(rejected map[string]*libRejection, dirs []string, r guard
 	}
 }
 
-func inGuardedTree(path string, dirs []string) bool {
-	for _, d := range dirs {
-		if path == d || strings.HasPrefix(path, d+"/") {
-			return true
+// inGuardedTree mirrors under_guarded_tree: the innermost root above path admits bin.
+func inGuardedTree(path, bin string, dirs []guard.TrustedDir) bool {
+	var inner *guard.TrustedDir
+	for i := range dirs {
+		d := &dirs[i]
+		if (path == d.Path || strings.HasPrefix(path, d.Path+"/")) && (inner == nil || len(d.Path) > len(inner.Path)) {
+			inner = d
 		}
 	}
-	return false
+	return inner != nil && (inner.Loaders == nil || slices.Contains(inner.Loaders, bin))
 }
 
 func keys(m map[string]struct{}) []string {
@@ -196,8 +215,8 @@ func (m *trustManager) stop() {
 	}
 }
 
-func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, libs, dirs []string,
-	rejected map[string]*libRejection) error {
+func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, libs []string,
+	dirs []guard.TrustedDir, rejected map[string]*libRejection) error {
 	if err := tg.SetGuardedDirs(dirs); err != nil {
 		return fmt.Errorf("recording guarded roots: %w", err)
 	}

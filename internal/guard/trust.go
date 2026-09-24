@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"sort"
+	"strings"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -67,7 +70,7 @@ func NewTrustGuard() (*TrustGuard, error) {
 // is both carries both flags. Unresolvable paths are skipped with a warning. Idempotent: the map is
 // cleared first, so a reload that dropped a binary also drops its trust entry (no stale over-trust).
 func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
-	if err := clearInodeMap(t.objs.GuardTrustedFiles); err != nil {
+	if err := clearInodeMap[uint8](t.objs.GuardTrustedFiles); err != nil {
 		return fmt.Errorf("clearing trusted files: %w", err)
 	}
 	flags := make(map[GuardInodeKey]uint8)
@@ -95,22 +98,89 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	return nil
 }
 
-// SetGuardedDirs records the (dev, ino) of every guarded resource root so a library loaded from
-// inside a write-protected tree is trusted without allow_lib (under_guarded_tree in
-// guard_trust.bpf.c). Unresolvable paths are skipped with a warning. Idempotent (cleared first).
-func (t *TrustGuard) SetGuardedDirs(roots []string) error {
-	if err := clearInodeMap(t.objs.GuardTrustedDirs); err != nil {
+// trustedDirAny mirrors TRUSTED_DIR_ANY in guard_trust.bpf.c.
+const trustedDirAny = uint64(1) << 63
+
+// TrustedDir is a guarded resource root for the library allowlist. Loaders nil: every whitelisted
+// binary may load from it (a whitelist-mode root). Otherwise only those binaries may (a read-only
+// lib_dir, whose Loaders are its writers).
+type TrustedDir struct {
+	Path    string
+	Loaders []string
+}
+
+// planTrustedDirs assigns one guard_trusted_dirs bit per distinct loader set, returning each root's
+// mask and each loader's bits. Past 63 sets the rest get mask 0 (nobody loads from them: fail
+// closed) and are returned in refused.
+func planTrustedDirs(dirs []TrustedDir) (roots, loaders map[string]uint64, refused []string) {
+	roots = make(map[string]uint64, len(dirs))
+	loaders = make(map[string]uint64)
+	bitOf := make(map[string]uint64)
+	for _, d := range dirs {
+		if d.Loaders == nil {
+			roots[d.Path] |= trustedDirAny
+			continue
+		}
+		set := append([]string(nil), d.Loaders...)
+		sort.Strings(set)
+		key := strings.Join(slices.Compact(set), "\x00")
+		bit, ok := bitOf[key]
+		if !ok {
+			if len(bitOf) >= 63 {
+				refused = append(refused, d.Path)
+				if _, seen := roots[d.Path]; !seen {
+					roots[d.Path] = 0
+				}
+				continue
+			}
+			bit = uint64(1) << len(bitOf)
+			bitOf[key] = bit
+			for _, l := range set {
+				loaders[l] |= bit
+			}
+		}
+		roots[d.Path] |= bit
+	}
+	return roots, loaders, refused
+}
+
+// SetGuardedDirs records every guarded resource root and who may load libraries from below it
+// (under_guarded_tree in guard_trust.bpf.c). Unresolvable paths are skipped with a warning.
+// Idempotent (cleared first).
+func (t *TrustGuard) SetGuardedDirs(dirs []TrustedDir) error {
+	roots, loaders, refused := planTrustedDirs(dirs)
+	for _, p := range refused {
+		log.Warnf("trust guard: too many distinct lib_dir writer sets, libraries under %s are "+
+			"trusted for no one", p)
+	}
+	if err := clearInodeMap[uint64](t.objs.GuardTrustedDirs); err != nil {
 		return fmt.Errorf("clearing guarded dirs: %w", err)
 	}
-	v := uint8(1)
+	if err := clearInodeMap[uint64](t.objs.GuardLibdirUsers); err != nil {
+		return fmt.Errorf("clearing lib_dir loaders: %w", err)
+	}
+	userBits := make(map[GuardInodeKey]uint64)
+	for path, bits := range loaders {
+		dev, ino, err := ebpf.StatInode(path)
+		if err != nil {
+			log.Warnf("trust guard: skipping unresolvable lib_dir writer %s: %v", path, err)
+			continue
+		}
+		userBits[GuardInodeKey{Dev: dev, Ino: ino}] |= bits
+	}
+	for key, bits := range userBits {
+		if err := t.objs.GuardLibdirUsers.Put(key, bits); err != nil {
+			return fmt.Errorf("recording lib_dir writer %+v: %w", key, err)
+		}
+	}
 	n := 0
-	for _, r := range roots {
+	for r, mask := range roots {
 		dev, ino, err := ebpf.StatInode(r)
 		if err != nil {
 			log.Warnf("trust guard: skipping unresolvable guarded root %s: %v", r, err)
 			continue
 		}
-		if err := t.objs.GuardTrustedDirs.Put(GuardInodeKey{Dev: dev, Ino: ino}, v); err != nil {
+		if err := t.objs.GuardTrustedDirs.Put(GuardInodeKey{Dev: dev, Ino: ino}, mask); err != nil {
 			return fmt.Errorf("recording guarded root %s: %w", r, err)
 		}
 		n++
@@ -119,12 +189,12 @@ func (t *TrustGuard) SetGuardedDirs(roots []string) error {
 	return nil
 }
 
-// clearInodeMap deletes every entry of a GuardInodeKey-keyed hash map so SetTrusted/SetGuardedDirs
-// can be re-applied on reload as a true replace, not an add-only merge.
-func clearInodeMap(m *cilium.Map) error {
+// clearInodeMap deletes every entry of a GuardInodeKey-keyed hash map whose values are V so
+// SetTrusted/SetGuardedDirs can be re-applied on reload as a true replace, not an add-only merge.
+func clearInodeMap[V any](m *cilium.Map) error {
 	var keys []GuardInodeKey
 	var k GuardInodeKey
-	var v uint8
+	var v V
 	it := m.Iterate()
 	for it.Next(&k, &v) {
 		keys = append(keys, k)

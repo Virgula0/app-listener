@@ -172,7 +172,7 @@ func (e *engine) syncTaintLocked() error {
 		union[exe] = slot
 	}
 	// Sets before the union: an exe must never point at a set whose whitelist isn't written yet.
-	if err := e.syncSetsLocked(info); err != nil {
+	if err := e.syncSetsLocked(info, union); err != nil {
 		return err
 	}
 	if err := syncU32Map(e.objs.GuardExeUnion, e.unionRows, union); err != nil {
@@ -183,32 +183,57 @@ func (e *engine) syncTaintLocked() error {
 }
 
 // syncSetsLocked recomputes every taint set ever allocated: its whitelist (the intersection of its
-// live members') and its membership rows (live member resources, and smaller sets it covers).
-func (e *engine) syncSetsLocked(info map[uint32]resInfo) error {
-	members := make(map[GuardTaintMemberKey]struct{})
+// live members'), and membership rows for the sets union still points at (planMemberRows).
+func (e *engine) syncSetsLocked(info map[uint32]resInfo, union map[GuardInodeKey]uint32) error {
 	for key, slot := range e.sets {
-		paths := setPaths(key)
 		var allowSets []map[GuardInodeKey]uint8
 		for res, ri := range info {
-			if slices.Contains(paths, ri.path) {
-				members[GuardTaintMemberKey{Set: slot, Member: res}] = struct{}{}
+			if slices.Contains(setPaths(key), ri.path) {
 				allowSets = append(allowSets, e.allows[res])
-			}
-		}
-		for otherKey, other := range e.sets {
-			if other != slot && isSubset(setPaths(otherKey), paths) {
-				members[GuardTaintMemberKey{Set: slot, Member: other}] = struct{}{}
 			}
 		}
 		if err := e.syncSetRowsLocked(slot, intersectAllows(allowSets)); err != nil {
 			return err
 		}
 	}
+	used := make(map[uint32]struct{})
+	for _, slot := range union {
+		if _, isSet := e.setAt[slot]; isSet {
+			used[slot] = struct{}{}
+		}
+	}
+	members := planMemberRows(e.sets, info, used)
 	if err := syncSetMap(e.objs.GuardTaintMembers, e.memberRows, members); err != nil {
 		return fmt.Errorf("writing taint-set members: %w", err)
 	}
 	e.memberRows = members
 	return nil
+}
+
+// planMemberRows lists each used set's members: its live resources and the used sets it covers.
+// Superseded sets (every guard added one at a time mints a larger one) get no rows, or the table
+// grows quadratically with the resource count; a process still tainted by one merges to
+// GUARD_RES_GLOBAL, the stricter intersection.
+func planMemberRows(sets map[string]uint32, info map[uint32]resInfo,
+	used map[uint32]struct{}) map[GuardTaintMemberKey]struct{} {
+	members := make(map[GuardTaintMemberKey]struct{})
+	for key, slot := range sets {
+		if _, ok := used[slot]; !ok {
+			continue
+		}
+		paths := setPaths(key)
+		for res, ri := range info {
+			if slices.Contains(paths, ri.path) {
+				members[GuardTaintMemberKey{Set: slot, Member: res}] = struct{}{}
+			}
+		}
+		for otherKey, other := range sets {
+			if _, ok := used[other]; ok && other != slot && isSubset(setPaths(otherKey), paths) {
+				members[GuardTaintMemberKey{Set: slot, Member: other}] = struct{}{}
+			}
+		}
+	}
+	return members
 }
 
 func (e *engine) syncSetRowsLocked(slot uint32, want map[GuardInodeKey]uint8) error {

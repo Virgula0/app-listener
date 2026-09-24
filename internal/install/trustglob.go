@@ -59,6 +59,23 @@ func (c *CandidateDir) ReservedLibGlobs(user, home string) []TrustGlob {
 	return out
 }
 
+// LibDirGlobs returns, for each wildcarded %HOME%-relative LibDirRelPaths pattern, its first
+// wildcard component as the reserved Name below the fixed prefix: the catalog refresh guards every
+// new match, so only the entry's writers may create one (and nothing planted predates the guard).
+func (c *CandidateDir) LibDirGlobs(user, home string) []TrustGlob {
+	var out []TrustGlob
+	for _, rel := range c.LibDirRelPaths {
+		parts := strings.Split(expandPlaceholders(rel, user, home), "/")
+		for i, part := range parts {
+			if strings.ContainsAny(part, "*?[") {
+				out = append(out, TrustGlob{Home: home, Fixed: parts[:i], Name: part})
+				break
+			}
+		}
+	}
+	return out
+}
+
 func splitTrustGlob(home, rel string) TrustGlob {
 	parts := strings.Split(rel, "/")
 	g := TrustGlob{Home: home, Name: parts[len(parts)-1]}
