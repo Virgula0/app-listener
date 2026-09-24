@@ -191,6 +191,7 @@ func startTrustGuard(cfg *daemonconfig.Config) *trustManager {
 		tg.Stop()
 		return &trustManager{}
 	}
+	guard.SetReplacementCheck(tg.AllowReplacement)
 	log.Infof("trust guard: enforcing write-protection + library allowlist for %d whitelisted binary(ies)", len(binaries))
 	return &trustManager{tg: tg}
 }
@@ -211,6 +212,7 @@ func (m *trustManager) reload(cfg *daemonconfig.Config) {
 
 func (m *trustManager) stop() {
 	if m != nil && m.tg != nil {
+		guard.SetReplacementCheck(nil)
 		m.tg.Stop()
 	}
 }
@@ -222,6 +224,9 @@ func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, lib
 	}
 	if err := tg.SetTrusted(binaries, libs); err != nil {
 		return fmt.Errorf("loading the trusted set: %w", err)
+	}
+	if err := tg.SetUpdaters(planUpdaters(cfg)); err != nil {
+		return fmt.Errorf("scoping binary updaters: %w", err)
 	}
 	users, err := install.ListUsers()
 	if err != nil {

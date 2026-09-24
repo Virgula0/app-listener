@@ -197,3 +197,46 @@ func TestBuildGlobReservations_SteamLibDirGlobs(t *testing.T) {
 		}
 	}
 }
+
+func hasChild(r guard.GlobReservations, parent, name string, bit uint64) bool {
+	return slices.ContainsFunc(r.Children, func(c guard.GlobChild) bool {
+		return c.Parent == parent && c.Name == name && c.Bits&bit != 0
+	})
+}
+
+func TestBuildGlobReservations_FixedBinaryAncestorsAndSymlinkTarget(t *testing.T) {
+	home := t.TempDir()
+	versions := filepath.Join(home, ".local/share/claude/versions")
+	bin := filepath.Join(home, ".local/bin")
+	mkdirs(t, filepath.Join(home, ".claude"), versions, bin)
+	target := filepath.Join(versions, "2.1.3")
+	if err := os.WriteFile(target, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(bin, "claude")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: filepath.Join(home, ".claude"), Binaries: []daemonconfig.BinaryRule{{Path: target}}},
+	}}
+	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+
+	claude := bitOf(t, r, "claude")
+	if r.Roots[bin]&claude == 0 {
+		t.Errorf("the binary's name must be reserved in %s: %v", bin, r.Roots)
+	}
+	for _, c := range [][2]string{{home, ".local"}, {filepath.Join(home, ".local"), "bin"}} {
+		if !hasChild(r, c[0], c[1], claude) {
+			t.Errorf("%s/%s must be reserved: %+v", c[0], c[1], r.Children)
+		}
+	}
+	ver := bitOf(t, r, "2.1.3")
+	for _, c := range [][2]string{{filepath.Join(home, ".local/share"), "claude"}, {filepath.Join(home, ".local/share/claude"), "versions"}} {
+		if !hasChild(r, c[0], c[1], ver) {
+			t.Errorf("symlink target directory %s/%s must be reserved: %+v", c[0], c[1], r.Children)
+		}
+	}
+	if r.Writers[target]&(claude|ver) != claude|ver {
+		t.Errorf("the whitelisted binary must write its own reservations: %v", r.Writers)
+	}
+}

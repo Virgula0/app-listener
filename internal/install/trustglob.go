@@ -24,7 +24,7 @@ func (g TrustGlob) Root() string {
 
 // TrustGlobs returns the entry's wildcarded %HOME% Whitelist and LibDirWriters patterns for one
 // user, sorted and de-duplicated. Absolute patterns are skipped (their trees are root-owned), and
-// so are fixed paths: one path is trusted on first use, then protection #1 guards it.
+// so are fixed paths (FixedBinaryGlobs).
 func (c *CandidateDir) TrustGlobs(user, home string) []TrustGlob {
 	pats := make([]string, 0, len(c.Whitelist)+len(c.LibDirWriters))
 	for p := range c.Whitelist {
@@ -43,6 +43,21 @@ func (c *CandidateDir) TrustGlobs(user, home string) []TrustGlob {
 		seen[p] = true
 		out = append(out, splitTrustGlob(home, expandPlaceholders(rel, user, home)))
 	}
+	return out
+}
+
+// FixedBinaryGlobs returns the entry's wildcard-free %HOME% Whitelist binaries for one user, each
+// naming the binary below its own directory. Protection #1 pins only the binary's inode, so the
+// daemon also reserves its name and every existing directory above it: a same-user process that
+// renames a parent away can't recreate the path, and a symlinked binary can't be re-pointed.
+func (c *CandidateDir) FixedBinaryGlobs(user, home string) []TrustGlob {
+	var out []TrustGlob
+	for p := range c.Whitelist {
+		if rel, ok := strings.CutPrefix(p, "%HOME%/"); ok && !strings.ContainsAny(rel, "*?[") {
+			out = append(out, splitTrustGlob(home, expandPlaceholders(rel, user, home)))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Root()+"/"+out[i].Name < out[j].Root()+"/"+out[j].Name })
 	return out
 }
 

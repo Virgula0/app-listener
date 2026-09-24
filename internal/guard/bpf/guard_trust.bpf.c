@@ -7,7 +7,7 @@
 // per-function trampoline limit.
 //
 // It closes two gaps inode-keyed access control can't, both on files OUTSIDE every guarded tree:
-//   #1 writer attribution: a whitelisted binary at a USER-WRITABLE path (home-directory apps: Claude, Discord) may only be replaced/modified by another whitelisted binary (the app's updater), never by same-user malware. Root-owned system binaries (/usr/bin/...) are deliberately NOT protected: users can't modify them, and protecting them would break package upgrades.
+//   #1 writer attribution: a whitelisted binary at a USER-WRITABLE path (home-directory apps: Claude, Discord) may only be replaced/modified by an updater of a resource whitelisting it (guard_bin_owner/guard_bin_updaters), never by same-user malware or another resource's binary. Root-owned system binaries (/usr/bin/...) are deliberately NOT protected: users can't modify them, and protecting them would break package upgrades.
 //   #2 library load allowlist: a whitelisted process may map executable code only from a library a non-whitelisted process couldn't have written. A library qualifies if it is:
 //     - an explicit TRUSTED_LIB (allow_lib), or
 //     - a root-owned file in a root-only-writable directory (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
@@ -30,6 +30,7 @@
 #define MAX_PATH 256
 #define PROT_EXEC 0x4
 #define FMODE_WRITE 0x2
+#define FMODE_CREATED (1 << 20) // set by the open that created the inode, before file_open runs
 #define S_IWGRP 00020
 #define S_IWOTH 00002
 #define S_IFMT 00170000
@@ -198,6 +199,42 @@ struct {
 	__type(value, __u64);
 } guard_glob_writers SEC(".maps");
 
+// #1 updater scoping. A bit is one set of resources (userspace assigns them): a protected file
+// carries the bits of the resources whitelisting it, an exe the bits of the resources it may update.
+// An exe may modify a protected file only when they share a bit, so a binary whitelisted for one
+// resource (git, cp) is not the updater of another resource's binary. Interpreters and general
+// tools get no updater bits at all.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_bin_owner SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_bin_updaters SEC(".maps");
+
+// guard_bin_origin: inode -> the updater exe that created it. The daemon re-admits a replaced
+// whitelisted binary only when its new inode was created by one of that binary's updaters and
+// never write-opened by any other exe since (tainted). LRU: an evicted entry means no provenance,
+// which refuses re-admission (fail closed).
+struct bin_origin {
+	struct inode_key exe;
+	__u8 tainted;
+	__u8 pad[7];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct inode_key);
+	__type(value, struct bin_origin);
+} guard_bin_origin SEC(".maps");
+
 struct trust_event {
 	__u32 pid;
 	__u32 uid;
@@ -269,13 +306,6 @@ static __always_inline struct inode *current_exe_inode(void)
 static __always_inline __u8 current_exe_flags(void)
 {
 	return trusted_flags_of(current_exe_inode());
-}
-
-// caller_is_app: the current exe is a whitelisted application binary (a valid modifier/updater for
-// #1).
-static __always_inline int caller_is_app(void)
-{
-	return (current_exe_flags() & TRUSTED_BINARY) != 0;
 }
 
 // inode_is_root_ro: owned by root and not modifiable in place by a normal user: not other-writable,
@@ -770,7 +800,7 @@ int trust_mmap(unsigned long long *ctx)
 // --- #1: writer attribution for user-writable whitelisted binaries ---
 // A protected target is a TRUSTED_BINARY/TRUSTED_LIB inode that is NOT an auto-trusted system file,
 // i.e. at a user-writable path where same-user malware could replace it and have the daemon
-// re-admit the replacement. Only another whitelisted binary (the app's updater) may modify it.
+// re-admit the replacement. Only its own resources' updaters may modify it.
 // Root-owned system binaries are exempt (package manager upgrades; non-root can't touch them).
 static __always_inline int protected_writable_target(struct inode *inode, struct dentry *dentry)
 {
@@ -781,14 +811,59 @@ static __always_inline int protected_writable_target(struct inode *inode, struct
 	return 1;
 }
 
+static __always_inline __u64 updater_bits_of(struct inode_key *exe)
+{
+	__u64 *v = bpf_map_lookup_elem(&guard_bin_updaters, exe);
+	return v ? *v : 0;
+}
+
+// caller_updates: the current exe is an updater of one of the resources whitelisting inode.
+static __always_inline int caller_updates(struct inode *inode)
+{
+	struct inode_key tk = {};
+	struct inode_key ek = {};
+	if (!fill_inode_key(inode, &tk) || !fill_inode_key(current_exe_inode(), &ek))
+		return 0;
+	__u64 *owner = bpf_map_lookup_elem(&guard_bin_owner, &tk);
+	return owner && (*owner & updater_bits_of(&ek));
+}
+
 static __always_inline int deny_if_protected(struct inode *inode, struct dentry *dentry)
 {
 	if (!protected_writable_target(inode, dentry))
 		return 0;
-	if (caller_is_app())
+	if (caller_updates(inode))
 		return 0; // the app's own updater may replace it
 	emit(dentry, TRUST_WRITEBLOCK);
 	return -EPERM;
+}
+
+// origin_record claims a just-created inode for the current exe when it is an updater.
+static __always_inline void origin_record(struct inode *inode)
+{
+	struct inode_key k = {};
+	struct bin_origin o = {};
+	if (!fill_inode_key(inode, &k) || !fill_inode_key(current_exe_inode(), &o.exe))
+		return;
+	if (!updater_bits_of(&o.exe))
+		return;
+	bpf_map_update_elem(&guard_bin_origin, &k, &o, BPF_ANY);
+}
+
+// origin_taint_foreign: any other exe opening or truncating a recorded inode for writing makes its
+// content no longer the updater's. Permanent.
+static __always_inline void origin_taint_foreign(struct inode *inode)
+{
+	struct inode_key k = {};
+	if (!fill_inode_key(inode, &k))
+		return;
+	struct bin_origin *o = bpf_map_lookup_elem(&guard_bin_origin, &k);
+	if (!o)
+		return;
+	struct inode_key ek = {};
+	if (fill_inode_key(current_exe_inode(), &ek) && ek.dev == o->exe.dev && ek.ino == o->exe.ino)
+		return;
+	o->tainted = 1;
 }
 
 SEC("lsm/path_unlink")
@@ -862,8 +937,12 @@ int trust_file_open(unsigned long long *ctx)
 	bpf_probe_read_kernel(&f_flags, sizeof(f_flags), &file->f_flags);
 	if ((f_flags & __O_TMPFILE) || ((f_flags & O_CREAT) && (f_flags & O_EXCL)))
 		jit_record_creation(inode); // no-op unless the creator is whitelisted
-	if (f_mode & FMODE_WRITE)
+	if ((f_flags & __O_TMPFILE) || (f_mode & FMODE_CREATED))
+		origin_record(inode); // no-op unless the creator is an updater
+	if (f_mode & FMODE_WRITE) {
 		jit_taint_foreign_write(inode);
+		origin_taint_foreign(inode);
+	}
 
 	if (!(f_mode & FMODE_WRITE))
 		return 0; // only a write-open can modify the binary in place
@@ -954,5 +1033,6 @@ int trust_path_truncate(unsigned long long *ctx)
 		return r;
 	if (glob_denied(dentry_parent(dentry), dentry))
 		return deny_plant(dentry);
+	origin_taint_foreign(inode);
 	return 0;
 }

@@ -28,6 +28,11 @@ func rootOwnedSafe(path string) error {
 	return nil
 }
 
+// SystemTrusted reports whether path passes rootOwnedSafe: a non-root user can't replace it.
+func SystemTrusted(path string) bool {
+	return rootOwnedSafe(path) == nil
+}
+
 func rootOwnedInode(path string) error {
 	var st syscall.Stat_t
 	if err := syscall.Stat(path, &st); err != nil {

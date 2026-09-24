@@ -61,6 +61,12 @@ func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
 	for _, g := range e.LibDirGlobs(u.Name, u.Home) {
 		b.reserve(g, g.Name, writers)
 	}
+	for _, g := range e.FixedBinaryGlobs(u.Name, u.Home) {
+		b.reserve(g, g.Name, writers)
+		if t, ok := symlinkTargetGlob(g); ok {
+			b.reserve(t, t.Name, writers)
+		}
+	}
 	// Library bits are per entry: the bit also grants loading (trust_mmap), and a "*.so" shared
 	// across entries would let one app's writers plant, and load, below another app's root.
 	for _, g := range e.ReservedLibGlobs(u.Name, u.Home) {
@@ -126,6 +132,22 @@ func reserveChain(g install.TrustGlob, mask uint64, roots map[string]uint64, chi
 		return
 	}
 	roots[dir] |= mask
+}
+
+// symlinkTargetGlob is the in-home file a fixed binary's symlink resolves to (~/.local/bin/claude
+// -> versions/X): the daemon whitelists the target, so its directories need the same reservation.
+func symlinkTargetGlob(g install.TrustGlob) (install.TrustGlob, bool) {
+	link := filepath.Join(g.Root(), g.Name)
+	target, err := filepath.EvalSymlinks(link)
+	if err != nil || target == link {
+		return install.TrustGlob{}, false
+	}
+	rel, ok := strings.CutPrefix(target, g.Home+"/")
+	if !ok {
+		return install.TrustGlob{}, false // outside the home: root-owned, protection #1 skips it
+	}
+	parts := strings.Split(rel, "/")
+	return install.TrustGlob{Home: g.Home, Fixed: parts[:len(parts)-1], Name: parts[len(parts)-1]}, true
 }
 
 // entryWriters returns the whitelisted binaries of every configured resource belonging to e for u.

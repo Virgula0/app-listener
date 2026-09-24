@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -42,6 +43,9 @@ type TrustGuard struct {
 	links []link.Link
 	rd    *ringbuf.Reader
 	done  chan struct{}
+	// ownerByPath: UpdaterPlan.Owners, for AllowReplacement.
+	ownerMu     sync.Mutex
+	ownerByPath map[string]uint64
 }
 
 // trustEvent mirrors struct trust_event in guard_trust.bpf.c.

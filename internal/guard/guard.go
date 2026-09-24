@@ -137,6 +137,8 @@ type Guard struct {
 	// deleted, so a running pre-replacement process keeps admission; ReSyncBinaries rewrites stale
 	// ones.
 	deployed map[string]GuardInodeKey
+	// refused: replacements ReSyncBinaries declined, reported once each.
+	refused refusedReplacements
 	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
 	eagerPopulate bool
 	// sweepRootMtime/sweepLastFull fingerprint a DIRECTORY root between SweepInodes ticks:
@@ -930,9 +932,9 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 	return nil
 }
 
-// ReSyncBinaries re-stats whitelisted binaries and rewrites inode-keyed entries after in-place
-// replacement. Stale keys are never deleted (running pre-replacement processes stay admitted;
-// vanished paths keep their key). Still-deferred rules are retried.
+// ReSyncBinaries re-stats whitelisted binaries and admits a replacement inode only when the
+// SetReplacementCheck check approves it. Stale keys are never deleted (running pre-replacement
+// processes stay admitted; vanished paths keep their key). Still-deferred rules are retried.
 func (g *Guard) ReSyncBinaries() (int, error) {
 	// Retry deferred rules first; addBinaryActions records newly resolved binaries in deployed, so the pass below skips them.
 	resolved, resolvedEvents, stillDeferred := g.resolveDeferred()
@@ -959,9 +961,19 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 		key := GuardInodeKey{Dev: dev, Ino: ino}
 
 		g.mu.Lock()
-		upToDate := g.deployed[path] == key
+		old := g.deployed[path]
 		g.mu.Unlock()
-		if upToDate {
+		if old == key {
+			continue
+		}
+		// Re-admitting by path alone let anyone who could swap the path (or a parent directory)
+		// inherit the entry; only an inode its updater created qualifies. Reload is the
+		// operator's path for anything else.
+		if !replacementAllowed(b.Path, old, key) {
+			if g.refused.firstTime(path, key) {
+				log.Warnf("guard %s: replacement of %s (inode %d) was not created by its updater — "+
+					"not re-admitted; reload the daemon after verifying it", g.path, path, key.Ino)
+			}
 			continue
 		}
 		if err := g.putBinaryKey(key, b.Path, exeEvents); err != nil {
@@ -1689,13 +1701,7 @@ func (g *Guard) verifyBinaryHashesOnce() {
 		}
 
 		if freshKey != st.key {
-			// Inode changed: a replacement flow (ReSyncBinaries, reload) owns re-admission; adopt
-			// the new identity.
-			st.key = freshKey
-			st.stat = fp
-			st.hash = hash
-			st.hashed = true
-			st.demoted = false
+			g.adoptReplacedIdentity(canonical, st, fp, hash)
 			continue
 		}
 		st.stat = fp
@@ -1714,6 +1720,23 @@ func (g *Guard) verifyBinaryHashesOnce() {
 			log.Errorf("guard %s: whitelisted binary %s was modified in place (inode unchanged, hash changed) \u2014 whitelist entry demoted to BLOCK", g.path, canonical)
 		}
 	}
+}
+
+// adoptReplacedIdentity re-pins st to a new inode at canonical. ReSyncBinaries owns re-admission,
+// so only an inode it admitted is adopted; a refused one must not be pinned as the binary's.
+func (g *Guard) adoptReplacedIdentity(canonical string, st *binaryVerifyState, fp ebpf.BinaryStat, hash [32]byte) {
+	freshKey := GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
+	g.mu.Lock()
+	admitted := g.deployed[canonical] == freshKey
+	g.mu.Unlock()
+	if !admitted {
+		return
+	}
+	st.key = freshKey
+	st.stat = fp
+	st.hash = hash
+	st.hashed = true
+	st.demoted = false
 }
 
 // parseGuardEvent decodes one ringbuf record, returning the event and the resource that produced
