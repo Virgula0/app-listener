@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -275,6 +276,39 @@ func (e *engine) allocSlotLocked(g *Guard) (uint32, error) {
 		}
 	}
 	return 0, fmt.Errorf("no free guard resource slot (max %d)", GuardMaxRes-1)
+}
+
+// claimInode maps key to g's resource unless path lies in a live resource rooted strictly inside
+// g's root. guard_inodes holds one owner per inode, so the innermost resource must win whatever
+// order the guards scan in (the sealed fscrypt.key inside the read-only /etc/app-listener guard).
+// Checked and written under e.mu: an inner guard registers its slot before scanning, so an outer
+// scan can't overwrite its rows on a stale check.
+func (e *engine) claimInode(g *Guard, path string, key GuardInodeKey) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.innerResourceOwnsLocked(g, filepath.Clean(path)) {
+		return nil
+	}
+	return e.objs.GuardInodes.Put(key, g.resID)
+}
+
+// innerResourceOwnsLocked: a replacement guard over the same root (reload) is not "inner".
+func (e *engine) innerResourceOwnsLocked(g *Guard, path string) bool {
+	outer := filepath.Clean(g.path)
+	for _, o := range &e.slots {
+		if o == nil || o == g {
+			continue
+		}
+		root := filepath.Clean(o.path)
+		if root != outer && pathWithin(root, outer) && pathWithin(path, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithin(path, root string) bool {
+	return path == root || strings.HasPrefix(path, root+"/")
 }
 
 // release retires g's slot and, once the last Guard is gone, detaches the shared programs.

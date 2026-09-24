@@ -562,3 +562,79 @@ func TestCopyXattrsPreservesUserAttributes(t *testing.T) {
 		t.Errorf("xattr value = %q, want hello", value[:n])
 	}
 }
+
+// The single-file migration runs as root on a file the user owns. If the file is replaced by a
+// symlink after it was classified, the sealed record must not hold content from the link target.
+func TestEncryptFileSwappedAfterClassification(t *testing.T) {
+	withMasterKey(t)
+	const marker = "OUTSIDE-THE-MIGRATED-FILE"
+	base := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(outside, []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(base, "secret.env")
+	if err := os.WriteFile(path, []byte("KEY=value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	defer func(prev func(string)) { testHookBeforeFileRead = prev }(testHookBeforeFileRead)
+	testHookBeforeFileRead = func(p string) {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_ = (&Vault{}).Encrypt(path)
+
+	record, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if plain, oerr := openFileVaultWithMasterKey(record); oerr == nil && strings.Contains(string(plain), marker) {
+		t.Fatal("the migration sealed content read through a symlink swapped in after classification")
+	}
+}
+
+// Every file vault is sealed under the same master key, so if a user's vault file is swapped for a
+// symlink to another vault after classification, decrypting must not write that vault's plaintext
+// back to the user's path.
+func TestDecryptFileSwappedAfterClassification(t *testing.T) {
+	withMasterKey(t)
+	const marker = "ANOTHER-VAULTS-PLAINTEXT"
+	seal := func(p, content string) {
+		t.Helper()
+		record, err := sealFileVaultWithMasterKey([]byte(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, record, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := filepath.Join(t.TempDir(), "other.env")
+	seal(other, marker)
+	path := filepath.Join(t.TempDir(), "secret.env")
+	seal(path, "KEY=value")
+
+	defer func(prev func(string)) { testHookBeforeFileRead = prev }(testHookBeforeFileRead)
+	testHookBeforeFileRead = func(p string) {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_ = (&Vault{}).Decrypt(path)
+
+	for _, p := range []string{path, path + DecryptSuffix} {
+		if data, err := os.ReadFile(p); err == nil && strings.Contains(string(data), marker) {
+			t.Fatalf("%s holds another vault's plaintext", p)
+		}
+	}
+}

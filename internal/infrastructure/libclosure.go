@@ -146,12 +146,19 @@ func walkNeeded(objPath string, f *elf.File, out map[string]struct{}, visited ma
 	}
 }
 
+// maxInterpLen is PATH_MAX: no real PT_INTERP is longer.
+const maxInterpLen = 4096
+
 // elfInterp returns the program interpreter path from the PT_INTERP segment,
 // or "" when there is none (a static binary).
 func elfInterp(f *elf.File) (string, error) {
 	for _, p := range f.Progs {
 		if p.Type != elf.PT_INTERP {
 			continue
+		}
+		// Filesz comes from a possibly user-writable binary parsed as root: bound it before allocating.
+		if p.Filesz > maxInterpLen {
+			return "", fmt.Errorf("PT_INTERP of %d bytes exceeds PATH_MAX", p.Filesz)
 		}
 		buf := make([]byte, p.Filesz)
 		if _, err := p.ReadAt(buf, 0); err != nil {

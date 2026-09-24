@@ -60,6 +60,9 @@ func rcTargets(u User) []rcTarget {
 
 const authSock = "SSH_AUTH_SOCK"
 
+// testHookBeforeRCRemove runs between the content check and the removal of a dedicated rc file.
+var testHookBeforeRCRemove = func(string) {}
+
 // sshConfigTarget is ~/.ssh/config with AddKeysToAgent, so ssh (whitelisted for ~/.ssh) loads a
 // key into the agent on first use; the daemon itself never touches the agent.
 func sshConfigTarget(u User) rcTarget {
@@ -111,7 +114,7 @@ func EnsureSSHAgentEnv(u User) ([]string, error) {
 func RemoveSSHAgentEnv(u User) ([]string, error) {
 	var changed []string
 	for _, t := range append(rcTargets(u), sshConfigTarget(u)) {
-		ok, err := removeRCBlock(t, u.UID)
+		ok, err := removeRCBlock(t, u)
 		if err != nil {
 			return changed, fmt.Errorf("%s: %w", t.Path, err)
 		}
@@ -167,8 +170,8 @@ func ensureRCBlock(t rcTarget, u User) (bool, error) {
 	return err == nil, err
 }
 
-func removeRCBlock(t rcTarget, uid uint32) (bool, error) {
-	f, err := openOwnedRegular(t.Path, uid)
+func removeRCBlock(t rcTarget, u User) (bool, error) {
+	f, err := openOwnedRegular(t.Path, u.UID)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
@@ -190,7 +193,8 @@ func removeRCBlock(t rcTarget, uid uint32) (bool, error) {
 		return false, nil
 	}
 	if t.Dedicated && strings.TrimSpace(text) == "" {
-		return true, os.Remove(t.Path)
+		testHookBeforeRCRemove(t.Path)
+		return true, removeCheckedFile(u.Home, t.Path, f)
 	}
 	// Shorter than before: overwrite in place first, truncate last, so a crash never leaves an
 	// empty rc file.
@@ -286,4 +290,39 @@ func createOwned(home, path string, uid, gid uint32, mode os.FileMode) (*os.File
 		return nil, err
 	}
 	return safeio.CreateExclNoFollow(dirfd, comps[len(comps)-1], mode, int(uid), int(gid))
+}
+
+// removeCheckedFile unlinks path only while it still names the file f was opened on, through a
+// parent reached from home without following symlinks: a parent swapped for a symlink after the
+// content check can't redirect root's unlink into another directory.
+func removeCheckedFile(home, path string, f *os.File) error {
+	rel, err := filepath.Rel(home, filepath.Clean(path))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return fmt.Errorf("%s is not inside %s", path, home)
+	}
+	comps := strings.Split(rel, string(os.PathSeparator))
+
+	dirfd, err := unix.Open(home, unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", home, err)
+	}
+	dirfd, err = safeio.DescendNoFollow(dirfd, comps[:len(comps)-1], false, 0)
+	defer unix.Close(dirfd)
+	if err != nil {
+		return err
+	}
+
+	name := comps[len(comps)-1]
+	var want, got unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &want); err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	// Following a final symlink is fine (dotfile managers): the unlink stays in the pinned parent.
+	if err := unix.Fstatat(dirfd, name, &got, 0); err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if got.Dev != want.Dev || got.Ino != want.Ino {
+		return fmt.Errorf("refusing to remove %s: it changed after it was checked", path)
+	}
+	return unix.Unlinkat(dirfd, name, 0)
 }

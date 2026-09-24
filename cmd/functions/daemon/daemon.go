@@ -215,20 +215,27 @@ func catchLifecycleSignals() (termSig, hup chan os.Signal, stop func()) {
 	}
 }
 
+// runOneShotMode runs --genkey, --check or --lockdown, which exit without starting the daemon.
+func runOneShotMode() (bool, error) {
+	switch {
+	case genKeyFlag:
+		return true, runGenKey()
+	case checkFlag:
+		return true, runBPFCheck()
+	case lockdownFlag:
+		runLockdown()
+		return true, nil
+	}
+	return false, nil
+}
+
 func runDaemon(cmd *cobra.Command, args []string) error {
 	serve, err := common.ParseServeFlags(cmd)
 	if err != nil {
 		return err
 	}
-	if genKeyFlag {
-		return runGenKey()
-	}
-	if checkFlag {
-		return runBPFCheck()
-	}
-	if lockdownFlag {
-		runLockdown()
-		return nil
+	if handled, modeErr := runOneShotMode(); handled {
+		return modeErr
 	}
 	if pprofAddr != "" {
 		startPprof(pprofAddr)
@@ -257,6 +264,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	sg.attach(pin)
 	defer sg.detach()
 
+	// Attached before anything is unlocked; startTrustGuard explains why the daemon can't run
+	// without it. Deferred first, so it stops last: d.Stop re-locks the vaults while it still runs.
+	trust, err := startTrustGuard(cfg)
+	if err != nil {
+		return err
+	}
+	defer trust.stop()
+
 	d, err := startGuardedDaemonAbortable(termSig, cfg, vault, pin)
 	if err != nil {
 		return err
@@ -268,12 +283,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	defer d.Stop()
 
-	// Trusted-binary/library protection: write-protect whitelisted binaries at user-writable paths
-	// (#1) and enforce the library-load allowlist (#2). Never fatal. Held across the daemon's
-	// lifetime so the SIGHUP reload can rebuild its trusted set (reload-added binaries otherwise get
-	// no library allowlist).
-	trust := startTrustGuard(cfg)
-	defer trust.stop()
+	// Returning here runs d.Stop, which re-locks what was just unlocked.
+	if err := trust.afterUnlock(cfg); err != nil {
+		return err
+	}
 
 	events := mergeDaemonEvents(d.Events(), sg.Events())
 

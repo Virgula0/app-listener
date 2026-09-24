@@ -8,6 +8,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -164,50 +165,74 @@ func keys(m map[string]struct{}) []string {
 // added by a reload must be re-applied to guard_trusted_files or it gets no library allowlist while
 // still holding access to the secrets.
 type trustManager struct {
-	tg *guard.TrustGuard
+	tg       *guard.TrustGuard
+	binaries int
 }
 
-// startTrustGuard brings up the daemon-wide trust guard: binary write-protection (#1), the
-// library-load allowlist (#2) and reserved glob names (#3), all always enforced. Best-effort: a failure logs and starts
-// nothing, never blocking startup or per-resource enforcement.
-func startTrustGuard(cfg *daemonconfig.Config) *trustManager {
-	binaries, libs, dirs, rejected := buildTrustedSet(cfg)
-	if len(binaries) == 0 {
-		return &trustManager{} // no whitelisted binaries: nothing to protect
+// startTrustGuard loads and attaches the daemon-wide trust guard — binary write-protection (#1), the
+// library-load allowlist (#2) and reserved glob names (#3) — with every path resolvable now. Called
+// before any vault is unlocked, and the daemon refuses to start if it fails: the per-resource guards
+// judge a process by its exe inode alone, so without this guard code injected into a whitelisted
+// process (a preloaded library) or a whitelisted binary rewritten in place reads the secrets. Started
+// even with no whitelisted binary, so a reload that adds one has a guard to update.
+func startTrustGuard(cfg *daemonconfig.Config) (*trustManager, error) {
+	if err := injectedTrustFault("start"); err != nil {
+		return nil, trustStartupError(err)
 	}
 	tg, err := guard.NewTrustGuard()
 	if err != nil {
-		log.Warnf("trust guard: not started (%v) — binary write-protection and library enforcement "+
-			"unavailable; per-resource enforcement is unaffected", err)
-		return &trustManager{}
+		return nil, trustStartupError(err)
 	}
-	if err := applyTrustSet(tg, cfg, binaries, libs, dirs, rejected); err != nil {
-		log.Warnf("trust guard: %v — not started", err)
+	m := &trustManager{tg: tg}
+	if err := m.apply(cfg); err != nil {
 		tg.Stop()
-		return &trustManager{}
+		return nil, trustStartupError(err)
 	}
 	if err := tg.Start(); err != nil {
-		log.Warnf("trust guard: could not attach (%v) — not started", err)
 		tg.Stop()
-		return &trustManager{}
+		return nil, trustStartupError(err)
 	}
 	guard.SetReplacementCheck(tg.AllowReplacement)
-	log.Infof("trust guard: enforcing write-protection + library allowlist for %d whitelisted binary(ies)", len(binaries))
-	return &trustManager{tg: tg}
+	return m, nil
 }
 
-// reload re-applies the trusted set from the new config to the running trust guard (SetTrusted /
-// SetGuardedDirs clear-then-fill, so it is a true replace). No-op if the trust guard never started.
+// afterUnlock re-applies the trusted set once vaults are unlocked: binaries and libraries inside
+// them only resolve now.
+func (m *trustManager) afterUnlock(cfg *daemonconfig.Config) error {
+	if err := injectedTrustFault("after-unlock"); err != nil {
+		return trustStartupError(err)
+	}
+	if err := m.apply(cfg); err != nil {
+		return trustStartupError(err)
+	}
+	log.Infof("trust guard: enforcing write-protection + library allowlist for %d whitelisted binary(ies)",
+		m.binaries)
+	return nil
+}
+
+func trustStartupError(err error) error {
+	return fmt.Errorf("%w: trust guard unavailable (%w) — refusing to start: without it code injected into a "+
+		"whitelisted process could read the guarded secrets", constants.ErrCriticalStartup, err)
+}
+
+// reload re-applies the trusted set from the new config (SetTrusted / SetGuardedDirs clear-then-fill,
+// so it is a true replace). On failure the previous set stays.
 func (m *trustManager) reload(cfg *daemonconfig.Config) {
-	if m == nil || m.tg == nil {
+	if err := m.apply(cfg); err != nil {
+		log.Errorf("trust guard: CRITICAL: reload could not re-apply the trusted set (%v) — keeping the previous "+
+			"set; binaries added by this reload have no library allowlist until this is fixed", err)
 		return
 	}
+	log.Infof("trust guard: trusted set rebuilt after reload (%d whitelisted binary(ies))", m.binaries)
+}
+
+func (m *trustManager) apply(cfg *daemonconfig.Config) error {
 	binaries, libs, dirs, rejected := buildTrustedSet(cfg)
 	if err := applyTrustSet(m.tg, cfg, binaries, libs, dirs, rejected); err != nil {
-		log.Warnf("trust guard: reload could not re-apply the trusted set (%v) — keeping the previous set", err)
-		return
+		return err
 	}
-	log.Infof("trust guard: trusted set rebuilt after reload (%d whitelisted binary(ies))", len(binaries))
+	m.binaries = len(binaries)
+	return nil
 }
 
 func (m *trustManager) stop() {

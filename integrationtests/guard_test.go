@@ -2455,15 +2455,29 @@ func (s *IntegrationSuite) TestGuard_PopulateInodes_FillsMap() {
 	s.runGuardTest(c, "TestPopulateInodesFillsMap")
 }
 
-// TestGuard_ReSyncBinaries_Replacement verifies the in-place-replacement
-// fix for the Discord updater denials: a whitelisted binary replaced in
-// place (same path, new inode) is denied after relaunch until
-// ReSyncBinaries rewrites its map entry, then allowed again.
+// A whitelisted binary replaced in place stays denied until ReSyncBinaries re-admits it, which it
+// does only when the replacement check approves that exact swap.
 func (s *IntegrationSuite) TestGuard_ReSyncBinaries_Replacement() {
 	c := s.newGuardTestContainer()
 	// pooled: terminated at suite end
 
 	s.runGuardTest(c, "TestReSyncBinariesReplacement")
+}
+
+// The shared engine records one owning resource per inode; with nested resources the innermost must
+// own a shared file whatever order the guards scan in.
+func (s *IntegrationSuite) TestGuard_NestedResource_OuterRescanKeepsInnerSealed() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestNestedResourceOuterRescanKeepsInnerSealed")
+}
+
+func (s *IntegrationSuite) TestGuard_NestedResources_InnermostOwns() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestNestedResourcesInnermostOwns")
 }
 
 // TestGuard_SweepInodes_RecreatedFileRoot verifies the fingerprint-gated

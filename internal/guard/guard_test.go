@@ -880,11 +880,9 @@ func (s *guardUnitTest) TestReconcileInodesEvictsStale() {
 		"ReconcileInodes must never evict the watch root's own entry")
 }
 
-// TestReSyncBinariesReplacement verifies the in-place-replacement fix
-// for the Discord updater denials: a whitelisted binary replaced in
-// place (same path, new inode) is denied after relaunch — the whitelist
-// is keyed by inode — until ReSyncBinaries rewrites its map entry, after
-// which the updated binary is allowed again.
+// A whitelisted binary replaced in place (same path, new inode) is denied until ReSyncBinaries
+// re-admits it, and re-admission needs the replacement check's approval: by path alone, anyone able
+// to swap the path would inherit the whitelist entry.
 func (s *guardUnitTest) TestReSyncBinariesReplacement() {
 	if os.Getuid() != 0 {
 		s.T().Skip("Skipping BPF test: requires root")
@@ -900,34 +898,122 @@ func (s *guardUnitTest) TestReSyncBinariesReplacement() {
 
 	entry, err := ComputeBinaryEntry(tool)
 	s.Require().NoError(err)
+	oldDev, oldIno, err := ebpf.StatInode(tool)
+	s.Require().NoError(err)
+	oldKey := GuardInodeKey{Dev: oldDev, Ino: oldIno}
 
 	g := s.newGuardedTree(root, []BinaryEntry{entry}, nil)
 	defer g.Stop()
 
-	// Original binary is whitelisted at build: allowed.
 	s.Require().NoError(runTool(tool, seed), "original binary must be allowed")
 
-	// Replace the binary in place: write a new file, rename over the
-	// old one — same path, brand-new inode.
 	replacement := filepath.Join("/tmp", fmt.Sprintf("guard-tool-new-%d", os.Getpid()))
 	s.Require().NoError(copySelf(replacement))
 	defer os.Remove(replacement)
 	s.Require().NoError(os.Rename(replacement, tool))
+	newDev, newIno, err := ebpf.StatInode(tool)
+	s.Require().NoError(err)
+	newKey := GuardInodeKey{Dev: newDev, Ino: newIno}
 
-	// The relaunched binary's inode is not whitelisted: denied.
 	s.Require().Error(runTool(tool, seed), "replaced binary must be denied until re-synced")
 
-	// ReSyncBinaries rewrites the map entry for the new inode.
+	// No check installed (no trust guard, so no provenance): refused, still denied in-kernel.
+	SetReplacementCheck(nil)
 	changed, err := g.ReSyncBinaries()
 	s.Require().NoError(err)
-	s.Require().GreaterOrEqual(changed, 1, "the replaced binary must be reported as changed")
+	s.Require().Zero(changed, "an unapproved replacement must not be re-admitted")
+	s.Require().Error(runTool(tool, seed), "an unapproved replacement must stay denied")
 
+	// Approved for exactly this old->new swap: re-admitted.
+	SetReplacementCheck(func(path string, o, n GuardInodeKey) bool {
+		return path == tool && o == oldKey && n == newKey
+	})
+	defer SetReplacementCheck(nil)
+	changed, err = g.ReSyncBinaries()
+	s.Require().NoError(err)
+	s.Require().Equal(1, changed, "the approved replacement must be reported as changed")
 	s.Require().NoError(runTool(tool, seed), "re-synced binary must be allowed")
 
-	// Idempotent: a second pass finds nothing to do.
 	again, err := g.ReSyncBinaries()
 	s.Require().NoError(err)
 	s.Require().Zero(again, "second re-sync must be a no-op")
+}
+
+// newSelfAllowedGuard builds and starts a guard that, like the daemon's, allows the running test
+// binary (root-gated): nested guards must still let their owner stat and scan every tree.
+func (s *guardUnitTest) newSelfAllowedGuard(root string, mode Mode, binaries []BinaryEntry) *Guard {
+	self, err := ComputeBinaryEntry("/proc/self/exe")
+	s.Require().NoError(err)
+	g, err := NewGuard(root, mode, binaries, true, 0, WithEagerPopulate(), WithSelfAllowBinary(self, nil))
+	s.Require().NoError(err, "building guard over %s", root)
+	s.Require().NoError(g.Start(), "starting guard over %s", root)
+	return g
+}
+
+// A sealed file (whitelist, no binaries) inside a read-only tree is the shape of fscrypt.key inside
+// /etc/app-listener. A rescan of the outer tree (what its periodic SweepInodes does) must not hand
+// the file to the outer resource, whose read-only rule lets everyone read.
+func (s *guardUnitTest) TestNestedResourceOuterRescanKeepsInnerSealed() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	outer := s.T().TempDir()
+	sealed := filepath.Join(outer, "key")
+	s.Require().NoError(os.WriteFile(sealed, []byte("data"), 0o600))
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-nest-tool-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+
+	og := s.newSelfAllowedGuard(outer, ModeReadOnly, nil)
+	defer og.Stop()
+	ig := s.newSelfAllowedGuard(sealed, ModeWhitelist, nil)
+	defer ig.Stop()
+
+	s.Require().Error(runTool(tool, sealed), "the sealed inner file must be denied")
+
+	s.Require().NoError(og.PopulateInodes())
+	s.Require().Error(runTool(tool, sealed), "an outer rescan must not unseal the inner file")
+}
+
+// guard_inodes holds one owner per inode: with nested resources (only the daemon's self guards;
+// configs refuse nesting) the innermost must own a shared file whichever resource scanned last.
+func (s *guardUnitTest) TestNestedResourcesInnermostOwns() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	outer := s.T().TempDir()
+	inner := filepath.Join(outer, "inner")
+	s.Require().NoError(os.Mkdir(inner, 0o755))
+	secret := filepath.Join(inner, "secret")
+	s.Require().NoError(os.WriteFile(secret, []byte("data"), 0o644))
+
+	tools := map[string]string{}
+	entries := map[string]BinaryEntry{}
+	for _, name := range []string{"outer-only", "inner-only", "both"} {
+		p := filepath.Join("/tmp", fmt.Sprintf("guard-nest-%s-%d", name, os.Getpid()))
+		s.Require().NoError(copySelf(p))
+		defer os.Remove(p)
+		e, err := ComputeBinaryEntry(p)
+		s.Require().NoError(err)
+		tools[name], entries[name] = p, e
+	}
+
+	og := s.newSelfAllowedGuard(outer, ModeWhitelist, []BinaryEntry{entries["outer-only"], entries["both"]})
+	defer og.Stop()
+	ig := s.newSelfAllowedGuard(inner, ModeWhitelist, []BinaryEntry{entries["inner-only"], entries["both"]})
+	defer ig.Stop()
+
+	check := func(when string) {
+		s.Require().NoErrorf(runTool(tools["both"], secret), "%s: a binary both resources allow must read", when)
+		s.Require().NoErrorf(runTool(tools["inner-only"], secret), "%s: the inner resource must own the file", when)
+		s.Require().Errorf(runTool(tools["outer-only"], secret), "%s: the outer whitelist must not apply inside the inner resource", when)
+	}
+	check("inner scanned last")
+	s.Require().NoError(og.PopulateInodes())
+	check("outer scanned last")
 }
 
 // TestMain intercepts the -helper-child invocation: the copied test

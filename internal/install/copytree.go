@@ -68,42 +68,37 @@ func treeSize(root string) (int64, error) {
 	return total, err
 }
 
-// copyTreeRoot handles the top-level dst (a directory the caller pre-created, or a lone file/symlink)
-// and hands the recursion to copyEntry via a parent dir fd.
+// testHookBeforeSourceOpen runs after a source entry was classified and before it is opened.
+var testHookBeforeSourceOpen = func(string) {}
+
+// copyTreeRoot copies src (a directory the caller may have pre-created at dst, or a lone
+// file/symlink) through parent dir fds on both sides. The parents themselves are the caller's
+// choice and may be symlinks (a dotfiles-managed ~/.config); everything below them is pinned.
 func copyTreeRoot(src, dst string, report func(int64)) error {
-	info, err := os.Lstat(src)
+	sparent, err := unix.Open(filepath.Dir(src), unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening %s: %w", filepath.Dir(src), err)
 	}
-	if info.IsDir() {
-		if mkErr := os.Mkdir(dst, info.Mode().Perm()); mkErr != nil && !os.IsExist(mkErr) {
-			return mkErr
-		}
-		dfd, oErr := unix.Open(dst, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if oErr != nil {
-			return fmt.Errorf("opening %s: %w", dst, oErr)
-		}
-		defer unix.Close(dfd)
-		return copyDirContents(src, dfd, info, 0, report)
+	defer unix.Close(sparent)
+	dparent, err := unix.Open(filepath.Dir(dst), unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", filepath.Dir(dst), err)
 	}
-	parent, oErr := unix.Open(filepath.Dir(dst), unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if oErr != nil {
-		return fmt.Errorf("opening %s: %w", filepath.Dir(dst), oErr)
-	}
-	defer unix.Close(parent)
-	return copyEntry(src, parent, filepath.Base(dst), info, 0, report)
+	defer unix.Close(dparent)
+	return copyEntry(sparent, filepath.Dir(src), filepath.Base(src), dparent, filepath.Base(dst), 0, report)
 }
 
-// copyDirContents copies every child of srcDir into the already-open dst dir fd, then applies the
-// directory's own mode/owner/mtime LAST — the destination directory is root-owned with the source's
-// perms throughout the copy, so its (unprivileged) eventual owner cannot inject entries mid-copy.
-func copyDirContents(srcDir string, dfd int, info fs.FileInfo, depth int, report func(int64)) error {
-	entries, err := os.ReadDir(srcDir)
+// copyDirContents copies every child of the open source dir sfd into the open dst dir fd, then
+// applies the directory's own mode/owner/mtime LAST — the destination directory is root-owned with
+// the source's perms throughout the copy, so its (unprivileged) eventual owner cannot inject entries
+// mid-copy.
+func copyDirContents(sfd int, srcDir string, dfd int, info fs.FileInfo, depth int, report func(int64)) error {
+	names, err := readDirNames(sfd)
 	if err != nil {
-		return err
+		return fmt.Errorf("reading %s: %w", srcDir, err)
 	}
-	for _, e := range entries {
-		if cerr := copyEntry(filepath.Join(srcDir, e.Name()), dfd, e.Name(), nil, depth+1, report); cerr != nil {
+	for _, name := range names {
+		if cerr := copyEntry(sfd, srcDir, name, dfd, name, depth+1, report); cerr != nil {
 			return cerr
 		}
 	}
@@ -116,46 +111,94 @@ func copyDirContents(srcDir string, dfd int, info fs.FileInfo, depth int, report
 	return futimesFromInfo(dfd, info)
 }
 
-// copyEntry copies one source entry (whose info is Lstat'd here) into dparent under name, never
-// following a symlink at name.
-func copyEntry(srcPath string, dparent int, name string, info fs.FileInfo, depth int, report func(int64)) error {
+// readDirNames lists the open directory sfd without consuming it.
+func readDirNames(sfd int) ([]string, error) {
+	dup, err := unix.Dup(sfd)
+	if err != nil {
+		return nil, err
+	}
+	d := os.NewFile(uintptr(dup), "")
+	defer d.Close()
+	return d.Readdirnames(-1)
+}
+
+// copyEntry copies sparent/sname into dparent/dname. The source is classified from an
+// O_PATH|O_NOFOLLOW handle and reopened relative to sparent only if it is still that inode: the
+// source tree belongs to the user and no guard is attached, so a name swapped for a symlink (or
+// another file) between the two steps must not make root copy content from outside the tree.
+func copyEntry(sparent int, srcDir, sname string, dparent int, dname string, depth int, report func(int64)) error {
+	srcPath := filepath.Join(srcDir, sname)
 	if depth > 64 {
 		return fmt.Errorf("directory tree too deep at %s", srcPath)
 	}
-	if info == nil {
-		var err error
-		if info, err = os.Lstat(srcPath); err != nil {
-			return err
-		}
+	pfd, err := unix.Openat(sparent, sname, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", srcPath, err)
 	}
+	pinned := os.NewFile(uintptr(pfd), srcPath)
+	defer pinned.Close()
+	info, err := pinned.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", srcPath, err)
+	}
+
 	switch {
 	case info.IsDir():
-		if mkErr := unix.Mkdirat(dparent, name, uint32(info.Mode().Perm())); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
-			return fmt.Errorf("creating dir %s: %w", name, mkErr)
+		testHookBeforeSourceOpen(srcPath)
+		sfd, oErr := reopenPinned(sparent, sname, info, unix.O_DIRECTORY)
+		if oErr != nil {
+			return fmt.Errorf("opening %s: %w", srcPath, oErr)
 		}
-		cfd, oErr := unix.Openat(dparent, name, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		defer unix.Close(sfd)
+		if mkErr := unix.Mkdirat(dparent, dname, uint32(info.Mode().Perm())); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
+			return fmt.Errorf("creating dir %s: %w", dname, mkErr)
+		}
+		cfd, oErr := unix.Openat(dparent, dname, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if oErr != nil {
 			if errors.Is(oErr, unix.ELOOP) || errors.Is(oErr, unix.ENOTDIR) {
-				return fmt.Errorf("%w: destination %s", safeio.ErrSymlink, name)
+				return fmt.Errorf("%w: destination %s", safeio.ErrSymlink, dname)
 			}
-			return fmt.Errorf("opening dir %s: %w", name, oErr)
+			return fmt.Errorf("opening dir %s: %w", dname, oErr)
 		}
 		defer unix.Close(cfd)
-		return copyDirContents(srcPath, cfd, info, depth, report)
+		return copyDirContents(sfd, srcPath, cfd, info, depth, report)
 	case info.Mode()&os.ModeSymlink != 0:
-		return copySymlinkAt(srcPath, dparent, name, info)
+		return copySymlinkAt(pfd, srcPath, dparent, dname, info)
 	case info.Mode().IsRegular():
-		return copyRegularAt(srcPath, dparent, name, info, report)
+		testHookBeforeSourceOpen(srcPath)
+		sfd, oErr := reopenPinned(sparent, sname, info, unix.O_RDONLY|unix.O_NONBLOCK)
+		if oErr != nil {
+			return fmt.Errorf("opening %s: %w", srcPath, oErr)
+		}
+		in := os.NewFile(uintptr(sfd), srcPath)
+		defer in.Close()
+		return copyRegularAt(in, dparent, dname, info, report)
 	default:
 		// Sockets, FIFOs, device nodes: nothing meaningful to copy.
 		return nil
 	}
 }
 
-func copySymlinkAt(srcPath string, dparent int, name string, info fs.FileInfo) error {
-	target, err := os.Readlink(srcPath)
+// reopenPinned opens sparent/name for reading (never through a symlink) and requires it to be the
+// inode pinned already.
+func reopenPinned(sparent int, name string, pinned fs.FileInfo, flags int) (int, error) {
+	fd, err := unix.Openat(sparent, name, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return -1, err
+	}
+	var st unix.Stat_t
+	want, ok := pinned.Sys().(*syscall.Stat_t)
+	if err := unix.Fstat(fd, &st); err != nil || !ok || st.Dev != want.Dev || st.Ino != want.Ino {
+		_ = unix.Close(fd)
+		return -1, errors.New("source entry changed while it was being copied")
+	}
+	return fd, nil
+}
+
+func copySymlinkAt(pfd int, srcPath string, dparent int, name string, info fs.FileInfo) error {
+	target, err := readlinkFD(pfd)
+	if err != nil {
+		return fmt.Errorf("reading link %s: %w", srcPath, err)
 	}
 	if err := unix.Symlinkat(target, dparent, name); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("creating symlink %s: %w", name, err)
@@ -169,12 +212,17 @@ func copySymlinkAt(srcPath string, dparent int, name string, info fs.FileInfo) e
 	return nil
 }
 
-func copyRegularAt(srcPath string, dparent int, name string, info fs.FileInfo, report func(int64)) error {
-	in, err := os.Open(srcPath)
+// readlinkFD reads the target of the symlink an O_PATH|O_NOFOLLOW fd refers to.
+func readlinkFD(pfd int) (string, error) {
+	buf := make([]byte, unix.PathMax)
+	n, err := unix.Readlinkat(pfd, "", buf)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer in.Close()
+	return string(buf[:n]), nil
+}
+
+func copyRegularAt(in *os.File, dparent int, name string, info fs.FileInfo, report func(int64)) error {
 	// Refuse to write through a symlink at name (a link planted by the destination's user), but
 	// allow overwriting an existing regular file (binary reinstall). O_NOFOLLOW on every open
 	// guards the check→open race: if name became a symlink after the Fstatat, the open fails.

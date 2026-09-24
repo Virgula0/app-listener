@@ -3,6 +3,7 @@ package fscrypt
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/safeio"
 	"github.com/google/fscrypt/actions"
 	"github.com/google/fscrypt/metadata"
 	log "github.com/sirupsen/logrus"
@@ -221,6 +223,28 @@ func stampCopyMetadata(out *os.File, src, dst string, info os.FileInfo) error {
 	return nil
 }
 
+// testHookBeforeFileRead runs after a single-file migration classified path and before it reads it.
+var testHookBeforeFileRead = func(string) {}
+
+// readClassifiedFile reads path only if it is still the regular file info described: the migration
+// runs as root on a file its user owns, so a name swapped for a symlink after classification must
+// not seal (and hand back) content from elsewhere.
+func readClassifiedFile(path string, info os.FileInfo) ([]byte, error) {
+	f, err := safeio.OpenRegularNoFollow(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	got, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(got, info) {
+		return nil, errors.New("file changed while it was being migrated")
+	}
+	return io.ReadAll(f)
+}
+
 // encryptFileWithProgress migrates a single regular file in place: the plaintext is sealed under
 // the file-vault subkey (filevault.go; the kernel ioctl can't target a standalone file) into a
 // fresh sibling, swapped in under the directory migration's backup-first crash-safety contract.
@@ -237,7 +261,8 @@ func (v *Vault) encryptFileWithProgress(path, backup string, onBytes func(copied
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", path, err)
 	}
-	plaintext, err := os.ReadFile(path)
+	testHookBeforeFileRead(path)
+	plaintext, err := readClassifiedFile(path, srcInfo)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
@@ -342,11 +367,12 @@ func (v *Vault) decryptFileWithProgress(path string, onBytes func(copied, total 
 		return err
 	}
 
-	info, statErr := os.Stat(path)
+	info, statErr := os.Lstat(path)
 	if statErr != nil {
 		return fmt.Errorf("stat %s: %w", path, statErr)
 	}
-	record, err := os.ReadFile(path)
+	testHookBeforeFileRead(path)
+	record, err := readClassifiedFile(path, info)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}

@@ -123,3 +123,35 @@ func TestRunsNatively(t *testing.T) {
 		t.Errorf("aarch64 must not count as native on amd64")
 	}
 }
+
+// A whitelisted binary at a user-writable path is parsed as root; its PT_INTERP size is
+// attacker-chosen and must not size an allocation.
+func TestLibraryClosureRejectsOversizedInterp(t *testing.T) {
+	const ehsize, phsize = 64, 56
+	buf := make([]byte, ehsize+phsize+16)
+	copy(buf, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	le := binary.LittleEndian
+	le.PutUint16(buf[16:], 3)      // ET_DYN
+	le.PutUint16(buf[18:], 62)     // EM_X86_64
+	le.PutUint32(buf[20:], 1)      // EV_CURRENT
+	le.PutUint64(buf[32:], ehsize) // e_phoff
+	le.PutUint16(buf[52:], ehsize) // e_ehsize
+	le.PutUint16(buf[54:], phsize) // e_phentsize
+	le.PutUint16(buf[56:], 1)      // e_phnum
+	ph := buf[ehsize:]
+	le.PutUint32(ph[0:], 3)             // PT_INTERP
+	le.PutUint64(ph[8:], ehsize+phsize) // p_offset
+	le.PutUint64(ph[32:], 1<<40)        // p_filesz
+	le.PutUint64(ph[40:], 1<<40)        // p_memsz
+
+	bin := filepath.Join(t.TempDir(), "crafted")
+	if err := os.WriteFile(bin, buf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("LibraryClosure panicked on a crafted ELF: %v", r)
+		}
+	}()
+	_, _, _ = LibraryClosure(bin)
+}

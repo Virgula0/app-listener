@@ -2070,66 +2070,6 @@ func (s *IntegrationSuite) TestDaemon_ManyResources_AttachStaysWithinTrampolineC
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
-// Nested watch roots: path_symlink's target check judges a symlink whose target lies under two
-// guarded roots by the INNERMOST one, the same nearest-guarded-ancestor rule every other hook
-// applies. Whitelisting ln for the outer root only must therefore let it alias outer content and
-// still deny it aliasing inner content — the outer grant must not leak inward.
-//
-// Only one decision may be emitted per path here: two sequential check_and_emit calls put
-// guard_path_symlink over the verifier's 1M-insn budget, so the innermost match is the single
-// resource consulted.
-func (s *IntegrationSuite) TestDaemon_SymlinkTarget_NestedRoots_InnermostGoverns() {
-	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
-	defer c.Terminate(s.ctx)
-
-	s.exec(c, []string{"sh", "-c",
-		"mkdir -p /protected/inner /etc/app-listener && " +
-			"echo OUTER-SECRET > /protected/secret && echo INNER-SECRET > /protected/inner/secret && " +
-			"chmod -R 755 /protected && rm -f /tmp/alias_outer /tmp/alias_inner /tmp/unrelated"})
-
-	// ln on this image is the uutils multicall inode (cat/mkdir/... share it), so this whitelists
-	// that whole applet set for the OUTER root — and for the outer root only.
-	s.startDaemon(c, `[watch /protected]
-need_encryption: false
-/usr/bin/ln
-
-[watch /protected/inner]
-need_encryption: false
-/usr/bin/grep`)
-
-	// Target under the outer root only: outer governs, ln is whitelisted there.
-	code, out := s.exec(c, []string{"/usr/bin/ln", "-s", "/protected/secret", "/tmp/alias_outer"})
-	s.Require().Equalf(0, code,
-		"ln is whitelisted for the outer root, so aliasing outer content must be allowed: %s", out)
-
-	// Target under BOTH roots: the innermost governs, and ln is not whitelisted there.
-	code, out = s.exec(c, []string{"/usr/bin/ln", "-s", "/protected/inner/secret", "/tmp/alias_inner"})
-	s.Require().NotEqualf(0, code,
-		"the outer root's whitelist must not leak into the nested inner root: %s", out)
-
-	code, _ = s.exec(c, []string{"sh", "-c", "test -L /tmp/alias_inner"})
-	s.Require().NotEqualf(0, code, "the denied symlink must not have been created")
-
-	// The denial is attributed to the inner resource, not the outer one: this is what pins the
-	// innermost-match rule rather than merely "something denied it".
-	denied := false
-	for _, ev := range parseDaemonEvents(s.readDaemonLog(c)) {
-		if !ev.Denied || ev.Op != "SYMLINK" {
-			continue
-		}
-		denied = true
-		s.Require().Equalf("/protected/inner", ev.Resource,
-			"the innermost watch root must own the decision, got resource=%q (path=%s)", ev.Resource, ev.Path)
-	}
-	s.Require().Truef(denied, "expected a DENIED SYMLINK event, daemon log:\n%s", s.readDaemonLog(c))
-
-	// Negative control: the check stays content-specific under nesting.
-	code, out = s.exec(c, []string{"/usr/bin/ln", "-s", "/etc/passwd", "/tmp/unrelated"})
-	s.Require().Equalf(0, code, "a symlink unrelated to either guarded root must succeed: %s", out)
-
-	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
-}
-
 // steamGlobConfig guards a Steam location so the catalog's Steam globs are reserved for root's
 // home, with a dash copy standing in for the Steam client (its builtins write as its own inode).
 // /usr/bin/bash is whitelisted for an unrelated resource: the confused deputy.

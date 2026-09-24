@@ -477,15 +477,39 @@ func findResource(cfg *Config, path string) *Resource {
 	return nil
 }
 
-// validateResources rejects duplicate watch paths across the whole config.
+// validateResources rejects duplicate and nested guarded roots across the whole config. The guard
+// engine records one owning resource per inode, so a file under two roots would follow only one of
+// their whitelists. Roots are compared symlink-resolved where they resolve (a locked vault's pending
+// path can't be), so two spellings of one directory are caught too.
 func validateResources(cfg *Config) error {
 	seen := make(map[string]bool, len(cfg.Resources))
+	resolved := make([]string, len(cfg.Resources))
 	for i := range cfg.Resources {
 		r := &cfg.Resources[i]
 		if seen[r.Path] {
 			return fmt.Errorf("daemon config: duplicate watch path: %s", r.Path)
 		}
 		seen[r.Path] = true
+		resolved[i] = filepath.Clean(r.Path)
+		if target, err := filepath.EvalSymlinks(r.Path); err == nil {
+			resolved[i] = target
+		}
+	}
+	for i := range resolved {
+		for j := range resolved {
+			if i == j {
+				continue
+			}
+			if resolved[i] == resolved[j] {
+				return fmt.Errorf("daemon config: %s and %s are the same directory: each guarded tree may be "+
+					"declared once", cfg.Resources[i].Path, cfg.Resources[j].Path)
+			}
+			if isInsidePath(resolved[i], resolved[j]) {
+				return fmt.Errorf("daemon config: guarded path %s is inside guarded path %s: nested guarded "+
+					"trees are not supported (a file can follow only one whitelist) — guard sibling "+
+					"directories or merge the two into one section", cfg.Resources[i].Path, cfg.Resources[j].Path)
+			}
+		}
 	}
 	return nil
 }

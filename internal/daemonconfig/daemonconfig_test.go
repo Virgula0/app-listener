@@ -1324,3 +1324,44 @@ func TestLibrariesBlockRejectsBinaryLines(t *testing.T) {
 		t.Fatalf("a bare binary line in a [libraries] block must be refused, got %v", err)
 	}
 }
+
+// Nested guarded roots would give a file two owners in the one-owner-per-inode engine.
+func TestLoadRejectsNestedRoots(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "inner")
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(outer, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, conf := range map[string]string{
+		"watch inside watch":   "[watch " + outer + "]\nneed_encryption: false\n\n[watch " + inner + "]\nneed_encryption: false\n",
+		"watch around watch":   "[watch " + inner + "]\nneed_encryption: false\n\n[watch " + outer + "]\nneed_encryption: false\n",
+		"lib_dir inside watch": "[watch " + outer + "]\nneed_encryption: false\n\n[libraries \"x\"]\nlib_dir " + inner + "\n",
+		"inside via symlinked parent": "[watch " + outer + "]\nneed_encryption: false\n\n[watch " +
+			filepath.Join(aliasParent, "inner") + "]\nneed_encryption: false\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, conf)); err == nil {
+				t.Fatal("a config with nested guarded roots must be rejected")
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsSiblingRoots(t *testing.T) {
+	base := t.TempDir()
+	a, b := filepath.Join(base, "a"), filepath.Join(base, "ab")
+	for _, d := range []string{a, b} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conf := "[watch " + a + "]\nneed_encryption: false\n\n[watch " + b + "]\nneed_encryption: false\n"
+	if _, err := Load(writeConfig(t, conf)); err != nil {
+		t.Fatalf("sibling roots sharing a name prefix must load: %v", err)
+	}
+}

@@ -1179,7 +1179,7 @@ func (g *Guard) addInode(path string) error {
 		Ino: ino,
 	}
 
-	if err := g.objs().GuardInodes.Put(key, g.resID); err != nil {
+	if err := sharedEngine.claimInode(g, path, key); err != nil {
 		return fmt.Errorf("adding inode %s to map: %w", path, err)
 	}
 	return nil

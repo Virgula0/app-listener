@@ -1,6 +1,7 @@
 package integrationtests
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -214,4 +215,45 @@ lib_binary /exploits/race_victim`)
 		"the refused trace must be logged as PTRACE ATTACH or TRACED_EXEC, daemon log:\n%s", log)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'race_victim' ; pkill -f 'app-listener daemon' || true"})
+}
+
+// The per-resource guards judge a process by its exe inode; only the trust guard stops code injected
+// into a whitelisted process or a whitelisted binary rewritten in place. Without it the daemon must
+// refuse to start with EX_CONFIG (78, no systemd restart loop): before anything is unlocked when the
+// guard can't load or attach, and re-sealing the vault when the post-unlock trusted set can't apply.
+func (s *IntegrationSuite) TestDaemon_TrustGuardUnavailable_RefusesToStart() {
+	for _, stage := range []string{"start", "after-unlock"} {
+		s.Run(stage, func() {
+			c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+			defer c.Terminate(s.ctx)
+			s.copyFscryptHarness(c)
+
+			const marker = "TRUST-GUARD-FAIL-SECRET-7B1C"
+			const secretFile = "/protected/secret.txt"
+			s.exec(c, []string{"sh", "-c",
+				"mkdir -p /protected /etc/app-listener && head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+			s.resetFileVaultTarget(c, secretFile, marker)
+			s.exec(c, []string{"chmod", "644", secretFile})
+			s.harnessMigrate(c, secretFile)
+			s.Require().True(s.harnessIsEncrypted(c, secretFile), "setup: the file must be sealed before the daemon starts")
+
+			config := fmt.Sprintf("[watch %s]\nneed_encryption: true\n/usr/bin/grep", secretFile)
+			s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", config)})
+
+			_, out := s.exec(c, []string{"sh", "-c", "APPLISTENER_TEST_TRUST_FAIL=" + stage +
+				" timeout 90 /app-listener daemon --config /etc/app-listener/daemon.conf --headless 2>&1; echo rc=$?"})
+			s.Require().Containsf(out, "rc=78", "the daemon must refuse to start with EX_CONFIG: %s", out)
+			s.Require().Containsf(out, "trust guard", "the refusal must name the trust guard: %s", out)
+			if stage == "start" {
+				// The self guards over /etc/app-listener attach first on purpose; the resource must not.
+				for _, attached := range []string{"watching: /protected", "guarding: /protected"} {
+					s.Require().NotContainsf(out, attached, "no resource guard may attach before the trust guard: %s", out)
+				}
+				s.Require().NotContainsf(out, "locked fscrypt directory", "nothing may be unlocked before the trust guard: %s", out)
+			}
+
+			s.Require().Truef(s.harnessIsEncrypted(c, secretFile), "the vault must be sealed after the refusal")
+			s.assertFileVaultSealed(c, secretFile, marker, "trust guard refusal at "+stage)
+		})
+	}
 }

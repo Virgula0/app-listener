@@ -22,7 +22,8 @@ every change to enforcement paths as security-sensitive:
   malformed config, a race during unlock — the correct outcome is "deny / refuse to
   start", never "continue unprotected". Preserve existing fail-closed checks
   (`CheckBPFLSM`, the attach-before-unlock ordering, deferred-binary resolution,
-  `/sys/fs/bpf` link pinning, `internal/protected` daemon-alive gates).
+  `/sys/fs/bpf` link pinning, `internal/protected` daemon-alive gates, the trust guard
+  attaching before any unlock with the daemon refusing to start — exit 78 — if it can't).
 - **No TOCTOU windows.** The daemon's invariant is that a resource is never readable
   without a live guard attached. Keep the `attach → unlock → populate → resolve →
   re-sync` order; never move an unlock earlier or a detach earlier.
