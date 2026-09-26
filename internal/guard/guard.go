@@ -349,28 +349,45 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		return nil, fmt.Errorf("populating BPF maps: %w", err)
 	}
 
-	// Activate BEFORE claiming any inode. An active slot with no inode rows denies nothing, so
-	// there is no window; then claiming the root (and, for eager guards, the tree) displaces any
-	// prior owner's row into an ALREADY-ACTIVE slot. On a reload this closes the gap where the
-	// replacement guard moved the live guard's root inode into a still-inactive slot, briefly
-	// unguarding the resource (res_cfg treats an inactive slot as unknown → not guarded).
-	if err := g.activate(); err != nil {
-		g.cleanup()
-		return nil, fmt.Errorf("activating guard for %s: %w", g.path, err)
+	claimRoot := func() error {
+		// populateMaps recorded the root ANCHOR (guard_config[3..4]) but not its guard_inodes row.
+		if err := g.addInode(g.path); err != nil {
+			return fmt.Errorf("claiming guard root inode for %s: %w", g.path, err)
+		}
+		return nil
 	}
-
-	// Claim the root inode now that the slot is live. populateMaps recorded the root ANCHOR
-	// (guard_config[3..4]) but not its guard_inodes row.
-	if err := g.addInode(g.path); err != nil {
-		g.cleanup()
-		return nil, fmt.Errorf("claiming guard root inode for %s: %w", g.path, err)
-	}
-
-	// Register the whole tree (see WithEagerPopulate); the root row is already in place.
-	if g.eagerPopulate {
+	populate := func() error {
 		if err := g.PopulateInodes(); err != nil {
+			return fmt.Errorf("populating inode map for %s (is the path readable?): %w", g.path, err)
+		}
+		return nil
+	}
+	activate := func() error {
+		if err := g.activate(); err != nil {
+			return fmt.Errorf("activating guard for %s: %w", g.path, err)
+		}
+		return nil
+	}
+
+	// Ordering. Normally ACTIVATE BEFORE claiming any inode: an active slot with no rows denies
+	// nothing, and claiming then displaces a prior owner's row into an ALREADY-ACTIVE slot — closing
+	// the reload gap where a replacement guard moved the live guard's root inode into a still-inactive
+	// slot, briefly unguarding it (res_cfg treats an inactive slot as unknown → not guarded).
+	// The exception is an eager guard that does NOT whitelist its own process (standalone `guard`):
+	// once the slot is live and the root is claimed, the guard's own file_open hook denies the
+	// populating walk (WithEagerPopulate), so it must claim+walk BEFORE activating. That is safe
+	// because such guards never reload — no live prior owner exists to displace into the inactive slot.
+	steps := []func() error{activate, claimRoot}
+	switch {
+	case g.eagerPopulate && g.selfBinary == nil:
+		steps = []func() error{claimRoot, populate, activate}
+	case g.eagerPopulate:
+		steps = []func() error{activate, claimRoot, populate}
+	}
+	for _, step := range steps {
+		if err := step(); err != nil {
 			g.cleanup()
-			return nil, fmt.Errorf("populating inode map for %s (is the path readable?): %w", g.path, err)
+			return nil, err
 		}
 	}
 
