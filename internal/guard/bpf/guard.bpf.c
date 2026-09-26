@@ -1463,6 +1463,30 @@ int guard_path_rename(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
+	struct dentry *new_parent = get_dentry_from_path((void *)ctx[2]);
+	struct inode *new_parent_inode = new_parent ? get_inode_from_path((void *)ctx[2]) : NULL;
+
+	// Destination resource, if the rename targets a guarded tree: the victim IS a watch root (a
+	// rename onto an existing file silently unlinks it — security_path_unlink never fires for a
+	// rename target — so clobbering a single-file watch would swap guarded content for an unguarded
+	// inode), or the destination directory is guarded (moving INTO a tree). Computed once here and
+	// reused below. Since 84df28d every resource shares one hook set, so a rename whose source and
+	// destination are DIFFERENT guarded resources must satisfy the DESTINATION's whitelist too, or a
+	// binary whitelisted only for the source could move/exchange into another resource's tree. Both
+	// sides are root-confined, so a stale inode never false-denies.
+	__u32 dst_res = GUARD_RES_NONE;
+	bool dst_victim_root = false, dst_parent_guarded = false;
+	if (new_dentry) {
+		struct inode *victim;
+		bpf_probe_read_kernel(&victim, sizeof(victim), &new_dentry->d_inode);
+		if (victim && inode_is_watch_root(victim, &dst_res))
+			dst_victim_root = true;
+	}
+	if (!dst_victim_root && new_parent_inode && new_parent_inode != inode &&
+	    guarded_map_hit(new_parent, new_parent_inode, 12, &dst_res))
+		dst_parent_guarded = true;
+	bool dst_guarded = dst_victim_root || dst_parent_guarded;
+
 	// Source side, one rooted walk: the file and its parent are both on old_dentry's chain, so a
 	// single root check confines both map hits (two 32-step walks would exceed the verifier
 	// budget).
@@ -1474,45 +1498,41 @@ int guard_path_rename(unsigned long long *ctx)
 			      read_inode_guard(parent_inode, &parent_res);
 	if (own_guarded || parent_guarded) {
 		res = own_guarded ? own_res : parent_res;
-		if (root_in_chain(old_dentry, inode, 16, res))
+		if (root_in_chain(old_dentry, inode, 16, res)) {
+			// Cross-resource move: judge by the destination resource, not the source's whitelist.
+			if (dst_guarded && dst_res != res)
+				res = dst_res;
 			return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
+		}
 	}
 
 	// Deep-file coverage, source side.
-	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK))
+	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK)) {
+		if (dst_guarded && dst_res != res)
+			res = dst_res;
 		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
-
-	// Destination-target side: a rename onto an existing file silently unlinks the victim
-	// (security_path_unlink never fires for a rename target). If the victim IS the watch root, the
-	// rename swaps guarded content for an unguarded inode, a bypass for a single-file watch whose
-	// parent isn't in guard_inodes. Deny on identity with the watch root; RENAME_EXCHANGE with the
-	// root as destination lands here too.
-	if (new_dentry) {
-		struct inode *victim;
-		bpf_probe_read_kernel(&victim, sizeof(victim), &new_dentry->d_inode);
-		if (victim && inode_is_watch_root(victim, &res))
-			return check_and_emit(EVENT_RENAME, new_dentry, NULL, false, NULL, false, false, res);
 	}
 
-	// Also check the destination parent: blocks renaming files from outside INTO a guarded dir, and
-	// into depth-boundary directories added to guard_inodes.
-	struct dentry *new_parent = get_dentry_from_path((void *)ctx[2]);
-	if (new_parent) {
-		struct inode *new_parent_inode = get_inode_from_path((void *)ctx[2]);
-		if (new_parent_inode && new_parent_inode != inode && guarded_map_hit(new_parent, new_parent_inode, 12, &res)) {
-			int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
-			if (ret != 0)
-				return ret;  // blocked — reject the rename
-			// Allowed: a renamed directory's inode is added to guard_inodes so its new location is
-			// guarded.
-			if (should_add_new_dir(res)) {
-				umode_t old_mode;
-				bpf_probe_read_kernel(&old_mode, sizeof(old_mode), &inode->i_mode);
-				if ((old_mode & S_IFMT) == S_IFDIR)
-					add_inode_to_guard(inode, res);
-			}
-			return 0;
+	// Destination-target side (source not guarded): victim is a watch root. RENAME_EXCHANGE with the
+	// root as destination lands here too.
+	if (dst_victim_root)
+		return check_and_emit(EVENT_RENAME, new_dentry, NULL, false, NULL, false, false, dst_res);
+
+	// Destination parent guarded: blocks renaming files from outside INTO a guarded dir, and into
+	// depth-boundary directories added to guard_inodes.
+	if (dst_parent_guarded) {
+		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, dst_res);
+		if (ret != 0)
+			return ret;  // blocked — reject the rename
+		// Allowed: a renamed directory's inode is added to guard_inodes so its new location is
+		// guarded.
+		if (should_add_new_dir(dst_res)) {
+			umode_t old_mode;
+			bpf_probe_read_kernel(&old_mode, sizeof(old_mode), &inode->i_mode);
+			if ((old_mode & S_IFMT) == S_IFDIR)
+				add_inode_to_guard(inode, dst_res);
 		}
+		return 0;
 	}
 
 	// Deep-file coverage, destination side: moving INTO a guarded region whose parent isn't in the
@@ -1650,7 +1670,20 @@ int guard_path_link(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
+	// Destination resource, if the link targets a guarded directory: link(2) writes a new name into
+	// the destination dir. Since 84df28d every resource shares one hook set, so a hardlink from a
+	// source resource INTO a DIFFERENT guarded resource must satisfy the destination's whitelist too
+	// — otherwise a binary whitelisted only for the source could plant an alias inside another tree.
+	// Computed once, reused below; root-confined so a stale inode never false-denies.
+	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
+	struct inode *new_parent_inode = new_parent ? get_inode_from_path((void *)ctx[1]) : NULL;
+	__u32 dst_res = GUARD_RES_NONE;
+	bool dst_guarded = new_parent_inode && new_parent_inode != inode &&
+			   guarded_map_hit(new_parent, new_parent_inode, 12, &dst_res);
+
 	if (guarded_map_hit(old_dentry, inode, 16, &res)) {
+		if (dst_guarded && dst_res != res)
+			res = dst_res;  // cross-resource: judge by the destination's whitelist
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 	}
 
@@ -1664,20 +1697,22 @@ int guard_path_link(unsigned long long *ctx)
 		struct inode *old_parent_inode;
 		bpf_probe_read_kernel(&old_parent_inode, sizeof(old_parent_inode), &old_parent->d_inode);
 		if (old_parent_inode && old_parent_inode != inode &&
-		    guarded_map_hit(old_parent, old_parent_inode, 16, &res))
-			return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
-	}
-	// Deep-file coverage, source side.
-	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK))
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
-
-	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
-	if (new_parent) {
-		struct inode *parent_inode = get_inode_from_path((void *)ctx[1]);
-		if (parent_inode && parent_inode != inode && guarded_map_hit(new_parent, parent_inode, 12, &res)) {
+		    guarded_map_hit(old_parent, old_parent_inode, 16, &res)) {
+			if (dst_guarded && dst_res != res)
+				res = dst_res;
 			return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 		}
 	}
+	// Deep-file coverage, source side.
+	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK)) {
+		if (dst_guarded && dst_res != res)
+			res = dst_res;
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
+	}
+
+	// Destination parent guarded (source not guarded): linking from outside INTO a guarded dir.
+	if (dst_guarded)
+		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, dst_res);
 
 	// Deep-file coverage, destination side: linking INTO a guarded region whose parent isn't in the
 	// map.

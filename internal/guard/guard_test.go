@@ -1064,3 +1064,69 @@ func (s *guardUnitTest) TestStoppedResourceWhitelistNotInheritedBySlotReuse() {
 	s.Require().Error(reuser.objs().GuardExeActions.Lookup(reuser.resKey(exe), &action),
 		"the resource reusing the slot must not inherit the previous resource's whitelist")
 }
+
+// Findings #2/#3: a replacement guard built over the SAME root as a still-live guard (what a reload
+// does before it decides whether to keep the new config) takes over the live guard's guard_inodes
+// row, because claimInode does not treat a same-root replacement as inner. When that replacement is
+// then stopped — a refused reload, a failed buildGuards, a rollback — Stop deletes every row it
+// owns, including the one it took, so the kept resource loses its only inode row. SweepInodes won't
+// re-add it (the root inode never changed) and ReconcileInodes only deletes, so the resource is
+// left readable indefinitely though the old guard is still attached and "keeping" it.
+func (s *guardUnitTest) TestReloadRollbackKeepsFileRootProtected() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-rollback-file-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+
+	root := filepath.Join(s.T().TempDir(), "secret")
+	s.Require().NoError(os.WriteFile(root, []byte("data"), 0o644))
+
+	// Both guards self-allow the test process, as the daemon's guards self-allow the daemon exe:
+	// otherwise the live guard would deny this process's stat/scan while it builds the replacement,
+	// which is not the behaviour under test. The separate `tool` binary (a different inode) stays
+	// non-whitelisted and is the real probe.
+	kept := s.newSelfAllowedGuard(root, ModeWhitelist, nil)
+	defer kept.Stop()
+	s.Require().Error(runTool(tool, root), "the live guard must deny a non-whitelisted reader")
+
+	// The reload's replacement guard for the same resource, built while the old one still runs.
+	repl := s.newSelfAllowedGuard(root, ModeWhitelist, nil)
+	s.Require().Error(runTool(tool, root), "with the replacement active the root stays denied")
+
+	// Reload refused / rolled back: only the replacement is stopped; kept stays attached.
+	repl.Stop()
+	s.Require().Error(runTool(tool, root),
+		"stopping the rolled-back replacement left the kept single-file resource readable — its inode row was deleted")
+}
+
+// Directory counterpart of TestReloadRollbackKeepsFileRootProtected: the replacement's eager scan
+// claims every row of the kept tree, so stopping it strips the whole tree, not just the root.
+func (s *guardUnitTest) TestReloadRollbackKeepsDirTreeProtected() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-rollback-dir-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+
+	root := s.T().TempDir()
+	inner := filepath.Join(root, "sub", "secret")
+	s.Require().NoError(os.MkdirAll(filepath.Dir(inner), 0o755))
+	s.Require().NoError(os.WriteFile(inner, []byte("data"), 0o644))
+
+	// Self-allowed for the same reason as the file-root case: the probe is the separate `tool`.
+	kept := s.newSelfAllowedGuard(root, ModeWhitelist, nil)
+	defer kept.Stop()
+	s.Require().Error(runTool(tool, inner), "the live guard must deny a non-whitelisted reader of a deep file")
+
+	repl := s.newSelfAllowedGuard(root, ModeWhitelist, nil)
+	s.Require().Error(runTool(tool, inner), "with the replacement active the deep file stays denied")
+
+	repl.Stop()
+	s.Require().Error(runTool(tool, inner),
+		"stopping the rolled-back replacement left the kept directory tree readable — its inode rows were deleted")
+}

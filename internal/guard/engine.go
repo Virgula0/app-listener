@@ -45,8 +45,14 @@ type engine struct {
 	linkNames []string
 	// slots maps res_id to the owning Guard so ringbuf events reach the right reader. Index 0 is
 	// resGlobal and never holds a Guard.
-	slots   [GuardMaxRes]*Guard
-	refs    int
+	slots [GuardMaxRes]*Guard
+	// prevOwner records, per inode, the LIVE resource whose guard_inodes row a later claim
+	// overwrote (a reload's replacement guard taking over the resource it replaces). On that
+	// replacement's Stop the row is handed BACK to the displaced owner if it is still live, instead
+	// of being deleted — otherwise a refused/rolled-back reload, or a failed buildGuards, would
+	// leave the kept resource with no inode row while its old guard is still attached (fail open).
+	prevOwner map[GuardInodeKey]uint32
+	refs      int
 	rd      *ringbuf.Reader
 	done    chan struct{}
 	started bool
@@ -289,7 +295,62 @@ func (e *engine) claimInode(g *Guard, path string, key GuardInodeKey) error {
 	if e.innerResourceOwnsLocked(g, filepath.Clean(path)) {
 		return nil
 	}
+	// If a DIFFERENT live resource currently owns this inode (a reload's replacement claiming the
+	// tree it replaces), remember it so releaseInodes can hand the row back rather than delete it.
+	var cur uint32
+	if e.objs.GuardInodes.Lookup(key, &cur) == nil && cur != g.resID &&
+		cur < GuardMaxRes && e.slots[cur] != nil {
+		if e.prevOwner == nil {
+			e.prevOwner = make(map[GuardInodeKey]uint32)
+		}
+		e.prevOwner[key] = cur
+	}
 	return e.objs.GuardInodes.Put(key, g.resID)
+}
+
+// releaseInodes drops resID's guard_inodes rows on Stop. A row whose previous owner (displaced by a
+// reload claim) is still live is handed BACK to it instead of deleted, so a resource kept across a
+// refused/rolled-back reload never loses its inode rows while its old guard is still attached. Done
+// under e.mu (like claimInode) so the check-and-restore is atomic against concurrent claims.
+func (e *engine) releaseInodes(resID uint32) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.objs.GuardInodes == nil {
+		return nil // engine already torn down
+	}
+
+	var owned []GuardInodeKey
+	var key GuardInodeKey
+	var val uint32
+	it := e.objs.GuardInodes.Iterate()
+	for it.Next(&key, &val) {
+		if val == resID {
+			owned = append(owned, key)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return err
+	}
+
+	for _, k := range owned {
+		prev, hasPrev := e.prevOwner[k]
+		if hasPrev && prev != resID && prev < GuardMaxRes && e.slots[prev] != nil {
+			if err := e.objs.GuardInodes.Put(k, prev); err != nil {
+				return err
+			}
+		} else if err := e.objs.GuardInodes.Delete(k); err != nil &&
+			!errors.Is(err, cilium.ErrKeyNotExist) {
+			return err
+		}
+		delete(e.prevOwner, k)
+	}
+	// Drop any remaining hand-back records that point AT this (now-gone) resource.
+	for k, v := range e.prevOwner {
+		if v == resID {
+			delete(e.prevOwner, k)
+		}
+	}
+	return nil
 }
 
 // innerResourceOwnsLocked: a replacement guard over the same root (reload) is not "inner".
@@ -365,6 +426,7 @@ func (e *engine) stopLocked() {
 	e.refs = 0
 	e.done = nil
 	e.sets, e.setAt, e.setRows, e.unionRows, e.memberRows = nil, nil, nil, nil, nil
+	e.prevOwner = nil
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.

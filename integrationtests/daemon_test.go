@@ -460,6 +460,123 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f taint_victim 2>/dev/null; pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass (finding #1): guard_path_rename and guard_path_link decide on the SOURCE side and return
+// before checking the destination (guard.bpf.c ~1475/~1653). Since 84df28d moved every resource
+// onto one hook set, a binary whitelisted for resource A can move/exchange/link into resource B
+// (which does not whitelist it). The headline is confidentiality: a RENAME_EXCHANGE of a file in A
+// with B's secret swaps their names, so B's content lands at a path in A that the SAME whitelisted
+// identity may read. The two operations must be judged against BOTH sides' whitelists; a binary
+// that is not a writer of B must be denied at B whatever its standing in A.
+func (s *IntegrationSuite) TestDaemon_Bypass_CrossResourceRenameLinkOnlySourceChecked() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-CROSS-RENAME-2D9B"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /resourceA /resourceB /exploits /etc/app-listener && " +
+			"printf '" + marker + "' > /resourceB/secret && chmod 755 /resourceA /resourceB && " +
+			"chmod 644 /resourceB/secret && printf 'DECOY-CONTENT' > /resourceA/decoy && chmod 644 /resourceA/decoy"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/xres_move"), "/exploits/xres_move", 0o755),
+		"copy xres_move")
+	s.exec(c, []string{"sh", "-c", "cp /exploits/xres_move /tmp/mover && chmod 755 /tmp/mover"})
+
+	// /tmp/mover is whitelisted for A only; /resourceB whitelists /usr/bin/true, never the mover.
+	s.startDaemon(c, `[watch /resourceA]
+need_encryption: false
+/tmp/mover
+
+[watch /resourceB]
+need_encryption: false
+/usr/bin/true`)
+
+	// Baselines that make the exploit meaningful.
+	code, out := s.exec(c, []string{"/tmp/mover", "read", "/resourceA/decoy"})
+	s.Require().Equalf(0, code, "the mover is whitelisted for A and must read A: %s", out)
+	code, out = s.exec(c, []string{"/tmp/mover", "read", "/resourceB/secret"})
+	s.Require().NotEqualf(0, code, "the mover is NOT whitelisted for B and must be denied a direct read: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat /resourceB/secret 2>&1"})
+	s.Require().NotEqualf(0, code, "a non-whitelisted reader of B must be denied: %s", out)
+
+	// Confidentiality: exchange A's decoy with B's secret. Must be denied at B's side.
+	code, out = s.exec(c, []string{"/tmp/mover", "exchange", "/resourceA/decoy", "/resourceB/secret"})
+	s.Require().NotEqualf(0, code,
+		"a RENAME_EXCHANGE into resource B by a binary whitelisted only for A must be denied: %s", out)
+	// Whether or not the exchange was refused, B's secret must never become readable through A.
+	_, out = s.exec(c, []string{"/tmp/mover", "read", "/resourceA/decoy"})
+	s.Require().NotContainsf(out, marker,
+		"B's secret leaked into resource A via cross-resource exchange and was read by the A-whitelisted binary: %s", out)
+
+	// Integrity: plant into B by rename and by hardlink from A. Both are source-side allowed today.
+	code, out = s.exec(c, []string{"/tmp/mover", "rename", "/resourceA/decoy", "/resourceB/planted"})
+	s.Require().NotEqualf(0, code, "renaming a file from A into B by an A-only binary must be denied: %s", out)
+	code, _ = s.exec(c, []string{"sh", "-c", "test -e /resourceB/planted"})
+	s.Require().NotEqualf(0, code, "the rename planted a file inside resource B")
+	code, out = s.exec(c, []string{"/tmp/mover", "link", "/resourceA/decoy", "/resourceB/aliased"})
+	s.Require().NotEqualf(0, code, "hardlinking a file from A into B by an A-only binary must be denied: %s", out)
+	code, _ = s.exec(c, []string{"sh", "-c", "test -e /resourceB/aliased"})
+	s.Require().NotEqualf(0, code, "the hardlink planted a file inside resource B")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Bypass (finding #3): a reload builds a replacement guard for every resource in the NEW config
+// before it validates the change. That replacement takes over the live guard's guard_inodes row.
+// When the reload is then refused (Phase 0: a resource was dropped) the replacement is stopped and
+// deletes the row it took, so a resource the daemon claims to be "keeping" is left readable while
+// its old guard is still attached. Nothing re-adds the row (SweepInodes needs a changed root inode,
+// ReconcileInodes only deletes).
+//
+// The config lives outside /etc/app-listener so the test can rewrite it (once running, the daemon
+// self-guards its own config dir). Dropping /dropB makes the SIGHUP reload refuse; /keepA is a
+// single-file root, so losing its one row fully unprotects it.
+func (s *IntegrationSuite) TestDaemon_RefusedReload_KeepsRemainingResourceProtected() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-REFUSED-RELOAD-6B4C"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /dropB && printf '" + marker + "' > /keepA && chmod 644 /keepA && echo x > /dropB/f"})
+
+	const cfgPath = "/tmp/poc-daemon.conf"
+	writeCfg := func(body string) {
+		code, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF", cfgPath, body)})
+		s.Require().Equalf(0, code, "writing %s: %s", cfgPath, out)
+	}
+	writeCfg("[watch /keepA]\nneed_encryption: false\n/usr/bin/true\n\n[watch /dropB]\nneed_encryption: false\n/usr/bin/true")
+
+	launch := "nohup /app-listener daemon --config " + cfgPath + " --headless > /tmp/daemon.log 2>&1 &"
+	code, out := s.exec(c, []string{"sh", "-c", launch})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, "[watch /keepA]\n[watch /dropB]")
+
+	// Baseline: /keepA is guarded (a non-whitelisted reader is denied).
+	code, out = s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat /keepA 2>&1"})
+	s.Require().NotEqualf(0, code, "baseline: /keepA must be guarded before the reload: %s", out)
+
+	// Drop /dropB and reload: Phase 0 refuses (removing a resource would leave it unprotected).
+	writeCfg("[watch /keepA]\nneed_encryption: false\n/usr/bin/true")
+	s.sigDaemon(c, "HUP")
+
+	refused := false
+	for deadline := time.Now().Add(daemonShutdownTimeout); time.Now().Before(deadline); {
+		if strings.Contains(s.readDaemonLog(c), "keeping previous configuration") {
+			refused = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Require().Truef(refused, "the reload dropping /dropB was not refused, daemon log:\n%s", s.readDaemonLog(c))
+
+	// The kept resource must still be guarded. Pre-fix the rolled-back replacement's Stop deleted
+	// /keepA's only inode row, so the still-attached old guard fails open.
+	code, out = s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat /keepA 2>&1"})
+	s.Require().NotEqualf(0, code,
+		"a refused reload left the kept resource /keepA readable — its inode row was deleted by the rolled-back guard: %s", out)
+	s.Require().NotContainsf(out, marker, "the kept resource's secret was disclosed after a refused reload: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // daemonPinFiles lists the daemon's pin files under /sys/fs/bpf/app-listener.
 func (s *IntegrationSuite) daemonPinFiles(c testcontainers.Container) []string {
 	_, out := s.exec(c, []string{"sh", "-c", "ls -1 /sys/fs/bpf/app-listener 2>/dev/null || true"})

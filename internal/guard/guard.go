@@ -335,8 +335,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	}
 
 	// Join the shared engine: the LSM programs attach once for the whole process (see engine).
-	// The slot starts INACTIVE, so this resource denies nothing until its inodes are registered —
-	// the same window the old attach-after-populate ordering gave, while every other resource
+	// The slot starts INACTIVE and denies nothing until activated below; every other resource
 	// stays enforced throughout.
 	resID, err := sharedEngine.acquire(g)
 	if err != nil {
@@ -344,24 +343,35 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	}
 	g.resID = resID
 
+	// Write the policy (mode, root anchor, whitelist) but claim NO inodes yet.
 	if err := g.populateMaps(); err != nil {
 		g.cleanup()
 		return nil, fmt.Errorf("populating BPF maps: %w", err)
 	}
 
-	// Register the whole tree before the resource goes live (see WithEagerPopulate); populateMaps
-	// only records the root.
+	// Activate BEFORE claiming any inode. An active slot with no inode rows denies nothing, so
+	// there is no window; then claiming the root (and, for eager guards, the tree) displaces any
+	// prior owner's row into an ALREADY-ACTIVE slot. On a reload this closes the gap where the
+	// replacement guard moved the live guard's root inode into a still-inactive slot, briefly
+	// unguarding the resource (res_cfg treats an inactive slot as unknown → not guarded).
+	if err := g.activate(); err != nil {
+		g.cleanup()
+		return nil, fmt.Errorf("activating guard for %s: %w", g.path, err)
+	}
+
+	// Claim the root inode now that the slot is live. populateMaps recorded the root ANCHOR
+	// (guard_config[3..4]) but not its guard_inodes row.
+	if err := g.addInode(g.path); err != nil {
+		g.cleanup()
+		return nil, fmt.Errorf("claiming guard root inode for %s: %w", g.path, err)
+	}
+
+	// Register the whole tree (see WithEagerPopulate); the root row is already in place.
 	if g.eagerPopulate {
 		if err := g.PopulateInodes(); err != nil {
 			g.cleanup()
 			return nil, fmt.Errorf("populating inode map for %s (is the path readable?): %w", g.path, err)
 		}
-	}
-
-	// Enforcement for this resource begins here.
-	if err := g.activate(); err != nil {
-		g.cleanup()
-		return nil, fmt.Errorf("activating guard for %s: %w", g.path, err)
 	}
 
 	g.pinSelfMaps()
@@ -1031,14 +1041,10 @@ func (g *Guard) populateMaps() error {
 		return rootErr
 	}
 
-	_, statErr := os.Stat(g.path)
-	if statErr != nil {
+	// Validate the path is present before writing policy; the root's guard_inodes row is claimed by
+	// NewGuard AFTER activation (statable even while an encrypted tree is locked).
+	if _, statErr := os.Stat(g.path); statErr != nil {
 		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)
-	}
-	// Store the path's own inode before attach so the ancestor walk covers the tree from the moment
-	// hooks go live (statable even while an encrypted tree is locked).
-	if addErr := g.addInode(g.path); addErr != nil {
-		return addErr
 	}
 
 	if binErr := g.addBinaryActions(g.binaries); binErr != nil {
@@ -1905,7 +1911,7 @@ func (g *Guard) dropResourceState() {
 	if sharedEngine.objs.GuardInodes == nil {
 		return // engine already torn down
 	}
-	if err := g.deleteInodesOfResource(); err != nil {
+	if err := sharedEngine.releaseInodes(g.resID); err != nil {
 		log.Warnf("guard %s: clearing inode entries: %v", g.path, err)
 	}
 	if err := deleteResKeys(g.objs().GuardExeActions, g.resID); err != nil {
@@ -1922,31 +1928,6 @@ func (g *Guard) dropResourceState() {
 			log.Warnf("guard %s: clearing watch path: %v", g.path, err)
 		}
 	}
-}
-
-// deleteInodesOfResource drops every guard_inodes row owned by this resource.
-func (g *Guard) deleteInodesOfResource() error {
-	var (
-		key   GuardInodeKey
-		val   uint32
-		stale []GuardInodeKey
-	)
-	it := g.objs().GuardInodes.Iterate()
-	for it.Next(&key, &val) {
-		if val == g.resID {
-			stale = append(stale, key)
-		}
-	}
-	if err := it.Err(); err != nil {
-		return err
-	}
-	for i := range stale {
-		if err := g.objs().GuardInodes.Delete(stale[i]); err != nil &&
-			!errors.Is(err, cilium.ErrKeyNotExist) {
-			return err
-		}
-	}
-	return nil
 }
 
 // deleteResKeys drops every row of a (res_id, inode)-keyed map belonging to res. It walks keys only

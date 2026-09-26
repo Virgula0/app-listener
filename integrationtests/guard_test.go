@@ -2500,6 +2500,24 @@ func (s *IntegrationSuite) TestGuard_ReconcileInodes_EvictsStale() {
 	s.runGuardTest(c, "TestReconcileInodesEvictsStale")
 }
 
+// Findings #2/#3: a reload builds a replacement guard over the same root as the still-live guard,
+// which takes over its guard_inodes row; if the reload is refused or rolled back the replacement is
+// stopped and deletes that row, leaving the kept resource unprotected while the old guard is still
+// attached. File-root and directory-tree variants.
+func (s *IntegrationSuite) TestGuard_ReloadRollback_KeepsFileRootProtected() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestReloadRollbackKeepsFileRootProtected")
+}
+
+func (s *IntegrationSuite) TestGuard_ReloadRollback_KeepsDirTreeProtected() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestReloadRollbackKeepsDirTreeProtected")
+}
+
 // guard_inode_free (lsm/inode_free_security) forgets a guarded inode when the kernel destroys it:
 // the only point catching a file freed by rename-over, how apps save (Steam rewrites registry.vdf
 // each launch). It fires for every inode leaving memory, so the key assertion is first: a live file
