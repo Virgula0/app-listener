@@ -104,6 +104,10 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if err := revertBunLaunchers(); err != nil {
+		return err
+	}
+
 	if err := revertSystemFiles(); err != nil {
 		return err
 	}

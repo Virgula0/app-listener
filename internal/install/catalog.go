@@ -57,7 +57,28 @@ type CandidateDir struct {
 	// below dir for the entry's whitelisted binaries (guard_trust.bpf.c #3), which may then load such
 	// files with no allow_lib. dir must exist when the daemon (re)loads, or nothing is reserved.
 	ReservedLibs []string
+	// BunLaunchers marks a Bun-based app whose runtime extracts a native library to
+	// $TMPDIR/.bun-<uid>-<hash>.so and dlopen()s it — untrustable on world-writable /tmp. The listed
+	// command names get a $TMPDIR-scoping launcher wrapper at install (opt-in), pointing them at the
+	// shared BunTmpRelDir; the entry's whitelisted binaries become writers of the .bun-* pattern
+	// reserved there (guard_trust.bpf.c #3, buildGlobReservations), so those extractions load under
+	// trust while a non-writer can neither plant nor load one.
+	BunLaunchers []string
 }
+
+// BunTmpRelDir is the home-relative shared directory Bun launchers redirect $TMPDIR to, so a Bun
+// app's per-launch native extraction lands somewhere the trust guard reserves for it instead of
+// world-writable /tmp. Created 0700 by the installer; the .bun-* pattern is reserved below it.
+const BunTmpRelDir = ".cache/app-listener/bun"
+
+// BunReservedName is the extraction name pattern reserved under BunTmpRelDir.
+const BunReservedName = ".bun-*"
+
+// BunTmpDir is BunTmpRelDir under home.
+func BunTmpDir(home string) string { return filepath.Join(home, BunTmpRelDir) }
+
+// IsBun reports a Bun-based entry whose launchers need the $TMPDIR redirect.
+func (c *CandidateDir) IsBun() bool { return len(c.BunLaunchers) > 0 }
 
 // IsSystem reports a system-level (AbsPaths) entry, probed once regardless of users.
 func (c *CandidateDir) IsSystem() bool { return len(c.AbsPaths) > 0 }
@@ -104,7 +125,8 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{
 			"/usr/local/bin/opencode": nil, "/usr/bin/opencode": nil,
 			"%HOME%/.local/bin/opencode": nil,
-		}},
+		},
+		BunLaunchers: []string{"opencode"}},
 	{Name: "code CLI (GitHub)", RelPaths: []string{".config/code-cli"},
 		Whitelist: map[string][]string{
 			"/usr/bin/code-cli": nil, "/usr/local/bin/code-cli": nil,

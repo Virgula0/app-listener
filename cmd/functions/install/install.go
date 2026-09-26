@@ -188,12 +188,9 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return errors.New("config contains no [watch] sections")
 	}
 
-	sshUsers, err := askSSHAgentUsers(cfg)
+	sshUsers, bunUsers, err := gatherPerUserSetup(cfg)
 	if err != nil {
 		return err
-	}
-	if keysErr := addKeysToAgent(sshUsers); keysErr != nil {
-		return keysErr
 	}
 
 	vault := fscrypt.New()
@@ -209,7 +206,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := deploy(cfgText, sshUsers, editPassword); err != nil {
+	if err := deploy(cfgText, sshUsers, bunUsers, editPassword); err != nil {
 		return err
 	}
 
@@ -549,7 +546,7 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 // persisted via writeEditPasswordHash right before EnableAndVerify's first start on a fresh
 // install: everything that could abort has succeeded and the daemon isn't running, so that first
 // start already self-guards the hash and opens the control socket (no follow-up reload).
-func deploy(cfgText string, sshUsers []inst.User, editPassword string) error {
+func deploy(cfgText string, sshUsers []inst.User, bunUsers []bunUser, editPassword string) error {
 	if err := installServices(sshUsers); err != nil {
 		return err
 	}
@@ -558,6 +555,11 @@ func deploy(cfgText string, sshUsers []inst.User, editPassword string) error {
 		return err
 	}
 	if err := preflightDeployedBinary(); err != nil {
+		return err
+	}
+	// Before the daemon (re)starts: the reserved .bun-* pattern activates only once each opted-in
+	// user's tmp dir exists.
+	if err := setupBunTmpdir(bunUsers); err != nil {
 		return err
 	}
 	if err := writeEditPasswordHash(editPassword); err != nil {

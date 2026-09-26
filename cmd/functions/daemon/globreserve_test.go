@@ -240,3 +240,51 @@ func TestBuildGlobReservations_FixedBinaryAncestorsAndSymlinkTarget(t *testing.T
 		t.Errorf("the whitelisted binary must write its own reservations: %v", r.Writers)
 	}
 }
+
+func TestBuildGlobReservations_BunTmpdir(t *testing.T) {
+	home := t.TempDir()
+	bunDir := filepath.Join(home, install.BunTmpRelDir)
+	mkdirs(t, filepath.Join(home, ".config/opencode"), bunDir)
+	bin := filepath.Join(home, ".local/bin/opencode")
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: filepath.Join(home, ".config/opencode"), Binaries: []daemonconfig.BinaryRule{{Path: bin}}},
+		{Path: filepath.Join(home, ".ssh"), Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/ssh"}}},
+	}}
+	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+
+	bit := bitOf(t, r, install.BunReservedName)
+	if r.Roots[bunDir]&bit == 0 {
+		t.Errorf("%s not reserved below %s: %v", install.BunReservedName, bunDir, r.Roots)
+	}
+	if r.Writers[bin]&bit == 0 {
+		t.Errorf("the configured Bun binary must be a writer of its extraction: %v", r.Writers)
+	}
+	if r.Writers["/usr/bin/ssh"]&bit != 0 {
+		t.Errorf("a non-Bun binary must not write the Bun extraction: %v", r.Writers)
+	}
+}
+
+func TestBuildGlobReservations_BunTmpdirMissingDirReservesNoRoot(t *testing.T) {
+	home := t.TempDir()
+	mkdirs(t, filepath.Join(home, ".config/opencode")) // the tmp dir is absent
+	bin := filepath.Join(home, ".local/bin/opencode")
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: filepath.Join(home, ".config/opencode"), Binaries: []daemonconfig.BinaryRule{{Path: bin}}},
+	}}
+	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	if _, ok := r.Roots[filepath.Join(home, install.BunTmpRelDir)]; ok {
+		t.Errorf("a missing Bun tmp dir must reserve no root: %v", r.Roots)
+	}
+}
+
+func TestBuildGlobReservations_BunTmpdirUnconfiguredReservesNothing(t *testing.T) {
+	home := t.TempDir()
+	mkdirs(t, filepath.Join(home, install.BunTmpRelDir)) // dir exists but opencode is not configured
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: filepath.Join(home, ".ssh"), Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/ssh"}}},
+	}}
+	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	if slices.Contains(r.Patterns, install.BunReservedName) {
+		t.Errorf("no configured Bun app: .bun-* must not be reserved: %v", r.Patterns)
+	}
+}

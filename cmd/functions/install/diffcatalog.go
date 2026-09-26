@@ -90,6 +90,11 @@ func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error
 		return restoreDaemonAfterDiffAbort(wasActive, sshErr)
 	}
 
+	bunUsers, bunErr := askBunTmpdirUsers(mergedCfg)
+	if bunErr != nil {
+		return restoreDaemonAfterDiffAbort(wasActive, bunErr)
+	}
+
 	vault := fscrypt.New()
 	securedText, secErr := secureResources(vault, mergedText, mergedCfg)
 	if secErr != nil {
@@ -100,7 +105,7 @@ func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error
 	// the daemon; its failure modes already leave a documented state, so they surface as-is.
 	// --diff-catalog never touches the edit-protected password (an existing hash stays and is
 	// self-guarded again by the restarted daemon).
-	if deployErr := deploy(securedText, sshUsers, ""); deployErr != nil {
+	if deployErr := deploy(securedText, sshUsers, bunUsers, ""); deployErr != nil {
 		return deployErr
 	}
 	if cleanErr := cleanOrphanedFscrypt(mergedCfg); cleanErr != nil {

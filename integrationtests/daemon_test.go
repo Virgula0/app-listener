@@ -2337,6 +2337,58 @@ func (s *IntegrationSuite) TestDaemon_GlobPlant_NonWriterDenied() {
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bun apps extract a native library to $TMPDIR/.bun-<uid>-<hash>.so and dlopen it; a launcher
+// wrapper points $TMPDIR at a private guarded dir where the daemon reserves .bun-* for the app
+// (opencode is a Bun catalog entry). A non-writer must not plant a .bun-* there (that would be an
+// LD_PRELOAD-shaped injection into the whitelisted app), while ordinary temp files a wrapped app's
+// child process writes to the same dir stay allowed — only the reserved name is gated.
+const (
+	bunTmpDir     = "/root/.cache/app-listener/bun"
+	bunGlobConfig = `[watch /root/.config/opencode]
+need_encryption: false
+/root/bin/opencode
+
+[watch /protected]
+need_encryption: false
+/usr/bin/bash`
+)
+
+func (s *IntegrationSuite) TestDaemon_BunTmpdir_PlantDeniedWriterAllowed() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener /root/.config/opencode /root/bin " + bunTmpDir +
+			" && cp /usr/bin/dash /root/bin/opencode && cp /usr/bin/true /tmp/stealer"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/glob_plant"), "/exploits/glob_plant", 0755),
+		"copy glob_plant")
+	s.startDaemon(c, bunGlobConfig)
+	s.Require().Contains(s.readDaemonLog(c), "reserved glob name(s)", "trust guard #3 was not populated")
+
+	evil := bunTmpDir + "/.bun-1000-deadbeef.so"
+	s.assertNotPlanted(c, "create", evil, []string{"sh", "-c", "echo x > " + evil})
+	s.assertNotPlanted(c, "symlink", evil, []string{"ln", "-s", "/tmp/stealer", evil})
+	s.assertNotPlanted(c, "hardlink", evil, []string{"ln", "/tmp/stealer", evil})
+	s.assertNotPlanted(c, "rename", evil, []string{"mv", "/tmp/stealer", evil})
+	s.assertNotPlanted(c, "O_TMPFILE+linkat", evil, []string{"/exploits/glob_plant", "tmpfile", bunTmpDir, evil})
+
+	// The app's own whitelisted binary extracts its .bun-* library into the reserved dir.
+	own := bunTmpDir + "/.bun-1000-abc123.so"
+	code, out := s.exec(c, []string{"/root/bin/opencode", "-c", "printf X > " + own})
+	s.Require().Equalf(0, code, "the Bun app's own binary must create %s: %s", own, out)
+
+	// Ordinary temp files (not .bun-*) in the same dir, and a .bun-* OUTSIDE the reserved root, stay
+	// writable: only the reserved name below the reserved root is gated, so a wrapped app's
+	// subprocesses (which inherit $TMPDIR) are not broken.
+	for _, p := range []string{bunTmpDir + "/tmp-XXXX", bunTmpDir + "/bun.lock", "/tmp/.bun-1000-x.so"} {
+		code, out = s.exec(c, []string{"sh", "-c", "echo x > " + p})
+		s.Require().Equalf(0, code, "%s is not a reserved match and must stay writable: %s", p, out)
+	}
+
+	s.Require().Contains(s.readDaemonLog(c), "TRUST DENIED  op=PLANT", "plant denials must be logged")
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Vuln 3: the owning app still installs new versions (the wildcard dir is new, the reserved name
 // is written by its own binary), and until the refresh whitelists that fresh match, nothing else,
 // not even a binary whitelisted for another resource, may rewrite or alias it.

@@ -160,6 +160,26 @@ func revertSSHAgents() error {
 	return nil
 }
 
+// revertBunLaunchers strips the installer's Bun launcher wrappers from every user's shell startup
+// files. The private cache dir (~/.cache/app-listener/bun) is left in place: it holds only
+// regenerable extractions and is no longer reserved once the daemon is gone.
+func revertBunLaunchers() error {
+	users, err := inst.ListUsers()
+	if err != nil {
+		return err
+	}
+	for i := range users {
+		files, rmErr := inst.RemoveBunLauncherEnv(users[i])
+		for _, f := range files {
+			log.Infof("removed Bun launcher wrapper from %s", f)
+		}
+		if rmErr != nil {
+			return fmt.Errorf("reverting Bun launchers for %s: %w", users[i].Name, rmErr)
+		}
+	}
+	return nil
+}
+
 // staleRCUsers returns the non-root users with no ssh-agent unit file at all and not being
 // removed now: any SSH_AUTH_SOCK block of ours in their shell rc points at nothing. A user with a
 // custom (non-sample) unit is excluded — the block may still serve it.

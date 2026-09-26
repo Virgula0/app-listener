@@ -17,17 +17,22 @@ import (
 )
 
 const (
-	rcBegin = "# >>> app-listener ssh-agent >>>"
-	rcEnd   = "# <<< app-listener ssh-agent <<<"
+	rcBegin    = "# >>> app-listener ssh-agent >>>"
+	rcEnd      = "# <<< app-listener ssh-agent <<<"
+	bunRCBegin = "# >>> app-listener bun tmpdir >>>"
+	bunRCEnd   = "# <<< app-listener bun tmpdir <<<"
 )
 
-// rcTarget is one user file that may carry our marked block. Create: made when missing (else only
-// existing files are touched). Dedicated: deleted when its block is removed and nothing else is
-// left. Setting: keyword whose presence in a non-comment line means the user configured it
-// themselves (case-insensitive). Prepend: block goes first (ssh_config scopes a trailing
-// directive to the last Host/Match, and the first value wins).
+// rcTarget is one user file that may carry our marked block. Begin/End delimit the block (a file may
+// carry an ssh-agent block and a bun block, told apart by their markers). Create: made when missing
+// (else only existing files are touched). Dedicated: deleted when its block is removed and nothing
+// else is left. Setting: keyword whose presence in a non-comment line means the user configured it
+// themselves (case-insensitive; empty skips the check). Prepend: block goes first (ssh_config scopes
+// a trailing directive to the last Host/Match, and the first value wins).
 type rcTarget struct {
 	Path      string
+	Begin     string
+	End       string
 	Block     string
 	Setting   string
 	Mode      os.FileMode
@@ -36,29 +41,53 @@ type rcTarget struct {
 	Prepend   bool
 }
 
-func rcBlock(lines ...string) string {
-	return rcBegin + "\n" + strings.Join(lines, "\n") + "\n" + rcEnd + "\n"
+func rcBlock(begin, end string, lines ...string) string {
+	return begin + "\n" + strings.Join(lines, "\n") + "\n" + end + "\n"
 }
 
 // rcTargets lists every startup file the installer may edit for u. The socket path mirrors
 // ssh-agent.service (%t/ssh-agent.socket = $XDG_RUNTIME_DIR); an already-set SSH_AUTH_SOCK
 // (e.g. a forwarded agent) is never overridden.
 func rcTargets(u User) []rcTarget {
-	posix := rcBlock(fmt.Sprintf(
+	posix := rcBlock(rcBegin, rcEnd, fmt.Sprintf(
 		`export SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-${XDG_RUNTIME_DIR:-/run/user/%d}/ssh-agent.socket}"`, u.UID))
-	fish := rcBlock(fmt.Sprintf(
+	fish := rcBlock(rcBegin, rcEnd, fmt.Sprintf(
 		`set -q SSH_AUTH_SOCK; or set -gx SSH_AUTH_SOCK (set -q XDG_RUNTIME_DIR; and echo $XDG_RUNTIME_DIR; or echo /run/user/%d)/ssh-agent.socket`,
 		u.UID))
 	sh := filepath.Base(u.Shell)
 	return []rcTarget{
-		{Path: filepath.Join(u.Home, ".zshrc"), Block: posix, Setting: authSock, Mode: 0o644, Create: sh == "zsh"},
-		{Path: filepath.Join(u.Home, ".bashrc"), Block: posix, Setting: authSock, Mode: 0o644, Create: sh == "bash"},
+		{Path: filepath.Join(u.Home, ".zshrc"), Begin: rcBegin, End: rcEnd, Block: posix, Setting: authSock, Mode: 0o644, Create: sh == "zsh"},
+		{Path: filepath.Join(u.Home, ".bashrc"), Begin: rcBegin, End: rcEnd, Block: posix, Setting: authSock, Mode: 0o644, Create: sh == "bash"},
 		{Path: filepath.Join(u.Home, ".config", "fish", "conf.d", "app-listener-ssh-agent.fish"),
-			Block: fish, Setting: authSock, Mode: 0o644, Create: sh == "fish", Dedicated: true},
+			Begin: rcBegin, End: rcEnd, Block: fish, Setting: authSock, Mode: 0o644, Create: sh == "fish", Dedicated: true},
 	}
 }
 
 const authSock = "SSH_AUTH_SOCK"
+
+// bunTargets lists every startup file the installer may edit to wrap u's Bun launchers so each runs
+// with $TMPDIR pointed at BunTmpDir(u.Home) — scoping the redirect to just those commands (not a
+// global export, which would relocate every program's temp files). `command`/`env` re-invoke the
+// real binary by PATH, so the function does not recurse. Interactive shells only; a GUI-launched Bun
+// app does not pick it up.
+func bunTargets(u User, launchers []string) []rcTarget {
+	dir := BunTmpDir(u.Home)
+	posixLines := make([]string, 0, len(launchers))
+	fishLines := make([]string, 0, len(launchers))
+	for _, l := range launchers {
+		posixLines = append(posixLines, fmt.Sprintf(`%s() { TMPDIR=%q command %s "$@"; }`, l, dir, l))
+		fishLines = append(fishLines, fmt.Sprintf(`function %s; env TMPDIR=%q %s $argv; end`, l, dir, l))
+	}
+	posix := rcBlock(bunRCBegin, bunRCEnd, posixLines...)
+	fish := rcBlock(bunRCBegin, bunRCEnd, fishLines...)
+	sh := filepath.Base(u.Shell)
+	return []rcTarget{
+		{Path: filepath.Join(u.Home, ".zshrc"), Begin: bunRCBegin, End: bunRCEnd, Block: posix, Mode: 0o644, Create: sh == "zsh"},
+		{Path: filepath.Join(u.Home, ".bashrc"), Begin: bunRCBegin, End: bunRCEnd, Block: posix, Mode: 0o644, Create: sh == "bash"},
+		{Path: filepath.Join(u.Home, ".config", "fish", "conf.d", "app-listener-bun.fish"),
+			Begin: bunRCBegin, End: bunRCEnd, Block: fish, Mode: 0o644, Create: sh == "fish", Dedicated: true},
+	}
+}
 
 // testHookBeforeRCRemove runs between the content check and the removal of a dedicated rc file.
 var testHookBeforeRCRemove = func(string) {}
@@ -68,7 +97,9 @@ var testHookBeforeRCRemove = func(string) {}
 func sshConfigTarget(u User) rcTarget {
 	return rcTarget{
 		Path:      filepath.Join(u.Home, ".ssh", "config"),
-		Block:     rcBlock("AddKeysToAgent yes"),
+		Begin:     rcBegin,
+		End:       rcEnd,
+		Block:     rcBlock(rcBegin, rcEnd, "AddKeysToAgent yes"),
 		Setting:   "AddKeysToAgent",
 		Mode:      0o600,
 		Create:    true,
@@ -85,7 +116,7 @@ func EnsureAddKeysToAgent(u User) (path string, changed bool, err error) {
 	if _, statErr := os.Stat(filepath.Dir(t.Path)); os.IsNotExist(statErr) {
 		return t.Path, false, nil // never create ~/.ssh here (needs 0700 and its own guard)
 	}
-	changed, err = ensureRCBlock(t, u)
+	changed, err = ensureRCBlock(&t, u)
 	if err != nil {
 		return t.Path, false, fmt.Errorf("%s: %w", t.Path, err)
 	}
@@ -98,7 +129,7 @@ func EnsureAddKeysToAgent(u User) (path string, changed bool, err error) {
 func EnsureSSHAgentEnv(u User) ([]string, error) {
 	var changed []string
 	for _, t := range rcTargets(u) {
-		ok, err := ensureRCBlock(t, u)
+		ok, err := ensureRCBlock(&t, u)
 		if err != nil {
 			return changed, fmt.Errorf("%s: %w", t.Path, err)
 		}
@@ -114,7 +145,7 @@ func EnsureSSHAgentEnv(u User) ([]string, error) {
 func RemoveSSHAgentEnv(u User) ([]string, error) {
 	var changed []string
 	for _, t := range append(rcTargets(u), sshConfigTarget(u)) {
-		ok, err := removeRCBlock(t, u)
+		ok, err := removeRCBlock(&t, u)
 		if err != nil {
 			return changed, fmt.Errorf("%s: %w", t.Path, err)
 		}
@@ -125,7 +156,63 @@ func RemoveSSHAgentEnv(u User) ([]string, error) {
 	return changed, nil
 }
 
-func ensureRCBlock(t rcTarget, u User) (bool, error) {
+// EnsureBunLauncherEnv appends the Bun launcher wrappers to u's shell startup files (login shell's
+// always, others only when present). Idempotent. Returns the files modified.
+func EnsureBunLauncherEnv(u User, launchers []string) ([]string, error) {
+	var changed []string
+	for _, t := range bunTargets(u, launchers) {
+		ok, err := ensureRCBlock(&t, u)
+		if err != nil {
+			return changed, fmt.Errorf("%s: %w", t.Path, err)
+		}
+		if ok {
+			changed = append(changed, t.Path)
+		}
+	}
+	return changed, nil
+}
+
+// RemoveBunLauncherEnv strips the Bun launcher block EnsureBunLauncherEnv added from every startup
+// file of u. Returns the files modified.
+func RemoveBunLauncherEnv(u User) ([]string, error) {
+	var changed []string
+	for _, t := range bunTargets(u, nil) {
+		ok, err := removeRCBlock(&t, u)
+		if err != nil {
+			return changed, fmt.Errorf("%s: %w", t.Path, err)
+		}
+		if ok {
+			changed = append(changed, t.Path)
+		}
+	}
+	return changed, nil
+}
+
+// EnsureBunTmpDir creates BunTmpDir(u.Home) (0700, owned by u) if missing, resolving the chain from
+// home O_NOFOLLOW so a user-planted symlink at any parent can't redirect root's mkdir/chown. The
+// trust reservation for .bun-* activates only once this dir exists, so the launcher wrapper and the
+// dir go in together. Returns the directory path.
+func EnsureBunTmpDir(u User) (string, error) {
+	dir := BunTmpDir(u.Home)
+	homeFD, err := unix.Open(u.Home, unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return dir, fmt.Errorf("opening %s: %w", u.Home, err)
+	}
+	leafFD, err := safeio.DescendCreateOwned(homeFD, strings.Split(BunTmpRelDir, "/"), int(u.UID), int(u.GID))
+	if err != nil {
+		_ = unix.Close(homeFD) // DescendCreateOwned returns dirFD unchanged on error
+		return dir, fmt.Errorf("creating %s: %w", dir, err)
+	}
+	defer unix.Close(leafFD)
+	// 0700: user-private cache, so a same-user process is the only local planter, shrinking the
+	// pre-reservation plant window a world-writable /tmp would leave wide open.
+	if err := unix.Fchmod(leafFD, 0o700); err != nil {
+		return dir, fmt.Errorf("chmod %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+func ensureRCBlock(t *rcTarget, u User) (bool, error) {
 	f, err := openOwnedRegular(t.Path, u.UID)
 	if errors.Is(err, fs.ErrNotExist) {
 		if !t.Create {
@@ -143,10 +230,10 @@ func ensureRCBlock(t rcTarget, u User) (bool, error) {
 		return false, err
 	}
 	text := string(data)
-	if strings.Contains(text, rcBegin) {
+	if strings.Contains(text, t.Begin) {
 		return false, nil
 	}
-	if setsKeyword(text, t.Setting) {
+	if t.Setting != "" && setsKeyword(text, t.Setting) {
 		log.Infof("%s already sets %s: leaving it alone", t.Path, t.Setting)
 		return false, nil
 	}
@@ -170,7 +257,7 @@ func ensureRCBlock(t rcTarget, u User) (bool, error) {
 	return err == nil, err
 }
 
-func removeRCBlock(t rcTarget, u User) (bool, error) {
+func removeRCBlock(t *rcTarget, u User) (bool, error) {
 	f, err := openOwnedRegular(t.Path, u.UID)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
@@ -185,7 +272,7 @@ func removeRCBlock(t rcTarget, u User) (bool, error) {
 		return false, err
 	}
 	orig := string(data)
-	text, err := stripRCBlocks(orig, t.Prepend)
+	text, err := stripRCBlocks(orig, t.Begin, t.End, t.Prepend)
 	if err != nil {
 		return false, err
 	}
@@ -204,29 +291,29 @@ func removeRCBlock(t rcTarget, u User) (bool, error) {
 	return true, f.Truncate(int64(len(text)))
 }
 
-// stripRCBlocks removes every marked block from text together with the blank separator that was
-// added alongside it.
-func stripRCBlocks(text string, prepend bool) (string, error) {
+// stripRCBlocks removes every begin/end-marked block from text together with the blank separator
+// that was added alongside it.
+func stripRCBlocks(text, begin, end string, prepend bool) (string, error) {
 	for {
-		start := strings.Index(text, rcBegin)
+		start := strings.Index(text, begin)
 		if start < 0 {
 			return text, nil
 		}
-		n := strings.Index(text[start:], rcEnd)
+		n := strings.Index(text[start:], end)
 		if n < 0 {
 			return "", errors.New("unterminated app-listener block: remove it by hand")
 		}
-		end := start + n + len(rcEnd)
-		if strings.HasPrefix(text[end:], "\n") {
-			end++
+		blockEnd := start + n + len(end)
+		if strings.HasPrefix(text[blockEnd:], "\n") {
+			blockEnd++
 		}
 		switch {
-		case prepend && start == 0 && strings.HasPrefix(text[end:], "\n"):
-			end++
+		case prepend && start == 0 && strings.HasPrefix(text[blockEnd:], "\n"):
+			blockEnd++
 		case !prepend && strings.HasSuffix(text[:start], "\n\n"):
 			start--
 		}
-		text = text[:start] + text[end:]
+		text = text[:start] + text[blockEnd:]
 	}
 }
 

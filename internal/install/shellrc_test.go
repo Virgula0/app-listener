@@ -196,3 +196,83 @@ func TestEnsureAddKeysToAgentNeverCreatesSSHDir(t *testing.T) {
 		t.Fatalf("~/.ssh must not be created: %v", err)
 	}
 }
+
+func TestEnsureBunLauncherEnvAppendsOnceAndRemoveRestores(t *testing.T) {
+	u := rcUser(t, "/usr/bin/zsh")
+	rc := filepath.Join(u.Home, ".zshrc")
+	const orig = "alias ll='ls -l'"
+	if err := os.WriteFile(rc, []byte(orig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := EnsureBunLauncherEnv(u, []string{"opencode"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := readFile(t, rc)
+	if strings.Count(got, bunRCBegin) != 1 {
+		t.Fatalf("expected exactly one bun block:\n%s", got)
+	}
+	wantFn := `opencode() { TMPDIR="` + BunTmpDir(u.Home) + `" command opencode "$@"; }`
+	if !strings.Contains(got, wantFn) {
+		t.Fatalf("wrapper function missing:\n%s", got)
+	}
+	if !strings.HasPrefix(got, orig+"\n") {
+		t.Fatalf("existing content altered:\n%s", got)
+	}
+
+	changed, err := RemoveBunLauncherEnv(u)
+	if err != nil || len(changed) != 1 {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	if got := readFile(t, rc); got != orig+"\n" {
+		t.Fatalf("remove did not restore the file: %q", got)
+	}
+}
+
+// The ssh-agent and bun blocks carry distinct markers, so adding/removing one leaves the other.
+func TestBunAndSSHBlocksCoexist(t *testing.T) {
+	u := rcUser(t, "/bin/bash")
+	rc := filepath.Join(u.Home, ".bashrc")
+	if err := os.WriteFile(rc, []byte("# rc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureSSHAgentEnv(u); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureBunLauncherEnv(u, []string{"opencode"}); err != nil {
+		t.Fatal(err)
+	}
+	got := readFile(t, rc)
+	if !strings.Contains(got, rcBegin) || !strings.Contains(got, bunRCBegin) {
+		t.Fatalf("both blocks expected:\n%s", got)
+	}
+	if _, err := RemoveBunLauncherEnv(u); err != nil {
+		t.Fatal(err)
+	}
+	got = readFile(t, rc)
+	if strings.Contains(got, bunRCBegin) {
+		t.Fatalf("bun block not removed:\n%s", got)
+	}
+	if !strings.Contains(got, "ssh-agent.socket") {
+		t.Fatalf("ssh-agent block must survive bun removal:\n%s", got)
+	}
+}
+
+func TestEnsureBunTmpDirCreates0700(t *testing.T) {
+	u := rcUser(t, "/bin/bash")
+	dir, err := EnsureBunTmpDir(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("want a 0700 dir, got %v", fi.Mode())
+	}
+	if _, err := EnsureBunTmpDir(u); err != nil { // idempotent
+		t.Fatalf("second call: %v", err)
+	}
+}

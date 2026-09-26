@@ -30,6 +30,7 @@ func buildGlobReservations(cfg *daemonconfig.Config, users []install.User) guard
 				b.addEntry(e, u)
 			}
 		}
+		b.reserveBunTmp(u)
 	}
 	for k, bits := range b.children {
 		b.r.Children = append(b.r.Children, guard.GlobChild{Parent: k[0], Name: k[1], Bits: bits})
@@ -72,6 +73,40 @@ func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
 	for _, g := range e.ReservedLibGlobs(u.Name, u.Home) {
 		b.reserve(g, e.Name+"\x00"+g.Name, writers)
 	}
+}
+
+// reserveBunTmp reserves the shared Bun extraction name (.bun-*) under ~/.cache/app-listener/bun for
+// every configured Bun app's binaries, all under ONE shared bit: a launcher wrapper points $TMPDIR
+// there (install), so a Bun app loads its own — and, harmlessly, another trusted Bun app's —
+// per-launch native library, while a non-writer can neither plant nor load one. Unlike per-entry
+// ReservedLibs the bit is shared: several apps write .bun-* into the same dir, so per-entry bits
+// would make each app a non-writer of the others' extractions and deny creation. The dir must exist
+// (the installer creates it only when the user opts in); a missing dir reserves nothing.
+func (b *globBuilder) reserveBunTmp(u install.User) {
+	seen := map[string]bool{}
+	var writers []string
+	for i := range install.Catalog {
+		e := &install.Catalog[i]
+		if !e.IsBun() {
+			continue
+		}
+		for _, w := range entryWriters(b.cfg, e, u) {
+			if !seen[w] {
+				seen[w] = true
+				writers = append(writers, w)
+			}
+		}
+	}
+	if len(writers) == 0 {
+		return
+	}
+	sort.Strings(writers)
+	b.reserve(install.TrustGlob{
+		Home:  u.Home,
+		Fixed: strings.Split(install.BunTmpRelDir, "/"),
+		Name:  install.BunReservedName,
+		Lib:   true,
+	}, "\x00bun-shared", writers)
 }
 
 func (b *globBuilder) reserve(g install.TrustGlob, key string, writers []string) {
