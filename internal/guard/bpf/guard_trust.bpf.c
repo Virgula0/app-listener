@@ -332,12 +332,36 @@ static __always_inline int inode_is_root_ro(struct inode *inode)
 	return 1;
 }
 
+// FUSE and fuseblk both report FUSE_SUPER_MAGIC (fs/fuse). An unprivileged user can mount a FUSE
+// filesystem (fusermount) whose server reports ANY file as root-owned and non-writable, so on-disk
+// ownership there proves nothing about root control. Never auto-trust a file on such a filesystem
+// (finding 5); genuine self-updated libraries live on the real fs and are covered by the guarded-tree
+// / reserved-library rules instead.
+#define FUSE_SUPER_MAGIC 0x65735546
+
+static __always_inline int inode_on_user_mountable_fs(struct inode *inode)
+{
+	if (!inode)
+		return 1; // no inode to vouch for: conservatively untrusted
+	struct super_block *sb = NULL;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return 1;
+	unsigned long magic = 0;
+	bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
+	return magic == FUSE_SUPER_MAGIC;
+}
+
 // is_system_trusted: the file is root-owned and not group/other-writable AND sits directly in a
 // directory that is likewise. Two levels are enough to tell /usr/lib, /opt/... (auto-trusted) from
 // anything a non-root user could replace: a user-writable directory lets its owner swap even a
-// root-owned file by unlink+create, so the parent must be root-owned too.
+// root-owned file by unlink+create, so the parent must be root-owned too. Files on a user-mountable
+// filesystem (FUSE) are never system-trusted whatever ownership they report — the file and its
+// parent share the superblock, so one check covers both.
 static __always_inline int is_system_trusted(struct inode *inode, struct dentry *dentry)
 {
+	if (inode_on_user_mountable_fs(inode))
+		return 0;
 	if (!inode_is_root_ro(inode))
 		return 0;
 	if (!dentry)

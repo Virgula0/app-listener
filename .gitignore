@@ -20,6 +20,7 @@ internal/guard/guard_bpf.go
 internal/guard/guardtrust_bpf.go
 internal/networkmonitor/networkmonitor_bpf.go
 internal/networkguard/guardnet_bpf.go
+build/*.o
 
 *.log
 

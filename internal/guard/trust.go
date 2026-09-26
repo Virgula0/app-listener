@@ -72,11 +72,11 @@ func NewTrustGuard() (*TrustGuard, error) {
 
 // SetTrusted (re)populates guard_trusted_files from resolved binary and library paths. A path that
 // is both carries both flags. Unresolvable paths are skipped with a warning. Idempotent: the map is
-// cleared first, so a reload that dropped a binary also drops its trust entry (no stale over-trust).
+// synced to exactly the new set (drops entries for removed binaries, no stale over-trust). Uses
+// syncMap (put-new-then-delete-stale) rather than clearing first, so a reload never opens a window
+// where no binary is trusted — during that window the library allowlist and binary write-protection
+// would enforce nothing (SIGHUP is the normal way the whitelist changes; see trustManager.reload).
 func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
-	if err := clearInodeMap[uint8](t.objs.GuardTrustedFiles); err != nil {
-		return fmt.Errorf("clearing trusted files: %w", err)
-	}
 	flags := make(map[GuardInodeKey]uint8)
 	add := func(path string, flag uint8) {
 		dev, ino, err := ebpf.StatInode(path)
@@ -92,10 +92,8 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	for _, l := range libs {
 		add(l, trustedLib)
 	}
-	for key, f := range flags {
-		if err := t.objs.GuardTrustedFiles.Put(key, f); err != nil {
-			return fmt.Errorf("populating trusted file %+v: %w", key, err)
-		}
+	if err := syncMap(t.objs.GuardTrustedFiles, flags); err != nil {
+		return fmt.Errorf("syncing trusted files: %w", err)
 	}
 	log.Infof("trust guard: %d trusted inode(s) loaded (%d binaries, %d libraries requested)",
 		len(flags), len(binaries), len(libs))
@@ -150,18 +148,13 @@ func planTrustedDirs(dirs []TrustedDir) (roots, loaders map[string]uint64, refus
 
 // SetGuardedDirs records every guarded resource root and who may load libraries from below it
 // (under_guarded_tree in guard_trust.bpf.c). Unresolvable paths are skipped with a warning.
-// Idempotent (cleared first).
+// Idempotent: synced to exactly the new set via syncMap (put-then-delete-stale), never cleared
+// first, so a reload never opens a window where the library allowlist trusts no one.
 func (t *TrustGuard) SetGuardedDirs(dirs []TrustedDir) error {
 	roots, loaders, refused := planTrustedDirs(dirs)
 	for _, p := range refused {
 		log.Warnf("trust guard: too many distinct lib_dir writer sets, libraries under %s are "+
 			"trusted for no one", p)
-	}
-	if err := clearInodeMap[uint64](t.objs.GuardTrustedDirs); err != nil {
-		return fmt.Errorf("clearing guarded dirs: %w", err)
-	}
-	if err := clearInodeMap[uint64](t.objs.GuardLibdirUsers); err != nil {
-		return fmt.Errorf("clearing lib_dir loaders: %w", err)
 	}
 	userBits := make(map[GuardInodeKey]uint64)
 	for path, bits := range loaders {
@@ -172,45 +165,22 @@ func (t *TrustGuard) SetGuardedDirs(dirs []TrustedDir) error {
 		}
 		userBits[GuardInodeKey{Dev: dev, Ino: ino}] |= bits
 	}
-	for key, bits := range userBits {
-		if err := t.objs.GuardLibdirUsers.Put(key, bits); err != nil {
-			return fmt.Errorf("recording lib_dir writer %+v: %w", key, err)
-		}
+	if err := syncMap(t.objs.GuardLibdirUsers, userBits); err != nil {
+		return fmt.Errorf("syncing lib_dir loaders: %w", err)
 	}
-	n := 0
+	rootKeys := make(map[GuardInodeKey]uint64, len(roots))
 	for r, mask := range roots {
 		dev, ino, err := ebpf.StatInode(r)
 		if err != nil {
 			log.Warnf("trust guard: skipping unresolvable guarded root %s: %v", r, err)
 			continue
 		}
-		if err := t.objs.GuardTrustedDirs.Put(GuardInodeKey{Dev: dev, Ino: ino}, mask); err != nil {
-			return fmt.Errorf("recording guarded root %s: %w", r, err)
-		}
-		n++
+		rootKeys[GuardInodeKey{Dev: dev, Ino: ino}] = mask
 	}
-	log.Infof("trust guard: %d guarded resource root(s) recorded (libraries inside them are trusted)", n)
-	return nil
-}
-
-// clearInodeMap deletes every entry of a GuardInodeKey-keyed hash map whose values are V so
-// SetTrusted/SetGuardedDirs can be re-applied on reload as a true replace, not an add-only merge.
-func clearInodeMap[V any](m *cilium.Map) error {
-	var keys []GuardInodeKey
-	var k GuardInodeKey
-	var v V
-	it := m.Iterate()
-	for it.Next(&k, &v) {
-		keys = append(keys, k)
+	if err := syncMap(t.objs.GuardTrustedDirs, rootKeys); err != nil {
+		return fmt.Errorf("syncing guarded dirs: %w", err)
 	}
-	if err := it.Err(); err != nil {
-		return err
-	}
-	for i := range keys {
-		if err := m.Delete(keys[i]); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
-			return err
-		}
-	}
+	log.Infof("trust guard: %d guarded resource root(s) recorded (libraries inside them are trusted)", len(rootKeys))
 	return nil
 }
 

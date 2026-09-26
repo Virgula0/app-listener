@@ -2518,6 +2518,15 @@ func (s *IntegrationSuite) TestGuard_ReloadRollback_KeepsDirTreeProtected() {
 	s.runGuardTest(c, "TestReloadRollbackKeepsDirTreeProtected")
 }
 
+// Finding #4: SetTrusted must sync guard_trusted_files (put-then-delete), never clear it before
+// refilling — otherwise a reload leaves a window where no binary is trusted.
+func (s *IntegrationSuite) TestGuard_SetTrusted_NeverDropsPersistentEntry() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestSetTrustedNeverDropsPersistentEntry")
+}
+
 // guard_inode_free (lsm/inode_free_security) forgets a guarded inode when the kernel destroys it:
 // the only point catching a file freed by rename-over, how apps save (Steam rewrites registry.vdf
 // each launch). It fires for every inode leaving memory, so the key assertion is first: a live file

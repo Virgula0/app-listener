@@ -331,6 +331,72 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass (finding #5): is_system_trusted auto-trusts any library reported as root-owned in a
+// root-owned directory. File ownership on a user-mountable filesystem (FUSE) is whatever the
+// unprivileged mounter's server claims, so it proves nothing about root control: a normal user can
+// mount a FUSE fs that reports an attacker library as root:root and LD_PRELOAD it into a whitelisted
+// binary. The fix refuses to system-trust files on a FUSE superblock; a genuine root-owned library
+// on the real filesystem must still load (positive control).
+//
+// Uses bindfs (a FUSE fs that can force root:root ownership) so no custom FUSE server is needed.
+// Skips cleanly if FUSE/bindfs is unavailable in the container.
+func (s *IntegrationSuite) TestDaemon_Bypass_FuseRootOwnedLibNotAutoTrusted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"command -v bindfs >/dev/null 2>&1 || (timeout 120 apt-get update -qq && " +
+			"timeout 120 apt-get install -y -qq --no-install-recommends bindfs)"})
+	if code2, _ := s.exec(c, []string{"sh", "-c", "command -v bindfs >/dev/null 2>&1"}); code2 != 0 {
+		s.T().Skipf("bindfs (FUSE) could not be installed — this test needs it: %s", out)
+	}
+	// A privileged container usually has /dev/fuse; create the node and load the module if not.
+	s.exec(c, []string{"sh", "-c",
+		"test -e /dev/fuse || mknod -m 666 /dev/fuse c 10 229; modprobe fuse 2>/dev/null || true"})
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener /src /fusemnt /realsys && chmod 755 /protected /src /fusemnt /realsys"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), "/exploits/lib_probe.so", 0o755), "copy lib_probe.so")
+	// The library the attacker wants loaded: lib_probe announces LIB_PROBE_LOADED from its
+	// constructor when ld.so maps and runs it.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/lib_probe.so /src/evil.so && chmod 644 /src/evil.so"})
+	// Positive-control copy on the REAL fs, genuinely root:root in a root:root dir.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/lib_probe.so /realsys/evil.so && chown 0:0 /realsys/evil.so && chmod 644 /realsys/evil.so"})
+
+	code, out = s.exec(c, []string{"sh", "-c",
+		"bindfs --force-user=root --force-group=root --perms=0644 /src /fusemnt 2>&1"})
+	if code != 0 {
+		s.T().Skipf("bindfs mount unavailable in this container (no /dev/fuse or no SYS_ADMIN): %s", out)
+	}
+	defer s.exec(c, []string{"sh", "-c", "fusermount -u /fusemnt 2>/dev/null || umount /fusemnt 2>/dev/null || true"})
+
+	// Confirm the mount really presents a FUSE fs reporting the library as root-owned; otherwise the
+	// test would pass vacuously.
+	_, ft := s.exec(c, []string{"sh", "-c", "stat -f -c %T /fusemnt 2>&1; stat -c '%U:%G' /fusemnt/evil.so 2>&1"})
+	if !strings.Contains(ft, "fuse") || !strings.Contains(ft, "root:root") {
+		s.T().Skipf("bindfs did not present a FUSE root-owned file (got %q) — cannot exercise the bypass", ft)
+	}
+
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	// Positive control: a genuine root-owned library on the real filesystem is still auto-trusted
+	// and loads into the whitelisted binary — the fix must not break system-library trust.
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/realsys/evil.so /usr/bin/true 2>&1"})
+	s.Require().Containsf(out, libProbeMarker,
+		"a genuine root-owned system library on the real fs must still load (is_system_trusted regressed): %s", out)
+
+	// Attack: the FUSE-hosted library reports root:root but is attacker-controlled. It must NOT be
+	// auto-trusted, so ld.so cannot map it into the whitelisted binary.
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/fusemnt/evil.so /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, libProbeMarker,
+		"a FUSE-hosted 'root-owned' library was auto-trusted and loaded into a whitelisted binary: %s", out)
+	s.requireDenialLogged(c, "LIBLOAD", "evil.so")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // The trust guard's trusted set is built once at daemon start and is never rebuilt on SIGHUP, but
 // SIGHUP is the normal way the whitelist changes: the pacman PostTransaction and apt
 // DPkg::Post-Invoke catalog-refresh hooks reload rather than restart. A binary whitelisted by a

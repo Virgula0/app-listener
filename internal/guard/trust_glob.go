@@ -172,8 +172,10 @@ func statKey(path string) (GuardTrustInodeKey, bool) {
 	return GuardTrustInodeKey{Dev: dev, Ino: ino}, true
 }
 
-// syncMap makes m hold exactly want: puts first, then deletes keys want lacks.
-func syncMap[K comparable](m *cilium.Map, want map[K]uint64) error {
+// syncMap makes m hold exactly want: puts first, then deletes keys want lacks. Never clears first,
+// so a reload (or a partial failure) never opens a window where the map is empty or missing entries
+// it will keep — the kernel always sees at least the previous set until the new one is fully in.
+func syncMap[K comparable, V any](m *cilium.Map, want map[K]V) error {
 	for k, v := range want {
 		if err := m.Put(k, v); err != nil {
 			return err
@@ -181,7 +183,7 @@ func syncMap[K comparable](m *cilium.Map, want map[K]uint64) error {
 	}
 	var (
 		k     K
-		v     uint64
+		v     V
 		stale []K
 	)
 	it := m.Iterate()

@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -1014,6 +1016,70 @@ func (s *guardUnitTest) TestNestedResourcesInnermostOwns() {
 	check("inner scanned last")
 	s.Require().NoError(og.PopulateInodes())
 	check("outer scanned last")
+}
+
+// Finding #4: SetTrusted must not empty guard_trusted_files before refilling it. A reload is the
+// normal way the trusted set changes (SIGHUP catalog refresh), and while the old code cleared the
+// map then re-populated it, a concurrent process was momentarily trusted for nothing — the library
+// allowlist and binary write-protection enforced nothing in that window. syncMap (put-then-delete)
+// keeps a binary that survives the change continuously present. A reader in a tight loop would see
+// the pre-fix clear-then-fill window; post-fix it never does.
+func (s *guardUnitTest) TestSetTrustedNeverDropsPersistentEntry() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	dir := s.T().TempDir()
+	persistent := filepath.Join(dir, "persistent-bin")
+	s.Require().NoError(os.WriteFile(persistent, []byte("x"), 0o755))
+	dev, ino, err := ebpf.StatInode(persistent)
+	s.Require().NoError(err)
+	pkey := GuardInodeKey{Dev: dev, Ino: ino}
+
+	// A pool of binaries that come and go across re-applications, so each SetTrusted is a real
+	// change (adds one, drops the previous) — the persistent one is in every set.
+	others := make([]string, 8)
+	for i := range others {
+		p := filepath.Join(dir, fmt.Sprintf("other-%d", i))
+		s.Require().NoError(os.WriteFile(p, []byte("y"), 0o755))
+		others[i] = p
+	}
+
+	tg, err := NewTrustGuard()
+	s.Require().NoError(err)
+	defer tg.Stop()
+	s.Require().NoError(tg.SetTrusted([]string{persistent}, nil))
+
+	// The persistent binary must be trusted at ALL times while SetTrusted re-applies concurrently.
+	var dropped atomic.Bool
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var v uint8
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := tg.objs.GuardTrustedFiles.Lookup(pkey, &v); err != nil {
+				dropped.Store(true)
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 300; i++ {
+		s.Require().NoError(tg.SetTrusted([]string{persistent, others[i%len(others)]}, nil))
+	}
+	close(stop)
+	wg.Wait()
+
+	s.Require().Falsef(dropped.Load(),
+		"the persistent binary vanished from guard_trusted_files during a re-apply — "+
+			"SetTrusted must sync (put-then-delete), never clear before refilling")
 }
 
 // TestMain intercepts the -helper-child invocation: the copied test
