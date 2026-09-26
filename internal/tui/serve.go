@@ -32,10 +32,9 @@ const (
 	minServeRows = 1
 	maxServeRows = 500
 
-	// fanoutBuffer is the per-subscriber event queue of the dual-TUI fanout.
-	// A subscriber that cannot keep up drops its oldest queued event instead
-	// of blocking the engine reader (which would overflow the kernel ring
-	// buffer and lose events for both subscribers).
+	// fanoutBuffer is the per-subscriber queue of the dual-TUI fanout. A subscriber that can't keep
+	// up drops its oldest queued event rather than block the engine reader (kernel ring-buffer
+	// overflow would lose events for both).
 	fanoutBuffer = 256
 )
 
@@ -55,11 +54,9 @@ type resizeMessage struct {
 	Rows int    `json:"rows"`
 }
 
-// EventFanout turns the single point-to-point engine event channel into two
-// ordered streams so the local TUI and the browser TUI can run as two
-// independent Bubble Tea programs (separate dimensions, scroll state and
-// counters) without competing for events. Stop closes both output channels
-// after the dispatcher exits, releasing any pending event receive command.
+// EventFanout splits the engine's single event channel into two ordered streams so the local and
+// browser TUIs run as independent Bubble Tea programs (own dimensions, scroll, counters). Stop
+// closes both outputs after the dispatcher exits, releasing any pending receive.
 type EventFanout[T any] struct {
 	source    <-chan T
 	local     chan T
@@ -114,9 +111,8 @@ func (f *EventFanout[T]) dispatch() {
 	}
 }
 
-// deliver queues ev without ever blocking: on a full queue the oldest queued
-// event is dropped first, so one slow subscriber cannot stall the other or
-// back-pressure the engine into kernel ring-buffer loss.
+// deliver queues ev without blocking: a full queue drops its oldest event first, so one slow
+// subscriber can't stall the other or back-pressure the engine into ring-buffer loss.
 func (f *EventFanout[T]) deliver(queue chan T, ev T) {
 	select {
 	case queue <- ev:
@@ -216,11 +212,9 @@ func (m *servedModel) View() string {
 	return ""
 }
 
-// Serve runs the local TUI and the browser TUI side by side. Both models must
-// be independent instances fed by an EventFanout: they own their dimensions
-// and state separately. Quitting the local TUI (q, ctrl+c or SIGINT/SIGTERM)
-// shuts down the browser endpoint; the process keeps its secure shutdown
-// ordering because the caller's deferred use case stop runs after Serve
+// Serve runs the local and browser TUIs side by side; both must be independent models fed by an
+// EventFanout. Quitting the local TUI (q, ctrl+c, SIGINT/SIGTERM) shuts down the browser endpoint;
+// secure shutdown ordering holds because the caller's deferred use case stop runs after Serve
 // returns.
 func Serve(local, browser tea.Model, options ServeOptions) error {
 	if !isInteractiveTerminal() {

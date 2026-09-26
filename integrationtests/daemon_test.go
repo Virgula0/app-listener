@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -90,27 +91,21 @@ func watchPathsInConfig(config string) []string {
 	return paths
 }
 
-// launchDaemon backgrounds the daemon process against the already-written
-// /etc/app-listener/daemon.conf, without waiting for it to come up. Split out
-// of startDaemon so a caller that needs to race something against the exact
-// startup window (see daemon_toctou_test.go) can start its racer immediately
-// before this call and stop it once awaitDaemonUp returns.
+// launchDaemon backgrounds the daemon on the already-written daemon.conf without waiting for it.
+// Split from startDaemon so a caller can start a racer right before this call and stop it once
+// awaitDaemonUp returns (daemon_toctou_test.go).
 func (s *IntegrationSuite) launchDaemon(c testcontainers.Container) {
 	cmd := "nohup /app-listener daemon --config /etc/app-listener/daemon.conf --headless > /tmp/daemon.log 2>&1 &"
 	code, out := s.exec(c, []string{"sh", "-c", cmd})
 	s.Require().Equalf(0, code, "starting daemon: %s", out)
 }
 
-// awaitDaemonUp polls until the daemon's guards are attached and its event
-// readers are running for EVERY resource in config: the pid file, then one
-// "guard started — guarding: <path>" log line per "[watch <path>]" section.
-// Waiting for only the first such line (as this used to) is a real race on a
-// multi-resource config: each guard (re)attach is its own multi-second
-// BPF-verifier pass on a slow host (see daemonShutdownTimeout), so a caller
-// that immediately reads/writes a LATER resource can hit it before its guard
-// — let alone its fscrypt unlock — is actually live. config may be "" (a
-// caller re-launching against an already-written daemon.conf it doesn't have
-// handy); that falls back to the old "at least one guard started" check.
+// awaitDaemonUp polls until the guards are attached and event readers running for EVERY resource in
+// config: the pid file, then one "guard started - guarding: <path>" line per "[watch <path>]".
+// Waiting for only the first line races on multi-resource configs: each guard attach is a
+// multi-second verifier pass on slow hosts (daemonShutdownTimeout), so a caller could touch a LATER
+// resource before its guard or unlock is live. config == "" (relaunch on an existing daemon.conf)
+// falls back to "at least one guard started".
 func (s *IntegrationSuite) awaitDaemonUp(c testcontainers.Container, config string) {
 	deadline := time.Now().Add(daemonShutdownTimeout)
 	ready := false
@@ -180,14 +175,11 @@ func (s *IntegrationSuite) readDaemonLog(c testcontainers.Container) string {
 // Test: the daemon self-whitelist must not be a universal key
 // ---------------------------------------------------------------
 
-// TestDaemon_SelfWhitelist_NoUniversalKey is the regression test for the
-// self-key bypass: the daemon whitelists its own executable inode on every
-// guarded resource so its fscrypt ioctls keep working. Identity used to be
-// keyed by exe inode alone, with no uid binding, so ANY local user executing
-// the same binary file ran with full allow rights on the whole tree — e.g.
-// `app-listener network-monitor <guarded-file>` reads the file to hash it
-// before any capability check. The self entry must only grant access to
-// uid 0 (the daemon itself) and only for the events it needs (OPEN, READ).
+// Regression for the self-key bypass: the daemon whitelists its own exe inode on every resource for
+// its fscrypt ioctls. Identity was keyed by exe inode alone, so ANY local user executing the same
+// binary got full allow on the tree (e.g. `app-listener network-monitor <guarded-file>` hashes the
+// file before any capability check). The self entry must grant only uid 0 and only the needed
+// events (OPEN, READ).
 func (s *IntegrationSuite) TestDaemon_SelfWhitelist_NoUniversalKey() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -239,20 +231,432 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
-// ---------------------------------------------------------------
-// Test: the daemon protects its own on-disk state
+// Bypass (finding #1): replacing a whitelisted binary at a user-writable path via rename gets the
+// REPLACEMENT re-whitelisted. Identity is the exe inode and the daemon re-admits whatever inode is
+// now at the path (ReSyncBinaries, on any denial and the periodic sweep) with no check that it's
+// the same binary, root-owned, or in a non-user-writable dir. The in-place swap is caught by the
+// hash-verify loop, but a RENAME gives a NEW inode via a path that only compares the stored inode.
+// Any home-directory whitelisted binary (Claude Code, Discord) could be swapped by same-user
+// malware. Re-admission must verify the binary (hash, or refuse non-root-owned/user-writable
+// paths): the replacement stays denied.
+func (s *IntegrationSuite) TestDaemon_Bypass_BinaryRenameReplaceReWhitelisted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-RENAME-REWHITELIST-7B3D"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/swap_benign"), "/exploits/swap_benign", 0755), "copy swap_benign")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/swap_reader"), "/exploits/swap_reader", 0755), "copy swap_reader")
+
+	// The whitelisted binary lives at a user-writable path (mirrors a
+	// home-directory app), initially the benign placeholder.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/swap_benign /tmp/app && chmod 755 /tmp/app"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/tmp/app`)
+
+	// Baseline: the whitelisted benign binary runs (proves the whitelist is
+	// active for /tmp/app's current inode).
+	code, out := s.exec(c, []string{"/tmp/app"})
+	s.Require().Equalf(0, code, "baseline whitelisted binary should run: %s", out)
+	s.Require().Contains(out, "BENIGN-APP-OK")
+
+	// Attack: try to rename the malicious reader OVER the whitelisted path.
+	// The binary lives at a user-writable path (/tmp), so the trust guard's
+	// writer-attribution (#1) must deny the replacement by a non-whitelisted
+	// process (mv), leaving the inode unchanged.
+	_, inodeOut := s.exec(c, []string{"sh", "-c",
+		"i1=$(stat -c %i /tmp/app); mv -f /exploits/swap_reader /tmp/app 2>/dev/null; i2=$(stat -c %i /tmp/app); echo $i1 $i2"})
+	inodeRe := regexp.MustCompile(`(\d+)[^0-9]+(\d+)`)
+	m := inodeRe.FindStringSubmatch(inodeOut)
+	s.Require().NotNil(m, "inode probe output: %q", inodeOut)
+	s.Require().Equalf(m[1], m[2],
+		"protected whitelisted binary was replaced by a non-app process (before=%s after=%s)", m[1], m[2])
+
+	// Belt-and-suspenders: even if the swap had somehow gone through, the
+	// replacement must never be able to read the guarded secret. Poll the
+	// whole re-sync window (denial-driven + the 30s periodic sweep).
+	leaked := false
+	var lastOut string
+	deadline := time.Now().Add(50 * time.Second)
+	for time.Now().Before(deadline) {
+		code, out = s.exec(c, []string{"sh", "-c", "timeout 10 /tmp/app /protected/secret 2>&1"})
+		lastOut = out
+		if strings.Contains(out, "STOLEN|"+marker) {
+			leaked = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// Secure expectation: the renamed-in replacement never gained the
+	// whitelist entry, so the secret is never leaked.
+	s.Require().Falsef(leaked,
+		"renamed-in binary was re-whitelisted and read the guarded secret: %q", lastOut)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Regression #2: a whitelisted binary run with LD_PRELOAD pointing at an attacker .so under a
+// user-writable path (/tmp) must NOT map it: the trust guard's library allowlist denies it (not
+// allow_lib, not an auto-trusted root-owned system lib, not inside a guarded tree), so the
+// constructor never runs. A plain run still works (real libraries are root-owned, auto-trusted).
+// Always enforced.
+func (s *IntegrationSuite) TestDaemon_Bypass_LdPreloadWhitelistedBinary() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-LD-PRELOAD-5E7A"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_leak.so"), "/tmp/leak.so", 0755), "copy preload_leak.so")
+
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	// Positive control: the whitelisted binary runs normally — its real
+	// libraries are root-owned system libs and are auto-trusted, so
+	// enforcement does not break it.
+	code, out := s.exec(c, []string{"/usr/bin/true"})
+	s.Require().Equalf(0, code, "whitelisted binary must still run under library enforcement: %s", out)
+
+	// Attack: LD_PRELOAD an attacker .so from a user-writable path.
+	_, out = s.exec(c, []string{"sh", "-c",
+		"LD_PRELOAD=/tmp/leak.so LEAK_FILE=/protected/secret /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated through LD_PRELOAD into a whitelisted binary: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Bypass (finding #5): is_system_trusted auto-trusts any library reported as root-owned in a
+// root-owned directory. File ownership on a user-mountable filesystem (FUSE) is whatever the
+// unprivileged mounter's server claims, so it proves nothing about root control: a normal user can
+// mount a FUSE fs that reports an attacker library as root:root and LD_PRELOAD it into a whitelisted
+// binary. The fix refuses to system-trust files on a FUSE superblock; a genuine root-owned library
+// on the real filesystem must still load (positive control).
 //
-// While the daemon runs it guards /etc/app-listener independent of any
-// [watch] section:
-//   - daemon.conf stays world-READABLE, but no process other than the
-//     app-listener binary may write / rename-over / delete it, nor create
-//     new files in the directory (ModeReadOnly);
-//   - fscrypt.key is not even readable except by the app-listener binary
-//     (ModeWhitelist, empty list — the key guard stacks on the RO dir guard).
+// Uses bindfs (a FUSE fs that can force root:root ownership) so no custom FUSE server is needed.
+// Skips cleanly if FUSE/bindfs is unavailable in the container.
+func (s *IntegrationSuite) TestDaemon_Bypass_FuseRootOwnedLibNotAutoTrusted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"command -v bindfs >/dev/null 2>&1 || (timeout 120 apt-get update -qq && " +
+			"timeout 120 apt-get install -y -qq --no-install-recommends bindfs)"})
+	if code2, _ := s.exec(c, []string{"sh", "-c", "command -v bindfs >/dev/null 2>&1"}); code2 != 0 {
+		s.T().Skipf("bindfs (FUSE) could not be installed — this test needs it: %s", out)
+	}
+	// A privileged container usually has /dev/fuse; create the node and load the module if not.
+	s.exec(c, []string{"sh", "-c",
+		"test -e /dev/fuse || mknod -m 666 /dev/fuse c 10 229; modprobe fuse 2>/dev/null || true"})
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener /src /fusemnt /realsys && chmod 755 /protected /src /fusemnt /realsys"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), "/exploits/lib_probe.so", 0o755), "copy lib_probe.so")
+	// The library the attacker wants loaded: lib_probe announces LIB_PROBE_LOADED from its
+	// constructor when ld.so maps and runs it.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/lib_probe.so /src/evil.so && chmod 644 /src/evil.so"})
+	// Positive-control copy on the REAL fs, genuinely root:root in a root:root dir.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/lib_probe.so /realsys/evil.so && chown 0:0 /realsys/evil.so && chmod 644 /realsys/evil.so"})
+
+	code, out = s.exec(c, []string{"sh", "-c",
+		"bindfs --force-user=root --force-group=root --perms=0644 /src /fusemnt 2>&1"})
+	if code != 0 {
+		s.T().Skipf("bindfs mount unavailable in this container (no /dev/fuse or no SYS_ADMIN): %s", out)
+	}
+	defer s.exec(c, []string{"sh", "-c", "fusermount -u /fusemnt 2>/dev/null || umount /fusemnt 2>/dev/null || true"})
+
+	// Confirm the mount really presents a FUSE fs reporting the library as root-owned; otherwise the
+	// test would pass vacuously.
+	_, ft := s.exec(c, []string{"sh", "-c", "stat -f -c %T /fusemnt 2>&1; stat -c '%U:%G' /fusemnt/evil.so 2>&1"})
+	if !strings.Contains(ft, "fuse") || !strings.Contains(ft, "root:root") {
+		s.T().Skipf("bindfs did not present a FUSE root-owned file (got %q) — cannot exercise the bypass", ft)
+	}
+
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	// Positive control: a genuine root-owned library on the real filesystem is still auto-trusted
+	// and loads into the whitelisted binary — the fix must not break system-library trust.
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/realsys/evil.so /usr/bin/true 2>&1"})
+	s.Require().Containsf(out, libProbeMarker,
+		"a genuine root-owned system library on the real fs must still load (is_system_trusted regressed): %s", out)
+
+	// Attack: the FUSE-hosted library reports root:root but is attacker-controlled. It must NOT be
+	// auto-trusted, so ld.so cannot map it into the whitelisted binary.
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/fusemnt/evil.so /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, libProbeMarker,
+		"a FUSE-hosted 'root-owned' library was auto-trusted and loaded into a whitelisted binary: %s", out)
+	s.requireDenialLogged(c, "LIBLOAD", "evil.so")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// The trust guard's trusted set is built once at daemon start and is never rebuilt on SIGHUP, but
+// SIGHUP is the normal way the whitelist changes: the pacman PostTransaction and apt
+// DPkg::Post-Invoke catalog-refresh hooks reload rather than restart. A binary whitelisted by a
+// reload is therefore attached to its per-resource guard while being ABSENT from
+// guard_trusted_files, and trust_mmap returns early unless the mapping process's exe carries
+// TRUSTED_BINARY — so it gets no library allowlist at all and LD_PRELOAD works against it, even
+// though the identical binary whitelisted at startup is protected.
+func (s *IntegrationSuite) TestDaemon_Bypass_LdPreloadBinaryWhitelistedByReload() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-RELOAD-TRUST-9C3F"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_leak.so"), "/tmp/leak.so", 0755), "copy preload_leak.so")
+
+	// The config lives OUTSIDE /etc/app-listener so this test can rewrite it: once the daemon runs,
+	// /etc/app-listener is self-guarded read-only and only the app-listener binary may write it (the
+	// real catalog refresh does so via `install --update-catalog-only`). /usr/bin/true is
+	// whitelisted at startup; /usr/bin/cat is added only by the SIGHUP reload below, mirroring a
+	// catalog refresh picking up a new binary.
+	const cfgPath = "/tmp/poc-daemon.conf"
+	writeCfg := func(body string) {
+		code, out := s.exec(c, []string{"sh", "-c",
+			fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF", cfgPath, body)})
+		s.Require().Equalf(0, code, "writing %s: %s", cfgPath, out)
+	}
+	writeCfg("[watch /protected]\nneed_encryption: false\n/usr/bin/true")
+
+	launch := "nohup /app-listener daemon --config " + cfgPath + " --headless > /tmp/daemon.log 2>&1 &"
+	code, out := s.exec(c, []string{"sh", "-c", launch})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, "[watch /protected]")
+
+	// Baseline: LD_PRELOAD into the startup-whitelisted binary is denied (trust set has it).
+	_, out = s.exec(c, []string{"sh", "-c",
+		"LD_PRELOAD=/tmp/leak.so LEAK_FILE=/protected/secret /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, marker, "baseline: startup-whitelisted binary must be preload-protected: %s", out)
+
+	writeCfg("[watch /protected]\nneed_encryption: false\n/usr/bin/true\n/usr/bin/cat")
+	s.sigDaemon(c, "HUP")
+
+	const reloadDone = "configuration reloaded without dropping protection"
+	done := false
+	for deadline := time.Now().Add(daemonShutdownTimeout); time.Now().Before(deadline); {
+		if strings.Contains(s.readDaemonLog(c), reloadDone) {
+			done = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	s.Require().Truef(done, "reload did not complete within %s, daemon log:\n%s", daemonShutdownTimeout, s.readDaemonLog(c))
+
+	// Positive control: the reload-added binary really is whitelisted now (per-resource access).
+	code, out = s.exec(c, []string{"sh", "-c", "cat /protected/secret"})
+	s.Require().Equalf(0, code, "reload-added binary should be whitelisted for the resource: %s", out)
+	s.Require().Containsf(out, marker, "reload-added binary should read the secret normally: %s", out)
+
+	// Attack: LD_PRELOAD an attacker .so into the reload-added whitelisted binary. Identical to the
+	// baseline that was denied, only the binary was whitelisted by reload instead of at startup.
+	_, out = s.exec(c, []string{"sh", "-c",
+		"LD_PRELOAD=/tmp/leak.so LEAK_FILE=/protected/secret /usr/bin/cat /dev/null 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated through LD_PRELOAD into a binary whitelisted by SIGHUP: "+
+			"the trust set was not rebuilt on reload: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Bypass (finding #4c): memory-read taint lost across a SIGHUP reload. A reload rebuilds every
+// guard with fresh BPF maps, emptying the tainted-pid set while the victim keeps the secret in
+// memory. Taint must survive a reload (re-seed from the surviving map or persist it): the
+// post-reload dump stays denied.
+func (s *IntegrationSuite) TestDaemon_Bypass_TaintLostOnReload() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-TAINT-RELOAD-6C4E"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/taint_victim"), "/exploits/taint_victim", 0755), "copy taint_victim")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/process_vm_readv"), "/exploits/process_vm_readv", 0755), "copy process_vm_readv")
+	s.exec(c, []string{"sh", "-c", "cp /exploits/taint_victim /tmp/victim && chmod 755 /tmp/victim"})
+
+	config := `[watch /protected]
+need_encryption: false
+/tmp/victim`
+	s.startDaemon(c, config)
+
+	// The whitelisted victim reads the secret into its heap and stays
+	// alive, tainted, holding the fd.
+	s.exec(c, []string{"sh", "-c", "/tmp/victim hold /protected/secret & echo $! > /tmp/vpid; sleep 1"})
+
+	// Before the reload: the attacker is blocked by taint tracking and
+	// cannot see the secret. (Proves the victim is tainted.)
+	_, out := s.exec(c, []string{"sh", "-c", "/exploits/process_vm_readv /protected/secret 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"pre-reload control: taint should have blocked the dump: %s", out)
+	// The refusal must be VISIBLE: the process gates used to deny silently,
+	// which once left a whole application failing with nothing in the log.
+	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'DAEMON DENIED  op=PTRACE' /tmp/daemon.log || true"})
+	s.Require().NotEqualf("0", strings.TrimSpace(logOut),
+		"the ptrace-class denial of process_vm_readv must be logged as op=PTRACE")
+
+	// Wait for the reload to COMPLETE before the post-reload attempt: the "guard started" markers
+	// awaitDaemonUp watches predate it, so only the reload-complete line proves the map swap (else
+	// the attacker races the still-tainted old guard and the test passes for the wrong reason).
+	s.sigDaemon(c, "HUP")
+	const reloadDone = "configuration reloaded without dropping protection"
+	reloaded := false
+	deadline := time.Now().Add(daemonShutdownTimeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(s.readDaemonLog(c), reloadDone) {
+			reloaded = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Require().Truef(reloaded, "reload did not complete within %s, daemon log:\n%s", daemonShutdownTimeout, s.readDaemonLog(c))
+
+	// After the reload: the victim is still alive and holds the secret,
+	// but the new guard's taint map is empty.
+	_, out = s.exec(c, []string{"sh", "-c", "/exploits/process_vm_readv /protected/secret 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"taint was lost across the reload; attacker dumped the secret from the surviving victim: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f taint_victim 2>/dev/null; pkill -f 'app-listener daemon' || true"})
+}
+
+// Bypass (finding #1): guard_path_rename and guard_path_link decide on the SOURCE side and return
+// before checking the destination (guard.bpf.c ~1475/~1653). Since 84df28d moved every resource
+// onto one hook set, a binary whitelisted for resource A can move/exchange/link into resource B
+// (which does not whitelist it). The headline is confidentiality: a RENAME_EXCHANGE of a file in A
+// with B's secret swaps their names, so B's content lands at a path in A that the SAME whitelisted
+// identity may read. The two operations must be judged against BOTH sides' whitelists; a binary
+// that is not a writer of B must be denied at B whatever its standing in A.
+func (s *IntegrationSuite) TestDaemon_Bypass_CrossResourceRenameLinkOnlySourceChecked() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-CROSS-RENAME-2D9B"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /resourceA /resourceB /exploits /etc/app-listener && " +
+			"printf '" + marker + "' > /resourceB/secret && chmod 755 /resourceA /resourceB && " +
+			"chmod 644 /resourceB/secret && printf 'DECOY-CONTENT' > /resourceA/decoy && chmod 644 /resourceA/decoy"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/xres_move"), "/exploits/xres_move", 0o755),
+		"copy xres_move")
+	s.exec(c, []string{"sh", "-c", "cp /exploits/xres_move /tmp/mover && chmod 755 /tmp/mover"})
+
+	// /tmp/mover is whitelisted for A only; /resourceB whitelists /usr/bin/true, never the mover.
+	s.startDaemon(c, `[watch /resourceA]
+need_encryption: false
+/tmp/mover
+
+[watch /resourceB]
+need_encryption: false
+/usr/bin/true`)
+
+	// Baselines that make the exploit meaningful.
+	code, out := s.exec(c, []string{"/tmp/mover", "read", "/resourceA/decoy"})
+	s.Require().Equalf(0, code, "the mover is whitelisted for A and must read A: %s", out)
+	code, out = s.exec(c, []string{"/tmp/mover", "read", "/resourceB/secret"})
+	s.Require().NotEqualf(0, code, "the mover is NOT whitelisted for B and must be denied a direct read: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat /resourceB/secret 2>&1"})
+	s.Require().NotEqualf(0, code, "a non-whitelisted reader of B must be denied: %s", out)
+
+	// Confidentiality: exchange A's decoy with B's secret. Must be denied at B's side.
+	code, out = s.exec(c, []string{"/tmp/mover", "exchange", "/resourceA/decoy", "/resourceB/secret"})
+	s.Require().NotEqualf(0, code,
+		"a RENAME_EXCHANGE into resource B by a binary whitelisted only for A must be denied: %s", out)
+	// Whether or not the exchange was refused, B's secret must never become readable through A.
+	_, out = s.exec(c, []string{"/tmp/mover", "read", "/resourceA/decoy"})
+	s.Require().NotContainsf(out, marker,
+		"B's secret leaked into resource A via cross-resource exchange and was read by the A-whitelisted binary: %s", out)
+
+	// Integrity: plant into B by rename and by hardlink from A. Both are source-side allowed today.
+	code, out = s.exec(c, []string{"/tmp/mover", "rename", "/resourceA/decoy", "/resourceB/planted"})
+	s.Require().NotEqualf(0, code, "renaming a file from A into B by an A-only binary must be denied: %s", out)
+	code, _ = s.exec(c, []string{"sh", "-c", "test -e /resourceB/planted"})
+	s.Require().NotEqualf(0, code, "the rename planted a file inside resource B")
+	code, out = s.exec(c, []string{"/tmp/mover", "link", "/resourceA/decoy", "/resourceB/aliased"})
+	s.Require().NotEqualf(0, code, "hardlinking a file from A into B by an A-only binary must be denied: %s", out)
+	code, _ = s.exec(c, []string{"sh", "-c", "test -e /resourceB/aliased"})
+	s.Require().NotEqualf(0, code, "the hardlink planted a file inside resource B")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Bypass (finding #3): a reload builds a replacement guard for every resource in the NEW config
+// before it validates the change. That replacement takes over the live guard's guard_inodes row.
+// When the reload is then refused (Phase 0: a resource was dropped) the replacement is stopped and
+// deletes the row it took, so a resource the daemon claims to be "keeping" is left readable while
+// its old guard is still attached. Nothing re-adds the row (SweepInodes needs a changed root inode,
+// ReconcileInodes only deletes).
 //
-// The app-listener binary itself (uid 0) keeps full access so install /
-// --genkey / --update-catalog-only work.
-// ---------------------------------------------------------------
+// The config lives outside /etc/app-listener so the test can rewrite it (once running, the daemon
+// self-guards its own config dir). Dropping /dropB makes the SIGHUP reload refuse; /keepA is a
+// single-file root, so losing its one row fully unprotects it.
+func (s *IntegrationSuite) TestDaemon_RefusedReload_KeepsRemainingResourceProtected() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-REFUSED-RELOAD-6B4C"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /dropB && printf '" + marker + "' > /keepA && chmod 644 /keepA && echo x > /dropB/f"})
+
+	const cfgPath = "/tmp/poc-daemon.conf"
+	writeCfg := func(body string) {
+		code, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF", cfgPath, body)})
+		s.Require().Equalf(0, code, "writing %s: %s", cfgPath, out)
+	}
+	writeCfg("[watch /keepA]\nneed_encryption: false\n/usr/bin/true\n\n[watch /dropB]\nneed_encryption: false\n/usr/bin/true")
+
+	launch := "nohup /app-listener daemon --config " + cfgPath + " --headless > /tmp/daemon.log 2>&1 &"
+	code, out := s.exec(c, []string{"sh", "-c", launch})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, "[watch /keepA]\n[watch /dropB]")
+
+	// Baseline: /keepA is guarded (a non-whitelisted reader is denied).
+	code, out = s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat /keepA 2>&1"})
+	s.Require().NotEqualf(0, code, "baseline: /keepA must be guarded before the reload: %s", out)
+
+	// Drop /dropB and reload: Phase 0 refuses (removing a resource would leave it unprotected).
+	writeCfg("[watch /keepA]\nneed_encryption: false\n/usr/bin/true")
+	s.sigDaemon(c, "HUP")
+
+	refused := false
+	for deadline := time.Now().Add(daemonShutdownTimeout); time.Now().Before(deadline); {
+		if strings.Contains(s.readDaemonLog(c), "keeping previous configuration") {
+			refused = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Require().Truef(refused, "the reload dropping /dropB was not refused, daemon log:\n%s", s.readDaemonLog(c))
+
+	// The kept resource must still be guarded. Pre-fix the rolled-back replacement's Stop deleted
+	// /keepA's only inode row, so the still-attached old guard fails open.
+	code, out = s.exec(c, []string{"sh", "-c", "setpriv --reuid=65534 --regid=65534 --clear-groups cat /keepA 2>&1"})
+	s.Require().NotEqualf(0, code,
+		"a refused reload left the kept resource /keepA readable — its inode row was deleted by the rolled-back guard: %s", out)
+	s.Require().NotContainsf(out, marker, "the kept resource's secret was disclosed after a refused reload: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// daemonPinFiles lists the daemon's pin files under /sys/fs/bpf/app-listener.
+func (s *IntegrationSuite) daemonPinFiles(c testcontainers.Container) []string {
+	_, out := s.exec(c, []string{"sh", "-c", "ls -1 /sys/fs/bpf/app-listener 2>/dev/null || true"})
+	return strings.Fields(out)
+}
+
+// The daemon protects its own on-disk state. While it runs, /etc/app-listener is guarded
+// independent of any [watch]:
+//   - daemon.conf stays world-READABLE, but nothing except the app-listener binary may
+//     write/rename-over/delete it or create files in the directory (ModeReadOnly);
+//   - fscrypt.key is unreadable except by the app-listener binary (ModeWhitelist, empty list;
+//     stacks on the RO dir guard).
+//
+// The binary itself (uid 0) keeps full access so install / --genkey / --update-catalog-only work.
 func (s *IntegrationSuite) TestDaemon_SelfProtection_ConfigAndKey() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -282,11 +686,10 @@ need_encryption: false
 	s.Require().Truef(selfReady, "self-protection guards did not attach, log:\n%s", log)
 	s.Require().Contains(log, "/etc/app-listener (readonly)")
 
-	// 0. `systemctl reload` runs helper processes (ExecReload=/bin/kill …)
-	// inside the unit's mount namespace, and setting that up bind-mounts the
-	// guarded directory. A mount onto /etc/app-listener must NOT be blocked
-	// in read-only mode or the helper dies with 226/NAMESPACE and reload
-	// fails (regression: the RO guard used to deny sb_mount here).
+	// 0. `systemctl reload` runs helpers (ExecReload=/bin/kill ...) in the unit's mount namespace,
+	// bind-mounting the guarded dir. A mount onto /etc/app-listener must NOT be blocked in
+	// read-only mode, or the helper dies with 226/NAMESPACE and reload fails (the RO guard used to
+	// deny sb_mount).
 	code, out := s.exec(c, []string{"sh", "-c",
 		"mkdir -p /tmp/mnt-probe && mount --bind /tmp/mnt-probe /etc/app-listener && umount /etc/app-listener && echo OK"})
 	s.Require().Equalf(0, code, "a bind mount over the RO-guarded dir must be allowed (systemctl reload namespacing): %s", out)
@@ -375,20 +778,14 @@ need_encryption: false
 	s.Require().Equal("32", strings.TrimSpace(keyLen), "fscrypt.key was modified or the guard never detached")
 }
 
-// ---------------------------------------------------------------
-// Test: raw block-device gate is daemon-wide and device-granular
+// The raw block-device gate is daemon-wide and device-granular. Two resources (/mnt/data/guardedA,
+// guardedB) share one backing device (loop-mounted ext4 at /mnt/data). The gate must:
+//   - be stamped ONCE ("blocking raw access to backing block device" appears once);
+//   - block raw reads even for an UNGUARDED path on the device (/mnt/data/open/*): coarse by
+//     design, accepted;
+//   - log the denial as resource=raw-block-device, never as a watched path.
 //
-// Two resources (/mnt/data/guardedA, /mnt/data/guardedB) share one backing
-// block device (a loop-mounted ext4 at /mnt/data). The gate must:
-//   - be stamped ONCE, not once per resource ("blocking raw access to
-//     backing block device" appears a single time);
-//   - block raw reads of the device even for an UNGUARDED path on it
-//     (/mnt/data/open/*) — coarse by design, documented, accepted;
-//   - log the denial as resource=raw-block-device, never as one of the
-//     watched paths (the old bug attributed it to a random resource).
-//
-// Skips if the environment cannot provide a loop device.
-// ---------------------------------------------------------------
+// Skips if no loop device is available.
 func (s *IntegrationSuite) TestDaemon_RawBlockDevice_DeviceScope() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -467,20 +864,14 @@ need_encryption: false
 		fmt.Sprintf("pkill -f 'app-listener daemon' || true; umount /mnt/data 2>/dev/null; losetup -d %s 2>/dev/null; true", loopDev)})
 }
 
-// ---------------------------------------------------------------
-// Test: edit-protected live mode (issue #40)
-//
-// With an edit-protected password configured, the daemon exposes a local
-// control socket. It must:
-//   - reject a peer that is not root (SO_PEERCRED);
-//   - reject a wrong password (and, after enough failures, lock out — not
-//     asserted here to keep the test quick);
-//   - on a correct password from a root app-listener peer, briefly widen the
-//     target resource's guard so `edit-protected --put` can write, then
-//     narrow it again (GRANTED / REVOKED both logged);
+// Edit-protected live mode (issue #40). With a password configured the daemon exposes a control
+// socket that must:
+//   - reject a non-root peer (SO_PEERCRED);
+//   - reject a wrong password (lockout after enough failures is not asserted, to keep the test
+//     quick);
+//   - on a correct password from a root app-listener peer, briefly widen the target resource's
+//     guard so `edit-protected --put` can write, then narrow it (GRANTED / REVOKED both logged);
 //   - allow only one live session at a time.
-//
-// ---------------------------------------------------------------
 func (s *IntegrationSuite) TestDaemon_EditProtected_LiveMode() {
 	const password = "Sup3r-Secret-99"
 
@@ -575,40 +966,25 @@ func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// ---------------------------------------------------------------
-// TOCTOU races across the daemon's lifecycle: start, SIGHUP reload,
-// graceful stop, and SIGKILL — for both a real kernel-fscrypt directory and
-// a real file-vault (single regular file) resource.
+// TOCTOU races across the daemon lifecycle (start, SIGHUP reload, graceful stop, SIGKILL) for both
+// a kernel-fscrypt directory and a file-vault (single regular file) resource.
 //
-// The invariant under test throughout is the one internal/usecase/daemon.go
-// documents everywhere: a resource is never readable in plaintext by an
-// unauthorized (non-whitelisted) process at any observable instant,
-// regardless of exactly when an attacker's read races the daemon's start,
-// reload, stop, or a hard kill. The daemon's own ordering guarantee is
-// attach -> unlock -> populate -> resolve -> re-sync (see daemon.go's doc
-// comment); a SIGKILL cannot be caught, so the second half of the
-// guarantee is the guard's LSM links staying pinned to /sys/fs/bpf, and
-// `daemon --lockdown` (the systemd ExecStopPost safety net) being able to
-// fully recover from ANY point in that ordering, including mid-transform
-// of a file-vault resource (see fscrypt/filevault.go's recovery sidecar).
+// Invariant (internal/usecase/daemon.go): a resource is never readable in plaintext by an
+// unauthorized process at any observable instant, however an attacker's read races start, reload,
+// stop or a hard kill. Ordering is attach -> unlock -> populate -> resolve -> re-sync; a SIGKILL
+// can't be caught, so the rest rests on the guard's LSM links staying pinned to /sys/fs/bpf and
+// `daemon --lockdown` (systemd ExecStopPost) recovering from ANY point, including mid-transform of
+// a file-vault (recovery sidecar, fscrypt/filevault.go).
 //
-// These tests emulate an attacker racing the daemon rather than reasoning
-// about the code: a background goroutine hammers the resource as an
-// unprivileged user throughout the transition window and the test fails if
-// it ever observes plaintext. Real Vault.Encrypt/IsEncrypted production
-// code (never a reimplementation) sets resources up and inspects them,
-// via a small root-capable exec harness compiled from internal/fscrypt —
-// see harness_test.go and main_test.go's fscryptTestAmd64Bin, mirroring
-// guardTestAmd64Bin's existing pattern in guard_test.go.
+// The tests emulate an attacker rather than reason about code: a background goroutine hammers the
+// resource as an unprivileged user through the transition and fails on any plaintext. Real
+// Vault.Encrypt/IsEncrypted set up and inspect resources via a root-capable harness compiled from
+// internal/fscrypt (harness_test.go, main_test.go's fscryptTestAmd64Bin, like guardTestAmd64Bin).
 //
-// The directory case needs a real fscrypt-capable filesystem (ext4 with
-// the `encrypt` feature flag, kernel CONFIG_FS_ENCRYPTION support) that a
-// container's overlayfs root cannot provide; setupFscryptDirFilesystem
-// builds one on a loop device and skips the test when the environment
-// cannot provide it, mirroring TestDaemon_RawBlockDevice_DeviceScope's own
-// escape hatch. The file-vault case needs nothing beyond the master key,
-// so it always runs.
-// ---------------------------------------------------------------
+// The directory case needs a real fscrypt-capable filesystem (ext4 with `encrypt`,
+// CONFIG_FS_ENCRYPTION), which overlayfs can't provide: setupFscryptDirFilesystem builds one on a
+// loop device and skips if unavailable (like TestDaemon_RawBlockDevice_DeviceScope). The file-vault
+// case needs only the master key and always runs.
 
 // copyFscryptHarness copies the fscrypt root-capable test harness into the
 // container at /fscrypt.harness (see internal/fscrypt/harness_test.go).
@@ -624,65 +1000,47 @@ func (s *IntegrationSuite) harnessRun(c testcontainers.Container, subtest, path 
 	return out
 }
 
-// harnessProbe execs one subtest of the fscrypt harness binary against path
-// without asserting success. The harness binary is never a whitelisted
-// binary on any guarded resource in these tests, so a still-enforcing
-// guard (its BPF LSM link can remain pinned and active for a window after
-// a SIGKILL, by design — see the architecture note on ExecStopPost) will
-// correctly deny it; callers that only want a best-effort diagnostic (not
-// a setup-time guarantee) should use this instead of harnessRun, since
-// that denial is itself proof the resource is NOT exposed, never a failure.
+// harnessProbe execs one harness subtest against path without asserting success. The harness is
+// never whitelisted on a guarded resource here, so a still-enforcing guard (link may stay pinned
+// for a window after SIGKILL, by design) correctly denies it: that denial proves the resource is
+// NOT exposed, never a failure. Use this, not harnessRun, for best-effort diagnostics.
 func (s *IntegrationSuite) harnessProbe(c testcontainers.Container, subtest, path string) (int, string) {
 	return s.exec(c, []string{"sh", "-c", fmt.Sprintf(
 		"APPLISTENER_HARNESS_PATH=%s /fscrypt.harness -test.run %s -test.v",
 		shQuote(path), shQuote("^TestFscryptHarness/"+subtest+"$"))})
 }
 
-// harnessMigrate seals path into its encrypted-at-rest form — a real kernel
-// fscrypt policy for a directory (the filesystem prerequisites are applied
-// programmatically first), the userspace file-vault format for a regular
-// file — via the real Vault.Encrypt production code path: exactly what
-// `install` does before the daemon ever attaches a guard.
+// harnessMigrate seals path into its encrypted-at-rest form (kernel fscrypt policy for a directory,
+// with filesystem prerequisites applied first; file-vault format for a regular file) via the real
+// Vault.Encrypt: exactly what `install` does before the daemon attaches a guard.
 func (s *IntegrationSuite) harnessMigrate(c testcontainers.Container, path string) {
 	s.harnessRun(c, "TestMigrate", path)
 }
 
-// assertFileVaultSealed confirms, via the already-whitelisted grep binary
-// rather than the fscrypt harness, that a regular file-vault path's raw
-// bytes no longer expose marker in the clear — the check `daemon
-// --lockdown` completed its job after a SIGKILL. The harness binary is
-// never whitelisted on the resource, so using it here would be wrong: its
-// own guard's pinned BPF link can still be actively enforcing at this
-// exact instant (lockdown widens self-access to relock the vault, it does
-// not unpin the link — see runLockdown's doc comment), so a harness
-// call would get denied regardless of whether the file is actually sealed,
-// exactly the false-failure assertNoUnauthorizedPlaintext already guards
-// against. Ciphertext reproducing an AEAD-sealed marker verbatim is not a
-// realistic possibility, so grep finding nothing is real proof of sealing,
-// and grep finding it is a genuine "lockdown failed to re-lock" failure —
-// not a false positive from an unrelated denial.
+// assertFileVaultSealed confirms, via the whitelisted grep (not the harness), that a file-vault
+// path's raw bytes no longer expose marker: the check that `daemon --lockdown` did its job after a
+// SIGKILL. The harness is never whitelisted, and the guard's pinned link may still enforce right
+// now (lockdown widens self-access to relock but doesn't unpin), so a harness call would be denied
+// whether or not the file is sealed (the false failure assertNoUnauthorizedPlaintext also avoids).
+// AEAD ciphertext won't reproduce the marker, so grep finding nothing is real proof and finding it
+// is a genuine lockdown failure.
 func (s *IntegrationSuite) assertFileVaultSealed(c testcontainers.Container, path, marker, context string) {
 	code, out := s.exec(c, []string{"grep", "-c", marker, path})
 	s.Require().Falsef(code == 0 && strings.Contains(out, "1"),
 		"%s: %s still exposes its plaintext marker after lockdown — not sealed", context, path)
 }
 
-// harnessIsEncrypted reports path's current on-disk encryption state via
-// the real Vault.IsEncrypted, without mutating anything. Only safe to call
-// when no guard could still be pinned-and-enforcing against the harness
-// binary itself — i.e. before any daemon has started, or after a clean,
-// unraced shutdown (which always unpins before the process exits). After a
-// SIGKILL, use assertFileVaultSealed instead.
+// harnessIsEncrypted reports path's on-disk encryption state via the real Vault.IsEncrypted,
+// mutating nothing. Only safe when no guard can still be pinned-and-enforcing against the harness:
+// before any daemon starts or after a clean unraced shutdown (which unpins). After a SIGKILL use
+// assertFileVaultSealed.
 func (s *IntegrationSuite) harnessIsEncrypted(c testcontainers.Container, path string) bool {
 	return strings.Contains(s.harnessRun(c, "TestIsEncrypted", path), "ENCRYPTED")
 }
 
-// resetFileVaultTarget clears any leftover backup/recovery sidecar from a
-// previous round of a kill-loop test (safe: no guard is watching yet at
-// this point — the "never delete, only rewrite in place" rule in
-// filevault.go is what the running guard enforces, not a rule these test
-// fixtures need to follow before any guard exists) and rewrites path as
-// fresh plaintext containing marker, ready for a new harnessMigrate call.
+// resetFileVaultTarget clears any leftover backup/recovery sidecar from a previous kill-loop round
+// (safe: no guard watches yet; filevault.go's "only rewrite in place" rule is for a live guard) and
+// rewrites path as fresh plaintext with marker, ready for harnessMigrate.
 func (s *IntegrationSuite) resetFileVaultTarget(c testcontainers.Container, path, marker string) {
 	cmd := fmt.Sprintf("rm -f %s %s.app_listener.backup %s.app_listener.recover && printf '%%s' %s > %s && chmod 600 %s",
 		path, path, path, shQuote(marker), path, path)
@@ -690,13 +1048,9 @@ func (s *IntegrationSuite) resetFileVaultTarget(c testcontainers.Container, path
 	s.Require().Equalf(0, code, "resetting file-vault target %s: %s", path, out)
 }
 
-// setupFscryptDirFilesystem creates a small ext4 loop-mounted filesystem
-// with the fscrypt `encrypt` feature flag set at mountPoint, so a directory
-// on it can carry a real kernel fscrypt policy (unlike the container's
-// overlayfs root). Skips the calling test when the environment cannot
-// provide a working loop device / encrypt-capable ext4 (older e2fsprogs, a
-// kernel without CONFIG_FS_ENCRYPTION), mirroring
-// TestDaemon_RawBlockDevice_DeviceScope's own escape hatch.
+// setupFscryptDirFilesystem loop-mounts a small ext4 with the `encrypt` feature at mountPoint so a
+// directory can carry a real kernel fscrypt policy (unlike the overlayfs root). Skips the test if
+// no working loop device / encrypt-capable ext4 (older e2fsprogs, no CONFIG_FS_ENCRYPTION).
 func (s *IntegrationSuite) setupFscryptDirFilesystem(c testcontainers.Container, mountPoint string) {
 	setup := fmt.Sprintf(`
 set -e
@@ -728,26 +1082,16 @@ func (s *IntegrationSuite) sigDaemon(c testcontainers.Container, sig string) {
 	s.exec(c, []string{"sh", "-c", "pkill -" + sig + " -f 'app-listener daemon' || true"})
 }
 
-// daemonShutdownTimeout is the budget awaitDaemonDead callers give a
-// graceful SIGTERM (Stop locks every vault back — see internal/usecase/daemon.go
-// — before the process exits) or a kill racing one. Each guard (re)attach is a
-// real BPF-verifier pass over 23 LSM hooks, observed taking 5-11s on a slower
-// host/kernel (e.g. a hardened kernel's extra verifier work); a reload or a
-// live-edit session can rebuild several guards (including the two
-// self-protection ones, selfguards.go) back to back, so the wait comfortably
-// covers a handful of those in sequence rather than the couple of seconds a
-// fast host needs.
+// daemonShutdownTimeout is the budget for a graceful SIGTERM (Stop locks every vault back first) or
+// a kill racing one. Each guard (re)attach is a verifier pass over 23 LSM hooks, 5-11s on slower
+// hosts (hardened kernels), and a reload or live-edit can rebuild several guards (incl. the two
+// self-protection ones) back to back, so it covers a handful in sequence.
 const daemonShutdownTimeout = 45 * time.Second
 
-// awaitDaemonDead polls until no live app-listener process remains,
-// returning false if one is still alive after timeout. Uses
-// noLiveAppListenerProcs (pool_test.go) — matching on `comm`, not the full
-// cmdline — rather than `pgrep -f 'app-listener daemon'`: run via `sh -c
-// "pgrep -f 'app-listener daemon' ..."`, that pattern string is itself
-// embedded in the wrapping shell's own /proc/<pid>/cmdline, so `pgrep -f`
-// (which searches the full cmdline of every process) matches the wrapping
-// shell that is running the check and reports "alive" forever regardless of
-// the real daemon's state.
+// awaitDaemonDead polls until no app-listener process remains (false after timeout). Uses
+// noLiveAppListenerProcs (pool_test.go), matching `comm`, not `pgrep -f 'app-listener daemon'`:
+// under `sh -c "pgrep -f ..."` the pattern is in the wrapping shell's own cmdline, so `pgrep -f`
+// matches it and reports "alive" forever.
 func (s *IntegrationSuite) awaitDaemonDead(c testcontainers.Container, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -760,22 +1104,16 @@ func (s *IntegrationSuite) awaitDaemonDead(c testcontainers.Container, timeout t
 	return false
 }
 
-// runLockdown execs `daemon --lockdown`, the systemd ExecStopPost safety
-// net: force-locks every encryption root in /etc/app-listener/daemon.conf
-// and exits. It is documented to always exit 0 (best-effort per root, so it
-// never blocks the unit from settling) — callers must check the real
-// on-disk state via harnessIsEncrypted, not this exit code, to know whether
-// it actually succeeded.
+// runLockdown execs `daemon --lockdown` (ExecStopPost safety net): force-locks every encryption
+// root in daemon.conf and exits. It always exits 0 (best-effort per root), so callers check the
+// real state via harnessIsEncrypted, not the exit code.
 func (s *IntegrationSuite) runLockdown(c testcontainers.Container) (int, string) {
 	return s.exec(c, []string{"/app-listener", "daemon", "--lockdown"})
 }
 
-// rawExec is s.exec without the fatal assertions on transport errors: safe
-// to call from a background goroutine (calling testify's Require/FailNow
-// from a non-test goroutine is undefined per the testing package's own
-// contract). A transport hiccup is treated as "nothing observed this
-// iteration", which is exactly the right behavior for a racer polling in a
-// tight loop.
+// rawExec is s.exec without fatal assertions on transport errors: safe from a background goroutine
+// (testify Require/FailNow off the test goroutine is undefined). A transport hiccup counts as
+// "nothing observed", right for a tight polling racer.
 func rawExec(ctx context.Context, c testcontainers.Container, cmd []string) (int, string) {
 	code, reader, err := c.Exec(ctx, cmd, tcexec.Multiplexed())
 	if err != nil {
@@ -788,14 +1126,10 @@ func rawExec(ctx context.Context, c testcontainers.Container, cmd []string) (int
 	return code, string(b)
 }
 
-// raceUnauthorizedReader repeatedly attempts, as an unprivileged user, to
-// read path's content until stop fires, setting leaked when an attempt
-// both succeeds (exit 0) and returns content containing marker — a genuine
-// plaintext exposure to an unauthorized reader. A resource that is still
-// locked (ciphertext, or unreadable before the daemon has even unlocked
-// it) never matches marker, and one properly guarded once unlocked is
-// denied outright — this only fires on the exact failure these tests exist
-// to catch.
+// raceUnauthorizedReader repeatedly tries, as an unprivileged user, to read path until stop fires,
+// setting leaked when an attempt succeeds (exit 0) and returns content containing marker: genuine
+// plaintext exposure. A still-locked resource never matches, and a properly guarded unlocked one is
+// denied outright, so it fires only on the failure these tests exist to catch.
 func (s *IntegrationSuite) raceUnauthorizedReader(c testcontainers.Container, path, marker string, stop <-chan struct{}, leaked *atomic.Bool) {
 	const nobody = "setpriv --reuid=65534 --regid=65534 --clear-groups"
 	for {
@@ -812,22 +1146,16 @@ func (s *IntegrationSuite) raceUnauthorizedReader(c testcontainers.Container, pa
 	}
 }
 
-// assertNoUnauthorizedPlaintext execs one direct (non-racing) check that an
-// unprivileged reader cannot currently see marker at path, regardless of
-// whether the guard is even attached right now (e.g. right after a
-// SIGKILL) — the resource must be safe by construction (still ciphertext,
-// or ciphertext-but-orphan-guarded), never "safe only while the guard
-// process happens to still be alive".
+// assertNoUnauthorizedPlaintext runs one direct check that an unprivileged reader can't currently
+// see marker at path, even if the guard isn't attached right now (e.g. after SIGKILL): the resource
+// must be safe by construction (ciphertext, or ciphertext-but-orphan-guarded), not "safe while the
+// guard process is alive".
 func (s *IntegrationSuite) assertNoUnauthorizedPlaintext(c testcontainers.Container, path, marker, context string) {
-	// Best-effort only: the guard's BPF LSM link can still be pinned and
-	// actively enforcing at this exact instant (a SIGKILL landing before
-	// Stop() reaches its own unpin step leaves it orphaned-but-active
-	// until `daemon --lockdown` runs) — in which case the harness binary,
-	// itself never whitelisted on this resource, is correctly denied by
-	// the very protection this test exists to prove. That denial is
-	// stronger evidence of "not exposed" than any encrypted/plaintext
-	// report could be, so it must never be escalated into a hard failure
-	// here — only the unprivileged-reader check below is the real assertion.
+	// Best-effort only: the guard's pinned link may still enforce right now (a SIGKILL before
+	// Stop() unpins leaves it orphaned-but-active until `daemon --lockdown`), in which case the
+	// never-whitelisted harness is correctly denied. That is stronger evidence of "not exposed"
+	// than any report, so never a hard failure; only the unprivileged-reader check below is the
+	// real assertion.
 	encStatus := "unknown (harness access denied by guard, itself a safe outcome)"
 	if code, out := s.harnessProbe(c, "TestIsEncrypted", path); code == 0 {
 		switch {
@@ -849,11 +1177,8 @@ func (s *IntegrationSuite) assertNoUnauthorizedPlaintext(c testcontainers.Contai
 // daemon process is launched until its guards are confirmed up.
 // ---------------------------------------------------------------
 
-// TestDaemon_StartupRace_NoPlaintextWindow_Directory races an unprivileged
-// reader against the daemon's startup on a real, kernel-fscrypt-encrypted
-// DIRECTORY resource: attach -> unlock -> populate must never leave a
-// window where the directory's key is provisioned but the guard is not yet
-// enforcing.
+// Races an unprivileged reader against startup on a real kernel-fscrypt-encrypted DIRECTORY: attach
+// -> unlock -> populate must never leave the key provisioned with the guard not yet enforcing.
 func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_Directory() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -945,26 +1270,16 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_File() {
 	s.Require().Truef(s.harnessIsEncrypted(c, secretFile), "a graceful stop must re-seal the file")
 }
 
-// TestDaemon_StartupRace_NoPlaintextWindow_GroupedResources is the regression
-// test for the daemon startup fan-out (buildGuards attaching guards
-// concurrently, then startGuards unlocking encryption roots and preparing
-// guards concurrently — see internal/usecase/daemon.go and
-// cmd/functions/daemon/daemon.go): TWO `watch:` sub-paths share ONE
-// encryption root, exactly the shape a browser-profile catalog entry uses
-// (Local Storage + Cookies under one profile vault). The root's key is
-// unlocked exactly once for the whole group (uniqueEncryptionRoots dedup),
-// so unlocking it makes BOTH sub-paths' plaintext content readable at the
-// kernel level at the same instant — the guard for EACH sub-path must
-// already be attached by then, or the sibling whose own guard lags behind
-// is exposed with nothing denying access to it. A naive per-resource
-// pipeline (attach+unlock+populate+resolve+start for one resource, fully
-// independent of its group siblings) would reintroduce exactly this window;
-// the concurrency added to buildGuards/startGuards keeps the invariant by
-// construction instead: buildGuards attaches EVERY resource's guard —
-// including every member of this group — as one completed fan-out phase
-// before startGuards.Start() ever calls Unlock, and unlockRoots only fans
-// out over already-deduplicated unique roots, never issuing two concurrent
-// unlocks for the one root this group shares.
+// Regression for the startup fan-out (buildGuards attaching concurrently, then startGuards
+// unlocking roots and preparing guards concurrently; internal/usecase/daemon.go,
+// cmd/functions/daemon/daemon.go): TWO `watch:` sub-paths share ONE encryption root
+// (browser-profile shape: Local Storage + Cookies under one vault). The root unlocks once for the
+// group (uniqueEncryptionRoots), making BOTH sub-paths' plaintext readable at once, so EACH
+// sub-path's guard must already be attached or the lagging sibling is exposed. A naive per-resource
+// pipeline would reintroduce this window; the concurrent version keeps the invariant because
+// buildGuards attaches EVERY guard (all group members) as one completed phase before
+// startGuards.Start() calls Unlock, and unlockRoots fans out only over deduplicated roots (never
+// two concurrent unlocks of the shared root).
 func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_GroupedResources() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1002,16 +1317,11 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_GroupedResou
 	go s.raceUnauthorizedReader(c, secretB, markerB, stop, &leakedB)
 
 	s.launchDaemon(c)
-	// watchPathsInConfig only understands a `[watch <path>]` section header as
-	// the guarded resource, which is wrong for a group: the header names the
-	// ENCRYPTION ROOT, never itself guarded (see TestLoadWatchGroup), so the
-	// per-path "guard started — guarding: <path>" markers awaitDaemonUp would
-	// derive from the real config never appear for it. Passing "" falls back
-	// to "pid file exists" as the sole readiness signal, which is still
-	// exact: writePidFile only runs after startGuardedDaemon's call to
-	// d.Start() returns, which does not return until EVERY configured
-	// guard — both group members included — has been through the full
-	// attach/unlock/populate/resolve/start pipeline.
+	// watchPathsInConfig treats a `[watch <path>]` header as the guarded resource, wrong for a
+	// group: the header names the ENCRYPTION ROOT, not itself guarded (TestLoadWatchGroup), so
+	// awaitDaemonUp's per-path "guard started" markers never appear. Passing "" falls back to "pid
+	// file exists", still exact: writePidFile runs only after startGuardedDaemon's d.Start()
+	// returns, i.e. after EVERY guard (group members included) finished the full pipeline.
 	s.awaitDaemonUp(c, "")
 	close(stop)
 
@@ -1036,21 +1346,14 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_GroupedResou
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("umount %s 2>/dev/null; losetup -D 2>/dev/null; true", mnt)})
 }
 
-// ---------------------------------------------------------------
-// C. SIGKILL landing somewhere inside startup's unlock/populate window,
-// across several delays, for the file-vault resource — the newest, most
-// crash-sensitive code path (in-place AEAD transform + recovery sidecar).
-// ---------------------------------------------------------------
+// C. SIGKILL inside startup's unlock/populate window at several delays, for the file-vault
+// resource: the newest, most crash-sensitive path (in-place AEAD transform + recovery sidecar).
 
-// TestDaemon_KillDuringUnlock_FileVault_NeverOrphansPlaintext repeatedly
-// SIGKILLs the daemon at increasing delays after launch — early enough to
-// plausibly land inside attach/unlock/populate at least once — and asserts
-// that whatever state the kill caught it in, the file is never both
-// plaintext and reachable by an unauthorized reader; that `daemon
-// --lockdown` (the ExecStopPost safety net) can always fully recover from
-// it; and that a subsequent clean restart round-trips the content without
-// corruption (proving the recovery sidecar in filevault.go actually does
-// its job on a real interrupted transform, not just in code review).
+// SIGKILLs the daemon at increasing delays after launch (early enough to plausibly land inside
+// attach/unlock/populate) and asserts that whatever state the kill caught, the file is never both
+// plaintext and reachable by an unauthorized reader; `daemon --lockdown` always recovers; and a
+// clean restart round-trips the content uncorrupted (the recovery sidecar works on a real
+// interrupted transform).
 func (s *IntegrationSuite) TestDaemon_KillDuringUnlock_FileVault_NeverOrphansPlaintext() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1103,24 +1406,15 @@ func (s *IntegrationSuite) TestDaemon_KillDuringUnlock_FileVault_NeverOrphansPla
 	}
 }
 
-// ---------------------------------------------------------------
-// D. Live catalog-refresh SIGHUP reload (whitelist change on an existing
-// resource): both the ordinary (uninterrupted) race window and a kill
-// landing mid-reload.
-// ---------------------------------------------------------------
+// D. Live catalog-refresh SIGHUP reload (whitelist change on an existing resource): the ordinary
+// reload race window, and a kill landing mid-reload.
 
-// installFakeSystemctl stubs a minimal /usr/local/bin/systemctl inside the
-// container. These test images run no systemd at all — the daemon here is
-// always launched directly via nohup, never as a unit — but install's LIVE
-// catalog refresh path (internal/systemd.IsDaemonActive / EnableAndVerify)
-// unconditionally shells out to the real systemctl to gate and deliver the
-// change. The stub covers exactly the subcommands that path calls:
-// is-active/is-enabled report the daemon as up (so the live-mode gate
-// passes and no unwanted enable/start/restart branch fires), daemon-reload
-// is a no-op, and reload is turned into what it would really do on a
-// systemd host — deliver an actual SIGHUP to the running daemon via its
-// pid file — which is what makes the resulting reload real and worth
-// racing/killing against.
+// installFakeSystemctl stubs /usr/local/bin/systemctl in the container. The images run no systemd
+// (the daemon is launched via nohup) but install's LIVE refresh path
+// (internal/systemd.IsDaemonActive / EnableAndVerify) shells out to systemctl. The stub covers what
+// that path calls: is-active/is-enabled report the daemon up (live gate passes, no
+// enable/start/restart branch), daemon-reload is a no-op, and reload delivers a real SIGHUP to the
+// daemon via its pid file, making the reload real and worth racing.
 func (s *IntegrationSuite) installFakeSystemctl(c testcontainers.Container) {
 	script := "#!/bin/sh\n" +
 		"case \"$1\" in\n" +
@@ -1135,26 +1429,18 @@ func (s *IntegrationSuite) installFakeSystemctl(c testcontainers.Container) {
 	s.Require().Equalf(0, code, "installing fake systemctl stub: %s", out)
 }
 
-// TestDaemon_KillDuringReload_NoUnprotectedWindow exercises Reload's own
-// documented ordering (the new guard attaches before the old one detaches)
-// for a resource whose WHITELIST changes via a live SIGHUP reload: first
-// with a live racer through a normal, uninterrupted reload, then with a
-// SIGKILL landing mid-reload — in both cases the resource must never end up
-// fully unguarded (open to any reader).
+// Exercises Reload's documented ordering (new guard attaches before the old detaches) for a
+// resource whose WHITELIST changes via a live SIGHUP reload: with a live racer through a normal
+// reload, then with a SIGKILL mid-reload. The resource must never end up fully unguarded.
 //
-// The trigger is `install --update-catalog-only --live --yes` against the
-// built-in WireGuard catalog entry (/etc/wireguard, whitelisting
-// /usr/bin/nmcli), not a raw shell rewrite of daemon.conf: the self-guard on
-// /etc/app-listener (see issue #53's follow-up hardening) now
-// deterministically denies any non-daemon-binary write there, so a brand
-// new [watch] section can never be introduced by hand-editing the config
-// while the daemon runs — and per README.md, adding a genuinely NEW
-// resource (`install` / `install --diff-catalog`) always stops the daemon
-// first anyway, live or not. `--update-catalog-only --live` is the one
-// documented live path: it re-expands an EXISTING catalog-matched section's
-// whitelist from inside the daemon's own binary (GUARD_ALLOW_ROOT — same
-// exe inode as the running daemon) and delivers the change via SIGHUP,
-// without any external process ever writing to the guarded config.
+// Trigger: `install --update-catalog-only --live --yes` on the built-in WireGuard entry
+// (/etc/wireguard, whitelisting /usr/bin/nmcli), not a raw shell rewrite of daemon.conf: the
+// /etc/app-listener self-guard (issue #53 follow-up) denies any non-daemon-binary write there, so a
+// NEW [watch] section can't be hand-added while the daemon runs (and adding a genuinely new
+// resource always stops the daemon first, per README.md). `--update-catalog-only --live` is the one
+// documented live path: it re-expands an EXISTING section's whitelist from the daemon's own binary
+// (GUARD_ALLOW_ROOT, same exe inode) and delivers via SIGHUP, with no external process writing the
+// guarded config.
 func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1167,21 +1453,15 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	writeMarker := func() {
 		s.exec(c, []string{"sh", "-c", fmt.Sprintf("mkdir -p /etc/wireguard && printf '%%s' '%s' > %s", marker, resourceB)})
 	}
-	// installNmcli simulates the real-world trigger for this workflow: a
-	// package manager installs a catalog-whitelisted binary after the
-	// daemon already started guarding the resource with an empty (nothing
-	// matched yet) whitelist. FilterExistingWhitelist only picks up binaries
-	// that exist on disk at scan time. This must be a real, standalone ELF
-	// binary, not a shebang script: guard identity is the CALLING PROCESS's
-	// own exe inode, and a script's process runs under its interpreter's
-	// inode (/bin/sh), never the script file's own — so a script here would
-	// always be denied regardless of whitelisting. /bin/cat (and friends)
-	// won't do either on modern Ubuntu: they're symlinks into one uutils
-	// coreutils multi-call binary that dispatches on ITS OWN RESOLVED PATH's
-	// basename (not argv[0] — `exec -a` doesn't help), so a copy landing at
-	// a path named "nmcli" is rejected as an unknown applet regardless.
-	// /usr/bin/grep is GNU grep, a genuine standalone binary indifferent to
-	// its own path/name — copying it works as a stand-in reader.
+	// installNmcli simulates the real trigger: a package manager installs a catalog-whitelisted
+	// binary after the daemon started guarding the resource with an empty whitelist
+	// (FilterExistingWhitelist only picks up binaries on disk at scan time). It must be a real
+	// standalone ELF, not a shebang script (identity is the CALLING PROCESS's exe inode, a script
+	// runs under its interpreter's /bin/sh, so it would always be denied). /bin/cat and friends
+	// won't do either on modern Ubuntu: they're symlinks into one uutils multicall binary that
+	// dispatches on its own RESOLVED path's basename (not argv[0]; `exec -a` doesn't help), so a
+	// copy at "nmcli" is an unknown applet. /usr/bin/grep is GNU grep, a standalone binary
+	// indifferent to its name: a copy works as the stand-in reader.
 	installNmcli := func() {
 		s.exec(c, []string{"sh", "-c", fmt.Sprintf("cp /usr/bin/grep %s && chmod +x %s", nmcli, nmcli)})
 	}
@@ -1251,17 +1531,12 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	s.Require().NotEqualf(0, code, "a non-whitelisted reader must still be denied after a kill mid-reload: %s", out)
 }
 
-// ---------------------------------------------------------------
-// E. Shutdown interrupted mid-lockdown: SIGTERM (starts the secure
-// lockdown — lock before detach) immediately followed by SIGKILL
-// (simulating systemd's stop-timeout force-kill, or an impatient admin).
-// ---------------------------------------------------------------
+// E. Shutdown interrupted mid-lockdown: SIGTERM (starts the secure lockdown: lock before detach)
+// immediately followed by SIGKILL (systemd stop-timeout or an impatient admin).
 
-// TestDaemon_KillDuringShutdown_LockdownRecovers races a SIGKILL against
-// the daemon's own graceful-shutdown lockdown sequence (Stop: lock vault
-// before guard detach) and verifies `daemon --lockdown` can still always
-// finish the job, without the content ever being both plaintext and
-// unguarded, and without silent corruption on the next start.
+// Races a SIGKILL against the graceful-shutdown lockdown (Stop: lock vault before guard detach) and
+// verifies `daemon --lockdown` still finishes the job, with content never both plaintext and
+// unguarded and no silent corruption on the next start.
 func (s *IntegrationSuite) TestDaemon_KillDuringShutdown_LockdownRecovers() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1302,37 +1577,24 @@ func (s *IntegrationSuite) TestDaemon_KillDuringShutdown_LockdownRecovers() {
 	s.runLockdown(c)
 }
 
-// ---------------------------------------------------------------
-// F. Live-edit-grant killed mid-session: the transient self-access
-// widening (CLAUDE.md's "live-edit grant is a real escalation path") must
-// never survive as a standing bypass usable by anyone but the exact
-// trusted actor it was scoped to, and must never survive a restart at all.
-// ---------------------------------------------------------------
+// F. Live-edit grant killed mid-session: the transient self-access widening (CLAUDE.md's "live-edit
+// grant is a real escalation path") must never survive as a standing bypass for anyone but the
+// exact trusted actor, and never survive a restart.
 
-// TestDaemon_LiveEditGrant_KilledMidSession_NoResidualEscalation opens a
-// real live edit-protected session (AUTH+SELECT over the control socket,
-// widening the daemon's own self-access on the target resource — see
-// guard.Guard.GrantSelfEditAccess) and races a SIGKILL against it before it
-// ever ends cleanly.
+// Opens a real live edit-protected session (AUTH+SELECT over the control socket, widening the
+// daemon's self-access on the target: guard.Guard.GrantSelfEditAccess) and races a SIGKILL against
+// it before it ends cleanly.
 //
-// The client must be the real app-listener binary (the control socket's
-// authPeer check refuses any other exe inode outright — CLAUDE.md's
-// "peer-exe check"), so the session's own write step cannot be slowed from
-// outside; instead its --put content is made large (512 MiB) so the
-// write+fsync between GRANTED and the client sending END takes long enough
-// for a tight log-poll-then-kill loop to land inside that window on a
-// reasonable fraction of runs. This is a best-effort race — like the
-// existing TestGuard_Bypass_PtraceRace — but the assertions below hold
-// regardless of whether the kill actually landed mid-grant or just after a
-// clean revoke: the widened mask is scoped to exactly (uid 0, the daemon's
-// own exe inode), so a non-root writer and a root shell that is NOT the
-// app-listener binary must both stay denied either way (CLAUDE.md's
-// "identity stays inode-based" invariant, exercised here against a live
-// orphaned grant rather than a static whitelist entry), and the resource's
-// other, unrelated content must never be touched. Finally, a fresh daemon
-// instance must come back at the read-only baseline with no residual
-// session — the grant lives only in the killed process's (and its orphaned
-// pinned BPF map's) state, never on disk.
+// The client must be the real app-listener binary (authPeer refuses any other exe inode: the
+// "peer-exe check"), so the write step can't be slowed from outside; instead --put content is large
+// (512 MiB) so write+fsync between GRANTED and END is long enough for a tight log-poll-then-kill
+// loop to land in the window on a fair fraction of runs. Best-effort race, but the assertions hold
+// whether or not the kill landed mid-grant: the widened mask is scoped to exactly (uid 0, the
+// daemon's exe inode), so a non-root writer and a root shell that is NOT the app-listener binary
+// both stay denied (the "identity stays inode-based" invariant against a live orphaned grant), and
+// unrelated content is never touched. A fresh daemon must return at the read-only baseline with no
+// residual session: the grant lives only in the killed process's and its orphaned pinned map's
+// state, never on disk.
 func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualEscalation() {
 	const password = "Sup3r-Secret-KillRace-77"
 	hash, err := editprotected.Hash(password, editprotected.OriginInstall)
@@ -1407,35 +1669,21 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after the final SIGTERM")
 }
 
-// ---------------------------------------------------------------
-// F. Recovery-sidecar symlink-follow: the file-vault crash-recovery sidecar
-// (internal/fscrypt/filevault.go's <resource>.app_listener.recover) must
-// never be opened, read, or created through a symlink.
-// ---------------------------------------------------------------
+// F. Recovery-sidecar symlink-follow: the file-vault sidecar (filevault.go's
+// <resource>.app_listener.recover) must never be opened, read or created through a symlink.
 
-// TestDaemon_FileVault_RecoverySidecarSymlink_NeverFollowed proves a
-// link-following bug in the file-vault crash-recovery sidecar: an attacker
-// who fully controls the parent directory of a file-vault resource (a real
-// precondition — the catalog's file-vault targets, e.g. a Steam
-// registry.vdf, live directly inside a user's own home directory) can,
-// while the daemon is not running, delete the not-yet-created sidecar and
-// replace it with a symlink pointing at any existing file that only root
-// can write. On the next daemon start, the unlock cycle's stageRecovery
-// step opens that symlink with O_RDWR and writes sealed file-vault
-// ciphertext straight into whatever it resolves to — a file completely
-// outside the guarded resource and outside the attacker's own write
-// permissions.
+// Proves a link-following bug in the file-vault recovery sidecar: an attacker controlling a
+// file-vault resource's parent directory (real precondition: catalog file-vault targets like
+// Steam's registry.vdf sit in the user's home) can, while the daemon is down, replace the
+// not-yet-created sidecar with a symlink to any root-writable file. On the next start stageRecovery
+// opens it O_RDWR and writes sealed ciphertext into that file, outside the resource and the
+// attacker's own permissions.
 //
-// To make the corruption deterministic instead of racing a timing window,
-// the resource's own directory (/protected) is remounted read-only right
-// after the malicious symlink is staged: this leaves the harmful write
-// (through the symlink, into a file OUTSIDE /protected) unaffected, but
-// makes the very next step — transformFileInPlace rewriting the real
-// resource file, which lives under /protected — fail deterministically
-// with EROFS. That failure aborts the unlock before clearRecovery (the
-// step that would otherwise truncate the sidecar, and thus the symlinked
-// victim file, back to empty) ever runs, so the corruption persists and can
-// be asserted on directly.
+// To make the corruption deterministic, /protected is remounted read-only right after staging the
+// symlink: the harmful write (through the symlink, outside /protected) is unaffected, but
+// transformFileInPlace on the real file fails with EROFS. That aborts the unlock before
+// clearRecovery (which would truncate the sidecar, hence the symlinked victim, to empty), so the
+// corruption persists and can be asserted.
 func (s *IntegrationSuite) TestDaemon_FileVault_RecoverySidecarSymlink_NeverFollowed() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1460,14 +1708,10 @@ chmod 600 %s
 	s.harnessMigrate(c, secretFile)
 	s.Require().True(s.harnessIsEncrypted(c, secretFile), "setup: the file must be sealed before the daemon ever starts")
 
-	// The attack: the resource's parent directory is fully attacker-owned
-	// (chmod 777 stands in for that — the real precondition is the
-	// directory being the user's own, e.g. their home directory), so an
-	// unprivileged user can freely create the not-yet-existing sidecar
-	// themselves, as a symlink to a root-writable file elsewhere.
-	// Remounting /protected read-only afterward only pins down the
-	// deterministic-failure trick described above — it plays no part in
-	// the vulnerability itself.
+	// The attack: the resource's parent dir is attacker-owned (chmod 777 stands in; the real
+	// precondition is a user's own home directory), so an unprivileged user can create the missing
+	// sidecar as a symlink to a root-writable file. The read-only remount only pins the
+	// deterministic-failure trick; it plays no part in the vulnerability.
 	attack := fmt.Sprintf(`set -e
 chmod 777 /protected
 setpriv --reuid=65534 --regid=65534 --clear-groups ln -s %s %s.app_listener.recover
@@ -1482,11 +1726,9 @@ mount -o remount,ro,bind /protected
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", config)})
 
 	s.launchDaemon(c)
-	// The daemon is expected to fail closed here (the resource's own
-	// directory is read-only and its sidecar is hostile) rather than come
-	// up — poll for either outcome without hard-failing, since the real
-	// assertion is what happened to the symlink's target, not whether the
-	// daemon itself started.
+	// The daemon is expected to fail closed (read-only resource dir, hostile sidecar): poll for
+	// either outcome without hard-failing, since the real assertion is what happened to the
+	// symlink's target.
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if code, _ := s.exec(c, []string{"sh", "-c", "test -f /run/app-listener-daemon.pid && echo ready"}); code == 0 {
@@ -1507,23 +1749,14 @@ mount -o remount,ro,bind /protected
 	s.sigDaemon(c, "KILL")
 }
 
-// ---------------------------------------------------------------
-// G. Stale watch-root inode after in-place recreation (steady state, not
-// startup): a guarded resource is deleted and recreated in place — an app
-// rebuilding its own directory/file, an fscrypt migration, a backup restore
-// — while the daemon keeps running. The kernel-side root-confinement anchor
-// (guard_config[3..4], consulted by root_in_chain in guard.bpf.c) and
-// g.rootKey must follow the new inode via the periodic SweepInodes, or two
-// things go wrong at once: the real recreated resource silently stops being
-// guarded (its ancestor chain no longer contains the stale anchor), and
-// whatever unrelated path later ends up holding the freed OLD inode number
-// gets denied purely by coincidence, misattributed to this resource. See
-// internal/guard/guard.go's SweepInodes doc comment and
-// TestSweepInodesRecreatedFileRoot / TestSweepInodesRecreatedDirRoot (unit
-// tests, internal/guard/guard_test.go) for the same regression at the
-// BPF-map level; these two exercise it through a real running daemon
-// instead, waiting out the real periodic sweep.
-// ---------------------------------------------------------------
+// G. Stale watch-root inode after in-place recreation (steady state): a guarded resource is deleted
+// and recreated in place (app rebuild, fscrypt migration, backup restore) while the daemon runs.
+// The kernel-side root anchor (guard_config[3..4], root_in_chain) and g.rootKey must follow the new
+// inode via the periodic SweepInodes, or the recreated resource silently stops being guarded and
+// whatever unrelated path gets the freed OLD inode number is denied by coincidence, misattributed
+// to this resource. See SweepInodes' doc and TestSweepInodesRecreatedFileRoot/DirRoot
+// (internal/guard/guard_test.go) for the BPF-map-level regression; these two go through a real
+// daemon and the real periodic sweep.
 
 // staleRootSweepPollTimeout comfortably exceeds the daemon's hardcoded
 // periodic sweep interval (resyncSweepEvery, internal/usecase/daemon.go,
@@ -1546,13 +1779,10 @@ func (s *IntegrationSuite) awaitDenied(c testcontainers.Container, cmd []string,
 	return false
 }
 
-// TestDaemon_StaleRootInode_Directory_RecreatedRootReguarded is the
-// directory-root regression test for the bug fixed in SweepInodes: before
-// the fix, only a single-file watch root's own inode change was detected and
-// re-anchored — a directory root's own identity was never re-checked (only
-// its mtime, to decide whether to re-walk top-level entries), so a
-// wholesale directory recreation left guard_config/g.rootKey pointed at the
-// freed old inode forever.
+// Directory-root regression for SweepInodes: only a single-file root's inode change was detected
+// and re-anchored; a directory root's identity was never re-checked (only its mtime, to decide on a
+// top-level re-walk), so wholesale recreation left guard_config/g.rootKey on the freed inode
+// forever.
 func (s *IntegrationSuite) TestDaemon_StaleRootInode_Directory_RecreatedRootReguarded() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1571,12 +1801,9 @@ func (s *IntegrationSuite) TestDaemon_StaleRootInode_Directory_RecreatedRootRegu
 	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/inside.txt"})
 	s.Require().NotEqualf(0, code, "cat on the original in-tree file should be blocked: %s", out)
 
-	// rename(2) preserves (dev, ino): moving the watch root itself out
-	// leaves its old inode living at /old-root — exactly the state a
-	// filesystem produces when it later reuses that freed inode number for
-	// an unrelated path. A fresh mkdir at /watch then gets a genuinely new
-	// inode (the parent, /, is not guarded, so this mkdir is unconditionally
-	// allowed regardless of whitelist).
+	// rename(2) preserves (dev, ino): moving the watch root out leaves its old inode at /old-root,
+	// as when a filesystem later reuses that freed number. A fresh mkdir at /watch gets a genuinely
+	// new inode (the parent / isn't guarded, so it's allowed regardless of whitelist).
 	code, out = s.exec(c, []string{"mv", "/watch", "/old-root"})
 	s.Require().Equalf(0, code, "whitelisted mv should move the watch root itself out: %s", out)
 	code, out = s.exec(c, []string{"mkdir", "/watch"})
@@ -1601,13 +1828,10 @@ func (s *IntegrationSuite) TestDaemon_StaleRootInode_Directory_RecreatedRootRegu
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 }
 
-// TestDaemon_StaleRootInode_File_RecreatedRootReguarded is
-// TestDaemon_StaleRootInode_Directory_RecreatedRootReguarded's single-file
-// counterpart: the case SweepInodes already handled before this fix (see
-// TestSweepInodesRecreatedFileRoot), exercised here end-to-end through a
-// real running daemon instead of a direct unit-level SweepInodes call, so a
-// future change to the shared plumbing (updateRootKey, the periodic sweep
-// wiring) that breaks either case gets caught by both.
+// Single-file counterpart of TestDaemon_StaleRootInode_Directory_RecreatedRootReguarded: the case
+// SweepInodes already handled (TestSweepInodesRecreatedFileRoot), now end-to-end through a real
+// daemon so a change to the shared plumbing (updateRootKey, sweep wiring) breaking either case is
+// caught by both.
 func (s *IntegrationSuite) TestDaemon_StaleRootInode_File_RecreatedRootReguarded() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1642,8 +1866,799 @@ func (s *IntegrationSuite) TestDaemon_StaleRootInode_File_RecreatedRootReguarded
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 }
 
-// The guard_path_unlink eviction fix itself (guard.bpf.c) is exercised at the
-// guard level, not here: see TestGuard_PathUnlinkEvictsInodeImmediately and
-// TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode in
-// integrationtests/guard_test.go, alongside the rest of the
-// TestGuard_InodeReuse_* family this fix complements.
+// The guard_path_unlink eviction fix is tested at guard level
+// (TestGuard_PathUnlinkEvictsInodeImmediately, TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode in
+// integrationtests/guard_test.go, with the TestGuard_InodeReuse_* family).
+
+// Trust guard provenance rule for runtime-generated code (guard_jit_origin, guard_trust.bpf.c). GPU
+// drivers JIT into a file they create (memfd, O_TMPFILE, mkstemp) and map it executable; no path or
+// ownership rule covers those inodes, so the daemon trusts an exec mapping when the mapping process
+// image created the inode and nothing else wrote it.
+//
+// The rule is an ALLOWANCE, so most of the test is what it must still refuse: an inode the attacker
+// created (no provenance), a merely new file, an inode handed over through execve (same pid,
+// different image), and one a foreign writer touched after creation.
+func (s *IntegrationSuite) TestDaemon_JitProvenanceTrustsOnlySelfCreatedCode() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-JIT-PROVENANCE-9B1D"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/jit_provenance"), "/exploits/jit_provenance", 0755), "copy jit_provenance")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_leak.so"), "/exploits/leak.so", 0755), "copy preload_leak.so")
+	// The same program at two paths: only /tmp/app is whitelisted, so
+	// /tmp/attacker stands in for same-user malware.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/jit_provenance /tmp/app && cp /exploits/jit_provenance /tmp/attacker && chmod 755 /tmp/app /tmp/attacker"})
+
+	// A benign library to stand in for JIT output: what matters is that the
+	// bytes are a loadable ELF the process produced itself.
+	const benignLib = "/lib/x86_64-linux-gnu/libz.so.1"
+	code, out := s.exec(c, []string{"sh", "-c", "test -f " + benignLib})
+	s.Require().Equalf(0, code, "test fixture expects %s in the image: %s", benignLib, out)
+
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/tmp/app
+/usr/bin/true`)
+
+	// 1. FUNCTIONAL: the whitelisted app may map code it created itself with
+	//    mkstemp — the driver's file-backed JIT path, and the reason this rule
+	//    exists at all.
+	code, out = s.exec(c, []string{"/tmp/app", "self", benignLib})
+	s.Require().Containsf(out, "MAPPED",
+		"a whitelisted process must be able to exec-map code it created itself (exit %d): %s", code, out)
+
+	// 2. FUNCTIONAL: the memfd variant, the first step of the fallback chain.
+	//    It depends on the fexit attach (memfd_create never reaches
+	//    security_file_open), so tolerate a kernel where that program could
+	//    not attach — the daemon says so, and the denial is fail-closed.
+	code, out = s.exec(c, []string{"/tmp/app", "memfd", benignLib})
+	if !strings.Contains(out, "MAPPED") {
+		_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'skipping memfd provenance' /tmp/daemon.log || true"})
+		s.Require().NotEqualf("0", strings.TrimSpace(logOut),
+			"memfd-backed self-created code was denied although the memfd provenance program attached (exit %d): %s", code, out)
+	}
+
+	// 3. ATTACK: the attacker allocates the memfd and hands it to a
+	//    whitelisted victim through an inherited fd plus LD_PRELOAD. The
+	//    victim maps an inode somebody else made: no provenance, no mapping.
+	_, out = s.exec(c, []string{"/tmp/attacker", "passfd", "/exploits/leak.so", "/usr/bin/true", "/protected/secret"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated: a whitelisted binary mapped a memfd created by an unwhitelisted process: %s", out)
+
+	// 4. ATTACK: the same handover performed by a WHITELISTED creator. execve
+	//    keeps the thread group id, so a pid-only provenance check would let
+	//    the victim inherit the attacker's memfd as if it had made it itself.
+	//    The mm and exe identity are what refuse it.
+	_, out = s.exec(c, []string{"/tmp/app", "passfd", "/exploits/leak.so", "/usr/bin/true", "/protected/secret"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated: provenance followed a pid across execve into a different image: %s", out)
+
+	// 5. ATTACK: a file is not trustworthy merely for being new — the
+	//    attacker creates it and the whitelisted victim preloads it.
+	_, out = s.exec(c, []string{"sh", "-c",
+		"/tmp/attacker self /exploits/leak.so >/tmp/fresh.txt 2>&1; p=$(sed -n 's/^\\(MAPPED\\|DENIED\\) \\([^ :]*\\).*/\\2/p' /tmp/fresh.txt | head -1); " +
+			"LD_PRELOAD=$p LEAK_FILE=/protected/secret /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"guarded content exfiltrated through a freshly created attacker .so: %s", out)
+
+	// 6. ATTACK: a foreign write after creation poisons the inode for good.
+	//    The whitelisted app creates its JIT file, an unrelated process
+	//    write-opens it (the /proc/<pid>/fd shape of the attack), and the
+	//    app's own mapping must then be refused.
+	s.exec(c, []string{"sh", "-c", "(/tmp/app hold " + benignLib + " 6 >/tmp/hold.log 2>&1 &) ; sleep 2"})
+	_, pathOut := s.exec(c, []string{"sh", "-c", "sed -n 's/^PATH=//p' /tmp/hold.log | head -1"})
+	jitPath := strings.TrimSpace(pathOut)
+	s.Require().NotEmptyf(jitPath, "hold mode did not report its JIT file: %s", pathOut)
+	// A write-open by another process is all it takes; the bytes need not change.
+	s.exec(c, []string{"sh", "-c", "exec 3<>" + jitPath + "; exec 3>&-"})
+	s.exec(c, []string{"sh", "-c", "sleep 6"})
+	_, holdOut := s.exec(c, []string{"sh", "-c", "cat /tmp/hold.log"})
+	s.Require().Containsf(holdOut, "DENIED",
+		"a JIT file that a foreign process write-opened must no longer be mappable: %s", holdOut)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// An application's atomic save (temp write + rename over the guarded file; Steam's registry.vdf
+// every launch) gives the watch root a new inode that is neither root nor in guard_inodes:
+// unguarded until the daemon re-anchors. This used to wait for the 30 s sweep; single-file roots
+// are now followed every second (fileRootFollowEvery). The kernel can't follow the rename itself
+// (guard_path_rename has no verifier budget left, issue #45).
+func (s *IntegrationSuite) TestDaemon_ReplacedSingleFileRootIsGuardedQuickly() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const secret = "REPLACED-ROOT-SECRET-4B7E"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /data /etc/app-listener && printf 'OLD' > /data/registry.vdf && chmod 755 /data"})
+	s.startDaemon(c, `[watch /data/registry.vdf]
+need_encryption: false
+/usr/bin/mv`)
+
+	code, out := s.exec(c, []string{"sh", "-c", "cat /data/registry.vdf 2>&1"})
+	s.Require().NotEqualf(0, code, "control: the file must be guarded before the save: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c",
+		"printf '" + secret + "' > /data/reg.tmp && /usr/bin/mv /data/reg.tmp /data/registry.vdf"})
+	s.Require().Equalf(0, code, "the whitelisted atomic save must succeed: %s", out)
+
+	// Re-anchored within a few follow ticks, not the 30 s sweep.
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		code, out = s.exec(c, []string{"sh", "-c", "cat /data/registry.vdf 2>&1"})
+		if code != 0 && !strings.Contains(out, secret) {
+			break
+		}
+		s.Require().Truef(time.Now().Before(deadline),
+			"the replaced file was still readable by a non-whitelisted process after 4s: %s", out)
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// And it stays guarded.
+	_, out = s.exec(c, []string{"sh", "-c", "sleep 2; cat /data/registry.vdf 2>&1"})
+	s.Require().NotContainsf(out, secret, "the re-anchored root must stay guarded: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// procReadProbe asks whether a PTRACE_MODE_READ-gated /proc access against pid is refused,
+// reporting in-band. It uses readlink(/proc/<pid>/exe): proc_pid_get_link() consults
+// proc_fd_access_allowed() -> ptrace_may_access(PTRACE_MODE_READ) and FAILS the syscall when the
+// guard refuses (seen in the daemon log). Two look-alike probes are NOT usable:
+//   - `ls /proc/<pid>/fd`: proc_fd_permission() returns once generic_permission() passes, and
+//     container root passes via CAP_DAC_OVERRIDE, so the LSM hook is never consulted;
+//   - `cat /proc/<pid>/maps`: was observed reading a guarded process's maps in full WHILE the
+//     daemon logged a matching op=PTRACE mode=READ denial. UNEXPLAINED: proc_maps_open() takes its
+//     mm from proc_mem_open(PTRACE_MODE_READ) and returns the error, and the read path has no
+//     advisory ptrace check, so the open should fail. Until the raw ptrace mode bits are logged
+//     (0x04 = NOAUDIT, an advisory call site) the denial can't be attributed to that open, so maps
+//     is unusable either way. ATTACH-class access (/proc/<pid>/mem, process_vm_readv) IS refused:
+//     see TestDaemon_OwnMetadataReadableMemoryNot and TestGuard_Bypass_ProcessVmReadv.
+//
+// rc is readlink's own status, not the exec's (a docker exec exit code has been 0 for a refused
+// command). state proves the target is alive: a dead pid also fails readlink and would pass a
+// denial assertion vacuously.
+func procReadProbe(pid string) string {
+	return "exe=$(readlink /proc/" + pid + "/exe 2>&1); rc=$?; " +
+		"st=$(awk '{print $3}' /proc/" + pid + "/stat 2>/dev/null); " +
+		"echo \"rc=$rc state=$st exe=$exe\""
+}
+
+// procGateMatrix reports every /proc access class for one pid, so a failure
+// says which ptrace-gated reads this kernel actually refuses.
+func procGateMatrix(pid string) string {
+	return "for f in exe maps environ mem stat status cmdline; do " +
+		"if [ \"$f\" = exe ]; then o=$(readlink /proc/" + pid + "/exe 2>&1); " +
+		"else o=$(head -c 40 /proc/" + pid + "/$f 2>&1 | tr -d \"\\0\" | head -1); fi; " +
+		"echo \"  $f rc=$? out=$o\"; done"
+}
+
+// Running a lib_binary writer of a read-only lib_dir must not taint the process. Taint shields a
+// process holding SECRETS from ptrace-class inspection; a read-only tree is world-readable code
+// with nothing to shield. The exec hook tainted in every guard anyway (unlike the file-access taint
+// sites, which skip read-only guards), leaving each runtime tree's writer list as the only
+// processes allowed to look at /proc/<pid> of half of Steam's process tree, silently.
+func (s *IntegrationSuite) TestDaemon_ReadOnlyGuardDoesNotTaintItsWriters() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	// The writer copy must keep the basename `sleep`: ubuntu:latest ships
+	// coreutils as one multi-call binary that dispatches on argv[0], so a
+	// copy named /tmp/rtwriter dies instantly with "coreutils: unknown
+	// program 'rtwriter'" and the test found no process to inspect.
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /rt /tmp/rtw /etc/app-listener && printf 'code' > /rt/lib.so && cp /usr/bin/sleep /tmp/rtw/sleep && chmod 755 /tmp/rtw/sleep"})
+	s.startDaemon(c, `[libraries "Runtime"]
+lib_dir /rt
+lib_binary /tmp/rtw/sleep`)
+
+	s.exec(c, []string{"sh", "-c", "(/tmp/rtw/sleep 30 &) ; sleep 1"})
+	_, pidOut := s.exec(c, []string{"sh", "-c", "pgrep -f '^/tmp/rtw/sleep 30' | head -1"})
+	pid := strings.TrimSpace(pidOut)
+	s.Require().NotEmptyf(pid, "the writer process did not start: %q", pidOut)
+
+	_, out := s.exec(c, []string{"sh", "-c", procReadProbe(pid)})
+	s.Require().Containsf(out, "rc=0",
+		"a process running a read-only tree's writer must stay inspectable by an unrelated process: %s", out)
+	s.Require().Containsf(out, "/tmp/rtw/sleep",
+		"the probe did not actually resolve the writer's exe, so it proves nothing: %s", out)
+
+	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE' /tmp/daemon.log || true"})
+	s.Require().Equalf("0", strings.TrimSpace(logOut), "no ptrace-class denial may come from a read-only guard")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f '^/tmp/rtw/sleep' ; pkill -f 'app-listener daemon' || true"})
+}
+
+// Pins the taint lifecycle:
+//   - the process that read the secret is tainted (not inspectable);
+//   - a forked child keeping the parent's memory stays tainted;
+//   - a child exec'ing a NON-whitelisted image is cleared (exec discards the address space, so it
+//     holds nothing from the vault).
+//
+// Before the exec rule every descendant of a tainted process (the whole Steam tree) stayed tainted
+// for life, and GameMode, PipeWire, the portal and Wine's wineserver were refused every look. The
+// refusal must also be logged with its access mode.
+func (s *IntegrationSuite) TestDaemon_TaintFollowsForkButNotExec() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /etc/app-listener && printf 'TAINT-LIFECYCLE-SECRET' > /protected/secret && " +
+			"chmod 755 /protected && chmod 644 /protected/secret && cp /bin/bash /tmp/wsh && chmod 755 /tmp/wsh && mkfifo /tmp/idle_fifo"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/tmp/wsh`)
+
+	// The whitelisted shell reads the secret with a builtin (no exec), then
+	// starts a fork-only subshell and a fork+exec child, recording pids.
+	s.exec(c, []string{"sh", "-c", `nohup /tmp/wsh -c '
+read -r x < /protected/secret
+printf "%s" "$x" > /tmp/p_value
+echo $$ > /tmp/p_reader
+( echo $BASHPID > /tmp/p_fork; while :; do read -t 1 -r _ <> /tmp/idle_fifo || true; done ) &
+/usr/bin/sleep 60 & echo $! > /tmp/p_exec
+wait' >/dev/null 2>&1 &
+sleep 2`})
+
+	pidOf := func(f string) string {
+		_, out := s.exec(c, []string{"sh", "-c", "cat " + f})
+		p := strings.TrimSpace(out)
+		s.Require().NotEmptyf(p, "missing %s", f)
+		return p
+	}
+	inspect := func(pid string) (int, string) {
+		return s.exec(c, []string{"sh", "-c", procReadProbe(pid)})
+	}
+	// diagnose is printed when a denial assertion fails: the whole /proc
+	// access matrix for the target (which classes this kernel actually
+	// refuses), its identity and liveness, a control read by an
+	// unwhitelisted process, and the daemon's own log.
+	diagnose := func(pid string) string {
+		_, diag := s.exec(c, []string{"sh", "-c",
+			"echo 'proc gate matrix:'; " + procGateMatrix(pid) + "; " +
+				"echo \"comm=$(cat /proc/" + pid + "/comm)\"; " +
+				"echo \"state=$(awk '{print $3}' /proc/" + pid + "/stat) threads=$(awk '/^Threads:/{print $2}' /proc/" + pid + "/status)\"; " +
+				"echo \"whitelist-inode=$(stat -c %d:%i /tmp/wsh)\"; " +
+				"echo \"control-read: $(cat /protected/secret 2>&1)\"; " +
+				"echo '--- daemon.log ---'; tail -30 /tmp/daemon.log"})
+		return diag
+	}
+	requireDenied := func(label, pid string) {
+		_, out := inspect(pid)
+		s.Require().Regexpf(`state=[RSD]`, out,
+			"%s: the target is not a live process, so a refusal proves nothing: %s", label, out)
+		if strings.Contains(out, "rc=0") {
+			s.Require().Failf(label, "the probe was not refused: pid=%s %s\n%s", pid, out, diagnose(pid))
+		}
+	}
+	requireAllowed := func(label, pid string) {
+		_, out := inspect(pid)
+		s.Require().Containsf(out, "rc=0", "%s: %s", label, out)
+		s.Require().Containsf(out, "exe=/", "%s: the probe resolved no exe, so it proves nothing: %s", label, out)
+	}
+
+	// Control first: taint is stamped when the whitelisted image execs and
+	// when it reads, so if the read itself was refused the whole test is
+	// vacuous — and the failure looks identical to a missing gate.
+	_, readValue := s.exec(c, []string{"sh", "-c", "cat /tmp/p_value 2>&1"})
+	s.Require().Equalf("TAINT-LIFECYCLE-SECRET", strings.TrimSpace(readValue),
+		"the whitelisted shell did not read the secret, so nothing tainted it: %q", readValue)
+
+	requireDenied("the process that read the secret must not be inspectable by an unwhitelisted process",
+		pidOf("/tmp/p_reader"))
+	requireDenied("a forked child sharing the reader's memory image must stay tainted", pidOf("/tmp/p_fork"))
+	requireAllowed("a child that exec'd an unwhitelisted image holds none of the vault's memory: its taint must be cleared",
+		pidOf("/tmp/p_exec"))
+
+	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE.*mode=READ' /tmp/daemon.log || true"})
+	s.Require().NotEqualf("0", strings.TrimSpace(logOut),
+		"a /proc/<pid>/maps denial must be logged as op=PTRACE with mode=READ")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f /tmp/wsh; pkill -f 'sleep 60'; pkill -f 'app-listener daemon' || true"})
+}
+
+// The daemon is tainted (it reads what it guards) and holds secrets (fscrypt key, edit-auth hash)
+// in memory. A ptrace ATTACH-class access (/proc/<pid>/mem, process_vm_readv) must stay denied; a
+// READ-class one (/proc/<pid>/maps, environ, exe; what journald does to label log lines) is
+// allowed, else each logged denial makes journald look it up and fail again.
+//
+// In a pid namespace the denial can only come from ptrace_access_check, which reads child->tgid
+// (init-namespace). The second gate, is_proc_mem_of_tainted() in file_open/file_permission, parses
+// the /proc directory NAME (the container's pid) and compares it to guard_tainted_pids, keyed on
+// the init-namespace tgid by mark_tainted(), so it can't match in a namespace. Both agree on the
+// host (the target); the namespace asymmetry only costs the secondary catch for reads on a
+// /proc/<pid>/mem fd opened before tainting.
+func (s *IntegrationSuite) TestDaemon_OwnMetadataReadableMemoryNot() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected/sub /etc/app-listener && printf 'S' > /protected/secret && chmod 755 /protected"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	_, pidOut := s.exec(c, []string{"sh", "-c", "cat /run/app-listener-daemon.pid"})
+	pid := strings.TrimSpace(pidOut)
+	s.Require().NotEmpty(pid, "daemon pid")
+
+	// ATTACH-class: still refused; this also proves the daemon IS tainted, so the READ assertion
+	// below isn't vacuous (an untainted process would open it and give an I/O error at offset 0).
+	// The refusal is EACCES, not the gate's EPERM: opening /proc/<pid>/mem calls
+	// mm_access(PTRACE_MODE_ATTACH), which maps any LSM denial to -EACCES before
+	// security_file_open. Keyed on that message, not the exec exit code (docker exec has reported 0
+	// for a refused command).
+	_, out := s.exec(c, []string{"sh", "-c", "head -c1 /proc/" + pid + "/mem 2>&1"})
+	s.Require().Regexpf("Permission denied|not permitted", out,
+		"memory of the daemon must stay unreadable to an unwhitelisted process: %s", out)
+
+	// READ-class: allowed.
+	_, out = s.exec(c, []string{"sh", "-c", procReadProbe(pid)})
+	s.Require().Containsf(out, "rc=0",
+		"metadata of the daemon's own process must be readable — journald resolves /proc/<pid>/exe for every line it labels: %s", out)
+	s.Require().Containsf(out, "exe=/", "the probe resolved no exe, so it proves nothing: %s", out)
+	s.Require().NotEmptyf(out, "empty maps: the daemon's address space was not really read, so the probe proves nothing")
+
+	_, logOut := s.exec(c, []string{"sh", "-c", "grep -c 'op=PTRACE.*comm=app-listener mode=READ' /tmp/daemon.log || true"})
+	s.Require().Equalf("0", strings.TrimSpace(logOut), "no READ-mode denial may be logged for the daemon itself")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// daemonScaleResources exceeds BPF_MAX_TRAMP_LINKS (38), the kernel's cap on trampoline links at a
+// single attach point. A real install guards ~34 catalog resources plus the daemon's two
+// self-guards, so production already sits just under it.
+const daemonScaleResources = 48
+
+// Every guarded resource used to attach its own copy of all 26 LSM programs, so each one added a
+// link to each attach point and usage on security_file_open was O(resources). Past the cap the
+// kernel returns E2BIG and the daemon refuses to start, which made the number of [watch] sections a
+// hard ceiling — and, because BPF-LSM links are global to the kernel rather than namespaced, a
+// daemon near the cap also starved every other BPF-LSM user on the host, containers included.
+//
+// Enforcement state is keyed by dev:ino, so one attached program set serves every resource by
+// resolving the accessed inode to its resource in-kernel, keeping attach usage O(1).
+func (s *IntegrationSuite) TestDaemon_ManyResources_AttachStaysWithinTrampolineCap() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	var mkdirs, config strings.Builder
+	mkdirs.WriteString("mkdir -p /etc/app-listener")
+	for i := range daemonScaleResources {
+		dir := fmt.Sprintf("/protected%02d", i)
+		fmt.Fprintf(&mkdirs, " %s", dir)
+		fmt.Fprintf(&config, "[watch %s]\nneed_encryption: false\n/usr/bin/sleep\n\n", dir)
+	}
+	s.exec(c, []string{"sh", "-c", mkdirs.String()})
+	s.exec(c, []string{"sh", "-c",
+		"echo TOP-SECRET-CONTENT > /protected00/secret && chmod 755 /protected00 && chmod 644 /protected00/secret"})
+
+	// startDaemon fails the test if any resource's guard never reports "guard started", which is
+	// what an exhausted attach point (E2BIG) causes.
+	s.startDaemon(c, config.String())
+
+	log := s.readDaemonLog(c)
+	s.Require().NotContainsf(log, "argument list too long",
+		"the daemon hit the per-attach-point trampoline cap with %d resources: %s", daemonScaleResources, log)
+
+	// All 48 attached — now prove enforcement still works, so the shared attach did not trade the
+	// cap for a guard that denies nothing.
+	const nobody = "setpriv --reuid=65534 --regid=65534 --clear-groups"
+	code, out := s.exec(c, []string{"sh", "-c", nobody + " grep -c TOP-SECRET /protected00/secret"})
+	s.Require().NotEqualf(0, code, "non-whitelisted reader must still be denied with %d resources, got: %s",
+		daemonScaleResources, out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// steamGlobConfig guards a Steam location so the catalog's Steam globs are reserved for root's
+// home, with a dash copy standing in for the Steam client (its builtins write as its own inode).
+// /usr/bin/bash is whitelisted for an unrelated resource: the confused deputy.
+const (
+	steamDir        = "/root/.local/share/Steam"
+	steamCommon     = steamDir + "/steamapps/common"
+	steamClient     = steamDir + "/ubuntu12_32/steam"
+	steamGlobConfig = `[watch ` + steamDir + `/config]
+need_encryption: false
+` + steamClient + `
+
+[watch /protected]
+need_encryption: false
+/usr/bin/bash`
+)
+
+// steamTools holds pressure-vessel's pv-*/srt-*/*-capsule-capture-libs helpers. Created before the
+// daemon starts: pv-runtime itself matches pv-*, so only a Steam binary may create it afterwards.
+const steamTools = steamDir + "/steamrt64/pv-runtime/x/pressure-vessel/libexec/steam-runtime-tools-0"
+
+func (s *IntegrationSuite) startSteamGlobDaemon(c testcontainers.Container) {
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener " + steamDir + "/config " + steamCommon + " " + steamTools +
+			" $(dirname " + steamClient + ") && cp /usr/bin/dash " + steamClient +
+			" && cp /usr/bin/true /tmp/stealer"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/glob_plant"), "/exploits/glob_plant", 0755),
+		"copy glob_plant")
+	s.startDaemon(c, steamGlobConfig)
+	s.Require().Contains(s.readDaemonLog(c), "reserved glob name(s)", "trust guard #3 was not populated")
+}
+
+// assertNotPlanted runs cmd (a plant attempt) and requires it to fail with path left absent.
+func (s *IntegrationSuite) assertNotPlanted(c testcontainers.Container, what, path string, cmd []string) {
+	code, out := s.exec(c, cmd)
+	s.Require().NotEqualf(0, code, "%s: planting %s must be denied: %s", what, path, out)
+	code, _ = s.exec(c, []string{"sh", "-c", "test -e " + shQuote(path) + " || test -L " + shQuote(path)})
+	s.Require().NotEqualf(0, code, "%s: %s exists after a denied plant", what, path)
+}
+
+// Vuln 3: a same-user process must not be able to create any path a catalog whitelist glob
+// matches (it would be whitelisted at the next refresh), by any route, while the wildcard dirs stay
+// otherwise writable.
+func (s *IntegrationSuite) TestDaemon_GlobPlant_NonWriterDenied() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startSteamGlobDaemon(c)
+
+	bin := steamCommon + "/exploit/files/bin"
+	ws := bin + "/wineserver"
+	code, out := s.exec(c, []string{"mkdir", "-p", bin})
+	s.Require().Equalf(0, code, "the wildcard dirs must stay writable: %s", out)
+
+	s.assertNotPlanted(c, "create", ws, []string{"sh", "-c", "echo x > " + ws})
+	s.assertNotPlanted(c, "symlink", ws, []string{"ln", "-s", "/tmp/stealer", ws})
+	s.assertNotPlanted(c, "hardlink", ws, []string{"ln", "/tmp/stealer", ws})
+	s.assertNotPlanted(c, "rename", ws, []string{"mv", "/tmp/stealer", ws})
+	s.assertNotPlanted(c, "mkdir", ws, []string{"mkdir", ws})
+	s.assertNotPlanted(c, "O_TMPFILE+linkat", ws, []string{"/exploits/glob_plant", "tmpfile", bin, ws})
+
+	// A directory assembled outside and moved in carries its content past the per-name check.
+	s.exec(c, []string{"sh", "-c", "mkdir -p /tmp/evil/files/bin && cp /usr/bin/true /tmp/evil/files/bin/wineserver"})
+	s.assertNotPlanted(c, "directory move", steamCommon+"/evil", []string{"mv", "/tmp/evil", steamCommon + "/evil"})
+
+	// Wildcard names: prefix (pv-*) and suffix (*-capsule-capture-libs).
+	s.assertNotPlanted(c, "prefix name", steamTools+"/pv-adverb", []string{"sh", "-c", "echo x > " + steamTools + "/pv-adverb"})
+	s.assertNotPlanted(c, "suffix name", steamTools+"/x86_64-linux-gnu-capsule-capture-libs",
+		[]string{"sh", "-c", "echo x > " + steamTools + "/x86_64-linux-gnu-capsule-capture-libs"})
+
+	// Negative controls: games keep writing their dirs, and only the fixed name is reserved.
+	for _, p := range []string{steamCommon + "/exploit/save.dat", bin + "/wineserver2", "/tmp/wineserver"} {
+		code, out = s.exec(c, []string{"sh", "-c", "echo x > " + p})
+		s.Require().Equalf(0, code, "%s is not a glob match and must stay writable: %s", p, out)
+	}
+
+	s.Require().Contains(s.readDaemonLog(c), "TRUST DENIED  op=PLANT", "denials must be logged")
+
+	// Renaming the root away is allowed, but recreating it would give an unregistered root.
+	code, out = s.exec(c, []string{"mv", steamCommon, steamCommon + ".old"})
+	s.Require().Equalf(0, code, "renaming the root away is harmless: %s", out)
+	s.assertNotPlanted(c, "root recreation", steamCommon, []string{"mkdir", steamCommon})
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Bun apps extract a native library to $TMPDIR/.bun-<uid>-<hash>.so and dlopen it; a launcher
+// wrapper points $TMPDIR at a private guarded dir where the daemon reserves .bun-* for the app
+// (opencode is a Bun catalog entry). A non-writer must not plant a .bun-* there (that would be an
+// LD_PRELOAD-shaped injection into the whitelisted app), while ordinary temp files a wrapped app's
+// child process writes to the same dir stay allowed — only the reserved name is gated.
+const (
+	bunTmpDir     = "/root/.cache/app-listener/bun"
+	bunGlobConfig = `[watch /root/.config/opencode]
+need_encryption: false
+/root/bin/opencode
+
+[watch /protected]
+need_encryption: false
+/usr/bin/bash`
+)
+
+func (s *IntegrationSuite) TestDaemon_BunTmpdir_PlantDeniedWriterAllowed() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener /root/.config/opencode /root/bin " + bunTmpDir +
+			" && cp /usr/bin/dash /root/bin/opencode && cp /usr/bin/true /tmp/stealer"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/glob_plant"), "/exploits/glob_plant", 0755),
+		"copy glob_plant")
+	s.startDaemon(c, bunGlobConfig)
+	s.Require().Contains(s.readDaemonLog(c), "reserved glob name(s)", "trust guard #3 was not populated")
+
+	evil := bunTmpDir + "/.bun-1000-deadbeef.so"
+	s.assertNotPlanted(c, "create", evil, []string{"sh", "-c", "echo x > " + evil})
+	s.assertNotPlanted(c, "symlink", evil, []string{"ln", "-s", "/tmp/stealer", evil})
+	s.assertNotPlanted(c, "hardlink", evil, []string{"ln", "/tmp/stealer", evil})
+	s.assertNotPlanted(c, "rename", evil, []string{"mv", "/tmp/stealer", evil})
+	s.assertNotPlanted(c, "O_TMPFILE+linkat", evil, []string{"/exploits/glob_plant", "tmpfile", bunTmpDir, evil})
+
+	// The app's own whitelisted binary extracts its .bun-* library into the reserved dir.
+	own := bunTmpDir + "/.bun-1000-abc123.so"
+	code, out := s.exec(c, []string{"/root/bin/opencode", "-c", "printf X > " + own})
+	s.Require().Equalf(0, code, "the Bun app's own binary must create %s: %s", own, out)
+
+	// Ordinary temp files (not .bun-*) in the same dir, and a .bun-* OUTSIDE the reserved root, stay
+	// writable: only the reserved name below the reserved root is gated, so a wrapped app's
+	// subprocesses (which inherit $TMPDIR) are not broken.
+	for _, p := range []string{bunTmpDir + "/tmp-XXXX", bunTmpDir + "/bun.lock", "/tmp/.bun-1000-x.so"} {
+		code, out = s.exec(c, []string{"sh", "-c", "echo x > " + p})
+		s.Require().Equalf(0, code, "%s is not a reserved match and must stay writable: %s", p, out)
+	}
+
+	s.Require().Contains(s.readDaemonLog(c), "TRUST DENIED  op=PLANT", "plant denials must be logged")
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Vuln 3: the owning app still installs new versions (the wildcard dir is new, the reserved name
+// is written by its own binary), and until the refresh whitelists that fresh match, nothing else,
+// not even a binary whitelisted for another resource, may rewrite or alias it.
+func (s *IntegrationSuite) TestDaemon_GlobPlant_OwnWriterAllowed() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startSteamGlobDaemon(c)
+
+	bin := steamCommon + "/newVersion/files/bin"
+	ws := bin + "/wineserver"
+	s.exec(c, []string{"mkdir", "-p", bin})
+	code, out := s.exec(c, []string{steamClient, "-c", "printf STEAM > " + ws})
+	s.Require().Equalf(0, code, "Steam's own binary must create %s: %s", ws, out)
+
+	for _, tc := range []struct {
+		what string
+		cmd  []string
+	}{
+		{"append", []string{"sh", "-c", "echo evil >> " + ws}},
+		{"truncate", []string{"truncate", "-s", "0", ws}},
+		{"hardlink alias", []string{"ln", ws, "/tmp/alias"}},
+		{"rename over", []string{"sh", "-c", "cp /usr/bin/true /tmp/over && mv -f /tmp/over " + ws}},
+		{"exchange onto it", []string{"sh", "-c", "cp /usr/bin/true /tmp/swap && /exploits/glob_plant exchange /tmp/swap " + ws}},
+		{"exchange from it", []string{"sh", "-c", "cp /usr/bin/true /tmp/swap && /exploits/glob_plant exchange " + ws + " /tmp/swap"}},
+	} {
+		code, out = s.exec(c, tc.cmd)
+		s.Require().NotEqualf(0, code, "%s of the fresh match by a non-writer must be denied: %s", tc.what, out)
+		_, content := s.exec(c, []string{"cat", ws})
+		s.Require().Equalf("STEAM", content, "%s altered the fresh match", tc.what)
+	}
+
+	// Confused deputy: whitelisted, but for another resource.
+	deputy := steamCommon + "/deputy/files/bin"
+	s.exec(c, []string{"mkdir", "-p", deputy})
+	code, out = s.exec(c, []string{"/usr/bin/bash", "-c", "echo x > " + deputy + "/wineserver"})
+	s.Require().NotEqualf(0, code, "a binary whitelisted for another resource must not plant: %s", out)
+
+	code, out = s.exec(c, []string{steamClient, "-c", "printf UPDATED >> " + ws})
+	s.Require().Equalf(0, code, "Steam's own binary must keep updating it: %s", out)
+	_, out = s.exec(c, []string{"cat", ws})
+	s.Require().Equal("STEAMUPDATED", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// discordLibConfig guards a Discord watch path so the catalog's ReservedLibs are reserved below
+// root's ~/.config/discord, with a dash copy standing in for the Discord client (a writer).
+// /usr/bin/bash is whitelisted for an unrelated resource: whitelisted, but not a writer.
+const (
+	discordDir       = "/root/.config/discord"
+	discordModules   = discordDir + "/0.0.1/modules"
+	discordClient    = discordDir + "/0.0.1/Discord"
+	libProbe         = "/exploits/lib_probe.so"
+	libProbeMarker   = "LIB_PROBE_LOADED"
+	discordLibConfig = `[watch ` + discordDir + `/sentry]
+need_encryption: false
+` + discordClient + `
+
+[watch /protected]
+need_encryption: false
+/usr/bin/bash`
+)
+
+// startDiscordLibDaemon hands modules/ to nobody: a root-owned dir would make every file in it an
+// auto-trusted system library (is_system_trusted) and the load tests vacuous.
+func (s *IntegrationSuite) startDiscordLibDaemon(c testcontainers.Container) {
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener " + discordDir + "/sentry " + discordModules +
+			"/discord_voice && cp /usr/bin/dash " + discordClient + " && chown -R 65534 " + discordModules})
+	for _, f := range []string{"lib_probe.so", "glob_plant"} {
+		s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/"+f), "/exploits/"+f, 0755), "copy "+f)
+	}
+	s.startDaemon(c, discordLibConfig)
+	s.Require().Contains(s.readDaemonLog(c), "reserved glob name(s)", "trust guard #3 was not populated")
+}
+
+// writeAsDiscord creates path with lib_probe's bytes; dash's redirection opens it as the client.
+func (s *IntegrationSuite) writeAsDiscord(c testcontainers.Container, path string) {
+	code, out := s.exec(c, []string{discordClient, "-c", "cat " + libProbe + " > " + shQuote(path)})
+	s.Require().Equalf(0, code, "Discord's own binary must write %s: %s", path, out)
+}
+
+// preload runs bin with lib LD_PRELOADed and reports whether lib's constructor ran.
+func (s *IntegrationSuite) preload(c testcontainers.Container, bin, lib string) (bool, string) {
+	_, out := s.exec(c, []string{"sh", "-c", "LD_PRELOAD=" + shQuote(lib) + " " + bin + " -c true 2>&1"})
+	return strings.Contains(out, libProbeMarker), out
+}
+
+func (s *IntegrationSuite) requireDenialLogged(c testcontainers.Container, op, name string) {
+	for _, line := range strings.Split(s.readDaemonLog(c), "\n") {
+		if strings.Contains(line, "TRUST DENIED  op="+op) && strings.Contains(line, name) {
+			return
+		}
+	}
+	s.Failf("denial not logged", "no op=%s line for %s in:\n%s", op, name, s.readDaemonLog(c))
+}
+
+// Discord's self-updated native code under ~/.config/discord is outside every guarded tree and
+// not root-owned; a reserved name its own binary wrote there must load, at any depth.
+func (s *IntegrationSuite) TestDaemon_ReservedLib_WriterLibraryLoads() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startDiscordLibDaemon(c)
+
+	for _, lib := range []string{
+		discordModules + "/probe.so",
+		discordModules + "/libprobe.so.1",
+		discordModules + "/discord_voice/discord_voice.node",
+	} {
+		s.writeAsDiscord(c, lib)
+		loaded, out := s.preload(c, discordClient, lib)
+		s.Require().Truef(loaded, "Discord must load its own reserved library %s: %s", lib, out)
+	}
+	s.Require().NotContains(s.readDaemonLog(c), "op=LIBLOAD", "no load may have been refused")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Loading a reserved name is sound only if nothing but Discord can bind or rewrite one: every
+// other process, including a binary whitelisted for another resource, is refused with op=PLANT.
+func (s *IntegrationSuite) TestDaemon_ReservedLib_NonWriterPlantDenied() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startDiscordLibDaemon(c)
+
+	deep := discordModules + "/a/b"
+	code, out := s.exec(c, []string{"mkdir", "-p", deep})
+	s.Require().Equalf(0, code, "unreserved directories must stay writable: %s", out)
+	s.exec(c, []string{"cp", libProbe, "/tmp/evil.so"})
+
+	s.assertNotPlanted(c, "create *.so", discordModules+"/evil.so",
+		[]string{"cp", libProbe, discordModules + "/evil.so"})
+	s.assertNotPlanted(c, "create lib*", discordModules+"/libevil.so.1",
+		[]string{"sh", "-c", "cat " + libProbe + " > " + discordModules + "/libevil.so.1"})
+	s.assertNotPlanted(c, "create at depth", deep+"/evil.node",
+		[]string{"sh", "-c", "cat " + libProbe + " > " + deep + "/evil.node"})
+	s.assertNotPlanted(c, "rename", deep+"/evil.so", []string{"mv", "/tmp/evil.so", deep + "/evil.so"})
+	s.assertNotPlanted(c, "hardlink", deep+"/evil.so", []string{"ln", "/tmp/evil.so", deep + "/evil.so"})
+	s.assertNotPlanted(c, "symlink", deep+"/evil.so", []string{"ln", "-s", "/tmp/evil.so", deep + "/evil.so"})
+	s.assertNotPlanted(c, "O_TMPFILE+linkat", deep+"/evil.so",
+		[]string{"/exploits/glob_plant", "tmpfile", deep, deep + "/evil.so"})
+	s.assertNotPlanted(c, "confused deputy", deep+"/evil.node",
+		[]string{"/usr/bin/bash", "-c", "cat " + libProbe + " > " + deep + "/evil.node"})
+	s.exec(c, []string{"sh", "-c", "mkdir -p /tmp/pkg && cp " + libProbe + " /tmp/pkg/evil.so"})
+	s.assertNotPlanted(c, "directory move", discordModules+"/pkg", []string{"mv", "/tmp/pkg", discordModules + "/pkg"})
+
+	lib := discordModules + "/libgood.so"
+	s.writeAsDiscord(c, lib)
+	for _, tc := range []struct {
+		what string
+		cmd  []string
+	}{
+		{"overwrite", []string{"sh", "-c", "cat /usr/bin/true > " + lib}},
+		{"append", []string{"sh", "-c", "echo evil >> " + lib}},
+		{"truncate", []string{"truncate", "-s", "0", lib}},
+		{"rename over", []string{"sh", "-c", "cp " + libProbe + " /tmp/over && mv -f /tmp/over " + lib}},
+		{"exchange", []string{"sh", "-c", "cp " + libProbe + " /tmp/swap && /exploits/glob_plant exchange /tmp/swap " + lib}},
+		{"hardlink alias", []string{"ln", lib, "/tmp/alias.so"}},
+	} {
+		code, out = s.exec(c, tc.cmd)
+		s.Require().NotEqualf(0, code, "%s of Discord's library by a non-writer must be denied: %s", tc.what, out)
+		code, _ = s.exec(c, []string{"cmp", "-s", libProbe, lib})
+		s.Require().Equalf(0, code, "%s altered Discord's library", tc.what)
+	}
+	s.requireDenialLogged(c, "PLANT", "evil.so")
+	s.requireDenialLogged(c, "PLANT", "libgood.so")
+
+	for _, p := range []string{deep + "/settings.json", "/tmp/free.so"} {
+		code, out = s.exec(c, []string{"sh", "-c", "echo x > " + p})
+		s.Require().Equalf(0, code, "%s is not reserved and must stay writable: %s", p, out)
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// The reservation trusts names, not the tree: an unreserved name in the same dir, a reserved name
+// outside the root, and Discord's own library mapped into a whitelisted non-writer stay refused.
+func (s *IntegrationSuite) TestDaemon_ReservedLib_UnreservedNameRefused() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startDiscordLibDaemon(c)
+
+	good := discordModules + "/probe.so"
+	s.writeAsDiscord(c, good)
+	loaded, out := s.preload(c, discordClient, good)
+	s.Require().Truef(loaded, "control: the reserved library must load: %s", out)
+
+	unreserved := discordModules + "/probe.dat"
+	s.writeAsDiscord(c, unreserved)
+	loaded, out = s.preload(c, discordClient, unreserved)
+	s.Require().Falsef(loaded, "an unreserved name below the root must not load: %s", out)
+	s.requireDenialLogged(c, "LIBLOAD", "probe.dat")
+
+	s.exec(c, []string{"sh", "-c", "mkdir -p /root/.config/other && chown 65534 /root/.config/other"})
+	outside := "/root/.config/other/probe.so"
+	s.writeAsDiscord(c, outside)
+	loaded, out = s.preload(c, discordClient, outside)
+	s.Require().Falsef(loaded, "a reserved name outside the root must not load: %s", out)
+
+	loaded, out = s.preload(c, "/usr/bin/bash", good)
+	s.Require().Falsef(loaded, "a whitelisted non-writer must not load Discord's library: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// probeExeAs reads /proc/<pid>/exe with a copy of readlink at bin (its inode is the caller's
+// identity), reporting the command's own status: docker-exec exit codes lie about denials.
+func probeExeAs(bin, pid string) string {
+	return "exe=$(" + bin + " /proc/" + pid + "/exe 2>&1); echo \"rc=$? exe=$exe\""
+}
+
+// A binary two resources whitelist (Steam's client: config + registry.vdf) taints its process with
+// the set of exactly those two: a caller both whitelist may inspect it, a caller only one does may
+// not. Judging it by every resource's intersection instead let no Steam process inspect another
+// and Steam's UI never came up.
+func (s *IntegrationSuite) TestDaemon_TaintSet_JudgedByItsOwnResources() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	// readlink copies keep their basename: ubuntu's coreutils is one multi-call binary.
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /r1 /r2 /r3 /etc/app-listener /opt/app /opt/y /opt/pboth /opt/pone /opt/pnone" +
+			" && echo s1 > /r1/secret && echo s2 > /r2/secret && echo s3 > /r3/secret" +
+			" && cp /usr/bin/dash /opt/app/app && cp /usr/bin/dash /opt/y/y" +
+			" && for p in pboth pone pnone; do cp /usr/bin/readlink /opt/$p/readlink; done" +
+			" && mkfifo /tmp/f /tmp/g"})
+	s.startDaemon(c, `[watch /r1]
+need_encryption: false
+/opt/app/app
+/opt/pboth/readlink
+/opt/pone/readlink
+
+[watch /r2]
+need_encryption: false
+/opt/app/app
+/opt/pboth/readlink
+
+[watch /r3]
+need_encryption: false
+/opt/y/y`)
+
+	// The victim reads both resources (each read must keep the set, not widen it to GLOBAL), then
+	// idles in a builtin so its image stays /opt/app/app.
+	s.exec(c, []string{"sh", "-c",
+		"(/opt/app/app -c 'read a < /r1/secret; read b < /r2/secret; read y < /tmp/f; exit 0' &); sleep 1"})
+	_, pidOut := s.exec(c, []string{"sh", "-c", "pgrep -f 'app -c read a' | head -1"})
+	pid := strings.TrimSpace(pidOut)
+	s.Require().NotEmptyf(pid, "the victim did not start: %q", pidOut)
+
+	_, out := s.exec(c, []string{"sh", "-c", probeExeAs("/opt/pboth/readlink", pid)})
+	s.Require().Containsf(out, "rc=0 exe=/opt/app/app",
+		"a caller every tainting resource whitelists must inspect the process: %s", out)
+	for _, p := range []string{"/opt/pone/readlink", "/opt/pnone/readlink"} {
+		_, out = s.exec(c, []string{"sh", "-c", probeExeAs(p, pid)})
+		s.Require().NotContainsf(out, "exe=/opt/app/app",
+			"%s is not whitelisted by every resource the process holds: %s", p, out)
+		s.Require().Containsf(out, "rc=1", "%s: the probe must report its own refusal: %s", p, out)
+	}
+
+	// Content from a resource outside the set (/r3, read before exec'ing the set's binary) can't
+	// be covered by it: the merge must fall back to GLOBAL, where pboth is not enough.
+	s.exec(c, []string{"sh", "-c",
+		"(/opt/y/y -c 'read z < /r3/secret; exec /opt/app/app -c \"read y < /tmp/g; exit 0\"' &); sleep 1"})
+	_, pidOut = s.exec(c, []string{"sh", "-c", "pgrep -f 'app -c read y < /tmp/g' | head -1"})
+	mixed := strings.TrimSpace(pidOut)
+	s.Require().NotEmptyf(mixed, "the mixed victim did not start: %q", pidOut)
+	_, out = s.exec(c, []string{"sh", "-c", probeExeAs("/opt/pboth/readlink", mixed)})
+	s.Require().NotContainsf(out, "exe=/opt/app/app",
+		"content from a resource outside the set must not be inspectable by the set's callers: %s", out)
+
+	s.Require().Contains(s.readDaemonLog(c), "op=PTRACE", "the refusals must be logged")
+	s.exec(c, []string{"sh", "-c", "echo > /tmp/f; echo > /tmp/g; pkill -f 'app-listener daemon' || true"})
+}

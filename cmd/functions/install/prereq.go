@@ -14,18 +14,13 @@ import (
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
-// resolveFilesystemPrereqs makes every encryption root's filesystem ready for
-// fscrypt. For each fixable prerequisite it asks the user whether to run the
-// command now (the installer is root) or abort — declining aborts the
-// install exactly like the old hard error did. A terminal condition
-// (unsupported filesystem or kernel) always aborts.
-//
-// The set of commands that can be offered here lives in
-// fscrypt.(*Vault).FilesystemPrereqs — audit it there.
+// resolveFilesystemPrereqs makes every encryption root's filesystem ready for fscrypt. For each
+// fixable prerequisite it asks whether to run the command now (the installer is root) or abort
+// (declining aborts the install). A terminal condition (unsupported filesystem or kernel) always
+// aborts. Offerable commands live in fscrypt.(*Vault).FilesystemPrereqs: audit them there.
 func resolveFilesystemPrereqs(vault *fscrypt.Vault, cfg *daemonconfig.Config) error {
-	// The per-filesystem `fscrypt setup` needs the global /etc/fscrypt.conf;
-	// create it up front (no-op when it already exists) so the command below
-	// does not fail on a first-ever run.
+	// Per-filesystem `fscrypt setup` needs the global /etc/fscrypt.conf: create it first (no-op if
+	// present) so a first-ever run doesn't fail.
 	if err := fscrypt.EnsureSystemSetup(); err != nil {
 		return fmt.Errorf("initializing fscrypt (/etc/fscrypt.conf): %w", err)
 	}
@@ -63,16 +58,13 @@ func resolveFilesystemPrereqs(vault *fscrypt.Vault, cfg *daemonconfig.Config) er
 	}
 }
 
-// collectFilesystemPrereqs returns every fixable prerequisite across the
-// config's encryption roots (each backing filesystem checked once), or a
-// terminal error. It performs no I/O beyond stat + read-only fscrypt probes,
-// so it is safe to call in a loop between remediation commands.
+// collectFilesystemPrereqs returns every fixable prerequisite across the config's encryption roots
+// (each backing filesystem once), or a terminal error. Only stat + read-only fscrypt probes, so
+// safe to loop between remediation commands.
 //
-// A regular-file resource is skipped entirely: single files are encrypted by
-// the package's own userspace AEAD vault (internal/fscrypt/filevault.go),
-// never the kernel fscrypt ioctl — FS_IOC_SET_ENCRYPTION_POLICY cannot
-// target a standalone regular file at all — so neither the `encrypt`
-// filesystem feature flag nor `fscrypt setup` applies to it.
+// Regular-file resources are skipped: single files use the userspace AEAD vault
+// (internal/fscrypt/filevault.go), never kernel fscrypt (FS_IOC_SET_ENCRYPTION_POLICY can't target
+// a standalone file), so neither the `encrypt` feature flag nor `fscrypt setup` applies.
 func collectFilesystemPrereqs(vault *fscrypt.Vault, cfg *daemonconfig.Config) ([]fscrypt.Prereq, error) {
 	var checkedDevs []uint64
 	var out []fscrypt.Prereq

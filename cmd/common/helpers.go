@@ -69,9 +69,9 @@ func ParseServeFlags(cmd *cobra.Command) (ServeConfig, error) {
 	return config, nil
 }
 
-// validateEnabledServe enforces every rule that only applies when --serve was
-// actually given: presentation conflicts, credential pairing, address syntax
-// and the interactive-terminal requirement of the dual local+browser TUI.
+// validateEnabledServe enforces the rules that apply only with --serve: presentation conflicts,
+// credential pairing, address syntax, and the interactive-terminal requirement of the dual
+// local+browser TUI.
 func validateEnabledServe(cmd *cobra.Command, config ServeConfig) error {
 	if requestedBoolFlag(cmd, "headless") {
 		return errors.New("--serve and --headless are mutually exclusive")
@@ -85,8 +85,19 @@ func validateEnabledServe(cmd *cobra.Command, config ServeConfig) error {
 	if requestedBoolFlag(cmd, "blocked-only") {
 		return errors.New("--blocked-only is only available with --headless")
 	}
+	if requestedBoolFlag(cmd, "no-log-metadata-blocks") {
+		return errors.New("--no-log-metadata-blocks is only available with --headless")
+	}
+	// Credentials are mandatory: the browser TUI mirrors the root daemon's live event stream
+	// (guarded paths, comms, PIDs, peers) over a loopback TCP socket, which carries no OS-level uid
+	// restriction, so any local user could otherwise connect with a non-browser WebSocket client
+	// (the Origin/Host checks only constrain browsers) and read it. Require --user/--password.
 	credentialsSet, mixedCredentials := credentialFlagState(cmd)
-	if credentialsSet && (mixedCredentials || config.Username == "" || config.Password == "") {
+	if !credentialsSet {
+		return errors.New("--serve requires --user and --password: the browser TUI exposes the daemon's " +
+			"event stream to any local user without them")
+	}
+	if mixedCredentials || config.Username == "" || config.Password == "" {
 		return errors.New("--user and --password must be non-empty and specified together")
 	}
 	if err := validateServeAddress(config.Address); err != nil {
@@ -253,10 +264,8 @@ func CheckEBPF() error {
 	return nil
 }
 
-// CheckBPFLSM verifies that the active kernel LSM stack includes the BPF
-// LSM. Required by every mode that relies on LSM hooks (guard,
-// network-guard, daemon); monitor and network-monitor are kprobe-based and
-// must not call it.
+// CheckBPFLSM verifies the active LSM stack includes BPF LSM. Required by every LSM-hook mode
+// (guard, network-guard, daemon); kprobe-based monitor and network-monitor must not call it.
 func CheckBPFLSM() error {
 	if err := ebpf.CheckBPFLSM(); err != nil {
 		log.Errorf("BPF LSM check failed: %v", err)

@@ -13,16 +13,17 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
-// TestOfferSSHAgentUnitsNoGuardedSSH: when no user's ~/.ssh is in the
+// TestAskSSHAgentUsersNoGuardedSSH: when no user's ~/.ssh is in the
 // config, the ssh-agent step is a silent no-op — no prompt, no error.
-func TestOfferSSHAgentUnitsNoGuardedSSH(t *testing.T) {
+func TestAskSSHAgentUsersNoGuardedSSH(t *testing.T) {
 	cfgText := "[watch]\npath = " + t.TempDir() + "\nneed_encryption: false\n"
 	cfg, err := validateConfigText(cfgText)
 	if err != nil {
 		t.Fatalf("parsing config: %v", err)
 	}
-	if err := offerSSHAgentUnits(cfg); err != nil {
-		t.Errorf("offerSSHAgentUnits must be a no-op when no ~/.ssh is guarded: %v", err)
+	users, err := askSSHAgentUsers(cfg)
+	if err != nil || len(users) != 0 {
+		t.Errorf("askSSHAgentUsers must be a no-op when no ~/.ssh is guarded: users=%v err=%v", users, err)
 	}
 }
 
@@ -86,14 +87,11 @@ func TestEnsureInstalledBinary(t *testing.T) {
 	}
 }
 
-// TestCheckRunningBinaryMatchesInstalled covers the three outcomes of the
-// wizard's binary-identity preflight: nothing installed yet (defer to
-// ensureInstalledBinary), the installed binary IS this process's own exe
-// (same inode — the normal "install via the deployed symlink" case), and a
-// DIFFERENT file at the install path (a freshly rebuilt standalone binary
-// run against an existing install) — the exact scenario that used to fail
-// only at the very last wizard step, writing the edit-protected password
-// hash, with a confusing "operation not permitted".
+// Covers the binary-identity preflight's three outcomes: nothing installed (defer to
+// ensureInstalledBinary), the installed binary IS this process's exe (same inode; the normal
+// deployed-symlink case), and a DIFFERENT file at the install path (a rebuilt standalone binary
+// against an existing install), which used to fail only at the last step (writing the password
+// hash) with a confusing "operation not permitted".
 func TestCheckRunningBinaryMatchesInstalled(t *testing.T) {
 	orig := installedBinaryPath
 	defer func() { installedBinaryPath = orig }()
@@ -164,12 +162,9 @@ func TestAskEncryptionSkipsNeedEncryptionFalse(t *testing.T) {
 	}
 }
 
-// TestCollectFilesystemPrereqsNoPanic is a regression test for the preflight
-// added with the fscrypt setup check: statting a real directory must not
-// panic (os.Stat returns *syscall.Stat_t, and the preflight must accept
-// exactly that type). The pure collector must return either no prerequisites
-// (host filesystem is already ready), a slice of runnable Prereq commands,
-// or a terminal classified error — never panic.
+// Regression for the fscrypt-setup preflight: statting a real directory must not panic (os.Stat
+// returns *syscall.Stat_t, which the preflight must accept). The collector returns no
+// prerequisites, runnable Prereq commands, or a terminal classified error, never a panic.
 func TestCollectFilesystemPrereqsNoPanic(t *testing.T) {
 	dir := t.TempDir()
 
@@ -265,12 +260,10 @@ func TestLiveEmptyWhitelistRejected(t *testing.T) {
 	}
 }
 
-// TestApplyLiveRefreshDeliversReload is the regression test for the missing
-// SIGHUP delivery: the first live implementation patched daemon.conf on
-// disk and returned WITHOUT delivering the change to the running daemon,
-// which kept enforcing the old whitelist while journalctl stayed silent.
-// Live mode must deliver the reload exactly when the config was written,
-// and skip it when the refreshed config matches the running one.
+// Regression for the missing SIGHUP delivery: the first live implementation patched daemon.conf and
+// returned without delivering it, so the daemon kept the old whitelist silently. Live mode must
+// deliver the reload exactly when the config was written, and skip it when the refreshed config
+// matches.
 func TestApplyLiveRefreshDeliversReload(t *testing.T) {
 	orig := deliverReload
 	defer func() { deliverReload = orig }()
@@ -320,7 +313,7 @@ func groupedDiscordConf(t *testing.T, home string) (string, *daemonconfig.Config
 		Allow:           []inst.BinaryRule{{Path: "/usr/bin/stale-entry"}},
 		Encrypt:         true,
 		ExtraWatchPaths: []string{lsDir, cookies},
-	}})
+	}}, nil)
 	cfg, err := validateConfigText(confText)
 	if err != nil {
 		t.Fatalf("generated grouped config does not parse: %v", err)
@@ -328,13 +321,10 @@ func groupedDiscordConf(t *testing.T, home string) (string, *daemonconfig.Config
 	return confText, cfg
 }
 
-// TestPatchCatalogSectionGroupedConfig is the regression test for the
-// pacman-hook breaker: `install --update-catalog-only` addressed a grouped
-// section's whitelist by its first watch sub-path, which has no [watch]
-// header — SetSectionWhitelist failed "section not found" and, in the
-// non-live flow, left the daemon stopped. The refresh must address the
-// section by its encryption root, re-expand the shared whitelist, and
-// preserve the `watch:` group structure.
+// Regression (pacman-hook breaker): `install --update-catalog-only` addressed a grouped section's
+// whitelist by its first watch sub-path, which has no [watch] header, so SetSectionWhitelist failed
+// "section not found" and (non-live) left the daemon stopped. It must address the section by its
+// encryption root, re-expand the shared whitelist and keep the `watch:` structure.
 func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
 	home := t.TempDir()
 	confText, cfg := groupedDiscordConf(t, home)
@@ -390,17 +380,11 @@ func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
 	}
 }
 
-// TestSectionsFromCandidatesSkipsMissingWatchSubPaths is the regression test
-// for a daemon startup crash: a fresh Discord config directory only creates
-// some of the catalog's WatchRelPaths sub-directories, and the installer used
-// to emit a `watch:` directive for every one of them regardless of whether it
-// existed. The daemon's ResolvePendingPaths pass (internal/daemonconfig)
-// treats a grouped watch path still missing once its encryption root is
-// available as a HARD, FATAL error by design (fail-closed: a declared but
-// unresolvable protected directory must not be silently dropped at runtime).
-// The fix has to happen earlier, at config-generation time, mirroring how a
-// plain (non-grouped) candidate is simply never proposed when its path does
-// not exist.
+// Regression for a daemon startup crash: a fresh Discord config dir creates only some of the
+// catalog's WatchRelPaths, and the installer emitted a `watch:` for every one. ResolvePendingPaths
+// (internal/daemonconfig) treats a grouped watch path still missing after unlock as FATAL by design
+// (fail closed), so the fix belongs at config-generation time: a missing path is never proposed, as
+// for a plain candidate.
 func TestSectionsFromCandidatesSkipsMissingWatchSubPaths(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".config", "discord")
@@ -422,7 +406,7 @@ func TestSectionsFromCandidatesSkipsMissingWatchSubPaths(t *testing.T) {
 		t.Errorf("ExtraWatchPaths = %v, want only the existing sub-path %q", sections[0].ExtraWatchPaths, existing)
 	}
 
-	confText := inst.GenerateConf(sections)
+	confText := inst.GenerateConf(sections, nil)
 	cfg, err := validateConfigText(confText)
 	if err != nil {
 		t.Fatalf("generated config does not parse: %v", err)
@@ -471,12 +455,9 @@ func TestGroupedSectionAddressedByEncryptionRoot(t *testing.T) {
 	}
 }
 
-// TestSetSectionWhitelistPreservesGroupStructure is the regression test for
-// grouped-section refreshes: SetSectionWhitelist must replace ONLY the
-// whitelist-entry lines, preserving the `watch:` group directives — a
-// refresh that erased them would silently unwatch the grouped trees. The
-// refreshed config must also parse back into the grouped resources with
-// their shared whitelist and encryption root intact.
+// SetSectionWhitelist must replace ONLY whitelist-entry lines and preserve `watch:` group
+// directives (erasing them would silently unwatch the grouped trees); the refreshed config must
+// parse back into the grouped resources with shared whitelist and encryption root intact.
 func TestSetSectionWhitelistPreservesGroupStructure(t *testing.T) {
 	vault := t.TempDir()
 	lsDir := filepath.Join(vault, "Local Storage")
@@ -556,5 +537,67 @@ func TestSoftenAutomatedRefreshErr(t *testing.T) {
 	}
 	if err := softenAutomatedRefreshErr(nil, true); err != nil {
 		t.Errorf("nil in, nil out, got %v", err)
+	}
+}
+
+// TestGeneratedLibraryBlockRoundTrips feeds the installer's [libraries]
+// output through the daemon's own parser: the block's lib_dir must come out as
+// a read-only resource written by the block's lib_binary alone — never by the
+// application's watch-section whitelist, and never reaching the protected
+// section.
+func TestGeneratedLibraryBlockRoundTrips(t *testing.T) {
+	home := t.TempDir()
+	secret := filepath.Join(home, "config")
+	runtime := filepath.Join(home, "steamrt64")
+	writer := filepath.Join(runtime, "pv", "bin", "pressure-vessel-wrap")
+	client := filepath.Join(home, "steam")
+	for _, d := range []string{secret, filepath.Dir(writer)} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{writer, client} {
+		if err := os.WriteFile(f, []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	confText := inst.GenerateConf(
+		[]inst.Section{{Path: secret, Allow: []inst.BinaryRule{{Path: client}}}},
+		[]inst.LibraryBlock{{Name: "Steam (alice)", LibDirs: []string{runtime}, LibWriters: []string{writer}}},
+	)
+	cfg, err := validateConfigText(confText)
+	if err != nil {
+		t.Fatalf("generated config with a [libraries] block does not parse: %v\n%s", err, confText)
+	}
+
+	has := func(r *daemonconfig.Resource, p string) bool {
+		for _, b := range r.Binaries {
+			if b.Path == p {
+				return true
+			}
+		}
+		return false
+	}
+	var lib, sec *daemonconfig.Resource
+	for i := range cfg.Resources {
+		switch cfg.Resources[i].Path {
+		case runtime:
+			lib = &cfg.Resources[i]
+		case secret:
+			sec = &cfg.Resources[i]
+		}
+	}
+	if lib == nil || sec == nil {
+		t.Fatalf("want the protected section and the lib_dir, got %+v", cfg.Resources)
+	}
+	if !lib.ReadOnly || !has(lib, writer) {
+		t.Errorf("lib_dir must be read-only and written by its block's lib_binary: %+v", lib)
+	}
+	if has(lib, client) {
+		t.Errorf("the watch section's whitelist leaked into the [libraries] lib_dir")
+	}
+	if has(sec, writer) {
+		t.Errorf("the lib_binary leaked into the protected section's whitelist")
 	}
 }

@@ -17,60 +17,46 @@ type MonitorRepository interface {
 
 // GuardRepository is the port implemented by the file system guard engine.
 type GuardRepository interface {
-	// PopulateInodes fills the inode map with the guarded tree's contents.
-	// The hooks are already attached (protection is live) when it is
-	// called; it runs after the resource was unlocked. Tolerant scanning:
-	// entries vanishing mid-scan are skipped, a full map degrades coverage
-	// but is not fatal.
+	// PopulateInodes fills the inode map with the guarded tree. Hooks are already attached
+	// (protection live); runs after the resource is unlocked. Tolerant: vanished entries are
+	// skipped, a full map degrades coverage but isn't fatal.
 	PopulateInodes() error
-	// ResolvePendingBinaries retries the whitelist entries that were
-	// deferred because their resource tree was still locked when the
-	// guard was built. It must be called only after the resource is
-	// accessible (post-unlock, post-PopulateInodes). On success the
-	// deferred binaries are added to the running whitelist; a binary
-	// that stays unreadable is kept deferred and logged — protection
-	// remains fail-closed.
+	// ResolvePendingBinaries retries whitelist entries deferred because their tree was locked at
+	// guard build. Call only after the resource is accessible (post-unlock, post-PopulateInodes).
+	// Resolved binaries join the running whitelist; still-unreadable ones stay deferred and logged
+	// (fail-closed).
 	ResolvePendingBinaries() error
-	// ReSyncBinaries re-stats every whitelisted binary and rewrites its
-	// inode-keyed entry when the file was replaced in place (an
-	// application update). Stale map keys are never deleted, so
-	// pre-replacement processes keep working. It is safe to call
-	// repeatedly; it also retries binaries still deferred from load. It
-	// returns the number of binaries whose map entries changed.
+	// ReSyncBinaries re-stats every whitelisted binary and rewrites its inode-keyed entry after an
+	// in-place replacement (app update). Stale keys are never deleted, so pre-replacement processes
+	// keep working. Safe to repeat; also retries still-deferred binaries. Returns how many entries
+	// changed.
 	ReSyncBinaries() (int, error)
-	// SweepInodes is the cheap periodic guard_inodes refresh: it re-scans
-	// only when the watch root's fingerprint moved (a recreated single-file
-	// root, or a directory root that gained/lost a top-level entry).
-	// Unconditional full re-walks are avoided — deeper changes are covered by
-	// BPF runtime discovery and the ancestor walk.
+	// SweepInodes is the cheap periodic guard_inodes refresh: re-scans only when the watch root's
+	// fingerprint moved (recreated single-file root, or a directory that gained/lost a top-level
+	// entry). Deeper changes are covered by BPF runtime discovery and the ancestor walk.
 	SweepInodes() error
-	// ReconcileInodes is the coarse-cadence counterpart to SweepInodes: it
-	// deletes guard_inodes entries whose (dev, ino) no longer corresponds to
-	// anything on disk. Every other path that touches guard_inodes only
-	// ever adds, so entries for long-deleted files accumulate for the life
-	// of the daemon; on a filesystem that reuses freed inode numbers, a
-	// stale entry can eventually collide with an unrelated file elsewhere
-	// on the same device and trigger a false denial. It never deletes
-	// anything unless a fresh, complete tree walk backs the decision, and
-	// never evicts the watch root's own key.
+	// ReconcileInodes is the coarse-cadence counterpart of SweepInodes: deletes guard_inodes
+	// entries whose (dev, ino) no longer exists on disk. Everything else only adds, and a stale
+	// entry can collide with an unrelated file via inode reuse (false denial). Deletes only when
+	// backed by a fresh, complete tree walk, and never the watch root's key.
 	ReconcileInodes() error
-	// GrantSelfEditAccess widens the root-gated self binary mask to cover the
-	// operations an interactive edit performs, for an authenticated live
-	// edit-protected session; RevokeSelfEditAccess restores the read-only
-	// baseline. Both touch only the uid-0-gated self inode, never the
-	// whitelist, and the change lives in the BPF map only (gone on restart).
+	// GrantSelfEditAccess widens the root-gated self binary mask for an authenticated live
+	// edit-protected session; RevokeSelfEditAccess restores the read-only baseline. Both touch only
+	// the uid-0-gated self inode, never the whitelist, and live only in the BPF map (gone on
+	// restart).
 	GrantSelfEditAccess() error
 	RevokeSelfEditAccess() error
-	// WithSelfVaultAccess widens this resource's guard self-access to cover
-	// the fscrypt file-vault's in-place unlock/lock (internal/fscrypt/
-	// filevault.go) for the duration of fn, then unconditionally restores
-	// the baseline mask. Directory resources never need this (their fscrypt
-	// unlock/lock is a pure kernel-keyring operation that never touches
-	// file content); only a single-file resource's vault reads and rewrites
-	// its own bytes on the guarded path itself. Deliberately distinct from
-	// GrantSelfEditAccess/RevokeSelfEditAccess, which is a broader,
-	// session-scoped grant for interactive edit-protected use.
+	// WithSelfVaultAccess widens this guard's self-access for the fscrypt file-vault's in-place
+	// unlock/lock (internal/fscrypt/filevault.go) for the duration of fn, then always restores the
+	// baseline. Only single-file resources need it (directory unlock/lock is pure keyring work).
+	// Distinct from GrantSelfEditAccess, the broader session-scoped grant for interactive edits.
 	WithSelfVaultAccess(fn func() error) error
+	// SnapshotTaintedPIDs returns the tgids marked tainted (holding guarded content in memory);
+	// RestoreTaintedPIDs re-stamps them into a fresh guard. Together they carry the memory-read
+	// taint across a reload: new guards start with empty maps, so without this a SIGHUP would drop
+	// process_vm_readv/ptrace protection for processes that already read a guarded file.
+	SnapshotTaintedPIDs() ([]uint32, error)
+	RestoreTaintedPIDs(pids []uint32) error
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

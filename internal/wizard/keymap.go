@@ -5,10 +5,9 @@ import (
 	"github.com/charmbracelet/huh"
 )
 
-// MultiSelectKeymap is the shared key map for the wizards' preselected
-// multi-selects: Ctrl+K toggles every entry, space/x toggles one, and the
-// field legend shows both. Apply it to the Form, not the field —
-// huh.NewForm overwrites each field's keymap with the form default.
+// MultiSelectKeymap is the shared keymap for preselected multi-selects: Ctrl+K toggles all, space/x
+// one, and the legend shows both. Apply it to the Form, not the field (huh.NewForm overwrites each
+// field's keymap).
 func MultiSelectKeymap() *huh.KeyMap {
 	keys := huh.NewDefaultKeyMap()
 	keys.MultiSelect.SelectAll = key.NewBinding(

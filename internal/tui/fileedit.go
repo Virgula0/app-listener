@@ -4,9 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/Virgula0/app-listener/internal/safeio"
 )
 
 // defaultNewFileMode models umask(022) defaults: 0644 files, 0755 dirs.
@@ -18,11 +23,24 @@ func defaultNewFileMode(isDir bool) os.FileMode {
 	return 0o666 &^ mask
 }
 
-// applyNewFileMeta gives fresh entries the ownership/mode the invoking user
-// would have gotten: under sudo it chowns to SUDO_UID/SUDO_GID natively;
-// non-root callers only get the defaultNewFileMode mode.
+// applyNewFileMeta gives fresh entries the ownership/mode the invoking user would have gotten:
+// under sudo it chowns to SUDO_UID/SUDO_GID; non-root callers only get defaultNewFileMode. It
+// operates on a symlink-safe descriptor (O_NOFOLLOW): os.Chmod follows a symlink, so a name planted
+// as a link before the chmod would otherwise have root chmod the link target.
 func applyNewFileMeta(path string, isDir bool) error {
 	mode := defaultNewFileMode(isDir)
+	flags := unix.O_NOFOLLOW | unix.O_CLOEXEC
+	if isDir {
+		flags |= unix.O_DIRECTORY
+	} else {
+		flags |= unix.O_RDONLY
+	}
+	fd, err := unix.Open(path, flags, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", path, err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
 	if os.Geteuid() == 0 {
 		uidStr, gidStr := os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID")
 		if uidStr != "" && gidStr != "" {
@@ -31,12 +49,12 @@ func applyNewFileMeta(path string, isDir bool) error {
 			if uidErr != nil || gidErr != nil {
 				return fmt.Errorf("parsing SUDO_UID/SUDO_GID: %v / %v", uidErr, gidErr)
 			}
-			if err := os.Lchown(path, int(uid), int(gid)); err != nil {
+			if err := f.Chown(int(uid), int(gid)); err != nil {
 				return fmt.Errorf("chown %s: %w", path, err)
 			}
 		}
 	}
-	return os.Chmod(path, mode)
+	return f.Chmod(mode)
 }
 
 // isOctalMode reports a 1-4 digit octal mode (leading zeros allowed);
@@ -119,9 +137,12 @@ func isBinaryContent(data []byte) bool {
 	return bytes.IndexByte(data[:n], 0) >= 0
 }
 
-// writeFileKeepMeta atomically replaces path with data (temp sibling +
-// rename after fsync), preserving mode and owner; symlinks are refused so
-// writes never follow links. Owner restoration requires root.
+// writeFileKeepMeta atomically replaces path with data (temp sibling + rename after fsync),
+// preserving mode and owner (needs root). The editor runs as root over a user-owned tree with no
+// guard attached in the offline flow, so every step is symlink-safe: the temp sibling is created
+// O_EXCL|O_NOFOLLOW inside the parent dir fd and metadata is applied on that descriptor, never on a
+// name that a planted symlink could redirect (a plain O_CREATE|O_TRUNC on a predictable temp name
+// let root truncate and chown the link target).
 func writeFileKeepMeta(path string, data []byte) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -130,54 +151,30 @@ func writeFileKeepMeta(path string, data []byte) error {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("refusing to write through symlink %s", path)
 	}
-	tmp := path + ".app_listener.edit"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	dirFD, err := unix.Open(dir, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening %s: %w", dir, err)
 	}
-	cleanup := true
-	defer func() {
-		_ = f.Close()
-		if cleanup {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if _, werr := f.Write(data); werr != nil {
-		return werr
-	}
-	if serr := f.Sync(); serr != nil {
-		return serr
-	}
-	if cerr := f.Chmod(info.Mode()); cerr != nil {
-		return cerr
-	}
-	// Chown needs root (the editor runs as root via --edit-protected);
-	// non-root temp files already carry the caller's ownership.
+	defer unix.Close(dirFD)
+
+	uid, gid := -1, -1
 	if os.Geteuid() == 0 {
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			if cerr := f.Chown(int(stat.Uid), int(stat.Gid)); cerr != nil {
-				return cerr
-			}
+			uid, gid = int(stat.Uid), int(stat.Gid)
 		}
 	}
-	if cerr := f.Close(); cerr != nil {
-		return cerr
-	}
-	cleanup = false
-	return os.Rename(tmp, path)
+	tmp := "." + base + ".app_listener.edit"
+	return safeio.AtomicWriteAt(dirFD, base, tmp, data, info.Mode().Perm(), uid, gid)
 }
 
-// writeFileInPlace rewrites path's EXISTING inode directly — open, truncate,
-// write, fsync — never a temp file or a rename. Used only for a single-file
-// edit-protected resource (fileEditModel.singleFile): unlike a file nested
-// inside a guarded directory, a single-file watch root's own guard also
-// protects its parent directory against anything created or renamed beside
-// it (see guard_path_rename's destination-parent-directory check in
-// guard.bpf.c — the same "rename-over-watchroot" defense CLAUDE.md calls
-// out), so writeFileKeepMeta's temp-sibling dance is denied there. Mode and
-// ownership are left exactly as they are — there is no separate temp file
-// whose metadata could ever need copying onto the live one, unlike the
-// create-then-rename path.
+// writeFileInPlace rewrites path's EXISTING inode (open, truncate, write, fsync), never a temp file
+// or rename. Only for a single-file edit-protected resource (fileEditModel.singleFile): a
+// single-file watch root's guard also protects its parent directory against anything
+// created/renamed beside it (guard_path_rename's destination-parent check, the
+// rename-over-watchroot defense), so writeFileKeepMeta's temp-sibling dance is denied. Mode and
+// ownership stay as they are (no temp file whose metadata needs copying).
 func writeFileInPlace(path string, data []byte) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -186,7 +183,9 @@ func writeFileInPlace(path string, data []byte) error {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("refusing to write through symlink %s", path)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	// O_NOFOLLOW + fstat: validate the descriptor, not the earlier Lstat, so a symlink swapped in
+	// between the two cannot redirect the truncate+write.
+	f, err := safeio.OpenRegularNoFollow(path, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}

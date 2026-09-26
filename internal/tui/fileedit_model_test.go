@@ -148,15 +148,11 @@ func inodeOf(t *testing.T, path string) uint64 {
 	return st.Ino
 }
 
-// TestFileEditModelSingleFileTarget is the regression test for the bug where
-// RunFileEditor/newFileEditModel unconditionally treated root as a
-// directory: os.ReadDir on a single guarded regular file (a file-vault
-// resource, e.g. registry.vdf) failed outright with "open root: not a
-// directory" before the editor ever opened. A single-file root must skip
-// the tree entirely, open straight into the editor, and save in place —
-// never through the tree editor's usual temp-file + rename (which a
-// single-file watch root's guard denies, since it also protects its own
-// parent directory against anything created or renamed beside it).
+// Regression: RunFileEditor/newFileEditModel treated root as a directory unconditionally, so
+// os.ReadDir on a single guarded regular file (a file-vault resource, e.g. registry.vdf) failed
+// with "open root: not a directory". A single-file root must skip the tree, open straight into the
+// editor, and save in place, never via temp-file + rename (denied by a single-file root's guard,
+// which also protects its parent directory).
 func TestFileEditModelSingleFileTarget(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.vdf")
 	if err := os.WriteFile(path, []byte("original content"), 0o600); err != nil {

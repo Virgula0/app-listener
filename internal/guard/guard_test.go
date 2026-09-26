@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -614,17 +616,20 @@ func (s *guardUnitTest) TestPopulateInodesFillsMap() {
 	defer g.Stop()
 
 	for _, p := range nodes {
-		var v uint8
-		s.Require().Truef(g.objs.GuardInodes.Lookup(keys[p], &v) == nil,
+		var v uint32
+		s.Require().Truef(g.objs().GuardInodes.Lookup(keys[p], &v) == nil,
 			"inode of %s missing from guard_inodes", p)
 	}
 
 	count := 0
-	it := g.objs.GuardInodes.Iterate()
+	it := g.objs().GuardInodes.Iterate()
 	var k GuardInodeKey
-	var v uint8
+	var v uint32
 	for it.Next(&k, &v) {
-		count++
+		// guard_inodes is shared by every resource; count only this guard's rows.
+		if v == g.resID {
+			count++
+		}
 	}
 	s.Require().Equal(len(nodes), count, "guard_inodes must contain exactly the tree nodes")
 }
@@ -654,8 +659,8 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	inMap := func(path string) bool {
 		dev, ino, err := ebpf.StatInode(path)
 		s.Require().NoError(err)
-		var v uint8
-		return g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
+		var v uint32
+		return g.objs().GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
 	}
 	s.Require().True(inMap(fileRoot), "the file root must be mapped at build")
 
@@ -676,41 +681,33 @@ func (s *guardUnitTest) TestSweepInodesRecreatedFileRoot() {
 	s.Require().NoError(g.SweepInodes())
 	s.Require().True(inMap(fileRoot), "SweepInodes must map the recreated file root")
 
-	// Regression coverage for the false-DENY-on-unrelated-files /
-	// silently-unguarded-real-file bug: SweepInodes must move BOTH the
-	// kernel-side root-confinement anchor (guard_config[3..4], consulted by
-	// root_in_chain in guard.bpf.c) and g.rootKey to the new inode, and evict
-	// the old one from guard_inodes — otherwise the old, now-freed inode
-	// number stays "protected" forever (ReconcileInodes refuses to evict
-	// g.rootKey) and, once the filesystem hands that number to an unrelated
-	// file anywhere else, that file gets denied under this resource's
-	// whitelist purely by inode-number coincidence, while the real
-	// recreated file silently stops being guarded (its ancestor chain no
-	// longer contains the stale configured root).
-	var gotDev, gotIno uint64
-	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
-	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
-	s.Require().Equal(newIno, gotIno, "guard_config root ino must follow the recreated file")
+	// Regression for the false-DENY-on-unrelated-files / silently-unguarded-real-file bug:
+	// SweepInodes must move BOTH the kernel root-confinement anchor (the resource slot,
+	// root_in_chain) and g.rootKey to the new inode and evict the old one from guard_inodes.
+	// Otherwise the old freed number stays "protected" forever (ReconcileInodes won't evict
+	// g.rootKey) and, once the filesystem gives it to an unrelated file elsewhere, that file is
+	// denied under this whitelist by coincidence while the real recreated file silently loses
+	// protection (its chain no longer contains the stale root).
+	cfg, cfgErr := g.resConfig()
+	s.Require().NoError(cfgErr)
+	gotDev, gotIno := cfg.RootDev, cfg.RootIno
+	s.Require().Equal(newIno, gotIno, "the resource slot's root ino must follow the recreated file")
 
 	g.mu.Lock()
 	gotRootKey := g.rootKey
 	g.mu.Unlock()
-	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match guard_config")
+	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match the resource slot")
 
-	var v uint8
+	var v uint32
 	oldKey := GuardInodeKey{Dev: gotDev, Ino: oldIno}
-	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
+	s.Require().Error(g.objs().GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
-// TestSweepInodesRecreatedDirRoot is TestSweepInodesRecreatedFileRoot's
-// directory-root counterpart: the regression test for the SAME bug class
-// (stale root-confinement anchor -> false DENY on an unrelated file
-// elsewhere + the real resource silently losing protection), for a
-// DIRECTORY watch root deleted and recreated wholesale (e.g. an in-place
-// fscrypt migration, a backup restore, or an app rebuilding its own config
-// directory) rather than a single guarded file. Before this fix, only the
-// single-file branch of SweepInodes re-anchored on a root-inode change; the
-// directory branch only tracked mtime and never re-checked its own inode.
+// Directory-root counterpart of TestSweepInodesRecreatedFileRoot (same bug class: stale anchor ->
+// false DENY + silently unguarded resource) for a DIRECTORY root deleted and recreated wholesale
+// (in-place fscrypt migration, backup restore, app rebuilding its config dir). Before the fix only
+// the single-file branch re-anchored; the directory branch tracked mtime and never re-checked its
+// own inode.
 func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	if os.Getuid() != 0 {
 		s.T().Skip("Skipping BPF test: requires root")
@@ -733,8 +730,8 @@ func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	inMap := func(path string) bool {
 		dev, ino, err := ebpf.StatInode(path)
 		s.Require().NoError(err)
-		var v uint8
-		return g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
+		var v uint32
+		return g.objs().GuardInodes.Lookup(GuardInodeKey{Dev: dev, Ino: ino}, &v) == nil
 	}
 	s.Require().True(inMap(watchDir), "the directory root must be mapped at build")
 
@@ -756,37 +753,30 @@ func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	s.Require().True(inMap(watchDir), "SweepInodes must map the recreated directory root")
 	s.Require().True(inMap(newFile), "SweepInodes must map the recreated directory's new content")
 
-	// Same regression coverage as TestSweepInodesRecreatedFileRoot: the
-	// kernel-side root-confinement anchor (guard_config[3..4], consulted by
-	// root_in_chain in guard.bpf.c) and g.rootKey must both move to the new
-	// inode, and the old one must be evicted from guard_inodes — otherwise
-	// it stays "protected" forever (ReconcileInodes refuses to evict
-	// g.rootKey) and, once the filesystem hands that freed inode number to
-	// an unrelated file/directory anywhere else, that gets denied under
-	// this resource's whitelist purely by inode-number coincidence, while
-	// the real recreated directory silently stops being guarded.
-	var gotDev, gotIno uint64
-	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(3), &gotDev))
-	s.Require().NoError(g.objs.GuardConfig.Lookup(uint32(4), &gotIno))
-	s.Require().Equal(newIno, gotIno, "guard_config root ino must follow the recreated directory")
+	// Same coverage as TestSweepInodesRecreatedFileRoot: the root-confinement anchor
+	// (the resource slot) and g.rootKey must move to the new inode and the old one be evicted from
+	// guard_inodes, else it stays "protected" forever and, once reused by an unrelated
+	// file/directory elsewhere, that gets denied by inode-number coincidence while the real
+	// recreated directory silently loses protection.
+	cfg, cfgErr := g.resConfig()
+	s.Require().NoError(cfgErr)
+	gotDev, gotIno := cfg.RootDev, cfg.RootIno
+	s.Require().Equal(newIno, gotIno, "the resource slot's root ino must follow the recreated directory")
 
 	g.mu.Lock()
 	gotRootKey := g.rootKey
 	g.mu.Unlock()
-	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match guard_config")
+	s.Require().Equal(GuardInodeKey{Dev: gotDev, Ino: gotIno}, gotRootKey, "g.rootKey must match the resource slot")
 
-	var v uint8
+	var v uint32
 	oldKey := GuardInodeKey{Dev: gotDev, Ino: oldIno}
-	s.Require().Error(g.objs.GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
+	s.Require().Error(g.objs().GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
-// The guard_path_rmdir eviction fix itself (guard.bpf.c) is exercised at the
-// guard level, not here: see TestGuard_PathRmdirEvictsInodeImmediately in
-// integrationtests/guard_test.go, which queries the live guard_inodes map via
-// bpftool running as root inside the privileged test container — a directory
-// has no hard-link equivalent to prove eviction through ordinary black-box
-// filesystem behavior (Linux refuses to hard-link a directory), so that test
-// verifies the map directly instead of via a surviving second name.
+// The guard_path_rmdir eviction fix is tested at guard level
+// (TestGuard_PathRmdirEvictsInodeImmediately in integrationtests/guard_test.go): it queries the
+// live guard_inodes map via bpftool as root in the privileged container, since a directory has no
+// hard-link equivalent to prove eviction black-box (Linux refuses to hard-link a directory).
 
 // TestSweepInodesDirRootGated verifies a directory root whose mtime has not
 // moved is not re-walked (the expensive path the sweep avoids).
@@ -816,13 +806,10 @@ func (s *guardUnitTest) TestSweepInodesDirRootGated() {
 	g.mu.Unlock()
 }
 
-// TestWalkLiveEntriesRootFailureIsHardError verifies the one behavior that
-// distinguishes walkLiveEntries from walkInodes: unlike PopulateInodes'
-// tolerant root-vanish handling (safe there — the BPF ancestor walk and
-// fail-closed defenses still cover under-collection), ReconcileInodes must
-// never read "the root was briefly unreadable" as "the guarded tree is
-// empty" — that would license evicting every entry, including the watch
-// root's own protection.
+// The one behavior distinguishing walkLiveEntries from walkInodes: unlike PopulateInodes' tolerant
+// root-vanish handling (safe there: the ancestor walk and fail-closed defenses cover
+// under-collection), ReconcileInodes must never read "root briefly unreadable" as "tree empty",
+// which would license evicting every entry, including the root's own protection.
 func (s *guardUnitTest) TestWalkLiveEntriesRootFailureIsHardError() {
 	err := walkLiveEntries("/some/path", false, 0, func(p string) error {
 		if p == "/some/path" {
@@ -853,14 +840,11 @@ func (s *guardUnitTest) TestWalkLiveEntriesToleratesVanishingChild() {
 	s.Require().Equal(3, seen, "root + both children must be visited")
 }
 
-// TestReconcileInodesEvictsStale verifies the periodic inode GC removes a
-// guard_inodes entry once its file is genuinely gone, while leaving the
-// watch root's own entry untouched. Nothing else in the guard ever deletes
-// from guard_inodes (PopulateInodes/SweepInodes/the BPF mkdir/rename
-// auto-discovery hooks only add), so a long-lived guard otherwise
-// accumulates one stale (dev, ino) per deleted file — and on a filesystem
-// that reuses freed inode numbers, a stale entry can later collide with an
-// unrelated file elsewhere on the same device and trigger a false DENY.
+// The periodic inode GC removes a guard_inodes entry once its file is gone, leaving the watch
+// root's entry untouched. Nothing else deletes from guard_inodes (PopulateInodes/SweepInodes/BPF
+// mkdir-rename discovery only add), so a long-lived guard accumulates a stale (dev, ino) per
+// deleted file, and on filesystems that reuse inode numbers one can collide with an unrelated file
+// and false-DENY.
 func (s *guardUnitTest) TestReconcileInodesEvictsStale() {
 	if os.Getuid() != 0 {
 		s.T().Skip("Skipping BPF test: requires root")
@@ -883,26 +867,24 @@ func (s *guardUnitTest) TestReconcileInodesEvictsStale() {
 	s.Require().NoError(err)
 	staleKey := GuardInodeKey{Dev: dev, Ino: ino}
 
-	var v uint8
-	s.Require().NoError(g.objs.GuardInodes.Lookup(staleKey, &v), "the file must be mapped at build")
+	var v uint32
+	s.Require().NoError(g.objs().GuardInodes.Lookup(staleKey, &v), "the file must be mapped at build")
 
 	s.Require().NoError(os.Remove(stale))
 	s.Require().NoError(g.ReconcileInodes())
 
-	s.Require().Error(g.objs.GuardInodes.Lookup(staleKey, &v),
+	s.Require().Error(g.objs().GuardInodes.Lookup(staleKey, &v),
 		"the deleted file's stale inode entry must be evicted")
 
 	rootDev, rootIno, err := ebpf.StatInode(root)
 	s.Require().NoError(err)
-	s.Require().NoError(g.objs.GuardInodes.Lookup(GuardInodeKey{Dev: rootDev, Ino: rootIno}, &v),
+	s.Require().NoError(g.objs().GuardInodes.Lookup(GuardInodeKey{Dev: rootDev, Ino: rootIno}, &v),
 		"ReconcileInodes must never evict the watch root's own entry")
 }
 
-// TestReSyncBinariesReplacement verifies the in-place-replacement fix
-// for the Discord updater denials: a whitelisted binary replaced in
-// place (same path, new inode) is denied after relaunch — the whitelist
-// is keyed by inode — until ReSyncBinaries rewrites its map entry, after
-// which the updated binary is allowed again.
+// A whitelisted binary replaced in place (same path, new inode) is denied until ReSyncBinaries
+// re-admits it, and re-admission needs the replacement check's approval: by path alone, anyone able
+// to swap the path would inherit the whitelist entry.
 func (s *guardUnitTest) TestReSyncBinariesReplacement() {
 	if os.Getuid() != 0 {
 		s.T().Skip("Skipping BPF test: requires root")
@@ -918,34 +900,186 @@ func (s *guardUnitTest) TestReSyncBinariesReplacement() {
 
 	entry, err := ComputeBinaryEntry(tool)
 	s.Require().NoError(err)
+	oldDev, oldIno, err := ebpf.StatInode(tool)
+	s.Require().NoError(err)
+	oldKey := GuardInodeKey{Dev: oldDev, Ino: oldIno}
 
 	g := s.newGuardedTree(root, []BinaryEntry{entry}, nil)
 	defer g.Stop()
 
-	// Original binary is whitelisted at build: allowed.
 	s.Require().NoError(runTool(tool, seed), "original binary must be allowed")
 
-	// Replace the binary in place: write a new file, rename over the
-	// old one — same path, brand-new inode.
 	replacement := filepath.Join("/tmp", fmt.Sprintf("guard-tool-new-%d", os.Getpid()))
 	s.Require().NoError(copySelf(replacement))
 	defer os.Remove(replacement)
 	s.Require().NoError(os.Rename(replacement, tool))
+	newDev, newIno, err := ebpf.StatInode(tool)
+	s.Require().NoError(err)
+	newKey := GuardInodeKey{Dev: newDev, Ino: newIno}
 
-	// The relaunched binary's inode is not whitelisted: denied.
 	s.Require().Error(runTool(tool, seed), "replaced binary must be denied until re-synced")
 
-	// ReSyncBinaries rewrites the map entry for the new inode.
+	// No check installed (no trust guard, so no provenance): refused, still denied in-kernel.
+	SetReplacementCheck(nil)
 	changed, err := g.ReSyncBinaries()
 	s.Require().NoError(err)
-	s.Require().GreaterOrEqual(changed, 1, "the replaced binary must be reported as changed")
+	s.Require().Zero(changed, "an unapproved replacement must not be re-admitted")
+	s.Require().Error(runTool(tool, seed), "an unapproved replacement must stay denied")
 
+	// Approved for exactly this old->new swap: re-admitted.
+	SetReplacementCheck(func(path string, o, n GuardInodeKey) bool {
+		return path == tool && o == oldKey && n == newKey
+	})
+	defer SetReplacementCheck(nil)
+	changed, err = g.ReSyncBinaries()
+	s.Require().NoError(err)
+	s.Require().Equal(1, changed, "the approved replacement must be reported as changed")
 	s.Require().NoError(runTool(tool, seed), "re-synced binary must be allowed")
 
-	// Idempotent: a second pass finds nothing to do.
 	again, err := g.ReSyncBinaries()
 	s.Require().NoError(err)
 	s.Require().Zero(again, "second re-sync must be a no-op")
+}
+
+// newSelfAllowedGuard builds and starts a guard that, like the daemon's, allows the running test
+// binary (root-gated): nested guards must still let their owner stat and scan every tree.
+func (s *guardUnitTest) newSelfAllowedGuard(root string, mode Mode, binaries []BinaryEntry) *Guard {
+	self, err := ComputeBinaryEntry("/proc/self/exe")
+	s.Require().NoError(err)
+	g, err := NewGuard(root, mode, binaries, true, 0, WithEagerPopulate(), WithSelfAllowBinary(self, nil))
+	s.Require().NoError(err, "building guard over %s", root)
+	s.Require().NoError(g.Start(), "starting guard over %s", root)
+	return g
+}
+
+// A sealed file (whitelist, no binaries) inside a read-only tree is the shape of fscrypt.key inside
+// /etc/app-listener. A rescan of the outer tree (what its periodic SweepInodes does) must not hand
+// the file to the outer resource, whose read-only rule lets everyone read.
+func (s *guardUnitTest) TestNestedResourceOuterRescanKeepsInnerSealed() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	outer := s.T().TempDir()
+	sealed := filepath.Join(outer, "key")
+	s.Require().NoError(os.WriteFile(sealed, []byte("data"), 0o600))
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-nest-tool-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+
+	og := s.newSelfAllowedGuard(outer, ModeReadOnly, nil)
+	defer og.Stop()
+	ig := s.newSelfAllowedGuard(sealed, ModeWhitelist, nil)
+	defer ig.Stop()
+
+	s.Require().Error(runTool(tool, sealed), "the sealed inner file must be denied")
+
+	s.Require().NoError(og.PopulateInodes())
+	s.Require().Error(runTool(tool, sealed), "an outer rescan must not unseal the inner file")
+}
+
+// guard_inodes holds one owner per inode: with nested resources (only the daemon's self guards;
+// configs refuse nesting) the innermost must own a shared file whichever resource scanned last.
+func (s *guardUnitTest) TestNestedResourcesInnermostOwns() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	outer := s.T().TempDir()
+	inner := filepath.Join(outer, "inner")
+	s.Require().NoError(os.Mkdir(inner, 0o755))
+	secret := filepath.Join(inner, "secret")
+	s.Require().NoError(os.WriteFile(secret, []byte("data"), 0o644))
+
+	tools := map[string]string{}
+	entries := map[string]BinaryEntry{}
+	for _, name := range []string{"outer-only", "inner-only", "both"} {
+		p := filepath.Join("/tmp", fmt.Sprintf("guard-nest-%s-%d", name, os.Getpid()))
+		s.Require().NoError(copySelf(p))
+		defer os.Remove(p)
+		e, err := ComputeBinaryEntry(p)
+		s.Require().NoError(err)
+		tools[name], entries[name] = p, e
+	}
+
+	og := s.newSelfAllowedGuard(outer, ModeWhitelist, []BinaryEntry{entries["outer-only"], entries["both"]})
+	defer og.Stop()
+	ig := s.newSelfAllowedGuard(inner, ModeWhitelist, []BinaryEntry{entries["inner-only"], entries["both"]})
+	defer ig.Stop()
+
+	check := func(when string) {
+		s.Require().NoErrorf(runTool(tools["both"], secret), "%s: a binary both resources allow must read", when)
+		s.Require().NoErrorf(runTool(tools["inner-only"], secret), "%s: the inner resource must own the file", when)
+		s.Require().Errorf(runTool(tools["outer-only"], secret), "%s: the outer whitelist must not apply inside the inner resource", when)
+	}
+	check("inner scanned last")
+	s.Require().NoError(og.PopulateInodes())
+	check("outer scanned last")
+}
+
+// Finding #4: SetTrusted must not empty guard_trusted_files before refilling it. A reload is the
+// normal way the trusted set changes (SIGHUP catalog refresh), and while the old code cleared the
+// map then re-populated it, a concurrent process was momentarily trusted for nothing — the library
+// allowlist and binary write-protection enforced nothing in that window. syncMap (put-then-delete)
+// keeps a binary that survives the change continuously present. A reader in a tight loop would see
+// the pre-fix clear-then-fill window; post-fix it never does.
+func (s *guardUnitTest) TestSetTrustedNeverDropsPersistentEntry() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	dir := s.T().TempDir()
+	persistent := filepath.Join(dir, "persistent-bin")
+	s.Require().NoError(os.WriteFile(persistent, []byte("x"), 0o755))
+	dev, ino, err := ebpf.StatInode(persistent)
+	s.Require().NoError(err)
+	pkey := GuardInodeKey{Dev: dev, Ino: ino}
+
+	// A pool of binaries that come and go across re-applications, so each SetTrusted is a real
+	// change (adds one, drops the previous) — the persistent one is in every set.
+	others := make([]string, 8)
+	for i := range others {
+		p := filepath.Join(dir, fmt.Sprintf("other-%d", i))
+		s.Require().NoError(os.WriteFile(p, []byte("y"), 0o755))
+		others[i] = p
+	}
+
+	tg, err := NewTrustGuard()
+	s.Require().NoError(err)
+	defer tg.Stop()
+	s.Require().NoError(tg.SetTrusted([]string{persistent}, nil))
+
+	// The persistent binary must be trusted at ALL times while SetTrusted re-applies concurrently.
+	var dropped atomic.Bool
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var v uint8
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := tg.objs.GuardTrustedFiles.Lookup(pkey, &v); err != nil {
+				dropped.Store(true)
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 300; i++ {
+		s.Require().NoError(tg.SetTrusted([]string{persistent, others[i%len(others)]}, nil))
+	}
+	close(stop)
+	wg.Wait()
+
+	s.Require().Falsef(dropped.Load(),
+		"the persistent binary vanished from guard_trusted_files during a re-apply — "+
+			"SetTrusted must sync (put-then-delete), never clear before refilling")
 }
 
 // TestMain intercepts the -helper-child invocation: the copied test
@@ -958,4 +1092,107 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(m.Run())
+}
+
+// A stopped resource's whitelist rows must leave the shared maps: resource ids are reused, so a
+// surviving row would let the next resource in that slot inherit a binary it never allowed.
+func (s *guardUnitTest) TestStoppedResourceWhitelistNotInheritedBySlotReuse() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-slot-tool-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+	entry, err := ComputeBinaryEntry(tool)
+	s.Require().NoError(err)
+	dev, ino, err := ebpf.StatInode(tool)
+	s.Require().NoError(err)
+	exe := GuardInodeKey{Dev: dev, Ino: ino}
+
+	// Keeps the shared engine (and its maps) alive across the other guard's stop.
+	holder := s.newGuardedTree(s.T().TempDir(), nil, nil)
+	defer holder.Stop()
+
+	allowing := s.newGuardedTree(s.T().TempDir(), []BinaryEntry{entry}, nil)
+	slot := allowing.resID
+	var action uint8
+	s.Require().NoError(allowing.objs().GuardExeActions.Lookup(allowing.resKey(exe), &action),
+		"the whitelisted binary must be registered for its resource")
+	allowing.Stop()
+
+	s.Require().Error(holder.objs().GuardExeActions.Lookup(GuardResInodeKey{ResId: slot, Ino: exe}, &action),
+		"a stopped resource's whitelist row must be removed from the shared map")
+
+	reuser := s.newGuardedTree(s.T().TempDir(), nil, nil)
+	defer reuser.Stop()
+	s.Require().Equal(slot, reuser.resID, "fixture: the freed slot id is reused")
+	s.Require().Error(reuser.objs().GuardExeActions.Lookup(reuser.resKey(exe), &action),
+		"the resource reusing the slot must not inherit the previous resource's whitelist")
+}
+
+// Findings #2/#3: a replacement guard built over the SAME root as a still-live guard (what a reload
+// does before it decides whether to keep the new config) takes over the live guard's guard_inodes
+// row, because claimInode does not treat a same-root replacement as inner. When that replacement is
+// then stopped — a refused reload, a failed buildGuards, a rollback — Stop deletes every row it
+// owns, including the one it took, so the kept resource loses its only inode row. SweepInodes won't
+// re-add it (the root inode never changed) and ReconcileInodes only deletes, so the resource is
+// left readable indefinitely though the old guard is still attached and "keeping" it.
+func (s *guardUnitTest) TestReloadRollbackKeepsFileRootProtected() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-rollback-file-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+
+	root := filepath.Join(s.T().TempDir(), "secret")
+	s.Require().NoError(os.WriteFile(root, []byte("data"), 0o644))
+
+	// Both guards self-allow the test process, as the daemon's guards self-allow the daemon exe:
+	// otherwise the live guard would deny this process's stat/scan while it builds the replacement,
+	// which is not the behaviour under test. The separate `tool` binary (a different inode) stays
+	// non-whitelisted and is the real probe.
+	kept := s.newSelfAllowedGuard(root, ModeWhitelist, nil)
+	defer kept.Stop()
+	s.Require().Error(runTool(tool, root), "the live guard must deny a non-whitelisted reader")
+
+	// The reload's replacement guard for the same resource, built while the old one still runs.
+	repl := s.newSelfAllowedGuard(root, ModeWhitelist, nil)
+	s.Require().Error(runTool(tool, root), "with the replacement active the root stays denied")
+
+	// Reload refused / rolled back: only the replacement is stopped; kept stays attached.
+	repl.Stop()
+	s.Require().Error(runTool(tool, root),
+		"stopping the rolled-back replacement left the kept single-file resource readable — its inode row was deleted")
+}
+
+// Directory counterpart of TestReloadRollbackKeepsFileRootProtected: the replacement's eager scan
+// claims every row of the kept tree, so stopping it strips the whole tree, not just the root.
+func (s *guardUnitTest) TestReloadRollbackKeepsDirTreeProtected() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	tool := filepath.Join("/tmp", fmt.Sprintf("guard-rollback-dir-%d", os.Getpid()))
+	s.Require().NoError(copySelf(tool))
+	defer os.Remove(tool)
+
+	root := s.T().TempDir()
+	inner := filepath.Join(root, "sub", "secret")
+	s.Require().NoError(os.MkdirAll(filepath.Dir(inner), 0o755))
+	s.Require().NoError(os.WriteFile(inner, []byte("data"), 0o644))
+
+	// Self-allowed for the same reason as the file-root case: the probe is the separate `tool`.
+	kept := s.newSelfAllowedGuard(root, ModeWhitelist, nil)
+	defer kept.Stop()
+	s.Require().Error(runTool(tool, inner), "the live guard must deny a non-whitelisted reader of a deep file")
+
+	repl := s.newSelfAllowedGuard(root, ModeWhitelist, nil)
+	s.Require().Error(runTool(tool, inner), "with the replacement active the deep file stays denied")
+
+	repl.Stop()
+	s.Require().Error(runTool(tool, inner),
+		"stopping the rolled-back replacement left the kept directory tree readable — its inode rows were deleted")
 }

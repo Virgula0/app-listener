@@ -36,12 +36,10 @@ type Monitor struct {
 
 	watchInodes map[string]string // "dev:ino" → watched path for hardlink detection
 
-	// paths memoizes the two per-event path lookups readEvent does for an
-	// event path that is NOT lexically inside a watched target — its
-	// EvalSymlinks resolution and its hardlink-inode check. On the
-	// unfiltered VFS firehose the same non-watched paths recur constantly,
-	// so this turns a per-event EvalSymlinks + stat into a map lookup
-	// without changing the filtering decision.
+	// paths memoizes the two per-event lookups readEvent does for an event path NOT lexically
+	// inside a watched target: its EvalSymlinks resolution and hardlink-inode check. On the
+	// unfiltered VFS firehose the same non-watched paths recur constantly, so this turns a
+	// per-event EvalSymlinks + stat into a map lookup without changing the filtering decision.
 	paths *pathCache
 }
 
@@ -273,9 +271,8 @@ func (m *Monitor) readEvent(rd *ringbuf.Reader) (*ebpf.FileEvent, bool) {
 	return nil, true
 }
 
-// pathInfo returns the cached EvalSymlinks resolution and hardlink verdict
-// for path (both computed together on a miss). Nil-safe: a Monitor built
-// without a cache computes each time.
+// pathInfo returns the cached EvalSymlinks resolution and hardlink verdict for path (both computed
+// on a miss). Nil-safe: a Monitor without a cache computes each time.
 func (m *Monitor) pathInfo(path string) pathCacheEntry {
 	if m.paths != nil {
 		if e, ok := m.paths.lookup(path); ok {
@@ -465,9 +462,8 @@ func (m *Monitor) scanDirInodes(dir string, currentDepth int) {
 	}
 }
 
-// resolveSymlinkToTarget rewrites an event path that is a symlink resolving
-// into a watched target; a path already inside a target, or not a symlink
-// alias of one, is returned unchanged. The EvalSymlinks call is cached.
+// resolveSymlinkToTarget rewrites an event path that is a symlink resolving into a watched target;
+// others are returned unchanged. EvalSymlinks is cached.
 func (m *Monitor) resolveSymlinkToTarget(path string) string {
 	if path == "" || m.matchesAnyTarget(path) {
 		return path

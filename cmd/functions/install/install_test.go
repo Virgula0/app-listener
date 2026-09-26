@@ -1,8 +1,11 @@
 package install
 
 import (
+	"bytes"
 	"strings"
 	"testing"
+
+	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
 func TestValidateMaintenanceFlags(t *testing.T) {
@@ -37,5 +40,25 @@ func TestValidateMaintenanceFlags(t *testing.T) {
 func TestDiffCatalogFlagRegistered(t *testing.T) {
 	if InstallCmd.Flags().Lookup("diff-catalog") == nil {
 		t.Fatal("install --diff-catalog flag is not registered")
+	}
+}
+
+func TestDaemonUnitWithMetadataOutput(t *testing.T) {
+	unit, err := inst.SampleContent("app-listener-daemon.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(unit, []byte("--no-log-metadata-blocks")) {
+		t.Fatal("the bundled unit is expected to quiet metadata denials by default")
+	}
+	got := daemonUnitWithMetadataOutput(unit)
+	if bytes.Contains(got, []byte("--no-log-metadata-blocks")) {
+		t.Fatalf("flag still present:\n%s", got)
+	}
+	if !bytes.Contains(got, []byte("ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only\n")) {
+		t.Fatalf("ExecStart mangled:\n%s", got)
+	}
+	if InstallCmd.Flags().Lookup("allow-metadata-output") == nil {
+		t.Fatal("--allow-metadata-output not registered")
 	}
 }

@@ -185,8 +185,8 @@ func formatGuardType(t ebpf.EventType) string {
 
 func (m *guardModel) renderGuardViewport() {
 	lines := make([]string, len(m.lines))
-	for i, el := range m.lines {
-		lines[i] = el.line
+	for i := range m.lines {
+		lines[i] = m.lines[i].line
 	}
 
 	content := lipgloss.JoinVertical(lipgloss.Left, lines...)

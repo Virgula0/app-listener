@@ -7,12 +7,9 @@ import (
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
-// TestDaemonSelfBaselineEventsNeverWrites pins daemonSelfBaselineEvents to
-// exactly {Open, Read, Stat} — the "never write" guarantee its own doc
-// comment makes for every permanent config/ephemeral guard's self grant.
-// Silently widening this package var would widen every construction site at
-// once (buildGuards' per-resource guards included), so a change here must be
-// deliberate, not a side effect of editing something else.
+// Pins daemonSelfBaselineEvents to exactly {Open, Read, Stat}: its "never write" guarantee for
+// every permanent config/ephemeral guard's self grant. Widening this var would widen every
+// construction site (buildGuards included) at once, so a change must be deliberate.
 func TestDaemonSelfBaselineEventsNeverWrites(t *testing.T) {
 	want := []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat}
 	if !slices.Equal(daemonSelfBaselineEvents, want) {
@@ -26,16 +23,11 @@ func TestDaemonSelfBaselineEventsNeverWrites(t *testing.T) {
 	}
 }
 
-// TestGroupUnlockSelfEventsIsBaselinePlusMknod: the ephemeral guard
-// unlockPendingGroupRoots attaches over a grouped encryption root stays live
-// through buildGuards, which must be able to pre-create the file-vault
-// recovery sidecar (an O_CREAT, gated by EVENT_MKNOD alone — see
-// guard_path_mknod) for any regular-file WatchRelPaths sub-resource under
-// that root. groupUnlockSelfEvents must therefore be exactly
-// daemonSelfBaselineEvents plus EventMknod: no less (the sidecar create is
-// denied again, reproducing the "could not pre-create the recovery sidecar"
-// warning) and no more (this mask must stay as narrow as the baseline it
-// widens, never drifting into write/delete/rename territory).
+// The ephemeral guard unlockPendingGroupRoots puts over a grouped root stays live through
+// buildGuards, which must pre-create the file-vault recovery sidecar (an O_CREAT gated by
+// EVENT_MKNOD alone; guard_path_mknod). groupUnlockSelfEvents must be exactly baseline +
+// EventMknod: no less (the create is denied, giving the "could not pre-create the recovery sidecar"
+// warning) and no more (never write/delete/rename).
 func TestGroupUnlockSelfEventsIsBaselinePlusMknod(t *testing.T) {
 	if !slices.Contains(groupUnlockSelfEvents, ebpf.EventMknod) {
 		t.Fatalf("groupUnlockSelfEvents = %v must contain EventMknod, or the ephemeral "+

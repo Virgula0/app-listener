@@ -1,9 +1,6 @@
-// Package fscrypt migration tests. One test file per production source
-// file is the convention here: EVERY test for migrate.go lives in this
-// file — directory migrations, single-file migrations and rollback cases
-// alike. Do not spawn variant files such as *_file_test.go or
-// *_rollback_test.go; append new cases below so related coverage stays
-// together.
+// Package fscrypt migration tests. One test file per production source file: EVERY migrate.go test
+// lives here (directory, single-file, rollback). No variant files like *_file_test.go; append new
+// cases below.
 package fscrypt
 
 import (
@@ -265,13 +262,10 @@ func TestDecryptMissingPath(t *testing.T) {
 	}
 }
 
-// TestEncryptRollbackOnUnsupportedFilesystem exercises the migration on a
-// filesystem without fscrypt support (t.TempDir usually lives on tmpfs).
-// The policy application is expected to fail and the original directory
-// must be restored with all contents — no data left in the backup-only
-// staging state. When the filesystem happens to support fscrypt (and the
-// environment has the privileges), the migration may actually succeed and
-// the test skips.
+// Migration on a filesystem without fscrypt support (t.TempDir is usually tmpfs): the policy
+// application is expected to fail and the original directory must be restored with all contents (no
+// backup-only staging state). If the filesystem does support fscrypt (and privileges allow) the
+// migration may succeed and the test skips.
 func TestEncryptRollbackOnUnsupportedFilesystem(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "vault")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -388,18 +382,11 @@ func TestEncryptFileRefusesSpecialFile(t *testing.T) {
 	}
 }
 
-// TestEncryptFileRollbackOnUnsupportedFilesystem mirrors the directory
-// rollback test: on a filesystem without fscrypt support (t.TempDir is
-// usually tmpfs) the migration fails before any rename and the original
-// file plus its metadata must be untouched, with no staging leftovers.
-// TestEncryptFileRollbackOnUnsupportedFilesystem: single-file encryption no
-// longer depends on the kernel fscrypt ioctl (the kernel never supported it
-// for a standalone regular file — see filevault.go), so unlike the
-// directory case above, there is no "unsupported filesystem" escape hatch
-// left to exercise here: given a valid master key, Encrypt must succeed on
-// any filesystem, including tmpfs. See TestFileMigrationRoundTrip and
-// TestRestoreBackupWorksOnFileVaultCiphertext below for the full
-// backup-first, temp-cleanup rollback contract on the new implementation.
+// Single-file counterpart of the directory rollback test. Single-file encryption no longer uses the
+// kernel ioctl (the kernel never supported it for a standalone file; filevault.go), so there's no
+// "unsupported filesystem" escape hatch: with a valid master key Encrypt must succeed on any
+// filesystem, tmpfs included. The backup-first, temp-cleanup rollback contract is covered by
+// TestFileMigrationRoundTrip and TestRestoreBackupWorksOnFileVaultCiphertext below.
 func TestEncryptFileRollbackOnUnsupportedFilesystem(t *testing.T) {
 	withMasterKey(t)
 	path := filepath.Join(t.TempDir(), "secret.env")
@@ -573,5 +560,81 @@ func TestCopyXattrsPreservesUserAttributes(t *testing.T) {
 	}
 	if string(value[:n]) != "hello" {
 		t.Errorf("xattr value = %q, want hello", value[:n])
+	}
+}
+
+// The single-file migration runs as root on a file the user owns. If the file is replaced by a
+// symlink after it was classified, the sealed record must not hold content from the link target.
+func TestEncryptFileSwappedAfterClassification(t *testing.T) {
+	withMasterKey(t)
+	const marker = "OUTSIDE-THE-MIGRATED-FILE"
+	base := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(outside, []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(base, "secret.env")
+	if err := os.WriteFile(path, []byte("KEY=value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	defer func(prev func(string)) { testHookBeforeFileRead = prev }(testHookBeforeFileRead)
+	testHookBeforeFileRead = func(p string) {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_ = (&Vault{}).Encrypt(path)
+
+	record, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if plain, oerr := openFileVaultWithMasterKey(record); oerr == nil && strings.Contains(string(plain), marker) {
+		t.Fatal("the migration sealed content read through a symlink swapped in after classification")
+	}
+}
+
+// Every file vault is sealed under the same master key, so if a user's vault file is swapped for a
+// symlink to another vault after classification, decrypting must not write that vault's plaintext
+// back to the user's path.
+func TestDecryptFileSwappedAfterClassification(t *testing.T) {
+	withMasterKey(t)
+	const marker = "ANOTHER-VAULTS-PLAINTEXT"
+	seal := func(p, content string) {
+		t.Helper()
+		record, err := sealFileVaultWithMasterKey([]byte(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, record, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := filepath.Join(t.TempDir(), "other.env")
+	seal(other, marker)
+	path := filepath.Join(t.TempDir(), "secret.env")
+	seal(path, "KEY=value")
+
+	defer func(prev func(string)) { testHookBeforeFileRead = prev }(testHookBeforeFileRead)
+	testHookBeforeFileRead = func(p string) {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_ = (&Vault{}).Decrypt(path)
+
+	for _, p := range []string{path, path + DecryptSuffix} {
+		if data, err := os.ReadFile(p); err == nil && strings.Contains(string(data), marker) {
+			t.Fatalf("%s holds another vault's plaintext", p)
+		}
 	}
 }

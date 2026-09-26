@@ -1,9 +1,7 @@
-// Package backups handles the .app_listener.backup migration copies the
-// installer leaves behind after an fscrypt migration: discovering them across
-// the catalog and the installed daemon.conf, an interactive multi-select, and
-// deleting or restoring them over the fscrypt vault. Shared by
-// `install --restore-backups` / `--delete-post-backups`, the install
-// post-step, and `uninstall`.
+// Package backups handles the .app_listener.backup copies left after an fscrypt migration:
+// discovery across the catalog and installed daemon.conf, interactive multi-select, delete/restore
+// over the vault. Shared by `install --restore-backups`/`--delete-post-backups`, the install
+// post-step and `uninstall`.
 package backups
 
 import (
@@ -27,23 +25,17 @@ type Backup struct {
 	BackupPath string
 }
 
-// Find lists every catalog or daemon.conf path that still carries a
-// .app_listener.backup directory, deduplicated by path. The set mirrors the
-// installer's own scope: the resources of /etc/app-listener/daemon.conf when
-// it exists (covering manually added directories) plus every catalog path
-// discovered for all local users and the system entries.
+// Find lists every catalog or daemon.conf path still carrying a .app_listener.backup, deduplicated.
+// Mirrors the installer's scope: resources of /etc/app-listener/daemon.conf (incl. manual dirs)
+// plus every catalog path for all local users and system entries.
 func Find() ([]Backup, error) {
 	return find(systemd.SystemConfigPath, install.ListUsers, install.DiscoverForUsers)
 }
 
-// find is Find's injectable core: systemConfigPath, listUsers and
-// discoverForUsers are parameters (rather than Find calling the real system
-// config path and install.ListUsers/DiscoverForUsers directly) so tests can
-// run this against fake data instead of the real system config and the real
-// catalog. On a host with the daemon actually installed, some catalog paths
-// (e.g. Steam's registry.vdf) can be live guarded resources — probing them
-// with os.Lstat from a process outside their whitelist (such as the test
-// binary itself) trips the guard and gets denied.
+// find is Find's injectable core (systemConfigPath, listUsers, discoverForUsers as parameters) so
+// tests use fake data: on a host with the daemon installed, some catalog paths (e.g. Steam's
+// registry.vdf) are live guarded resources, and os.Lstat from outside their whitelist (the test
+// binary) trips the guard.
 func find(systemConfigPath string, listUsers func() ([]install.User, error), discoverForUsers func([]install.User) []install.Candidate) ([]Backup, error) {
 	seen := make(map[string]bool)
 	var paths []string
@@ -60,9 +52,8 @@ func find(systemConfigPath string, listUsers func() ([]install.User, error), dis
 			return nil, fmt.Errorf("reading %s: %w", systemConfigPath, loadErr)
 		}
 		for i := range cfg.Resources {
-			// Grouped sections: the backup is at the encryption root (the whole
-			// vault is renamed aside during migration), at the watch path
-			// itself otherwise — keep both.
+			// Grouped sections: the backup is at the encryption root (the whole vault is renamed
+			// aside), else at the watch path itself; keep both.
 			add(cfg.Resources[i].Path)
 			add(cfg.Resources[i].EncryptionRootOrPath())
 		}
@@ -124,10 +115,9 @@ func Delete(entries []Backup) error {
 	})
 }
 
-// Restore deletes each entry's live (encrypted) directory and moves its
-// backup back to the original path, behind a progress indicator. The caller
-// MUST have stopped the daemon first — restoring under a live daemon would
-// let it keep using the directories being deleted.
+// Restore deletes each entry's live (encrypted) directory and moves its backup back, behind a
+// progress indicator. The caller MUST have stopped the daemon first (it would keep using the
+// directories being deleted).
 func Restore(entries []Backup) error {
 	vault := fscrypt.New()
 	return withProgress("Restoring", entries, func(b Backup) error {
@@ -138,9 +128,8 @@ func Restore(entries []Backup) error {
 	})
 }
 
-// withProgress runs op for every entry while a single-line progress bar at
-// the bottom of the terminal shows progress (one step per directory); the
-// fscrypt logs scroll normally above it.
+// withProgress runs op per entry under a one-line progress bar at the terminal bottom (one step per
+// directory); fscrypt logs scroll above it.
 func withProgress(verb string, entries []Backup, op func(Backup) error) error {
 	total := len(entries)
 	return wizard.WithBottomBar(func(bar *wizard.BottomBar) error {

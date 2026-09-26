@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,15 +43,11 @@ func TestPartitionEncryptionRootsSplitsDirsAndFiles(t *testing.T) {
 	}
 }
 
-// TestDaemonUseCaseWidensGuardSelfAccessForFileVaultResource is the
-// regression test for the bug where the daemon's own process got denied by
-// its own guard while unlocking/locking a single-file vault resource in
-// place: the guard's baseline self mask (open/read/stat) does not permit
-// the write the in-place transform needs, so it must run under
-// guard.WithSelfVaultAccess — verified here by counting calls into the
-// fake guard's WithSelfVaultAccess, not by asserting on the (unrelated)
-// crypto outcome. A sibling directory resource must NOT get the same
-// treatment (its fscrypt lifecycle never touches file content).
+// Regression: the daemon's own process was denied by its own guard when unlocking/locking a
+// single-file vault in place: the baseline self mask (open/read/stat) forbids the write the
+// in-place transform needs, so it must run under guard.WithSelfVaultAccess. Verified by counting
+// calls into the fake guard's WithSelfVaultAccess, not the (unrelated) crypto outcome. A sibling
+// directory resource must NOT get it (its fscrypt lifecycle never touches file content).
 func TestDaemonUseCaseWidensGuardSelfAccessForFileVaultResource(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "ssh")
@@ -99,6 +96,9 @@ type fakeVault struct {
 	mu sync.Mutex
 
 	encrypted map[string]bool
+	// strictPlain mirrors the real vault: IsProvisioned on a path with no
+	// fscrypt policy is an error, not "not provisioned".
+	strictPlain bool
 	// unlocked is the fscrypt lock state: Unlock provisions, Lock
 	// deprovisions.
 	unlocked map[string]bool
@@ -153,6 +153,9 @@ func (f *fakeVault) IsEncrypted(path string) (bool, error) {
 func (f *fakeVault) IsProvisioned(path string) (bool, error) {
 	if f.checkErr != nil {
 		return false, f.checkErr
+	}
+	if f.strictPlain && !f.encrypted[path] {
+		return false, fmt.Errorf("get policy for %s: file or directory %q is not encrypted", path, path)
 	}
 	return f.unlocked[path], nil
 }
@@ -228,13 +231,10 @@ func TestDaemonUseCaseConstructorMismatch(t *testing.T) {
 	}
 }
 
-// TestDaemonUseCaseStartEncryptionMismatchIsCriticalStartup verifies that a
-// need_encryption: true resource whose disk state disagrees (issue #53 — a
-// backup restore, or any change made outside the daemon) makes Start fail
-// with an error wrapping constants.ErrCriticalStartup: this condition
-// reproduces identically on every restart, so main.go must exit with the
-// non-retryable status instead of letting systemd's Restart=on-failure
-// crash-loop the daemon forever.
+// A need_encryption: true resource whose disk state disagrees (issue #53: backup restore or any
+// out-of-band change) makes Start fail with an error wrapping constants.ErrCriticalStartup: it
+// reproduces on every restart, so main.go must exit non-retryable rather than crash-loop under
+// Restart=on-failure.
 func TestDaemonUseCaseStartEncryptionMismatchIsCriticalStartup(t *testing.T) {
 	vault := newFakeVault() // /vault reports as NOT encrypted
 	d, err := NewDaemonUseCase(
@@ -543,15 +543,11 @@ func TestDaemonUseCaseStopKeyMissingIsSuccess(t *testing.T) {
 	}
 }
 
-// TestDaemonUseCaseStopNotEncryptedDoesNotBlockForever is the regression
-// test for issue #53: a resource marked need_encryption: true whose fscrypt
-// policy is entirely gone (e.g. a backup restore replaced the encrypted tree
-// with plaintext while the daemon was down) must not turn Stop's lockdown
-// into an infinite retry loop the way a genuinely busy key correctly does
-// (see TestDaemonUseCaseStopBlocksUntilAllLocked) — there is no key to
-// remove, so retrying can never succeed. Stop must still complete and detach
-// the guard, having logged the condition, instead of deadlocking shutdown
-// (systemctl stop / SIGTERM re-enters the same stuck call forever).
+// Regression for issue #53: a need_encryption: true resource whose fscrypt policy is entirely gone
+// (e.g. a backup restore replaced the tree with plaintext while the daemon was down) must not turn
+// Stop's lockdown into an infinite retry loop like a genuinely busy key does
+// (TestDaemonUseCaseStopBlocksUntilAllLocked): there's no key to remove. Stop must log the
+// condition, complete and detach the guard instead of deadlocking shutdown.
 func TestDaemonUseCaseStopNotEncryptedDoesNotBlockForever(t *testing.T) {
 	vault := newFakeVault("/vault")
 	// Every Lock call on /vault hits the policy-less path, forever — unlike
@@ -767,8 +763,15 @@ func TestDaemonUseCaseStartPopulateFailure(t *testing.T) {
 		t.Fatalf("NewDaemonUseCase: %v", err)
 	}
 
-	if err := d.Start(); !errors.Is(err, errBoom) {
-		t.Fatalf("Start should propagate populate error, got %v", err)
+	startErr := d.Start()
+	if !errors.Is(startErr, errBoom) {
+		t.Fatalf("Start should propagate populate error, got %v", startErr)
+	}
+	// A populate failure reproduces on every start: it must carry the
+	// critical tag (exit 78, RestartPreventExitStatus) or systemd crash-loops
+	// the daemon, cycling every vault through unlock/lock.
+	if !errors.Is(startErr, constants.ErrCriticalStartup) {
+		t.Errorf("populate failure must be ErrCriticalStartup, got %v", startErr)
 	}
 	if !vault.unlocked["/vault"] {
 		t.Error("resource should have been unlocked before the populate attempt")
@@ -1043,12 +1046,10 @@ func TestDaemonUseCaseReloadRefusedDuringShutdown(t *testing.T) {
 	}
 }
 
-// TestDaemonUseCaseReloadRollbackOrderLocksWhileGuarded is the regression
-// test for the rollback ordering bypass: a failed reload used to detach the
-// new guards BEFORE locking the freshly unlocked resource back, so a busy
-// pin left it unlocked with no guard attached (the old guards do not cover
-// a resource the old config never had). The rollback must lock first —
-// while the new guards still deny access — and detach only afterwards.
+// Regression for the rollback ordering bypass: a failed reload used to detach the new guards BEFORE
+// locking the freshly unlocked resource back, so a busy pin left it unlocked with no guard (old
+// guards don't cover a resource the old config lacked). Rollback must lock first, while the new
+// guards still deny, and detach only afterwards.
 func TestDaemonUseCaseReloadRollbackOrderLocksWhileGuarded(t *testing.T) {
 	vault := newFakeVault("/a", "/b")
 	old := newFakeGuardRepo()
@@ -1131,15 +1132,11 @@ func TestDaemonUseCaseReloadRollbackBusyPinKeepsGuardsAttached(t *testing.T) {
 	}
 }
 
-// TestDaemonUseCaseReloadRollbackNotEncryptedKeepsGuardsAttached is the
-// regression test for the security-review finding on the issue #53 fix: a
-// newly-unlocked resource whose fscrypt policy vanishes before rollback can
-// lock it back (e.g. a backup restore racing a SIGHUP reload) has no old
-// guard to fall back on. Unlike lockUntilAllKeyless (Stop, where every guard
-// detaches together regardless), rollbackReload must treat
-// repository.ErrNotEncrypted exactly like a stuck busy key here — the new
-// guard stays attached (orphaned) denying access, never detached early —
-// or this resource would end up both unencrypted AND unguarded.
+// Regression for the security-review finding on the issue #53 fix: a newly-unlocked resource whose
+// policy vanishes before rollback can lock it back (e.g. a backup restore racing a SIGHUP reload)
+// has no old guard to fall back on. Unlike Stop (where every guard detaches together),
+// rollbackReload must treat repository.ErrNotEncrypted like a stuck busy key: the new guard stays
+// attached (orphaned), denying access, or the resource ends up both unencrypted AND unguarded.
 func TestDaemonUseCaseReloadRollbackNotEncryptedKeepsGuardsAttached(t *testing.T) {
 	vault := newFakeVault("/a", "/b")
 	old := newFakeGuardRepo()
@@ -1220,6 +1217,34 @@ func TestDaemonUseCaseGroupedEncryptionRootsDeduplicated(t *testing.T) {
 	for i, g := range guards {
 		if !g.(*fakeGuardRepo).isStopped() {
 			t.Errorf("guards[%d] must be stopped", i)
+		}
+	}
+}
+
+// A reload adding a need_encryption:false resource (a lib_dir from a catalog refresh) must succeed
+// without touching fscrypt. It used to fall through to IsProvisioned, which the real vault fails on
+// a policy-less directory, rejecting the whole reload (a restart, which filters these out up front,
+// worked).
+func TestDaemonUseCaseReloadAddsUnencryptedResource(t *testing.T) {
+	vault := newFakeVault("/a")
+	vault.strictPlain = true
+	old := newFakeGuardRepo()
+	d := startDaemon(t, vault, []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	lib := daemonconfig.Resource{Path: "/lib", NeedEncryption: false, ReadOnly: true}
+	newA, newLib := newFakeGuardRepo(), newFakeGuardRepo()
+	if err := d.Reload(
+		[]daemonconfig.Resource{resource("/a"), lib},
+		[]repository.GuardRepository{newA, newLib},
+	); err != nil {
+		t.Fatalf("Reload adding an unencrypted resource: %v", err)
+	}
+	if !newLib.started {
+		t.Error("the added unencrypted resource's guard must be started")
+	}
+	for _, p := range vault.unlockCalls {
+		if p == "/lib" {
+			t.Error("an unencrypted resource must never be unlocked")
 		}
 	}
 }

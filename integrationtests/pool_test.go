@@ -9,31 +9,24 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 )
 
-// ---------------------------------------------------------------
-// Container pool: one privileged container per test FILE, reused by every
-// test in that file. Creating and destroying a container costs ~13-15s
-// (docker create + binary copy + 10s stop grace + ryuk teardown), which
-// dominated the suite runtime. Tests within a file are sequential and use
-// per-test state isolation, so a shared container is safe:
-//
+// Container pool: one privileged container per test FILE, reused by every test in it. Creating one
+// costs ~13-15s (docker create + binary copy + 10s stop grace + ryuk teardown), which dominated
+// suite runtime. Tests in a file are sequential with per-test state isolation, so sharing is safe:
 //   - readiness is polled (log markers + PID liveness), never slept;
 //   - guard/monitor processes are stopped PID-scoped between tests;
-//   - before each hand-off the pool verifies the container is running,
-//     reachable and has NO stray app-listener processes, recreating it
-//     otherwise (the running test fails as before — no logic retries).
-// ---------------------------------------------------------------
+//   - before each hand-off the pool verifies the container is running, reachable and has NO stray
+//     app-listener processes, recreating it otherwise (the running test fails as before; no logic
+//     retries).
 
 type pooledContainer struct {
 	container testcontainers.Container
 	uses      int
 }
 
-// maxPoolUses caps how many tests share one container: a long-lived
-// container accumulates overlayfs whiteout/dentry-cache state from repeated
-// `rm -rf`+recreate cycles on the same work paths, which eventually degrades
-// the guard's kernel-side path reconstruction (events still enforced, but
-// the reported path may drop components). Rotating the container keeps every
-// test in a fresh overlay while still saving ~90% of the churn.
+// maxPoolUses caps tests per container: a long-lived container accumulates overlayfs
+// whiteout/dentry-cache state from repeated `rm -rf`+recreate on the same paths, degrading the
+// guard's kernel-side path reconstruction (still enforced, but reported paths may drop components).
+// Rotating keeps tests on a fresh overlay while saving ~90% of the churn.
 const maxPoolUses = 12
 
 var pools map[string]*pooledContainer
@@ -93,12 +86,10 @@ func (s *IntegrationSuite) teardownPools() {
 // Domain accessors. Each resets the standard per-domain state so every test
 // starts from a clean slate inside the shared container.
 
-// guardContainer is the pool for guard_test.go: resets the standard guard
-// work directories. Guard logs are self-resetting (startGuardStd truncates
-// them via `>` on every start). A leftover mount on /watch (a failed
-// tmpfs-variant test) is lazily unmounted first — files inside a submount
-// report mount-relative paths in guard events — and any loop bindings from
-// the raw-block-device test are detached (losetup -D).
+// guardContainer is the pool for guard_test.go: resets the standard guard work dirs (guard logs
+// self-reset: startGuardStd truncates on every start). A leftover /watch mount (failed tmpfs test)
+// is lazily unmounted first (submount files report mount-relative paths) and raw-block-device loop
+// bindings are detached (losetup -D).
 func (s *IntegrationSuite) guardContainer() testcontainers.Container {
 	c := s.acquirePool("guard")
 	s.exec(c, []string{"sh", "-c", "mountpoint -q /watch && umount /watch 2>/dev/null; losetup -D 2>/dev/null || true; rm -rf /watch /protected /exploits /ctl /img.ext4; mkdir -p /watch"})
@@ -113,12 +104,10 @@ func (s *IntegrationSuite) monitorContainer() testcontainers.Container {
 	return c
 }
 
-// netguardContainer is the pool for networkguard_test.go, which already
-// shares one container and one delta-parsed log today. The reset clears the
-// inter-test coordination markers (/tmp/go gates the delayed net_tester
-// servers: a stale marker would let a pre-attach server listen before the
-// guard attaches, defeating the pre-attach assertions) and the per-test
-// server logs.
+// netguardContainer is the pool for networkguard_test.go (one container, one delta-parsed log). The
+// reset clears inter-test markers (/tmp/go gates the delayed net_tester servers: a stale marker
+// would let a pre-attach server listen before the guard attaches, defeating the pre-attach
+// assertions) and per-test server logs.
 func (s *IntegrationSuite) netguardContainer() testcontainers.Container {
 	c := s.acquirePool("netguard")
 	s.exec(c, []string{"sh", "-c", "rm -f /tmp/go /tmp/guard.log /tmp/server.log /tmp/delayed.log /tmp/send.log /tmp/recv.log /tmp/resolved.log"})
@@ -136,13 +125,10 @@ func (s *IntegrationSuite) netmonContainer() testcontainers.Container {
 // PID-scoped process lifecycle
 // ---------------------------------------------------------------
 
-// capturePID runs cmd (which must background a process itself) and returns
-// the PID of the backgrounded process via `echo $!`.
-//
-// Docker exec output is a raw multiplexed stream whose 8-byte frame headers
-// can leak into the captured text (the whole suite reads it with
-// garbage-tolerant Contains for this reason), so the PID is extracted from
-// the trailing digit run instead of parsing strictly.
+// capturePID runs cmd (which must background a process itself) and returns the backgrounded PID via
+// `echo $!`. Docker exec output is a multiplexed stream whose 8-byte frame headers can leak into
+// the text (the suite uses garbage-tolerant Contains), so the PID is taken from the trailing digit
+// run.
 func (s *IntegrationSuite) capturePID(c testcontainers.Container, cmd string) int {
 	code, out := s.exec(c, []string{"sh", "-c", cmd + "\necho $!"})
 	s.Require().Equalf(0, code, "starting background process: %s", out)

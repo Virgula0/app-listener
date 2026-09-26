@@ -54,9 +54,8 @@ func tcpServer(port string) {
 	l.Close()
 }
 
-// tcpServerDelayed binds first, then listens once the marker file appears.
-// Used to observe a LISTEN denied by the guard on a socket that was already
-// bound (and therefore allowed) before the guard attached.
+// tcpServerDelayed binds first, then listens once the marker file appears: observes a LISTEN denied
+// by the guard on a socket already bound (allowed) before the guard attached.
 func tcpServerDelayed(port, waitFile string) error {
 	sock, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -205,6 +204,31 @@ func udpClient(host, port string) {
 	conn.Close()
 }
 
+// udpSendTo exfiltrates over an UNCONNECTED UDP socket: ListenPacket + WriteTo issues sendto(2),
+// which never reaches security_socket_connect — only security_socket_sendmsg. A network policy that
+// gates enforcement on the reporting event set therefore lets this through whenever SEND is not in
+// the set, even in whitelist mode.
+func udpSendTo(host, port string) int {
+	var lc net.ListenConfig
+	pc, err := lc.ListenPacket(context.Background(), "udp", ":0")
+	if err != nil {
+		fmt.Printf("listenpacket error: %v\n", err)
+		return 1
+	}
+	defer pc.Close()
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
+	if err != nil {
+		fmt.Printf("resolve error: %v\n", err)
+		return 1
+	}
+	if _, err := pc.WriteTo([]byte("exfiltrated-secret\n"), addr); err != nil {
+		fmt.Printf("sendto error: %v\n", err)
+		return 1
+	}
+	fmt.Println("SENT")
+	return 0
+}
+
 func unixServer(path string) {
 	l, err := (&net.ListenConfig{}).Listen(context.Background(), "unix", path)
 	if err != nil {
@@ -255,6 +279,10 @@ var commands = map[string]func(args []string) int{
 		needArgs(args, 2)
 		udpClient(args[0], args[1])
 		return 0
+	},
+	"udp-sendto": func(args []string) int {
+		needArgs(args, 2)
+		return udpSendTo(args[0], args[1])
 	},
 	"udp-recv-loop": func(args []string) int {
 		needArgs(args, 2)

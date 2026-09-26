@@ -189,13 +189,10 @@ func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	}
 }
 
-// TestBuildxWhitelistedInKubeAndDocker verifies that docker-buildx (the
-// CLI plugin at /usr/lib/docker/cli-plugins) is whitelisted in both the
-// .kube and .docker entries: buildx reads ~/.kube/config for its
-// kubernetes driver and ~/.docker/config.json plus the buildx store
-// (buildx/.lock, instance state) for its own bookkeeping. Without these
-// entries, every docker buildx invocation is denied while the dirs are
-// guarded.
+// docker-buildx (CLI plugin at /usr/lib/docker/cli-plugins) must be whitelisted in both .kube and
+// .docker entries: it reads ~/.kube/config (kubernetes driver) and ~/.docker/config.json plus the
+// buildx store (buildx/.lock, instance state). Otherwise every docker buildx invocation is denied
+// while the dirs are guarded.
 func TestBuildxWhitelistedInKubeAndDocker(t *testing.T) {
 	const buildx = "/usr/lib/docker/cli-plugins/docker-buildx"
 	seen := map[string]bool{}
@@ -567,18 +564,12 @@ func TestDiscordNarrowedWatches(t *testing.T) {
 	}
 }
 
-// TestExtraWatchPathsForSkipsMissing is the regression test for a daemon
-// startup crash: a fresh Discord install only creates some of the catalog's
-// WatchRelPaths sub-directories (e.g. "IndexedDB" may not exist yet), and
-// ExtraWatchPathsFor used to return every one of them unconditionally. The
-// generated config then declared a `watch:` path that never resolves, and
-// the daemon's ResolvePendingPaths pass (daemonconfig.go) treats a grouped
-// watch path still missing after its encryption root is available as a
-// fatal error — by design, per ResolvePendingPaths' doc comment, "silently
-// dropping it would leave a declared-protected directory unguarded". A
-// non-existent sub-path must therefore never reach the generated config in
-// the first place, exactly like a plain (non-grouped) RelPaths candidate
-// that Discover simply does not propose when missing.
+// Regression for a daemon startup crash: a fresh Discord install creates only some WatchRelPaths
+// (e.g. "IndexedDB" may be missing) and ExtraWatchPathsFor returned all unconditionally. The config
+// then declared a `watch:` that never resolves, and ResolvePendingPaths (daemonconfig.go) treats a
+// grouped watch path missing after unlock as fatal by design ("silently dropping it would leave a
+// declared-protected directory unguarded"). A missing sub-path must never reach the generated
+// config, like a plain RelPaths candidate Discover doesn't propose.
 func TestExtraWatchPathsForSkipsMissing(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".config", "discord")
@@ -599,5 +590,141 @@ func TestExtraWatchPathsForSkipsMissing(t *testing.T) {
 	want := []string{existing}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("ExtraWatchPathsFor = %v, want %v (missing sub-paths must be dropped)", got, want)
+	}
+}
+
+// TestExpandLibDirWritersGlob verifies that a lib-dir writer pattern is
+// matched against the filesystem and that only REAL executables survive:
+// globbing a whole helper directory (the intended use, since a runtime's tool
+// set grows with every update) also matches subdirectories, and a directory
+// inode can never be a process's exe.
+func TestExpandLibDirWritersGlob(t *testing.T) {
+	home := t.TempDir()
+	toolDir := filepath.Join(home, "runtime", "libexec", "steam-runtime-tools-0")
+	if err := os.MkdirAll(filepath.Join(toolDir, "shaders"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	tool := filepath.Join(toolDir, "x86_64-linux-gnu-capsule-capture-libs")
+	if err := os.WriteFile(tool, []byte("ELF"), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	entry := CandidateDir{LibDirWriters: []string{
+		"%HOME%/runtime/libexec/steam-runtime-tools-0/*",
+		"%HOME%/runtime/does-not-exist",
+	}}
+	got := entry.ExpandLibDirWriters("alice", home)
+	if len(got) != 1 || got[0] != tool {
+		t.Errorf("ExpandLibDirWriters = %v, want exactly [%s] "+
+			"(the 'shaders' directory and the missing path must be dropped)", got, tool)
+	}
+}
+
+// TestSteamLibDirWritersCoverItsOwnBinaries: in the [libraries] block form a
+// lib_dir inherits no whitelist, so every Steam binary that writes state
+// beside itself inside a runtime tree must be an explicit writer. Missing
+// steamwebhelper (CEF's .cef-initialize-sentinel in ubuntu12_64) stopped Steam
+// from starting at all.
+func TestSteamLibDirWritersCoverItsOwnBinaries(t *testing.T) {
+	var steam *CandidateDir
+	for i := range Catalog {
+		if Catalog[i].Name == "Steam" {
+			steam = &Catalog[i]
+		}
+	}
+	if steam == nil {
+		t.Fatal("no Steam catalog entry")
+	}
+	home := t.TempDir()
+	var want []string
+	for _, rel := range []string{
+		".local/share/Steam/ubuntu12_32/steam",
+		".local/share/Steam/ubuntu12_64/steamwebhelper",
+		".local/share/Steam/ubuntu12_64/gameoverlayui",
+	} {
+		p := filepath.Join(home, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, p)
+	}
+	got := strings.Join(steam.ExpandLibDirWriters("alice", home), "\n")
+	for _, w := range want {
+		if !strings.Contains(got, w) {
+			t.Errorf("Steam lib_binary writers miss %s; got:\n%s", w, got)
+		}
+	}
+}
+
+// TestSteamLibDirsExcludeScoutRuntime: the legacy scout runtime
+// ("SteamLinuxRuntime", no suffix) holds no whitelisted program, only
+// libraries for native games that are never trust-checked, and its entry
+// point must create symlinks under var/ on every launch. Guarding it made
+// native scout games exit instantly; the container runtimes stay guarded.
+func TestSteamLibDirsExcludeScoutRuntime(t *testing.T) {
+	var steam *CandidateDir
+	for i := range Catalog {
+		if Catalog[i].Name == "Steam" {
+			steam = &Catalog[i]
+		}
+	}
+	if steam == nil {
+		t.Fatal("no Steam catalog entry")
+	}
+	home := t.TempDir()
+	common := filepath.Join(home, ".local/share/Steam/steamapps/common")
+	for _, d := range []string{"SteamLinuxRuntime", "SteamLinuxRuntime_soldier", "SteamLinuxRuntime_sniper", "SteamLinuxRuntime_4"} {
+		if err := os.MkdirAll(filepath.Join(common, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := map[string]bool{}
+	for _, d := range steam.ExpandLibDirs("alice", home) {
+		got[d] = true
+	}
+	if got[filepath.Join(common, "SteamLinuxRuntime")] {
+		t.Errorf("the scout runtime must not be a lib_dir")
+	}
+	for _, d := range []string{"SteamLinuxRuntime_soldier", "SteamLinuxRuntime_sniper", "SteamLinuxRuntime_4"} {
+		if !got[filepath.Join(common, d)] {
+			t.Errorf("container runtime %s must stay a lib_dir", d)
+		}
+	}
+}
+
+// TestSteamLibDirsCoverProtonCodeOnly: Valve Proton's code (files/lib) is a
+// lib_dir — its whitelisted wine64-preloader loads Wine from there — but the
+// Proton root is not, because the proton script (python3) rewrites dist.lock
+// there on every launch. linux32 is covered for the overlay's steamclient.so.
+func TestSteamLibDirsCoverProtonCodeOnly(t *testing.T) {
+	var steam *CandidateDir
+	for i := range Catalog {
+		if Catalog[i].Name == "Steam" {
+			steam = &Catalog[i]
+		}
+	}
+	home := t.TempDir()
+	steamDir := filepath.Join(home, ".local/share/Steam")
+	proton := filepath.Join(steamDir, "steamapps/common/Proton 11.0")
+	for _, d := range []string{filepath.Join(proton, "files/lib"), filepath.Join(proton, "files/share"), filepath.Join(steamDir, "linux32")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := map[string]bool{}
+	for _, d := range steam.ExpandLibDirs("alice", home) {
+		got[d] = true
+	}
+	if !got[filepath.Join(proton, "files/lib")] {
+		t.Errorf("Proton's files/lib must be a lib_dir")
+	}
+	if got[proton] || got[filepath.Join(proton, "files")] {
+		t.Errorf("the Proton root must not be guarded: the proton script writes dist.lock there on every launch")
+	}
+	if !got[filepath.Join(steamDir, "linux32")] {
+		t.Errorf("linux32 must be a lib_dir (the overlay loads linux32/steamclient.so)")
 	}
 }

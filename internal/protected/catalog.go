@@ -8,19 +8,16 @@ import (
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 )
 
-// vaultKeyCheck is the subset of *fscrypt.Vault needed for the key
-// verification step; an interface keeps this package decoupled and
-// headlessly testable.
+// vaultKeyCheck is the subset of *fscrypt.Vault needed for key verification; an interface keeps the
+// package decoupled and headlessly testable.
 type vaultKeyCheck interface {
 	IsEncrypted(path string) (bool, error)
 	VerifyKey(path string) error
 }
 
-// VerifyEncryptedKeys checks the master key against every encrypted
-// directory. A directory that does not unlock with the master key is a
-// fatal error: removing the daemon (and possibly the key with
-// --delete-key) would lock that directory forever since no usable key
-// remains.
+// VerifyEncryptedKeys checks the master key against every encrypted directory. One that doesn't
+// unlock is fatal: removing the daemon (and possibly the key via --delete-key) would lock it
+// forever.
 func VerifyEncryptedKeys(vault vaultKeyCheck, encrypted []string) error {
 	for _, path := range encrypted {
 		log.Infof("verifying master key against %s ...", path)

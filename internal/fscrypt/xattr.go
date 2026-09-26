@@ -1,6 +1,6 @@
-// Xattr preservation for in-place migrations: copying between plaintext and
-// encrypted copies would drop SELinux labels, file capabilities and user.*
-// xattrs. Best-effort: failed reads/writes are logged and skipped, not fatal.
+// Xattr preservation for in-place migrations: copying between plaintext and encrypted copies would
+// drop SELinux labels, file capabilities and user.* xattrs. Best-effort: failed reads/writes are
+// logged and skipped.
 package fscrypt
 
 import (

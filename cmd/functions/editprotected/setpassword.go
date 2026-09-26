@@ -6,18 +6,38 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/protected"
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
-// runSetPassword sets a first edit-protected password or rotates a
-// cli-managed one. A password chosen during `app-listener install` cannot be
-// rotated here (the installer owns it) — that is refused with a clear
-// pointer.
+// authorizeFirstTimeSetPassword gates creating the FIRST edit-protected password (the transition
+// from "no password" to "live mode armed"). The daemon self-guards edit-auth.hash so no non-daemon
+// binary can write it, but that check is per-binary, not per-caller: `edit-protected --set-password`
+// IS the daemon binary, so absent this gate any root process could arm live mode on a running
+// production daemon (whose vaults are unlocked) with no interaction and no proof of ownership, then
+// read every protected resource through the control socket. The audited bootstrap for the first
+// password is `install`; refuse the first-time CLI set while the daemon is running and point there.
+// Offline (daemon stopped, vaults locked) it is allowed: that flow already requires stopping the
+// daemon, which a legitimate operator can do and a remote attacker cannot silently.
+func authorizeFirstTimeSetPassword(daemonRunning bool) error {
+	if daemonRunning {
+		return errors.New("refusing to set the first edit-protected password while the daemon is running: " +
+			"the first password is created by `sudo app-listener install` (the audited bootstrap). " +
+			"Either run the installer, or stop the daemon first (systemctl stop app-listener-daemon) to set it offline")
+	}
+	return nil
+}
+
+// runSetPassword sets a first edit-protected password or rotates a cli-managed one. A password
+// chosen during `install` is owned by the installer and refused here with a pointer.
 func runSetPassword() error {
 	encoded, err := LoadHashFile()
 	switch {
 	case errors.Is(err, ErrNoHashFile):
-		// First-time set.
+		// First-time set: arming live edit-protected on a resource that had no password.
+		if aErr := authorizeFirstTimeSetPassword(protected.DaemonRunning()); aErr != nil {
+			return aErr
+		}
 	case err != nil:
 		return err
 	default:
@@ -108,9 +128,9 @@ func PromptNewPassword() (string, error) {
 	return first, nil
 }
 
-// reloadDaemonForPasswordChange asks a running daemon to reconcile its
-// control socket with the new password state (SIGHUP; the reload handler
-// calls control.refresh). A stopped daemon picks it up on next start.
+// reloadDaemonForPasswordChange asks a running daemon (SIGHUP; the reload handler calls
+// control.refresh) to reconcile its control socket with the new password state. A stopped daemon
+// picks it up on next start.
 func reloadDaemonForPasswordChange() error {
 	if !systemd.IsDaemonActive() {
 		return nil

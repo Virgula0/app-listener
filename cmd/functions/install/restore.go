@@ -10,16 +10,11 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// restoreBackups undoes the fscrypt migration: the found
-// .app_listener.backup directories are shown in a TUI list (all
-// preselected) and, after a single confirmation, the encrypted copies are
-// deleted and the backups moved back to the original locations. It aborts
-// when the daemon is running — restoring while the daemon is active would
-// let it keep unlocking and using the very directories being deleted, and
-// leaves daemon.conf declaring need_encryption: true for a resource that no
-// longer has a policy at all (see issue #53). RequireDaemonStopped (not the
-// bare DaemonRunning systemd check) also catches a daemon started manually
-// outside systemd.
+// restoreBackups undoes the fscrypt migration: the found .app_listener.backup dirs are listed (all
+// preselected) and, after one confirmation, the encrypted copies are deleted and backups moved
+// back. Aborts while the daemon runs: it would keep using the directories being deleted and leave
+// daemon.conf declaring need_encryption: true for a resource with no policy (issue #53).
+// RequireDaemonStopped (not the bare systemd check) also catches a manually started daemon.
 func restoreBackups() error {
 	if err := protected.RequireDaemonStopped(); err != nil {
 		return err
@@ -57,13 +52,10 @@ func restoreBackups() error {
 	return nil
 }
 
-// deletePostBackups deletes every found .app_listener.backup: the backups
-// are shown in a TUI list (all preselected) and, after a single
-// confirmation, removed with a TUI progress bar showing the progress. It
-// aborts when the daemon is running, exactly like restoreBackups: a backup
-// is the only way to recover a resource the daemon might still be relying
-// on (e.g. a crashed unlock), so it must never be deleted out from under a
-// live daemon.
+// deletePostBackups deletes every found .app_listener.backup: listed (all preselected), one
+// confirmation, then removed under a TUI progress bar. Aborts while the daemon runs, like
+// restoreBackups: a backup is the only recovery for a resource the daemon may still rely on (e.g. a
+// crashed unlock), so never delete it under a live daemon.
 func deletePostBackups() error {
 	if err := protected.RequireDaemonStopped(); err != nil {
 		return err

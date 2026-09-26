@@ -98,12 +98,9 @@ func TestAwaitStartupOrSignalAbortWithFailedStartup(t *testing.T) {
 	}
 }
 
-// TestLoadDaemonConfigMissingFileIsCriticalStartup verifies that every
-// loadDaemonConfig failure wraps constants.ErrCriticalStartup: a config file
-// that fails to resolve, parse, or declare any [watch] section will fail the
-// exact same way on every future restart, so main.go must exit with the
-// non-retryable status instead of letting systemd's Restart=on-failure
-// crash-loop the daemon every RestartSec forever.
+// Every loadDaemonConfig failure must wrap constants.ErrCriticalStartup: a config that fails to
+// resolve, parse or declare a [watch] section fails identically on every restart, so main.go must
+// exit non-retryable instead of letting Restart=on-failure crash-loop.
 func TestLoadDaemonConfigMissingFileIsCriticalStartup(t *testing.T) {
 	prevConfigFlag := configFlag
 	defer func() { configFlag = prevConfigFlag }()
