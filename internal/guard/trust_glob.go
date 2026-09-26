@@ -19,7 +19,7 @@ const (
 	globPrefix   uint8 = 2
 	globSuffix   uint8 = 3
 	globNameMax        = 32
-	globAffixMax       = 8
+	globAffixMax       = 16 // must equal GLOB_AFFIX_MAX in guard_trust.bpf.c (array size + unrolled scan)
 	globMaxBits        = 64
 )
 

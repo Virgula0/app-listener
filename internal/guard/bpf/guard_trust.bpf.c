@@ -136,7 +136,7 @@ struct {
 #define GLOB_EXACT 1
 #define GLOB_PREFIX 2
 #define GLOB_SUFFIX 3
-#define GLOB_AFFIX_MAX 8
+#define GLOB_AFFIX_MAX 16
 
 struct glob_name_key {
 	__u8 kind;
