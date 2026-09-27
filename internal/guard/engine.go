@@ -53,9 +53,9 @@ type engine struct {
 	// leave the kept resource with no inode row while its old guard is still attached (fail open).
 	prevOwner map[GuardInodeKey]uint32
 	refs      int
-	rd      *ringbuf.Reader
-	done    chan struct{}
-	started bool
+	rd        *ringbuf.Reader
+	done      chan struct{}
+	started   bool
 
 	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
 	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).

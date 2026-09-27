@@ -310,22 +310,13 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	entries := make([]BinaryEntry, len(binaries))
 	copy(entries, binaries)
 
-	canonical := make(map[string]string, len(entries))
-	for _, b := range entries {
-		resolved, err := filepath.EvalSymlinks(b.Path)
-		if err != nil {
-			resolved = b.Path // unresolvable now (stays equal, fail-closed)
-		}
-		canonical[b.Path] = resolved
-	}
-
 	g := &Guard{
 		events:         make(chan GuardEvent, 1024),
 		done:           make(chan struct{}),
 		path:           path,
 		mode:           mode,
 		binaries:       entries,
-		canonicalPaths: canonical,
+		canonicalPaths: canonicalPaths(entries),
 		recursive:      recursive,
 		depth:          depth,
 		deployed:       make(map[string]GuardInodeKey),
@@ -349,6 +340,33 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		return nil, fmt.Errorf("populating BPF maps: %w", err)
 	}
 
+	for _, step := range g.startSteps() {
+		if err := step(); err != nil {
+			g.cleanup()
+			return nil, err
+		}
+	}
+
+	g.pinSelfMaps()
+
+	log.Infof("guard created \u2014 resource %d watching: %s (%s)", g.resID, path, modeString(mode))
+	return g, nil
+}
+
+func canonicalPaths(entries []BinaryEntry) map[string]string {
+	canonical := make(map[string]string, len(entries))
+	for _, b := range entries {
+		resolved, err := filepath.EvalSymlinks(b.Path)
+		if err != nil {
+			resolved = b.Path // unresolvable now (stays equal, fail-closed)
+		}
+		canonical[b.Path] = resolved
+	}
+	return canonical
+}
+
+// startSteps is NewGuard's activate / claim-root / populate sequence for this guard.
+func (g *Guard) startSteps() []func() error {
 	claimRoot := func() error {
 		// populateMaps recorded the root ANCHOR (guard_config[3..4]) but not its guard_inodes row.
 		if err := g.addInode(g.path); err != nil {
@@ -377,24 +395,13 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	// once the slot is live and the root is claimed, the guard's own file_open hook denies the
 	// populating walk (WithEagerPopulate), so it must claim+walk BEFORE activating. That is safe
 	// because such guards never reload — no live prior owner exists to displace into the inactive slot.
-	steps := []func() error{activate, claimRoot}
 	switch {
 	case g.eagerPopulate && g.selfBinary == nil:
-		steps = []func() error{claimRoot, populate, activate}
+		return []func() error{claimRoot, populate, activate}
 	case g.eagerPopulate:
-		steps = []func() error{activate, claimRoot, populate}
+		return []func() error{activate, claimRoot, populate}
 	}
-	for _, step := range steps {
-		if err := step(); err != nil {
-			g.cleanup()
-			return nil, err
-		}
-	}
-
-	g.pinSelfMaps()
-
-	log.Infof("guard created \u2014 resource %d watching: %s (%s)", g.resID, path, modeString(mode))
-	return g, nil
+	return []func() error{activate, claimRoot}
 }
 
 // objs is the shared engine's loaded BPF objects; every Guard keys into them by resID.
