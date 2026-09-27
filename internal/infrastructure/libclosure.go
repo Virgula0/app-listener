@@ -19,19 +19,21 @@ import (
 // the file AND its parent directory must be owned by root (uid 0) and not writable by group (unless
 // the group is root) or other. A user-writable parent lets its owner replace even a root-owned file
 // by unlink+create, so both levels are checked — the same rule as guard_trust.bpf.c's
-// is_system_trusted + mount_vouches_ownership. Symlinks are resolved by the caller (resolveSoname),
-// so path is a real file.
+// is_system_trusted + mount_vouches_ownership. Symlinks are resolved first so the parent checked is
+// the real file's, as in the kernel.
 func rootOwnedSafe(path string) error {
-	if err := mountVouchesOwnership(path); err != nil {
-		return err
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("cannot resolve %s: %w", path, err)
 	}
+	path = resolved
 	if err := rootOwnedInode(path); err != nil {
 		return err
 	}
 	if err := rootOwnedInode(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("parent %s", err)
 	}
-	return nil
+	return mountVouchesOwnership(path)
 }
 
 // SystemTrusted reports whether path passes rootOwnedSafe: a non-root user can't replace it.
@@ -40,11 +42,15 @@ func SystemTrusted(path string) bool {
 }
 
 // mountVouchesOwnership rejects nosuid and FUSE mounts: a user-mounted image or FUSE server can
-// present any file as root-owned.
+// present any file as root-owned. Judged in pid 1's mount namespace: the unit's own is all nosuid.
 func mountVouchesOwnership(path string) error {
+	host, err := hostView(path)
+	if err != nil {
+		return err
+	}
 	var fs unix.Statfs_t
-	if err := unix.Statfs(path, &fs); err != nil {
-		return fmt.Errorf("cannot statfs %s: %w", path, err)
+	if err := unix.Statfs(host, &fs); err != nil {
+		return fmt.Errorf("cannot statfs %s: %w", host, err)
 	}
 	if fs.Type == unix.FUSE_SUPER_MAGIC {
 		return fmt.Errorf("%s is on a FUSE filesystem", path)
@@ -53,6 +59,15 @@ func mountVouchesOwnership(path string) error {
 		return fmt.Errorf("%s is on a nosuid mount", path)
 	}
 	return nil
+}
+
+// hostView is path as seen from pid 1's root. path must be absolute and symlink-free: an absolute
+// symlink met under /proc/1/root resolves against the caller's root, not pid 1's.
+func hostView(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("%s is not an absolute path", path)
+	}
+	return "/proc/1/root" + filepath.Clean(path), nil
 }
 
 func rootOwnedInode(path string) error {

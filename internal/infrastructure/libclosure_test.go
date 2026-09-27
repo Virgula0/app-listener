@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestResolveLibraryClosure(t *testing.T) {
@@ -23,6 +25,7 @@ func TestResolveLibraryClosure(t *testing.T) {
 	if bin == "" {
 		t.Skip("no known dynamic binary available")
 	}
+	skipWithoutHostRoot(t)
 
 	closure, err := ResolveLibraryClosure(bin)
 	if err != nil {
@@ -154,4 +157,76 @@ func TestLibraryClosureRejectsOversizedInterp(t *testing.T) {
 		}
 	}()
 	_, _, _ = LibraryClosure(bin)
+}
+
+func skipWithoutHostRoot(t *testing.T) {
+	t.Helper()
+	var fs unix.Statfs_t
+	if err := unix.Statfs("/proc/1/root/", &fs); err != nil {
+		t.Skipf("pid 1's root not readable (needs root): %v", err)
+	}
+}
+
+func TestHostView(t *testing.T) {
+	for in, want := range map[string]string{
+		"/usr/lib/libc.so.6":   "/proc/1/root/usr/lib/libc.so.6",
+		"/usr/lib/../lib/x.so": "/proc/1/root/usr/lib/x.so",
+		"/":                    "/proc/1/root/",
+		"//usr//lib/./libm.so": "/proc/1/root/usr/lib/libm.so",
+	} {
+		if got, err := hostView(in); err != nil || got != want {
+			t.Errorf("hostView(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "usr/lib/libc.so.6", "../etc/shadow"} {
+		if got, err := hostView(in); err == nil {
+			t.Errorf("hostView(%q) = %q; want an error for a relative path", in, got)
+		}
+	}
+}
+
+// Runs on a thread whose own mount namespace has / remounted nosuid, like the unit's
+// (PrivateTmp/ProtectSystem): pid 1's suid / must still vouch.
+func TestMountVouchesOwnershipJudgesHostNamespace(t *testing.T) {
+	skipWithoutHostRoot(t)
+	var host unix.Statfs_t
+	if err := unix.Statfs("/proc/1/root/", &host); err != nil {
+		t.Fatal(err)
+	}
+	if host.Flags&unix.ST_NOSUID != 0 || host.Type == unix.FUSE_SUPER_MAGIC {
+		t.Skip("pid 1's / is itself nosuid or FUSE")
+	}
+	type result struct {
+		err  error
+		skip string
+	}
+	done := make(chan result)
+	go func() {
+		runtime.LockOSThread() // never unlocked: the thread and its namespace die with the goroutine
+		if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+			done <- result{skip: "unshare(CLONE_NEWNS): " + err.Error()}
+			return
+		}
+		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+			done <- result{skip: "making / private: " + err.Error()}
+			return
+		}
+		if err := unix.Mount("", "/", "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_NOSUID, ""); err != nil {
+			done <- result{skip: "remounting / nosuid: " + err.Error()}
+			return
+		}
+		var own unix.Statfs_t
+		if err := unix.Statfs("/", &own); err != nil || own.Flags&unix.ST_NOSUID == 0 {
+			done <- result{skip: "this thread's / did not become nosuid"}
+			return
+		}
+		done <- result{err: mountVouchesOwnership("/")}
+	}()
+	r := <-done
+	if r.skip != "" {
+		t.Skip(r.skip)
+	}
+	if r.err != nil {
+		t.Fatalf("mountVouchesOwnership(/) = %v from a nosuid namespace; pid 1's / is suid", r.err)
+	}
 }

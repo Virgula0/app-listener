@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -52,9 +53,13 @@ func TestResolveLibraryClosureRejectsUserWritableOriginDir(t *testing.T) {
 		t.Skipf("cannot build binary with $ORIGIN rpath: %v: %s", cerr, out)
 	}
 
-	closure, rerr := ResolveLibraryClosure(appBin)
+	closure, refused, rerr := LibraryClosure(appBin)
 	if rerr != nil {
-		t.Fatalf("ResolveLibraryClosure(%s): %v", appBin, rerr)
+		t.Fatalf("LibraryClosure(%s): %v", appBin, rerr)
+	}
+	// Ownership is judged before the mount, so this holds without root (no /proc/1/root).
+	if why := refused[rogueLib]; why == nil || !strings.Contains(why.Error(), "not root-owned") {
+		t.Errorf("rogue library refused for %v; want its user ownership", why)
 	}
 
 	if slices.Contains(closure, rogueLib) {
