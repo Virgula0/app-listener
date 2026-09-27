@@ -13,7 +13,8 @@
 //     - a root-owned file in a root-only-writable directory on a non-nosuid mount (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
 //     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
 //     - a #3 reserved name below its root, mapped by one of that name's writers (glob_lib_trusted).
-//   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused.
+//   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused. A process that
+//   mapped such code before its exe was whitelisted is refused the secrets (trust_code_suspect).
 //   #3 reserved glob names: the catalog refresh turns whitelist globs with user-writable wildcard
 //     dirs (Steam's common/*/files/bin/wineserver) into trust grants, so only the entry's own
 //     binaries may bind a name such a glob fixes anywhere below its fixed root (see glob_denied).
@@ -56,6 +57,7 @@
 #define TRUST_LIBLOAD 0    // a whitelisted binary mapped an untrusted library
 #define TRUST_WRITEBLOCK 1 // a non-app tried to modify a protected binary
 #define TRUST_PLANT 2      // a non-writer tried to bind a reserved glob name
+#define TRUST_SUSPECT 3    // a code-suspect process of a whitelisted exe opened a guarded file
 
 struct inode_key {
 	__u64 dev;
@@ -234,6 +236,19 @@ struct {
 	__type(key, struct inode_key);
 	__type(value, struct bin_origin);
 } guard_bin_origin SEC(".maps");
+
+// trust_code_suspect: tgids that exec-mapped code trust_mmap would refuse a whitelisted binary,
+// while their exe was not TRUSTED_BINARY. trust_mmap judges only new mappings, so a process that
+// preloaded code before a reload whitelisted its exe would otherwise keep it and read the secrets;
+// trust_file_open refuses it every regular file below a whitelist-mode guarded root until it execs.
+// Inherited across fork, cleared on exec and on leader exit (guard_tainted_pids' lifecycle). A
+// mark that can't be recorded refuses the mapping (fail closed).
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, __u32);
+	__type(value, __u8);
+} trust_code_suspect SEC(".maps");
 
 struct trust_event {
 	__u32 pid;
@@ -798,11 +813,48 @@ static __always_inline int deny_plant(struct dentry *dentry)
 	return -EPERM;
 }
 
+static __always_inline int mark_code_suspect(void)
+{
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 one = 1;
+	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &one, BPF_ANY))
+		return -EPERM;
+	return 0;
+}
+
+// under_secret_root: the innermost guarded root at or above dentry is whitelist-mode (a read-only
+// lib_dir holds world-readable code, not secrets). Nested roots are refused at config load.
+static __always_inline int under_secret_root(struct dentry *dentry)
+{
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+	struct inode_key k = {};
+	if (!fill_inode_key(inode, &k))
+		return 0;
+	struct dentry *d = dentry;
+	for (int i = 0; i < 32; i++) {
+		struct inode *di = NULL;
+		bpf_probe_read_kernel(&di, sizeof(di), &d->d_inode);
+		if (di) {
+			bpf_probe_read_kernel(&k.ino, sizeof(k.ino), &di->i_ino);
+			__u64 *users = bpf_map_lookup_elem(&guard_trusted_dirs, &k);
+			if (users)
+				return (*users & TRUSTED_DIR_ANY) != 0;
+		}
+		struct dentry *parent = NULL;
+		bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
+		if (!parent || parent == d)
+			break;
+		d = parent;
+	}
+	return 0;
+}
+
 // #2 library load allowlist: a whitelisted binary may map executable code only from a trusted
 // library (allow_lib), an auto-trusted system file (root-owned, root-only-writable dir), a guarded
 // tree, its own JIT output or one of its app's reserved library names. An
-// untrusted exec-map is the shape of an LD_PRELOAD/dlopen of attacker code: always logged, denied
-// when enforce_libs is set.
+// untrusted exec-map is the shape of an LD_PRELOAD/dlopen of attacker code: logged and denied. Any
+// other process mapping such code is marked code-suspect instead (trust_code_suspect).
 SEC("lsm/mmap_file")
 int trust_mmap(unsigned long long *ctx)
 {
@@ -812,14 +864,16 @@ int trust_mmap(unsigned long long *ctx)
 		return 0;
 	if (!(prot & PROT_EXEC))
 		return 0;
-	if (!(current_exe_flags() & TRUSTED_BINARY))
-		return 0; // only whitelisted-application processes are subject to it
 
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 	__u8 flags = trusted_flags_of(inode);
 	if (flags & (TRUSTED_LIB | TRUSTED_BINARY))
 		return 0; // explicitly trusted (or the binary re-mapping itself)
+	struct inode *exe = current_exe_inode();
+	int exe_trusted = trusted_flags_of(exe) & TRUSTED_BINARY;
+	if (!exe_trusted && inode == exe)
+		return 0; // a not-yet-whitelisted process's own image is its identity, not injected code
 
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
@@ -832,6 +886,8 @@ int trust_mmap(unsigned long long *ctx)
 	if (glob_lib_trusted(dentry))
 		return 0; // reserved name below its root: only this app's binaries could write it
 
+	if (!exe_trusted)
+		return mark_code_suspect();
 	emit(dentry, TRUST_LIBLOAD);
 	return -EPERM;
 }
@@ -983,12 +1039,20 @@ int trust_file_open(unsigned long long *ctx)
 		origin_taint_foreign(inode);
 	}
 
-	if (!(f_mode & FMODE_WRITE))
-		return 0; // only a write-open can modify the binary in place
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
 	if (!dentry)
 		return 0;
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	if (bpf_map_lookup_elem(&trust_code_suspect, &tgid) && !dentry_is_dir(dentry) &&
+	    under_secret_root(dentry)) {
+		if (current_exe_flags() & TRUSTED_BINARY)
+			emit(dentry, TRUST_SUSPECT); // a non-whitelisted exe is the guard's to report
+		return -EPERM;
+	}
+
+	if (!(f_mode & FMODE_WRITE))
+		return 0; // only a write-open can modify the binary in place
 	int r = deny_if_protected(inode, dentry);
 	if (r)
 		return r;
@@ -1073,5 +1137,49 @@ int trust_path_truncate(unsigned long long *ctx)
 	if (glob_denied(dentry_parent(dentry), dentry))
 		return deny_plant(dentry);
 	origin_taint_foreign(inode);
+	return 0;
+}
+
+// Code-suspect lifecycle (trust_code_suspect). Fork: the child shares the mapped code. At
+// sched_process_fork, not task_alloc: the child's tgid is assigned after security_task_alloc.
+SEC("tp_btf/sched_process_fork")
+int trust_sched_process_fork(unsigned long long *ctx)
+{
+	struct task_struct *parent = (struct task_struct *)ctx[0];
+	struct task_struct *child = (struct task_struct *)ctx[1];
+	if (!parent || !child)
+		return 0;
+	__u32 ptgid = 0, ctgid = 0;
+	bpf_probe_read_kernel(&ptgid, sizeof(ptgid), &parent->tgid);
+	if (!bpf_map_lookup_elem(&trust_code_suspect, &ptgid))
+		return 0;
+	bpf_probe_read_kernel(&ctgid, sizeof(ctgid), &child->tgid);
+	__u8 one = 1;
+	bpf_map_update_elem(&trust_code_suspect, &ctgid, &one, BPF_ANY);
+	return 0;
+}
+
+// Exec replaces every mapping; runs before the new image's segments and libraries are mapped, so
+// those are judged afresh by trust_mmap.
+SEC("lsm/bprm_committed_creds")
+int trust_bprm_committed(unsigned long long *ctx)
+{
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	bpf_map_delete_elem(&trust_code_suspect, &tgid);
+	return 0;
+}
+
+// Keyed by tgid: clear only when the group leader exits, so a reused pid starts clean.
+SEC("lsm/task_free")
+int trust_task_free(unsigned long long *ctx)
+{
+	struct task_struct *task = (struct task_struct *)ctx[0];
+	if (!task)
+		return 0;
+	__u32 pid = 0, tgid = 0;
+	bpf_probe_read_kernel(&pid, sizeof(pid), &task->pid);
+	bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
+	if (pid == tgid)
+		bpf_map_delete_elem(&trust_code_suspect, &tgid);
 	return 0;
 }

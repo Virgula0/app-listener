@@ -32,6 +32,7 @@ const (
 	trustLibload    uint32 = 0
 	trustWriteblock uint32 = 1
 	trustPlant      uint32 = 2
+	trustSuspect    uint32 = 3
 )
 
 // TrustGuard owns guard_trusted_files and the daemon-wide trusted-binary/library protections
@@ -207,11 +208,16 @@ func (t *TrustGuard) hooks() []trustHook {
 		{t.objs.TrustPathMkdir, "path_mkdir", false},
 		{t.objs.TrustPathSymlink, "path_symlink", false},
 		{t.objs.TrustPathLink, "path_link", false},
+		// The code-suspect lifecycle (trust_code_suspect). bprm_committed_creds and task_free clear
+		// marks; without them marks go stale. Required together with the fork tracepoint
+		// (attachSuspectFork), or a suspect process's children would escape the mark.
+		{t.objs.TrustBprmCommitted, "bprm_committed_creds", true},
+		{t.objs.TrustTaskFree, "task_free", true},
 	}
 }
 
-// Start attaches every trust LSM program and drains events. A required hook (mmap_file) that cannot
-// attach fails the start; other hooks are best-effort. It never blocks the per-resource guards.
+// Start attaches every trust program and drains events. A required hook (mmap_file, the
+// code-suspect lifecycle) that cannot attach fails the start; other hooks are best-effort. It never blocks the per-resource guards.
 func (t *TrustGuard) Start() error {
 	for _, h := range t.hooks() {
 		l, err := link.AttachLSM(link.LSMOptions{Program: h.prog})
@@ -230,6 +236,10 @@ func (t *TrustGuard) Start() error {
 	if len(t.links) == 0 {
 		return errors.New("no trust programs attached")
 	}
+	if err := t.attachSuspectFork(); err != nil {
+		t.detachLinks()
+		return err
+	}
 	t.attachMemfdProvenance()
 
 	rd, err := ringbuf.NewReader(t.objs.TrustRb)
@@ -241,10 +251,26 @@ func (t *TrustGuard) Start() error {
 	return nil
 }
 
-// attachMemfdProvenance attaches the one non-LSM trust program: an fexit on the kernel's memfd
-// allocation, recording that a whitelisted process created this anonymous inode (trust_memfd_alloc
-// in guard_trust.bpf.c). A memfd never reaches security_file_open, so without it the first step of
-// a GPU driver's JIT fallback chain has no provenance.
+// attachSuspectFork attaches the fork tracepoint that carries a code-suspect mark to the child,
+// which shares the parent's mapped code. Required: without it a suspect process escapes the mark
+// by forking.
+func (t *TrustGuard) attachSuspectFork() error {
+	l, err := link.AttachTracing(link.TracingOptions{
+		Program:    t.objs.TrustSchedProcessFork,
+		AttachType: cilium.AttachTraceRawTp,
+	})
+	if err != nil {
+		return fmt.Errorf("required trust hook sched_process_fork failed to attach: %w — code "+
+			"preloaded before a binary was whitelisted would survive a fork", err)
+	}
+	t.links = append(t.links, l)
+	return nil
+}
+
+// attachMemfdProvenance attaches an fexit on the kernel's memfd allocation, recording that a
+// whitelisted process created this anonymous inode (trust_memfd_alloc in guard_trust.bpf.c). A
+// memfd never reaches security_file_open, so without it the first step of a GPU driver's JIT
+// fallback chain has no provenance.
 //
 // Best-effort and fail-closed: without the record a memfd exec-map stays denied and the driver
 // falls through to O_TMPFILE/mkstemp, which file_open sees.
@@ -283,6 +309,9 @@ func (t *TrustGuard) readLoop() {
 		case trustPlant:
 			logTrustDenied("PLANT", comm, ev.PID, ev.UID, path,
 				"only the owning app's binaries may create or modify a file a catalog glob reserves")
+		case trustSuspect:
+			logTrustDenied("PRELOADED", comm, ev.PID, ev.UID, path,
+				"this process mapped untrusted code before its binary was whitelisted; restart it")
 		default:
 			logTrustDenied("LIBLOAD", comm, ev.PID, ev.UID, path,
 				"a whitelisted binary tried to exec-map an untrusted file "+

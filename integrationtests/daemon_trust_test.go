@@ -426,3 +426,85 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: trust_mmap only gates NEW mappings. A process of a not-yet-whitelisted binary preloads
+// attacker code, waits, and reads the secret once a reload whitelists that exe.
+func (s *IntegrationSuite) TestDaemon_Bypass_PreloadedBeforeWhitelistReadsAfterReload() {
+	s.preloadedBeforeWhitelist(false)
+}
+
+// Same, but the preloaded process forks after the reload and the child, sharing the payload's
+// mappings without an mmap of its own, does the read.
+func (s *IntegrationSuite) TestDaemon_Bypass_PreloadedBeforeWhitelistForkedChildReads() {
+	s.preloadedBeforeWhitelist(true)
+}
+
+func (s *IntegrationSuite) preloadedBeforeWhitelist(fork bool) {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-PRELOAD-HELD-7D42"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret" +
+			" && rm -f /tmp/go* /tmp/leak* /tmp/armed*"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_wait.so"), "/tmp/wait.so", 0o755),
+		"copy preload_wait.so")
+
+	// Outside /etc/app-listener so the test can rewrite it (the daemon self-guards that dir).
+	const cfgPath = "/tmp/poc-daemon.conf"
+	writeCfg := func(body string) {
+		code, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF", cfgPath, body)})
+		s.Require().Equalf(0, code, "writing %s: %s", cfgPath, out)
+	}
+	writeCfg("[watch /protected]\nneed_encryption: false\n/usr/bin/true")
+	code, out := s.exec(c, []string{"sh", "-c",
+		"nohup /app-listener daemon --config " + cfgPath + " --headless > /tmp/daemon.log 2>&1 &"})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, "[watch /protected]")
+
+	forkEnv := ""
+	if fork {
+		forkEnv = "LEAK_FORK=1 "
+	}
+	preload := func(tag string) string {
+		return forkEnv + "LD_PRELOAD=/tmp/wait.so LEAK_FILE=/protected/secret LEAK_GO=/tmp/go-" + tag +
+			" LEAK_OUT=/tmp/leak-" + tag + " LEAK_ARMED=/tmp/armed-" + tag + " /usr/bin/grep x /dev/null"
+	}
+
+	// Control: grep is not whitelisted yet, so the preload maps but its read is denied.
+	s.exec(c, []string{"sh", "-c", "touch /tmp/go-ctl && " + preload("ctl") + " >/dev/null 2>&1; true"})
+	res, ok := s.awaitFile(c, "/tmp/leak-ctl", 15*time.Second)
+	s.Require().Truef(ok, "control: the preload never ran in the non-whitelisted grep")
+	s.Require().NotContainsf(res, marker, "control: non-whitelisted grep must be denied the secret: %s", res)
+
+	// Attack: arm a grep process with the payload while grep is still untrusted and unwhitelisted.
+	s.exec(c, []string{"sh", "-c", "nohup sh -c '" + preload("held") + "' >/dev/null 2>&1 &"})
+	_, ok = s.awaitFile(c, "/tmp/armed-held", 15*time.Second)
+	s.Require().Truef(ok, "the held preload never armed")
+
+	// A reload (a catalog refresh picking up an installed app) whitelists grep.
+	writeCfg("[watch /protected]\nneed_encryption: false\n/usr/bin/true\n/usr/bin/grep")
+	s.sigDaemon(c, "HUP")
+	s.Require().Truef(s.awaitLog(c, "configuration reloaded without dropping protection", daemonShutdownTimeout),
+		"reload did not complete, daemon log:\n%s", s.readDaemonLog(c))
+	s.Require().Truef(s.awaitLog(c, "trust guard: trusted set rebuilt after reload", 10*time.Second),
+		"the trust guard did not rebuild after the reload, daemon log:\n%s", s.readDaemonLog(c))
+
+	// Control: grep is now whitelisted and a NEW preload into it is refused by the trust guard.
+	_, out = s.exec(c, []string{"sh", "-c", "grep -c " + marker + " /protected/secret"})
+	s.Require().Containsf(out, "1", "control: grep must be whitelisted after the reload: %s", out)
+	s.exec(c, []string{"sh", "-c", "touch /tmp/go-new && " + preload("new") + " >/dev/null 2>&1; true"})
+	_, armedNew := s.awaitFile(c, "/tmp/armed-new", 3*time.Second)
+	s.Require().Falsef(armedNew, "control: a fresh LD_PRELOAD into the now-trusted grep must be refused")
+
+	// The held process, preloaded before grep was trusted, now runs as a whitelisted exe.
+	s.exec(c, []string{"touch", "/tmp/go-held"})
+	res, ok = s.awaitFile(c, "/tmp/leak-held", 15*time.Second)
+	s.Require().Truef(ok, "the held preload never reported")
+	s.Require().NotContainsf(res, marker,
+		"code preloaded into grep BEFORE a reload whitelisted it read the secret afterwards (fork=%v): %s",
+		fork, res)
+	s.Require().Truef(s.awaitLog(c, "op=PRELOADED", 10*time.Second),
+		"the refused read was not logged, daemon log:\n%s", s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
