@@ -47,6 +47,14 @@ type TrustGuard struct {
 	// ownerByPath: UpdaterPlan.Owners, for AllowReplacement.
 	ownerMu     sync.Mutex
 	ownerByPath map[string]uint64
+	// guard_vouched_devs upkeep (trust_mounts.go).
+	mountMu   sync.Mutex
+	mountFd   int
+	mountStop int
+	mountDone chan struct{}
+	vouched   int
+	// mountUntracked: the watch died, so SyncMounts refuses to vouch anything again.
+	mountUntracked bool
 }
 
 // trustEvent mirrors struct trust_event in guard_trust.bpf.c.
@@ -64,7 +72,7 @@ func NewTrustGuard() (*TrustGuard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("trust guard: removing memlock rlimit: %v", err)
 	}
-	t := &TrustGuard{done: make(chan struct{})}
+	t := &TrustGuard{done: make(chan struct{}), mountFd: -1, mountStop: -1, vouched: -1}
 	if err := LoadGuardTrustObjects(&t.objs, nil); err != nil {
 		return nil, fmt.Errorf("loading trust BPF objects: %w", err)
 	}
@@ -217,8 +225,13 @@ func (t *TrustGuard) hooks() []trustHook {
 }
 
 // Start attaches every trust program and drains events. A required hook (mmap_file, the
-// code-suspect lifecycle) that cannot attach fails the start; other hooks are best-effort. It never blocks the per-resource guards.
+// code-suspect lifecycle, sb_delete) that cannot attach fails the start; other hooks are
+// best-effort. It never blocks the per-resource guards.
 func (t *TrustGuard) Start() error {
+	if err := t.startMountVouch(); err != nil {
+		t.detachLinks()
+		return err
+	}
 	for _, h := range t.hooks() {
 		l, err := link.AttachLSM(link.LSMOptions{Program: h.prog})
 		if err != nil {
@@ -241,6 +254,10 @@ func (t *TrustGuard) Start() error {
 		return err
 	}
 	t.attachMemfdProvenance()
+	if err := t.startMountWatch(); err != nil {
+		t.detachLinks()
+		return err
+	}
 
 	rd, err := ringbuf.NewReader(t.objs.TrustRb)
 	if err != nil {
@@ -339,6 +356,7 @@ func (t *TrustGuard) Stop() {
 		_ = t.rd.Close()
 	}
 	t.detachLinks()
+	t.stopMountWatch()
 	_ = t.objs.Close()
 }
 

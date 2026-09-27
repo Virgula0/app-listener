@@ -508,3 +508,121 @@ func (s *IntegrationSuite) preloadedBeforeWhitelist(fork bool) {
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
+
+// inNosuidNamespace runs cmd in a fresh mount namespace whose / is remounted nosuid, as systemd
+// does for the daemon's unit and bwrap/Flatpak do for sandboxed apps. It prints ROOTOPTS= first so
+// the caller can check the namespace really is nosuid.
+func inNosuidNamespace(cmd string) string {
+	return "unshare -m sh -c " + shQuote("mount -o remount,bind,nosuid / && "+
+		"awk '$5==\"/\"{print \"ROOTOPTS=\" $6}' /proc/self/mountinfo && "+cmd)
+}
+
+// A nosuid mount says nothing about who mounted the superblock under it: the daemon's own unit
+// namespace and every sandbox remount system mounts nosuid. The daemon's library closure and the
+// kernel's auto-trust must both judge pid 1's mounts, or libc is refused to a sandboxed app.
+func (s *IntegrationSuite) TestDaemon_NosuidNamespace_SystemLibsStillTrusted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c", "mkdir -p /protected /exploits /etc/app-listener /realsys /tmp/nb && echo s > /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), libProbe, 0o755), "copy lib_probe.so")
+	s.exec(c, []string{"sh", "-c",
+		"cp " + libProbe + " /realsys/evil.so && chmod 644 /realsys/evil.so && " +
+			"cp " + libProbe + " /tmp/nb/evil.so && chown -R 65534:65534 /tmp/nb && chmod 644 /tmp/nb/evil.so"})
+
+	const config = "[watch /protected]\nneed_encryption: false\n/usr/bin/true"
+	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + config + "\nEOF"})
+	code, out := s.exec(c, []string{"sh", "-c", "nohup " + inNosuidNamespace(
+		"exec /app-listener daemon --config /etc/app-listener/daemon.conf --headless") + " > /tmp/daemon.log 2>&1 &"})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, config)
+	defer s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+
+	log := s.readDaemonLog(c)
+	s.Require().Regexpf(`ROOTOPTS=\S*nosuid`, log, "the daemon's namespace must have a nosuid /: %s", log)
+	s.Require().NotContainsf(log, "is on a nosuid mount",
+		"the library closure judged the daemon's own nosuid namespace instead of pid 1's:\n%s", log)
+
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/realsys/evil.so /usr/bin/true 2>&1"})
+	s.Require().Containsf(out, libProbeMarker, "control: a root-owned system library must load in pid 1's namespace: %s", out)
+
+	_, out = s.exec(c, []string{"sh", "-c", inNosuidNamespace("LD_PRELOAD=/realsys/evil.so /usr/bin/true 2>&1")})
+	s.Require().Regexpf(`ROOTOPTS=\S*nosuid`, out, "the sandbox's / must be nosuid: %s", out)
+	s.Require().Containsf(out, libProbeMarker,
+		"a root-owned system library was refused to a whitelisted binary in a nosuid sandbox: %s", out)
+	s.Require().NotContainsf(s.readDaemonLog(c), "path=/realsys/evil.so",
+		"trust_mmap refused the system library in the sandbox")
+
+	_, out = s.exec(c, []string{"sh", "-c", inNosuidNamespace("LD_PRELOAD=/tmp/nb/evil.so /usr/bin/true 2>&1")})
+	s.Require().NotContainsf(out, libProbeMarker, "control: a user-owned library must still be refused in the sandbox: %s", out)
+	s.requireDenialLogged(c, "LIBLOAD", "/tmp/nb/evil.so")
+}
+
+// Bypass: vouching is keyed by device number, and loop minors are reused. Once root's non-nosuid
+// image is unmounted, a user image udisks2 attaches to the same loop device (nosuid) must not
+// inherit its trust, however soon after the unmount it is used.
+func (s *IntegrationSuite) TestDaemon_Bypass_ReusedLoopMinorNotVouched() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c", "mkdir -p /protected /exploits /etc/app-listener /mnt/r /media/u && echo s > /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), libProbe, 0o755), "copy lib_probe.so")
+
+	build := `
+set -e
+rm -rf /tmp/r /tmp/u && mkdir -p /tmp/r/tree/lib /tmp/u/tree/lib
+cp ` + libProbe + ` /tmp/r/tree/lib/evil.so && chmod 755 /tmp/r/tree/lib && chmod 644 /tmp/r/tree/lib/evil.so
+dd if=/dev/zero of=/tmp/r/img bs=1M count=16 status=none
+mkfs.ext4 -q -F -d /tmp/r/tree /tmp/r/img
+cp ` + libProbe + ` /tmp/u/tree/lib/evil.so && chmod 755 /tmp/u/tree/lib && chmod 644 /tmp/u/tree/lib/evil.so
+chown -R 65534:65534 /tmp/u
+cat > /tmp/u/build.sh <<'EOF'
+set -e
+cd /tmp/u
+dd if=/dev/zero of=img bs=1M count=16 status=none
+mkfs.ext4 -q -F -d tree img
+for f in /lib /lib/evil.so; do
+  debugfs -w -R "sif $f uid 0" img >/dev/null 2>&1
+  debugfs -w -R "sif $f gid 0" img >/dev/null 2>&1
+done
+EOF
+` + nobodyRun + `env PATH=/usr/sbin:/usr/bin:/sbin:/bin sh /tmp/u/build.sh
+for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+LOOP=$(losetup -f --show /tmp/r/img)
+mount "$LOOP" /mnt/r
+printf 'LOOPDEV=%s\n' "$LOOP"
+printf 'ROOTDEV=%s\n' "$(mountpoint -d /mnt/r)"
+`
+	code, out := s.exec(c, []string{"sh", "-c", build})
+	if code != 0 || !strings.Contains(out, "LOOPDEV=/dev/loop") {
+		s.T().Skipf("image build / loop mount unavailable here (exit %d): %s", code, out)
+	}
+	defer s.exec(c, []string{"sh", "-c", "umount /mnt/r /media/u 2>/dev/null; losetup -D 2>/dev/null; true"})
+	loop := regexp.MustCompile(`LOOPDEV=(\S+)`).FindStringSubmatch(out)[1]
+	rootDev := regexp.MustCompile(`ROOTDEV=(\S+)`).FindStringSubmatch(out)[1]
+
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+	defer s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/mnt/r/lib/evil.so /usr/bin/true 2>&1"})
+	s.Require().Containsf(out, libProbeMarker, "control: root's non-nosuid loop image must be vouched: %s", out)
+
+	// One shell, no pause: the user image must be judged before any mountinfo re-sync could run.
+	swap := `
+umount /mnt/r && losetup -d ` + loop + ` || exit 1
+for i in 1 2 3 4 5 6 7 8 9 10; do losetup ` + loop + ` /tmp/u/img 2>/dev/null && break; sleep 0.05; done
+mount -o nosuid,nodev ` + loop + ` /media/u || exit 1
+printf 'USERDEV=%s\n' "$(mountpoint -d /media/u)"
+stat -c 'owner=%u:%g mode=%a' /media/u/lib/evil.so
+LD_PRELOAD=/media/u/lib/evil.so /usr/bin/true 2>&1
+`
+	code, out = s.exec(c, []string{"sh", "-c", swap})
+	s.Require().Containsf(out, "USERDEV="+rootDev+"\n", "the user image must reuse root's loop device %s (exit %d): %s", rootDev, code, out)
+	s.Require().Containsf(out, "owner=0:0 mode=644", "the user image's library must present as root-owned: %s", out)
+	s.Require().NotContainsf(out, libProbeMarker,
+		"a user image on a reused loop minor inherited the unmounted root image's trust: %s", out)
+	// Trust events print the path below the superblock's root, not the mount point.
+	s.requireDenialLogged(c, "LIBLOAD", "path=/lib/evil.so")
+}

@@ -10,7 +10,7 @@
 //   #1 writer attribution: a whitelisted binary at a USER-WRITABLE path (home-directory apps: Claude, Discord) may only be replaced/modified by an updater of a resource whitelisting it (guard_bin_owner/guard_bin_updaters), never by same-user malware or another resource's binary. Root-owned system binaries (/usr/bin/...) are deliberately NOT protected: users can't modify them, and protecting them would break package upgrades.
 //   #2 library load allowlist: a whitelisted process may map executable code only from a library a non-whitelisted process couldn't have written. A library qualifies if it is:
 //     - an explicit TRUSTED_LIB (allow_lib), or
-//     - a root-owned file in a root-only-writable directory on a non-nosuid mount (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
+//     - a root-owned file in a root-only-writable directory on a superblock root mounted without nosuid in pid 1's mount namespace (system libs under /usr/lib, /opt; auto-trusted, survives package updates; see guard_vouched_devs), or
 //     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
 //     - a #3 reserved name below its root, mapped by one of that name's writers (glob_lib_trusted).
 //   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused. A process that
@@ -250,6 +250,42 @@ struct {
 	__type(value, __u8);
 } trust_code_suspect SEC(".maps");
 
+// guard_vouched_devs: sb->s_dev of every non-FUSE superblock with a mount WITHOUT nosuid in pid 1's
+// mount namespace, synced by userspace from /proc/1/mountinfo; value = the guard_dev_seq snapshot
+// taken before that read. Only root makes such a mount, so only there do on-disk root ownership bits
+// mean root wrote the file: udisks2/fusermount/fstab `user` force nosuid for user images. Judged per
+// superblock, not per mount, because sandboxes (bwrap, Flatpak, NoNewPrivileges units) remount the
+// same system superblocks nosuid in their own namespaces.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, __u64);
+} guard_vouched_devs SEC(".maps");
+
+// guard_dead_devs: dev -> guard_dev_seq when its superblock shut down (trust_sb_delete). A vouched
+// entry synced under an older snapshot may describe that dead superblock (userspace read mountinfo
+// before it died), and the dev can already name a user's new one (a reused loop minor): stale.
+// Userspace prunes tombstones its latest completed sync covers.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, __u64);
+	__type(value, __u64);
+} guard_dead_devs SEC(".maps");
+
+// guard_dev_seq: [0] superblock shutdown counter, [1] tombstones that could not be recorded
+// (userspace then drops every vouched dev and re-syncs).
+#define DEV_SEQ_NOW 0
+#define DEV_SEQ_LOST 1
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, __u32);
+	__type(value, __u64);
+} guard_dev_seq SEC(".maps");
+
 struct trust_event {
 	__u32 pid;
 	__u32 uid;
@@ -390,19 +426,20 @@ static __always_inline int is_system_trusted(struct inode *inode, struct dentry 
 	return inode_is_root_ro(pinode);
 }
 
-// mount_vouches_ownership: the file's mount is not nosuid. Every unprivileged mount path (udisks2,
-// fusermount, fstab `user`) forces nosuid because the mounter doesn't vouch for the fs's ownership
-// bits, and a user-built image (loop-mounted ext4, ISO) can present ANY file as root-owned. Such a
-// file is never system-trusted. nodev is not checked: snap squashfs mounts carry it.
-static __always_inline int mount_vouches_ownership(struct file *file)
+// mount_vouches_ownership: root vouches for the ownership bits on the file's superblock
+// (guard_vouched_devs) and it has not shut down since that was synced. A user-built image
+// (loop-mounted ext4, ISO) can present ANY file as root-owned; such a file is never system-trusted.
+// nodev is not checked: snap squashfs mounts carry it. Missing entry or unreadable sb: untrusted.
+static __always_inline int mount_vouches_ownership(struct inode *inode)
 {
-	struct vfsmount *mnt = NULL;
-	bpf_probe_read_kernel(&mnt, sizeof(mnt), &file->f_path.mnt);
-	if (!mnt)
+	struct inode_key k = {};
+	if (!fill_inode_key(inode, &k))
 		return 0;
-	int mflags = MNT_NOSUID;
-	bpf_probe_read_kernel(&mflags, sizeof(mflags), &mnt->mnt_flags);
-	return !(mflags & MNT_NOSUID);
+	__u64 *synced = bpf_map_lookup_elem(&guard_vouched_devs, &k.dev);
+	if (!synced)
+		return 0;
+	__u64 *died = bpf_map_lookup_elem(&guard_dead_devs, &k.dev);
+	return !died || *died <= *synced;
 }
 
 // under_guarded_tree: the innermost guarded root at or above the file (guard_trusted_dirs) admits
@@ -877,7 +914,7 @@ int trust_mmap(unsigned long long *ctx)
 
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
-	if (mount_vouches_ownership(file) && is_system_trusted(inode, dentry))
+	if (mount_vouches_ownership(inode) && is_system_trusted(inode, dentry))
 		return 0; // auto-trusted root-owned system library
 	if (under_guarded_tree(inode, dentry))
 		return 0; // inside a write-protected guarded tree this exe may load from
@@ -1156,6 +1193,37 @@ int trust_sched_process_fork(unsigned long long *ctx)
 	bpf_probe_read_kernel(&ctgid, sizeof(ctgid), &child->tgid);
 	__u8 one = 1;
 	bpf_map_update_elem(&trust_code_suspect, &ctgid, &one, BPF_ANY);
+	return 0;
+}
+
+// trust_sb_delete runs in generic_shutdown_super, before the filesystem releases its dev for reuse
+// (kill_block_super's bdev put, kill_anon_super's free_anon_bdev), so a dying superblock's dev is
+// unvouched before another superblock can take it, whatever the mountinfo re-sync's latency.
+SEC("lsm/sb_delete")
+int trust_sb_delete(unsigned long long *ctx)
+{
+	struct super_block *sb = (struct super_block *)ctx[0];
+	if (!sb)
+		return 0;
+	dev_t d = 0;
+	bpf_probe_read_kernel(&d, sizeof(d), &sb->s_dev);
+	__u64 dev = d;
+	// Tombstone before the delete: a sync that read mountinfo while this sb lived can only put the
+	// dev back once the tombstone already marks it stale.
+	__u32 k = DEV_SEQ_NOW;
+	__u64 *seq = bpf_map_lookup_elem(&guard_dev_seq, &k);
+	__u64 now = 0;
+	if (seq) {
+		__sync_fetch_and_add(seq, 1);
+		now = *seq; // >= this death's number: a racing death only makes the tombstone stricter
+	}
+	if (!seq || bpf_map_update_elem(&guard_dead_devs, &dev, &now, BPF_ANY)) {
+		k = DEV_SEQ_LOST;
+		__u64 *lost = bpf_map_lookup_elem(&guard_dev_seq, &k);
+		if (lost)
+			__sync_fetch_and_add(lost, 1);
+	}
+	bpf_map_delete_elem(&guard_vouched_devs, &dev);
 	return 0;
 }
 

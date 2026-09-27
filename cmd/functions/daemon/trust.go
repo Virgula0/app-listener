@@ -218,6 +218,10 @@ func trustStartupError(err error) error {
 // reload re-applies the trusted set from the new config (SetTrusted / SetGuardedDirs clear-then-fill,
 // so it is a true replace). On failure the previous set stays.
 func (m *trustManager) reload(cfg *daemonconfig.Config) {
+	if err := m.tg.SyncMounts(); err != nil {
+		log.Errorf("trust guard: CRITICAL: mount re-sync on reload failed (%v) — system libraries are "+
+			"refused to whitelisted binaries until it succeeds", err)
+	}
 	if err := m.apply(cfg); err != nil {
 		log.Errorf("trust guard: CRITICAL: reload could not re-apply the trusted set (%v) — keeping the previous "+
 			"set; binaries added by this reload have no library allowlist until this is fixed", err)

@@ -69,14 +69,19 @@ func ComputeBinaryEntry(path string) (BinaryEntry, error) {
 	}, nil
 }
 
-// StatInode returns the dev/ino pair of path, with dev encoded the way the
-// BPF programs expect ((major << 20) | minor).
+// KernelDev encodes major:minor as the kernel's internal dev_t (sb->s_dev), which the BPF programs
+// key on; userspace's st_dev encoding differs.
+func KernelDev(major, minor uint32) uint64 {
+	return uint64(major)<<20 | uint64(minor)
+}
+
+// StatInode returns the dev/ino pair of path, with dev encoded by KernelDev.
 func StatInode(path string) (dev, ino uint64, err error) {
 	var s syscall.Stat_t
 	if err := syscall.Stat(path, &s); err != nil {
 		return 0, 0, err
 	}
-	return uint64((unix.Major(s.Dev) << 20) | unix.Minor(s.Dev)), s.Ino, nil
+	return KernelDev(unix.Major(s.Dev), unix.Minor(s.Dev)), s.Ino, nil
 }
 
 // LstatInode is StatInode without following a final symlink: it identifies
@@ -86,7 +91,7 @@ func LstatInode(path string) (dev, ino uint64, err error) {
 	if err := syscall.Lstat(path, &s); err != nil {
 		return 0, 0, err
 	}
-	return uint64((unix.Major(s.Dev) << 20) | unix.Minor(s.Dev)), s.Ino, nil
+	return KernelDev(unix.Major(s.Dev), unix.Minor(s.Dev)), s.Ino, nil
 }
 
 // BinaryStat is a cheap change-detection fingerprint: recompute the hash only when Size, MtimeNs or
@@ -105,7 +110,7 @@ func StatBinary(path string) (BinaryStat, error) {
 		return BinaryStat{}, err
 	}
 	return BinaryStat{
-		Dev:     uint64((unix.Major(s.Dev) << 20) | unix.Minor(s.Dev)),
+		Dev:     KernelDev(unix.Major(s.Dev), unix.Minor(s.Dev)),
 		Ino:     s.Ino,
 		Size:    s.Size,
 		MtimeNs: s.Mtim.Sec*1_000_000_000 + s.Mtim.Nsec,
