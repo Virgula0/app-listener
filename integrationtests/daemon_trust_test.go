@@ -282,3 +282,81 @@ func (s *IntegrationSuite) awaitFile(c testcontainers.Container, path string, ti
 	return "", false
 }
 
+// Bypass: reservation #3 checks only the name being bound below a glob root, and the catalog
+// refresh globs THROUGH symlinks (filepath.Glob + os.Stat), then the daemon EvalSymlinks the match.
+// A directory symlink with an unreserved name, pointing outside the root, gets an attacker binary
+// whitelisted by the next unattended refresh. Two shapes: a wildcard component (Discord's
+// ~/.config/discord/*/Discord) and a missing fixed component (Claude's ~/.local/bin/claude when
+// ~/.local/bin does not exist yet).
+func (s *IntegrationSuite) TestDaemon_Bypass_CatalogRefreshFollowsPlantedSymlink() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.installFakeSystemctl(c)
+
+	const (
+		discordMarker = "TOP-SECRET-DISCORD-TOKEN-3B8D"
+		claudeMarker  = "TOP-SECRET-CLAUDE-TOKEN-8F21"
+		discordSecret = discordDir + "/sentry/secret"
+		claudeSecret  = "/root/.claude/secret"
+	)
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/xres_move"), "/exploits/xres_move", 0o755),
+		"copy xres_move")
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /exploits /etc/app-listener " + discordDir + "/sentry $(dirname " + discordClient + ") /root/.claude /root/.local" +
+			" && rm -rf /root/.local/bin" +
+			" && cp /usr/bin/dash " + discordClient + " && cp /usr/bin/true /usr/local/bin/claude" +
+			" && printf '" + discordMarker + "' > " + discordSecret + " && printf '" + claudeMarker + "' > " + claudeSecret +
+			" && chmod 644 " + discordSecret + " " + claudeSecret +
+			" && head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+
+	s.startDaemon(c, `[watch `+discordDir+`/sentry]
+need_encryption: false
+`+discordClient+`
+
+[watch /root/.claude]
+need_encryption: false
+/usr/local/bin/claude`)
+	s.Require().Contains(s.readDaemonLog(c), "reserved glob name(s)", "trust guard #3 was not populated")
+
+	// Controls: the reservation is live (a direct plant of the reserved name is refused).
+	s.exec(c, []string{"mkdir", "-p", discordDir + "/direct"})
+	s.assertNotPlanted(c, "direct Discord plant", discordDir+"/direct/Discord",
+		[]string{"cp", "/exploits/xres_move", discordDir + "/direct/Discord"})
+	s.exec(c, []string{"rmdir", discordDir + "/direct"})
+
+	// Attack, as a non-whitelisted process: the binaries live outside every reserved root, and only
+	// an unreserved directory name (a symlink) is created inside the user's tree.
+	code, out := s.exec(c, []string{"sh", "-c",
+		"mkdir -p /tmp/x /tmp/y && cp /exploits/xres_move /tmp/x/Discord && cp /exploits/xres_move /tmp/y/claude" +
+			" && ln -s /tmp/x " + discordDir + "/app-0.0.999 && ln -s /tmp/y /root/.local/bin 2>&1"})
+	s.Require().Equalf(0, code, "planting the symlinks: %s", out)
+
+	for _, tc := range []struct{ bin, secret, marker string }{
+		{"/tmp/x/Discord", discordSecret, discordMarker},
+		{"/tmp/y/claude", claudeSecret, claudeMarker},
+	} {
+		_, out = s.exec(c, []string{tc.bin, "read", tc.secret})
+		s.Require().NotContainsf(out, tc.marker, "baseline: %s must be denied before the refresh: %s", tc.bin, out)
+	}
+
+	// The unattended refresh the boot unit / package-manager hooks run.
+	code, refresh := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	if code == 0 {
+		s.awaitLog(c, "configuration reloaded", 60*time.Second)
+	}
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+
+	for _, tc := range []struct{ bin, secret, marker string }{
+		{"/tmp/x/Discord", discordSecret, discordMarker},
+		{"/tmp/y/claude", claudeSecret, claudeMarker},
+	} {
+		_, out = s.exec(c, []string{tc.bin, "read", tc.secret})
+		s.Require().NotContainsf(out, tc.marker,
+			"%s (outside every reserved root, reached through a planted directory symlink) was whitelisted "+
+				"by the catalog refresh and read %s: %s\nrefresh (exit %d):\n%s\ndaemon.conf:\n%s",
+			tc.bin, tc.secret, out, code, refresh, conf)
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+

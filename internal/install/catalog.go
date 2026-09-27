@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // CandidateDir describes one critical directory type the installer probes.
@@ -601,7 +603,7 @@ func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
 			matches = m
 		}
 		for _, p := range matches {
-			if seen[p] {
+			if seen[p] || !homeMatchConfined(home, pattern, p) {
 				continue
 			}
 			info, err := os.Lstat(p)
@@ -637,7 +639,7 @@ func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
 			matches = m
 		}
 		for _, p := range matches {
-			if seen[p] {
+			if seen[p] || !homeMatchConfined(home, pattern, p) {
 				continue
 			}
 			// Stat, not Lstat: a symlinked helper resolves like any whitelisted binary (the daemon
@@ -668,6 +670,59 @@ func (c *CandidateDir) LibraryBlockFor(user, home string) LibraryBlock {
 		LibDirs:    c.ExpandLibDirs(user, home),
 		LibWriters: c.ExpandLibDirWriters(user, home),
 	}
+}
+
+// homeMatchConfined reports whether match, expanded from a catalog pattern under home, stays below
+// the roots the trust guard reserves names in (#3). Each name the pattern leaves to the filesystem
+// — a wildcard, or a fixed component missing at the last reload (~/.local/bin) — is creatable by
+// any same-user process, and a symlink there (bin -> /tmp/y) would get a planted binary trusted:
+// so every symlinked directory below home must resolve inside its own parent, and a glob match
+// inside the glob's fixed root. Patterns outside home need root to plant.
+func homeMatchConfined(home, pattern, match string) bool {
+	home = strings.TrimSuffix(home, "/")
+	rel, ok := strings.CutPrefix(match, home+"/")
+	if home == "" || !ok {
+		return true
+	}
+	dir := home
+	for _, c := range strings.Split(filepath.Dir(rel), "/") {
+		if c == "." {
+			break
+		}
+		next := filepath.Join(dir, c)
+		if !symlinkStaysInParent(dir, next) {
+			log.Warnf("catalog: skipping %s: %s is a symlink leaving %s — whitelist it by hand in a "+
+				"non-catalog section if intended", match, next, dir)
+			return false
+		}
+		dir = next
+	}
+	i := strings.IndexAny(pattern, "*?[")
+	if i < 0 {
+		return true
+	}
+	root, err := filepath.EvalSymlinks(filepath.Dir(pattern[:i]))
+	if err != nil {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(match)
+	return err == nil && strings.HasPrefix(resolved, strings.TrimSuffix(root, "/")+"/")
+}
+
+func symlinkStaysInParent(parent, path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return true
+	}
+	p, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return false
+	}
+	t, err := filepath.EvalSymlinks(path)
+	return err == nil && strings.HasPrefix(t, strings.TrimSuffix(p, "/")+"/")
 }
 
 func expandPlaceholders(s, user, home string) string {
@@ -755,13 +810,13 @@ func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
 				continue // malformed pattern: skip the whole entry
 			}
 			for _, m := range matches {
-				if _, err := os.Stat(m); err == nil {
+				if _, err := os.Stat(m); err == nil && homeMatchConfined(c.User.Home, rule.Path, m) {
 					out = append(out, BinaryRule{Path: m, Events: rule.Events})
 				}
 			}
 			continue
 		}
-		if _, err := os.Stat(rule.Path); err == nil {
+		if _, err := os.Stat(rule.Path); err == nil && homeMatchConfined(c.User.Home, rule.Path, rule.Path) {
 			out = append(out, rule)
 		}
 	}

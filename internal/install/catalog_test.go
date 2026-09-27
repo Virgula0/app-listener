@@ -485,6 +485,61 @@ func TestFilterExistingWhitelistGlob(t *testing.T) {
 	}
 }
 
+// A wildcard dir, or a fixed dir missing at the last reload, is creatable by any same-user process:
+// a symlink there must not pull a binary from outside its parent into the whitelist.
+func TestFilterExistingWhitelistSymlinkEscape(t *testing.T) {
+	home := t.TempDir()
+	outside := t.TempDir()
+	write := func(p string) {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := func(target, name string) {
+		if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(home, ".config/discord/app-1.0.0/Discord"))
+	write(filepath.Join(outside, "evil/Discord"))
+	link(filepath.Join(outside, "evil"), filepath.Join(home, ".config/discord/evil"))
+	write(filepath.Join(outside, "bin/claude"))
+	link(filepath.Join(outside, "bin"), filepath.Join(home, ".local/bin"))
+	write(filepath.Join(home, ".other/share/bin/gemini"))
+	link(filepath.Join(home, ".other/share/bin"), filepath.Join(home, ".other/bin"))
+
+	c := Candidate{
+		User: User{Name: "tester", Home: home},
+		Entry: CandidateDir{Whitelist: map[string][]string{
+			"%HOME%/.config/discord/*/Discord": nil,
+			"%HOME%/.local/bin/claude":         nil,
+			"%HOME%/.other/bin/gemini":         nil,
+		}},
+	}
+	var got []string
+	for _, r := range c.FilterExistingWhitelist() {
+		got = append(got, r.Path)
+	}
+	want := []string{
+		filepath.Join(home, ".config/discord/app-1.0.0/Discord"),
+		filepath.Join(home, ".other/bin/gemini"), // symlink resolving inside its parent
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("FilterExistingWhitelist = %v, want %v", got, want)
+	}
+
+	entry := CandidateDir{LibDirWriters: []string{"%HOME%/.config/discord/*/Discord", "%HOME%/.local/bin/claude"}}
+	if ws := entry.ExpandLibDirWriters("tester", home); !slices.Equal(ws, want[:1]) {
+		t.Errorf("ExpandLibDirWriters = %v, want %v", ws, want[:1])
+	}
+}
+
 // TestFilterExistingWhitelistMixed verifies a whitelist mixing a concrete
 // path and a glob keeps the existing concrete path and every glob match.
 func TestFilterExistingWhitelistMixed(t *testing.T) {
