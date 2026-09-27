@@ -16,8 +16,9 @@ import (
 // buildGlobReservations derives trust protection #3 from the built-in catalog, the source of the
 // globs the catalog refresh expands. An entry counts for a user only when one of its locations is
 // a configured resource: that resource's binaries become the only writers of its reserved names
-// (an unconfigured app has no writers, and reserving would lock its own installer out).
-func buildGlobReservations(cfg *daemonconfig.Config, users []install.User) guard.GlobReservations {
+// (an unconfigured app has no writers, and reserving would lock its own installer out). It also
+// returns the users whose Bun tmp dir is a reserved root (trustManager.reserveGlobs vets it).
+func buildGlobReservations(cfg *daemonconfig.Config, users []install.User) (guard.GlobReservations, []install.User) {
 	b := globBuilder{
 		cfg:      cfg,
 		r:        guard.GlobReservations{Roots: map[string]uint64{}, Writers: map[string]uint64{}},
@@ -41,7 +42,7 @@ func buildGlobReservations(cfg *daemonconfig.Config, users []install.User) guard
 		}
 		return b.r.Children[i].Name < b.r.Children[j].Name
 	})
-	return b.r
+	return b.r, b.bun
 }
 
 type globBuilder struct {
@@ -49,6 +50,7 @@ type globBuilder struct {
 	r        guard.GlobReservations
 	bitOf    map[string]int
 	children map[[2]string]uint64
+	bun      []install.User
 }
 
 func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
@@ -62,6 +64,7 @@ func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
 	for _, g := range e.LibDirGlobs(u.Name, u.Home) {
 		b.reserve(g, g.Name, writers)
 	}
+	b.reserveFixedLibDirs(e, u, writers)
 	for _, g := range e.FixedBinaryGlobs(u.Name, u.Home) {
 		b.reserve(g, g.Name, writers)
 		if t, ok := symlinkTargetGlob(g); ok {
@@ -81,7 +84,8 @@ func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
 // per-launch native library, while a non-writer can neither plant nor load one. Unlike per-entry
 // ReservedLibs the bit is shared: several apps write .bun-* into the same dir, so per-entry bits
 // would make each app a non-writer of the others' extractions and deny creation. The dir must exist
-// (the installer creates it only when the user opts in); a missing dir reserves nothing.
+// (the installer creates it only when the user opts in); a missing dir reserves nothing. An existing
+// one may predate its reservation, so it is listed in b.bun for reserveGlobs to vet.
 func (b *globBuilder) reserveBunTmp(u install.User) {
 	seen := map[string]bool{}
 	var writers []string
@@ -101,12 +105,51 @@ func (b *globBuilder) reserveBunTmp(u install.User) {
 		return
 	}
 	sort.Strings(writers)
-	b.reserve(install.TrustGlob{
+	g := install.TrustGlob{
 		Home:  u.Home,
 		Fixed: strings.Split(install.BunTmpRelDir, "/"),
 		Name:  install.BunReservedName,
 		Lib:   true,
-	}, "\x00bun-shared", writers)
+	}
+	b.reserve(g, "\x00bun-shared", writers)
+	if b.r.Roots[g.Root()] != 0 {
+		b.bun = append(b.bun, u)
+	}
+}
+
+// reserveFixedLibDirs reserves each wildcard-free lib dir of e, present or not, as exact names along
+// its path for e's writers: the catalog refresh adopts such a dir once it exists and trusts what it
+// holds for those writers, so a non-writer must not create it (or recreate it after an rmdir).
+// Exact children, not a root: a root reserves at any depth, and would make every game dir named
+// linux64 below steamapps writer-only. One bit per entry; its pattern name matches no root.
+func (b *globBuilder) reserveFixedLibDirs(e *install.CandidateDir, u install.User, writers []string) {
+	dirs := e.FixedLibDirs(u.Name, u.Home)
+	if len(dirs) == 0 {
+		return
+	}
+	mask := b.bit(e.Name+"\x00libdirs", dirs[0][len(dirs[0])-1])
+	for _, comps := range dirs {
+		dir := u.Home
+		for _, c := range comps {
+			if underResource(b.cfg, dir) {
+				break // that resource's guard already gates creating anything below it
+			}
+			if _, _, ok := guard.ParseGlobName(c); !ok {
+				log.Warnf("trust guard: lib dir component %q below %s cannot be reserved; a same-user process "+
+					"could create it and the catalog refresh would trust its libraries", c, dir)
+				break
+			}
+			b.children[[2]string{dir, c}] |= mask
+			next := filepath.Join(dir, c)
+			if fi, err := os.Stat(next); err != nil || !fi.IsDir() {
+				break
+			}
+			dir = next
+		}
+	}
+	for _, w := range writers {
+		b.r.Writers[w] |= mask
+	}
 }
 
 func (b *globBuilder) reserve(g install.TrustGlob, key string, writers []string) {

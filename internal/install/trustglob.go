@@ -91,6 +91,18 @@ func (c *CandidateDir) LibDirGlobs(user, home string) []TrustGlob {
 	return out
 }
 
+// FixedLibDirs returns the entry's wildcard-free LibDirRelPaths for one user as components below
+// home, whether or not they exist.
+func (c *CandidateDir) FixedLibDirs(user, home string) [][]string {
+	var out [][]string
+	for _, rel := range c.LibDirRelPaths {
+		if rel = expandPlaceholders(rel, user, home); !strings.ContainsAny(rel, "*?[") {
+			out = append(out, strings.Split(rel, "/"))
+		}
+	}
+	return out
+}
+
 func splitTrustGlob(home, rel string) TrustGlob {
 	parts := strings.Split(rel, "/")
 	g := TrustGlob{Home: home, Name: parts[len(parts)-1]}

@@ -167,6 +167,7 @@ func keys(m map[string]struct{}) []string {
 type trustManager struct {
 	tg       *guard.TrustGuard
 	binaries int
+	bunRoots map[inodeID]bool // Bun tmp dirs the last apply reserved (reserveGlobs)
 }
 
 // startTrustGuard loads and attaches the daemon-wide trust guard — binary write-protection (#1), the
@@ -232,7 +233,7 @@ func (m *trustManager) reload(cfg *daemonconfig.Config) {
 
 func (m *trustManager) apply(cfg *daemonconfig.Config) error {
 	binaries, libs, dirs, rejected := buildTrustedSet(cfg)
-	if err := applyTrustSet(m.tg, cfg, binaries, libs, dirs, rejected); err != nil {
+	if err := m.applyTrustSet(cfg, binaries, libs, dirs, rejected); err != nil {
 		return err
 	}
 	m.binaries = len(binaries)
@@ -246,8 +247,9 @@ func (m *trustManager) stop() {
 	}
 }
 
-func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, libs []string,
+func (m *trustManager) applyTrustSet(cfg *daemonconfig.Config, binaries, libs []string,
 	dirs []guard.TrustedDir, rejected map[string]*libRejection) error {
+	tg := m.tg
 	if err := tg.SetGuardedDirs(dirs); err != nil {
 		return fmt.Errorf("recording guarded roots: %w", err)
 	}
@@ -261,8 +263,8 @@ func applyTrustSet(tg *guard.TrustGuard, cfg *daemonconfig.Config, binaries, lib
 	if err != nil {
 		return fmt.Errorf("listing users for reserved glob names: %w", err)
 	}
-	reservations := buildGlobReservations(cfg, users)
-	if err := tg.SetGlobReservations(reservations); err != nil {
+	reservations, bun := buildGlobReservations(cfg, users)
+	if err := m.reserveGlobs(reservations, bun); err != nil {
 		return fmt.Errorf("reserving glob names: %w", err)
 	}
 	warnUntrustedLibs(rejected, dirs, reservations)

@@ -40,7 +40,7 @@ func TestBuildGlobReservations_Steam(t *testing.T) {
 		{Path: filepath.Join(steam, "config"), Binaries: []daemonconfig.BinaryRule{{Path: client}}},
 		{Path: filepath.Join(home, ".ssh"), Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/ssh"}}},
 	}}
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 
 	ws := bitOf(t, r, "wineserver")
 	if r.Roots[common]&ws == 0 {
@@ -76,7 +76,7 @@ func TestBuildGlobReservations_UnconfiguredEntryReservesNothing(t *testing.T) {
 	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
 		{Path: filepath.Join(home, ".ssh"), Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/ssh"}}},
 	}}
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 	if len(r.Patterns) != 0 || len(r.Roots) != 0 || len(r.Writers) != 0 {
 		t.Fatalf("Steam is not configured, so nothing may be reserved: %+v", r)
 	}
@@ -90,7 +90,7 @@ func TestBuildGlobReservations_InTreeRootSkipped(t *testing.T) {
 	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
 		{Path: foundry, Binaries: []daemonconfig.BinaryRule{{Path: filepath.Join(foundry, "bin/forge")}}},
 	}}
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 	if len(r.Patterns) != 0 {
 		t.Fatalf("foundry's bin/* is inside its guarded tree, nothing to reserve: %v", r.Patterns)
 	}
@@ -109,7 +109,7 @@ func TestBuildGlobReservations_DiscordLibs(t *testing.T) {
 	discord := filepath.Join(home, ".config/discord")
 	mkdirs(t, discord)
 	cfg, bin := discordLibConfig(home)
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 
 	for _, name := range []string{"*.so", "lib*", "*.node"} {
 		bit := bitOf(t, r, name)
@@ -140,7 +140,7 @@ func TestBuildGlobReservations_MissingLibRootNotWidened(t *testing.T) {
 	home := t.TempDir()
 	mkdirs(t, filepath.Join(home, ".config"))
 	cfg, _ := discordLibConfig(home)
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 	lib := bitOf(t, r, "lib*")
 	for root, bits := range r.Roots {
 		if bits&lib != 0 {
@@ -185,7 +185,7 @@ func TestBuildGlobReservations_SteamLibDirGlobs(t *testing.T) {
 	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
 		{Path: filepath.Join(steam, "config"), Binaries: []daemonconfig.BinaryRule{{Path: client}}},
 	}}
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 
 	for _, name := range []string{"Proton*", "SteamLinuxRuntime_*"} {
 		bit := bitOf(t, r, name)
@@ -219,7 +219,7 @@ func TestBuildGlobReservations_FixedBinaryAncestorsAndSymlinkTarget(t *testing.T
 	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
 		{Path: filepath.Join(home, ".claude"), Binaries: []daemonconfig.BinaryRule{{Path: target}}},
 	}}
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 
 	claude := bitOf(t, r, "claude")
 	if r.Roots[bin]&claude == 0 {
@@ -250,7 +250,7 @@ func TestBuildGlobReservations_BunTmpdir(t *testing.T) {
 		{Path: filepath.Join(home, ".config/opencode"), Binaries: []daemonconfig.BinaryRule{{Path: bin}}},
 		{Path: filepath.Join(home, ".ssh"), Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/ssh"}}},
 	}}
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 
 	bit := bitOf(t, r, install.BunReservedName)
 	if r.Roots[bunDir]&bit == 0 {
@@ -271,7 +271,7 @@ func TestBuildGlobReservations_BunTmpdirMissingDirReservesNoRoot(t *testing.T) {
 	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
 		{Path: filepath.Join(home, ".config/opencode"), Binaries: []daemonconfig.BinaryRule{{Path: bin}}},
 	}}
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 	if _, ok := r.Roots[filepath.Join(home, install.BunTmpRelDir)]; ok {
 		t.Errorf("a missing Bun tmp dir must reserve no root: %v", r.Roots)
 	}
@@ -283,8 +283,102 @@ func TestBuildGlobReservations_BunTmpdirUnconfiguredReservesNothing(t *testing.T
 	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
 		{Path: filepath.Join(home, ".ssh"), Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/ssh"}}},
 	}}
-	r := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
 	if slices.Contains(r.Patterns, install.BunReservedName) {
 		t.Errorf("no configured Bun app: .bun-* must not be reserved: %v", r.Patterns)
+	}
+}
+
+func steamLibDirConfig(home string) (*daemonconfig.Config, string) {
+	steam := filepath.Join(home, ".local/share/Steam")
+	client := filepath.Join(steam, "ubuntu12_32/steam")
+	return &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: filepath.Join(steam, "config"), Binaries: []daemonconfig.BinaryRule{{Path: client}}},
+		{Path: filepath.Join(home, ".ssh"), Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/ssh"}}},
+	}}, client
+}
+
+// The catalog refresh adopts a wildcard-free lib dir once it exists, so a missing one must be
+// reserved as well as a present one (a non-writer creating compatibilitytools.d with a library).
+func TestBuildGlobReservations_SteamFixedLibDirs(t *testing.T) {
+	home := t.TempDir()
+	steam := filepath.Join(home, ".local/share/Steam")
+	mkdirs(t, filepath.Join(steam, "config"), filepath.Join(steam, "ubuntu12_64"))
+	cfg, client := steamLibDirConfig(home)
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+
+	bit := bitOf(t, r, "ubuntu12_32")
+	for _, c := range [][2]string{
+		{home, ".local"}, {filepath.Join(home, ".local"), "share"}, {filepath.Join(home, ".local/share"), "Steam"},
+		{steam, "ubuntu12_64"}, {steam, "compatibilitytools.d"}, {steam, "linux64"},
+	} {
+		if !hasChild(r, c[0], c[1], bit) {
+			t.Errorf("%s/%s must be reserved for Steam's writers: %+v", c[0], c[1], r.Children)
+		}
+	}
+	for root, bits := range r.Roots {
+		if bits&bit != 0 {
+			t.Errorf("lib dirs are exact children, but %s reserves their bit at any depth", root)
+		}
+	}
+	if r.Writers[client]&bit == 0 {
+		t.Errorf("the Steam client must be a writer of its lib dirs: %v", r.Writers)
+	}
+	if r.Writers["/usr/bin/ssh"]&bit != 0 {
+		t.Errorf("another entry's binary must not create Steam's lib dirs: %v", r.Writers)
+	}
+}
+
+func TestBuildGlobReservations_FixedLibDirStopsAtFirstMissing(t *testing.T) {
+	home := t.TempDir()
+	mkdirs(t, filepath.Join(home, ".local"))
+	cfg, _ := steamLibDirConfig(home)
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+
+	bit := bitOf(t, r, "ubuntu12_32")
+	if !hasChild(r, filepath.Join(home, ".local"), "share", bit) {
+		t.Errorf("the first missing component must be reserved in its parent: %+v", r.Children)
+	}
+	for _, c := range r.Children {
+		if c.Bits&bit != 0 && c.Parent != home && c.Parent != filepath.Join(home, ".local") {
+			t.Errorf("reserved %s/%s below a missing dir", c.Parent, c.Name)
+		}
+	}
+}
+
+// SetGlobReservations refuses more than 64 keys: every catalog entry configured at once must fit.
+func TestBuildGlobReservations_WholeCatalogFits(t *testing.T) {
+	home := t.TempDir()
+	cfg := &daemonconfig.Config{}
+	for i := range install.Catalog {
+		e := &install.Catalog[i]
+		if e.IsSystem() {
+			continue
+		}
+		for j, p := range e.PathsFor(home, "u") {
+			cfg.Resources = append(cfg.Resources, daemonconfig.Resource{
+				Path:     p,
+				Binaries: []daemonconfig.BinaryRule{{Path: filepath.Join("/opt", e.Name, string(rune('a'+j)))}},
+			})
+		}
+	}
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	if len(r.Patterns) > 64 {
+		t.Errorf("%d reserved keys, SetGlobReservations accepts 64: %q", len(r.Patterns), r.Patterns)
+	}
+	t.Logf("%d of 64 reserved keys used", len(r.Patterns))
+}
+
+func TestBuildGlobReservations_BunRootsListed(t *testing.T) {
+	withDir, without := t.TempDir(), t.TempDir()
+	mkdirs(t, filepath.Join(withDir, install.BunTmpRelDir))
+	var cfg daemonconfig.Config
+	for _, h := range []string{withDir, without} {
+		cfg.Resources = append(cfg.Resources, daemonconfig.Resource{Path: filepath.Join(h, ".config/opencode"),
+			Binaries: []daemonconfig.BinaryRule{{Path: filepath.Join(h, ".local/bin/opencode")}}})
+	}
+	_, bun := buildGlobReservations(&cfg, []install.User{{Name: "a", Home: withDir}, {Name: "b", Home: without}})
+	if len(bun) != 1 || bun[0].Home != withDir {
+		t.Errorf("only the user with a reserved Bun tmp dir must be vetted: %+v", bun)
 	}
 }

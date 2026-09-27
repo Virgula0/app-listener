@@ -626,3 +626,98 @@ LD_PRELOAD=/media/u/lib/evil.so /usr/bin/true 2>&1
 	// Trust events print the path below the superblock's root, not the mount point.
 	s.requireDenialLogged(c, "LIBLOAD", "path=/lib/evil.so")
 }
+
+// Bypass: the .bun-* reservation turns on for ANY existing Bun tmp dir. A same-user process that
+// creates it while the user has none (redirect declined) plants a .bun-* library that the next
+// reload trusts in the Bun app: glob_lib_trusted judges name and root, not who wrote the file
+// before the reservation existed. Owned by nobody like a user's cache (root-owned = system lib).
+func (s *IntegrationSuite) TestDaemon_Bypass_BunTmpdirPlantedBeforeReservation() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener /root/.config/opencode /root/bin /root/.cache" +
+			" && cp /usr/bin/dash /root/bin/opencode"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), libProbe, 0o755),
+		"copy lib_probe.so")
+	s.startDaemon(c, bunGlobConfig)
+
+	plant := bunTmpDir + "/.bun-1000-evil.so"
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p " + bunTmpDir + "/sub && cp " + libProbe + " " + plant +
+		" && cp " + libProbe + " " + bunTmpDir + "/sub/.bun-1000-deep.so && chown -R 65534 /root/.cache/app-listener"})
+	s.Require().Equalf(0, code, "planting while nothing is reserved: %s", out)
+	loaded, out := s.preload(c, "/root/bin/opencode", plant)
+	s.Require().Falsef(loaded, "baseline: an unreserved plant must not load: %s", out)
+
+	s.sigDaemon(c, "HUP")
+	s.Require().True(s.awaitLog(c, "trusted set rebuilt after reload", 60*time.Second),
+		"reload did not complete:\n%s", s.readDaemonLog(c))
+
+	for _, p := range []string{plant, bunTmpDir + "/sub/.bun-1000-deep.so"} {
+		loaded, out = s.preload(c, "/root/bin/opencode", p)
+		s.Require().Falsef(loaded, "%s, planted before its dir was reserved, loaded into the whitelisted Bun app: %s",
+			p, out)
+	}
+
+	// Control: the app's own extraction, written after the reservation, still loads.
+	own := bunTmpDir + "/.bun-1000-own.so"
+	code, out = s.exec(c, []string{"/root/bin/opencode", "-c", "cat " + libProbe + " > " + own})
+	s.Require().Equalf(0, code, "the Bun app's own binary must extract %s: %s", own, out)
+	loaded, out = s.preload(c, "/root/bin/opencode", own)
+	s.Require().Truef(loaded, "control: the Bun app's own extraction must load: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Bypass: the catalog refresh adopts every wildcard-free lib_dir that exists (Steam's
+// compatibilitytools.d is absent until a custom Proton is installed), and only wildcard lib dirs
+// are reserved. A same-user process creates the missing dir with a library in it, the unattended
+// refresh turns it into a lib_dir, and the library preloads into Steam's whitelisted binaries.
+func (s *IntegrationSuite) TestDaemon_Bypass_CatalogRefreshAdoptsPlantedLibDir() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.installFakeSystemctl(c)
+
+	const (
+		helper  = steamDir + "/ubuntu12_64/steamwebhelper"
+		compat  = steamDir + "/compatibilitytools.d"
+		plant   = compat + "/evil.so"
+		shipped = steamDir + "/ubuntu12_64/libshipped.so"
+	)
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), libProbe, 0o755),
+		"copy lib_probe.so")
+	// ubuntu12_64 is Steam's shipped runtime (predates the daemon), handed to nobody so its library is
+	// not an auto-trusted system file.
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /etc/app-listener " + steamDir + "/config " + steamDir + "/ubuntu12_64" +
+			" && cp /usr/bin/dash " + helper + " && cp " + libProbe + " " + shipped +
+			" && chown 65534 " + steamDir + "/ubuntu12_64 " + shipped +
+			" && head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+	s.startDaemon(c, `[watch `+steamDir+`/config]
+need_encryption: false
+`+helper)
+
+	// Attack: may be refused outright (the fix reserves the name); the outcome is what counts.
+	_, attack := s.exec(c, []string{"sh", "-c",
+		"mkdir " + compat + " && cp " + libProbe + " " + plant + " && chown -R 65534 " + compat + " 2>&1"})
+	loaded, out := s.preload(c, helper, plant)
+	s.Require().Falsef(loaded, "baseline: the plant must not load before the refresh: %s", out)
+
+	code, refresh := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	if code == 0 {
+		s.awaitLog(c, "configuration reloaded", 60*time.Second)
+	}
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+
+	loaded, out = s.preload(c, helper, plant)
+	s.Require().Falsef(loaded,
+		"a library in a lib dir a non-writer created was adopted by the unattended refresh and loaded into "+
+			"steamwebhelper: %s\nattack: %s\nrefresh (exit %d):\n%s\ndaemon.conf:\n%s", out, attack, code, refresh, conf)
+
+	// Controls: an existing Steam runtime dir is still adopted, and its library loads into Steam.
+	s.Require().Containsf(conf, `lib_dir "`+steamDir+`/ubuntu12_64"`, "the shipped runtime must stay a lib_dir")
+	loaded, out = s.preload(c, helper, shipped)
+	s.Require().Truef(loaded, "control: Steam must load its shipped runtime library: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

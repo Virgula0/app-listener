@@ -51,6 +51,15 @@ func (s *IntegrationSuite) readNetGuardLog(c testcontainers.Container) string {
 	return out
 }
 
+// readNetGuardEventsOf returns only the typ/comm event lines, filtered inside the container. The
+// LSM hooks are host-wide: under --no-throttle a host process whose sends the whitelist refuses
+// (it retries in a loop) can outgrow readNetGuardLog's tail window before the test's events land.
+func (s *IntegrationSuite) readNetGuardEventsOf(c testcontainers.Container, typ, comm string) string {
+	_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("grep -aF %s %s | tail -c 262144",
+		shQuote("NETGUARD|"+typ+"|"+comm+"|"), netGuardLogPath)})
+	return out
+}
+
 func (s *IntegrationSuite) stopNetGuard(c testcontainers.Container) {
 	if netGuardPID != 0 {
 		s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null || true", netGuardPID)})
@@ -100,7 +109,7 @@ func netGuardHasBlockedEvent(logContent, expectedComm, expectedType string) bool
 func (s *IntegrationSuite) waitForNetGuardBlockedEvent(c testcontainers.Container, expectedComm, expectedType string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if netGuardHasBlockedEvent(s.readNetGuardLog(c), expectedComm, expectedType) {
+		if netGuardHasBlockedEvent(s.readNetGuardEventsOf(c, expectedType, expectedComm), expectedComm, expectedType) {
 			return
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -136,13 +145,13 @@ func netGuardBlockedEventCount(logContent, comm, typ string) int {
 func (s *IntegrationSuite) waitForNetGuardEventCount(c testcontainers.Container, comm, typ string, min int, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if netGuardBlockedEventCount(s.readNetGuardLog(c), comm, typ) >= min {
+		if netGuardBlockedEventCount(s.readNetGuardEventsOf(c, typ, comm), comm, typ) >= min {
 			return
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
 	full := s.readNetGuardLog(c)
-	found := netGuardBlockedEventCount(full, comm, typ)
+	found := netGuardBlockedEventCount(s.readNetGuardEventsOf(c, typ, comm), comm, typ)
 	s.T().Fatalf("timed out waiting for >=%d blocked %s events (comm=%s), found=%d, logBytes=%d; "+
 		"log head/raw:\n%q\ncontext files:\n%s",
 		min, typ, comm, found, len(full), netGuardTail(full), s.guardContextFiles(c))
