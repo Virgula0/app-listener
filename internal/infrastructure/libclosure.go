@@ -11,14 +11,20 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // rootOwnedSafe reports why path is not safe to auto-trust as a system library, or nil when it is:
 // the file AND its parent directory must be owned by root (uid 0) and not writable by group (unless
 // the group is root) or other. A user-writable parent lets its owner replace even a root-owned file
 // by unlink+create, so both levels are checked — the same rule as guard_trust.bpf.c's
-// is_system_trusted. Symlinks are resolved by the caller (resolveSoname), so path is a real file.
+// is_system_trusted + mount_vouches_ownership. Symlinks are resolved by the caller (resolveSoname),
+// so path is a real file.
 func rootOwnedSafe(path string) error {
+	if err := mountVouchesOwnership(path); err != nil {
+		return err
+	}
 	if err := rootOwnedInode(path); err != nil {
 		return err
 	}
@@ -31,6 +37,22 @@ func rootOwnedSafe(path string) error {
 // SystemTrusted reports whether path passes rootOwnedSafe: a non-root user can't replace it.
 func SystemTrusted(path string) bool {
 	return rootOwnedSafe(path) == nil
+}
+
+// mountVouchesOwnership rejects nosuid and FUSE mounts: a user-mounted image or FUSE server can
+// present any file as root-owned.
+func mountVouchesOwnership(path string) error {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(path, &fs); err != nil {
+		return fmt.Errorf("cannot statfs %s: %w", path, err)
+	}
+	if fs.Type == unix.FUSE_SUPER_MAGIC {
+		return fmt.Errorf("%s is on a FUSE filesystem", path)
+	}
+	if fs.Flags&unix.ST_NOSUID != 0 {
+		return fmt.Errorf("%s is on a nosuid mount", path)
+	}
+	return nil
 }
 
 func rootOwnedInode(path string) error {

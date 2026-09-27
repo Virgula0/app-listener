@@ -360,3 +360,69 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: is_system_trusted excludes only FUSE. A filesystem image the user builds keeps its
+// on-disk ownership when mounted (udisks2 lets an active-session user loop-mount one, nosuid,nodev
+// but exec allowed), so a "root-owned" library on it is auto-trusted and preloads into a whitelisted
+// binary. The image is built unprivileged; only the mount runs as root, standing in for udisksd.
+func (s *IntegrationSuite) TestDaemon_Bypass_UserImageRootOwnedLibNotAutoTrusted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c", "mkdir -p /protected /exploits /etc/app-listener /realsys /tmp/nb && echo s > /protected/secret"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), libProbe, 0o755), "copy lib_probe.so")
+
+	build := `
+set -e
+rm -rf /tmp/u && mkdir -p /tmp/u/tree/lib
+cp ` + libProbe + ` /tmp/u/tree/lib/evil.so
+chmod 755 /tmp/u/tree/lib && chmod 644 /tmp/u/tree/lib/evil.so
+chown -R 65534:65534 /tmp/u
+cat > /tmp/u/build.sh <<'EOF'
+set -e
+cd /tmp/u
+dd if=/dev/zero of=img bs=1M count=16 status=none
+mkfs.ext4 -q -F -d tree img
+for f in /lib /lib/evil.so; do
+  debugfs -w -R "sif $f uid 0" img >/dev/null 2>&1
+  debugfs -w -R "sif $f gid 0" img >/dev/null 2>&1
+done
+EOF
+` + nobodyRun + `env PATH=/usr/sbin:/usr/bin:/sbin:/bin sh /tmp/u/build.sh
+for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+mkdir -p /media/u
+LOOP=$(losetup -f --show /tmp/u/img)
+mount -o nosuid,nodev "$LOOP" /media/u
+printf 'LOOPDEV=%s\n' "$LOOP"
+stat -f -c 'fstype=%T' /media/u
+stat -c 'owner=%u:%g mode=%a' /media/u/lib /media/u/lib/evil.so
+`
+	code, out := s.exec(c, []string{"sh", "-c", build})
+	if code != 0 || !strings.Contains(out, "LOOPDEV=/dev/loop") {
+		s.T().Skipf("unprivileged image build / loop mount unavailable here (exit %d): %s", code, out)
+	}
+	defer s.exec(c, []string{"sh", "-c", "umount /media/u 2>/dev/null; losetup -D 2>/dev/null; true"})
+	s.Require().NotContainsf(out, "fuse", "the image must be a real block filesystem, not FUSE: %s", out)
+	s.Require().Containsf(out, "owner=0:0 mode=755", "the library's dir on the image must present as root-owned: %s", out)
+	s.Require().Containsf(out, "owner=0:0 mode=644", "the library on the image must present as root-owned: %s", out)
+
+	// Controls on the real fs: a genuine root-owned library loads, a user-owned one is refused.
+	s.exec(c, []string{"sh", "-c",
+		"cp " + libProbe + " /realsys/evil.so && chmod 644 /realsys/evil.so && " +
+			"cp " + libProbe + " /tmp/nb/evil.so && chown -R 65534:65534 /tmp/nb && chmod 644 /tmp/nb/evil.so"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/realsys/evil.so /usr/bin/true 2>&1"})
+	s.Require().Containsf(out, libProbeMarker, "control: a genuine root-owned system library must load: %s", out)
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/tmp/nb/evil.so /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, libProbeMarker, "control: a user-owned library must be refused: %s", out)
+
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/media/u/lib/evil.so /usr/bin/true 2>&1"})
+	s.Require().NotContainsf(out, libProbeMarker,
+		"a library on a user-built, loop-mounted ext4 image presenting as root-owned was auto-trusted and "+
+			"loaded into a whitelisted binary: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+

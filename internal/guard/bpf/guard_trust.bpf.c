@@ -10,7 +10,7 @@
 //   #1 writer attribution: a whitelisted binary at a USER-WRITABLE path (home-directory apps: Claude, Discord) may only be replaced/modified by an updater of a resource whitelisting it (guard_bin_owner/guard_bin_updaters), never by same-user malware or another resource's binary. Root-owned system binaries (/usr/bin/...) are deliberately NOT protected: users can't modify them, and protecting them would break package upgrades.
 //   #2 library load allowlist: a whitelisted process may map executable code only from a library a non-whitelisted process couldn't have written. A library qualifies if it is:
 //     - an explicit TRUSTED_LIB (allow_lib), or
-//     - a root-owned file in a root-only-writable directory (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
+//     - a root-owned file in a root-only-writable directory on a non-nosuid mount (system libs under /usr/lib, /opt; auto-trusted, survives package updates), or
 //     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
 //     - a #3 reserved name below its root, mapped by one of that name's writers (glob_lib_trusted).
 //   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused.
@@ -373,6 +373,21 @@ static __always_inline int is_system_trusted(struct inode *inode, struct dentry 
 	struct inode *pinode;
 	bpf_probe_read_kernel(&pinode, sizeof(pinode), &parent->d_inode);
 	return inode_is_root_ro(pinode);
+}
+
+// mount_vouches_ownership: the file's mount is not nosuid. Every unprivileged mount path (udisks2,
+// fusermount, fstab `user`) forces nosuid because the mounter doesn't vouch for the fs's ownership
+// bits, and a user-built image (loop-mounted ext4, ISO) can present ANY file as root-owned. Such a
+// file is never system-trusted. nodev is not checked: snap squashfs mounts carry it.
+static __always_inline int mount_vouches_ownership(struct file *file)
+{
+	struct vfsmount *mnt = NULL;
+	bpf_probe_read_kernel(&mnt, sizeof(mnt), &file->f_path.mnt);
+	if (!mnt)
+		return 0;
+	int mflags = MNT_NOSUID;
+	bpf_probe_read_kernel(&mflags, sizeof(mflags), &mnt->mnt_flags);
+	return !(mflags & MNT_NOSUID);
 }
 
 // under_guarded_tree: the innermost guarded root at or above the file (guard_trusted_dirs) admits
@@ -808,7 +823,7 @@ int trust_mmap(unsigned long long *ctx)
 
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
-	if (is_system_trusted(inode, dentry))
+	if (mount_vouches_ownership(file) && is_system_trusted(inode, dentry))
 		return 0; // auto-trusted root-owned system library
 	if (under_guarded_tree(inode, dentry))
 		return 0; // inside a write-protected guarded tree this exe may load from
