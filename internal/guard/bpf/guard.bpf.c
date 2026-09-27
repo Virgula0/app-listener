@@ -1449,6 +1449,16 @@ int guard_path_unlink(unsigned long long *ctx)
 	return ret;
 }
 
+// xres_judge picks the slot deciding a rename/link from source resource src_res. Across two
+// guarded resources that is GUARD_RES_GLOBAL (intersection of every whitelist: the daemon only).
+// Either side's whitelist alone would let a binary allowed in one resource move the other's
+// content across, and guard_inodes keeps one owner per inode, so a moved file keeps its source row,
+// which is_guarded_access treats as unguarded off the source root's chain.
+static __always_inline __u32 xres_judge(__u32 src_res, bool dst_guarded, __u32 dst_res)
+{
+	return (dst_guarded && dst_res != src_res) ? GUARD_RES_GLOBAL : src_res;
+}
+
 SEC("lsm/path_rename")
 int guard_path_rename(unsigned long long *ctx)
 {
@@ -1470,10 +1480,9 @@ int guard_path_rename(unsigned long long *ctx)
 	// rename onto an existing file silently unlinks it — security_path_unlink never fires for a
 	// rename target — so clobbering a single-file watch would swap guarded content for an unguarded
 	// inode), or the destination directory is guarded (moving INTO a tree). Computed once here and
-	// reused below. Since 84df28d every resource shares one hook set, so a rename whose source and
-	// destination are DIFFERENT guarded resources must satisfy the DESTINATION's whitelist too, or a
-	// binary whitelisted only for the source could move/exchange into another resource's tree. Both
-	// sides are root-confined, so a stale inode never false-denies.
+	// reused below. A rename whose source and destination are DIFFERENT guarded resources is judged
+	// by GUARD_RES_GLOBAL (see xres_judge). Both sides are root-confined, so a stale inode never
+	// false-denies.
 	__u32 dst_res = GUARD_RES_NONE;
 	bool dst_victim_root = false, dst_parent_guarded = false;
 	if (new_dentry) {
@@ -1499,17 +1508,14 @@ int guard_path_rename(unsigned long long *ctx)
 	if (own_guarded || parent_guarded) {
 		res = own_guarded ? own_res : parent_res;
 		if (root_in_chain(old_dentry, inode, 16, res)) {
-			// Cross-resource move: judge by the destination resource, not the source's whitelist.
-			if (dst_guarded && dst_res != res)
-				res = dst_res;
+			res = xres_judge(res, dst_guarded, dst_res);
 			return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
 		}
 	}
 
 	// Deep-file coverage, source side.
 	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK)) {
-		if (dst_guarded && dst_res != res)
-			res = dst_res;
+		res = xres_judge(res, dst_guarded, dst_res);
 		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
 	}
 
@@ -1671,10 +1677,9 @@ int guard_path_link(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &old_dentry->d_inode);
 
 	// Destination resource, if the link targets a guarded directory: link(2) writes a new name into
-	// the destination dir. Since 84df28d every resource shares one hook set, so a hardlink from a
-	// source resource INTO a DIFFERENT guarded resource must satisfy the destination's whitelist too
-	// — otherwise a binary whitelisted only for the source could plant an alias inside another tree.
-	// Computed once, reused below; root-confined so a stale inode never false-denies.
+	// the destination dir. A hardlink from one guarded resource INTO a different one is judged by
+	// GUARD_RES_GLOBAL (see xres_judge). Computed once, reused below; root-confined so a stale inode
+	// never false-denies.
 	struct dentry *new_parent = get_dentry_from_path((void *)ctx[1]);
 	struct inode *new_parent_inode = new_parent ? get_inode_from_path((void *)ctx[1]) : NULL;
 	__u32 dst_res = GUARD_RES_NONE;
@@ -1682,8 +1687,7 @@ int guard_path_link(unsigned long long *ctx)
 			   guarded_map_hit(new_parent, new_parent_inode, 12, &dst_res);
 
 	if (guarded_map_hit(old_dentry, inode, 16, &res)) {
-		if (dst_guarded && dst_res != res)
-			res = dst_res;  // cross-resource: judge by the destination's whitelist
+		res = xres_judge(res, dst_guarded, dst_res);
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 	}
 
@@ -1698,15 +1702,13 @@ int guard_path_link(unsigned long long *ctx)
 		bpf_probe_read_kernel(&old_parent_inode, sizeof(old_parent_inode), &old_parent->d_inode);
 		if (old_parent_inode && old_parent_inode != inode &&
 		    guarded_map_hit(old_parent, old_parent_inode, 16, &res)) {
-			if (dst_guarded && dst_res != res)
-				res = dst_res;
+			res = xres_judge(res, dst_guarded, dst_res);
 			return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 		}
 	}
 	// Deep-file coverage, source side.
 	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK)) {
-		if (dst_guarded && dst_res != res)
-			res = dst_res;
+		res = xres_judge(res, dst_guarded, dst_res);
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 	}
 

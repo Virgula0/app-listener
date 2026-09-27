@@ -257,3 +257,28 @@ func (s *IntegrationSuite) TestDaemon_TrustGuardUnavailable_RefusesToStart() {
 		})
 	}
 }
+
+const nobodyRun = "setpriv --reuid=65534 --regid=65534 --clear-groups "
+
+// awaitLog polls the daemon log for needle.
+func (s *IntegrationSuite) awaitLog(c testcontainers.Container, needle string, timeout time.Duration) bool {
+	for dl := time.Now().Add(timeout); time.Now().Before(dl); {
+		if strings.Contains(s.readDaemonLog(c), needle) {
+			return true
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
+}
+
+// awaitFile polls until path exists and returns its content.
+func (s *IntegrationSuite) awaitFile(c testcontainers.Container, path string, timeout time.Duration) (string, bool) {
+	for dl := time.Now().Add(timeout); time.Now().Before(dl); {
+		if code, out := s.exec(c, []string{"sh", "-c", "cat " + shQuote(path) + " 2>/dev/null"}); code == 0 {
+			return out, true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return "", false
+}
+

@@ -585,6 +585,66 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: guard_path_rename/guard_path_link replace the source resource with the destination's
+// (`res = dst_res`), so a binary whitelisted ONLY for B may link/rename A's secret into B. The
+// moved inode keeps its A row, and is_guarded_access returns "not guarded" when that row's root is
+// not on the new path's chain, so the new name is readable by every process.
+func (s *IntegrationSuite) TestDaemon_Bypass_CrossResourcePullByDestinationOnlyBinary() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-XRES-PULL-5E7A"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /resourceA /resourceB /exploits /etc/app-listener && chmod 755 /resourceA /resourceB && " +
+			"printf '" + marker + "-LINK' > /resourceA/secret && printf '" + marker + "-RENAME' > /resourceA/secret2 && " +
+			"chmod 644 /resourceA/secret /resourceA/secret2 && echo b > /resourceB/own"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/xres_move"), "/exploits/xres_move", 0o755),
+		"copy xres_move")
+	s.exec(c, []string{"sh", "-c", "cp /exploits/xres_move /tmp/mover && chmod 755 /tmp/mover"})
+
+	// The mover is whitelisted for B only; A whitelists /usr/bin/true, never the mover.
+	s.startDaemon(c, `[watch /resourceA]
+need_encryption: false
+/usr/bin/true
+
+[watch /resourceB]
+need_encryption: false
+/tmp/mover`)
+
+	// Baselines: neither the B-only mover nor an unrelated reader may read A.
+	code, out := s.exec(c, []string{"/tmp/mover", "read", "/resourceA/secret"})
+	s.Require().NotEqualf(0, code, "baseline: the B-only mover must be denied a direct read of A: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat /resourceA/secret 2>&1"})
+	s.Require().NotEqualf(0, code, "baseline: a non-whitelisted reader must be denied A: %s", out)
+	code, out = s.exec(c, []string{"/tmp/mover", "read", "/resourceB/own"})
+	s.Require().Equalf(0, code, "baseline: the mover is whitelisted for B and must read B: %s", out)
+
+	for _, tc := range []struct{ op, src, dst, marker string }{
+		{"link", "/resourceA/secret", "/resourceB/pulled-link", marker + "-LINK"},
+		{"rename", "/resourceA/secret2", "/resourceB/pulled-rename", marker + "-RENAME"},
+	} {
+		moveCode, moveOut := s.exec(c, []string{"/tmp/mover", tc.op, tc.src, tc.dst})
+
+		// Worst impact first: A's secret readable by ANY process through the new name.
+		_, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat " + tc.dst + " 2>&1"})
+		s.Require().NotContainsf(out, tc.marker,
+			"%s: A's secret moved into B is readable by a non-whitelisted process at %s: %s", tc.op, tc.dst, out)
+		// A hardlink leaves the A name live; if B's rescan re-owns the inode, the A name loses its row.
+		if tc.op == "link" {
+			_, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat " + tc.src + " 2>&1"})
+			s.Require().NotContainsf(out, tc.marker,
+				"%s: the original A name became readable by a non-whitelisted process: %s", tc.op, out)
+		}
+		_, out = s.exec(c, []string{"/tmp/mover", "read", tc.dst})
+		s.Require().NotContainsf(out, tc.marker,
+			"%s: a binary whitelisted only for B read A's secret after pulling it into B: %s", tc.op, out)
+		s.Require().NotEqualf(0, moveCode,
+			"%s of A's file into B by a binary NOT whitelisted for A must be denied: %s", tc.op, moveOut)
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Bypass (finding #3): a reload builds a replacement guard for every resource in the NEW config
 // before it validates the change. That replacement takes over the live guard's guard_inodes row.
 // When the reload is then refused (Phase 0: a resource was dropped) the replacement is stopped and
