@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -52,10 +53,12 @@ type engine struct {
 	// of being deleted — otherwise a refused/rolled-back reload, or a failed buildGuards, would
 	// leave the kept resource with no inode row while its old guard is still attached (fail open).
 	prevOwner map[GuardInodeKey]uint32
-	refs      int
-	rd        *ringbuf.Reader
-	done      chan struct{}
-	started   bool
+	// keptLogged: per inode, the last resource told it may not take the row (log once).
+	keptLogged map[GuardInodeKey]uint32
+	refs       int
+	rd         *ringbuf.Reader
+	done       chan struct{}
+	started    bool
 
 	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
 	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).
@@ -284,28 +287,173 @@ func (e *engine) allocSlotLocked(g *Guard) (uint32, error) {
 	return 0, fmt.Errorf("no free guard resource slot (max %d)", GuardMaxRes-1)
 }
 
-// claimInode maps key to g's resource unless path lies in a live resource rooted strictly inside
-// g's root. guard_inodes holds one owner per inode, so the innermost resource must win whatever
-// order the guards scan in (the sealed fscrypt.key inside the read-only /etc/app-listener guard).
-// Checked and written under e.mu: an inner guard registers its slot before scanning, so an outer
-// scan can't overwrite its rows on a stale check.
-func (e *engine) claimInode(g *Guard, path string, key GuardInodeKey) error {
+// claimInode maps key (found at statPath, logically path) to g's resource unless path lies in a
+// live resource rooted strictly inside g's root. guard_inodes holds one owner per inode, so the
+// innermost resource must win whatever order the guards scan in (the sealed fscrypt.key inside the
+// read-only /etc/app-listener guard). Checked and written under e.mu: an inner guard registers its
+// slot before scanning, so an outer scan can't overwrite its rows on a stale check.
+//
+// A row of another live resource, or an in-tree symlink's target, is taken only when the inode's
+// physical chain says g is its nearest root (mayClaimLocked): a path that came to resolve into
+// another tree must not hand that tree's inodes to g's mode.
+func (e *engine) claimInode(g *Guard, path, statPath string, key GuardInodeKey, viaLink bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.innerResourceOwnsLocked(g, filepath.Clean(path)) {
 		return nil
 	}
-	// If a DIFFERENT live resource currently owns this inode (a reload's replacement claiming the
-	// tree it replaces), remember it so releaseInodes can hand the row back rather than delete it.
 	var cur uint32
+	owner := uint32(0)
 	if e.objs.GuardInodes.Lookup(key, &cur) == nil && cur != g.resID &&
 		cur < GuardMaxRes && e.slots[cur] != nil {
+		owner = cur
+	}
+	// A reload's replacement over the same root takes the tree it replaces.
+	replacing := owner != 0 && filepath.Clean(e.slots[owner].path) == filepath.Clean(g.path)
+	if !replacing && (owner != 0 || viaLink) && !e.mayClaimLocked(g, path, statPath, key, owner, viaLink) {
+		return nil
+	}
+	// Remember a displaced live owner so releaseInodes can hand the row back rather than delete it.
+	if owner != 0 {
 		if e.prevOwner == nil {
 			e.prevOwner = make(map[GuardInodeKey]uint32)
 		}
-		e.prevOwner[key] = cur
+		e.prevOwner[key] = owner
 	}
 	return e.objs.GuardInodes.Put(key, g.resID)
+}
+
+// mayClaimLocked applies the kernel's nearest-root rule to the inode's physical chain. owner's row
+// only guards where its root is on the chain (root_in_chain), so a row whose owner root is absent
+// is stale and g may take it; one whose owner root is nearer than g's is not g's. An unknowable
+// chain keeps the current owner.
+func (e *engine) mayClaimLocked(g *Guard, path, statPath string, key GuardInodeKey, owner uint32, viaLink bool) bool {
+	chain, ok := inodeChain(statPath, key, viaLink)
+	if !ok {
+		if owner != 0 {
+			e.warnKeptLocked(g, path, key, owner, "its physical location could not be verified")
+		}
+		return false
+	}
+	// g's reload twin shares its root: not a competing resource.
+	self := func(id uint32) bool { return id == g.resID || e.slots[id].path == g.path }
+	outranks := func(id uint32) bool { return tieRank(g) > tieRank(e.slots[id]) }
+	if nearestRootClaims(chain, e.rootsLocked(), self, owner, outranks) {
+		return true
+	}
+	if owner != 0 {
+		e.warnKeptLocked(g, path, key, owner, "it lies in that resource's tree")
+	}
+	return false
+}
+
+// tieRank orders resources anchored on the same root inode under different paths, i.e. one path
+// re-pointed onto another resource: a path that IS its root beats one reaching it through a
+// symlink, then a whitelist beats a read-only (world-readable) mode.
+func tieRank(g *Guard) int {
+	r := 0
+	if g.canonicalRoot.Load() {
+		r += 2
+	}
+	if g.mode != ModeReadOnly {
+		r++
+	}
+	return r
+}
+
+// outrankedOnRoot names a live resource (not g's reload twin) anchored on root that g must yield
+// to: a higher tieRank, or an equal one that holds the root row already.
+func (e *engine) outrankedOnRoot(g *Guard, root GuardInodeKey) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var rowOwner uint32
+	_ = e.objs.GuardInodes.Lookup(root, &rowOwner)
+	for id, r := range e.rootsLocked() {
+		o := e.slots[id]
+		if r != root || id == g.resID || o.path == g.path {
+			continue
+		}
+		if tieRank(o) > tieRank(g) || (tieRank(o) == tieRank(g) && rowOwner == id) {
+			return o.path
+		}
+	}
+	return ""
+}
+
+// nearestRootClaims applies root_in_chain's view to chain (nearest first). A live owner's row is
+// claimable when its root is off the chain (stale) or farther than self's, or tied and outranked.
+// A symlink target (owner 0) only inside self's tree with no other root nearer, or tied and not
+// outranked.
+func nearestRootClaims(chain []GuardInodeKey, roots map[uint32]GuardInodeKey, self func(uint32) bool,
+	owner uint32, outranks func(uint32) bool) bool {
+	nearestOf := func(match func(uint32) bool) int {
+		for i, k := range chain {
+			for id, r := range roots {
+				if r == k && match(id) {
+					return i
+				}
+			}
+		}
+		return -1
+	}
+	sIdx := nearestOf(self)
+	if owner != 0 {
+		oIdx := nearestOf(func(id uint32) bool { return id == owner })
+		return oIdx < 0 || (sIdx >= 0 && (sIdx < oIdx || (sIdx == oIdx && outranks(owner))))
+	}
+	blocking := nearestOf(func(id uint32) bool {
+		if self(id) {
+			return false
+		}
+		i := slices.Index(chain, roots[id])
+		return i < sIdx || !outranks(id)
+	})
+	return sIdx >= 0 && (blocking < 0 || blocking > sIdx)
+}
+
+// rootsLocked returns every live resource's root anchor as the kernel sees it (guard_res_config),
+// read there rather than from Guard.rootKey: Guard.mu may be held across a call into the engine.
+func (e *engine) rootsLocked() map[uint32]GuardInodeKey {
+	roots := make(map[uint32]GuardInodeKey)
+	for id, o := range &e.slots {
+		if o == nil {
+			continue
+		}
+		var cfg GuardResConfig
+		if e.objs.GuardResConfig.Lookup(uint32(id), &cfg) == nil { //nolint:gosec // id < GuardMaxRes
+			roots[uint32(id)] = GuardInodeKey{Dev: cfg.RootDev, Ino: cfg.RootIno} //nolint:gosec // id < GuardMaxRes
+		}
+	}
+	return roots
+}
+
+// liveOwner returns the live resource other than self whose row or root anchor key is, 0 if none.
+func (e *engine) liveOwner(self uint32, key GuardInodeKey) uint32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var cur uint32
+	if e.objs.GuardInodes.Lookup(key, &cur) == nil && cur != self && cur < GuardMaxRes && e.slots[cur] != nil {
+		return cur
+	}
+	for id, r := range e.rootsLocked() {
+		if id != self && r == key {
+			return id
+		}
+	}
+	return 0
+}
+
+func (e *engine) warnKeptLocked(g *Guard, path string, key GuardInodeKey, owner uint32, why string) {
+	if e.keptLogged == nil {
+		e.keptLogged = make(map[GuardInodeKey]uint32)
+	}
+	if e.keptLogged[key] == g.resID {
+		return
+	}
+	e.keptLogged[key] = g.resID
+	log.Errorf("guard %s: CRITICAL: %s (inode %d) is guarded by resource %s and %s — not taking it over; "+
+		"a path in this resource resolves into another resource's tree", g.path, path, key.Ino,
+		e.slots[owner].path, why)
 }
 
 // releaseInodes drops resID's guard_inodes rows on Stop. A row whose previous owner (displaced by a

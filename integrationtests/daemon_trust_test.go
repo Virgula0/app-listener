@@ -721,3 +721,71 @@ need_encryption: false
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
+
+// Bypass: every resource shares one guard_inodes map with one owner per inode. A read-only
+// lib_dir's periodic sweep re-stats its root path through symlinks, so once a same-user process
+// makes that path resolve to another resource's directory, the sweep re-anchors onto it and claims
+// its inodes for the lib_dir, whose mode lets every process read.
+// A file created after start (no inode row of its own) must stay the secret resource's too.
+func (s *IntegrationSuite) TestDaemon_Bypass_LibDirSweepTakesOverResource() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const (
+		marker = "TOP-SECRET-LIBDIR-TAKEOVER-5E07"
+		secret = "/root/.ssh/id_secret"
+		later  = "/root/.ssh/id_later"
+		libF   = "/root/app/lib/libreal.txt"
+	)
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /etc/app-listener /root/.ssh /root/app/lib /tmp/sshw /tmp/appw" +
+			" && printf '" + marker + "' > " + secret + " && chmod 644 " + secret +
+			" && echo LIB-CONTENT-OK > " + libF +
+			" && cp /usr/bin/cat /tmp/sshw/cat && cp /usr/bin/dash /tmp/sshw/dash && cp /usr/bin/dash /tmp/appw/dash"})
+	s.startDaemon(c, `[libraries "App"]
+lib_dir /root/app/lib
+lib_binary /tmp/appw/dash
+
+[watch /root/.ssh]
+need_encryption: false
+/tmp/sshw/cat
+/tmp/sshw/dash`)
+
+	readAs := func(bin, path string) string {
+		_, out := s.exec(c, []string{"sh", "-c", bin + " " + path + " 2>&1; echo rc=$?"})
+		return out
+	}
+	code, out := s.exec(c, []string{"/tmp/sshw/dash", "-c", "printf '" + marker + "' > " + later})
+	s.Require().Equalf(0, code, "the whitelisted dash must create %s: %s", later, out)
+	// Controls: the secrets are denied to a non-whitelisted reader and served to the whitelisted one;
+	// the lib_dir's own content is world-readable.
+	for _, f := range []string{secret, later} {
+		s.Require().NotContainsf(readAs("cat", f), marker, "baseline: non-whitelisted cat must be denied %s", f)
+		s.Require().Containsf(readAs("/tmp/sshw/cat", f), marker, "control: whitelisted cat must read %s", f)
+	}
+	s.Require().Contains(readAs("cat", libF), "LIB-CONTENT-OK", "control: the lib_dir is readable")
+
+	// Attack, as a non-whitelisted process: only unguarded names change (the lib_dir's parent and a
+	// new entry in its place). A relative target is not a watch-root path for path_symlink.
+	_, out = s.exec(c, []string{"sh", "-c",
+		"mv /root/app /root/app.old && mkdir /root/app && ln -s ../.ssh /root/app/lib; echo rc=$?; ls -la /root/app"})
+	s.Require().Containsf(out, "rc=0", "the lib_dir's path must be re-pointable by a non-whitelisted process: %s", out)
+
+	// Past at least two sweep ticks (resyncSweepEvery = 30s).
+	for dl := time.Now().Add(75 * time.Second); time.Now().Before(dl); time.Sleep(3 * time.Second) {
+		for _, f := range []string{secret, later} {
+			out = readAs("cat", f)
+			s.Require().NotContainsf(out, marker,
+				"the lib_dir sweep re-anchored onto /root/.ssh and made %s readable to every process: %s\n"+
+					"daemon log:\n%s", f, out, s.readDaemonLog(c))
+		}
+	}
+	for _, f := range []string{secret, later} {
+		s.Require().Containsf(readAs("/tmp/sshw/cat", f), marker, "control: whitelisted cat must still read %s", f)
+	}
+	log := s.readDaemonLog(c)
+	s.Require().Containsf(log, "refusing to re-anchor",
+		"the sweep must have seen and refused the re-pointed root, daemon log:\n%s", log)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

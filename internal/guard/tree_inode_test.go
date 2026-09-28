@@ -44,19 +44,20 @@ func TestReadOnlyTreeInodeDoesNotFollowSymlinks(t *testing.T) {
 	}
 	_, targetIno, _ := ebpf.StatInode(outside)
 
-	_, roIno, err := (&Guard{mode: ModeReadOnly}).treeInode(link)
+	roKey, roLink, err := (&Guard{mode: ModeReadOnly}).treeInode(link)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if roIno == targetIno {
+	if roKey.Ino == targetIno || roLink {
 		t.Errorf("read-only guard recorded the symlink TARGET inode (host library) instead of the link")
 	}
 	// Whitelist (secret) guards keep the historical follow semantics.
-	_, wlIno, err := (&Guard{mode: ModeWhitelist}).treeInode(link)
+	wlKey, wlLink, err := (&Guard{mode: ModeWhitelist}).treeInode(link)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if wlIno != targetIno {
-		t.Errorf("whitelist guard behavior changed: want target inode %d, got %d", targetIno, wlIno)
+	if wlKey.Ino != targetIno || !wlLink {
+		t.Errorf("whitelist guard behavior changed: want target inode %d via link, got %d (link=%v)",
+			targetIno, wlKey.Ino, wlLink)
 	}
 }

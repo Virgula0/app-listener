@@ -152,6 +152,14 @@ type Guard struct {
 	// updateRootKey when a single-file root is recreated (a stale anchor stops guarding the real
 	// file and guards whatever reuses the freed inode). Guarded by mu.
 	rootKey GuardInodeKey
+	// rootReal is where the root path resolved when anchored (d_path); a sweep never re-anchors
+	// onto a root that now resolves elsewhere. anchorRefused: last refused key (log once). Both
+	// guarded by mu.
+	rootReal      string
+	anchorRefused GuardInodeKey
+	// canonicalRoot: the configured path IS its resolved root (no symlink on the way). Decides a
+	// tie between resources anchored on one inode (tieRank); read by other guards' claims.
+	canonicalRoot atomic.Bool
 	// pinPrefix (WithPinning) is the bpffs prefix each LSM link is pinned at (prefix+hook) so
 	// enforcement survives SIGKILL/OOM. Stop() removes pins; CleanupStalePins retires a killed
 	// process's. Cleared if pinning fails mid-attach (pinDegraded).
@@ -369,7 +377,13 @@ func canonicalPaths(entries []BinaryEntry) map[string]string {
 func (g *Guard) startSteps() []func() error {
 	claimRoot := func() error {
 		// populateMaps recorded the root ANCHOR (guard_config[3..4]) but not its guard_inodes row.
-		if err := g.addInode(g.path); err != nil {
+		root, err := g.openAnchoredRoot()
+		if err == nil {
+			key, statPath := g.rootEntry(root)
+			err = sharedEngine.claimInode(g, g.path, statPath, key, false)
+			root.close()
+		}
+		if err != nil {
 			return fmt.Errorf("claiming guard root inode for %s: %w", g.path, err)
 		}
 		return nil
@@ -1057,13 +1071,18 @@ func (g *Guard) populateMaps() error {
 	// Watch root (dev, ino) feeds the BPF root-confinement check (guard_config[3..4]): an entry
 	// only guards an access whose dentry chain reaches this root, so inode reuse elsewhere can't
 	// deny unrelated files.
-	rootDev, rootIno, rootStatErr := ebpf.StatInode(g.path)
-	if rootStatErr != nil {
-		return fmt.Errorf("stating guard root %s: %w", g.path, rootStatErr)
+	root, rootErr := openRoot(g.path)
+	if rootErr != nil {
+		return fmt.Errorf("stating guard root %s: %w", g.path, rootErr)
 	}
-	if rootErr := g.updateRootKey(GuardInodeKey{Dev: rootDev, Ino: rootIno}); rootErr != nil {
-		return rootErr
+	root.close()
+	if keyErr := g.updateRootKey(root.key); keyErr != nil {
+		return keyErr
 	}
+	g.mu.Lock()
+	g.rootReal = root.resolved
+	g.mu.Unlock()
+	g.canonicalRoot.Store(filepath.Clean(g.path) == root.resolved)
 
 	// Validate the path is present before writing policy; the root's guard_inodes row is claimed by
 	// NewGuard AFTER activation (statable even while an encrypted tree is locked).
@@ -1187,32 +1206,52 @@ func (g *Guard) updateRootKey(newKey GuardInodeKey) error {
 	return nil
 }
 
-// treeInode returns the inode a tree walk records for path. Whitelist guards follow symlinks (also
-// guarding an in-tree link's target). Read-only guards (`lib_dir`) must not: trees like Steam's
-// pressure-vessel link into host /usr/lib (would guard system libs, or fail on dangling links and
-// trip the locked-vault heuristic); the link's own entry belongs to the tree.
-func (g *Guard) treeInode(path string) (dev, ino uint64, err error) {
-	if g.mode == ModeReadOnly {
-		return ebpf.LstatInode(path)
+// treeInode returns the inode a tree walk records for path. Whitelist guards follow a symlink entry
+// (viaLink: claimInode then checks where its target physically lies). Read-only guards (`lib_dir`)
+// must not: trees like Steam's pressure-vessel link into host /usr/lib (would guard system libs, or
+// fail on dangling links and trip the locked-vault heuristic); the link's own entry belongs to the
+// tree. The entry is lstat'ed first, so a non-link's key is the entry's own, whatever a racing
+// rename puts there afterwards.
+func (g *Guard) treeInode(path string) (GuardInodeKey, bool, error) {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return GuardInodeKey{}, false, err
 	}
-	return ebpf.StatInode(path)
+	key := GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}
+	if g.mode == ModeReadOnly || st.Mode&unix.S_IFMT != unix.S_IFLNK {
+		return key, false, nil
+	}
+	dev, ino, err := ebpf.StatInode(path)
+	return GuardInodeKey{Dev: dev, Ino: ino}, true, err
 }
 
-func (g *Guard) addInode(path string) error {
-	dev, ino, err := g.treeInode(path)
+// addInode claims the entry at statPath (below a pinned root's proc path) as logical path.
+func (g *Guard) addInode(statPath, path string) error {
+	key, viaLink, err := g.treeInode(statPath)
 	if err != nil {
 		return err
 	}
-
-	key := GuardInodeKey{
-		Dev: dev,
-		Ino: ino,
-	}
-
-	if err := sharedEngine.claimInode(g, path, key); err != nil {
+	if err := sharedEngine.claimInode(g, path, statPath, key, viaLink); err != nil {
 		return fmt.Errorf("adding inode %s to map: %w", path, err)
 	}
 	return nil
+}
+
+// openAnchoredRoot pins the root and requires it to still be the anchored one.
+func (g *Guard) openAnchoredRoot() (*rootHandle, error) {
+	root, err := openRoot(g.path)
+	if err != nil {
+		return nil, fmt.Errorf("stating guarded path %s: %w", g.path, err)
+	}
+	g.mu.Lock()
+	key, resolved := g.rootKey, g.rootReal
+	g.mu.Unlock()
+	if root.key != key || root.resolved != resolved {
+		root.close()
+		return nil, fmt.Errorf("guard root %s changed since it was anchored (was %s inode %d, now %s inode %d)",
+			g.path, resolved, key.Ino, root.resolved, root.key.Ino)
+	}
+	return root, nil
 }
 
 // PopulateInodes fills guard_inodes with every file/dir under the path; run once the path is
@@ -1220,35 +1259,56 @@ func (g *Guard) addInode(path string) error {
 // meanwhile). Tolerant (see walkInodes): degraded coverage weakens rename/unlink/mmap precision,
 // not open/read.
 func (g *Guard) PopulateInodes() error {
-	info, statErr := os.Stat(g.path)
-	if statErr != nil {
-		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)
-	}
-	if info.IsDir() {
-		if scanErr := g.scanDirInodes(g.path, 0); scanErr != nil {
-			return scanErr
-		}
-	} else {
-		if addErr := g.addInode(g.path); addErr != nil {
-			return addErr
-		}
-	}
-	return nil
-}
-
-func (g *Guard) scanDirInodes(dir string, currentDepth int) error {
-	return walkInodes(dir, g.recursive, g.depth, currentDepth, g.addInode)
-}
-
-// reanchorRoot moves the root identity from oldKey to newKey: rescan via the caller-chosen scan
-// (addInode for a file, scanDirInodes for a dir), move the guard_config[3..4] anchor and g.rootKey,
-// then evict oldKey. A stale anchor would stop guarding the recreated resource and deny whatever
-// reuses the freed inode number.
-func (g *Guard) reanchorRoot(oldKey, newKey GuardInodeKey, rescan func() error) error {
-	if err := rescan(); err != nil {
+	root, err := g.openAnchoredRoot()
+	if err != nil {
 		return err
 	}
-	if err := g.updateRootKey(newKey); err != nil {
+	defer root.close()
+	return g.scanRoot(root)
+}
+
+// rootEntry returns the root's own guard_inodes row and where to stat it: the anchor, except that
+// a read-only root which is a symlink records the link, as treeInode does for any entry.
+func (g *Guard) rootEntry(root *rootHandle) (key GuardInodeKey, statPath string) {
+	var st unix.Stat_t
+	if g.mode == ModeReadOnly && unix.Lstat(g.path, &st) == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}, g.path
+	}
+	return root.key, root.proc
+}
+
+// scanRoot claims root and, for a directory, the tree below it, walking through root's fd. A guard
+// outranked on a shared root claims nothing: the tree is the other resource's.
+func (g *Guard) scanRoot(root *rootHandle) error {
+	if rival := sharedEngine.outrankedOnRoot(g, root.key); rival != "" {
+		log.Errorf("guard %s: CRITICAL: its root is the same directory as resource %s, reached through a "+
+			"symlink — not scanning it; fix the path and reload the daemon", g.path, rival)
+		return nil
+	}
+	key, statPath := g.rootEntry(root)
+	if err := sharedEngine.claimInode(g, g.path, statPath, key, false); err != nil {
+		return fmt.Errorf("adding inode %s to map: %w", g.path, err)
+	}
+	if !root.dir {
+		return nil
+	}
+	add := func(p string) error {
+		if p == root.proc {
+			return nil // claimed above: the proc path itself is the magic link, not the tree
+		}
+		return g.addInode(p, root.logical(g.path, p))
+	}
+	return walkInodes(root.proc, g.recursive, g.depth, 0, add)
+}
+
+// reanchorRoot moves the root identity from oldKey to the pinned root: rescan through it, move the
+// guard_config[3..4] anchor and g.rootKey, then evict oldKey. A stale anchor would stop guarding
+// the recreated resource and deny whatever reuses the freed inode number.
+func (g *Guard) reanchorRoot(oldKey GuardInodeKey, root *rootHandle) error {
+	if err := g.scanRoot(root); err != nil {
+		return err
+	}
+	if err := g.updateRootKey(root.key); err != nil {
 		return err
 	}
 	if delErr := g.objs().GuardInodes.Delete(oldKey); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {
@@ -1257,70 +1317,72 @@ func (g *Guard) reanchorRoot(oldKey, newKey GuardInodeKey, rescan func() error) 
 	return nil
 }
 
-// sweepDirRootRecreated checks whether a directory root itself was deleted and recreated (new
-// inode: fscrypt migration, backup restore, app rebuild), not just a top-level entry change. Runs
-// ahead of the mtime/dirRescanMinGap throttle, which must never delay it. Reports whether it
-// handled this tick (repaired), so SweepInodes skips the mtime re-scan.
-func (g *Guard) sweepDirRootRecreated(info os.FileInfo) (bool, error) {
-	dev, ino, statErr := ebpf.StatInode(g.path)
-	if statErr != nil {
-		return false, statErr
+// reanchorRefusal says why the root may not move from oldKey to root, "" if it may. A recreated
+// root (fscrypt migration, backup restore, app rebuild) keeps its path, filesystem and is nobody
+// else's; a root path re-pointed through an unguarded ancestor or a symlink would otherwise take
+// over whatever it now names (another resource's tree, rows and all).
+func (g *Guard) reanchorRefusal(oldKey GuardInodeKey, root *rootHandle, resolved string) string {
+	switch {
+	case root.resolved != resolved:
+		return fmt.Sprintf("it now resolves to %s instead of %s", root.resolved, resolved)
+	case root.key.Dev != oldKey.Dev:
+		return "it moved to another filesystem"
 	}
-	newKey := GuardInodeKey{Dev: dev, Ino: ino}
+	if owner := sharedEngine.liveOwner(g.resID, root.key); owner != 0 {
+		return fmt.Sprintf("its inode belongs to resource %d", owner)
+	}
+	return ""
+}
+
+// sweepRoot re-anchors a root whose inode changed. handled: the sweep must not re-scan by mtime
+// this tick (re-anchored, or refused: a refused root's path names a tree that is not ours).
+func (g *Guard) sweepRoot(root *rootHandle) (handled bool, err error) {
 	g.mu.Lock()
-	oldKey := g.rootKey
+	oldKey, resolved, refused := g.rootKey, g.rootReal, g.anchorRefused
 	g.mu.Unlock()
-	if newKey == oldKey {
+	if root.key == oldKey && root.resolved == resolved {
 		return false, nil
 	}
-
+	if why := g.reanchorRefusal(oldKey, root, resolved); why != "" {
+		if refused != root.key {
+			log.Errorf("guard %s: CRITICAL: refusing to re-anchor the guard root: %s. Keeping the old "+
+				"anchor; restore the path or reload the daemon after verifying it", g.path, why)
+			g.mu.Lock()
+			g.anchorRefused = root.key
+			g.mu.Unlock()
+		}
+		return true, nil
+	}
 	// The whole subtree is new (new inodes even for same names): re-scan fully, including the
 	// root's entry, before moving the anchor. Stale non-root entries age out via inode GC.
-	if err := g.reanchorRoot(oldKey, newKey, func() error { return g.scanDirInodes(g.path, 0) }); err != nil {
-		return false, err
-	}
-	now := time.Now()
-	g.mu.Lock()
-	g.sweepRootMtime = info.ModTime()
-	g.sweepLastFull = now
-	g.mu.Unlock()
-	return true, nil
+	return true, g.reanchorRoot(oldKey, root)
 }
 
 // SweepInodes is the cheap periodic refresh of guard_inodes (a full re-walk per tick cost ~14%
 // daemon CPU):
-//   - single-file root: re-map only when its inode changed;
-//   - directory root: first, unthrottled, check whether the directory itself was recreated and
-//     re-anchor; then re-scan the top level only if the dir mtime moved. Deeper additions are
-//     covered by the path_mkdir hook and the ancestor walk.
+//   - root whose inode changed (deleted and recreated): re-anchor, unthrottled, unless the path
+//     now names something else (reanchorRefusal);
+//   - directory root: otherwise re-scan the top level only if the dir mtime moved. Deeper
+//     additions are covered by the path_mkdir hook and the ancestor walk.
 func (g *Guard) SweepInodes() error {
-	info, err := os.Stat(g.path)
+	root, err := openRoot(g.path)
 	if err != nil {
 		return fmt.Errorf("stating guarded path %s: %w", g.path, err)
 	}
+	defer root.close()
 
-	if !info.IsDir() {
-		dev, ino, statErr := ebpf.StatInode(g.path)
-		if statErr != nil {
-			return statErr
+	if handled, anchorErr := g.sweepRoot(root); anchorErr != nil || handled || !root.dir {
+		if handled && anchorErr == nil && root.dir {
+			g.markSwept(root)
 		}
-		newKey := GuardInodeKey{Dev: dev, Ino: ino}
-		g.mu.Lock()
-		oldKey := g.rootKey
-		g.mu.Unlock()
-		if newKey == oldKey {
-			return nil
-		}
-		// Root was deleted and recreated with a new inode: reanchorRoot moves protection (a stale
-		// anchor is dangerous, see its doc).
-		return g.reanchorRoot(oldKey, newKey, func() error { return g.addInode(g.path) })
+		return anchorErr
 	}
 
-	if handled, recreateErr := g.sweepDirRootRecreated(info); recreateErr != nil || handled {
-		return recreateErr
+	var st unix.Stat_t
+	if statErr := unix.Fstat(root.fd, &st); statErr != nil {
+		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)
 	}
-
-	mtime := info.ModTime()
+	mtime := time.Unix(st.Mtim.Unix())
 	g.mu.Lock()
 	// Re-walk only when a top-level entry changed, and no more often than dirRescanMinGap; new
 	// subtrees meanwhile are covered by path_mkdir and the ancestor walk.
@@ -1329,15 +1391,23 @@ func (g *Guard) SweepInodes() error {
 	if skip {
 		return nil
 	}
-	if scanErr := g.scanDirInodes(g.path, 0); scanErr != nil {
+	if scanErr := g.scanRoot(root); scanErr != nil {
 		return scanErr
+	}
+	g.markSwept(root)
+	return nil
+}
+
+func (g *Guard) markSwept(root *rootHandle) {
+	var st unix.Stat_t
+	if unix.Fstat(root.fd, &st) != nil {
+		return
 	}
 	now := time.Now()
 	g.mu.Lock()
-	g.sweepRootMtime = mtime
+	g.sweepRootMtime = time.Unix(st.Mtim.Unix())
 	g.sweepLastFull = now
 	g.mu.Unlock()
-	return nil
 }
 
 const dirRescanMinGap = 5 * time.Minute
@@ -1446,30 +1516,32 @@ func walkLiveEntries(root string, recursive bool, depthLimit int, add func(strin
 }
 
 // liveInodeKeys stats the guarded tree now, for ReconcileInodes to diff against guard_inodes.
-// Errors whenever the walk can't be trusted as complete, collecting nothing.
+// Errors whenever the walk can't be trusted as complete, collecting nothing — including when the
+// root path no longer names the anchored root (it would judge our rows against another tree).
 func (g *Guard) liveInodeKeys() (map[GuardInodeKey]struct{}, error) {
-	live := make(map[GuardInodeKey]struct{})
+	root, err := g.openAnchoredRoot()
+	if err != nil {
+		return nil, err
+	}
+	defer root.close()
+	entry, _ := g.rootEntry(root)
+	live := map[GuardInodeKey]struct{}{root.key: {}, entry: {}}
+	if !root.dir {
+		return live, nil
+	}
 	collect := func(path string) error {
+		if path == root.proc {
+			return nil
+		}
 		// Same stat flavor as addInode: populate and reconcile must agree on each path's inode.
-		dev, ino, err := g.treeInode(path)
+		key, _, err := g.treeInode(path)
 		if err != nil {
 			return err
 		}
-		live[GuardInodeKey{Dev: dev, Ino: ino}] = struct{}{}
+		live[key] = struct{}{}
 		return nil
 	}
-
-	info, err := os.Stat(g.path)
-	if err != nil {
-		return nil, fmt.Errorf("stating guarded path %s: %w", g.path, err)
-	}
-	if !info.IsDir() {
-		if err := collect(g.path); err != nil {
-			return nil, fmt.Errorf("collecting root inode %s: %w", g.path, err)
-		}
-		return live, nil
-	}
-	if err := walkLiveEntries(g.path, g.recursive, g.depth, collect); err != nil {
+	if err := walkLiveEntries(root.proc, g.recursive, g.depth, collect); err != nil {
 		return nil, err
 	}
 	return live, nil
