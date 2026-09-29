@@ -722,6 +722,62 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: only the wildcard component of a lib dir glob is reserved, so inside a Proton* dir that
+// lacks files/lib (the EasyAntiCheat runtime, old dist layouts) a non-writer creates the fixed tail,
+// and the unattended refresh adopts it as a lib dir Steam's writers load from.
+func (s *IntegrationSuite) TestDaemon_Bypass_WildcardLibDirTailPlanted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.installFakeSystemctl(c)
+
+	const (
+		helper  = steamDir + "/ubuntu12_64/steamwebhelper"
+		eac     = steamCommon + "/Proton_EasyAntiCheat_Runtime"
+		plant   = eac + "/files/lib/evil.so"
+		proton  = steamCommon + "/Proton_9.0/files/lib"
+		shipped = proton + "/libwine.so"
+	)
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), libProbe, 0o755),
+		"copy lib_probe.so")
+	// Steam's Proton installs predate the daemon, handed to nobody so they aren't auto-trusted. No
+	// spaces in the names: LD_PRELOAD splits on them, and the probe would never load either way.
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /etc/app-listener " + steamDir + "/config " + steamDir + "/ubuntu12_64 " +
+			shQuote(eac) + " " + shQuote(proton) +
+			" && cp /usr/bin/dash " + helper + " && cp " + libProbe + " " + shQuote(shipped) +
+			" && chown -R 65534 " + steamCommon +
+			" && head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+	s.startDaemon(c, `[watch `+steamDir+`/config]
+need_encryption: false
+`+helper)
+
+	// Attack: may be refused outright (the fix reserves the tail); the outcome is what counts.
+	_, attack := s.exec(c, []string{"sh", "-c",
+		"mkdir -p " + shQuote(eac+"/files/lib") + " && cp " + libProbe + " " + shQuote(plant) +
+			" && chown -R 65534 " + shQuote(eac+"/files") + " 2>&1; echo rc=$?"})
+	loaded, out := s.preload(c, helper, plant)
+	s.Require().Falsef(loaded, "baseline: the plant must not load before the refresh: %s", out)
+
+	code, refresh := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	if code == 0 {
+		s.awaitLog(c, "configuration reloaded", 60*time.Second)
+	}
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+
+	loaded, out = s.preload(c, helper, plant)
+	s.Require().Falsef(loaded,
+		"a lib dir tail a non-writer created under a Proton* dir was adopted by the unattended refresh and "+
+			"its library loaded into steamwebhelper: %s\nattack: %s\nrefresh (exit %d):\n%s\ndaemon.conf:\n%s",
+		out, attack, code, refresh, conf)
+
+	// Controls: Steam's own Proton lib dir is adopted and its library loads into Steam.
+	s.Require().Containsf(conf, `lib_dir "`+proton+`"`, "the genuine Proton lib dir must be adopted:\n%s", conf)
+	loaded, out = s.preload(c, helper, shipped)
+	s.Require().Truef(loaded, "control: Steam must load its Proton library: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Bypass: every resource shares one guard_inodes map with one owner per inode. A read-only
 // lib_dir's periodic sweep re-stats its root path through symlinks, so once a same-user process
 // makes that path resolve to another resource's directory, the sweep re-anchors onto it and claims

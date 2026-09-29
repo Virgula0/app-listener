@@ -783,3 +783,18 @@ func TestSteamLibDirsCoverProtonCodeOnly(t *testing.T) {
 		t.Errorf("linux32 must be a lib_dir (the overlay loads linux32/steamclient.so)")
 	}
 }
+
+// The daemon reserves a lib dir glob's tail as exact names (reserveLibDirTail): a second wildcard
+// there could not be reserved, leaving a creatable component the refresh would adopt.
+func TestCatalogLibDirGlobsHaveOneWildcard(t *testing.T) {
+	for i := range Catalog {
+		for _, g := range Catalog[i].LibDirGlobs("u", "/home/u") {
+			for _, c := range g.Tail {
+				if strings.ContainsAny(c, "*?[") {
+					t.Errorf("%s: lib dir %s/%s/%s has a wildcard after the first", Catalog[i].Name, g.Root(),
+						g.Name, strings.Join(g.Tail, "/"))
+				}
+			}
+		}
+	}
+}

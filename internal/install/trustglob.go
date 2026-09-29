@@ -17,6 +17,12 @@ type TrustGlob struct {
 	Lib   bool
 }
 
+// LibDirGlob is a LibDirGlobs pattern: Tail holds its components after the wildcard Name.
+type LibDirGlob struct {
+	TrustGlob
+	Tail []string
+}
+
 // Root is the glob's leading wildcard-free directory.
 func (g TrustGlob) Root() string {
 	return filepath.Join(append([]string{g.Home}, g.Fixed...)...)
@@ -75,15 +81,16 @@ func (c *CandidateDir) ReservedLibGlobs(user, home string) []TrustGlob {
 }
 
 // LibDirGlobs returns, for each wildcarded %HOME%-relative LibDirRelPaths pattern, its first
-// wildcard component as the reserved Name below the fixed prefix: the catalog refresh guards every
-// new match, so only the entry's writers may create one (and nothing planted predates the guard).
-func (c *CandidateDir) LibDirGlobs(user, home string) []TrustGlob {
-	var out []TrustGlob
+// wildcard component as the reserved Name below the fixed prefix and the rest as Tail: the catalog
+// refresh guards every new match, so only the entry's writers may create one (and nothing planted
+// predates the guard).
+func (c *CandidateDir) LibDirGlobs(user, home string) []LibDirGlob {
+	var out []LibDirGlob
 	for _, rel := range c.LibDirRelPaths {
 		parts := strings.Split(expandPlaceholders(rel, user, home), "/")
 		for i, part := range parts {
 			if strings.ContainsAny(part, "*?[") {
-				out = append(out, TrustGlob{Home: home, Fixed: parts[:i], Name: part})
+				out = append(out, LibDirGlob{TrustGlob{Home: home, Fixed: parts[:i], Name: part}, parts[i+1:]})
 				break
 			}
 		}

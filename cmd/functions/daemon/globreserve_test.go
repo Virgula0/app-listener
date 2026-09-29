@@ -382,3 +382,34 @@ func TestBuildGlobReservations_BunRootsListed(t *testing.T) {
 		t.Errorf("only the user with a reserved Bun tmp dir must be vetted: %+v", bun)
 	}
 }
+
+// Only Proton* is reserved at the root: inside a match lacking files/lib (the EasyAntiCheat
+// runtime) the tail must be reserved too, or a non-writer creates it and the refresh adopts it.
+func TestBuildGlobReservations_WildcardLibDirTail(t *testing.T) {
+	home := t.TempDir()
+	steam := filepath.Join(home, ".local/share/Steam")
+	common := filepath.Join(steam, "steamapps/common")
+	eac := filepath.Join(common, "Proton EasyAntiCheat Runtime")
+	proton := filepath.Join(common, "Proton 9.0")
+	game := filepath.Join(common, "SomeGame")
+	mkdirs(t, filepath.Join(steam, "config"), eac, filepath.Join(proton, "files/lib"), game)
+	cfg, client := steamLibDirConfig(home)
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+
+	bit := bitOf(t, r, "ubuntu12_32")
+	for _, c := range [][2]string{
+		{eac, "files"}, {proton, "files"}, {filepath.Join(proton, "files"), "lib"},
+	} {
+		if !hasChild(r, c[0], c[1], bit) {
+			t.Errorf("%s/%s must be reserved for Steam's writers: %+v", c[0], c[1], r.Children)
+		}
+	}
+	for _, c := range r.Children {
+		if c.Parent == filepath.Join(eac, "files") || c.Parent == game {
+			t.Errorf("reserved %s/%s: below a missing dir or outside every Proton* match", c.Parent, c.Name)
+		}
+	}
+	if r.Writers[client]&bit == 0 {
+		t.Errorf("the Steam client must be a writer of the Proton tails: %v", r.Writers)
+	}
+}

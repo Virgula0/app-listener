@@ -61,10 +61,11 @@ func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
 	for _, g := range e.TrustGlobs(u.Name, u.Home) {
 		b.reserve(g, g.Name, writers)
 	}
-	for _, g := range e.LibDirGlobs(u.Name, u.Home) {
-		b.reserve(g, g.Name, writers)
-	}
 	b.reserveFixedLibDirs(e, u, writers)
+	for _, g := range e.LibDirGlobs(u.Name, u.Home) {
+		b.reserve(g.TrustGlob, g.Name, writers)
+		b.reserveLibDirTail(e, &g, writers)
+	}
 	for _, g := range e.FixedBinaryGlobs(u.Name, u.Home) {
 		b.reserve(g, g.Name, writers)
 		if t, ok := symlinkTargetGlob(g); ok {
@@ -121,34 +122,68 @@ func (b *globBuilder) reserveBunTmp(u install.User) {
 // its path for e's writers: the catalog refresh adopts such a dir once it exists and trusts what it
 // holds for those writers, so a non-writer must not create it (or recreate it after an rmdir).
 // Exact children, not a root: a root reserves at any depth, and would make every game dir named
-// linux64 below steamapps writer-only. One bit per entry; its pattern name matches no root.
+// linux64 below steamapps writer-only.
 func (b *globBuilder) reserveFixedLibDirs(e *install.CandidateDir, u install.User, writers []string) {
 	dirs := e.FixedLibDirs(u.Name, u.Home)
 	if len(dirs) == 0 {
 		return
 	}
-	mask := b.bit(e.Name+"\x00libdirs", dirs[0][len(dirs[0])-1])
+	mask := b.libDirBit(e, dirs[0][len(dirs[0])-1], writers)
 	for _, comps := range dirs {
-		dir := u.Home
-		for _, c := range comps {
-			if underResource(b.cfg, dir) {
-				break // that resource's guard already gates creating anything below it
-			}
-			if _, _, ok := guard.ParseGlobName(c); !ok {
-				log.Warnf("trust guard: lib dir component %q below %s cannot be reserved; a same-user process "+
-					"could create it and the catalog refresh would trust its libraries", c, dir)
-				break
-			}
-			b.children[[2]string{dir, c}] |= mask
-			next := filepath.Join(dir, c)
-			if fi, err := os.Stat(next); err != nil || !fi.IsDir() {
-				break
-			}
-			dir = next
+		b.reserveExactPath(u.Home, comps, mask)
+	}
+}
+
+// reserveLibDirTail reserves g's fixed tail (Proton*/files/lib) below every existing match of its
+// wildcard, as for a fixed lib dir: the root reserves only the wildcard name, so in a match lacking
+// the tail a non-writer could create it and the refresh would adopt the plant. A match made after
+// this reload is covered from the next one.
+func (b *globBuilder) reserveLibDirTail(e *install.CandidateDir, g *install.LibDirGlob, writers []string) {
+	if len(g.Tail) == 0 {
+		return
+	}
+	matches, err := filepath.Glob(filepath.Join(g.Root(), g.Name))
+	if err != nil {
+		log.Warnf("trust guard: lib dir pattern %s/%s is malformed (%v); its tail is not reserved", g.Root(),
+			g.Name, err)
+		return
+	}
+	mask := b.libDirBit(e, g.Tail[len(g.Tail)-1], writers)
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && fi.IsDir() {
+			b.reserveExactPath(m, g.Tail, mask)
 		}
 	}
+}
+
+// libDirBit is e's lib dir bit, granted to writers. One bit per entry; its pattern name matches no
+// root, so it reserves only exact children.
+func (b *globBuilder) libDirBit(e *install.CandidateDir, name string, writers []string) uint64 {
+	mask := b.bit(e.Name+"\x00libdirs", name)
 	for _, w := range writers {
 		b.r.Writers[w] |= mask
+	}
+	return mask
+}
+
+// reserveExactPath reserves comps below dir as exact children, each in its parent, up to and
+// including the first one missing.
+func (b *globBuilder) reserveExactPath(dir string, comps []string, mask uint64) {
+	for _, c := range comps {
+		if underResource(b.cfg, dir) {
+			return // that resource's guard already gates creating anything below it
+		}
+		if _, _, ok := guard.ParseGlobName(c); !ok || strings.ContainsAny(c, "*?[") {
+			log.Warnf("trust guard: lib dir component %q below %s cannot be reserved; a same-user process "+
+				"could create it and the catalog refresh would trust its libraries", c, dir)
+			return
+		}
+		b.children[[2]string{dir, c}] |= mask
+		next := filepath.Join(dir, c)
+		if fi, err := os.Stat(next); err != nil || !fi.IsDir() {
+			return
+		}
+		dir = next
 	}
 }
 
