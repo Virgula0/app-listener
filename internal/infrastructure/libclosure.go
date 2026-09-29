@@ -93,8 +93,7 @@ func rootOwnedInode(path string) error {
 // whitelisted binary.
 //
 // Deliberately NOT complete: dlopen'd libraries (NSS, gconv, GL drivers, plugins) are invisible
-// here and must come from allow_lib. The result is the automatic base the daemon trusts for every
-// whitelisted binary (libc, the loader) so operators needn't list them.
+// here. Only members passing rootOwnedSafe are returned, i.e. those the kernel system-trusts.
 //
 // Empty closure, no error, for: a statically linked binary (no INTERP/dynamic section); a script
 // (#!), which runs as its interpreter, a separate binary resolved on its own; an ELF for an
@@ -105,8 +104,9 @@ func ResolveLibraryClosure(binaryPath string) ([]string, error) {
 	return trusted, err
 }
 
-// LibraryClosure is ResolveLibraryClosure plus the closure members it refused to auto-trust, with
-// why. The kernel may still accept those (guarded tree, reserved name); the caller decides.
+// LibraryClosure is ResolveLibraryClosure plus the members that fail rootOwnedSafe, with why. The
+// daemon uses only the refusals, to warn: trust_mmap may still accept them (guarded tree, reserved
+// name). Paths are unresolved, so never feed them to a path-keyed trust decision.
 func LibraryClosure(binaryPath string) (trusted []string, rejected map[string]error, err error) {
 	if isScript(binaryPath) {
 		return nil, nil, nil
@@ -131,12 +131,8 @@ func LibraryClosure(binaryPath string) (trusted []string, rejected map[string]er
 	visited := make(map[string]bool)
 	walkNeeded(binaryPath, f, out, visited)
 
-	// Trust only root-owned, non-user-writable libraries. The resolved set is fed to the daemon-wide
-	// TRUSTED_LIB map, an unconditional pass in trust_mmap, so a library reachable through the
-	// binary's own RPATH/$ORIGIN under a user-writable directory (many catalog apps live in $HOME and
-	// ship RUNPATH=$ORIGIN) would otherwise let same-user malware plant an LD_PRELOAD payload that
-	// gets trusted into every whitelisted process. This mirrors the kernel's is_system_trusted
-	// auto-trust rule; a legitimate non-root library must be listed via allow_lib after review.
+	// Split by the kernel's is_system_trusted rule: RPATH/$ORIGIN often resolves into a user-writable
+	// $HOME dir, where a planted library must never count as system-trusted.
 	trusted = make([]string, 0, len(out))
 	for p := range out {
 		if rerr := rootOwnedSafe(p); rerr != nil {

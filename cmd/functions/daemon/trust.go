@@ -17,8 +17,10 @@ import (
 
 // buildTrustedSet computes the daemon-wide trusted sets from the config:
 //   - binaries: every whitelisted binary (TRUSTED_BINARY);
-//   - libs: each binary's static library closure, the allow_lib entries and /etc/ld.so.preload
-//     (TRUSTED_LIB);
+//   - libs: the allow_lib entries and /etc/ld.so.preload (TRUSTED_LIB). Never the static library
+//     closure: its members that pass rootOwnedSafe are system-trusted by the kernel anyway, and
+//     SetTrusted re-stats the unresolved path, so a symlink in a user-writable RPATH dir re-pointed
+//     after the check would make a user-owned inode TRUSTED_LIB;
 //   - dirs: every guarded resource root, so libraries inside those write-protected trees are
 //     trusted without allow_lib (a read-only lib_dir only for its own writers).
 //
@@ -59,9 +61,7 @@ func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs []string, dirs []
 		libSet[l] = struct{}{}
 	}
 
-	// Static dependency closure of every whitelisted binary (the auto part the
-	// operator never has to list).
-	rejected = addLibraryClosures(binSet, libSet)
+	rejected = closureRejections(binSet)
 
 	// Global force-preloads: everything in /etc/ld.so.preload is loaded into
 	// every dynamically linked process and must be trusted.
@@ -91,18 +91,15 @@ func trustedDirOf(res *daemonconfig.Resource) guard.TrustedDir {
 	return d
 }
 
-// addLibraryClosures adds every binary's auto-trustable library closure to libSet and returns the
-// members it refused.
-func addLibraryClosures(binSet, libSet map[string]struct{}) map[string]*libRejection {
+// closureRejections maps each closure library the kernel won't system-trust to why and to the
+// binaries loading it. Only for warnUntrustedLibs: no closure member enters the trusted set.
+func closureRejections(binSet map[string]struct{}) map[string]*libRejection {
 	rejected := make(map[string]*libRejection)
 	for b := range binSet {
-		closure, refused, err := ebpf.LibraryClosure(b)
+		_, refused, err := libraryClosure(b)
 		if err != nil {
 			log.Warnf("trust guard: could not resolve library closure of %s: %v", b, err)
 			continue
-		}
-		for _, l := range closure {
-			libSet[l] = struct{}{}
 		}
 		for l, why := range refused {
 			if rejected[l] == nil {
@@ -113,6 +110,8 @@ func addLibraryClosures(binSet, libSet map[string]struct{}) map[string]*libRejec
 	}
 	return rejected
 }
+
+var libraryClosure = ebpf.LibraryClosure
 
 type libRejection struct {
 	why  error

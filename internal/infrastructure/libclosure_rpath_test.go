@@ -9,20 +9,8 @@ import (
 	"testing"
 )
 
-// ResolveLibraryClosure feeds the daemon-wide trusted-library set (guard_trusted_files,
-// TRUSTED_LIB), and TRUSTED_LIB is an unconditional pass in trust_mmap — the check that is supposed
-// to stop LD_PRELOAD of attacker code into a whitelisted process. The closure resolves DT_NEEDED
-// using the binary's OWN DT_RPATH/DT_RUNPATH with $ORIGIN expanded, searched BEFORE the system
-// directories, and filters nothing by ownership.
-//
-// Many whitelisted binaries in the catalog live in user-writable, unguarded directories
-// (~/.config/discord/*/Discord, ~/.local/bin/*, ~/.foundry/bin/*) and ship RUNPATH=$ORIGIN, so a
-// same-user attacker who drops a .so beside such a binary gets its inode admitted to the trusted
-// set — and the set is daemon-wide, so it is then loadable into /usr/bin/ssh too.
-//
-// The closure must apply the same rule the kernel side uses for auto-trust (is_system_trusted):
-// root-owned and not writable by a normal user. Anything else has to be an explicit, reviewed
-// allow_lib.
+// RUNPATH=$ORIGIN often points into a user-writable $HOME dir: a library planted there must be
+// refused (warnUntrustedLibs), never classed as system-trusted.
 func TestResolveLibraryClosureRejectsUserWritableOriginDir(t *testing.T) {
 	gcc, err := exec.LookPath("gcc")
 	if err != nil {
@@ -63,8 +51,7 @@ func TestResolveLibraryClosureRejectsUserWritableOriginDir(t *testing.T) {
 	}
 
 	if slices.Contains(closure, rogueLib) {
-		t.Fatalf("closure trusts a library from a user-writable $ORIGIN directory: %s\n"+
-			"it would be added daemon-wide as TRUSTED_LIB and become loadable into every "+
-			"whitelisted binary\nfull closure: %v", rogueLib, closure)
+		t.Fatalf("closure classes a library from a user-writable $ORIGIN directory as system-trusted: "+
+			"%s\nfull closure: %v", rogueLib, closure)
 	}
 }
