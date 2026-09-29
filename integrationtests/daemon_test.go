@@ -838,6 +838,48 @@ need_encryption: false
 	s.Require().Equal("32", strings.TrimSpace(keyLen), "fscrypt.key was modified or the guard never detached")
 }
 
+// Bypass: guard_fs_sbdevs gates the ancestor walk per filesystem, and a failed insert only warned.
+// With more guarded filesystems than it holds, a file whose inode and parent have no guard_inodes
+// row (a dir a whitelisted app moved in) was "not guarded" for rename: moved out, it reads freely.
+// Every resource's filesystem is a tmpfs of its own, beside the daemon's /etc self-guard.
+func (s *IntegrationSuite) TestDaemon_Bypass_FsDeviceGateFull() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const n = 9
+	var setup, config strings.Builder
+	setup.WriteString("mkdir -p /etc/app-listener /tmp/w && cp /usr/bin/mv /tmp/w/mv")
+	for i := 1; i <= n; i++ {
+		m := fmt.Sprintf("/m%d", i)
+		fmt.Fprintf(&setup, " && mkdir -p %[1]s && mount -t tmpfs tmpfs %[1]s && mkdir -p %[1]s/w %[1]s/out "+
+			"%[1]s/stage/a/b/c && printf 'FSGATE-SECRET-%[2]d' > %[1]s/stage/a/b/c/secret && "+
+			"printf 'FSGATE-PRE-%[2]d' > %[1]s/w/pre.txt", m, i)
+		fmt.Fprintf(&config, "[watch %s/w]\nneed_encryption: false\n/tmp/w/mv\n\n", m)
+	}
+	code, out := s.exec(c, []string{"sh", "-c", setup.String()})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, config.String())
+
+	for i := 1; i <= n; i++ {
+		m := fmt.Sprintf("/m%d", i)
+		_, out = s.exec(c, []string{"sh", "-c", "cat " + m + "/w/pre.txt 2>&1; echo rc=$?"})
+		s.Require().NotContainsf(out, fmt.Sprintf("FSGATE-PRE-%d", i), "baseline: %s/w is guarded", m)
+		// Same-fs rename, not a copy: a copy's mkdir/open would map every level via discovery.
+		code, out = s.exec(c, []string{"sh", "-c", "/tmp/w/mv " + m + "/stage/a " + m + "/w/a 2>&1; echo rc=$?"})
+		s.Require().Containsf(out, "rc=0", "fixture: the whitelisted mv must move the tree in: %s", out)
+	}
+	for i := 1; i <= n; i++ {
+		m := fmt.Sprintf("/m%d", i)
+		_, out = s.exec(c, []string{"sh", "-c", "mv " + m + "/w/a/b/c/secret " + m + "/out/secret 2>&1; echo mv_rc=$?; " +
+			"cat " + m + "/out/secret " + m + "/w/a/b/c/secret 2>&1; echo cat_rc=$?"})
+		s.Require().NotContainsf(out, fmt.Sprintf("FSGATE-SECRET-%d", i),
+			"%s: a non-whitelisted mv took a guarded file out of the tree and cat read it: %s\ndaemon log:\n%s",
+			m, out, s.readDaemonLog(c))
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // The raw block-device gate is daemon-wide and device-granular. Two resources (/mnt/data/guardedA,
 // guardedB) share one backing device (loop-mounted ext4 at /mnt/data). The gate must:
 //   - be stamped ONCE ("blocking raw access to backing block device" appears once);

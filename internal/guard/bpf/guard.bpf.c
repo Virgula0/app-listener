@@ -201,7 +201,8 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8);
+	// Shared by every resource and never pruned; a guard whose device doesn't fit fails to build.
+	__uint(max_entries, 256);
 	__type(key, __u64);  // filesystem device (sb->s_dev) of the guarded path
 	__type(value, __u8);
 } guard_fs_sbdevs SEC(".maps");

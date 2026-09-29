@@ -1116,7 +1116,7 @@ func (g *Guard) populateMaps() error {
 		log.Warnf("backing block device detection: %v", err)
 	}
 	if err := g.addFsDeviceGate(); err != nil {
-		log.Warnf("filesystem device gate: %v", err)
+		return fmt.Errorf("filesystem device gate: %w", err)
 	}
 
 	return nil
@@ -1124,8 +1124,8 @@ func (g *Guard) populateMaps() error {
 
 // addFsDeviceGate records the path's fs device in guard_fs_sbdevs so the ancestor walk skips other
 // filesystems in one lookup (st_dev == i_sb->s_dev on all fs types, incl. anon
-// tmpfs/overlayfs/btrfs). Must be unconditional: an empty map disables the walk and exposes deeper
-// content.
+// tmpfs/overlayfs/btrfs). Must not fail open: without its device the walk answers "not guarded" on
+// the whole filesystem, so rename/unlink/stat of an unmapped inode below the root go unchecked.
 func (g *Guard) addFsDeviceGate() error {
 	var s syscall.Stat_t
 	if err := syscall.Stat(g.path, &s); err != nil {
