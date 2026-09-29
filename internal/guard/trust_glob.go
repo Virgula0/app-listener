@@ -99,15 +99,17 @@ func compileGlobNames(patterns []string) (map[GuardTrustGlobNameKey]uint64, []Gu
 }
 
 // resolveBits stats every path and ORs its bits under the inode key; unresolvable paths are skipped.
-func resolveBits(paths map[string]uint64) map[GuardTrustInodeKey]uint64 {
+func resolveBits(paths map[string]uint64, stat statFunc) map[GuardTrustInodeKey]uint64 {
 	out := make(map[GuardTrustInodeKey]uint64)
 	for p, bits := range paths {
-		if k, ok := statKey(p); ok {
+		if k, ok := statKey(p, stat); ok {
 			out[k] |= bits
 		}
 	}
 	return out
 }
+
+type statFunc func(string) (dev, ino uint64, err error)
 
 func resolveChildren(children []GlobChild) (map[GuardTrustGlobChildKey]uint64, error) {
 	out := make(map[GuardTrustGlobChildKey]uint64)
@@ -115,7 +117,7 @@ func resolveChildren(children []GlobChild) (map[GuardTrustGlobChildKey]uint64, e
 		if kind, _, ok := ParseGlobName(c.Name); !ok || kind != globExact {
 			return nil, fmt.Errorf("reserved component %q is not a plain name", c.Name)
 		}
-		if k, ok := statKey(c.Parent); ok {
+		if k, ok := statKey(c.Parent, ebpf.StatInode); ok {
 			out[GuardTrustGlobChildKey{Parent: k, S: globText(c.Name)}] |= c.Bits
 		}
 	}
@@ -134,7 +136,8 @@ func (t *TrustGuard) SetGlobReservations(r GlobReservations) error {
 	if err != nil {
 		return err
 	}
-	roots, writers := resolveBits(r.Roots), resolveBits(r.Writers)
+	// Writers are whitelisted binaries, resolved as the whitelist is; roots may be /proc/self/fd/N.
+	roots, writers := resolveBits(r.Roots, ebpf.StatInode), resolveBits(r.Writers, ebpf.StatConfined)
 
 	// Writers and names first: a root that lands before its writers would deny the app itself.
 	if err := syncMap(t.objs.GuardGlobWriters, writers); err != nil {
@@ -163,8 +166,8 @@ func (t *TrustGuard) SetGlobReservations(r GlobReservations) error {
 	return nil
 }
 
-func statKey(path string) (GuardTrustInodeKey, bool) {
-	dev, ino, err := ebpf.StatInode(path)
+func statKey(path string, stat statFunc) (GuardTrustInodeKey, bool) {
+	dev, ino, err := stat(path)
 	if err != nil {
 		log.Warnf("trust guard: skipping unresolvable %s: %v", path, err)
 		return GuardTrustInodeKey{}, false

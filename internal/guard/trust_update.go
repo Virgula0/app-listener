@@ -8,6 +8,8 @@ import (
 
 	cilium "github.com/cilium/ebpf"
 	log "github.com/sirupsen/logrus"
+
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 // UpdaterPlan scopes protection #1 (guard_bin_owner/guard_bin_updaters in guard_trust.bpf.c): a
@@ -22,10 +24,10 @@ type UpdaterPlan struct {
 // SetUpdaters (re)applies the updater scoping. Updaters are written before owners: an owner row
 // landing first only refuses its app's update for that instant, never grants a foreign one.
 func (t *TrustGuard) SetUpdaters(p UpdaterPlan) error {
-	if err := syncMap(t.objs.GuardBinUpdaters, resolveBits(p.Updaters)); err != nil {
+	if err := syncMap(t.objs.GuardBinUpdaters, resolveBits(p.Updaters, ebpf.StatConfined)); err != nil {
 		return fmt.Errorf("binary updaters: %w", err)
 	}
-	if err := syncMap(t.objs.GuardBinOwner, resolveBits(p.Owners)); err != nil {
+	if err := syncMap(t.objs.GuardBinOwner, resolveBits(p.Owners, ebpf.StatConfined)); err != nil {
 		return fmt.Errorf("binary owners: %w", err)
 	}
 	t.ownerMu.Lock()

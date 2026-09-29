@@ -162,6 +162,53 @@ func TestLoadBinarySymlinkResolved(t *testing.T) {
 	}
 }
 
+// A stored catalog match's directory re-pointed out of its user-writable parent (files/bin ->
+// /tmp/evil) must not be followed at the next start or reload.
+func TestLoadBinaryThroughEscapingDirSymlinkDeferred(t *testing.T) {
+	dir := t.TempDir()
+	app := t.TempDir()
+	evil := t.TempDir()
+	for _, p := range []string{filepath.Join(app, "real/wineserver"), filepath.Join(evil, "wineserver")} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("#!/bin/sh"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(evil, filepath.Join(app, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(app, "inside")); err != nil {
+		t.Fatal(err)
+	}
+	escaping := filepath.Join(app, "bin/wineserver")
+	confined := filepath.Join(app, "inside/wineserver")
+
+	cfg, err := Load(writeConfig(t, `[watch `+dir+`]
+`+escaping+`
+`+confined+`
+
+[libraries "App"]
+allow_lib `+escaping+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	r := cfg.Resources[0]
+	if len(r.Binaries) != 1 || r.Binaries[0].Path != filepath.Join(app, "real/wineserver") {
+		t.Errorf("only the in-parent symlink may resolve, to its target: %+v", r.Binaries)
+	}
+	if len(r.PendingBinaries) != 1 || r.PendingBinaries[0].Path != escaping {
+		t.Errorf("the escaping path must stay deferred, unresolved: %+v", r.PendingBinaries)
+	}
+	for _, l := range cfg.SharedAllowLibs {
+		if strings.HasPrefix(l, evil) {
+			t.Errorf("allow_lib followed the escaping symlink to %s", l)
+		}
+	}
+}
+
 func TestLoadUnknownEventFails(t *testing.T) {
 	dir := t.TempDir()
 	_, err := Load(writeConfig(t, `[watch `+dir+`]

@@ -568,7 +568,7 @@ func guardModeKey(m Mode) (uint64, error) {
 // addBinaryActions stores per-binary allow/block flags in guard_exe_actions, keyed by filesystem inode.
 func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 	for _, b := range binaries {
-		dev, ino, err := ebpf.StatInode(b.Path)
+		dev, ino, err := ebpf.StatConfined(b.Path)
 		if err != nil {
 			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
 		}
@@ -833,7 +833,7 @@ func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf
 		if err != nil {
 			return fmt.Errorf("invalid event mask for binary %s: %w", b.Path, err)
 		}
-		dev, ino, err := ebpf.StatInode(b.Path)
+		dev, ino, err := ebpf.StatConfined(b.Path)
 		if err != nil {
 			return fmt.Errorf("cannot stat binary %s for event mask: %w", b.Path, err)
 		}
@@ -855,17 +855,17 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 	events = make(map[string][]ebpf.EventType, len(deferredList))
 	for _, deferred := range deferredList {
 		rule := deferred.rule
-		path := rule.Path
-		if realPath, err := filepath.EvalSymlinks(path); err == nil {
-			path = realPath
+		path, err := ebpf.ResolveConfined(rule.Path)
+		var entry BinaryEntry
+		if err == nil {
+			entry, err = ComputeBinaryEntry(path)
 		}
-		entry, err := ComputeBinaryEntry(path)
 		if err != nil {
 			deferred.attempts++
 			if deferred.attempts >= maxResolveAttempts {
-				log.Warnf("guard %s: aborting deferred binary, still unreadable after %d attempts: %s", g.path, deferred.attempts, rule.Path)
+				log.Warnf("guard %s: aborting deferred binary after %d attempts: %v", g.path, deferred.attempts, err)
 			} else {
-				log.Warnf("guard %s: binary still unreadable, keeping it deferred: %s", g.path, rule.Path)
+				log.Warnf("guard %s: keeping binary deferred: %v", g.path, err)
 				stillDeferred = append(stillDeferred, deferred)
 			}
 			continue
@@ -1001,9 +1001,10 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 	var changed int
 	for _, b := range binaries {
 		path := canonicalBinaryPath(b.Path)
-		dev, ino, err := ebpf.StatInode(path)
+		dev, ino, err := ebpf.StatConfined(b.Path)
 		if err != nil {
-			// Vanished mid-update (rename, then removal); the previously deployed key stays valid.
+			// Vanished mid-update (rename, then removal) or re-pointed out of its tree; the previously
+			// deployed key stays valid.
 			continue
 		}
 		key := GuardInodeKey{Dev: dev, Ino: ino}

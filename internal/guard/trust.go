@@ -88,7 +88,7 @@ func NewTrustGuard() (*TrustGuard, error) {
 func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	flags := make(map[GuardInodeKey]uint8)
 	add := func(path string, flag uint8) {
-		dev, ino, err := ebpf.StatInode(path)
+		dev, ino, err := ebpf.StatConfined(path)
 		if err != nil {
 			log.Warnf("trust guard: skipping unresolvable %s: %v", path, err)
 			return
@@ -167,7 +167,7 @@ func (t *TrustGuard) SetGuardedDirs(dirs []TrustedDir) error {
 	}
 	userBits := make(map[GuardInodeKey]uint64)
 	for path, bits := range loaders {
-		dev, ino, err := ebpf.StatInode(path)
+		dev, ino, err := ebpf.StatConfined(path)
 		if err != nil {
 			log.Warnf("trust guard: skipping unresolvable lib_dir writer %s: %v", path, err)
 			continue

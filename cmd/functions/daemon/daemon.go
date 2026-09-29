@@ -29,6 +29,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/repository"
 	"github.com/Virgula0/app-listener/internal/tui"
@@ -415,6 +416,23 @@ func configureDaemonLogging() {
 	log.SetOutput(os.Stderr)
 }
 
+// setConfinedHomes points ebpf.OpenConfined at every user home before whitelist paths are resolved;
+// with no user list it confines every symlinked directory (fail closed).
+func setConfinedHomes() {
+	users, err := install.ListUsers()
+	if err != nil {
+		log.Errorf("daemon: listing users (%v) — every symlinked directory in a whitelisted path must "+
+			"stay inside its parent until a reload succeeds", err)
+		ebpf.SetUserHomes([]string{"/"})
+		return
+	}
+	homes := make([]string, 0, len(users))
+	for _, u := range users {
+		homes = append(homes, u.Home)
+	}
+	ebpf.SetUserHomes(homes)
+}
+
 // loadDaemonConfig resolves, loads and sanity-checks the config. Failures are permanent
 // (constants.ErrCriticalStartup), not worth a systemd restart.
 func loadDaemonConfig() (string, *daemonconfig.Config, error) {
@@ -422,6 +440,7 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("%w: %w", constants.ErrCriticalStartup, err)
 	}
+	setConfinedHomes()
 	cfg, err := daemonconfig.Load(configPath)
 	if err != nil {
 		return "", nil, fmt.Errorf("%w: loading config %s: %w", constants.ErrCriticalStartup, configPath, err)
@@ -482,6 +501,7 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 // a fresh pin generation and hand them to the usecase. On failure the freshly unlocked vaults are
 // locked back and the previous config keeps running. Returns the live pin generation.
 func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pinBase string) (string, *daemonconfig.Config, error) {
+	setConfinedHomes()
 	cfg, err := daemonconfig.Load(configPath)
 	if err != nil {
 		return "", nil, err

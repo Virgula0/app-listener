@@ -649,15 +649,22 @@ func applyDirective(group *watchGroup, line string, lineNo int) error {
 }
 
 // recordBinaryRule stats and symlink-resolves one rule into resolved or, if unreadable (locked tree
-// or gone), deferred. Deferring rather than dropping: a dropped rule silently disables the entry,
-// while a deferred one stays out of the BPF whitelist (denied) until it resolves (fail-closed).
+// or gone) or reached through a re-pointable symlink (ebpf.OpenConfined), deferred. Deferring rather
+// than dropping: a dropped rule silently disables the entry, while a deferred one stays out of the
+// BPF whitelist (denied) until it resolves (fail-closed).
 func recordBinaryRule(rule BinaryRule, resolved, deferred *[]BinaryRule, lineNo int) {
 	if _, statErr := os.Stat(rule.Path); statErr != nil {
 		log.Warnf("daemon config line %d: binary not readable yet, deferring: %s", lineNo, rule.Path)
 		*deferred = append(*deferred, rule)
 		return
 	}
-	if target, resolveErr := filepath.EvalSymlinks(rule.Path); resolveErr == nil && target != rule.Path {
+	target, err := ebpf.ResolveConfined(rule.Path)
+	if err != nil {
+		log.Warnf("daemon config line %d: binary refused, deferring: %v", lineNo, err)
+		*deferred = append(*deferred, rule)
+		return
+	}
+	if target != rule.Path {
 		log.Infof("daemon config line %d: binary symlink resolved: %s -> %s", lineNo, rule.Path, target)
 		rule.Path = target
 	}
@@ -689,10 +696,13 @@ func applyAllowLib(group *watchGroup, libPath string, lineNo int) error {
 		group.pendingLibs = append(group.pendingLibs, libPath)
 		return nil //nolint:nilerr // deferred, not dropped — same fail-closed handling as a binary
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(libPath); resolveErr == nil && resolved != libPath {
-		libPath = resolved
+	resolved, err := ebpf.ResolveConfined(libPath)
+	if err != nil {
+		log.Warnf("daemon config line %d: allow_lib refused, deferring: %v", lineNo, err)
+		group.pendingLibs = append(group.pendingLibs, libPath)
+		return nil
 	}
-	group.libs = append(group.libs, libPath)
+	group.libs = append(group.libs, resolved)
 	return nil
 }
 

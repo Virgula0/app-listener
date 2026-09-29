@@ -778,6 +778,64 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: daemon.conf stores expanded glob matches whose components below the wildcard are
+// unreserved. Re-pointing one (files/bin -> /tmp/evil) is refused while the daemon runs, but a
+// restart or reload re-parses the stored path and whitelists whatever it now resolves to.
+func (s *IntegrationSuite) TestDaemon_Bypass_StoredMatchRepointedAcrossRestart() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const (
+		marker  = "TOP-SECRET-STEAM-LOGIN-3C91"
+		secret  = steamDir + "/config/loginusers.vdf"
+		bin     = steamCommon + "/Proton_9.0/files/bin"
+		ws      = bin + "/wineserver"
+		control = steamCommon + "/Proton_8.0/files/bin/wineserver"
+		evil    = "/tmp/evil/wineserver"
+	)
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /etc/app-listener " + steamDir + "/config " + bin + " " + steamCommon + "/Proton_8.0/files/bin" +
+			" && printf '" + marker + "' > " + secret + " && chmod 644 " + secret +
+			" && cp /usr/bin/grep " + ws + " && cp /usr/bin/grep " + control})
+	config := `[watch ` + steamDir + `/config]
+need_encryption: false
+` + ws + `
+` + control
+	s.startDaemon(c, config)
+
+	readAs := func(exe string) string {
+		_, out := s.exec(c, []string{"sh", "-c", exe + " -h . " + secret + " 2>&1; echo rc=$?"})
+		return out
+	}
+	// grep, not cat: ubuntu:latest's cat is multi-call coreutils and refuses another basename.
+	s.Require().NotContains(readAs("grep"), marker, "baseline: non-whitelisted grep must be denied")
+	s.Require().Contains(readAs(ws), marker, "control: the stored wineserver must read the secret")
+
+	_, attack := s.exec(c, []string{"sh", "-c",
+		"mv " + bin + " " + bin + ".old && mkdir -p /tmp/evil && cp /usr/bin/grep " + evil +
+			" && ln -s /tmp/evil " + bin + " 2>&1; echo rc=$?"})
+	s.Require().NotContainsf(readAs(ws), marker, "baseline: the running daemon must refuse the re-pointed path "+
+		"(attack: %s)", attack)
+
+	s.sigDaemon(c, "TERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
+	s.launchDaemon(c)
+	s.awaitDaemonUp(c, config)
+	s.Require().NotContainsf(readAs(evil), marker,
+		"after a restart the stored path's re-pointed component got %s whitelisted\nattack: %s\ndaemon log:\n%s",
+		evil, attack, s.readDaemonLog(c))
+	s.Require().Contains(readAs(control), marker, "control: an intact stored match must still read after a restart")
+
+	s.sigDaemon(c, "HUP")
+	s.awaitLog(c, "configuration reloaded", 60*time.Second)
+	s.Require().NotContainsf(readAs(evil), marker,
+		"after a reload the stored path's re-pointed component got %s whitelisted\ndaemon log:\n%s",
+		evil, s.readDaemonLog(c))
+	s.Require().Contains(readAs(control), marker, "control: an intact stored match must still read after a reload")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Bypass: every resource shares one guard_inodes map with one owner per inode. A read-only
 // lib_dir's periodic sweep re-stats its root path through symlinks, so once a same-user process
 // makes that path resolve to another resource's directory, the sweep re-anchors onto it and claims
