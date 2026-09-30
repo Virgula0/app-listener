@@ -54,13 +54,9 @@ func TestPinStateRoundTrip(t *testing.T) {
 	}
 }
 
-// TestWritePinStateInPlace is the regression test mirroring
-// TestWriteHashFileInPlaceOverPlaceholder: once a record already exists (as
-// it always does after the first write in a process's lifetime), a second
-// write — a reload minting a fresh generation — must rewrite it on the SAME
-// inode, never by creating a new directory entry and swapping it in. Once
-// the daemon's ModeReadOnly self-guard on /etc/app-listener is attached,
-// only rewriting an EXISTING entry is permitted.
+// Mirrors TestWriteHashFileInPlaceOverPlaceholder: once a record exists, a second write (a reload's
+// fresh generation) must rewrite the SAME inode, never create-and-swap: once the ModeReadOnly
+// self-guard on /etc/app-listener is attached, only rewriting an EXISTING entry is permitted.
 func TestWritePinStateInPlace(t *testing.T) {
 	withTempPinStateFile(t)
 

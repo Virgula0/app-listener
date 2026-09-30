@@ -3,10 +3,17 @@ package tui
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"math"
 	"os"
+	"path/filepath"
 	"strconv"
-	"syscall"
+	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/Virgula0/app-listener/internal/safeio"
 )
 
 // defaultNewFileMode models umask(022) defaults: 0644 files, 0755 dirs.
@@ -18,25 +25,31 @@ func defaultNewFileMode(isDir bool) os.FileMode {
 	return 0o666 &^ mask
 }
 
-// applyNewFileMeta gives fresh entries the ownership/mode the invoking user
-// would have gotten: under sudo it chowns to SUDO_UID/SUDO_GID natively;
-// non-root callers only get the defaultNewFileMode mode.
-func applyNewFileMeta(path string, isDir bool) error {
-	mode := defaultNewFileMode(isDir)
-	if os.Geteuid() == 0 {
-		uidStr, gidStr := os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID")
-		if uidStr != "" && gidStr != "" {
-			uid, uidErr := strconv.ParseUint(uidStr, 10, 32)
-			gid, gidErr := strconv.ParseUint(gidStr, 10, 32)
-			if uidErr != nil || gidErr != nil {
-				return fmt.Errorf("parsing SUDO_UID/SUDO_GID: %v / %v", uidErr, gidErr)
-			}
-			if err := os.Lchown(path, int(uid), int(gid)); err != nil {
-				return fmt.Errorf("chown %s: %w", path, err)
+// applyNewFileMeta gives fresh entries the ownership/mode the invoking user would have gotten:
+// under sudo it chowns to SUDO_UID/SUDO_GID; non-root callers only get defaultNewFileMode. It
+// operates on a descriptor opened beneath the vault (vaultFS.withFile), never on a name a planted
+// symlink could redirect.
+func applyNewFileMeta(v *vaultFS, path string, isDir bool) error {
+	flags := os.O_RDONLY
+	if isDir {
+		flags |= unix.O_DIRECTORY
+	}
+	return v.withFile(path, flags, func(f *os.File) error {
+		if os.Geteuid() == 0 {
+			uidStr, gidStr := os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID")
+			if uidStr != "" && gidStr != "" {
+				uid, uidErr := strconv.ParseUint(uidStr, 10, 32)
+				gid, gidErr := strconv.ParseUint(gidStr, 10, 32)
+				if uidErr != nil || gidErr != nil {
+					return fmt.Errorf("parsing SUDO_UID/SUDO_GID: %v / %v", uidErr, gidErr)
+				}
+				if err := f.Chown(int(uid), int(gid)); err != nil {
+					return fmt.Errorf("chown %s: %w", path, err)
+				}
 			}
 		}
-	}
-	return os.Chmod(path, mode)
+		return f.Chmod(defaultNewFileMode(isDir))
+	})
 }
 
 // isOctalMode reports a 1-4 digit octal mode (leading zeros allowed);
@@ -119,78 +132,39 @@ func isBinaryContent(data []byte) bool {
 	return bytes.IndexByte(data[:n], 0) >= 0
 }
 
-// writeFileKeepMeta atomically replaces path with data (temp sibling +
-// rename after fsync), preserving mode and owner; symlinks are refused so
-// writes never follow links. Owner restoration requires root.
-func writeFileKeepMeta(path string, data []byte) error {
-	info, err := os.Lstat(path)
+// writeFileKeepMeta atomically replaces name (relative to vault) with data (temp sibling + rename
+// after fsync), preserving mode and owner (needs root). The parent is opened beneath the vault and
+// every later step works on that descriptor: the temp sibling is created O_EXCL|O_NOFOLLOW and
+// metadata is applied on its fd, never on a name a planted symlink could redirect.
+func writeFileKeepMeta(vault *os.Root, name string, data []byte) error {
+	dir, err := vault.Open(filepath.Dir(name))
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to write through symlink %s", path)
+	defer dir.Close()
+	dirFD := int(dir.Fd())
+	base := filepath.Base(name)
+	var st unix.Stat_t
+	if err := unix.Fstatat(dirFD, base, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("stating %s: %w", name, err)
 	}
-	tmp := path + ".app_listener.edit"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
-	if err != nil {
-		return err
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("refusing to write %s: not a regular file", name)
 	}
-	cleanup := true
-	defer func() {
-		_ = f.Close()
-		if cleanup {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if _, werr := f.Write(data); werr != nil {
-		return werr
-	}
-	if serr := f.Sync(); serr != nil {
-		return serr
-	}
-	if cerr := f.Chmod(info.Mode()); cerr != nil {
-		return cerr
-	}
-	// Chown needs root (the editor runs as root via --edit-protected);
-	// non-root temp files already carry the caller's ownership.
+	uid, gid := -1, -1
 	if os.Geteuid() == 0 {
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			if cerr := f.Chown(int(stat.Uid), int(stat.Gid)); cerr != nil {
-				return cerr
-			}
-		}
+		uid, gid = int(st.Uid), int(st.Gid)
 	}
-	if cerr := f.Close(); cerr != nil {
-		return cerr
-	}
-	cleanup = false
-	return os.Rename(tmp, path)
+	tmp := "." + base + ".app_listener.edit"
+	return safeio.AtomicWriteAt(dirFD, base, tmp, data, os.FileMode(st.Mode&0o777), uid, gid)
 }
 
-// writeFileInPlace rewrites path's EXISTING inode directly — open, truncate,
-// write, fsync — never a temp file or a rename. Used only for a single-file
-// edit-protected resource (fileEditModel.singleFile): unlike a file nested
-// inside a guarded directory, a single-file watch root's own guard also
-// protects its parent directory against anything created or renamed beside
-// it (see guard_path_rename's destination-parent-directory check in
-// guard.bpf.c — the same "rename-over-watchroot" defense CLAUDE.md calls
-// out), so writeFileKeepMeta's temp-sibling dance is denied there. Mode and
-// ownership are left exactly as they are — there is no separate temp file
-// whose metadata could ever need copying onto the live one, unlike the
-// create-then-rename path.
-func writeFileInPlace(path string, data []byte) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to write through symlink %s", path)
-	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+// writeFileInPlace rewrites f's inode (truncate, write, fsync), never a temp file or rename. Only
+// for a single-file edit-protected resource (fileEditModel.singleFile): a single-file watch root's
+// guard also protects its parent directory against anything created/renamed beside it
+// (guard_path_rename's destination-parent check, the rename-over-watchroot defense), so
+// writeFileKeepMeta's temp-sibling dance is denied. Mode and ownership stay as they are.
+func writeFileInPlace(f *os.File, data []byte) error {
 	if err := f.Truncate(0); err != nil {
 		return err
 	}
@@ -198,6 +172,150 @@ func writeFileInPlace(path string, data []byte) error {
 		return err
 	}
 	return f.Sync()
+}
+
+// vaultFS pins the opened vault for the whole editor session. The editor runs as root over a
+// user-owned tree, so re-walking an absolute path lets that user redirect a write, chmod, chown or
+// delete by swapping any directory on it (inside the vault or above it) for a symlink. Every access
+// resolves beneath the pinned directory (os.Root: no symlink or ".." leaves it) or goes through the
+// pinned single file.
+type vaultFS struct {
+	base string
+	dir  *os.Root
+	file *os.File // single-file resource
+}
+
+// openVault pins path: a regular file O_RDWR|O_NOFOLLOW, a directory as an os.Root. A symlinked
+// root is refused, never followed.
+func openVault(path string) (*vaultFS, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case info.Mode().IsRegular():
+		f, err := safeio.OpenRegularNoFollow(path, os.O_RDWR, 0)
+		if err != nil {
+			return nil, err
+		}
+		return &vaultFS{base: path, file: f}, nil
+	case info.IsDir():
+		r, err := os.OpenRoot(path)
+		if err != nil {
+			return nil, err
+		}
+		// OpenRoot follows a final symlink: reject a swap since the Lstat.
+		if got, err := r.Stat("."); err != nil || !os.SameFile(got, info) {
+			_ = r.Close()
+			return nil, fmt.Errorf("%s changed while opening it", path)
+		}
+		return &vaultFS{base: path, dir: r}, nil
+	default:
+		return nil, fmt.Errorf("%s is neither a regular file nor a directory", path)
+	}
+}
+
+func (v *vaultFS) close() {
+	if v.dir != nil {
+		_ = v.dir.Close()
+	}
+	if v.file != nil {
+		_ = v.file.Close()
+	}
+}
+
+// rel maps an absolute path the tree holds to its name beneath the vault.
+func (v *vaultFS) rel(path string) (string, error) {
+	if v.dir == nil && v.file == nil {
+		return "", fmt.Errorf("the vault %s is not open", v.base)
+	}
+	r, err := filepath.Rel(v.base, path)
+	if err != nil || r == ".." || strings.HasPrefix(r, "../") {
+		return "", fmt.Errorf("%s is outside the vault", path)
+	}
+	if v.file != nil && r != "." {
+		return "", fmt.Errorf("%s: a single-file resource has no entries", path)
+	}
+	return r, nil
+}
+
+func (v *vaultFS) lstat(path string) (os.FileInfo, error) {
+	r, err := v.rel(path)
+	if err != nil {
+		return nil, err
+	}
+	if v.file != nil {
+		return v.file.Stat()
+	}
+	return v.dir.Lstat(r)
+}
+
+func (v *vaultFS) readFile(path string) ([]byte, error) {
+	r, err := v.rel(path)
+	if err != nil {
+		return nil, err
+	}
+	if v.file != nil {
+		return io.ReadAll(io.NewSectionReader(v.file, 0, math.MaxInt64))
+	}
+	return v.dir.ReadFile(r)
+}
+
+func (v *vaultFS) readDir(path string) ([]os.DirEntry, error) {
+	r, err := v.rel(path)
+	if err != nil {
+		return nil, err
+	}
+	if v.dir == nil {
+		return nil, fmt.Errorf("%s is not a directory", path)
+	}
+	d, err := v.dir.Open(r)
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+	return d.ReadDir(-1)
+}
+
+func (v *vaultFS) write(path string, data []byte) error {
+	r, err := v.rel(path)
+	if err != nil {
+		return err
+	}
+	if v.file != nil {
+		return writeFileInPlace(v.file, data)
+	}
+	return writeFileKeepMeta(v.dir, r, data)
+}
+
+// dirOp runs op on path's name beneath a directory vault; the vault root itself is refused.
+func (v *vaultFS) dirOp(path string, op func(root *os.Root, name string) error) error {
+	r, err := v.rel(path)
+	if err != nil {
+		return err
+	}
+	if v.dir == nil || r == "." {
+		return fmt.Errorf("refusing to change the vault root %s", path)
+	}
+	return op(v.dir, r)
+}
+
+// withFile runs fn on path opened beneath the vault with O_NOFOLLOW added: fn acts on that
+// descriptor, not on a name.
+func (v *vaultFS) withFile(path string, flags int, fn func(*os.File) error) error {
+	r, err := v.rel(path)
+	if err != nil {
+		return err
+	}
+	if v.file != nil {
+		return fn(v.file)
+	}
+	f, err := v.dir.OpenFile(r, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return fn(f)
 }
 
 // dirEntry is one row of the right-pane directory listing.
@@ -209,13 +327,13 @@ type dirEntry struct {
 }
 
 // listEntries stats up to limit children, skipping vanished entries.
-func listEntries(n *fileNode, limit int) []dirEntry {
+func listEntries(v *vaultFS, n *fileNode, limit int) []dirEntry {
 	out := make([]dirEntry, 0, min(limit, len(n.children)))
 	for _, c := range n.children {
 		if len(out) >= limit {
 			break
 		}
-		info, err := os.Lstat(c.path)
+		info, err := v.lstat(c.path)
 		if err != nil {
 			continue
 		}

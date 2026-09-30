@@ -29,11 +29,9 @@ func UnifiedDiff(existing, desired string) string {
 	return out
 }
 
-// ConfirmOverwrite compares an existing file with the desired content.
-// Identical files are skipped without asking. When they differ, the diff
-// is shown in a full-screen TUI viewer, then the user is asked whether to
-// overwrite. It returns true only when the existing file was (or will be)
-// replaced.
+// ConfirmOverwrite compares an existing file with the desired content: identical is skipped without
+// asking; otherwise the diff shows in a full-screen viewer, then the user is asked to overwrite.
+// True only if the file was (or will be) replaced.
 func ConfirmOverwrite(path string, existing, desired []byte) (bool, error) {
 	if bytes.Equal(existing, desired) {
 		return false, nil

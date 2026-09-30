@@ -8,10 +8,9 @@ import (
 	"github.com/google/fscrypt/filesystem"
 )
 
-// Prereq is a host requirement the installer can satisfy by running ONE
-// privileged command as root. Every command the installer may run on the
-// user's behalf is produced by FilesystemPrereqs below — this is the single
-// place to audit the installer's auto-run command surface.
+// Prereq is a host requirement the installer can satisfy by running ONE privileged command as root.
+// Every command the installer may run on the user's behalf comes from FilesystemPrereqs below: the
+// single place to audit the auto-run command surface.
 type Prereq struct {
 	// Title is a short imperative summary ("Enable fscrypt on /dev/sda2").
 	Title string
@@ -24,14 +23,10 @@ type Prereq struct {
 // Command renders Argv as a copy-pasteable shell string (display only).
 func (p Prereq) Command() string { return strings.Join(p.Argv, " ") }
 
-// FilesystemPrereqs inspects the filesystem backing path and returns the
-// commands needed to make it usable for fscrypt encryption, in the order
-// they must run. It returns nil when the filesystem is already ready.
-//
-// A non-nil error is TERMINAL: the filesystem type or the kernel cannot
-// support fscrypt at all, so no command would help and the caller must
-// abort. Fixable conditions never return an error — they come back as
-// Prereq entries the caller can offer to run.
+// FilesystemPrereqs inspects path's backing filesystem and returns the commands needed to make it
+// fscrypt-ready, in run order; nil if already ready. A non-nil error is TERMINAL (filesystem type
+// or kernel can't support fscrypt; abort). Fixable conditions come back as Prereq entries the
+// caller can offer to run.
 func (v *Vault) FilesystemPrereqs(path string) ([]Prereq, error) {
 	mnt, err := filesystem.FindMount(path)
 	if err != nil {

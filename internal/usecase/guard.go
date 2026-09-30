@@ -10,9 +10,8 @@ type GuardUseCase interface {
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent
-	// PopulateInodes fills the inode map with the guarded tree's contents.
-	// Must be called before Start so every file is protected from the
-	// moment the guard is attached (not just those reached lazily).
+	// PopulateInodes fills the inode map with the guarded tree; call before Start so every file is
+	// protected from attach, not just those reached lazily.
 	PopulateInodes() error
 }
 

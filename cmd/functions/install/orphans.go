@@ -6,11 +6,9 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
-// cleanOrphanedFscrypt removes the fscrypt policy and protector metadata
-// left behind by directories that no longer exist. The live set mirrors the
-// installer's own scope: every discoverable catalog directory, the system
-// entries, and the final config resources. Runs after deployment as the
-// second-to-last step.
+// cleanOrphanedFscrypt removes fscrypt policy/protector metadata left by directories that no longer
+// exist. The live set mirrors the installer's scope: every discoverable catalog dir, system entries
+// and the final config resources. Runs after deployment, second-to-last.
 func cleanOrphanedFscrypt(cfg *daemonconfig.Config) error {
 	users, err := inst.ListUsers()
 	if err != nil {
@@ -27,9 +25,8 @@ func cleanOrphanedFscrypt(cfg *daemonconfig.Config) error {
 	}
 	for i := range cfg.Resources {
 		r := &cfg.Resources[i]
-		// Keep both the guarded watch path and its encryption root: grouped
-		// sections carry the fscrypt policy on the root, which must not be
-		// classified as orphaned metadata.
+		// Keep both the guarded watch path and its encryption root: grouped sections carry the
+		// policy on the root, which must not be classified as orphaned.
 		paths = append(paths, r.Path, r.EncryptionRootOrPath())
 	}
 

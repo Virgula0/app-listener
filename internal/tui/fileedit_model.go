@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,8 +19,8 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
-// Limits for the embedded file preview/editor: binary content is never
-// edited, and files past the edit limit are shown read-only.
+// Limits for the embedded editor: binary content is never edited; files past the edit limit are
+// read-only.
 const (
 	maxEditableBytes = 2 << 20 // 2 MiB
 	binaryScanBytes  = 8 << 10 // 8 KiB of a file are scanned for NUL bytes
@@ -47,8 +49,7 @@ const (
 	createDir
 )
 
-// chownUser is one candidate in the chown picker. A uid of -1 keeps the
-// current ownership.
+// chownUser is one chown-picker candidate (uid -1 keeps current ownership).
 type chownUser struct {
 	label string
 	uid   int
@@ -85,21 +86,19 @@ type fileNode struct {
 	children []*fileNode
 }
 
-// fileEditModel is the two-pane protected-file editor: a file tree on the
-// left and a directory listing / file editor / chmod / chown pane on the
-// right. The vault it edits is expected to be unlocked (provisioned) by the
-// caller for the whole session and is re-locked when RunFileEditor returns.
+// fileEditModel is the two-pane protected-file editor (file tree left; directory listing / editor /
+// chmod / chown right). The vault must be unlocked by the caller for the whole session and is
+// re-locked when RunFileEditor returns.
 type fileEditModel struct {
-	root *fileNode
-	rows []*fileNode
-	cur  int
-	top  int // tree scroll offset
+	root  *fileNode
+	vault *vaultFS
+	rows  []*fileNode
+	cur   int
+	top   int // tree scroll offset
 
-	// singleFile is true when root itself is a guarded regular file (a
-	// file-vault resource) rather than a directory: there is nothing to
-	// browse, so the tree is a single, childless row and save() writes
-	// in place instead of through the tree editor's usual temp-file+rename
-	// (see writeFileInPlace).
+	// singleFile: root itself is a guarded regular file (file-vault resource), not a directory: the
+	// tree is one childless row and save() writes in place, not temp-file+rename
+	// (writeFileInPlace).
 	singleFile bool
 
 	mode fileEditMode
@@ -134,14 +133,12 @@ type fileEditModel struct {
 	status string
 }
 
-// RunFileEditor opens a full-screen editor rooted at root, which must already
-// be unlocked/plaintext. root is usually a directory (the two-pane tree
-// browser); when it is a single guarded regular file (a file-vault resource)
-// the tree is skipped and the editor opens straight on that one file. It
-// returns when the editor is closed; nothing about the fscrypt state is
-// changed, so the caller must re-lock the vault afterwards.
+// RunFileEditor opens a full-screen editor rooted at root, which must already be
+// unlocked/plaintext. A directory opens the two-pane tree; a single guarded regular file opens
+// straight on it. Returns when closed; fscrypt state is untouched, so the caller must re-lock.
 func RunFileEditor(root string) error {
 	m := newFileEditModel(root)
+	defer m.vault.close()
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := prog.Run()
 	return err
@@ -161,18 +158,17 @@ func newFileEditModel(root string) *fileEditModel {
 	}
 	m.editor = textarea.New()
 	m.editor.ShowLineNumbers = true
-	// Word jumps are the vim-style ctrl+left/right the editor promises in
-	// its legend (the alt+/alt+f defaults stay available).
+	// Word jumps are the vim-style ctrl+left/right the legend promises (alt+ defaults stay).
 	m.editor.KeyMap.WordBackward.SetKeys("ctrl+left", "alt+left", "alt+b")
 	m.editor.KeyMap.WordForward.SetKeys("ctrl+right", "alt+right", "alt+f")
 	m.editor.Blur()
 
-	// A single-file resource has nothing to browse — os.ReadDir(root) on a
-	// regular file fails outright ("open root: not a directory"), which is
-	// exactly the bug this branch fixes. Lstat, not Stat: a symlinked root
-	// is refused by enterEditor below, never silently followed.
-	info, statErr := os.Lstat(root)
-	if statErr == nil && info.Mode().IsRegular() {
+	vault, vaultErr := openVault(root)
+	if vaultErr != nil {
+		vault = &vaultFS{base: root}
+	}
+	m.vault = vault
+	if vault.file != nil {
 		m.singleFile = true
 		m.root = &fileNode{path: root, name: name, loaded: true}
 	} else {
@@ -181,11 +177,13 @@ func newFileEditModel(root string) *fileEditModel {
 		if err := m.loadChildren(m.root); err != nil {
 			m.status = "error: " + err.Error()
 		}
+		if vaultErr != nil {
+			m.status = "error: " + vaultErr.Error()
+		}
 	}
 	m.rebuild()
 	if m.singleFile {
-		// Nothing to navigate to first: open straight into the editor,
-		// exactly like pressing enter on the single row would.
+		// Nothing to navigate to first: open straight into the editor.
 		if err := m.enterEditor(); err != nil {
 			m.status = "error: " + err.Error()
 		}
@@ -209,8 +207,8 @@ func (m *fileEditModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		if m.mode != prevMode {
-			// A mode change alters the pane split (the editor is a sidebar
-			// vs. half vs. focus) — re-fit before the next render.
+			// A mode change alters the pane split (sidebar/half/focus): re-fit before the next
+			// render.
 			m.refit()
 		}
 		return m, cmd
@@ -218,15 +216,12 @@ func (m *fileEditModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// treeSidebarWidth is the tree pane width while editing a file: the editor
-// is the focus, so the tree shrinks to a context sidebar and the editor
-// takes the rest of the terminal.
+// treeSidebarWidth: tree pane width while editing (the editor is the focus; the tree shrinks to a
+// sidebar).
 const treeSidebarWidth = 32
 
-// paneLayout returns the left (tree) and right (info/editor) column widths
-// for the current mode, from the width the terminal actually gives the
-// content (after the app margin) minus one column for the separator. In
-// modeEdit the tree is a sidebar; every other mode splits evenly.
+// paneLayout returns the tree and right-pane widths for the current mode from the usable content
+// width minus one separator column: modeEdit uses a sidebar, other modes split evenly.
 func (m *fileEditModel) paneLayout() (left, right int) {
 	usable := max(m.width-appStyle.GetHorizontalMargins(), 4)
 	if m.mode == modeEdit {
@@ -246,9 +241,7 @@ func (m *fileEditModel) resize(width, height int) {
 	m.refit()
 }
 
-// refit recomputes the pane geometry (mode-dependent) and re-sizes the
-// editor to it. Call it whenever the terminal size or the mode changes, so
-// entering/leaving the editor widens/narrows it immediately.
+// refit recomputes the pane geometry and resizes the editor; call on terminal-size or mode change.
 func (m *fileEditModel) refit() {
 	m.leftW, m.rightW = m.paneLayout()
 	m.editor.SetWidth(max(m.rightW, 10))
@@ -296,8 +289,7 @@ func (m *fileEditModel) updateNavKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	return nil, false
 }
 
-// navAction handles the non-movement nav keys; it reports whether the
-// editor must quit.
+// navAction handles non-movement nav keys; reports whether the editor must quit.
 func (m *fileEditModel) navAction(msg tea.KeyMsg) bool {
 	switch msg.String() {
 	case "g":
@@ -416,14 +408,13 @@ func (m *fileEditModel) updateConfirmKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	return nil, false
 }
 
-// loadChildren fills a directory node with its (sorted, lazily loaded)
-// children. Directory entries come first, then files, each ordered by name
-// without respect to case.
+// loadChildren fills a directory node with sorted, lazily loaded children (directories first, then
+// files, case-insensitive by name).
 func (m *fileEditModel) loadChildren(n *fileNode) error {
 	if !n.isDir || n.loaded {
 		return nil
 	}
-	entries, err := os.ReadDir(n.path)
+	entries, err := m.vault.readDir(n.path)
 	if err != nil {
 		return err
 	}
@@ -442,8 +433,6 @@ func (m *fileEditModel) loadChildren(n *fileNode) error {
 	return nil
 }
 
-// sortNodes orders directory nodes before file nodes, then by name without
-// regard to case.
 func sortNodes(nodes []*fileNode) {
 	sort.Slice(nodes, func(i, j int) bool {
 		if nodes[i].isDir != nodes[j].isDir {
@@ -453,9 +442,8 @@ func sortNodes(nodes []*fileNode) {
 	})
 }
 
-// rebuild flattens the visible tree (the root and every loaded, open
-// directory descendant) into the row slice, keeping the cursor on the same
-// node when possible.
+// rebuild flattens the visible tree (root plus loaded, open directories) into rows, keeping the
+// cursor on the same node when possible.
 func (m *fileEditModel) rebuild() {
 	selected := m.selected()
 	m.rows = m.rows[:0]
@@ -544,15 +532,14 @@ func (m *fileEditModel) toggleDir(n *fileNode) {
 	m.ensureCursorVisible()
 }
 
-// enterEditor opens the selected file in the focused textarea. Re-entering
-// the editor for the same, unsaved file keeps the buffer; joining a
-// different file reloads from disk. Symlinks are never followed.
+// enterEditor opens the selected file in the focused textarea. Re-entering the same unsaved file
+// keeps the buffer; a different file reloads. Symlinks are never followed.
 func (m *fileEditModel) enterEditor() error {
 	n := m.selected()
 	if n == nil || n.isDir {
 		return nil
 	}
-	info, err := os.Lstat(n.path)
+	info, err := m.vault.lstat(n.path)
 	if err != nil {
 		return err
 	}
@@ -579,11 +566,10 @@ func (m *fileEditModel) enterEditor() error {
 	return nil
 }
 
-// previewFile loads path's content into the editor (blurred). Binary files
-// and files over maxEditableBytes reset the preview and report a status
-// instead.
+// previewFile loads path into the (blurred) editor; binary files and files over maxEditableBytes
+// reset the preview and report a status.
 func (m *fileEditModel) previewFile(path string) error {
-	info, err := os.Stat(path)
+	info, err := m.vault.lstat(path)
 	if err != nil {
 		return err
 	}
@@ -593,7 +579,7 @@ func (m *fileEditModel) previewFile(path string) error {
 		m.status = fmt.Sprintf("%s is %.1f MiB — only files up to 2 MiB can be edited", path, float64(info.Size())/(1<<20))
 		return nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := m.vault.readFile(path)
 	if err != nil {
 		return err
 	}
@@ -618,17 +604,7 @@ func (m *fileEditModel) save() error {
 	if m.editPath == "" {
 		return nil
 	}
-	// A single-file resource's parent directory is itself guarded against
-	// anything created or renamed beside it (the same "rename-over-
-	// watchroot" defense CLAUDE.md calls out) — writeFileKeepMeta's usual
-	// temp-sibling + rename would be denied there. writeFileInPlace rewrites
-	// the file's existing inode directly, same as every other in-place
-	// unlock/lock in this codebase.
-	writer := writeFileKeepMeta
-	if m.singleFile {
-		writer = writeFileInPlace
-	}
-	if err := writer(m.editPath, []byte(m.editor.Value())); err != nil {
+	if err := m.vault.write(m.editPath, []byte(m.editor.Value())); err != nil {
 		return err
 	}
 	m.original = m.editor.Value()
@@ -646,9 +622,8 @@ func (m *fileEditModel) savePending() {
 	}
 }
 
-// beginCreate switches to the input mode used for the new file/directory
-// name. The new entry is created inside the currently selected directory
-// (or the parent of a selected file).
+// beginCreate switches to the new-name input mode; the entry is created in the selected directory
+// (or the selected file's parent).
 func (m *fileEditModel) beginCreate(kind fileKind) {
 	n := m.selected()
 	if n == nil {
@@ -684,15 +659,22 @@ func (m *fileEditModel) createEntry() {
 	var err error
 	switch m.inputKind {
 	case createFile:
-		err = os.WriteFile(target, nil, 0o600)
+		// O_EXCL|O_NOFOLLOW: an existing symlink at target is refused, never followed.
+		err = m.vault.dirOp(target, func(r *os.Root, name string) error {
+			f, openErr := r.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
+			if openErr != nil {
+				return openErr
+			}
+			return f.Close()
+		})
 	case createDir:
-		err = os.Mkdir(target, 0o750)
+		err = m.vault.dirOp(target, func(r *os.Root, name string) error { return r.Mkdir(name, 0o750) })
 	}
 	if err != nil {
 		m.status = err.Error()
 		return
 	}
-	if err := applyNewFileMeta(target, m.inputKind == createDir); err != nil {
+	if err := applyNewFileMeta(m.vault, target, m.inputKind == createDir); err != nil {
 		m.status = err.Error()
 	}
 	if parent := m.findDir(m.inputDir); parent != nil {
@@ -728,15 +710,14 @@ func (m *fileEditModel) findDir(path string) *fileNode {
 	return nil
 }
 
-// beginChmod prepares the octal mode editor for the selected entry. The
-// value is a conventional unix mode: 3-4 octal digits where the optional
-// leading digit carries setuid/setgid/sticky (e.g. 4755).
+// beginChmod prepares the octal mode editor: 3-4 digits, the optional leading digit carrying
+// setuid/setgid/sticky (e.g. 4755).
 func (m *fileEditModel) beginChmod() {
 	n := m.selected()
 	if n == nil {
 		return
 	}
-	info, err := os.Lstat(n.path)
+	info, err := m.vault.lstat(n.path)
 	if err != nil {
 		m.status = err.Error()
 		return
@@ -750,8 +731,8 @@ func (m *fileEditModel) beginChmod() {
 	m.chmodInput.Width = max(m.paneWidth()-12, 4)
 	m.chmodInput.Prompt = "mode: "
 	m.chmodInput.Placeholder = "0644"
-	// Prefill the full mode including setuid/setgid/sticky, so confirming
-	// an untouched input can never silently strip those bits.
+	// Prefill the full mode incl. setuid/setgid/sticky so confirming untouched input can't strip
+	// them.
 	m.chmodInput.SetValue(fmt.Sprintf("%04o", fileModeToUnixMode(info.Mode())))
 	m.chmodInput.Focus()
 	m.mode = modeChmod
@@ -771,24 +752,32 @@ func (m *fileEditModel) applyChmod() {
 		m.status = "invalid mode: must not exceed 07777"
 		return
 	}
-	// The typed value is a unix mode; os.FileMode must be derived through
-	// the converter or the setuid/setgid/sticky bits are lost (a raw cast
-	// maps them onto undefined FileMode bits that chmod ignores).
-	if err := os.Chmod(m.chmodPath, unixModeToFileMode(uint32(perm))); err != nil {
+	// Re-validate at apply time on an O_PATH|O_NOFOLLOW descriptor: beginChmod's Lstat check is
+	// seconds stale. The value is a unix mode: convert via the converter, or setuid/setgid/sticky
+	// are lost (a raw os.FileMode cast maps them onto bits chmod ignores).
+	mode := unixModeToFileMode(uint32(perm))
+	err := m.vault.withFile(m.chmodPath, unix.O_PATH, func(f *os.File) error {
+		if info, statErr := f.Stat(); statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink — chmod is refused", m.chmodPath)
+		}
+		// O_PATH descriptors can't fchmod directly; chmod via /proc/self/fd resolves the pinned
+		// inode without re-walking the (swappable) path.
+		return os.Chmod(fmt.Sprintf("/proc/self/fd/%d", f.Fd()), mode)
+	})
+	if err != nil {
 		m.status = err.Error()
 		return
 	}
 	m.status = "chmod " + m.chmodPath + " = " + v
 }
 
-// beginChown opens the owner picker listing every login user plus a
-// "keep current" entry.
+// beginChown opens the owner picker (every login user plus "keep current").
 func (m *fileEditModel) beginChown() {
 	n := m.selected()
 	if n == nil {
 		return
 	}
-	info, err := os.Lstat(n.path)
+	info, err := m.vault.lstat(n.path)
 	if err != nil {
 		m.status = err.Error()
 		return
@@ -833,7 +822,13 @@ func (m *fileEditModel) applyChown() {
 		m.mode = modeNav
 		return
 	}
-	if err := os.Lchown(m.chownPath, u.uid, u.gid); err != nil {
+	err := m.vault.withFile(m.chownPath, unix.O_PATH, func(f *os.File) error {
+		if info, statErr := f.Stat(); statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink — chown is refused", m.chownPath)
+		}
+		return unix.Fchownat(int(f.Fd()), "", u.uid, u.gid, unix.AT_EMPTY_PATH)
+	})
+	if err != nil {
 		m.status = err.Error()
 		m.mode = modeNav
 		return
@@ -842,8 +837,8 @@ func (m *fileEditModel) applyChown() {
 	m.mode = modeNav
 }
 
-// beginDelete asks for confirmation (default no) before removing the
-// selected entry — recursive for directories.
+// beginDelete asks for confirmation (default no) before removing the entry (recursive for
+// directories).
 func (m *fileEditModel) beginDelete() {
 	n := m.selected()
 	if n == nil {
@@ -870,7 +865,7 @@ func (m *fileEditModel) confirmDelete() {
 	path := m.pendingDelete
 	m.pendingDelete = ""
 	m.mode = modeNav
-	if err := os.RemoveAll(path); err != nil {
+	if err := m.vault.dirOp(path, (*os.Root).RemoveAll); err != nil {
 		m.status = err.Error()
 		return
 	}
@@ -892,13 +887,11 @@ func (m *fileEditModel) paneHeight() int {
 	if m.height < 6 {
 		return 2
 	}
-	// 2 chrome rows (the header + the top margin) plus however many rows the
-	// legend wraps to at this width.
+	// 2 chrome rows (header + top margin) plus the legend's wrapped rows at this width.
 	return max(m.height-2-m.legendRows(), 2)
 }
 
-// legendRows is the number of terminal rows the (width-wrapped) legend
-// occupies for the current mode.
+// legendRows: terminal rows the width-wrapped legend occupies in the current mode.
 func (m *fileEditModel) legendRows() int {
 	return strings.Count(m.legend(), "\n") + 1
 }
@@ -922,15 +915,13 @@ func (m *fileEditModel) View() string {
 	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, head, m.body(), m.legend()))
 }
 
-// body lays the tree and the info/editor pane side by side, each fixed to
-// its column width so the layout fills the terminal.
+// body lays the tree and info/editor pane side by side, each fixed to its column width.
 func (m *fileEditModel) body() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top,
 		m.renderTree(m.leftW, m.paneHeight()),
 		paneSepStyle.Render("│"),
-		// Fix the right column to rightW so the pane reaches the terminal
-		// edge (renderRight clips its own content to rightW, so Width only
-		// pads; MaxWidth is the belt against a stray wide line).
+		// Fix the right column to rightW so it reaches the terminal edge (renderRight clips to
+		// rightW, so Width only pads; MaxWidth guards a stray wide line).
 		lipgloss.NewStyle().Width(m.rightW).MaxWidth(m.rightW).
 			Render(m.renderRight(m.rightW, m.paneHeight())),
 	)
@@ -948,11 +939,9 @@ func (m *fileEditModel) renderTree(width, height int) string {
 			}
 		}
 		prefix := strings.Repeat("  ", n.depth)
-		// Pad every row to the full pane width so the block lipgloss lays out
-		// is exactly `width` wide — otherwise JoinHorizontal sizes the tree
-		// column to its longest line and the right pane never reaches the
-		// terminal edge. Padding first also makes the selection bar span the
-		// whole pane.
+		// Pad every row to the full pane width: otherwise JoinHorizontal sizes the tree column to
+		// its longest line and the right pane never reaches the edge. Padding first also makes the
+		// selection bar span the pane.
 		label := clipLabel(prefix+marker+n.name, width)
 		label += strings.Repeat(" ", max(0, width-lipgloss.Width(label)))
 		if i == m.cur {
@@ -999,8 +988,7 @@ func (m *fileEditModel) renderChownPicker(width, height int) string {
 	return b.String()
 }
 
-// renderEntryInfo draws the right pane for the selected node: a directory
-// listing or the file metadata.
+// renderEntryInfo draws the right pane: a directory listing or file metadata.
 func (m *fileEditModel) renderEntryInfo(width, height int) string {
 	n := m.selected()
 	if n == nil {
@@ -1014,7 +1002,7 @@ func (m *fileEditModel) renderEntryInfo(width, height int) string {
 			b.WriteString(err.Error())
 			return b.String()
 		}
-		for _, e := range listEntries(n, height-2) {
+		for _, e := range listEntries(m.vault, n, height-2) {
 			name := e.name
 			if e.isDir {
 				name += "/"
@@ -1027,7 +1015,7 @@ func (m *fileEditModel) renderEntryInfo(width, height int) string {
 		}
 		return b.String()
 	}
-	info, err := os.Lstat(n.path)
+	info, err := m.vault.lstat(n.path)
 	if err != nil {
 		b.WriteString(err.Error())
 		return b.String()
@@ -1047,9 +1035,8 @@ func (m *fileEditModel) legend() string {
 	for _, h := range legendHints[m.mode] {
 		parts = append(parts, fileEditHintKey.Render(h.keys)+" "+h.label)
 	}
-	// Wrap to the terminal so the nav-mode hint list (which is wider than a
-	// typical terminal) never spills past the right edge; paneHeight accounts
-	// for the extra rows.
+	// Wrap to the terminal so the wide nav-mode hint list doesn't spill past the edge; paneHeight
+	// accounts for the extra rows.
 	usable := max(m.width-appStyle.GetHorizontalMargins(), 20)
 	return footerStyle.Width(usable).Render(strings.Join(parts, "  ·  "))
 }

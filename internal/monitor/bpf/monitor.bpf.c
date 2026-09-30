@@ -104,20 +104,14 @@ static __always_inline int emit_event_kern(__u32 type, __u32 fd, const char *pat
 	return 0;
 }
 
-/*
- * VFS-level kprobes – catch open/read/write from the common syscall
- * families (normal syscalls, execve, sendfile, splice, copy_file_range,
- * open_by_handle_at, etc.). io_uring bypasses the vfs_* helpers entirely
- * and is handled separately by the io_read / io_write kprobes below.
- *
- * We walk the dentry tree manually instead of using bpf_d_path
- * because bpf_d_path is not available in non-sleepable kprobe/fentry
- * programs and vfs_open/vfs_read/vfs_write are not sleepable.
- *
- * vfs_open       – ALL file opens.
- * vfs_read       – ALL file reads.
- * vfs_write      – ALL file writes.
- */
+// VFS-level kprobes: catch open/read/write from the common syscall families (normal syscalls,
+// execve, sendfile, splice, copy_file_range, open_by_handle_at). io_uring bypasses the vfs_*
+// helpers and is handled by the io_read/io_write kprobes below.
+//
+// The dentry tree is walked manually because bpf_d_path isn't available in non-sleepable
+// kprobe/fentry programs (vfs_open/read/write aren't sleepable).
+//
+// vfs_open: ALL opens. vfs_read: ALL reads. vfs_write: ALL writes.
 
 static __always_inline long read_path(struct dentry *dentry, char *buf, int buf_size)
 {
@@ -258,15 +252,12 @@ int trace_vfs_write(struct pt_regs *ctx)
 	return emit_event_kern(EVENT_WRITE, 0, buf + off, NULL);
 }
 
-/*
- * Additional VFS kprobes for syscalls that bypass vfs_read/vfs_write.
- *
- *   vfs_readv             – readv, preadv (modern kernels)
- *   vfs_copy_file_range   – copy_file_range
- *   do_splice             – splice (when in is a file)
- *   do_splice_direct      – sendfile (via do_sendfile → do_splice_direct)
- *   security_mmap_file    – mmap (kprobe alternative to tracepoint)
- */
+// Additional VFS kprobes for syscalls that bypass vfs_read/vfs_write:
+//   vfs_readv             - readv, preadv (modern kernels)
+//   vfs_copy_file_range   - copy_file_range
+//   do_splice             - splice (when in is a file)
+//   do_splice_direct      - sendfile (via do_sendfile -> do_splice_direct)
+//   security_mmap_file    - mmap (kprobe alternative to tracepoint)
 
 SEC("kprobe/vfs_readv")
 int trace_vfs_readv(struct pt_regs *ctx)
@@ -373,11 +364,8 @@ int trace_splice_file_range(struct pt_regs *ctx)
 	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
 }
 
-/*
- * do_sendfile catches the sendfile syscall on kernels where
- * sendfile no longer calls do_splice_direct/splice_file_range.
- * We resolve the file from the task's fd table using CO-RE.
- */
+// do_sendfile catches sendfile on kernels where it no longer calls
+// do_splice_direct/splice_file_range. The file is resolved from the task's fd table via CO-RE.
 SEC("kprobe/do_sendfile")
 int trace_do_sendfile(struct pt_regs *ctx)
 {
@@ -432,9 +420,7 @@ int trace_do_sendfile(struct pt_regs *ctx)
 	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
 }
 
-/*
- * vfs_iter_read is a catch-all for read-like operations on newer kernels.
- */
+// vfs_iter_read: catch-all for read-like operations on newer kernels.
 SEC("kprobe/vfs_iter_read")
 int trace_vfs_iter_read(struct pt_regs *ctx)
 {
@@ -456,19 +442,12 @@ int trace_vfs_iter_read(struct pt_regs *ctx)
 	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
 }
 
-/*
- * io_uring read/write.
- *
- * io_uring does NOT go through vfs_read / vfs_readv / vfs_iter_read: its
- * data path is io_read() -> call_read_iter() -> file->f_op->read_iter()
- * (and the mirror for writes), so every vfs_* kprobe above misses it and
- * an io_uring READV/WRITEV against a watched file would be invisible.
- * io_read() / io_write() take the request as arg1; io_kiocb.file (first
- * member of an anonymous union) is the target file, already resolved at
- * this point. Executed inline in the submitter for NOWAIT-capable files,
- * otherwise by an io-wq worker thread that shares the owner's tgid — so
- * the pid still resolves to the real process either way.
- */
+// io_uring read/write. io_uring does NOT go through vfs_read/vfs_readv/vfs_iter_read (its path is
+// io_read() -> call_read_iter() -> f_op->read_iter(), mirrored for writes), so every vfs_* kprobe
+// above misses a READV/WRITEV on a watched file. io_read()/io_write() take the request as arg1;
+// io_kiocb.file (first member of an anonymous union) is the already-resolved target. Runs inline in
+// the submitter, or in an io-wq worker sharing the owner's tgid, so the pid is the real process
+// either way.
 SEC("kprobe/io_read")
 int trace_io_read(struct pt_regs *ctx)
 {
@@ -544,24 +523,17 @@ int trace_security_mmap_file(struct pt_regs *ctx)
 	return emit_event_kern(EVENT_MMAP, 0, buf + off, NULL);
 }
 
-/*
- * VFS-level kprobes for filesystem metadata operations.
- *
- * These replace tracepoint/syscalls/sys_enter_* because tracepoints
- * require debugfs/tracefs to be mounted, which is not always available
- * in containers. VFS kprobes work wherever kprobes are supported.
- *
- * vfs_mkdir     – catches both mkdir and mkdirat syscalls
- * vfs_rmdir     – catches rmdir and unlinkat(AT_REMOVEDIR)
- * vfs_unlink    – catches both unlink and unlinkat syscalls
- * vfs_rename    – catches both rename and renameat2 syscalls
- * vfs_symlink   – catches both symlink and symlinkat syscalls
- * vfs_link      – catches both link and linkat syscalls
- *
- * For handlers that need two path buffers (rename, link), we use
- * fill_path() with the tmp_buf percpu array to avoid exceeding the
- * BPF stack limit (512 bytes).
- */
+// VFS kprobes for metadata operations. They replace tracepoint/syscalls/sys_enter_* because
+// tracepoints need debugfs/tracefs, often absent in containers.
+//   vfs_mkdir   - mkdir, mkdirat
+//   vfs_rmdir   - rmdir, unlinkat(AT_REMOVEDIR)
+//   vfs_unlink  - unlink, unlinkat
+//   vfs_rename  - rename, renameat2
+//   vfs_symlink - symlink, symlinkat
+//   vfs_link    - link, linkat
+//
+// Handlers needing two path buffers (rename, link) use fill_path() with the tmp_buf percpu array to
+// stay under the 512-byte BPF stack limit.
 
 SEC("kprobe/vfs_mkdir")
 int trace_vfs_mkdir(struct pt_regs *ctx)
@@ -686,27 +658,15 @@ int trace_vfs_link(struct pt_regs *ctx)
 	return 0;
 }
 
-/*
- * Metadata-operation coverage: path-based ops that never create a
- * struct file and therefore never pass through vfs_open. The enum
- * values and their order MUST stay in sync with the Go EventType
- * enum (internal/infrastructure/event.go).
- *
- * notify_change                    – chmod/chown/utimes/truncate size
- *                                   (vfs_truncate -> do_truncate ->
- *                                   notify_change); also fires for
- *                                   O_TRUNC opens, which is accurate
- *                                   (the size does change).
- * vfs_setxattr / vfs_removexattr   – extended attributes.
- * vfs_mknod                        – device nodes / FIFOs / sockets.
- * vfs_getattr                      – stat/lstat/statx/fstat metadata
- *                                   reads (same chokepoint as the
- *                                   guard's inode_getattr LSM hook).
- * vfs_readlink                     – symlink body reads.
- * do_faccessat                     – access(2)/faccessat(2) probes;
- *                                   the user-supplied pathname is
- *                                   emitted directly (arg 2).
- */
+// Metadata-operation coverage: path-based ops that never create a struct file, so never hit
+// vfs_open. Enum values and order MUST match the Go EventType enum
+// (internal/infrastructure/event.go).
+//   notify_change            - chmod/chown/utimes/truncate size (vfs_truncate -> do_truncate -> notify_change); also O_TRUNC opens (the size does change)
+//   vfs_setxattr/removexattr - extended attributes
+//   vfs_mknod                - device nodes / FIFOs / sockets
+//   vfs_getattr              - stat/lstat/statx/fstat (same chokepoint as the guard's inode_getattr hook)
+//   vfs_readlink             - symlink body reads
+//   do_faccessat             - access(2)/faccessat(2); the user-supplied pathname is emitted directly (arg 2)
 
 SEC("kprobe/notify_change")
 int trace_notify_change(struct pt_regs *ctx)
@@ -814,11 +774,8 @@ int trace_do_faccessat(struct pt_regs *ctx)
 	return emit_event(EVENT_STAT, 0, pathname, NULL);
 }
 
-/*
- * Memory-mapped I/O – maps a file into memory so reads happen without
- * any read-family syscall. Keeps the mmap tracepoint because it also
- * captures the file descriptor and works alongside security_mmap_file.
- */
+// Memory-mapped I/O: reads happen with no read-family syscall. Keeps the mmap tracepoint because it
+// also captures the fd and works alongside security_mmap_file.
 
 SEC("tracepoint/syscalls/sys_enter_mmap")
 int trace_mmap(struct trace_event_raw_sys_enter *ctx)

@@ -21,10 +21,9 @@ const quitKey = "ctrl+c"
 // initializingView is shown while the TUI is not ready yet.
 const initializingView = "\n  Initializing..."
 
-// Rows each view spends outside the viewport: header/info/footer blocks,
-// blank separators and the two appStyle vertical margins. The viewport must
-// be sized as height minus these rows, otherwise the bottom of the view
-// (resource bar, footer) overflows the reported terminal height.
+// Rows each view spends outside the viewport (header/info/footer, separators, the two appStyle
+// margins). The viewport is height minus these, else the bottom (resource bar, footer) overflows
+// the terminal.
 const (
 	fileViewFixedRows    = 8 // header, blank, info | resource, blank, footer | margins
 	networkViewFixedRows = 9 // header, blank, info, stats | resource, blank, footer | margins
@@ -278,9 +277,8 @@ func (m *model) View() string {
 	)), m.width)
 }
 
-// clipToWidth truncates every rendered line to width. Chrome lines and event
-// lines wider than the terminal would otherwise wrap in xterm and silently
-// consume extra rows, pushing the resource bar and footer out of the window.
+// clipToWidth truncates every rendered line to width: wider chrome/event lines would wrap in xterm,
+// consume extra rows and push the resource bar and footer out.
 func clipToWidth(view string, width int) string {
 	if width <= 0 {
 		return view
@@ -292,11 +290,9 @@ func (m *model) renderResourceBar() string {
 	return formatResourceBar(m.lastStats, m.startTime, m.eventsPerSec)
 }
 
-// syncViewport sizes the viewport, creating it on first use, then re-renders
-// the viewport content through render. fixedRows is every row the view spends
-// outside the viewport (headers, footers, separators and margins); the
-// viewport gets exactly the remaining height so the whole view fits the
-// reported terminal size.
+// syncViewport sizes the viewport (created on first use) and re-renders its content. fixedRows is
+// every row outside the viewport; the viewport gets the remaining height so the view fits the
+// terminal.
 func syncViewport(v *viewport.Model, ready *bool, width, height, fixedRows int, render func()) {
 	viewportWidth := max(1, width-appStyle.GetHorizontalMargins())
 	viewportHeight := max(1, height-fixedRows)

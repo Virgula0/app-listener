@@ -9,15 +9,23 @@ import (
 
 // User is a login account that may have directories worth protecting.
 type User struct {
-	Name string
-	UID  uint32
-	GID  uint32
-	Home string
+	Name  string
+	UID   uint32
+	GID   uint32
+	Home  string
+	Shell string
 }
 
-// minLoginUID is the lower bound for "real" users; system accounts below
-// this are skipped. Root (UID 0) is an exception: its home directory
-// holds the most sensitive credentials on the system.
+// shell returns the login shell field of a parsed passwd line ("" when absent).
+func shell(fields []string) string {
+	if len(fields) > 6 {
+		return fields[6]
+	}
+	return ""
+}
+
+// minLoginUID is the lower bound for "real" users (system accounts below are skipped). Root (UID 0)
+// is exempt: its home holds the most sensitive credentials.
 const minLoginUID = 1000
 
 // ListUsers returns the local login users — root plus every user with a
@@ -30,9 +38,8 @@ func ListUsers() ([]User, error) {
 	return parsePasswd(data)
 }
 
-// parsePasswd parses /etc/passwd content. Users are kept when the UID is
-// 0 (root) or >= minLoginUID, the home directory is a plausible absolute
-// path, and the home directory actually exists.
+// parsePasswd parses /etc/passwd content: keeps UID 0 or >= minLoginUID entries whose home is a
+// plausible absolute path that exists.
 func parsePasswd(data []byte) ([]User, error) {
 	var users []User
 	for lineno, line := range strings.Split(string(data), "\n") {
@@ -58,7 +65,7 @@ func parsePasswd(data []byte) ([]User, error) {
 		if _, err := os.Stat(home); err != nil {
 			continue
 		}
-		users = append(users, User{Name: fields[0], UID: uint32(uid), GID: uint32(gid), Home: home})
+		users = append(users, User{Name: fields[0], UID: uint32(uid), GID: uint32(gid), Home: home, Shell: shell(fields)})
 	}
 	return users, nil
 }

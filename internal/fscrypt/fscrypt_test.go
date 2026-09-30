@@ -126,13 +126,10 @@ func TestIsEncryptedRegularFile(t *testing.T) {
 	}
 }
 
-// TestIsNotEncryptedErr verifies the classifier Vault.Lock uses to map onto
-// repository.ErrNotEncrypted: it must recognize the library's
-// metadata.ErrNotEncrypted (a path with no fscrypt policy at all — e.g. one
-// a backup restore replaced with plaintext) and reject both an unrelated
-// error and the superficially similar metadata.ErrLockedRegularFile, which
-// means "policy exists, key is gone" and must keep mapping onto
-// repository.ErrKeyMissing instead.
+// Verifies the classifier Vault.Lock uses for repository.ErrNotEncrypted: it must recognize
+// metadata.ErrNotEncrypted (no fscrypt policy at all, e.g. replaced by a plaintext backup restore)
+// and reject an unrelated error and the similar metadata.ErrLockedRegularFile ("policy exists, key
+// gone"), which must keep mapping to repository.ErrKeyMissing.
 func TestIsNotEncryptedErr(t *testing.T) {
 	if !isNotEncryptedErr(&metadata.ErrNotEncrypted{Path: "/x"}) {
 		t.Error("expected metadata.ErrNotEncrypted to be recognized")

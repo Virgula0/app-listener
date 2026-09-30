@@ -40,9 +40,8 @@ func formatGuardEventLine(ev *guard.GuardEvent) string {
 	)
 }
 
-// sanitizeTerminalText strips control characters (including terminal escape
-// sequences and forged newlines) from attacker-controlled event fields
-// before they reach xterm or any rendered view. Shared implementation.
+// sanitizeTerminalText strips control characters (terminal escapes, forged newlines) from
+// attacker-controlled event fields before they reach xterm or a view. Shared implementation.
 func sanitizeTerminalText(value string) string {
 	return logging.SanitizeText(value)
 }

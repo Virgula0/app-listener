@@ -14,15 +14,13 @@ import (
 	"github.com/Virgula0/app-listener/internal/tui"
 )
 
-// runLiveEdit is the daemon-running flow. The password is asked ONCE, up
-// front — before any protected path is shown — then the daemon returns the
-// list of guarded directories, the user picks one, the daemon widens that
-// resource's guard for the session, the editor runs, and the grant is
-// released. The daemon owns the vault lifecycle throughout.
+// runLiveEdit is the daemon-running flow: password asked ONCE up front (before any protected path
+// is shown), the daemon returns the guarded directories, the user picks one, the daemon widens that
+// resource's guard for the session, the editor runs, the grant is released. The daemon owns the
+// vault lifecycle.
 //
-// The password is read BEFORE connecting: the daemon arms a short handshake
-// deadline the moment it accepts, so a connection that stays silent while the
-// operator types would be dropped as a timeout.
+// The password is read BEFORE connecting: the daemon arms a short handshake deadline on accept, so
+// a connection silent while the operator types would time out.
 func runLiveEdit() error {
 	password, err := promptPassword("Edit-protected password")
 	if err != nil {
@@ -107,9 +105,8 @@ func runNonInteractiveLivePut() error {
 	if !filepath.IsAbs(dest) {
 		dest = filepath.Join(resourceFlag, dest)
 	}
-	// Lexical containment is a first gate only; writeWithin re-checks every
-	// component with O_NOFOLLOW so a symlink in the tree cannot redirect the
-	// write outside the guarded resource.
+	// Lexical containment is only a first gate; writeWithin re-checks every component with
+	// O_NOFOLLOW so a symlink in the tree can't redirect the write outside the guarded resource.
 	if !within(resourceFlag, dest) {
 		return fmt.Errorf("--put target %s is outside the resource %s", dest, resourceFlag)
 	}

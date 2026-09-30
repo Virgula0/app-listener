@@ -1,20 +1,13 @@
-// The `app-listener edit-protected` command opens fscrypt-encrypted
-// (or plain) protected directories in the embedded two-pane editor.
+// The `app-listener edit-protected` command opens fscrypt-encrypted (or plain) protected
+// directories in the embedded two-pane editor. Two modes, chosen automatically:
+//   - offline (no password configured, or daemon stopped): fatally refuses while the daemon runs,
+//     re-scans the catalog like the uninstaller, unlocks ONE vault with the master key, edits,
+//     re-locks; a vault never stays open after return.
+//   - live (password set at install and daemon running): authenticates over the daemon's control
+//     socket, which briefly widens that one resource's guard for the write, then narrows it. The
+//     daemon keeps running; the vault lifecycle is untouched.
 //
-// Two modes, chosen automatically:
-//
-//   - offline (no edit-protected password configured, or the daemon is
-//     stopped): fatally refuses while the daemon runs, re-scans the catalog
-//     like the uninstaller, unlocks ONE vault with the master key, edits, and
-//     re-locks it — a vault never stays open after the command returns.
-//
-//   - live (an edit-protected password was set at install time and the
-//     daemon is running): authenticates to the daemon over its local control
-//     socket, which briefly widens that one resource's guard so the edit can
-//     be written, then narrows it again. The daemon keeps running and the
-//     vault lifecycle is never touched.
-//
-// `--set-password` / `--clear-password` manage the password itself.
+// `--set-password` / `--clear-password` manage the password.
 package editprotected
 
 import (
@@ -102,9 +95,8 @@ func runEditProtected(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	// The control socket exists only when a running daemon has a password
-	// configured — the exact precondition for live mode, and independent of
-	// whether systemd supervises the daemon.
+	// The control socket exists only when a running daemon has a password configured: the exact
+	// precondition for live mode, independent of whether systemd supervises the daemon.
 	liveReady := LiveModeAvailable()
 
 	if putFlag != "" {

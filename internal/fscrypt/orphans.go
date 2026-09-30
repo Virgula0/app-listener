@@ -13,16 +13,14 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// appProtectorPrefix names the raw-key protectors created for migrated directories
-// (see applyRawKeyPolicy). It is the signature marking fscrypt metadata as ours:
-// only metadata with this prefix and a raw-key source is ever touched by orphan
-// cleanup, so login protectors and foreign setups survive it.
+// appProtectorPrefix names the raw-key protectors created for migrated dirs (applyRawKeyPolicy). It
+// marks fscrypt metadata as ours: only metadata with this prefix and a raw-key source is touched by
+// orphan cleanup, so login protectors and foreign setups survive.
 const appProtectorPrefix = "app-listener-key-"
 
-// LivePolicyDescriptors returns the policy descriptors attached to the given paths; only paths that
-// exist right now contribute, so a deleted directory's metadata counts as orphaned. The inputs are
-// every catalog watch directory plus the final config resources — the complete set of levels the
-// installer ever encrypts.
+// LivePolicyDescriptors returns the policy descriptors attached to the given paths; only paths
+// existing now contribute, so a deleted directory's metadata counts as orphaned. Inputs: every
+// catalog watch dir plus the final config resources (every level the installer ever encrypts).
 func LivePolicyDescriptors(paths []string) (map[string]struct{}, error) {
 	live := make(map[string]struct{})
 	for _, p := range paths {
@@ -58,10 +56,10 @@ func isAppProtector(p *metadata.ProtectorData) bool {
 		strings.HasPrefix(p.GetName(), appProtectorPrefix)
 }
 
-// SelectOrphans partitions one mount's fscrypt metadata into entries to keep and entries that may be
-// deleted: an orphan protector is referenced by no policy attached to a still-existing path; an orphan
-// policy's directory is gone and it uses only protectors created by this installer. Existing-but-
-// unconfigured directories (e.g. an independently encrypted ~/.ssh) keep their metadata.
+// SelectOrphans partitions one mount's fscrypt metadata into keep and deletable. An orphan
+// protector is referenced by no policy on a still-existing path; an orphan policy's directory is
+// gone and uses only this installer's protectors. Existing-but-unconfigured dirs (e.g. an
+// independently encrypted ~/.ssh) keep their metadata.
 func SelectOrphans(protectors []*metadata.ProtectorData, policies []*metadata.PolicyData, livePolicies map[string]struct{}) (orphanProtectors, orphanPolicies []string) {
 	refs := make(map[string][]string, len(policies))
 	for _, p := range policies {
@@ -141,9 +139,9 @@ func orphanedPolicies(policies []*metadata.PolicyData, refs map[string][]string,
 	return orphan
 }
 
-// CleanOrphans deletes the orphaned fscrypt policy/protector metadata on the mount containing anchor —
-// only app-listener-key-* raw-key protectors and the policies referencing solely them, never login
-// protectors or foreign setups. A metadata-free mount is a no-op; returned counts are actual removals.
+// CleanOrphans deletes orphaned fscrypt metadata on anchor's mount: only app-listener-key-* raw-key
+// protectors and policies referencing solely them, never login protectors or foreign setups. A
+// metadata-free mount is a no-op; counts are actual removals.
 func CleanOrphans(anchor string, livePolicies map[string]struct{}) (removedProtectors, removedPolicies int, err error) {
 	ctx, ctxErr := actions.NewContextFromPath(anchor, nil)
 	if ctxErr != nil {

@@ -15,21 +15,18 @@ import (
 	"unicode"
 )
 
-// HashFile is where the installer (and `edit-protected --set-password`)
-// persists the PBKDF2 hash of the edit-protected authentication password. It
-// lives next to fscrypt.key in the daemon's self-protected config directory:
-// the running daemon guards it whitelist-empty (readable/writable only by the
-// app-listener binary — see selfProtectSpecs in the daemon package), and on
-// disk it is 0600 root-owned.
+// HashFile is where the installer (and `edit-protected --set-password`) persists the PBKDF2 hash of
+// the edit-protected password, beside fscrypt.key in the self-protected config dir: the running
+// daemon guards it whitelist-empty (only the app-listener binary may read/write; selfProtectSpecs),
+// and on disk it is 0600 root-owned.
 const HashFile = "/etc/app-listener/edit-auth.hash"
 
 // hashFilePath is HashFile in production; tests point it at a temp file.
 var hashFilePath = HashFile
 
-// Password strength floor. The password is a local, rate-limited,
-// lockout-protected secret (the daemon throttles guesses over the control
-// socket), so the bar is "not trivially guessable", not "resists an offline
-// crack of the 0600 root-only hash file".
+// Password strength floor: the password is a local, rate-limited, lockout-protected secret (the
+// daemon throttles guesses over the control socket), so the bar is "not trivially guessable", not
+// "resists an offline crack of the 0600 hash file".
 const (
 	minPasswordLen = 12
 	minCharClasses = 3
@@ -38,10 +35,9 @@ const (
 	pbkdf2SaltLen  = 16
 )
 
-// Origin records how the hash file was created. `edit-protected
-// --set-password` is allowed to rotate a cli-set password but refuses to
-// touch one chosen during `app-listener install` (rotating that one requires
-// re-running the installer).
+// Origin records how the hash file was created. `edit-protected --set-password` may rotate a
+// cli-set password but refuses one chosen during `install` (rotating that requires re-running the
+// installer).
 type Origin string
 
 const (
@@ -49,9 +45,8 @@ const (
 	OriginCLI     Origin = "cli"
 )
 
-// ErrNoHashFile means no edit-protected password has been configured: live
-// mode is unavailable and edit-protected falls back to the daemon-stopped
-// flow.
+// ErrNoHashFile: no edit-protected password configured, so live mode is unavailable and
+// edit-protected falls back to the daemon-stopped flow.
 var ErrNoHashFile = errors.New("no edit-protected password is configured")
 
 // ValidatePassword enforces the strength floor: length, character-class
@@ -94,13 +89,9 @@ func ValidatePassword(pw string) error {
 	return nil
 }
 
-// Hash derives the stored representation of pw:
-//
-//	pbkdf2-sha256$<iter>$<b64salt>$<b64dk>$<origin>
-//
-// base64 is raw-url (no padding, no '$'). The origin trailer lets
-// --set-password distinguish an installer-chosen password from a
-// cli-chosen one.
+// Hash derives the stored form of pw: pbkdf2-sha256$<iter>$<b64salt>$<b64dk>$<origin>. base64 is
+// raw-url (no padding, no '$'). The origin trailer lets --set-password tell an installer-chosen
+// password from a cli-chosen one.
 func Hash(pw string, origin Origin) (string, error) {
 	if err := ValidatePassword(pw); err != nil {
 		return "", err
@@ -179,12 +170,9 @@ func OriginOf(encoded string) (Origin, error) {
 	return p.origin, nil
 }
 
-// HashFileExists reports whether an edit-protected password is configured.
-// The daemon pre-creates HashFile as an empty placeholder before it ever
-// self-guards it (see cmd/functions/daemon/selfguards.go
-// ensureHashFilePlaceholder), so existence alone no longer means
-// "configured" — an empty (or whitespace-only) file means "not configured",
-// same as the file being absent entirely.
+// HashFileExists reports whether a password is configured. The daemon pre-creates HashFile as an
+// empty placeholder before self-guarding it (ensureHashFilePlaceholder), so existence alone doesn't
+// mean configured: an empty or whitespace-only file = not configured, same as absent.
 func HashFileExists() (bool, error) {
 	data, err := os.ReadFile(hashFilePath)
 	if err != nil {
@@ -213,17 +201,12 @@ func LoadHashFile() (string, error) {
 	return trimmed, nil
 }
 
-// WriteHashFile writes encoded to HashFile IN PLACE, on the file's existing
-// inode (open, truncate, write, fsync) — never by creating a new directory
-// entry and renaming it over. That distinction matters here specifically:
-// while the daemon runs, HashFile sits inside the ReadOnly-guarded
-// /etc/app-listener (see selfProtectSpecs), whose self-allow for the daemon's
-// own binary covers rewriting an EXISTING entry but not creating a new one.
-// The daemon guarantees HashFile always exists (as an empty placeholder if
-// no password is set — see ensureHashFilePlaceholder) before that guard ever
-// attaches, so this only ever needs the in-place path; the create branch
-// below is a fallback for the case nothing has bootstrapped it yet (no
-// daemon has run since /etc/app-listener was created).
+// WriteHashFile writes encoded to HashFile IN PLACE on the file's existing inode (open, truncate,
+// write, fsync), never create-and-rename: while the daemon runs, HashFile is inside the
+// ReadOnly-guarded /etc/app-listener, whose self-allow covers rewriting an EXISTING entry but not
+// creating one. The daemon guarantees the file exists (empty placeholder if no password) before
+// that guard attaches, so only the in-place path is needed; the create branch is a fallback for
+// when nothing has bootstrapped it (no daemon has run since /etc/app-listener was created).
 func WriteHashFile(encoded string) error {
 	dir := filepath.Dir(hashFilePath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -252,11 +235,9 @@ func WriteHashFile(encoded string) error {
 	return f.Sync()
 }
 
-// RemoveHashFile clears the stored password by truncating HashFile to empty
-// IN PLACE — see WriteHashFile for why this never unlinks the file (removing
-// then recreating it would need a new directory entry in the ReadOnly-
-// guarded /etc/app-listener, which the daemon's own self-allow does not
-// permit while it is running). A missing file is treated as already-cleared.
+// RemoveHashFile clears the password by truncating HashFile IN PLACE (see WriteHashFile:
+// unlink+recreate needs a new entry in the RO-guarded /etc/app-listener, which the daemon's
+// self-allow forbids while running). A missing file counts as already cleared.
 func RemoveHashFile() error {
 	f, err := os.OpenFile(hashFilePath, os.O_WRONLY, 0)
 	if err != nil {

@@ -13,11 +13,9 @@ var (
 	// (ENOKEY): the directory is fully locked.
 	ErrKeyMissing = errors.New("key not present")
 
-	// ErrNotEncrypted reports that path carries no fscrypt policy at all —
-	// distinct from ErrKeyBusy/ErrKeyMissing, which both presuppose a policy
-	// exists. Unlike ErrKeyBusy this is permanent: retrying Lock can never
-	// turn a policy-less path into a locked one, so callers must not retry
-	// it forever the way they retry ErrKeyBusy.
+	// ErrNotEncrypted: path has no fscrypt policy at all, distinct from ErrKeyBusy/ErrKeyMissing
+	// (which presuppose one). Permanent: retrying Lock can't make a policy-less path locked, so
+	// callers must not retry it like ErrKeyBusy.
 	ErrNotEncrypted = errors.New("path is not encrypted")
 )
 
@@ -31,8 +29,7 @@ type Vault interface {
 	// Unlock provisions the policy key for path so its contents are
 	// readable. It is a no-op when the policy is already provisioned.
 	Unlock(path string) error
-	// Lock deprovisions the policy key for path. When forceFlush is true
-	// the deprovision is attempted even if the policy does not appear
-	// provisioned, and errors are translated to ErrKeyBusy/ErrKeyMissing.
+	// Lock deprovisions the policy key for path. With forceFlush it is attempted even if the policy
+	// doesn't look provisioned; errors map to ErrKeyBusy/ErrKeyMissing.
 	Lock(path string, forceFlush bool) error
 }

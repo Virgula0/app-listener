@@ -35,22 +35,18 @@ const (
 	// PacmanHookName is the embedded sample and installed file name of the
 	// pacman post-transaction catalog-refresh hook.
 	PacmanHookName = "50-app-listener-reload.hook"
-	// AptHooksDir is apt's config drop-in directory; AptHookName is the
-	// embedded sample and installed file name of the DPkg::Post-Invoke
-	// catalog-refresh hook (mirrors the pacman hook on Debian/Ubuntu).
+	// AptHooksDir is apt's config drop-in dir; AptHookName is the installed name of the
+	// DPkg::Post-Invoke catalog-refresh hook (the apt counterpart of the pacman hook).
 	AptHooksDir = "/etc/apt/apt.conf.d"
 	AptHookName = "95app-listener-reload"
-	// AptHookSample is the embedded daemon-samples file the apt hook is
-	// installed from (kept distinct from AptHookName so the drop-in gets the
-	// conventional numeric prefix while the sample name stays descriptive).
+	// AptHookSample is the embedded daemon-samples file the hook is installed from (distinct from
+	// AptHookName so the drop-in gets the conventional numeric prefix).
 	AptHookSample = "apt-app-listener-reload"
 	// DaemonServiceName is the systemd unit name (without .service).
 	DaemonServiceName = "app-listener-daemon"
-	// CatalogRefreshServiceName is the boot-time catalog-refresh oneshot unit
-	// (without .service): it runs `install --update-catalog-only --live` once
-	// per boot, after the daemon, so package changes made while the hook was
-	// not running (offline installs, direct dpkg/pacman -U, a failed hook)
-	// are still picked up.
+	// CatalogRefreshServiceName is the boot-time catalog-refresh oneshot (without .service): runs
+	// `install --update-catalog-only --live` once per boot after the daemon, catching package
+	// changes the hook missed (offline installs, direct dpkg/pacman -U, a failed hook).
 	CatalogRefreshServiceName = "app-listener-catalog-refresh"
 )
 
@@ -59,9 +55,8 @@ const (
 	daemonActiveState  = "active"
 )
 
-// StopDaemonIfRunning cleanly stops an active unit (the caller re-enables it
-// later) and fatally refuses daemons running outside systemd; after a stop
-// the installed config's resources are verified locked.
+// StopDaemonIfRunning cleanly stops an active unit (the caller re-enables it) and fatally refuses
+// daemons running outside systemd; afterwards the installed config's resources are verified locked.
 func StopDaemonIfRunning() error {
 	if strings.TrimSpace(SystemctlOutput("is-active", DaemonServiceName)) == daemonActiveState {
 		log.Infof("daemon is running under systemd: stopping it ...")
@@ -85,9 +80,9 @@ func StopDaemonIfRunning() error {
 	return nil
 }
 
-// VerifyInstalledResourcesLocked loads the installed config and checks every
-// encrypted resource is keyless: the daemon only exits after its lockdown, so
-// a violation means it was killed and continuing would leave trees unguarded.
+// VerifyInstalledResourcesLocked loads the installed config and checks every encrypted resource is
+// keyless: the daemon exits only after its lockdown, so a violation means it was killed and
+// continuing would leave trees unguarded.
 func VerifyInstalledResourcesLocked() error {
 	if _, err := os.Stat(SystemConfigPath); os.IsNotExist(err) {
 		log.Debug("no installed config yet: nothing to verify")
@@ -100,10 +95,9 @@ func VerifyInstalledResourcesLocked() error {
 	return VerifyResourcesLocked(cfg.Resources, fscrypt.New().IsProvisioned)
 }
 
-// VerifyResourcesLocked reports an error when any encrypted resource is
-// still provisioned (unlocked). Grouped resources share one fscrypt vault
-// keyed on the encryption root, so the lock state is checked there (and once
-// per root), not on each watch sub-path.
+// VerifyResourcesLocked errors if any encrypted resource is still provisioned. Grouped resources
+// share one vault keyed on the encryption root, so state is checked once per root, not per watch
+// sub-path.
 func VerifyResourcesLocked(resources []daemonconfig.Resource, provisioned func(string) (bool, error)) error {
 	var unlocked []string
 	seen := make(map[string]bool)
@@ -152,16 +146,14 @@ func SystemctlOutput(args ...string) string {
 	return string(out)
 }
 
-// IsDaemonActive reports whether the daemon service unit is currently
-// active, for callers that must distinguish a running daemon (vaults
-// unlocked, guards attached) from a stopped one.
+// IsDaemonActive reports whether the unit is active (running daemon: vaults unlocked, guards
+// attached; vs stopped).
 func IsDaemonActive() bool {
 	return strings.TrimSpace(SystemctlOutput("is-active", DaemonServiceName)) == daemonActiveState
 }
 
-// ReloadDaemonIfActive sends the daemon a SIGHUP (systemctl reload) when it
-// is running, and is a no-op otherwise. Used for changes the daemon can pick
-// up on reload without a restart — e.g. the edit-protected password file.
+// ReloadDaemonIfActive sends SIGHUP (systemctl reload) if running, else no-op. For changes picked
+// up on reload, e.g. the edit-protected password file.
 func ReloadDaemonIfActive() error {
 	if !IsDaemonActive() {
 		return nil
@@ -169,9 +161,8 @@ func ReloadDaemonIfActive() error {
 	return RunCmd("systemctl", "reload", DaemonServiceName)
 }
 
-// EnableAndVerify brings the daemon to enabled-and-running regardless of
-// prior state: a changed config on a running daemon is delivered via SIGHUP
-// reload (restart fallback); both states are verified.
+// EnableAndVerify brings the daemon to enabled-and-running from any state: a changed config on a
+// running daemon is delivered via SIGHUP (restart fallback); both states verified.
 func EnableAndVerify(configChanged bool) error {
 	if err := RunCmd("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
@@ -216,10 +207,8 @@ func EnableAndVerify(configChanged bool) error {
 	return nil
 }
 
-// EnableCatalogRefresh enables the boot-time catalog-refresh oneshot unit so
-// it runs once on every subsequent boot (after the daemon). It is not started
-// now: `install` has just written the freshest possible config. A missing unit
-// file (older sample set, manual removal) is a warning, not an error — the
+// EnableCatalogRefresh enables the boot-time refresh oneshot (runs once per boot after the daemon).
+// Not started now: `install` just wrote the freshest config. A missing unit file is a warning:
 // package-manager hooks remain the primary refresh path.
 func EnableCatalogRefresh() error {
 	unit := CatalogRefreshServiceName + ".service"
@@ -244,9 +233,9 @@ func EnsureBinSymlink() error {
 	return EnsureBinSymlinkAt(BinSymlinkPath, InstallBinaryPath)
 }
 
-// EnsureBinSymlinkAt creates linkPath -> targetPath idempotently: a correct
-// symlink is kept, regular files and foreign symlinks are refused with a
-// warning, and a missing parent directory is only a warning.
+// EnsureBinSymlinkAt creates linkPath -> targetPath idempotently: a correct symlink is kept,
+// regular files and foreign symlinks are refused with a warning, a missing parent dir is only a
+// warning.
 func EnsureBinSymlinkAt(linkPath, targetPath string) error {
 	info, err := os.Lstat(linkPath)
 	switch {
@@ -301,9 +290,8 @@ func RemoveBinSymlinkAt(linkPath, targetPath string) {
 	log.Infof("removed symlink %s", linkPath)
 }
 
-// ReplaceInstalledBinary swaps srcPath into dstPath atomically with mode
-// 0700: content is staged in a sibling temp file renamed over the
-// destination, so replacing a running binary never fails with ETXTBSY.
+// ReplaceInstalledBinary swaps srcPath into dstPath atomically (mode 0700): staged in a sibling
+// temp file renamed over the destination, so replacing a running binary never hits ETXTBSY.
 func ReplaceInstalledBinary(srcPath, dstPath string) error {
 	tmp, err := os.CreateTemp(filepath.Dir(dstPath), ".app-listener-new-*")
 	if err != nil {
@@ -338,22 +326,17 @@ func ReplaceInstalledBinary(srcPath, dstPath string) error {
 // var so tests can point it at a temp directory.
 var daemonUnitFile = filepath.Join(SystemdDir, DaemonServiceName+".service")
 
-// DaemonUnitInstalled reports whether the daemon systemd unit file is present.
-// The binary-only and update flows use it to skip the enable/start/verify
-// step when only the binary was ever deployed (the one-line installer path):
-// there is no unit to bring up, so replacing the binary is the whole job —
-// `sudo app-listener install` sets the daemon up later.
+// DaemonUnitInstalled reports whether the daemon unit file exists. Binary-only/update flows skip
+// enable/start/verify when only the binary was deployed (one-line installer): replacing it is the
+// whole job; `sudo app-listener install` sets up the daemon later.
 func DaemonUnitInstalled() bool {
 	_, err := os.Stat(daemonUnitFile)
 	return err == nil
 }
 
-// DeployInstalledBinary installs srcPath as the service binary: stops the
-// daemon first (outside-systemd is fatal), replaces it atomically, recreates
-// the PATH symlink and restores enabled-and-running. Shared by update/install.
-// When the daemon service unit is not installed yet (only the binary was ever
-// deployed) it stops after the atomic replace and the symlink — there is no
-// unit to enable or verify.
+// DeployInstalledBinary installs srcPath as the service binary: stops the daemon (outside-systemd
+// is fatal), replaces it atomically, recreates the PATH symlink, restores enabled-and-running.
+// Shared by update/install. If the unit isn't installed it stops after the replace and symlink.
 func DeployInstalledBinary(srcPath string) error {
 	if err := StopDaemonIfRunning(); err != nil {
 		return err
@@ -376,14 +359,10 @@ func DeployInstalledBinary(srcPath string) error {
 	return EnableAndVerify(false)
 }
 
-// DeployInstalledBinaryNoRestart installs srcPath as the service binary
-// WITHOUT stopping or restarting a running daemon: ReplaceInstalledBinary's
-// atomic rename-over-the-running-binary technique means a daemon process
-// already running keeps executing its old, now-unlinked inode until
-// something restarts it, so guards stay attached and any unlocked fscrypt
-// vaults are never touched. Used by `install --binary-only` when the admin
-// chooses to skip the automatic restart; the caller is responsible for
-// telling them to restart manually to pick up the new binary.
+// DeployInstalledBinaryNoRestart installs the service binary WITHOUT stopping a running daemon: the
+// atomic rename-over means it keeps executing its old unlinked inode, so guards stay attached and
+// unlocked vaults are untouched. For `install --binary-only` when the admin skips the restart; the
+// caller must tell them to restart manually.
 func DeployInstalledBinaryNoRestart(srcPath string) error {
 	if err := ReplaceInstalledBinary(srcPath, InstallBinaryPath); err != nil {
 		return err

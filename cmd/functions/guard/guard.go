@@ -86,9 +86,8 @@ func runGuard(cmd *cobra.Command, args []string) error {
 		return checkErr
 	}
 
-	// LSM hooks (file_open, file_permission) are the enforcement mechanism
-	// of the fs guard: refuse to run on kernels whose LSM stack lacks bpf
-	// (attach can succeed while the hooks never fire).
+	// The fs guard's enforcement is the LSM hooks (file_open, file_permission): refuse kernels
+	// whose LSM stack lacks bpf (attach can succeed while the hooks never fire).
 	if checkErr := common.CheckBPFLSM(); checkErr != nil {
 		return checkErr
 	}
@@ -100,11 +99,9 @@ func runGuard(cmd *cobra.Command, args []string) error {
 
 	ucase := usecase.NewGuardUseCase(g)
 
-	// Every file and directory under the guarded path was already
-	// registered in guard_inodes inside NewGuard (WithEagerPopulate),
-	// before the LSM hooks attached: the whole tree is protected from the
-	// first instant the hooks are live, and the guard's own startup scan
-	// can never be blocked by its own file_open hook.
+	// Every file/dir under the guarded path was already registered in guard_inodes inside NewGuard
+	// (WithEagerPopulate) before the hooks attached: the tree is protected from the first live
+	// instant and the guard's own scan can't be blocked by its file_open hook.
 	if startErr := ucase.Start(); startErr != nil {
 		return fmt.Errorf("starting guard: %w", startErr)
 	}

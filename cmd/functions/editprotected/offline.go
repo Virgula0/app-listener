@@ -12,9 +12,8 @@ import (
 	"github.com/Virgula0/app-listener/internal/tui"
 )
 
-// runOfflineEdit is the daemon-stopped flow: re-scan which catalog
-// directories are encrypted, let the user pick ONE, verify the master key,
-// unlock, edit, and re-lock — a vault never stays open after this returns.
+// runOfflineEdit is the daemon-stopped flow: re-scan encrypted catalog dirs, pick ONE, verify the
+// master key, unlock, edit, re-lock (a vault never stays open after return).
 func runOfflineEdit() error {
 	if err := protected.RequireDaemonStopped(); err != nil {
 		return err
@@ -35,9 +34,8 @@ func runOfflineEdit() error {
 		return err
 	}
 
-	// A directory whose policy does not unlock with the master key must
-	// never be edited: the writes would land in an unreadable policy and
-	// the re-lock could not complete.
+	// Never edit a directory whose policy doesn't unlock with the master key: writes would land in
+	// an unreadable policy and the re-lock couldn't complete.
 	if err := protected.VerifyEncryptedKeys(vault, []string{chosen}); err != nil {
 		return err
 	}
@@ -47,9 +45,8 @@ func runOfflineEdit() error {
 		return fmt.Errorf("unlock %s: %w", chosen, err)
 	}
 
-	// Re-lock no matter how the editor exits: a protected directory must
-	// never stay unlocked after this command returns. On failure the
-	// operator gets the manual command.
+	// Re-lock however the editor exits: a protected directory must never stay unlocked after
+	// return. On failure the operator gets the manual command.
 	defer func() {
 		if err := protected.RelockResources(vault, chosen); err != nil {
 			log.Errorf("could not fully re-lock %s: %v — run `fscrypt lock %s` manually as soon as possible", chosen, err, chosen)
@@ -65,9 +62,8 @@ func runOfflineEdit() error {
 	return nil
 }
 
-// pickEncryptedDir asks which of the encrypted catalog directories to open.
-// Only one vault is ever unlocked at a time, so exactly one directory is
-// returned. With a single candidate the picker is skipped.
+// pickEncryptedDir asks which encrypted catalog directory to open (only one vault is unlocked at a
+// time); skipped with a single candidate.
 func pickEncryptedDir(encrypted []string) (string, error) {
 	if len(encrypted) == 1 {
 		path := encrypted[0]

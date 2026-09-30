@@ -1,8 +1,6 @@
-// Package protected implements the daemon-guard and fscrypt-key checks
-// shared by the installer, the uninstaller and the edit-protected command:
-// everything that must verify which catalog directories are currently
-// encrypted with the master key and refuse to run while the daemon is
-// still alive.
+// Package protected holds the daemon-guard and fscrypt-key checks shared by the installer,
+// uninstaller and edit-protected: verifying which catalog directories are encrypted with the master
+// key, and refusing to run while the daemon is alive.
 package protected
 
 import (
@@ -40,10 +38,8 @@ func systemctlActive() string {
 	return string(out)
 }
 
-// FindDaemonProcesses scans procRoot for an app-listener daemon process
-// (matching the "app-listener daemon" invocation, i.e. any `--headless` or
-// foreground run) and returns its PIDs. Processes under a PID namespace that
-// have already exited or are unreadable are skipped.
+// FindDaemonProcesses scans procRoot for an app-listener daemon process ("app-listener daemon", any
+// --headless or foreground run) and returns PIDs. Exited or unreadable processes are skipped.
 func FindDaemonProcesses(procRoot string) ([]int, error) {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -69,9 +65,8 @@ func FindDaemonProcesses(procRoot string) ([]int, error) {
 	return pids, nil
 }
 
-// isDaemonCmdline reports whether a NUL-separated /proc cmdline blob belongs
-// to an app-listener daemon process, i.e. the executable is app-listener and
-// the "daemon" subcommand is among its arguments.
+// isDaemonCmdline: a NUL-separated /proc cmdline belongs to an app-listener daemon (exe is
+// app-listener, "daemon" among the args).
 func isDaemonCmdline(cmdline string) bool {
 	args := strings.Split(cmdline, "\x00")
 	if len(args) == 0 || args[0] == "" {
@@ -88,9 +83,8 @@ func isDaemonCmdline(cmdline string) bool {
 	return false
 }
 
-// RequireDaemonStopped fatally refuses while an app-listener-daemon is
-// running: an active systemd unit and a daemon process running outside
-// systemd are both fatal, and the operator must stop them manually.
+// RequireDaemonStopped fatally refuses while a daemon runs: an active systemd unit or a daemon
+// process outside systemd; the operator must stop them manually.
 func RequireDaemonStopped() error {
 	if DaemonRunning() {
 		return fmt.Errorf("fatal: the daemon is running — stop it first: systemctl stop %s", daemonServiceName)
@@ -106,9 +100,8 @@ func RequireDaemonStopped() error {
 	return nil
 }
 
-// ScanEncryptedCatalogDirs re-scans the catalog for every local user (plus
-// the system-level entries) and returns the directories that are currently
-// encrypted with fscrypt, mirroring exactly what the installer would have
+// ScanEncryptedCatalogDirs re-scans the catalog for every local user (plus system entries) and
+// returns the directories currently fscrypt-encrypted, mirroring what the installer would have
 // picked.
 func ScanEncryptedCatalogDirs(vault interface {
 	IsEncrypted(path string) (bool, error)
@@ -136,12 +129,9 @@ func ScanEncryptedCatalogDirs(vault interface {
 	return encrypted, nil
 }
 
-// ExistingEncryptedDirs returns the paths from the given set that are
-// currently encrypted: a kernel fscrypt policy for a directory, or a
-// file-vault ciphertext record for a regular file (vault.IsEncrypted
-// dispatches on the target's type — see isRegularFileTarget in
-// internal/fscrypt). A plain, never-encrypted entry of either kind is
-// skipped.
+// ExistingEncryptedDirs returns the paths in the set that are currently encrypted: a kernel fscrypt
+// policy (directory) or a file-vault ciphertext record (regular file; vault.IsEncrypted dispatches
+// on type, see isRegularFileTarget in internal/fscrypt). Plain entries of either kind are skipped.
 func ExistingEncryptedDirs(vault interface {
 	IsEncrypted(path string) (bool, error)
 }, paths []string) ([]string, error) {

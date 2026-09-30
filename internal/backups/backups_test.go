@@ -30,13 +30,10 @@ func TestDelete(t *testing.T) {
 	}
 }
 
-// TestFindSmoke exercises find's dedup/matching logic against fake
-// dependencies — never the real system config or the real catalog. Find()
-// itself (via install.DiscoverForUsers) probes real catalog paths for real
-// local users; on a host with the daemon actually installed, some of those
-// (e.g. Steam's registry.vdf) can be live guarded resources, and this test
-// binary is not on any resource's whitelist, so calling the real Find()
-// here would trip the guard and log a spurious DENIED.
+// Exercises find's dedup/matching against fake dependencies, never the real system config or
+// catalog: the real Find() probes real catalog paths, some of which (e.g. Steam's registry.vdf) can
+// be live guarded resources on a host with the daemon installed, and this test binary isn't
+// whitelisted, so it would trip the guard with a spurious DENIED.
 func TestFindSmoke(t *testing.T) {
 	root := t.TempDir()
 	withBackup := filepath.Join(root, "guarded")

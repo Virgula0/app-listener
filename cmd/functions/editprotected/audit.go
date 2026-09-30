@@ -13,9 +13,8 @@ import (
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
-// auditAfterEdit loads the installed daemon.conf (if any) and audits the
-// edited tree. interactive controls how findings are surfaced: an acknowledge
-// prompt for the TUI flows, plain warnings for --put (no TTY).
+// auditAfterEdit loads the installed daemon.conf (if any) and audits the edited tree. interactive
+// picks how findings surface: an acknowledge prompt (TUI) or plain warnings (--put, no TTY).
 func auditAfterEdit(resource string, interactive bool) {
 	cfg, err := daemonconfig.Load(systemd.SystemConfigPath)
 	if err != nil {
@@ -25,11 +24,9 @@ func auditAfterEdit(resource string, interactive bool) {
 	auditAfterEditWithConfig(cfg, resource, interactive)
 }
 
-// auditAfterEditWithConfig inspects the edited resource tree for things that
-// would sit outside the daemon's protection or weaken it and reports any
-// findings. Advisory only: nothing is changed or blocked. In an interactive
-// flow it also shows a one-way acknowledgement so the operator cannot miss
-// the warnings; --put just logs them.
+// auditAfterEditWithConfig inspects the edited tree for anything outside the daemon's protection or
+// weakening it and reports findings. Advisory only: nothing is changed or blocked. Interactive
+// flows add a one-way acknowledgement so the warnings aren't missed; --put just logs.
 func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string, interactive bool) {
 	findings := make([]string, 0, 8)
 	findings = append(findings, auditTree(resource)...)
@@ -48,9 +45,8 @@ func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string, interac
 		return
 	}
 
-	// A one-way acknowledgement, not a decision: the edit is already written
-	// and nothing here changes or reverts it — the prompt only makes sure the
-	// operator saw the warnings.
+	// A one-way acknowledgement, not a decision: the edit is already written; the prompt only
+	// ensures the operator saw the warnings.
 	_ = huh.NewForm(huh.NewGroup(
 		huh.NewNote().
 			Title("Post-edit audit — review the warnings above").
@@ -124,9 +120,8 @@ func auditEntry(root, path string, info os.FileInfo) string {
 	return ""
 }
 
-// auditGroupCoverage flags entries under a grouped encryption root that fall
-// outside every guarded watch path of that group: they are encrypted at rest
-// but nothing guards access to them.
+// auditGroupCoverage flags entries under a grouped encryption root outside every guarded watch path
+// of the group: encrypted at rest but access unguarded.
 func auditGroupCoverage(cfg *daemonconfig.Config, resource string) []string {
 	if cfg == nil {
 		return nil

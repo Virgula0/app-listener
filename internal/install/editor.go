@@ -27,9 +27,8 @@ const (
 	editorSidePadding = 4
 )
 
-// EditText opens the embedded bubbletea multiline editor pre-filled with
-// initial. Ctrl+S saves and returns the edited text; Esc aborts with
-// ErrEditCanceled.
+// EditText opens the embedded multiline editor pre-filled with initial. Ctrl+S saves and returns
+// the text; Esc aborts with ErrEditCanceled.
 func EditText(title, initial string) (string, error) {
 	m := newEditorModel(title, initial)
 	p := tea.NewProgram(&m, tea.WithAltScreen())

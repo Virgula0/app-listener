@@ -59,12 +59,23 @@ func TestIsBinaryContent(t *testing.T) {
 	}
 }
 
+func openRootT(t *testing.T, dir string) *os.Root {
+	t.Helper()
+	r, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	return r
+}
+
 func TestWriteFileKeepMeta(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "secret.cfg")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.cfg")
 	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFileKeepMeta(path, []byte("new-content")); err != nil {
+	if err := writeFileKeepMeta(openRootT(t, dir), "secret.cfg", []byte("new-content")); err != nil {
 		t.Fatalf("writeFileKeepMeta: %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -93,7 +104,7 @@ func TestWriteFileKeepMetaRefusesSymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFileKeepMeta(link, []byte("hijack")); err == nil {
+	if err := writeFileKeepMeta(openRootT(t, dir), "link", []byte("hijack")); err == nil {
 		t.Fatal("writing through a symlink was not refused")
 	}
 }
@@ -105,7 +116,12 @@ func TestWriteFileInPlace(t *testing.T) {
 	}
 	before := inodeOf(t, path)
 
-	if err := writeFileInPlace(path, []byte("new")); err != nil {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := writeFileInPlace(f, []byte("new")); err != nil {
 		t.Fatalf("writeFileInPlace: %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -120,7 +136,7 @@ func TestWriteFileInPlace(t *testing.T) {
 	}
 }
 
-func TestWriteFileInPlaceRefusesSymlink(t *testing.T) {
+func TestOpenVaultRefusesSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target")
 	if err := os.WriteFile(target, []byte("t"), 0o600); err != nil {
@@ -130,8 +146,9 @@ func TestWriteFileInPlaceRefusesSymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFileInPlace(link, []byte("hijack")); err == nil {
-		t.Fatal("writing through a symlink was not refused")
+	if v, err := openVault(link); err == nil {
+		v.close()
+		t.Fatal("a symlinked vault root was not refused")
 	}
 }
 
@@ -148,15 +165,11 @@ func inodeOf(t *testing.T, path string) uint64 {
 	return st.Ino
 }
 
-// TestFileEditModelSingleFileTarget is the regression test for the bug where
-// RunFileEditor/newFileEditModel unconditionally treated root as a
-// directory: os.ReadDir on a single guarded regular file (a file-vault
-// resource, e.g. registry.vdf) failed outright with "open root: not a
-// directory" before the editor ever opened. A single-file root must skip
-// the tree entirely, open straight into the editor, and save in place —
-// never through the tree editor's usual temp-file + rename (which a
-// single-file watch root's guard denies, since it also protects its own
-// parent directory against anything created or renamed beside it).
+// Regression: RunFileEditor/newFileEditModel treated root as a directory unconditionally, so
+// os.ReadDir on a single guarded regular file (a file-vault resource, e.g. registry.vdf) failed
+// with "open root: not a directory". A single-file root must skip the tree, open straight into the
+// editor, and save in place, never via temp-file + rename (denied by a single-file root's guard,
+// which also protects its parent directory).
 func TestFileEditModelSingleFileTarget(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.vdf")
 	if err := os.WriteFile(path, []byte("original content"), 0o600); err != nil {

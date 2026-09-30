@@ -11,11 +11,14 @@ import (
 	"github.com/Virgula0/app-listener/internal/usecase"
 )
 
+// noPID is PID_MAX_LIMIT: pids are always below it, so /proc/<noPID>/exe never resolves on any host.
+const noPID = 4194304
+
 func deniedEvent() usecase.DaemonEvent {
 	return usecase.DaemonEvent{
 		Resource: "/home/alice/.ssh",
 		Event: guard.GuardEvent{FileEvent: ebpf.FileEvent{
-			PID: 1234, UID: 1000, Comm: "ssh",
+			PID: noPID, UID: 1000, Comm: "ssh",
 			Type: ebpf.EventOpen, Path: "/home/alice/.ssh/authorized_keys",
 		}, Blocked: true},
 	}
@@ -47,9 +50,9 @@ func TestWriteEventBlocked(t *testing.T) {
 			"resource=/home/alice/.ssh",
 			"op=OPEN",
 			"comm=ssh",
-			"commFullPath=~", // pid 1234 is not a real running process in the test
+			"commFullPath=~",
 			"path=/home/alice/.ssh/authorized_keys",
-			"pid=1234",
+			"pid=4194304",
 		} {
 			if !strings.Contains(line, want) {
 				t.Errorf("line %q: missing field %q", line, want)

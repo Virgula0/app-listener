@@ -3,7 +3,6 @@ package install
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	log "github.com/sirupsen/logrus"
 
@@ -13,13 +12,11 @@ import (
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
-// runDiffCatalog is the incremental counterpart of the full wizard: it
-// compares the catalog against the installed daemon.conf and offers to add —
-// protect and encrypt — every discoverable critical directory that is not
-// already guarded. Existing sections are left byte-for-byte intact; the
-// selected new sections are appended and the normal install pipeline
-// (verify encryption state → ask encryption → migrate → deploy → (re)start)
-// runs on the merged config. Requires a previous installation; interactive.
+// runDiffCatalog is the incremental counterpart of the full wizard: compares the catalog with the
+// installed daemon.conf and offers to protect and encrypt every discoverable critical directory not
+// already guarded. Existing sections stay byte-for-byte intact; selected sections are appended and
+// the normal pipeline (verify encryption -> ask -> migrate -> deploy -> (re)start) runs on the
+// merged config. Requires a previous installation; interactive.
 func runDiffCatalog() error {
 	mergedText, mergedCfg, proceed, err := collectDiffAdditions()
 	if err != nil || !proceed {
@@ -28,10 +25,9 @@ func runDiffCatalog() error {
 	return applyDiffAdditions(mergedText, mergedCfg)
 }
 
-// collectDiffAdditions reads the installed config, discovers the catalog
-// directories missing from it, runs the picker and the editor, and returns
-// the merged config text + parsed config. proceed is false (with nil error)
-// when there is nothing to add or the user selected nothing.
+// collectDiffAdditions reads the installed config, discovers catalog directories missing from it,
+// runs the picker and editor, and returns the merged text + parsed config. proceed=false (nil
+// error) when there's nothing to add or nothing selected.
 func collectDiffAdditions() (mergedText string, mergedCfg *daemonconfig.Config, proceed bool, err error) {
 	oldBytes, readErr := os.ReadFile(systemd.SystemConfigPath)
 	if readErr != nil {
@@ -73,9 +69,8 @@ func collectDiffAdditions() (mergedText string, mergedCfg *daemonconfig.Config, 
 	return text, parsed, true, nil
 }
 
-// applyDiffAdditions runs the encrypt + deploy half of the install pipeline
-// on the merged config. The daemon is stopped for the whole cycle (a new
-// section may need an in-place fscrypt migration) and brought back on the
+// applyDiffAdditions runs the encrypt + deploy half on the merged config. The daemon is stopped for
+// the whole cycle (a new section may need an in-place fscrypt migration) and restored on the
 // existing config if the user aborts before deploy.
 func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error {
 	wasActive := systemd.IsDaemonActive()
@@ -87,18 +82,30 @@ func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error
 		return restoreDaemonAfterDiffAbort(wasActive, keyErr)
 	}
 
+	sshUsers, sshErr := askSSHAgentUsers(mergedCfg)
+	if sshErr == nil {
+		sshErr = addKeysToAgent(sshUsers)
+	}
+	if sshErr != nil {
+		return restoreDaemonAfterDiffAbort(wasActive, sshErr)
+	}
+
+	bunUsers, bunErr := askBunTmpdirUsers(mergedCfg)
+	if bunErr != nil {
+		return restoreDaemonAfterDiffAbort(wasActive, bunErr)
+	}
+
 	vault := fscrypt.New()
 	securedText, secErr := secureResources(vault, mergedText, mergedCfg)
 	if secErr != nil {
 		return restoreDaemonAfterDiffAbort(wasActive, secErr)
 	}
 
-	// deploy writes the config only after ConfirmOverwrite, runs the eBPF
-	// preflight, and (re)starts the daemon — its own failure modes already
-	// leave the box in a documented state, so surface them as-is. --diff-catalog
-	// never touches the edit-protected password (an existing hash file, if
-	// any, is untouched and self-guarded again by the restarted daemon).
-	if deployErr := deploy(securedText, mergedCfg, ""); deployErr != nil {
+	// deploy writes the config only after ConfirmOverwrite, runs the eBPF preflight, and (re)starts
+	// the daemon; its failure modes already leave a documented state, so they surface as-is.
+	// --diff-catalog never touches the edit-protected password (an existing hash stays and is
+	// self-guarded again by the restarted daemon).
+	if deployErr := deploy(securedText, sshUsers, bunUsers, ""); deployErr != nil {
 		return deployErr
 	}
 	if cleanErr := cleanOrphanedFscrypt(mergedCfg); cleanErr != nil {
@@ -117,9 +124,8 @@ func configPaths(cfg *daemonconfig.Config) []string {
 	return out
 }
 
-// uncoveredCandidates returns the catalog candidates whose path is neither a
-// configured watch path / encryption root nor nested with one (in either
-// direction) — i.e. the directories a diff would propose adding.
+// uncoveredCandidates returns catalog candidates whose path is neither a configured watch
+// path/encryption root nor nested with one (either direction): what a diff would propose adding.
 func uncoveredCandidates(cfg *daemonconfig.Config, users []inst.User) []inst.Candidate {
 	covered := configPaths(cfg)
 	all := inst.DiscoverForUsers(users)
@@ -132,9 +138,8 @@ func uncoveredCandidates(cfg *daemonconfig.Config, users []inst.User) []inst.Can
 	return fresh
 }
 
-// pathCovered reports whether p is already protected by an existing config
-// path: equal to it, inside it, or a parent of it (a new parent watch would
-// overlap an existing guarded tree).
+// pathCovered: p is already protected by a config path: equal, inside, or a parent of it (a new
+// parent watch would overlap an existing guarded tree).
 func pathCovered(p string, covered []string) bool {
 	for _, cv := range covered {
 		if cv == "" {
@@ -147,21 +152,21 @@ func pathCovered(p string, covered []string) bool {
 	return false
 }
 
-// appendSectionsAndEdit appends the generated sections for picked to the
-// existing config text verbatim and opens the editor on the result, so the
-// diff the user reviews (here and again at ConfirmOverwrite) is exactly the
-// new sections.
+// appendSectionsAndEdit appends the generated sections verbatim to the existing config and opens
+// the editor, so the diff the user reviews (here and at ConfirmOverwrite) is exactly the new
+// sections.
 func appendSectionsAndEdit(oldText string, picked []inst.Candidate) (string, *daemonconfig.Config, error) {
-	merged := strings.TrimRight(oldText, "\n") + "\n" +
-		inst.GenerateSections(sectionsFromCandidates(picked)) + "\n"
+	merged := inst.InsertSectionsBeforeLibraries(oldText, inst.GenerateSections(sectionsFromCandidates(picked)))
+	for _, block := range libraryBlocksFromCandidates(picked) {
+		merged = inst.EnsureLibraryBlock(merged, &block)
+	}
 	return runConfigEditor(
 		"app-listener daemon.conf — new sections appended, review and save (Ctrl+S)",
 		merged)
 }
 
-// restoreDaemonAfterDiffAbort brings the daemon back on the existing config
-// when a diff-catalog run is aborted after the daemon was stopped, then
-// returns the original cause.
+// restoreDaemonAfterDiffAbort restarts the daemon on the existing config when the run is aborted
+// after the daemon was stopped, then returns the original cause.
 func restoreDaemonAfterDiffAbort(wasActive bool, cause error) error {
 	if wasActive {
 		log.Warn("catalog diff aborted — restarting the daemon on the existing config ...")

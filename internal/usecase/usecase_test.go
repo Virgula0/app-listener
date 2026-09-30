@@ -58,6 +58,9 @@ type fakeGuardRepo struct {
 	editGrantErr     error
 	vaultAccessCalls int
 	events           chan guard.GuardEvent
+	taintedPIDs      []uint32
+	anchor           guard.GuardInodeKey
+	anchorAlive      bool
 }
 
 func newFakeGuardRepo() *fakeGuardRepo {
@@ -122,6 +125,23 @@ func (f *fakeGuardRepo) vaultAccessCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.vaultAccessCalls
+}
+
+func (f *fakeGuardRepo) SnapshotTaintedPIDs() ([]uint32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uint32(nil), f.taintedPIDs...), nil
+}
+
+func (f *fakeGuardRepo) RootAnchor() (guard.GuardInodeKey, bool, error) {
+	return f.anchor, f.anchorAlive, nil
+}
+
+func (f *fakeGuardRepo) RestoreTaintedPIDs(pids []uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.taintedPIDs = append(f.taintedPIDs, pids...)
+	return nil
 }
 
 func (f *fakeGuardRepo) Start() error {

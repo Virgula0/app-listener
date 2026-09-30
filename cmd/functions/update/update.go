@@ -1,11 +1,8 @@
-// The `app-listener update` command self-updates the daemon from the latest
-// GitHub release of --channel (default stable): read the embedded version,
-// pick the newest release of the channel (skip when not older); download
-// binary + sha256 + Ed25519 signature and verify them (embedded public key,
-// checksum, GitHub asset digest); show the changelog and confirm (--yes
-// skips, non-terminal stdin aborts); atomically replace the installed binary
-// and restart the daemon mirroring the installer's stop/start contract. The
-// signing private key lives only in a GitHub Actions secret.
+// The `app-listener update` command self-updates from the latest GitHub release of --channel
+// (default stable): skip if not newer; download binary + sha256 + Ed25519 signature and verify
+// (embedded public key, checksum, GitHub asset digest); show the changelog and confirm (--yes
+// skips, non-terminal stdin aborts); atomically replace the binary and restart the daemon per the
+// installer's stop/start contract. The signing key lives only in a GitHub Actions secret.
 package update
 
 import (
@@ -177,9 +174,8 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Staging dir owned here: the verified download must survive until
-	// applyUpdate swaps the binary (downloadAndVerify's return would clean
-	// it up prematurely).
+	// Staging dir is owned here: the verified download must survive until applyUpdate swaps the
+	// binary (downloadAndVerify's return would clean it up early).
 	tmp, err := os.MkdirTemp("", "app-listener-update-*")
 	if err != nil {
 		return err
@@ -203,9 +199,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	return applyUpdate(binPath)
 }
 
-// downloadAndVerify downloads the three assets into the caller-owned staging
-// dir and runs every verification (signature, checksum, digest, binary
-// sanity) before anything reaches the user; progress shows on the TUI bar.
+// downloadAndVerify downloads the three assets into the caller-owned staging dir and runs every
+// verification (signature, checksum, digest, binary sanity) before anything reaches the user;
+// progress on the TUI bar.
 func downloadAndVerify(tmp string, r *githubRelease, binURL, binDigest, checksumURL, sigURL string) (string, error) {
 	var binPath, checksumPath, sigPath string
 	err := wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
@@ -231,9 +227,8 @@ func downloadAndVerify(tmp string, r *githubRelease, binURL, binDigest, checksum
 	return binPath, nil
 }
 
-// confirmUpdate decides whether to apply: --yes logs the changelog and
-// proceeds; otherwise the notes open in a TUI viewer (non-tty aborts) and
-// the user confirms.
+// confirmUpdate: --yes logs the changelog and proceeds; otherwise the notes open in a TUI viewer
+// (non-tty aborts) and the user confirms.
 func confirmUpdate(r *githubRelease) (bool, error) {
 	if yesFlag {
 		log.Infof("--yes given: skipping the changelog viewer and the confirmation prompt")
@@ -480,9 +475,8 @@ func updateHTTPClient() *http.Client {
 	return &http.Client{Timeout: updateHTTPTimeout}
 }
 
-// downloadFile downloads url into path atomically (temp file + rename),
-// leaving mode 0700: hardened kernels refuse to exec without x bits and
-// os.CreateTemp makes 0600; progress reports on bar when non-nil.
+// downloadFile downloads url into path atomically (temp + rename), mode 0700: hardened kernels
+// refuse to exec without x bits and os.CreateTemp makes 0600. Progress goes to bar when non-nil.
 func downloadFile(client *http.Client, url, path string, bar *wizard.BottomBar, label string) error {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
 	if err != nil {
@@ -643,9 +637,8 @@ func sanityCheckBinary(path, wantVersion string) error {
 	return nil
 }
 
-// applyUpdate stops the daemon (verifying the lock state), atomically
-// replaces the installed binary and brings the unit back to
-// enabled-and-running.
+// applyUpdate stops the daemon (verifying lock state), atomically replaces the binary and brings
+// the unit back to enabled-and-running.
 func applyUpdate(binPath string) error {
 	if err := systemd.DeployInstalledBinary(binPath); err != nil {
 		return err

@@ -1,6 +1,6 @@
-// Package logging centralizes the CLI verbosity model: mapping constants.VerboseLevel onto
-// logrus levels, the --dump-log file hook, and routing Go's stdlib logger (used by google/fscrypt
-// during migrations) into logrus.
+// Package logging centralizes the CLI verbosity model: constants.VerboseLevel -> logrus levels, the
+// --dump-log file hook, and routing Go's stdlib logger (used by google/fscrypt during migrations)
+// into logrus.
 package logging
 
 import (
@@ -42,9 +42,9 @@ func VerboseToLogrus(v constants.VerboseLevel) (log.Level, error) {
 	}
 }
 
-// DumpHook mirrors selected logrus entries into the --dump-log writer as plain, color-free text,
-// applying its own verbose-derived threshold independent of the console logger level. Every write
-// is flushed (sync-per-write): an abrupt process exit never loses already-emitted lines.
+// DumpHook mirrors selected logrus entries into the --dump-log writer as plain text, with its own
+// verbose-derived threshold independent of the console. Every write is synced, so an abrupt exit
+// loses no emitted lines.
 type DumpHook struct {
 	mu  sync.Mutex
 	w   io.Writer
@@ -100,11 +100,9 @@ func formatEntry(e *log.Entry) string {
 	return b.String()
 }
 
-// SanitizeText replaces control characters (which includes terminal escape
-// sequences such as ESC/OSC and forged newlines) with '?'. Event fields
-// originate from the kernel ring buffer — attacker-controlled filenames,
-// process names and destinations — and would otherwise forge audit lines in
-// journald or the --dump-log file.
+// SanitizeText replaces control characters (terminal escapes such as ESC/OSC, forged newlines) with
+// '?'. Event fields come from the kernel ring buffer (attacker-controlled filenames, process names,
+// destinations) and would otherwise forge audit lines in journald or --dump-log.
 func SanitizeText(value string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
@@ -132,9 +130,9 @@ func sortStrings(s []string) {
 	}
 }
 
-// BridgeStdLog routes the default Go stdlib logger (google/fscrypt logs its migration
-// progress through it) into logrus at info level, so those lines reach both the console and
-// --dump-log. The returned restore reinstates the previous writer/flags.
+// BridgeStdLog routes the stdlib logger (google/fscrypt logs migration progress through it) into
+// logrus at info level so those lines reach the console and --dump-log. The returned restore
+// reinstates the previous writer/flags.
 func BridgeStdLog() (restore func()) {
 	prevWriter := stdlog.Writer()
 	prevFlags := stdlog.Flags()

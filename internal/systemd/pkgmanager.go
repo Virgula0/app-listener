@@ -42,9 +42,8 @@ func (p PackageManager) HasReloadHook() bool {
 	return p == PkgPacman || p == PkgApt
 }
 
-// packageManagerProbe pairs a manager with the signals that mark it present:
-// the hook drop-in directory (the thing that actually has to exist for a hook
-// to work) or the tool on PATH.
+// packageManagerProbe pairs a manager with its presence signals: the hook drop-in directory (what
+// must exist for a hook to work) or the tool on PATH.
 type packageManagerProbe struct {
 	pm   PackageManager
 	dirs []string
@@ -58,9 +57,8 @@ var packageManagerProbes = []packageManagerProbe{
 	{PkgZypper, []string{"/etc/zypp"}, []string{"zypper"}},
 }
 
-// DetectPackageManagers returns every package manager present on the host, in
-// a stable order. More than one can match (containers, mixed systems); the
-// caller installs a hook for each that has one.
+// DetectPackageManagers returns every package manager present, in stable order. Several can match
+// (containers, mixed systems); the caller installs a hook for each that has one.
 func DetectPackageManagers() []PackageManager {
 	return detectPackageManagers(packageManagerProbes)
 }

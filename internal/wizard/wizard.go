@@ -1,6 +1,5 @@
-// Package wizard holds the interactive helpers shared by the installer and
-// uninstaller wizards: single-confirmation prompts and the bottom progress
-// bar used while directories are encrypted or decrypted.
+// Package wizard holds interactive helpers shared by the installer and uninstaller:
+// single-confirmation prompts and the bottom progress bar for encrypting/decrypting directories.
 package wizard
 
 import (
@@ -31,13 +30,9 @@ func ConfirmOnce(question, affirmative string) (bool, error) {
 	return answer, nil
 }
 
-// bottomBar is a single-line progress bar pinned at the bottom of the
-// terminal. The loggers (logrus and the standard log used by the fscrypt
-// library) are routed through it: before each log line the bar line is
-// cleared, the line is written, and the bar is re-rendered underneath — so
-// the fscrypt logs scroll normally above a bar that stays visible. When
-// stderr is not a terminal the bar is disabled and everything passes
-// through untouched.
+// bottomBar is a one-line progress bar pinned at the terminal bottom. Loggers (logrus and the
+// fscrypt library's standard log) are routed through it: clear the bar, write the line, re-render
+// below, so logs scroll above a visible bar. Disabled (pass-through) when stderr isn't a terminal.
 type bottomBar struct {
 	mu   sync.Mutex
 	w    io.Writer
@@ -103,9 +98,8 @@ func (b *bottomBar) done() {
 	b.show = false
 }
 
-// renderBar builds the bar line: label, a 20-block progress bar and the
-// percentage, truncated to the current terminal width (resizing-safe: the
-// width is re-queried on every render).
+// renderBar builds the bar line (label, 20-block bar, percentage), truncated to the current
+// terminal width (re-queried each render, so resize-safe).
 func renderBar(label string, fraction float64) string {
 	pct := int(fraction * 100)
 	if pct > 100 {
@@ -123,9 +117,8 @@ func renderBar(label string, fraction float64) string {
 	return text
 }
 
-// WithBottomBar runs run with the progress bar active and the loggers
-// routed through it; the bar and the redirects are cleaned up on return,
-// so the terminal is left exactly as it was.
+// WithBottomBar runs run with the progress bar active and loggers routed through it, restoring the
+// terminal on return.
 func WithBottomBar(run func(bar *BottomBar) error) error {
 	bar := newBottomBar(os.Stderr)
 	prevStd := stdlog.Writer()

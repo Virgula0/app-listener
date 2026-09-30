@@ -12,23 +12,22 @@ import (
 	"time"
 )
 
-// ControlSocket is the daemon's local control endpoint. The daemon creates it
-// 0600 root-owned and additionally checks SO_PEERCRED (uid 0) and that the
-// peer's executable is the daemon's own binary before honoring a request. It
-// exists only while an edit-protected password is configured.
+// ControlSocket is the daemon's local control endpoint, present only while an edit-protected
+// password is configured. Created 0600 root-owned; the daemon also checks SO_PEERCRED (uid 0) and
+// that the peer's exe is its own binary before honoring a request.
 const ControlSocket = "/run/app-listener-daemon.control"
 
 // Control protocol (line based, UTF-8), two phases on one connection:
 //
 //	client -> AUTH\n<password>\n
-//	server -> OK <n>\n<resource-1>\n…<resource-n>\n   (authenticated)
+//	server -> OK <n>\n<resource-1>\n...<resource-n>\n   (authenticated)
 //	       -> ERR <reason>\n                          (refused; conn closed)
 //	client -> SELECT <resource>\n
-//	server -> OK\n | ERR <reason>\n                   (grant activated)
+//	server -> OK\n | ERR <reason>\n                    (grant activated)
 //	client -> END\n                                   (edit finished)
 //
-// The password is checked before any resource path is disclosed. The server
-// also revokes the grant on EOF or when EditSessionMaxDuration elapses.
+// The password is checked before any resource path is disclosed. The server revokes the grant on
+// EOF or when EditSessionMaxDuration elapses.
 const (
 	ctrlAuth   = "AUTH"
 	ctrlSelect = "SELECT"
@@ -65,9 +64,8 @@ func dialLiveSession() (*liveSession, error) {
 	return &liveSession{conn: conn, r: bufio.NewReader(conn)}, nil
 }
 
-// Authenticate proves the password to the daemon and returns the configured
-// watch paths. A non-nil error means authentication failed (message safe to
-// show).
+// Authenticate proves the password to the daemon and returns the configured watch paths. A non-nil
+// error means authentication failed (message safe to show).
 func (s *liveSession) Authenticate(password string) ([]string, error) {
 	_ = s.conn.SetDeadline(time.Now().Add(controlIOTimeout))
 	if _, err := fmt.Fprintf(s.conn, "%s\n%s\n", ctrlAuth, password); err != nil {
@@ -141,10 +139,9 @@ func parseErr(line string) (msg string, isErr bool) {
 	return "", false
 }
 
-// LiveModeAvailable reports whether the daemon's control socket is present —
-// the precise signal that a running daemon has an edit-protected password
-// configured (the socket exists only then). Used to pick live vs. offline
-// without depending on systemd being the daemon's supervisor.
+// LiveModeAvailable reports whether the daemon's control socket exists: the precise signal that a
+// running daemon has an edit-protected password (works without systemd supervising it). Picks live
+// vs offline.
 func LiveModeAvailable() bool {
 	_, err := os.Stat(ControlSocket)
 	return err == nil
