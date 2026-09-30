@@ -523,6 +523,7 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 		pending.lockRoots(vault)
 		return "", nil, resolveErr
 	}
+	awaitReloadGate()
 	newGuards, buildErr := buildGuards(cfg.Resources, pin)
 	if buildErr != nil {
 		pending.lockRoots(vault)

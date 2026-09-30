@@ -255,6 +255,92 @@ func (s *IntegrationSuite) TestDaemon_Bypass_SweepReanchorsSwappedAncestor() {
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: SetGuardedDirs re-stats each resource path at reload and marks it TRUSTED_DIR_ANY, which
+// trusts every library below it, pre-existing ones included. After an ancestor swap that is the
+// user's own dir, so a library the user left there preloads into any whitelisted binary.
+func (s *IntegrationSuite) TestDaemon_Bypass_ReloadTrustsSwappedRootLibraries() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	if !s.startSwappableRootDaemon(c) {
+		return
+	}
+	// Positive control: the moved real tree is still guarded, so its writer's library is trusted.
+	good := swapHome + "/.config.real/gh/good.so"
+	code, out := s.exec(c, []string{"/tmp/w/cp", "/exploits/lib_probe.so", good})
+	s.Require().Equalf(0, code, "control: the root's whitelisted writer must plant a library: %s", out)
+	loaded, out := s.preload(c, "/usr/bin/bash", good)
+	s.T().Logf("control: library written by the root's writer inside the guarded root loaded=%v", loaded)
+
+	lib := swapRoot + "/evil.so"
+	loaded, out = s.preload(c, "/usr/bin/bash", lib)
+	s.Require().Falsef(loaded, "control: the user's library must not load before the reload: %s", out)
+
+	s.reloadAndAwait(c)
+	loaded, out = s.preload(c, "/usr/bin/bash", lib)
+	s.Require().Falsef(loaded,
+		"after the reload a library the user placed under the swapped root loaded into a whitelisted binary: %s\n"+
+			"daemon log:\n%s", out, s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Bypass: validateResources rejects nesting at config load, but NewGuard re-opens the root by path
+// later. A read-only lib_dir re-pointed into another resource between the two becomes that
+// subtree's innermost root and takes its guard_inodes rows, which read-only mode lets anyone read.
+// The ci-only reload gate holds the window open so the test is deterministic.
+func (s *IntegrationSuite) TestDaemon_Bypass_LibDirRepointedIntoResourceAtReload() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const (
+		marker = "TOP-SECRET-LIBDIR-TAKEOVER-9E3B"
+		libDir = swapHome + "/steam/linux64"
+		gate   = "/tmp/reload-gate"
+	)
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected/sub " + libDir + " /tmp/rtw /etc/app-listener && printf '" + marker +
+			"' > /protected/sub/secret && chmod 755 /protected /protected/sub && chmod 644 /protected/sub/secret && " +
+			"cp /usr/bin/dash /tmp/rtw/dash && chown -R 65534:65534 " + swapHome + " && chmod 755 " + swapHome})
+	config := `[libraries "Runtime"]
+lib_dir ` + libDir + `
+lib_binary /tmp/rtw/dash
+
+[watch /protected]
+need_encryption: false
+/usr/bin/true`
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", config)})
+	code, out := s.exec(c, []string{"sh", "-c", "APPLISTENER_TEST_RELOAD_GATE=" + gate +
+		" nohup /app-listener daemon --config /etc/app-listener/daemon.conf --headless > /tmp/daemon.log 2>&1 &"})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, config)
+
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat /protected/sub/secret 2>&1"})
+	s.Require().NotContainsf(out, marker, "baseline: a non-whitelisted reader must be denied /protected: %s", out)
+
+	s.sigDaemon(c, "HUP")
+	s.Require().Truef(s.awaitLog(c, "test: reload paused before guard build", daemonShutdownTimeout),
+		"the reload never reached the gate (binary built without -tags ci?):\n%s", s.readDaemonLog(c))
+	// Swap the unguarded ancestor (renaming the root itself is refused). Relative target:
+	// path_symlink only matches absolute targets against guarded paths.
+	code, out = s.exec(c, []string{"sh", "-c", nobodyRun + "sh -c 'cd " + swapHome + " && mv steam steam.real" +
+		" && mkdir steam && ln -s ../../protected/sub steam/linux64' 2>&1"})
+	s.exec(c, []string{"touch", gate})
+	s.T().Logf("user's re-point of the lib_dir ancestor: rc=%d %s", code, out)
+	for dl := time.Now().Add(daemonShutdownTimeout); time.Now().Before(dl); {
+		if l := s.readDaemonLog(c); strings.Contains(l, reloadEnd) || strings.Contains(l, reloadRefused) {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat /protected/sub/secret " + libDir + "/secret 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"after the reload /protected/sub became readable by a non-whitelisted process: %s\ndaemon log:\n%s",
+		out, s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Vuln 3 (B): a globbed lib_dir (Steam's Proton*, SteamLinuxRuntime_*) becomes a trusted-library
 // root for every future match at the next catalog refresh, so only Steam may create a match.
 func (s *IntegrationSuite) TestDaemon_LibDirGlob_NonWriterCannotCreateMatch() {
