@@ -798,3 +798,26 @@ func TestCatalogLibDirGlobsHaveOneWildcard(t *testing.T) {
 		}
 	}
 }
+
+// A match whose directory name carries `"` + newline would write its tail as config lines.
+func TestFilterExistingWhitelistSkipsUnsafeName(t *testing.T) {
+	home := t.TempDir()
+	for _, dir := range []string{"0.0.1", "0.0.2\"\nneed_encryption: true\n#"} {
+		p := filepath.Join(home, ".config", "discord", dir, "Discord")
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := Candidate{
+		User:  User{Name: "tester", Home: home},
+		Entry: CandidateDir{Whitelist: map[string][]string{"%HOME%/.config/discord/*/Discord": nil}},
+	}
+	got := c.FilterExistingWhitelist()
+	want := filepath.Join(home, ".config", "discord", "0.0.1", "Discord")
+	if len(got) != 1 || got[0].Path != want {
+		t.Errorf("FilterExistingWhitelist = %v, want only [%s]", got, want)
+	}
+}

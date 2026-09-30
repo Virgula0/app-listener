@@ -138,6 +138,9 @@ func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, 
 
 	newLines := make([]string, 0, len(newRules))
 	for _, rule := range newRules {
+		if !ConfSafePath(rule.Path) {
+			return "", fmt.Errorf("refusing to write %q into the configuration: it holds a quote or control character", rule.Path)
+		}
 		line := quotePath(rule.Path)
 		if len(rule.Events) > 0 {
 			line += " " + strings.Join(rule.Events, ",")
@@ -217,9 +220,16 @@ func ParseSectionHeaderPath(line string) (path string, ok bool) {
 	return unquotePath(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(t, "[watch "), "]"))), true
 }
 
+// ConfSafePath reports whether path can be written as a quoted daemon.conf path. The format has
+// no escaping: a `"` ends the quoted path and a newline starts a new directive, so a name a
+// same-user process gave a glob match would otherwise inject config lines.
+func ConfSafePath(path string) bool {
+	return !strings.ContainsFunc(path, func(r rune) bool { return r == '"' || r < 0x20 || r == 0x7f })
+}
+
 // quotePath double-quotes path: the installer always quotes generated paths so spaces/whitespace
 // round-trip through the daemon parser unambiguously (quoting is optional there only for
-// hand-written configs).
+// hand-written configs). Callers pass ConfSafePath paths only.
 func quotePath(path string) string {
 	return `"` + path + `"`
 }

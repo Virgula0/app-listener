@@ -226,3 +226,12 @@ need_encryption: true
 		}
 	}
 }
+
+func TestSetSectionWhitelistRefusesUnsafePath(t *testing.T) {
+	conf := "[watch /w]\nneed_encryption: false\n/usr/bin/true\n"
+	for _, p := range []string{"/x\"\nneed_encryption: true", "/x\" READ", "/x\rY"} {
+		if _, err := SetSectionWhitelist(conf, "/w", []BinaryRule{{Path: p}}); err == nil {
+			t.Errorf("SetSectionWhitelist accepted %q", p)
+		}
+	}
+}

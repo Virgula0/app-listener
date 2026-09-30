@@ -462,6 +462,69 @@ func (s *IntegrationSuite) awaitFile(c testcontainers.Container, path string, ti
 	return "", false
 }
 
+// Bypass: the catalog refresh writes each glob match into daemon.conf as `"<path>"` with no
+// escaping, and a quoted path ends at its first `"`. A non-whitelisted process renames the
+// wildcard directory of an existing install (Discord's ~/.config/discord/*/Discord) to a name
+// holding `"` and newlines, and the unattended refresh writes the lines it carries into the
+// section; a name that doesn't parse leaves a config the daemon refuses at its next start.
+func (s *IntegrationSuite) TestDaemon_Bypass_CatalogRefreshInjectsThroughMatchedName() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.installFakeSystemctl(c)
+
+	const (
+		marker   = "TOP-SECRET-CONF-INJECT-6D0F"
+		injected = "need_encryption: true"
+	)
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /etc/app-listener /protected " + discordDir + "/sentry $(dirname " + discordClient + ")" +
+			" && cp /usr/bin/dash " + discordClient + " && printf '" + marker + "' > /protected/secret" +
+			" && chmod 755 /protected && chmod 644 /protected/secret" +
+			" && head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+	s.startDaemon(c, `[watch `+discordDir+`/sentry]
+need_encryption: false
+`+discordClient+`
+
+[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	_, out := s.exec(c, []string{"sh", "-c", nobodyRun + "cat /protected/secret 2>&1"})
+	s.Require().NotContainsf(out, marker, "baseline: a non-whitelisted reader must be denied /protected: %s", out)
+
+	evil := discordDir + "/0.0.1\"\n" + injected + "\n#"
+	code, attack := s.exec(c, []string{"sh", "-c", "mv " + shQuote(discordDir+"/0.0.1") + " " + shQuote(evil) + " 2>&1"})
+	s.T().Logf("rename of the wildcard dir to a quote/newline name: rc=%d %s", code, attack)
+
+	code, refresh := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	if code == 0 {
+		s.awaitLog(c, "configuration reloaded", 60*time.Second)
+	}
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().NotContainsf(conf, "\n"+injected+"\n",
+		"a directory name carried a directive into daemon.conf through the catalog refresh:\n"+
+			"refresh (exit %d):\n%s\ndaemon.conf:\n%s", code, refresh, conf)
+
+	// The config must still bring the daemon up: a refused start leaves every resource unguarded.
+	s.sigDaemon(c, "TERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
+	s.exec(c, []string{"rm", "-f", "/run/app-listener-daemon.pid"})
+	s.launchDaemon(c)
+	up := false
+	for dl := time.Now().Add(daemonShutdownTimeout); time.Now().Before(dl) && !up; time.Sleep(500 * time.Millisecond) {
+		code, _ = s.exec(c, []string{"test", "-f", "/run/app-listener-daemon.pid"})
+		up = code == 0
+	}
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat /protected/secret 2>&1"})
+	s.Require().NotContainsf(out, marker,
+		"after a restart on the refreshed config /protected was readable (daemon up=%v): %s\ndaemon.conf:\n%s\n"+
+			"daemon log:\n%s", up, out, conf, s.readDaemonLog(c))
+	s.Require().Truef(up, "the daemon refused to start on the refreshed config:\n%s\ndaemon log:\n%s",
+		conf, s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Bypass: reservation #3 checks only the name being bound below a glob root, and the catalog
 // refresh globs THROUGH symlinks (filepath.Glob + os.Stat), then the daemon EvalSymlinks the match.
 // A directory symlink with an unreserved name, pointing outside the root, gets an attacker binary

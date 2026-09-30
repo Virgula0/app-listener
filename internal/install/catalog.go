@@ -603,7 +603,7 @@ func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
 			matches = m
 		}
 		for _, p := range matches {
-			if seen[p] || !homeMatchConfined(home, pattern, p) {
+			if seen[p] || !confSafeMatch(p) || !homeMatchConfined(home, pattern, p) {
 				continue
 			}
 			info, err := os.Lstat(p)
@@ -639,7 +639,7 @@ func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
 			matches = m
 		}
 		for _, p := range matches {
-			if seen[p] || !homeMatchConfined(home, pattern, p) {
+			if seen[p] || !confSafeMatch(p) || !homeMatchConfined(home, pattern, p) {
 				continue
 			}
 			// Stat, not Lstat: a symlinked helper resolves like any whitelisted binary (the daemon
@@ -707,6 +707,15 @@ func homeMatchConfined(home, pattern, match string) bool {
 	}
 	resolved, err := filepath.EvalSymlinks(match)
 	return err == nil && strings.HasPrefix(resolved, strings.TrimSuffix(root, "/")+"/")
+}
+
+// confSafeMatch drops a glob match daemon.conf can't hold (see ConfSafePath).
+func confSafeMatch(match string) bool {
+	if ConfSafePath(match) {
+		return true
+	}
+	log.Warnf("catalog: skipping %q: a quote or control character in its name cannot be written to daemon.conf", match)
+	return false
 }
 
 func symlinkStaysInParent(parent, path string) bool {
@@ -810,7 +819,7 @@ func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
 				continue // malformed pattern: skip the whole entry
 			}
 			for _, m := range matches {
-				if _, err := os.Stat(m); err == nil && homeMatchConfined(c.User.Home, rule.Path, m) {
+				if _, err := os.Stat(m); err == nil && confSafeMatch(m) && homeMatchConfined(c.User.Home, rule.Path, m) {
 					out = append(out, BinaryRule{Path: m, Events: rule.Events})
 				}
 			}
