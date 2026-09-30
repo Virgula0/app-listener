@@ -24,18 +24,28 @@ var generalTools = []string{
 	"cp", "mv", "install", "rsync", "tar", "curl", "wget",
 }
 
-// isGeneralTool also judges the binary the path resolves to, since updater rights attach to its
-// inode: a multi-call binary (uutils coreutils hard-linked under every applet name, busybox behind
-// symlinks) runs whichever applet argv[0] names, and the caller picks argv[0] (`exec -a cp`), so
-// whitelisting its harmless `date` would make it `cp`. More than one hard link, or a symlink
-// target named like a general tool, therefore counts as one. A path that doesn't resolve yet
-// (a deferred binary) is judged by its name.
-func isGeneralTool(path string) bool {
-	if namedGeneralTool(path) {
-		return true
+// mayUpdate judges the binary the path resolves to, since updater rights attach to its inode: a
+// multi-call binary (uutils coreutils hard-linked under every applet name, busybox behind symlinks)
+// runs whichever applet argv[0] names, and the caller picks argv[0] (`exec -a cp`), so whitelisting
+// its harmless `date` would make it `cp`. More than one hard link, or a symlink target named like a
+// general tool, therefore counts as one. A path that doesn't resolve yet (a deferred binary) is
+// judged by its name. The hard-link rule alone is waived for a user-writable lib_binary:
+// pressure-vessel hard-links its runtime into every var/tmp-XXXXXX and must delete those links.
+// Never for a root-owned binary (distro coreutils, busybox).
+func mayUpdate(path string, libBinary bool) bool {
+	if resolvesToNamedTool(path) {
+		return false
 	}
+	return !hardLinked(path) || (libBinary && !ebpf.SystemTrusted(path))
+}
+
+func hardLinked(path string) bool {
 	var st unix.Stat_t
-	if unix.Stat(path, &st) == nil && st.Nlink > 1 {
+	return unix.Stat(path, &st) == nil && st.Nlink > 1
+}
+
+func resolvesToNamedTool(path string) bool {
+	if namedGeneralTool(path) {
 		return true
 	}
 	resolved, err := filepath.EvalSymlinks(path)
@@ -47,9 +57,9 @@ func namedGeneralTool(path string) bool {
 }
 
 // planUpdaters assigns one bit per distinct resource binary set: a resource's binaries and
-// allow_libs own its bit, and its binaries, general tools excepted, are its updaters. Past 64
-// sets the rest own no bit, so nobody may modify their binaries (fail closed). [libraries]
-// allow_libs belong to no resource and get no owner either.
+// allow_libs own its bit, and its binaries, general tools excepted (see mayUpdate), are its
+// updaters. Past 64 sets the rest own no bit, so nobody may modify their binaries (fail closed).
+// [libraries] allow_libs belong to no resource and get no owner either.
 func planUpdaters(cfg *daemonconfig.Config) guard.UpdaterPlan {
 	p := guard.UpdaterPlan{Owners: map[string]uint64{}, Updaters: map[string]uint64{}}
 	bitOf := map[string]uint64{}
@@ -70,16 +80,21 @@ func planUpdaters(cfg *daemonconfig.Config) guard.UpdaterPlan {
 			bit = uint64(1) << len(bitOf)
 			bitOf[key] = bit
 		}
+		libBins := libBinaries(res)
 		for _, b := range set {
 			p.Owners[b] |= bit
-			if !isGeneralTool(b) {
+			if mayUpdate(b, libBins[b]) {
 				p.Updaters[b] |= bit
 			}
 		}
 		for _, l := range append(slices.Clone(res.AllowLibs), res.PendingLibs...) {
 			p.Owners[l] |= bit
 		}
-		warnGeneralTools(res, set)
+		if tools := generalToolsToWarn(set); len(tools) > 0 {
+			log.Warnf("trust guard: %s whitelists general tool(s) %s beside user-writable binaries — "+
+				"they are not allowed to update those binaries, but any arguments given to them reach %s",
+				res.Path, strings.Join(tools, ", "), res.Path)
+		}
 	}
 	return p
 }
@@ -95,21 +110,35 @@ func resourceBinaries(res *daemonconfig.Resource) []string {
 	return slices.Compact(set)
 }
 
-// warnGeneralTools flags a general tool whitelisted beside a user-writable binary: the tool is no
-// updater, but it still reads the resource's secrets on attacker-chosen arguments.
-func warnGeneralTools(res *daemonconfig.Resource, set []string) {
+func libBinaries(res *daemonconfig.Resource) map[string]bool {
+	out := map[string]bool{}
+	for _, list := range [][]daemonconfig.BinaryRule{res.Binaries, res.PendingBinaries} {
+		for _, b := range list {
+			if b.LibBinary {
+				out[b.Path] = true
+			}
+		}
+	}
+	return out
+}
+
+// generalToolsToWarn lists the general tools whitelisted beside a user-writable binary: no updater,
+// but they still read the resource's secrets on attacker-chosen arguments. A hard link alone isn't
+// warned about: runtimes (Steam's pressure-vessel) hard-link ordinary binaries; mayUpdate judges
+// those.
+func generalToolsToWarn(set []string) []string {
 	var tools []string
 	userWritable := false
 	for _, b := range set {
-		if isGeneralTool(b) {
+		switch {
+		case resolvesToNamedTool(b):
 			tools = append(tools, b)
-		} else if !ebpf.SystemTrusted(b) {
+		case !ebpf.SystemTrusted(b):
 			userWritable = true
 		}
 	}
-	if len(tools) > 0 && userWritable {
-		log.Warnf("trust guard: %s whitelists general tool(s) %s beside user-writable binaries — they "+
-			"are not allowed to update those binaries, but any arguments given to them reach %s",
-			res.Path, strings.Join(tools, ", "), res.Path)
+	if !userWritable {
+		return nil
 	}
+	return tools
 }

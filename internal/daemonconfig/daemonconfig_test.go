@@ -1189,6 +1189,14 @@ lib_binary `+writer+`
 	if !hasPendingBinary(protectedRes, "/usr/bin/example") {
 		t.Errorf("the section whitelist must still apply to the protected resource")
 	}
+	// Only the directive marks a rule LibBinary (it waives the hard-link updater rule).
+	for _, list := range [][]BinaryRule{lib.Binaries, lib.PendingBinaries, protectedRes.Binaries, protectedRes.PendingBinaries} {
+		for _, r := range list {
+			if r.LibBinary != (r.Path == writer) {
+				t.Errorf("rule %s: LibBinary = %v, want %v", r.Path, r.LibBinary, r.Path == writer)
+			}
+		}
+	}
 }
 
 // TestLoadLibBinaryDeferredWhenUnreadable keeps the fail-closed handling of a

@@ -49,8 +49,8 @@ func TestIsGeneralTool(t *testing.T) {
 		"/usr/bin/python3.12": true, "/usr/bin/node": true, "/bin/sh": true,
 		"/home/u/.local/bin/claude": false, "/opt/steam/steam": false,
 	} {
-		if got := isGeneralTool(path); got != want {
-			t.Errorf("isGeneralTool(%s) = %v, want %v", path, got, want)
+		if got := !mayUpdate(path, false); got != want {
+			t.Errorf("general tool %s = %v, want %v", path, got, want)
 		}
 	}
 }
@@ -76,8 +76,76 @@ func TestIsGeneralToolJudgesTheInode(t *testing.T) {
 		multi: true, filepath.Join(dir, "true"): true, single: false,
 		filepath.Join(dir, "missing"): false,
 	} {
-		if got := isGeneralTool(path); got != want {
-			t.Errorf("isGeneralTool(%s) = %v, want %v", path, got, want)
+		if got := !mayUpdate(path, false); got != want {
+			t.Errorf("general tool %s = %v, want %v", path, got, want)
 		}
+	}
+}
+
+// A hard link keeps a binary out of the updaters but only a tool's name warns: Steam's runtime
+// hard-links every pressure-vessel binary, which flooded the journal.
+func TestGeneralToolsToWarn_HardLinkIsNoUpdaterButNoWarning(t *testing.T) {
+	dir := t.TempDir()
+	app, linked, git := filepath.Join(dir, "app"), filepath.Join(dir, "pv-adverb"), filepath.Join(dir, "git")
+	for _, p := range []string{app, linked, git} {
+		if err := os.WriteFile(p, []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Link(linked, filepath.Join(dir, "copy")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := generalToolsToWarn([]string{app, linked}); len(got) != 0 {
+		t.Errorf("hard-linked non-tool must not warn: %v", got)
+	}
+	if got := generalToolsToWarn([]string{app, linked, git}); len(got) != 1 || got[0] != git {
+		t.Errorf("named tool beside a user-writable binary must warn alone: %v", got)
+	}
+	if got := generalToolsToWarn([]string{git}); len(got) != 0 {
+		t.Errorf("no user-writable sibling, no warning: %v", got)
+	}
+
+	p := planUpdaters(&daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: "/protected", Binaries: rules(app, linked)},
+	}})
+	if p.Updaters[linked] != 0 || p.Updaters[app] == 0 {
+		t.Errorf("hard-linked binary must stay out of the updaters: %v", p.Updaters)
+	}
+}
+
+// The hard-link waiver is for a user-writable lib_binary only; a tool's name is never waived.
+func TestMayUpdate_HardLinkWaivedForUserWritableLibBinary(t *testing.T) {
+	dir := t.TempDir()
+	pv, cp := filepath.Join(dir, "pv-adverb"), filepath.Join(dir, "cp")
+	for _, p := range []string{pv, cp} {
+		if err := os.WriteFile(p, []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(p, p+".link"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		path      string
+		libBinary bool
+		want      bool
+	}{
+		{pv, true, true},
+		{pv, false, false},
+		{cp, true, false},
+	} {
+		if got := mayUpdate(c.path, c.libBinary); got != c.want {
+			t.Errorf("mayUpdate(%s, libBinary=%v) = %v, want %v", c.path, c.libBinary, got, c.want)
+		}
+	}
+
+	p := planUpdaters(&daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: "/lib", ReadOnly: true, Binaries: []daemonconfig.BinaryRule{{Path: pv, LibBinary: true}}},
+		{Path: "/secret", Binaries: rules(pv, filepath.Join(dir, "app"))},
+	}})
+	lib := p.Owners[pv] &^ p.Owners[filepath.Join(dir, "app")]
+	if p.Updaters[pv] != lib {
+		t.Errorf("hard-linked lib_binary must update only its lib_dir set: updaters=%b lib=%b", p.Updaters[pv], lib)
 	}
 }

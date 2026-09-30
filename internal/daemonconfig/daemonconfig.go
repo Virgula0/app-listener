@@ -101,6 +101,8 @@ type BinaryRule struct {
 	Path string
 	// Events restricts the operations this binary may perform; empty means every type.
 	Events []ebpf.EventType
+	// LibBinary marks a `lib_binary` directive: a writer of its section's lib_dirs only.
+	LibBinary bool
 }
 
 // watchGroup is the parse state of one [watch <root>] section: the section path is the ENCRYPTION
@@ -805,7 +807,7 @@ func applyLibBinary(group *watchGroup, value string, lineNo int) error {
 		return fmt.Errorf("daemon config line %d: lib_binary does not accept event restrictions "+
 			"(%q): a library directory is guarded read-only, which carries no per-binary event mask", lineNo, rest)
 	}
-	recordBinaryRule(BinaryRule{Path: binPath}, &group.libBinaries, &group.libPending, lineNo)
+	recordBinaryRule(BinaryRule{Path: binPath, LibBinary: true}, &group.libBinaries, &group.libPending, lineNo)
 	return nil
 }
 

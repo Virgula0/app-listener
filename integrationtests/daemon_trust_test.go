@@ -178,6 +178,49 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// The hard-link updater rule is waived for a user-writable lib_binary only: pressure-vessel
+// hard-links its helpers into every var/tmp-XXXXXX and must delete those links. A root-owned
+// hard-linked lib_binary (distro coreutils) stays no updater; the single-link control proves that
+// refusal is the hard-link rule, not a missing owner bit.
+func (s *IntegrationSuite) TestDaemon_LibBinary_HardLinkWaiverUserWritableOnly() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/rawfsop"), "/exploits/rawfsop", 0755))
+	s.copySwapFixtures(c)
+	code, out := s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /rt /tmp/rtw /usr/local/pv /etc/app-listener && echo s > /protected/secret" +
+			" && cp /exploits/rawfsop /tmp/rtw/pv-tool && ln /tmp/rtw/pv-tool /tmp/rtw/pv-tool.link" +
+			" && chown -R 65534 /tmp/rtw" +
+			" && cp /exploits/rawfsop /usr/local/pv/pv-root && ln /usr/local/pv/pv-root /usr/local/pv/pv-root.link" +
+			" && cp /exploits/rawfsop /usr/local/pv/pv-single" +
+			" && cp " + swapBenignPath + " /tmp/app && chmod 755 /tmp/app"})
+	s.Require().Equalf(0, code, "fixture setup: %s", out)
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/tmp/app
+lib_dir /rt
+lib_binary /tmp/rtw/pv-tool
+lib_binary /usr/local/pv/pv-root
+lib_binary /usr/local/pv/pv-single`)
+
+	before := s.inodeOf(c, "/tmp/app")
+	code, out = s.exec(c, []string{"/usr/local/pv/pv-root", "unlink", "/tmp/app"})
+	s.T().Logf("root-owned hard-linked lib_binary: rc=%d %s", code, out)
+	s.Require().Equalf(before, s.inodeOf(c, "/tmp/app"),
+		"a root-owned hard-linked lib_binary became an updater and removed the protected binary")
+	s.requireDenialLogged(c, "WRITE", "/tmp/app")
+
+	code, out = s.exec(c, []string{"/tmp/rtw/pv-tool", "unlink", "/tmp/rtw/pv-tool.link"})
+	s.Require().Equalf(0, code, "user-writable hard-linked lib_binary must delete its own hard link: %s", out)
+	s.Require().Empty(s.inodeOf(c, "/tmp/rtw/pv-tool.link"), "the hard link is still there")
+
+	code, out = s.exec(c, []string{"/usr/local/pv/pv-single", "unlink", "/tmp/app"})
+	s.Require().Equalf(0, code, "control: a single-link lib_binary of the same set must be an updater: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Vuln 3 (A): a read-only lib_dir is trusted for loading only by its own lib_binary writers. Its
 // contents may predate the guard, so a library planted there must not load into an unrelated
 // whitelisted binary.
