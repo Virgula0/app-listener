@@ -90,10 +90,11 @@ type fileNode struct {
 // chmod / chown right). The vault must be unlocked by the caller for the whole session and is
 // re-locked when RunFileEditor returns.
 type fileEditModel struct {
-	root *fileNode
-	rows []*fileNode
-	cur  int
-	top  int // tree scroll offset
+	root  *fileNode
+	vault *vaultFS
+	rows  []*fileNode
+	cur   int
+	top   int // tree scroll offset
 
 	// singleFile: root itself is a guarded regular file (file-vault resource), not a directory: the
 	// tree is one childless row and save() writes in place, not temp-file+rename
@@ -137,6 +138,7 @@ type fileEditModel struct {
 // straight on it. Returns when closed; fscrypt state is untouched, so the caller must re-lock.
 func RunFileEditor(root string) error {
 	m := newFileEditModel(root)
+	defer m.vault.close()
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := prog.Run()
 	return err
@@ -161,10 +163,12 @@ func newFileEditModel(root string) *fileEditModel {
 	m.editor.KeyMap.WordForward.SetKeys("ctrl+right", "alt+right", "alt+f")
 	m.editor.Blur()
 
-	// Single-file resource: os.ReadDir(root) on a regular file fails ("not a directory"). Lstat,
-	// not Stat: a symlinked root is refused by enterEditor, never followed.
-	info, statErr := os.Lstat(root)
-	if statErr == nil && info.Mode().IsRegular() {
+	vault, vaultErr := openVault(root)
+	if vaultErr != nil {
+		vault = &vaultFS{base: root}
+	}
+	m.vault = vault
+	if vault.file != nil {
 		m.singleFile = true
 		m.root = &fileNode{path: root, name: name, loaded: true}
 	} else {
@@ -172,6 +176,9 @@ func newFileEditModel(root string) *fileEditModel {
 		m.status = "loading " + root
 		if err := m.loadChildren(m.root); err != nil {
 			m.status = "error: " + err.Error()
+		}
+		if vaultErr != nil {
+			m.status = "error: " + vaultErr.Error()
 		}
 	}
 	m.rebuild()
@@ -407,7 +414,7 @@ func (m *fileEditModel) loadChildren(n *fileNode) error {
 	if !n.isDir || n.loaded {
 		return nil
 	}
-	entries, err := os.ReadDir(n.path)
+	entries, err := m.vault.readDir(n.path)
 	if err != nil {
 		return err
 	}
@@ -532,7 +539,7 @@ func (m *fileEditModel) enterEditor() error {
 	if n == nil || n.isDir {
 		return nil
 	}
-	info, err := os.Lstat(n.path)
+	info, err := m.vault.lstat(n.path)
 	if err != nil {
 		return err
 	}
@@ -562,7 +569,7 @@ func (m *fileEditModel) enterEditor() error {
 // previewFile loads path into the (blurred) editor; binary files and files over maxEditableBytes
 // reset the preview and report a status.
 func (m *fileEditModel) previewFile(path string) error {
-	info, err := os.Stat(path)
+	info, err := m.vault.lstat(path)
 	if err != nil {
 		return err
 	}
@@ -572,7 +579,7 @@ func (m *fileEditModel) previewFile(path string) error {
 		m.status = fmt.Sprintf("%s is %.1f MiB — only files up to 2 MiB can be edited", path, float64(info.Size())/(1<<20))
 		return nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := m.vault.readFile(path)
 	if err != nil {
 		return err
 	}
@@ -597,15 +604,7 @@ func (m *fileEditModel) save() error {
 	if m.editPath == "" {
 		return nil
 	}
-	// A single-file resource's parent directory is guarded against anything created/renamed beside
-	// it (rename-over-watchroot defense), so writeFileKeepMeta's temp-sibling + rename would be
-	// denied. writeFileInPlace rewrites the existing inode, like every other in-place unlock/lock
-	// here.
-	writer := writeFileKeepMeta
-	if m.singleFile {
-		writer = writeFileInPlace
-	}
-	if err := writer(m.editPath, []byte(m.editor.Value())); err != nil {
+	if err := m.vault.write(m.editPath, []byte(m.editor.Value())); err != nil {
 		return err
 	}
 	m.original = m.editor.Value()
@@ -660,21 +659,22 @@ func (m *fileEditModel) createEntry() {
 	var err error
 	switch m.inputKind {
 	case createFile:
-		// O_EXCL|O_NOFOLLOW: os.WriteFile follows an existing symlink at target and would truncate
-		// the link's victim; refuse instead. The editor runs as root over a user-owned tree.
-		var fd int
-		fd, err = unix.Open(target, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
-		if err == nil {
-			err = unix.Close(fd)
-		}
+		// O_EXCL|O_NOFOLLOW: an existing symlink at target is refused, never followed.
+		err = m.vault.dirOp(target, func(r *os.Root, name string) error {
+			f, openErr := r.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
+			if openErr != nil {
+				return openErr
+			}
+			return f.Close()
+		})
 	case createDir:
-		err = os.Mkdir(target, 0o750)
+		err = m.vault.dirOp(target, func(r *os.Root, name string) error { return r.Mkdir(name, 0o750) })
 	}
 	if err != nil {
 		m.status = err.Error()
 		return
 	}
-	if err := applyNewFileMeta(target, m.inputKind == createDir); err != nil {
+	if err := applyNewFileMeta(m.vault, target, m.inputKind == createDir); err != nil {
 		m.status = err.Error()
 	}
 	if parent := m.findDir(m.inputDir); parent != nil {
@@ -717,7 +717,7 @@ func (m *fileEditModel) beginChmod() {
 	if n == nil {
 		return
 	}
-	info, err := os.Lstat(n.path)
+	info, err := m.vault.lstat(n.path)
 	if err != nil {
 		m.status = err.Error()
 		return
@@ -752,23 +752,22 @@ func (m *fileEditModel) applyChmod() {
 		m.status = "invalid mode: must not exceed 07777"
 		return
 	}
-	// Re-validate at apply time with O_NOFOLLOW: beginChmod's Lstat check is seconds stale, and
-	// os.Chmod by path follows a symlink, so a swap in that window would chmod an arbitrary file.
-	// The value is a unix mode: convert via the converter, or setuid/setgid/sticky are lost (a raw
-	// os.FileMode cast maps them onto bits chmod ignores).
-	fd, err := unix.Open(m.chmodPath, unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_PATH, 0)
+	// Re-validate at apply time on an O_PATH|O_NOFOLLOW descriptor: beginChmod's Lstat check is
+	// seconds stale. The value is a unix mode: convert via the converter, or setuid/setgid/sticky
+	// are lost (a raw os.FileMode cast maps them onto bits chmod ignores).
+	mode := unixModeToFileMode(uint32(perm))
+	err := m.vault.withFile(m.chmodPath, unix.O_PATH, func(f *os.File) error {
+		if info, statErr := f.Stat(); statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink — chmod is refused", m.chmodPath)
+		}
+		// O_PATH descriptors can't fchmod directly; chmod via /proc/self/fd resolves the pinned
+		// inode without re-walking the (swappable) path.
+		return os.Chmod(fmt.Sprintf("/proc/self/fd/%d", f.Fd()), mode)
+	})
 	if err != nil {
 		m.status = err.Error()
 		return
 	}
-	// O_PATH descriptors can't fchmod directly; chmod via /proc/self/fd resolves the pinned inode
-	// without re-walking the (swappable) path.
-	if err := os.Chmod(fmt.Sprintf("/proc/self/fd/%d", fd), unixModeToFileMode(uint32(perm))); err != nil {
-		_ = unix.Close(fd)
-		m.status = err.Error()
-		return
-	}
-	_ = unix.Close(fd)
 	m.status = "chmod " + m.chmodPath + " = " + v
 }
 
@@ -778,7 +777,7 @@ func (m *fileEditModel) beginChown() {
 	if n == nil {
 		return
 	}
-	info, err := os.Lstat(n.path)
+	info, err := m.vault.lstat(n.path)
 	if err != nil {
 		m.status = err.Error()
 		return
@@ -823,7 +822,13 @@ func (m *fileEditModel) applyChown() {
 		m.mode = modeNav
 		return
 	}
-	if err := os.Lchown(m.chownPath, u.uid, u.gid); err != nil {
+	err := m.vault.withFile(m.chownPath, unix.O_PATH, func(f *os.File) error {
+		if info, statErr := f.Stat(); statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink — chown is refused", m.chownPath)
+		}
+		return unix.Fchownat(int(f.Fd()), "", u.uid, u.gid, unix.AT_EMPTY_PATH)
+	})
+	if err != nil {
 		m.status = err.Error()
 		m.mode = modeNav
 		return
@@ -860,7 +865,7 @@ func (m *fileEditModel) confirmDelete() {
 	path := m.pendingDelete
 	m.pendingDelete = ""
 	m.mode = modeNav
-	if err := os.RemoveAll(path); err != nil {
+	if err := m.vault.dirOp(path, (*os.Root).RemoveAll); err != nil {
 		m.status = err.Error()
 		return
 	}
@@ -997,7 +1002,7 @@ func (m *fileEditModel) renderEntryInfo(width, height int) string {
 			b.WriteString(err.Error())
 			return b.String()
 		}
-		for _, e := range listEntries(n, height-2) {
+		for _, e := range listEntries(m.vault, n, height-2) {
 			name := e.name
 			if e.isDir {
 				name += "/"
@@ -1010,7 +1015,7 @@ func (m *fileEditModel) renderEntryInfo(width, height int) string {
 		}
 		return b.String()
 	}
-	info, err := os.Lstat(n.path)
+	info, err := m.vault.lstat(n.path)
 	if err != nil {
 		b.WriteString(err.Error())
 		return b.String()

@@ -26,6 +26,7 @@ var (
 	netTesterAmd64Bin   string
 	guardTestAmd64Bin   string
 	fscryptTestAmd64Bin string
+	tuiTestAmd64Bin     string
 )
 
 // hostInfraBindPaths are host binaries the LSM network guard blocks in whitelist mode because its
@@ -70,6 +71,7 @@ func TestMain(m *testing.M) {
 	netTesterAmd64Bin = absPath("../build/test/net_tester-amd64")
 	guardTestAmd64Bin = absPath("../build/test/guard-amd64")
 	fscryptTestAmd64Bin = absPath("../build/test/fscrypt-amd64")
+	tuiTestAmd64Bin = absPath("../build/test/tui-amd64")
 
 	// Daemon mode links fscrypt, which needs cgo (mlock): CGO_ENABLED=0 no longer compiles. The
 	// binary must still be static: it runs in ubuntu:latest containers whose glibc (2.39) is older
@@ -106,6 +108,16 @@ func TestMain(m *testing.M) {
 	cmdGuardTest.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	if err := cmdGuardTest.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build guard test binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	// The edit-protected editor's root-only checks (internal/tui/harness_test.go), built the same
+	// way: the package needs no cgo.
+	cmdTuiTest := exec.Command("go", "test", "-tags", "ci", "-c", "-o", tuiTestAmd64Bin, "../internal/tui/")
+	cmdTuiTest.Stderr = os.Stderr
+	cmdTuiTest.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+	if err := cmdTuiTest.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build tui test binary: %v\n", err)
 		os.Exit(1)
 	}
 
