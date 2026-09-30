@@ -58,7 +58,7 @@ func TestCatalogRefreshUnitShape(t *testing.T) {
 	}
 }
 
-// TestAptHookShape: the apt hook must call --update-catalog-only and must not
+// TestAptHookShape: the apt hook must refresh live when the daemon runs and must not
 // fail an apt run on a refresh error.
 func TestAptHookShape(t *testing.T) {
 	b, err := SampleContent("apt-app-listener-reload")
@@ -68,11 +68,29 @@ func TestAptHookShape(t *testing.T) {
 	hook := string(b)
 	for _, needle := range []string{
 		"DPkg::Post-Invoke",
-		"install --update-catalog-only --yes",
-		"|| true",
+		"systemctl is-active --quiet app-listener-daemon",
+		"install --update-catalog-only --live --yes || true",
+		"install --update-catalog-only --yes || true",
 	} {
 		if !strings.Contains(hook, needle) {
 			t.Errorf("apt hook missing %q\n%s", needle, hook)
+		}
+	}
+}
+
+// TestPacmanHookPrefersLive: a running daemon must be refreshed live, never stopped by the hook.
+func TestPacmanHookPrefersLive(t *testing.T) {
+	b, err := SampleContent("50-app-listener-reload.hook")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := string(b)
+	for _, needle := range []string{
+		"systemctl is-active --quiet app-listener-daemon; then exec /usr/local/bin/app-listener install --update-catalog-only --live --yes",
+		"exec /usr/local/bin/app-listener install --update-catalog-only --yes'",
+	} {
+		if !strings.Contains(hook, needle) {
+			t.Errorf("pacman hook missing %q\n%s", needle, hook)
 		}
 	}
 }

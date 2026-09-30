@@ -2,17 +2,13 @@
 #
 # After every pacman install/upgrade, re-scan the app-listener catalog
 # whitelist: deleted binaries are dropped, new ones are picked up, and
-# glob patterns are re-expanded. The daemon is restarted automatically.
+# glob patterns are re-expanded.
 #
-# The previous approach only sent SIGHUP to re-read inodes; the full
-# catalog rescan subsumes that — the daemon is reloaded by
-# EnableAndVerify after writing the refreshed config.
-#
-# Encrypted resources are unlocked for the re-scan under an ephemeral
-# self-only guard (attached before the unlock, dropped after the vault is
-# confirmed locked back): the window denies every reader except the root
-# installer process, and a vault that cannot be re-locked fails the hook
-# instead of staying unlocked.
+# With the daemon running the refresh is --live: the daemon keeps guarding,
+# apps keep their files open, and a changed whitelist arrives by SIGHUP.
+# Only a stopped daemon takes the offline flow, which unlocks encrypted
+# resources under an ephemeral self-only guard for the re-scan and starts
+# the daemon afterwards.
 
 [Trigger]
 Operation = Install
@@ -23,4 +19,4 @@ Target = *
 [Action]
 Description = Refreshing app-listener whitelist from catalog
 When = PostTransaction
-Exec = /usr/local/bin/app-listener install --update-catalog-only --yes
+Exec = /bin/sh -c 'if systemctl is-active --quiet app-listener-daemon; then exec /usr/local/bin/app-listener install --update-catalog-only --live --yes; fi; exec /usr/local/bin/app-listener install --update-catalog-only --yes'
