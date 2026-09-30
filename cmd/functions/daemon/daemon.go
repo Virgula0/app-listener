@@ -256,11 +256,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// edit-auth.hash), attached synchronously HERE, before the config guards touch bpffs: otherwise
 	// a killed predecessor's self-guard pins (swept by CleanupStalePins, same pin.base) would leave
 	// a window with no replacements. pinstate.go's ensurePinStateFilePlaceholder keeps
-	// writePinState working under the live RO self-guard. Self guards stay OUT of the usecase's
-	// guard set so a SIGHUP reload's transient guard doubling stays under the kernel's per-LSM-hook
-	// program cap (selfGuards.detach/attach around reload). A failed self guard is logged CRITICAL
-	// but never aborts startup (config guards are the core function and compete for the same link
-	// slots).
+	// writePinState working under the live RO self-guard. They stay attached across every reload.
+	// A failed self guard is logged CRITICAL but never aborts startup.
 	sg := newSelfGuards()
 	sg.attach(pin)
 	defer sg.detach()
@@ -310,7 +307,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	control := startControlManager(d)
 	defer control.close()
 
-	reload := makeReloadHandler(d, configPath, vault, pin, sg, control, trust)
+	reload := makeReloadHandler(d, configPath, vault, pin, control, trust)
 	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
 }
 
@@ -453,8 +450,10 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 
 // makeReloadHandler returns the SIGHUP handler: re-parse the config, rebuild every guard
 // (re-statting binaries so updated ones get new inodes) and hand the batch to the usecase, which
-// swaps without dropping protection. Any failure keeps the previous config running.
-func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, sg *selfGuards, control *controlManager, trust *trustManager) func() {
+// swaps without dropping protection. Any failure keeps the previous config running. The self
+// guards stay attached throughout: the reload only needs free resource slots, which reloadOnce
+// checks before building anything.
+func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, control *controlManager, trust *trustManager) func() {
 	return func() {
 		// A reload rebuilds every guard, so end any live edit-protected grant first (its client
 		// gets EOF; the tree is read-only again before the swap).
@@ -463,15 +462,9 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		// start/stop the control socket.
 		defer control.refresh()
 
-		// Self guards step aside for the reload: config guards briefly run old+new together, which
-		// must stay under the kernel's per-LSM-hook program cap (BPF_MAX_TRAMP_LINKS). Re-attached
-		// (best effort) after the swap, on both success and keep-previous paths.
-		sg.detach()
-
 		liveGen, cfg, err := reloadOnce(d, configPath, vault, pin.base)
 		if err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
-			sg.attach(pin)
 			return
 		}
 		// Rebuild the daemon-wide trusted set from the new config: a binary added by this reload
@@ -479,21 +472,30 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		// against it while it holds full access to the secrets.
 		trust.reload(cfg)
 		// The usecase's commit already unpinned the old generation's guards; sweep every other
-		// generation, keeping the live batch. Self guards are detached here, so their pins are gone
-		// and can't look stale.
-		if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{liveGen: true}); cleanErr != nil {
+		// generation, keeping the live batch and the self guards' (pin.gen never rotates).
+		if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{liveGen: true, pin.gen: true}); cleanErr != nil {
 			log.Warnf("daemon: could not sweep stale guard pins after reload: %v", cleanErr)
 		}
-		// The reload minted a fresh config-guard generation (not the self guards': pin.gen on this
-		// outer variable never changes): record it, or `daemon --lockdown` would recover the
-		// pre-reload generation whose pins CleanupStalePins just removed.
+		// The reload minted a fresh config-guard generation: record it, or `daemon --lockdown`
+		// would recover the pre-reload generation whose pins the commit just removed.
 		if pinErr := writePinState(pinCfg{base: pin.base, gen: liveGen}); pinErr != nil {
 			log.Warnf("daemon: could not record pin state after reload (%v) — `daemon --lockdown` will not be "+
 				"able to widen self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 		}
-		sg.attach(pin)
 		log.Infof("daemon: configuration reloaded from %s", configPath)
 	}
+}
+
+// reloadSlotsNeeded is how many resource slots a reload of cfg claims on top of the live ones: one
+// per resource plus one ephemeral guard per pending group root (an upper bound).
+func reloadSlotsNeeded(cfg *daemonconfig.Config) int {
+	n := len(cfg.Resources)
+	for i := range cfg.Resources {
+		if cfg.Resources[i].PathPending {
+			n++
+		}
+	}
+	return n
 }
 
 // reloadOnce performs one SIGHUP reload: re-parse, unlock any newly added grouped vault under an
@@ -508,6 +510,12 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 	}
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("config contains no [watch] sections")
+	}
+	// Old and new guards overlap until the commit, with the self guards still attached: refuse up
+	// front rather than detach anything to make room.
+	if need, free := reloadSlotsNeeded(cfg), guard.FreeResourceSlots(); need > free {
+		return "", nil, fmt.Errorf("reload needs %d guard resource slots but only %d are free (max %d) — "+
+			"restart the daemon to apply this configuration", need, free, guard.GuardMaxRes-1)
 	}
 
 	pin := pinCfg{base: pinBase, gen: newPinGeneration()}

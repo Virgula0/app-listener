@@ -67,3 +67,57 @@ EOF`})
 	s.Require().NotContainsf(out, "rc=124", "the daemon must refuse at load, not run: %s", out)
 	s.Require().NotContainsf(out, "guard started", "no guard may attach for a refused config: %s", out)
 }
+
+// fscrypt.key stays sealed through SIGHUP reloads: a non-whitelisted root reader races repeated
+// reloads and must never see the key, since the self guards are never detached for a reload.
+func (s *IntegrationSuite) TestDaemon_SelfProtection_KeySealedAcrossReloads() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "SELF-KEY-RELOAD-MARKER-012345678" // 32 bytes, like a real key
+	const reloads = 5
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /etc/app-listener && echo s > /protected/secret && printf '" +
+			marker + "' > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/sleep`)
+
+	selfReady := false
+	for dl := time.Now().Add(45 * time.Second); time.Now().Before(dl); {
+		if strings.Contains(s.readDaemonLog(c), "self-protection: guarding /etc/app-listener/fscrypt.key") {
+			selfReady = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Require().Truef(selfReady, "self-protection guards did not attach, log:\n%s", s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "rm -f /tmp/racer.stop /tmp/racer.out /tmp/racer.n; nohup sh -c '" +
+		"n=0; while [ ! -e /tmp/racer.stop ]; do cat /etc/app-listener/fscrypt.key 2>/dev/null; " +
+		"n=$((n+1)); echo $n > /tmp/racer.n; done' > /tmp/racer.out 2>&1 &"})
+
+	for i := 1; i <= reloads; i++ {
+		s.sigDaemon(c, "HUP")
+		done := false
+		for dl := time.Now().Add(daemonShutdownTimeout); time.Now().Before(dl); {
+			l := s.readDaemonLog(c)
+			s.Require().NotContainsf(l, reloadRefused, "reload %d was refused:\n%s", i, l)
+			if strings.Count(l, reloadEnd) >= i {
+				done = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		s.Require().Truef(done, "reload %d did not finish, log:\n%s", i, s.readDaemonLog(c))
+	}
+
+	s.exec(c, []string{"sh", "-c", "touch /tmp/racer.stop; sleep 1"})
+	_, n := s.exec(c, []string{"sh", "-c", "cat /tmp/racer.n"})
+	s.Require().NotEqualf("", strings.TrimSpace(n), "the racer never ran")
+	_, out := s.exec(c, []string{"sh", "-c", "cat /tmp/racer.out"})
+	s.Require().NotContainsf(out, marker, "fscrypt.key was readable by a non-daemon process during a reload "+
+		"(%s reads)", strings.TrimSpace(n))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

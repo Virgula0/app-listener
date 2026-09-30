@@ -275,6 +275,19 @@ func (e *engine) attachForkTaintLocked() {
 	e.linkNames = append(e.linkNames, "sched-process-fork")
 }
 
+// FreeResourceSlots is how many resource slots a new Guard can still claim.
+func FreeResourceSlots() int {
+	sharedEngine.mu.Lock()
+	defer sharedEngine.mu.Unlock()
+	free := 0
+	for id := 1; id < GuardMaxRes; id++ {
+		if sharedEngine.slots[id] == nil && sharedEngine.setAt[uint32(id)] == "" { //nolint:gosec // id < GuardMaxRes
+			free++
+		}
+	}
+	return free
+}
+
 // allocSlotLocked reserves a resource id for g. Slot 0 is reserved (resGlobal), and so is every
 // taint-set slot.
 func (e *engine) allocSlotLocked(g *Guard) (uint32, error) {
