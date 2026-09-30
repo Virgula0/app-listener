@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
@@ -46,6 +48,33 @@ func TestIsGeneralTool(t *testing.T) {
 	for path, want := range map[string]bool{
 		"/usr/bin/python3.12": true, "/usr/bin/node": true, "/bin/sh": true,
 		"/home/u/.local/bin/claude": false, "/opt/steam/steam": false,
+	} {
+		if got := isGeneralTool(path); got != want {
+			t.Errorf("isGeneralTool(%s) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+// Updater rights attach to the inode: a hard-linked multi-call binary or a symlink to busybox is a
+// general tool whatever applet name is whitelisted.
+func TestIsGeneralToolJudgesTheInode(t *testing.T) {
+	dir := t.TempDir()
+	multi := filepath.Join(dir, "date")
+	single := filepath.Join(dir, "app")
+	for _, p := range []string{multi, single, filepath.Join(dir, "busybox")} {
+		if err := os.WriteFile(p, []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Link(multi, filepath.Join(dir, "cp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "busybox"), filepath.Join(dir, "true")); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]bool{
+		multi: true, filepath.Join(dir, "true"): true, single: false,
+		filepath.Join(dir, "missing"): false,
 	} {
 		if got := isGeneralTool(path); got != want {
 			t.Errorf("isGeneralTool(%s) = %v, want %v", path, got, want)

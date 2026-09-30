@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
@@ -17,15 +18,32 @@ import (
 // whitelisting one never makes it an updater: `git`, `node -e`, `cp` would otherwise rewrite the
 // app binaries sharing its resource. Matched on the basename; a trailing version (python3.12) too.
 var generalTools = []string{
-	"sh", "bash", "dash", "zsh", "fish", "ksh", "busybox", "env",
+	"sh", "bash", "dash", "zsh", "fish", "ksh", "busybox", "toybox", "coreutils", "env",
 	"git", "node", "nodejs", "npm", "npx", "bun", "deno",
 	"python", "perl", "ruby", "php", "lua", "java",
 	"cp", "mv", "install", "rsync", "tar", "curl", "wget",
 }
 
+// isGeneralTool also judges the binary the path resolves to, since updater rights attach to its
+// inode: a multi-call binary (uutils coreutils hard-linked under every applet name, busybox behind
+// symlinks) runs whichever applet argv[0] names, and the caller picks argv[0] (`exec -a cp`), so
+// whitelisting its harmless `date` would make it `cp`. More than one hard link, or a symlink
+// target named like a general tool, therefore counts as one. A path that doesn't resolve yet
+// (a deferred binary) is judged by its name.
 func isGeneralTool(path string) bool {
-	base := strings.TrimRight(filepath.Base(path), "0123456789.")
-	return slices.Contains(generalTools, base)
+	if namedGeneralTool(path) {
+		return true
+	}
+	var st unix.Stat_t
+	if unix.Stat(path, &st) == nil && st.Nlink > 1 {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	return err == nil && namedGeneralTool(resolved)
+}
+
+func namedGeneralTool(path string) bool {
+	return slices.Contains(generalTools, strings.TrimRight(filepath.Base(path), "0123456789."))
 }
 
 // planUpdaters assigns one bit per distinct resource binary set: a resource's binaries and

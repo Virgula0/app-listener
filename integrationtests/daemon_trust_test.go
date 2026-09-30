@@ -128,6 +128,56 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: planUpdaters excludes general tools by the whitelisted path's basename, but updater
+// rights attach to the inode. Ubuntu's coreutils is one multi-call binary hard-linked under every
+// applet name, so whitelisting a harmless applet (date) makes cp/dd/tee, the same inode, updaters
+// of the resource's app binary: any process rewrites it through them, and the app keeps its inode.
+func (s *IntegrationSuite) TestDaemon_Bypass_MultiCallAppletBecomesUpdater() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const (
+		marker  = "TOP-SECRET-MULTICALL-UPDATER-2E7C"
+		applets = "/usr/lib/cargo/bin/coreutils"
+	)
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener && printf '" + marker +
+			"' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+	code, out := s.exec(c, []string{"sh", "-c", "stat -Lc %i /usr/bin/date " + applets + "/cp 2>&1 | sort -u | wc -l"})
+	if code != 0 || strings.TrimSpace(out) != "1" {
+		s.T().Skipf("coreutils here is not one multi-call inode (date vs cp): %s", out)
+	}
+	s.copySwapFixtures(c)
+	s.exec(c, []string{"sh", "-c", "cp " + swapBenignPath + " /tmp/app && chmod 755 /tmp/app"})
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/tmp/app
+/usr/bin/date`)
+
+	code, out = s.exec(c, []string{"/tmp/app"})
+	s.Require().Equalf(0, code, "baseline whitelisted binary should run: %s", out)
+	before := s.inodeOf(c, "/tmp/app")
+
+	// Each runs from a non-whitelisted shell; only the applet is the resource's.
+	for _, tc := range []struct{ what, cmd string }{
+		{"cp applet", applets + "/cp " + swapReaderPath + " /tmp/app"},
+		{"dd applet", applets + "/dd if=" + swapReaderPath + " of=/tmp/app status=none"},
+		{"tee applet", applets + "/tee /tmp/app < " + swapReaderPath + " > /dev/null"},
+	} {
+		code, out = s.exec(c, []string{"sh", "-c", tc.cmd + " 2>&1"})
+		s.T().Logf("%s: rc=%d %s", tc.what, code, out)
+		s.Require().Equalf(before, s.inodeOf(c, "/tmp/app"), "%s replaced the protected binary", tc.what)
+		code, out = s.exec(c, []string{"cmp", "-s", swapBenignPath, "/tmp/app"})
+		s.Require().Equalf(0, code,
+			"%s rewrote the resource's app binary: whitelisting `date` made the multi-call coreutils inode "+
+				"an updater: %s", tc.what, out)
+	}
+
+	s.assertNeverStolen(c, "/tmp/app", "/protected/secret", marker)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Vuln 3 (A): a read-only lib_dir is trusted for loading only by its own lib_binary writers. Its
 // contents may predate the guard, so a library planted there must not load into an unrelated
 // whitelisted binary.
