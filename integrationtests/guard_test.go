@@ -2490,6 +2490,20 @@ func (s *IntegrationSuite) TestGuard_SweepInodes_RecreatedFileRoot() {
 	s.runGuardTest(c, "TestSweepInodesRecreatedFileRoot")
 }
 
+func (s *IntegrationSuite) TestGuard_SweepInodes_RecreatedDirRoot() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestSweepInodesRecreatedDirRoot")
+}
+
+func (s *IntegrationSuite) TestGuard_SweepInodes_DirRootGated() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestSweepInodesDirRootGated")
+}
+
 func (s *IntegrationSuite) TestGuard_SweepInodes_RootRenamedAsideReanchors() {
 	c := s.newGuardTestContainer()
 	// pooled: terminated at suite end

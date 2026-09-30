@@ -1341,10 +1341,10 @@ func (g *Guard) reanchorRefusal(oldKey GuardInodeKey, root *rootHandle, resolved
 	return ""
 }
 
-// anchorAlive reports whether key is a root that still exists and was not moved by an allowed
-// rename. inode_free_security zeroes the anchor only when the root is freed with no links, so a
-// set anchor names a root that still exists wherever an ancestor swap moved it: re-anchoring would
-// leave that tree unguarded. guard_root_moved releases a root its whitelisted app renamed away.
+// anchorAlive reports whether key is still the anchor and no allowed operation released it. A
+// root moved by an ancestor swap stays anchored (re-anchoring would leave that tree unguarded);
+// guard_root_moved records one an allowed rename, unlink or rmdir released, and
+// inode_free_security zeroes the anchor of one freed with no links.
 func (g *Guard) anchorAlive(key GuardInodeKey) (bool, error) {
 	cfg, err := g.resConfig()
 	if err != nil {

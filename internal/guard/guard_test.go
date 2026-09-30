@@ -859,13 +859,18 @@ func (s *guardUnitTest) TestSweepInodesDirRootGated() {
 	root := s.T().TempDir()
 	s.Require().NoError(os.WriteFile(filepath.Join(root, "a"), []byte("x"), 0o644))
 
-	g := s.newGuardedTree(root, nil, nil)
+	// The sweep's re-walk reads the guarded root: whitelist this test process, as the daemon
+	// scanning its own resources always is.
+	exe, err := os.Executable()
+	s.Require().NoError(err)
+	self, err := ComputeBinaryEntry(exe)
+	s.Require().NoError(err)
+	g := s.newGuardedTree(root, []BinaryEntry{self}, nil)
 	defer g.Stop()
 
-	// First sweep records the fingerprint (mtime unchanged since build, so it
-	// is a no-op) and every subsequent sweep with an unchanged root is a
-	// no-op — a file created in a SUBdir must not be picked up here (BPF
-	// discovery + the ancestor walk cover it), only a top-level change does.
+	// The first sweep walks the root and records its mtime; every later sweep with an unchanged
+	// root is a no-op — a file created in a SUBdir must not be picked up here (BPF discovery + the
+	// ancestor walk cover it), only a top-level change does.
 	s.Require().NoError(g.SweepInodes())
 	g.mu.Lock()
 	seededMtime := g.sweepRootMtime

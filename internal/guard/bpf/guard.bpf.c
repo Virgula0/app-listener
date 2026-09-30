@@ -122,10 +122,11 @@ struct {
 	__type(value, struct res_config);
 } guard_res_config SEC(".maps");
 
-// guard_root_moved records a watch root that an allowed rename moved (its whitelisted app renamed
-// it aside or replaced it). Userspace may then re-anchor although the old root inode still exists;
-// a root that moved only because an unguarded ancestor was swapped is never recorded here, so the
-// sweep keeps refusing that. Written by path_rename only, read by userspace only.
+// guard_root_moved records a watch root an allowed operation released: renamed aside or replaced
+// by its whitelisted app, or deleted. Userspace may then re-anchor although the old root inode may
+// still exist; a root that moved only because an unguarded ancestor was swapped is never recorded
+// here, so the sweep keeps refusing that. Written by path_rename/path_unlink/path_rmdir on allow,
+// read by userspace only.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, GUARD_MAX_RES);
@@ -638,6 +639,22 @@ static __always_inline void add_inode_to_guard(struct inode *inode, __u32 res_id
 		count_degrade(0);
 }
 
+// note_root_moved records a watch root among src and victim in guard_root_moved. Called only on an
+// allowed rename (the moved inode and the displaced victim) or an allowed final unlink/rmdir, before
+// the row that names its resource is evicted. Out of line: one small body after the decision.
+static __noinline int note_root_moved(struct inode *src, struct inode *victim)
+{
+	for (int i = 0; i < 2; i++) {
+		struct inode *in = i ? victim : src;
+		__u32 res = GUARD_RES_NONE;
+		struct inode_key ikey = {};
+		if (!in || !inode_is_watch_root(in, &res) || !inode_key_of(in, &ikey))
+			continue;
+		bpf_map_update_elem(&guard_root_moved, &res, &ikey, BPF_ANY);
+	}
+	return 0;
+}
+
 // Evict an inode from guard_inodes when path_unlink/path_rmdir lets a delete through: the kernel
 // frees the inode right after, and its number can go to an unrelated file. Evicting now (not
 // waiting for ReconcileInodes, up to inodeGCEvery ~1h) closes that window. A miss (never a member)
@@ -646,6 +663,9 @@ static __always_inline void evict_inode_from_guard(struct inode *inode)
 {
 	if (!inode)
 		return;
+	// A deleted root is released like a renamed one: inode_free_security can no longer zero its
+	// anchor once the row naming its resource is gone.
+	note_root_moved(inode, NULL);
 
 	struct inode_key ikey = {};
 	bpf_probe_read_kernel(&ikey.ino, sizeof(ikey.ino), &inode->i_ino);
@@ -1469,22 +1489,6 @@ int guard_path_unlink(unsigned long long *ctx)
 static __always_inline __u32 xres_judge(__u32 src_res, bool dst_guarded, __u32 dst_res)
 {
 	return (dst_guarded && dst_res != src_res) ? GUARD_RES_GLOBAL : src_res;
-}
-
-// note_root_moved records a watch root among the renamed inode and the displaced victim in
-// guard_root_moved. Called only once path_rename allowed the rename. Out of line so the tail it
-// adds after the decision stays one small body.
-static __noinline int note_root_moved(struct inode *src, struct inode *victim)
-{
-	for (int i = 0; i < 2; i++) {
-		struct inode *in = i ? victim : src;
-		__u32 res = GUARD_RES_NONE;
-		struct inode_key ikey = {};
-		if (!in || !inode_is_watch_root(in, &res) || !inode_key_of(in, &ikey))
-			continue;
-		bpf_map_update_elem(&guard_root_moved, &res, &ikey, BPF_ANY);
-	}
-	return 0;
 }
 
 SEC("lsm/path_rename")
