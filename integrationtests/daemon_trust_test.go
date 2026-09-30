@@ -221,6 +221,66 @@ lib_binary /usr/local/pv/pv-single`)
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// A lib_dir lets any process clear write bits of a non-root-owned regular file (Proton's
+// steampipe_fixups restore) and nothing else: adding a bit, touching another bit, a directory, a
+// root-owned file (dropping g+w would make it system-trusted), chown/utimes/xattrs, or a
+// whitelist tree stay denied. Asserted on the resulting mode, not the probe's exit code.
+func (s *IntegrationSuite) TestDaemon_LibDir_ChmodMayOnlyDropWriteBits() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	for _, p := range []string{"chmod", "chown", "utimes", "setxattr"} {
+		s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/"+p), "/exploits/"+p, 0755), "copy "+p)
+	}
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /rt/sub /protected /etc/app-listener" +
+		" && for f in drop addw addx suid dropr meta; do echo x > /rt/$f.so; done" +
+		" && chmod 755 /rt/drop.so /rt/suid.so /rt/dropr.so /rt/meta.so && chmod 555 /rt/addw.so" +
+		" && chmod 444 /rt/addx.so && chown -R 65534 /rt" +
+		" && echo x > /rt/root.so && chown 0:1234 /rt/root.so && chmod 664 /rt/root.so" +
+		" && echo s > /protected/secret && chown 65534 /protected/secret && chmod 644 /protected/secret"})
+	s.Require().Equalf(0, code, "fixture setup: %s", out)
+	s.startDaemon(c, `[libraries "Runtime"]
+lib_dir /rt
+
+[watch /protected]
+need_encryption: false
+/usr/bin/true`)
+
+	modeOf := func(path string) string {
+		_, out := s.exec(c, []string{"stat", "-c", "%a", path})
+		return strings.TrimSpace(out)
+	}
+	const eperm = "Operation not permitted"
+	for _, tc := range []struct{ what, path, mode, want string }{
+		{"drop write bits", "/rt/drop.so", "555", "555"},
+		{"add a write bit", "/rt/addw.so", "755", "555"},
+		{"add exec bits", "/rt/addx.so", "555", "444"},
+		{"drop write but add setuid", "/rt/suid.so", "4555", "755"},
+		{"drop a read bit", "/rt/dropr.so", "311", "755"},
+		{"drop write on a directory", "/rt/sub", "555", "755"},
+		{"drop g+w on a root-owned file", "/rt/root.so", "644", "664"},
+	} {
+		_, out := s.exec(c, []string{"/exploits/chmod", tc.path, tc.mode})
+		s.Require().Equalf(tc.want, modeOf(tc.path), "%s: chmod %s %s: %s", tc.what, tc.mode, tc.path, out)
+		if tc.mode != tc.want {
+			s.Require().Containsf(out, eperm, "%s: the refusal must be the guard's EPERM", tc.what)
+		}
+	}
+	// stat itself is denied in a whitelist tree, so only the kernel's answer is observable.
+	_, out = s.exec(c, []string{"/exploits/chmod", "/protected/secret", "444"})
+	s.Require().Containsf(out, eperm, "drop write in a whitelist tree must stay denied: %s", out)
+
+	_, before := s.exec(c, []string{"stat", "-c", "%u:%g %Y", "/rt/meta.so"})
+	for _, p := range []string{"chown", "utimes", "setxattr"} {
+		_, out := s.exec(c, []string{"/exploits/" + p, "/rt/meta.so"})
+		s.Require().Containsf(out, eperm, "%s must stay denied in a lib_dir: %s", p, out)
+	}
+	_, after := s.exec(c, []string{"stat", "-c", "%u:%g %Y", "/rt/meta.so"})
+	s.Require().Equal(before, after, "chown/utimes changed a lib_dir file")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Vuln 3 (A): a read-only lib_dir is trusted for loading only by its own lib_binary writers. Its
 // contents may predate the guard, so a library planted there must not load into an unrelated
 // whitelisted binary.

@@ -31,3 +31,13 @@ func TestAddBinaryEventsReadOnlyRejectsRestriction(t *testing.T) {
 		t.Fatalf("restricted binary in read-only mode must be refused, got: %v", err)
 	}
 }
+
+// The chmod allowance must never reach a whitelist (secret) or blacklist tree; refused before any
+// BPF slot is taken.
+func TestWithChmodDropWriteNeedsReadOnly(t *testing.T) {
+	for _, mode := range []Mode{ModeWhitelist, ModeBlacklist} {
+		if _, err := NewGuard(t.TempDir(), mode, nil, true, 0, WithChmodDropWrite()); err == nil {
+			t.Errorf("mode %s accepted WithChmodDropWrite", modeString(mode))
+		}
+	}
+}

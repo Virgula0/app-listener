@@ -172,6 +172,8 @@ type Guard struct {
 	rawDevicesSet bool
 	// dropAllowed: no consumer wants allowed events (WithoutAllowedEvents).
 	dropAllowed bool
+	// chmodDropWrite: WithChmodDropWrite.
+	chmodDropWrite bool
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -233,6 +235,14 @@ func WithBackingDevices(rdevs []uint32) GuardOption {
 func WithoutAllowedEvents() GuardOption {
 	return func(g *Guard) {
 		g.dropAllowed = true
+	}
+}
+
+// WithChmodDropWrite lets any process clear write bits of a non-root-owned regular file in a
+// ModeReadOnly tree (a lib_dir); see chmod_only_drops_write in guard.bpf.c.
+func WithChmodDropWrite() GuardOption {
+	return func(g *Guard) {
+		g.chmodDropWrite = true
 	}
 }
 
@@ -331,6 +341,9 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	}
 	for _, opt := range opts {
 		opt(g)
+	}
+	if g.chmodDropWrite && mode != ModeReadOnly {
+		return nil, fmt.Errorf("guard %s: WithChmodDropWrite needs ModeReadOnly (it would widen a secret tree)", path)
 	}
 
 	// Join the shared engine: the LSM programs attach once for the whole process (see engine).
@@ -1053,6 +1066,9 @@ func (g *Guard) writeGuardConfig(modeKey uint64) error {
 		Mode:      modeKey,
 		Recursive: recursiveVal,
 		Depth:     uint64(g.depth),
+	}
+	if g.chmodDropWrite {
+		cfg.ChmodDropWrite = 1
 	}
 	if putErr := g.objs().GuardResConfig.Put(g.resID, cfg); putErr != nil {
 		return fmt.Errorf("writing resource slot %d: %w", g.resID, putErr)

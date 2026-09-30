@@ -963,6 +963,9 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	if headless && blockedOnly {
 		opts = append(opts, guard.WithoutAllowedEvents())
 	}
+	if r.ReadOnly {
+		opts = append(opts, guard.WithChmodDropWrite())
+	}
 	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0, opts...)
 	if err != nil {
 		return nil, err

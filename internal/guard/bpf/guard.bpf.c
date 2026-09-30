@@ -14,6 +14,8 @@
 #define MAY_ACCESS 0x00000010
 #define MAY_OPEN   0x00000020
 #define MAY_CHDIR  0x00000040
+#define ATTR_MODE  0x00000001
+#define ATTR_CTIME 0x00000040
 #define ATTR_SIZE 0x00000008
 #define ATTR_FILE 0x00002000
 #define GUARD_BLOCK 1
@@ -113,6 +115,7 @@ struct res_config {
 	__u64 root_dev;
 	__u64 root_ino;
 	__u64 taint_set; // nonzero: a taint-set slot (no tree; only judges tainted processes)
+	__u64 chmod_drop_write; // lib_dir only: see chmod_only_drops_write
 };
 
 struct {
@@ -543,6 +546,9 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent, 
 #define S_IFMT  00170000
 #define S_IFBLK 0060000
 #define S_IFDIR 0040000
+#define S_IFREG 0100000
+#define S_IALLUGO 07777
+#define S_IWUGO 00222
 
 // Is the inode a block device whose dev_t matches a guarded filesystem (debugfs/dd raw reads bypass
 // VFS)?
@@ -1805,6 +1811,30 @@ int guard_path_truncate(unsigned long long *ctx)
 	return 0;
 }
 
+// chmod_only_drops_write: a lib_dir lets any process clear write bits of a regular file (Proton's
+// steampipe_fixups chmods a-w its own files/lib after every update). That only narrows access: no
+// bit is added (exec, setuid) and no content changes. Never on a root-owned file: dropping g/o+w
+// would make it system-trusted (inode_is_root_ro), i.e. auto-loadable. chown, utimes, xattrs and
+// directories stay whitelist-gated. i_mode is stable here: notify_change holds the inode lock.
+static __always_inline int chmod_only_drops_write(__u32 res_id, struct inode *inode, __u32 ia_valid,
+						  struct iattr *attr)
+{
+	struct res_config *cfg = res_cfg(res_id);
+	if (!cfg || !cfg->chmod_drop_write || !inode)
+		return 0;
+	if (!(ia_valid & ATTR_MODE) || (ia_valid & ~(ATTR_MODE | ATTR_CTIME)))
+		return 0;
+	__u32 uid = 0;
+	umode_t old_mode = 0, new_mode = 0;
+	bpf_probe_read_kernel(&uid, sizeof(uid), &inode->i_uid); // kuid_t { uid_t val; }
+	bpf_probe_read_kernel(&old_mode, sizeof(old_mode), &inode->i_mode);
+	bpf_probe_read_kernel(&new_mode, sizeof(new_mode), &attr->ia_mode);
+	if (uid == 0 || (old_mode & S_IFMT) != S_IFREG || (new_mode & S_IFMT) != S_IFREG)
+		return 0;
+	__u32 old_perm = old_mode & S_IALLUGO, new_perm = new_mode & S_IALLUGO;
+	return !(new_perm & ~old_perm) && !((old_perm ^ new_perm) & ~S_IWUGO);
+}
+
 SEC("lsm/inode_setattr")
 int guard_inode_setattr(unsigned long long *ctx)
 {
@@ -1829,6 +1859,8 @@ int guard_inode_setattr(unsigned long long *ctx)
 		__u32 ia_valid;
 		bpf_probe_read_kernel(&ia_valid, sizeof(ia_valid), &attr->ia_valid);
 		if (ia_valid & (ATTR_SIZE | ATTR_FILE))
+			return 0;
+		if (chmod_only_drops_write(res, inode, ia_valid, attr))
 			return 0;
 	}
 
