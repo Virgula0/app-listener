@@ -645,6 +645,69 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: path_rename/path_link take dst_guarded only from a watch-root victim or a destination
+// dir with its own guard_inodes row, and a guarded source returns before the destination ancestor
+// walk. A dir moved into B maps only its top level, so /resourceB/d/sub has no row: an A-only
+// binary's move there is judged by A's whitelist instead of GUARD_RES_GLOBAL.
+func (s *IntegrationSuite) TestDaemon_Bypass_CrossResourceIntoUnmappedDestinationDir() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-XRES-UNMAPPED-4A1C"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /resourceA /resourceB /stage/d/sub /stage/d/probe /exploits /etc/app-listener && " +
+			"chmod -R 755 /resourceA /resourceB /stage && printf '" + marker + "' > /stage/d/sub/secret && " +
+			"printf '" + marker + "' > /stage/d/probe/secret && chmod 644 /stage/d/sub/secret /stage/d/probe/secret && " +
+			"for f in decoy p1 p2; do printf 'A-CONTENT' > /resourceA/$f && chmod 644 /resourceA/$f; done"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/xres_move"), "/exploits/xres_move", 0o755),
+		"copy xres_move")
+	// Two copies = two identities: /tmp/mover is whitelisted for A only, /tmp/bmover for B only.
+	s.exec(c, []string{"sh", "-c", "cp /exploits/xres_move /tmp/mover && cp /exploits/xres_move /tmp/bmover && " +
+		"chmod 755 /tmp/mover /tmp/bmover"})
+
+	s.startDaemon(c, `[watch /resourceA]
+need_encryption: false
+/tmp/mover
+
+[watch /resourceB]
+need_encryption: false
+/tmp/bmover`)
+
+	code, out := s.exec(c, []string{"/tmp/bmover", "rename", "/stage/d", "/resourceB/d"})
+	s.Require().Equalf(0, code, "fixture: B's own binary must move its tree into B: %s", out)
+
+	// Baselines on a sibling: any open below d/sub would map it (discover_guarded_parent).
+	const probe = "/resourceB/d/probe/secret"
+	code, out = s.exec(c, []string{"/tmp/mover", "read", probe})
+	s.Require().NotEqualf(0, code, "baseline: the A-only mover must be denied a direct read of B: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat " + probe + " 2>&1"})
+	s.Require().NotEqualf(0, code, "baseline: a non-whitelisted reader must be denied B: %s", out)
+
+	const secret = "/resourceB/d/sub/secret"
+	code, out = s.exec(c, []string{"/tmp/mover", "exchange", "/resourceA/decoy", secret})
+	s.T().Logf("exchange into unmapped d/sub: rc=%d %s", code, out)
+	_, leaked := s.exec(c, []string{"/tmp/mover", "read", "/resourceA/decoy"})
+	s.Require().NotContainsf(leaked, marker,
+		"B's secret was exchanged into A and read by the A-only binary: %s", leaked)
+	_, leaked = s.exec(c, []string{"sh", "-c", nobodyRun + "cat /resourceA/decoy " + secret + " 2>&1"})
+	s.Require().NotContainsf(leaked, marker, "B's secret became readable by a non-whitelisted process: %s", leaked)
+	s.Require().NotEqualf(0, code, "RENAME_EXCHANGE into an unmapped dir of B by an A-only binary must be denied: %s", out)
+
+	for _, tc := range []struct{ op, src, dst string }{
+		{"rename", "/resourceA/p1", "/resourceB/d/sub/planted-rename"},
+		{"link", "/resourceA/p2", "/resourceB/d/sub/planted-link"},
+	} {
+		code, out = s.exec(c, []string{"/tmp/mover", tc.op, tc.src, tc.dst})
+		s.T().Logf("%s into unmapped d/sub: rc=%d %s", tc.op, code, out)
+		s.Require().NotEqualf(0, code, "%s from A into an unmapped dir of B by an A-only binary must be denied: %s",
+			tc.op, out)
+		code, _ = s.exec(c, []string{"sh", "-c", "test -e " + tc.dst})
+		s.Require().NotEqualf(0, code, "%s planted %s inside resource B", tc.op, tc.dst)
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Bypass (finding #3): a reload builds a replacement guard for every resource in the NEW config
 // before it validates the change. That replacement takes over the live guard's guard_inodes row.
 // When the reload is then refused (Phase 0: a resource was dropped) the replacement is stopped and

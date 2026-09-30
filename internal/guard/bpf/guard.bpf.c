@@ -1496,6 +1496,11 @@ int guard_path_rename(unsigned long long *ctx)
 	    guarded_map_hit(new_parent, new_parent_inode, 12, &dst_res))
 		dst_parent_guarded = true;
 	bool dst_guarded = dst_victim_root || dst_parent_guarded;
+	// Walked here, not after the source side: a guarded source returns early, and a destination
+	// dir with no row of its own (moved in, runtime-created, full map) must still make the move
+	// cross-resource.
+	if (!dst_guarded && new_parent)
+		dst_guarded = guarded_ancestor_within_limit(new_parent, &dst_res, ANCESTOR_WALK);
 
 	// Source side, one rooted walk: the file and its parent are both on old_dentry's chain, so a
 	// single root check confines both map hits (two 32-step walks would exceed the verifier
@@ -1525,9 +1530,9 @@ int guard_path_rename(unsigned long long *ctx)
 	if (dst_victim_root)
 		return check_and_emit(EVENT_RENAME, new_dentry, NULL, false, NULL, false, false, dst_res);
 
-	// Destination parent guarded: blocks renaming files from outside INTO a guarded dir, and into
-	// depth-boundary directories added to guard_inodes.
-	if (dst_parent_guarded) {
+	// Destination guarded (source not): blocks renaming files from outside INTO a guarded dir,
+	// mapped or reached by the ancestor walk.
+	if (dst_guarded) {
 		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, dst_res);
 		if (ret != 0)
 			return ret;  // blocked — reject the rename
@@ -1539,24 +1544,7 @@ int guard_path_rename(unsigned long long *ctx)
 			if ((old_mode & S_IFMT) == S_IFDIR)
 				add_inode_to_guard(inode, dst_res);
 		}
-		return 0;
 	}
-
-	// Deep-file coverage, destination side: moving INTO a guarded region whose parent isn't in the
-	// map.
-	if (new_parent && guarded_ancestor_within_limit(new_parent, &res, ANCESTOR_WALK)) {
-		int ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
-		if (ret != 0)
-			return ret;
-		if (should_add_new_dir(res)) {
-			umode_t old_mode;
-			bpf_probe_read_kernel(&old_mode, sizeof(old_mode), &inode->i_mode);
-			if ((old_mode & S_IFMT) == S_IFDIR)
-				add_inode_to_guard(inode, res);
-		}
-		return 0;
-	}
-
 	return 0;
 }
 
@@ -1686,6 +1674,9 @@ int guard_path_link(unsigned long long *ctx)
 	__u32 dst_res = GUARD_RES_NONE;
 	bool dst_guarded = new_parent_inode && new_parent_inode != inode &&
 			   guarded_map_hit(new_parent, new_parent_inode, 12, &dst_res);
+	// See path_rename: a guarded source returns before any later destination walk.
+	if (!dst_guarded && new_parent)
+		dst_guarded = guarded_ancestor_within_limit(new_parent, &dst_res, ANCESTOR_WALK);
 
 	if (guarded_map_hit(old_dentry, inode, 16, &res)) {
 		res = xres_judge(res, dst_guarded, dst_res);
@@ -1713,14 +1704,9 @@ int guard_path_link(unsigned long long *ctx)
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 	}
 
-	// Destination parent guarded (source not guarded): linking from outside INTO a guarded dir.
+	// Destination guarded (source not guarded): linking from outside INTO a guarded region.
 	if (dst_guarded)
 		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, dst_res);
-
-	// Deep-file coverage, destination side: linking INTO a guarded region whose parent isn't in the
-	// map.
-	if (new_parent && guarded_ancestor_within_limit(new_parent, &res, ANCESTOR_WALK))
-		return check_and_emit(EVENT_HARDLINK, old_dentry, NULL, false, new_dentry, false, false, res);
 
 	return 0;
 }
