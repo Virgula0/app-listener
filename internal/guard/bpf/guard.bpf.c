@@ -122,6 +122,17 @@ struct {
 	__type(value, struct res_config);
 } guard_res_config SEC(".maps");
 
+// guard_root_moved records a watch root that an allowed rename moved (its whitelisted app renamed
+// it aside or replaced it). Userspace may then re-anchor although the old root inode still exists;
+// a root that moved only because an unguarded ancestor was swapped is never recorded here, so the
+// sweep keeps refusing that. Written by path_rename only, read by userspace only.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, GUARD_MAX_RES);
+	__type(key, __u32);  // res_id
+	__type(value, struct inode_key);
+} guard_root_moved SEC(".maps");
+
 // Per-resource maps are keyed by (res_id, inode): a binary whitelisted for one resource must not
 // inherit that allow on another.
 struct res_inode_key {
@@ -1460,6 +1471,22 @@ static __always_inline __u32 xres_judge(__u32 src_res, bool dst_guarded, __u32 d
 	return (dst_guarded && dst_res != src_res) ? GUARD_RES_GLOBAL : src_res;
 }
 
+// note_root_moved records a watch root among the renamed inode and the displaced victim in
+// guard_root_moved. Called only once path_rename allowed the rename. Out of line so the tail it
+// adds after the decision stays one small body.
+static __noinline int note_root_moved(struct inode *src, struct inode *victim)
+{
+	for (int i = 0; i < 2; i++) {
+		struct inode *in = i ? victim : src;
+		__u32 res = GUARD_RES_NONE;
+		struct inode_key ikey = {};
+		if (!in || !inode_is_watch_root(in, &res) || !inode_key_of(in, &ikey))
+			continue;
+		bpf_map_update_elem(&guard_root_moved, &res, &ikey, BPF_ANY);
+	}
+	return 0;
+}
+
 SEC("lsm/path_rename")
 int guard_path_rename(unsigned long long *ctx)
 {
@@ -1486,8 +1513,8 @@ int guard_path_rename(unsigned long long *ctx)
 	// false-denies.
 	__u32 dst_res = GUARD_RES_NONE;
 	bool dst_victim_root = false, dst_parent_guarded = false;
+	struct inode *victim = NULL;
 	if (new_dentry) {
-		struct inode *victim;
 		bpf_probe_read_kernel(&victim, sizeof(victim), &new_dentry->d_inode);
 		if (victim && inode_is_watch_root(victim, &dst_res))
 			dst_victim_root = true;
@@ -1511,24 +1538,29 @@ int guard_path_rename(unsigned long long *ctx)
 	bool own_guarded = read_inode_guard(inode, &own_res);
 	bool parent_guarded = parent_inode && parent_inode != inode &&
 			      read_inode_guard(parent_inode, &parent_res);
+	int ret;
 	if (own_guarded || parent_guarded) {
 		res = own_guarded ? own_res : parent_res;
 		if (root_in_chain(old_dentry, inode, 16, res)) {
 			res = xres_judge(res, dst_guarded, dst_res);
-			return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
+			ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
+			goto decided;
 		}
 	}
 
 	// Deep-file coverage, source side.
 	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK)) {
 		res = xres_judge(res, dst_guarded, dst_res);
-		return check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
+		ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
+		goto decided;
 	}
 
 	// Destination-target side (source not guarded): victim is a watch root. RENAME_EXCHANGE with the
 	// root as destination lands here too.
-	if (dst_victim_root)
-		return check_and_emit(EVENT_RENAME, new_dentry, NULL, false, NULL, false, false, dst_res);
+	if (dst_victim_root) {
+		ret = check_and_emit(EVENT_RENAME, new_dentry, NULL, false, NULL, false, false, dst_res);
+		goto decided;
+	}
 
 	// Destination guarded (source not): blocks renaming files from outside INTO a guarded dir,
 	// mapped or reached by the ancestor walk.
@@ -1546,6 +1578,12 @@ int guard_path_rename(unsigned long long *ctx)
 		}
 	}
 	return 0;
+
+decided:
+	// A root can only move past the checks above, so every root move lands here.
+	if (ret == 0)
+		note_root_moved(inode, victim);
+	return ret;
 }
 
 // symlink_scan / symlink_scan_step find which watch roots a symlink target names, for

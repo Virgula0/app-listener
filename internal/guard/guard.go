@@ -1201,6 +1201,9 @@ func (g *Guard) updateRootKey(newKey GuardInodeKey) error {
 	if putErr := g.objs().GuardResConfig.Put(g.resID, cfg); putErr != nil {
 		return fmt.Errorf("setting watch root in resource slot %d: %w", g.resID, putErr)
 	}
+	if err := g.clearRootMoved(); err != nil {
+		return err
+	}
 	g.mu.Lock()
 	g.rootKey = newKey
 	g.mu.Unlock()
@@ -1332,7 +1335,47 @@ func (g *Guard) reanchorRefusal(oldKey GuardInodeKey, root *rootHandle, resolved
 	if owner := sharedEngine.liveOwner(g.resID, root.key); owner != 0 {
 		return fmt.Sprintf("its inode belongs to resource %d", owner)
 	}
+	if alive, err := g.anchorAlive(oldKey); err != nil || alive {
+		return "the previous root still exists (an ancestor directory was moved or replaced)"
+	}
 	return ""
+}
+
+// anchorAlive reports whether key is a root that still exists and was not moved by an allowed
+// rename. inode_free_security zeroes the anchor only when the root is freed with no links, so a
+// set anchor names a root that still exists wherever an ancestor swap moved it: re-anchoring would
+// leave that tree unguarded. guard_root_moved releases a root its whitelisted app renamed away.
+func (g *Guard) anchorAlive(key GuardInodeKey) (bool, error) {
+	cfg, err := g.resConfig()
+	if err != nil {
+		return false, err
+	}
+	if cfg.RootDev != key.Dev || cfg.RootIno != key.Ino {
+		return false, nil
+	}
+	var moved GuardInodeKey
+	if err := g.objs().GuardRootMoved.Lookup(g.resID, &moved); err != nil {
+		return false, fmt.Errorf("reading moved root of resource slot %d: %w", g.resID, err)
+	}
+	return moved != key, nil
+}
+
+// clearRootMoved forgets a recorded root move: the anchor it released is gone or back in place.
+func (g *Guard) clearRootMoved() error {
+	if err := g.objs().GuardRootMoved.Put(g.resID, GuardInodeKey{}); err != nil {
+		return fmt.Errorf("clearing moved root of resource slot %d: %w", g.resID, err)
+	}
+	return nil
+}
+
+// RootAnchor returns the root this guard is confined to and whether that inode still exists (see
+// anchorAlive).
+func (g *Guard) RootAnchor() (GuardInodeKey, bool, error) {
+	g.mu.Lock()
+	key := g.rootKey
+	g.mu.Unlock()
+	alive, err := g.anchorAlive(key)
+	return key, alive, err
 }
 
 // sweepRoot re-anchors a root whose inode changed. handled: the sweep must not re-scan by mtime
@@ -1342,7 +1385,8 @@ func (g *Guard) sweepRoot(root *rootHandle) (handled bool, err error) {
 	oldKey, resolved, refused := g.rootKey, g.rootReal, g.anchorRefused
 	g.mu.Unlock()
 	if root.key == oldKey && root.resolved == resolved {
-		return false, nil
+		// A move whose rename failed, or that was undone, must not release the root later.
+		return false, g.clearRootMoved()
 	}
 	if why := g.reanchorRefusal(oldKey, root, resolved); why != "" {
 		if refused != root.key {

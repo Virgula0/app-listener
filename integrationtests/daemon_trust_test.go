@@ -161,6 +161,100 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+const (
+	swapHome      = "/home/u"
+	swapRoot      = swapHome + "/.config/gh"
+	swapMarker    = "TOP-SECRET-GH-TOKEN-5C2E"
+	reloadEnd     = "daemon: configuration reloaded from"
+	reloadRefused = "reload failed, keeping previous configuration"
+)
+
+// reloadAndAwait sends SIGHUP and waits for the reload to commit (trust set included) or be refused.
+func (s *IntegrationSuite) reloadAndAwait(c testcontainers.Container) {
+	s.sigDaemon(c, "HUP")
+	for dl := time.Now().Add(daemonShutdownTimeout); time.Now().Before(dl); {
+		if l := s.readDaemonLog(c); strings.Contains(l, reloadEnd) || strings.Contains(l, reloadRefused) {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	s.Failf("reload did not finish", "daemon log:\n%s", s.readDaemonLog(c))
+}
+
+// startSwappableRootDaemon guards swapRoot, whose ancestors belong to the unprivileged user, beside
+// /protected (whitelisting bash); /tmp/w/cp is swapRoot's writer. Returns false when the user's
+// ancestor swap was refused, i.e. the guard already blocks the attack's first step.
+func (s *IntegrationSuite) startSwappableRootDaemon(c testcontainers.Container) bool {
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p " + swapRoot + " /protected /exploits /etc/app-listener /tmp/w && cp /usr/bin/cp /tmp/w/cp && " +
+			"printf '" + swapMarker + "' > " + swapRoot +
+			"/hosts.yml && echo s > /protected/secret && chown -R 65534:65534 " + swapHome +
+			" && chmod 755 /protected " + swapHome + " " + swapHome + "/.config"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), "/exploits/lib_probe.so", 0o755),
+		"copy lib_probe.so")
+	s.startDaemon(c, `[watch `+swapRoot+`]
+need_encryption: false
+/tmp/w/cp
+
+[watch /protected]
+need_encryption: false
+/usr/bin/bash`)
+
+	_, out := s.exec(c, []string{"sh", "-c", nobodyRun + "cat " + swapRoot + "/hosts.yml 2>&1"})
+	s.Require().NotContainsf(out, swapMarker, "baseline: a non-whitelisted reader must be denied %s: %s", swapRoot, out)
+	code, out := s.exec(c, []string{"sh", "-c", nobodyRun + "cp /exploits/lib_probe.so " + swapRoot + "/evil.so 2>&1"})
+	s.Require().NotEqualf(0, code, "baseline: a non-whitelisted writer must be denied %s: %s", swapRoot, out)
+
+	code, out = s.exec(c, []string{"sh", "-c", nobodyRun + "sh -c 'mv " + swapHome + "/.config " + swapHome +
+		"/.config.real && mkdir -p " + swapRoot + " && cp /exploits/lib_probe.so " + swapRoot + "/evil.so' 2>&1"})
+	if code != 0 {
+		s.T().Logf("the user's swap of an ancestor of the watch root was refused: %s", out)
+		return false
+	}
+	return true
+}
+
+// Bypass: a reload re-resolves a kept resource's root by path. After the user swaps an unguarded
+// ancestor, the new guard anchors on the user's replacement dir, and the real tree (moved aside,
+// still holding the secret) is off the new root's chain.
+func (s *IntegrationSuite) TestDaemon_Bypass_ReloadReanchorsSwappedAncestor() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	if !s.startSwappableRootDaemon(c) {
+		return
+	}
+	moved := swapHome + "/.config.real/gh/hosts.yml"
+	_, out := s.exec(c, []string{"sh", "-c", nobodyRun + "cat " + moved + " 2>&1"})
+	s.Require().NotContainsf(out, swapMarker, "control: the moved tree must stay guarded before any reload: %s", out)
+
+	s.reloadAndAwait(c)
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat " + moved + " 2>&1"})
+	s.Require().NotContainsf(out, swapMarker,
+		"after the reload the real tree became readable by a non-whitelisted process: %s\ndaemon log:\n%s",
+		out, s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// Bypass: the periodic sweep re-anchors a root whose path resolves to a new inode on the same
+// filesystem, so the ancestor swap needs no reload at all, only one sweep tick (resyncSweepEvery).
+func (s *IntegrationSuite) TestDaemon_Bypass_SweepReanchorsSwappedAncestor() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	if !s.startSwappableRootDaemon(c) {
+		return
+	}
+	refused := s.awaitLog(c, "refusing to re-anchor the guard root", 45*time.Second)
+	s.T().Logf("sweep refused the re-anchor: %v", refused)
+
+	_, out := s.exec(c, []string{"sh", "-c", nobodyRun + "cat " + swapHome + "/.config.real/gh/hosts.yml 2>&1"})
+	s.Require().NotContainsf(out, swapMarker,
+		"after a sweep tick the real tree became readable by a non-whitelisted process: %s\ndaemon log:\n%s",
+		out, s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Vuln 3 (B): a globbed lib_dir (Steam's Proton*, SteamLinuxRuntime_*) becomes a trusted-library
 // root for every future match at the next catalog refresh, so only Steam may create a match.
 func (s *IntegrationSuite) TestDaemon_LibDirGlob_NonWriterCannotCreateMatch() {

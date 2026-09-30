@@ -57,6 +57,10 @@ type GuardRepository interface {
 	// process_vm_readv/ptrace protection for processes that already read a guarded file.
 	SnapshotTaintedPIDs() ([]uint32, error)
 	RestoreTaintedPIDs(pids []uint32) error
+	// RootAnchor returns the watch root the guard is confined to and whether that inode still
+	// exists. Reload compares a kept resource's old and new anchors with it: a new root while the
+	// old one still exists means the path was re-pointed through an unguarded ancestor.
+	RootAnchor() (key guard.GuardInodeKey, alive bool, err error)
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

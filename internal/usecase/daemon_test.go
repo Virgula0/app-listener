@@ -718,6 +718,36 @@ func TestDaemonUseCaseReloadBeforeStart(t *testing.T) {
 	}
 }
 
+func TestDaemonUseCaseReloadRefusesRootMovedWhileOldAlive(t *testing.T) {
+	old := newFakeGuardRepo()
+	old.anchor, old.anchorAlive = guard.GuardInodeKey{Dev: 1, Ino: 10}, true
+	d := startDaemon(t, newFakeVault("/a"), []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	next := newFakeGuardRepo()
+	next.anchor = guard.GuardInodeKey{Dev: 1, Ino: 20}
+	if err := d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{next}); err == nil {
+		t.Fatal("a kept resource re-pointed while its old root still exists must refuse the reload")
+	}
+	if old.stopped {
+		t.Error("the old guard must keep running after a refused reload")
+	}
+	if !next.stopped {
+		t.Error("the refused new guard must be detached")
+	}
+}
+
+func TestDaemonUseCaseReloadAllowsDeletedRootToMove(t *testing.T) {
+	old := newFakeGuardRepo()
+	old.anchor = guard.GuardInodeKey{Dev: 1, Ino: 10} // alive=false: the kernel zeroed the anchor
+	d := startDaemon(t, newFakeVault("/a"), []daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{old})
+
+	next := newFakeGuardRepo()
+	next.anchor = guard.GuardInodeKey{Dev: 1, Ino: 20}
+	if err := d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{next}); err != nil {
+		t.Fatalf("a recreated root must re-anchor on reload: %v", err)
+	}
+}
+
 func TestDaemonUseCaseReloadKeptResources(t *testing.T) {
 	vault := newFakeVault("/a")
 	old := newFakeGuardRepo()

@@ -773,6 +773,77 @@ func (s *guardUnitTest) TestSweepInodesRecreatedDirRoot() {
 	s.Require().Error(g.objs().GuardInodes.Lookup(oldKey, &v), "the stale old-root inode must be evicted from guard_inodes")
 }
 
+// A root its whitelisted app renamed aside still exists, yet the sweep must re-anchor on the
+// recreated path: the allowed rename released it (guard_root_moved).
+func (s *guardUnitTest) TestSweepInodesRootRenamedAsideReanchors() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	parent := s.T().TempDir()
+	watchDir := filepath.Join(parent, "profile")
+	s.Require().NoError(os.Mkdir(watchDir, 0o755))
+
+	exe, err := os.Executable()
+	s.Require().NoError(err)
+	self, err := ComputeBinaryEntry(exe)
+	s.Require().NoError(err)
+	g := s.newGuardedTree(watchDir, []BinaryEntry{self}, nil)
+	defer g.Stop()
+
+	s.Require().NoError(os.Rename(watchDir, filepath.Join(parent, "profile.old")))
+	s.Require().NoError(os.Mkdir(watchDir, 0o755))
+	_, newIno, err := ebpf.StatInode(watchDir)
+	s.Require().NoError(err)
+
+	s.Require().NoError(g.SweepInodes())
+	cfg, err := g.resConfig()
+	s.Require().NoError(err)
+	s.Require().Equal(newIno, cfg.RootIno, "a root renamed aside by its whitelisted app must release the anchor")
+	alive, err := g.anchorAlive(GuardInodeKey{Dev: cfg.RootDev, Ino: cfg.RootIno})
+	s.Require().NoError(err)
+	s.Require().True(alive, "re-anchoring must clear the recorded move")
+}
+
+// An unguarded ancestor swapped under a live root must not re-anchor, even when the swapping
+// process is whitelisted; a root moved and moved back must not stay released.
+func (s *guardUnitTest) TestSweepInodesAncestorSwapRefused() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+
+	base := s.T().TempDir()
+	ancestor := filepath.Join(base, "config")
+	watchDir := filepath.Join(ancestor, "gh")
+	s.Require().NoError(os.MkdirAll(watchDir, 0o755))
+
+	exe, err := os.Executable()
+	s.Require().NoError(err)
+	self, err := ComputeBinaryEntry(exe)
+	s.Require().NoError(err)
+	g := s.newGuardedTree(watchDir, []BinaryEntry{self}, nil)
+	defer g.Stop()
+	_, oldIno, err := ebpf.StatInode(watchDir)
+	s.Require().NoError(err)
+
+	aside := filepath.Join(ancestor, "gh.tmp")
+	s.Require().NoError(os.Rename(watchDir, aside))
+	s.Require().NoError(os.Rename(aside, watchDir))
+	s.Require().NoError(g.SweepInodes())
+
+	s.Require().NoError(os.Rename(ancestor, filepath.Join(base, "config.aside")))
+	s.Require().NoError(os.MkdirAll(watchDir, 0o755))
+	s.Require().NoError(g.SweepInodes())
+
+	cfg, err := g.resConfig()
+	s.Require().NoError(err)
+	s.Require().Equal(oldIno, cfg.RootIno, "an ancestor swap must not move the anchor off the live root")
+	g.mu.Lock()
+	refused := g.anchorRefused
+	g.mu.Unlock()
+	s.Require().NotZero(refused.Ino, "the sweep must record the refusal")
+}
+
 // The guard_path_rmdir eviction fix is tested at guard level
 // (TestGuard_PathRmdirEvictsInodeImmediately in integrationtests/guard_test.go): it queries the
 // live guard_inodes map via bpftool as root in the privileged container, since a directory has no

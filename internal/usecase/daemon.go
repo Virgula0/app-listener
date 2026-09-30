@@ -462,6 +462,10 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	for i := range d.resources {
 		oldByPath[d.resources[i].Path] = i
 	}
+	if err := d.refuseMovedRoots(resources, guards, oldByPath); err != nil {
+		d.rollbackReload(resources, guards, nil)
+		return err
+	}
 
 	// Phase 1: validate and unlock resources new to the config. Nothing is committed, so errors
 	// roll back (detach new guards, re-lock). Guards are already attached, so unlocks always have
@@ -488,6 +492,33 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	// Phase 4 — commit: swap references, retire old forwarders, detach old LSM programs.
 	d.commitReload(resources, guards)
 	log.Info("daemon: configuration reloaded without dropping protection")
+	return nil
+}
+
+// refuseMovedRoots refuses a reload whose guard for a kept resource anchored on a different root
+// while the old root still exists: the path was re-pointed through an unguarded ancestor, and
+// committing would guard the new target and leave the real tree unguarded. A deleted root (anchor
+// zeroed by the kernel) may move.
+func (d *daemonUseCase) refuseMovedRoots(resources []daemonconfig.Resource, guards []repository.GuardRepository, oldByPath map[string]int) error {
+	for i := range resources {
+		oi, kept := oldByPath[resources[i].Path]
+		if !kept {
+			continue
+		}
+		oldKey, alive, err := d.guards[oi].RootAnchor()
+		if err != nil {
+			return fmt.Errorf("reload refused: reading the current root of %s: %w", resources[i].Path, err)
+		}
+		newKey, _, err := guards[i].RootAnchor()
+		if err != nil {
+			return fmt.Errorf("reload refused: reading the new root of %s: %w", resources[i].Path, err)
+		}
+		if newKey != oldKey && alive {
+			return fmt.Errorf("reload refused: %s now names a different directory while the guarded one "+
+				"still exists (an ancestor directory was moved or replaced) — restore the path, or restart "+
+				"the daemon after verifying it", resources[i].Path)
+		}
+	}
 	return nil
 }
 

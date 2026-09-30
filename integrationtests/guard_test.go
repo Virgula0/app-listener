@@ -2490,6 +2490,20 @@ func (s *IntegrationSuite) TestGuard_SweepInodes_RecreatedFileRoot() {
 	s.runGuardTest(c, "TestSweepInodesRecreatedFileRoot")
 }
 
+func (s *IntegrationSuite) TestGuard_SweepInodes_RootRenamedAsideReanchors() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestSweepInodesRootRenamedAsideReanchors")
+}
+
+func (s *IntegrationSuite) TestGuard_SweepInodes_AncestorSwapRefused() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestSweepInodesAncestorSwapRefused")
+}
+
 // ReconcileInodes GC removes a guard_inodes entry once its file is genuinely deleted and never
 // touches the watch root's own entry (stale entries otherwise collide with a reused inode number
 // elsewhere: false DENY).
