@@ -180,6 +180,12 @@ site and check each argument's declared type.
 - `make test` → `CGO_ENABLED=1 go test $(go list ./... | grep -v /integrationtests) --count=1 -p 1`.
   Package-parallelism is forced to `-p 1` (BPF/global state); keep new tests serial-safe.
 - Single unit test: `CGO_ENABLED=1 go test ./internal/guard/ -run TestName -count=1`.
+- **Unit tests must not need root.** A test that needs root (BPF, fscrypt, chown to another uid) is
+  an integration test, never a unit test that skips unless run with `sudo go test`. When it must
+  call package internals, put it in an env-gated harness suite in that package
+  (`internal/fscrypt/harness_test.go`, `internal/tui/harness_test.go`; `internal/guard`'s
+  `TestGuardUnitTest` is the older uid-gated form), compile it in `integrationtests/main_test.go`
+  (`go test -tags ci -c`, static), and add an `IntegrationSuite` wrapper that runs one subtest.
 - `make test-integration` → builds the C exploit corpus (`make -C integrationtests/exploits`),
   then `go test ./integrationtests/ -v --count=1 -timeout 60m`. Needs **rootful Docker**;
   spins privileged testcontainers (`CAP_BPF`, `SYS_ADMIN`, host `/sys/kernel/btf` bind-mounted,
