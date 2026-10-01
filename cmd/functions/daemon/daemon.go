@@ -130,10 +130,21 @@ summary per minute.
 The guard itself never changes behavior — filtering is purely presentational.
 
 SIGHUP reloads the configuration: every resource's binary whitelist is
-recomputed (by inode, so pacman/system updates that replace binaries are
-picked up) and applied atomically — new guards attach before the old
-ones detach, so protection is never dropped. A malformed configuration
-keeps the previous one running.`,
+recomputed by inode and applied atomically — new guards attach before the
+old ones detach, so protection is never dropped. A malformed configuration
+keeps the previous one running.
+
+Updates need no reload and no hook. A root-owned whitelisted binary that a
+package manager replaces (temp file + rename) is re-admitted as soon as the
+daemon sees it, if the new file is root-owned in a root-owned directory; so
+is a new root-owned match of the catalog's absolute patterns. A new app
+version below a home directory (Discord, Steam, Claude) is admitted by the
+catalog refresh the daemon runs at startup and whenever it sees a binary
+written below a catalog pattern: daemon.conf is rewritten (only if it still
+holds the configuration the daemon runs) and reloaded in-process, logged as
+"DAEMON catalog-refresh resource=... admitted=... dropped=...". A process
+started from a binary before it was replaced keeps its access, a reload
+included; re-running the replaced image (held fd, /proc/<pid>/exe) does not.`,
 	Args: cobra.NoArgs,
 	RunE: runDaemon,
 }
@@ -200,8 +211,9 @@ func startPprof(addr string) {
 //   - SIGTERM/SIGINT: otherwise a signal during startup kills the process with no deferred Stop,
 //     leaving unlocked vault keys provisioned until ExecStopPost (guards are pinned, so trees stay
 //     enforced).
-//   - SIGHUP: a reload (`edit-protected --set-password`, catalog-refresh hook) can arrive seconds
-//     after start; SIGHUP's default is to terminate, so it would kill the daemon mid-startup.
+//   - SIGHUP: a reload (`edit-protected --set-password`, `install --update-catalog-only`) can arrive
+//     seconds after start; SIGHUP's default is to terminate, so it would kill the daemon
+//     mid-startup.
 //
 // Both channels are buffered: an early signal is queued, and runDaemonUI drains hup once startup
 // completes. Registered for the process lifetime; the caller defers the returned stop.

@@ -160,7 +160,7 @@ func keys(m map[string]struct{}) []string {
 
 // trustManager owns the daemon-wide trust guard across its lifetime, including SIGHUP reloads. The
 // trusted set is built once at start AND rebuilt on every reload: SIGHUP is the normal way the
-// whitelist changes (the pacman/apt catalog-refresh hooks reload rather than restart), so a binary
+// whitelist changes (the in-daemon catalog refresh reloads rather than restarts), so a binary
 // added by a reload must be re-applied to guard_trusted_files or it gets no library allowlist while
 // still holding access to the secrets.
 type trustManager struct {

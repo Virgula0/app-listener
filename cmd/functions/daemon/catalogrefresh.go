@@ -148,7 +148,7 @@ func newCatalogRefresher(configPath string, cfg *daemonconfig.Config, reload fun
 	return r, nil
 }
 
-// start watches and runs the startup refresh (replacing the boot-time refresh unit).
+// start watches and runs the startup refresh.
 func (r *catalogRefresher) start() {
 	go r.watchLoop()
 	r.refreshes.now()

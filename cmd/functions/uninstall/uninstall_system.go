@@ -15,10 +15,10 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// revertSystemFiles removes every file the installer deployed: the daemon unit, boot-time
-// catalog-refresh unit, pacman/apt hook, the binary at /usr/local/sbin, the PATH symlink,
-// /etc/app-listener/daemon.conf and the edit-protected password hash. Both units are disabled first
-// (best effort) and systemd reloaded. /etc/app-listener itself stays: the master key lives there
+// revertSystemFiles removes every file the installer deployed: the daemon unit, the legacy
+// catalog-refresh unit and pacman/apt hooks an earlier install left, the binary at
+// /usr/local/sbin, the PATH symlink, /etc/app-listener/daemon.conf and the edit-protected password
+// hash. Both units are disabled first (best effort) and systemd reloaded. /etc/app-listener itself stays: the master key lives there
 // and only removeMasterKey deletes it.
 func revertSystemFiles() error {
 	for _, unit := range []string{systemd.DaemonServiceName, systemd.CatalogRefreshServiceName} {
@@ -31,15 +31,12 @@ func revertSystemFiles() error {
 	systemd.RemoveBinSymlink()
 
 	removed := 0
-	for _, path := range []string{
+	for _, path := range append([]string{
 		filepath.Join(systemd.SystemdDir, systemd.DaemonServiceName+".service"),
-		filepath.Join(systemd.SystemdDir, systemd.CatalogRefreshServiceName+".service"),
-		filepath.Join(systemd.PacmanHooksDir, systemd.PacmanHookName),
-		filepath.Join(systemd.AptHooksDir, systemd.AptHookName),
 		systemd.InstallBinaryPath,
 		systemd.SystemConfigPath,
 		editprotected.HashFile,
-	} {
+	}, systemd.LegacyCatalogRefreshFiles()...) {
 		if _, err := os.Lstat(path); os.IsNotExist(err) {
 			continue
 		}

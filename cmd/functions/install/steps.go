@@ -482,7 +482,7 @@ func vaultOpUnderGuard(g *guard.Guard, path string, op func() error) error {
 
 // lockVaultFully force-flushes the vault key until it is gone, never giving up (like the daemon's
 // lockdown): the caller keeps the ephemeral guard attached, so the tree stays guarded while this
-// retries. A persistent pin blocks the pacman hook with a loud log rather than leaving the vault
+// retries. A persistent pin blocks the refresh with a loud log rather than leaving the vault
 // unlocked.
 func lockVaultFully(vault *fscrypt.Vault, path string, g *guard.Guard) {
 	for {

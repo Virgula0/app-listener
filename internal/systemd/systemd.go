@@ -30,25 +30,53 @@ const (
 	SystemConfigPath = "/etc/app-listener/daemon.conf"
 	// SystemdDir is the system unit directory.
 	SystemdDir = "/etc/systemd/system"
-	// PacmanHooksDir is Arch's post-transaction hook directory.
-	PacmanHooksDir = "/etc/pacman.d/hooks"
-	// PacmanHookName is the embedded sample and installed file name of the
-	// pacman post-transaction catalog-refresh hook.
-	PacmanHookName = "50-app-listener-reload.hook"
-	// AptHooksDir is apt's config drop-in dir; AptHookName is the installed name of the
-	// DPkg::Post-Invoke catalog-refresh hook (the apt counterpart of the pacman hook).
-	AptHooksDir = "/etc/apt/apt.conf.d"
-	AptHookName = "95app-listener-reload"
-	// AptHookSample is the embedded daemon-samples file the hook is installed from (distinct from
-	// AptHookName so the drop-in gets the conventional numeric prefix).
-	AptHookSample = "apt-app-listener-reload"
 	// DaemonServiceName is the systemd unit name (without .service).
 	DaemonServiceName = "app-listener-daemon"
-	// CatalogRefreshServiceName is the boot-time catalog-refresh oneshot (without .service): runs
-	// `install --update-catalog-only --live` once per boot after the daemon, catching package
-	// changes the hook missed (offline installs, direct dpkg/pacman -U, a failed hook).
+
+	// Legacy catalog-refresh triggers, superseded by the daemon's own catalog watch: earlier
+	// installers deployed them, install and uninstall remove them (RemoveLegacyCatalogRefresh).
+	PacmanHooksDir            = "/etc/pacman.d/hooks"
+	PacmanHookName            = "50-app-listener-reload.hook"
+	AptHooksDir               = "/etc/apt/apt.conf.d"
+	AptHookName               = "95app-listener-reload"
 	CatalogRefreshServiceName = "app-listener-catalog-refresh"
 )
+
+// LegacyCatalogRefreshFiles are the files an earlier installer deployed for the legacy refresh.
+func LegacyCatalogRefreshFiles() []string {
+	return []string{
+		filepath.Join(SystemdDir, CatalogRefreshServiceName+".service"),
+		filepath.Join(PacmanHooksDir, PacmanHookName),
+		filepath.Join(AptHooksDir, AptHookName),
+	}
+}
+
+// RemoveLegacyCatalogRefresh disables the boot-time refresh unit and deletes it and the
+// package-manager hooks an earlier install deployed. The daemon refreshes its catalog itself now;
+// a hook left behind would stop the daemon (non-live) or race it on every package transaction.
+// The caller reloads systemd.
+func RemoveLegacyCatalogRefresh() error {
+	unit := filepath.Join(SystemdDir, CatalogRefreshServiceName+".service")
+	if _, err := os.Lstat(unit); err == nil {
+		if err := RunCmd("systemctl", "disable", CatalogRefreshServiceName); err != nil {
+			log.Warnf("systemctl disable %s failed: %v", CatalogRefreshServiceName, err)
+		}
+	}
+	return removeLegacy(LegacyCatalogRefreshFiles())
+}
+
+func removeLegacy(paths []string) error {
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("removing the legacy catalog refresh %s: %w", path, err)
+		}
+		log.Infof("removed %s: the daemon now refreshes its catalog itself", path)
+	}
+	return nil
+}
 
 const (
 	daemonEnabledState = "enabled"
@@ -204,27 +232,6 @@ func EnableAndVerify(configChanged bool) error {
 		return fmt.Errorf("daemon is not running (is-active: %q) — inspect with: journalctl -u %s -e", active, DaemonServiceName)
 	}
 	log.Infof("daemon is running (%s)", active)
-	return nil
-}
-
-// EnableCatalogRefresh enables the boot-time refresh oneshot (runs once per boot after the daemon).
-// Not started now: `install` just wrote the freshest config. A missing unit file is a warning:
-// package-manager hooks remain the primary refresh path.
-func EnableCatalogRefresh() error {
-	unit := CatalogRefreshServiceName + ".service"
-	if _, err := os.Stat(filepath.Join(SystemdDir, unit)); err != nil {
-		log.Warnf("%s not installed: skipping boot-time catalog refresh (%v)", unit, err)
-		return nil
-	}
-	enabled := strings.TrimSpace(SystemctlOutput("is-enabled", unit))
-	if enabled == daemonEnabledState {
-		log.Infof("%s already enabled across reboots", unit)
-		return nil
-	}
-	if err := RunCmd("systemctl", "enable", unit); err != nil {
-		return fmt.Errorf("systemctl enable %s: %w", unit, err)
-	}
-	log.Infof("%s enabled: the catalog whitelist is refreshed once per boot", unit)
 	return nil
 }
 

@@ -259,7 +259,10 @@ shutdown deprovisions fscrypt keys in passes *while guards still deny*. LSM link
 pinned under `/sys/fs/bpf` so a `SIGKILL` leaves trees enforced until `ExecStopPost`
 re-locks the vaults. `systemctl reload` (SIGHUP) recomputes every binary's inode identity
 atomically — new guards attach before old ones detach; a broken config keeps the running
-one. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
+one. The daemon keeps the catalog current itself (`catalogrefresh.go`/`catalogwatch.go`):
+inotify hints schedule the guards' re-sync (root-owned system binaries, admitted live by
+`AllowReplacement`'s system-file rule) or the shared `install.RefreshCatalog` plus an
+in-process reload (home apps), compare-and-swapped against the config it runs. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
 edit-auth hash. When `edit-protected` has a password configured, `control.go` opens the
 live-edit control socket and `DaemonUseCase.GrantEditAccess` / the guard's
 `GrantSelfEditAccess`+`RevokeSelfEditAccess` implement the transient per-resource write
@@ -276,9 +279,8 @@ grant. The `GuardRepository` port has daemon-specific methods (`PopulateInodes`,
 - `internal/fscrypt` — encryption lifecycle, xattr policy checks, orphan/migrate handling.
 - `internal/protected` — shared "is the daemon running / which dirs are encrypted with the
   master key" checks that gate `install`, `uninstall`, `edit-protected`.
-- `internal/systemd` — generates the systemd units, package-manager catalog-refresh hooks
-  (pacman `PostTransaction`, apt `DPkg::Post-Invoke`), per-user ssh-agent unit, boot-time
-  refresh service.
+- `internal/systemd` — generates the systemd units and the per-user ssh-agent unit, and removes
+  the legacy catalog-refresh triggers earlier versions installed (pacman/apt hooks, boot unit).
 - `scripts/install.sh` is the `curl … | sudo bash` installer: `check-compatibility` +
   Ed25519 signature / checksum / GitHub asset-digest verification before atomic install.
 
