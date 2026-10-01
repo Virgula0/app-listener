@@ -64,6 +64,8 @@ struct inode_key {
 	__u64 ino;
 };
 
+#include "exe_supersede.h"
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -354,9 +356,33 @@ static __always_inline struct inode *current_exe_inode(void)
 	return inode;
 }
 
+// current_exe_key: the current exe's key, unless this process exec'd a superseded image after the
+// supersede (exe_supersede.h): such a process holds none of the binary's trust.
+static __always_inline int current_exe_key(struct inode_key *k)
+{
+	if (!fill_inode_key(current_exe_inode(), k))
+		return 0;
+	return !exe_refused((struct task_struct *)bpf_get_current_task(), k);
+}
+
 static __always_inline __u8 current_exe_flags(void)
 {
-	return trusted_flags_of(current_exe_inode());
+	struct inode_key k = {};
+	if (!current_exe_key(&k))
+		return 0;
+	__u8 *f = bpf_map_lookup_elem(&guard_trusted_files, &k);
+	return f ? *f : 0;
+}
+
+// mappable_flags: the trust flags a mapping of inode may rely on. A superseded inode, or a reused
+// number carrying its rows, has none.
+static __always_inline __u8 mappable_flags(struct inode *inode)
+{
+	struct inode_key k = {};
+	if (!fill_inode_key(inode, &k) || exe_is_superseded(&k))
+		return 0;
+	__u8 *f = bpf_map_lookup_elem(&guard_trusted_files, &k);
+	return f ? *f : 0;
 }
 
 // inode_is_root_ro: owned by root and not modifiable in place by a normal user: not other-writable,
@@ -472,7 +498,7 @@ static __always_inline int under_guarded_tree(struct inode *inode, struct dentry
 				if (*users & TRUSTED_DIR_ANY)
 					return 1;
 				struct inode_key ek = {};
-				if (!fill_inode_key(current_exe_inode(), &ek))
+				if (!current_exe_key(&ek))
 					return 0;
 				__u64 *bits = bpf_map_lookup_elem(&guard_libdir_users, &ek);
 				return bits && (*bits & *users);
@@ -518,7 +544,7 @@ static __always_inline int fill_current_image(struct proc_image *img)
 	img->mm = (__u64)mm;
 	img->tgid = bpf_get_current_pid_tgid() >> 32;
 	__u8 *f = bpf_map_lookup_elem(&guard_trusted_files, &img->exe);
-	img->flags = f ? *f : 0;
+	img->flags = f && !exe_refused(task, &img->exe) ? *f : 0;
 	return 1;
 }
 
@@ -692,7 +718,7 @@ static __always_inline struct dentry *dentry_parent(struct dentry *d)
 static __always_inline __u64 current_writer_bits(void)
 {
 	struct inode_key k = {};
-	if (!fill_inode_key(current_exe_inode(), &k))
+	if (!current_exe_key(&k))
 		return 0;
 	__u64 *v = bpf_map_lookup_elem(&guard_glob_writers, &k);
 	return v ? *v : 0;
@@ -904,13 +930,12 @@ int trust_mmap(unsigned long long *ctx)
 
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
-	__u8 flags = trusted_flags_of(inode);
-	if (flags & (TRUSTED_LIB | TRUSTED_BINARY))
-		return 0; // explicitly trusted (or the binary re-mapping itself)
+	if (mappable_flags(inode) & (TRUSTED_LIB | TRUSTED_BINARY))
+		return 0; // explicitly trusted
 	struct inode *exe = current_exe_inode();
-	int exe_trusted = trusted_flags_of(exe) & TRUSTED_BINARY;
-	if (!exe_trusted && inode == exe)
-		return 0; // a not-yet-whitelisted process's own image is its identity, not injected code
+	if (inode == exe)
+		return 0; // a process's own image is its identity, not injected code
+	int exe_trusted = current_exe_flags() & TRUSTED_BINARY;
 
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
@@ -954,7 +979,7 @@ static __always_inline int caller_updates(struct inode *inode)
 {
 	struct inode_key tk = {};
 	struct inode_key ek = {};
-	if (!fill_inode_key(inode, &tk) || !fill_inode_key(current_exe_inode(), &ek))
+	if (!fill_inode_key(inode, &tk) || !current_exe_key(&ek))
 		return 0;
 	__u64 *owner = bpf_map_lookup_elem(&guard_bin_owner, &tk);
 	return owner && (*owner & updater_bits_of(&ek));
@@ -970,15 +995,18 @@ static __always_inline int deny_if_protected(struct inode *inode, struct dentry 
 	return -EPERM;
 }
 
-// origin_record claims a just-created inode for the current exe when it is an updater.
+// origin_record claims a just-created inode for the current exe when it is an updater. Any other
+// creator drops the row: it can only be a previous inode's whose number this one reuses.
 static __always_inline void origin_record(struct inode *inode)
 {
 	struct inode_key k = {};
 	struct bin_origin o = {};
-	if (!fill_inode_key(inode, &k) || !fill_inode_key(current_exe_inode(), &o.exe))
+	if (!fill_inode_key(inode, &k))
 		return;
-	if (!updater_bits_of(&o.exe))
+	if (!current_exe_key(&o.exe) || !updater_bits_of(&o.exe)) {
+		bpf_map_delete_elem(&guard_bin_origin, &k);
 		return;
+	}
 	bpf_map_update_elem(&guard_bin_origin, &k, &o, BPF_ANY);
 }
 
@@ -993,7 +1021,7 @@ static __always_inline void origin_taint_foreign(struct inode *inode)
 	if (!o)
 		return;
 	struct inode_key ek = {};
-	if (fill_inode_key(current_exe_inode(), &ek) && ek.dev == o->exe.dev && ek.ino == o->exe.ino)
+	if (current_exe_key(&ek) && ek.dev == o->exe.dev && ek.ino == o->exe.ino)
 		return;
 	o->tainted = 1;
 }
@@ -1249,5 +1277,54 @@ int trust_task_free(unsigned long long *ctx)
 	bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
 	if (pid == tgid)
 		bpf_map_delete_elem(&trust_code_suspect, &tgid);
+	return 0;
+}
+
+// Superseded keys (exe_supersede.h) for every trusted file, libraries included: guard.bpf.c covers
+// only whitelisted binaries.
+static __always_inline int trust_supersede(struct inode *inode)
+{
+	struct inode_key k = {};
+	if (!exe_last_link_key(inode, &k) || !bpf_map_lookup_elem(&guard_trusted_files, &k))
+		return 0;
+	return exe_note_supersede(&k, 0) ? -EPERM : 0;
+}
+
+SEC("lsm/inode_unlink")
+int trust_inode_unlink(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (!dentry)
+		return 0;
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+	return trust_supersede(inode);
+}
+
+// No flags here: see guard_inode_rename.
+SEC("lsm/inode_rename")
+int trust_inode_rename(unsigned long long *ctx)
+{
+	struct dentry *new_dentry = (struct dentry *)ctx[3];
+	if (!new_dentry)
+		return 0;
+	struct inode *victim = NULL;
+	bpf_probe_read_kernel(&victim, sizeof(victim), &new_dentry->d_inode);
+	return trust_supersede(victim);
+}
+
+// i_nlink 0 only: inode_free_security also fires for live inodes leaving the cache.
+SEC("lsm/inode_free_security")
+int trust_inode_free(unsigned long long *ctx)
+{
+	struct inode *inode = (struct inode *)ctx[0];
+	unsigned int nlink = 1;
+	struct inode_key k = {};
+	if (!inode)
+		return 0;
+	bpf_probe_read_kernel(&nlink, sizeof(nlink), &inode->i_nlink);
+	if (nlink != 0 || !fill_inode_key(inode, &k))
+		return 0;
+	exe_note_freed(&k, bpf_map_lookup_elem(&guard_trusted_files, &k) != NULL);
 	return 0;
 }

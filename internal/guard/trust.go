@@ -72,8 +72,12 @@ func NewTrustGuard() (*TrustGuard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("trust guard: removing memlock rlimit: %v", err)
 	}
+	shared, err := supersedeMaps()
+	if err != nil {
+		return nil, err
+	}
 	t := &TrustGuard{done: make(chan struct{}), mountFd: -1, mountStop: -1, vouched: -1}
-	if err := LoadGuardTrustObjects(&t.objs, nil); err != nil {
+	if err := LoadGuardTrustObjects(&t.objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
 		return nil, fmt.Errorf("loading trust BPF objects: %w", err)
 	}
 	return t, nil
@@ -101,11 +105,55 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	for _, l := range libs {
 		add(l, trustedLib)
 	}
+	for k := range flags {
+		liftSuperseded(k)
+	}
+	if err := t.keepSuperseded(flags); err != nil {
+		return fmt.Errorf("keeping superseded trusted files: %w", err)
+	}
 	if err := syncMap(t.objs.GuardTrustedFiles, flags); err != nil {
 		return fmt.Errorf("syncing trusted files: %w", err)
 	}
 	log.Infof("trust guard: %d trusted inode(s) loaded (%d binaries, %d libraries requested)",
 		len(flags), len(binaries), len(libs))
+	return nil
+}
+
+// keepSuperseded adds to flags every trusted inode that lost its last link but still exists: a
+// process started before the update keeps its library allowlist across a reload, which rebuilds
+// the set from paths. Bit rows (owners, updaters, writers) are not kept: their bits are reassigned
+// per reload.
+func (t *TrustGuard) keepSuperseded(flags map[GuardInodeKey]uint8) error {
+	var k GuardInodeKey
+	var f uint8
+	it := t.objs.GuardTrustedFiles.Iterate()
+	for it.Next(&k, &f) {
+		if _, ok := flags[k]; ok {
+			continue
+		}
+		if mark, ok := supersededMark(k); ok && mark.Freed == 0 {
+			flags[k] = f
+		}
+	}
+	return it.Err()
+}
+
+// trusts reports whether k is a trusted file.
+func (t *TrustGuard) trusts(k GuardInodeKey) bool {
+	var f uint8
+	return t.objs.GuardTrustedFiles.Lookup(GuardTrustInodeKey{Dev: k.Dev, Ino: k.Ino}, &f) == nil
+}
+
+// forgetExe drops every trust row keyed by k (supersede.go). guard_bin_origin is left to the
+// kernel: every creation rewrites or drops its row (origin_record).
+func (t *TrustGuard) forgetExe(k GuardInodeKey) error {
+	key := GuardTrustInodeKey{Dev: k.Dev, Ino: k.Ino}
+	for _, m := range []*cilium.Map{t.objs.GuardTrustedFiles, t.objs.GuardBinOwner, t.objs.GuardBinUpdaters,
+		t.objs.GuardGlobWriters, t.objs.GuardLibdirUsers} {
+		if err := m.Delete(key); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -221,6 +269,11 @@ func (t *TrustGuard) hooks() []trustHook {
 		// (attachSuspectFork), or a suspect process's children would escape the mark.
 		{t.objs.TrustBprmCommitted, "bprm_committed_creds", true},
 		{t.objs.TrustTaskFree, "task_free", true},
+		// Superseded keys for trusted libraries (exe_supersede.h): without them a freed library's
+		// number, reused by any file, would stay TRUSTED_LIB.
+		{t.objs.TrustInodeUnlink, "inode_unlink", true},
+		{t.objs.TrustInodeRename, "inode_rename", true},
+		{t.objs.TrustInodeFree, "inode_free_security", true},
 	}
 }
 
@@ -265,6 +318,7 @@ func (t *TrustGuard) Start() error {
 	}
 	t.rd = rd
 	go t.readLoop()
+	setSupersedeTrust(t)
 	return nil
 }
 
@@ -352,6 +406,11 @@ func (t *TrustGuard) Stop() {
 	default:
 		close(t.done)
 	}
+	supersede.mu.Lock()
+	if supersede.trust == t {
+		supersede.trust = nil
+	}
+	supersede.mu.Unlock()
 	if t.rd != nil {
 		_ = t.rd.Close()
 	}

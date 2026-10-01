@@ -133,10 +133,13 @@ type Guard struct {
 	verifyStop         chan struct{}
 	// degradeStop shuts the BPF degradation watcher down (startDegradeWatch).
 	degradeStop chan struct{}
-	// deployed: per canonical whitelisted path, the (dev, ino) in the BPF maps. Keys are never
-	// deleted, so a running pre-replacement process keeps admission; ReSyncBinaries rewrites stale
-	// ones.
+	// deployed: per canonical whitelisted path, the (dev, ino) in the BPF maps. A replaced key stays
+	// in the maps, admitting only processes started before its supersede, until its inode is gone
+	// (supersede.go).
 	deployed map[string]GuardInodeKey
+	// keyPaths: every key this guard admitted from a whitelist line, to that line's path. Outlives
+	// deployed's entry, so a superseded key can be carried across a reload (SnapshotSuperseded).
+	keyPaths map[GuardInodeKey]string
 	// refused: replacements ReSyncBinaries declined, reported once each.
 	refused refusedReplacements
 	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
@@ -338,6 +341,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		recursive:      recursive,
 		depth:          depth,
 		deployed:       make(map[string]GuardInodeKey),
+		keyPaths:       make(map[GuardInodeKey]string),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -457,8 +461,13 @@ func (g *Guard) resConfig() (GuardResConfig, error) {
 // PinDegraded reports that requested pinning was refused: enforcing, but won't survive SIGKILL.
 func (g *Guard) PinDegraded() bool { return SharedPinDegraded() }
 
-// requiredHooks: without these, files could be opened and read unchecked.
-var requiredHooks = map[string]bool{"file_open": true, "file_permission": true}
+// requiredHooks: without the first two, files could be opened and read unchecked; without the
+// rest, a superseded binary or a reused inode number would keep its whitelist entry
+// (exe_supersede.h).
+var requiredHooks = map[string]bool{
+	"file_open": true, "file_permission": true,
+	"inode_unlink": true, "inode_rename": true, "bprm_committed_creds": true,
+}
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
 // (g.pinPrefix+suffix); exported so `daemon --lockdown` (no live Guard) can reopen just those maps.
@@ -554,6 +563,8 @@ func guardLSMHooks(o *GuardObjects) []struct {
 		{o.GuardTaskFree, "task_free"},
 		{o.GuardInodeFree, "inode_free_security"},
 		{o.GuardBprmCommitted, "bprm_committed_creds"},
+		{o.GuardInodeUnlink, "inode_unlink"},
+		{o.GuardInodeRename, "inode_rename"},
 	}
 }
 
@@ -593,11 +604,13 @@ func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 		if g.mode == ModeWhitelist || g.mode == ModeReadOnly {
 			action = uint8(GUARD_ALLOW)
 		}
+		liftSuperseded(inodeKey)
 		if err := g.putExeAction(inodeKey, action); err != nil {
 			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
 		}
 		g.mu.Lock()
 		g.deployed[canonicalBinaryPath(b.Path)] = inodeKey
+		g.keyPaths[inodeKey] = b.Path
 		g.mu.Unlock()
 	}
 	return nil
@@ -994,8 +1007,8 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 }
 
 // ReSyncBinaries re-stats whitelisted binaries and admits a replacement inode only when the
-// SetReplacementCheck check approves it. Stale keys are never deleted (running pre-replacement
-// processes stay admitted; vanished paths keep their key). Still-deferred rules are retried.
+// SetReplacementCheck check approves it. A replaced key stays admitted for processes started
+// before its supersede (supersede.go). Still-deferred rules are retried.
 func (g *Guard) ReSyncBinaries() (int, error) {
 	// Retry deferred rules first; addBinaryActions records newly resolved binaries in deployed, so the pass below skips them.
 	resolved, resolvedEvents, stillDeferred := g.resolveDeferred()
@@ -1038,11 +1051,13 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 			}
 			continue
 		}
+		liftSuperseded(key)
 		if err := g.putBinaryKey(key, b.Path, exeEvents); err != nil {
 			return changed, err
 		}
 		g.mu.Lock()
 		g.deployed[path] = key
+		g.keyPaths[key] = b.Path
 		g.mu.Unlock()
 		changed++
 	}
@@ -1869,20 +1884,24 @@ func (g *Guard) verifyBinaryHashesOnce() {
 		}
 		st.stat = fp
 		st.hashed = true
-		if st.demoted {
-			continue // once tampering is detected the entry stays blocked
-		}
-		if hash != st.hash {
-			// Same inode, different content: replaced in place. Demote to GUARD_BLOCK (fail
-			// closed).
-			if putErr := g.putExeAction(st.key, uint8(GUARD_BLOCK)); putErr != nil {
-				log.Errorf("guard %s: demoting in-place replaced binary %s: %v", g.path, canonical, putErr)
-				continue
-			}
-			st.demoted = true
-			log.Errorf("guard %s: whitelisted binary %s was modified in place (inode unchanged, hash changed) \u2014 whitelist entry demoted to BLOCK", g.path, canonical)
+		if !st.demoted && hash != st.hash {
+			g.demoteInPlace(canonical, st)
 		}
 	}
+}
+
+// demoteInPlace blocks st's key: same inode, different content, so it was rewritten in place (fail
+// closed). Once demoted the entry stays blocked.
+func (g *Guard) demoteInPlace(canonical string, st *binaryVerifyState) {
+	if exeGone(st.key) {
+		return // not in place: a new file reuses a freed inode's number (supersede.go)
+	}
+	if putErr := g.putExeAction(st.key, uint8(GUARD_BLOCK)); putErr != nil {
+		log.Errorf("guard %s: demoting in-place replaced binary %s: %v", g.path, canonical, putErr)
+		return
+	}
+	st.demoted = true
+	log.Errorf("guard %s: whitelisted binary %s was modified in place (inode unchanged, hash changed) \u2014 whitelist entry demoted to BLOCK", g.path, canonical)
 }
 
 // adoptReplacedIdentity re-pins st to a new inode at canonical. ReSyncBinaries owns re-admission,
@@ -2085,6 +2104,34 @@ func (g *Guard) dropResourceState() {
 			log.Warnf("guard %s: clearing watch path: %v", g.path, err)
 		}
 	}
+}
+
+// deleteInoKeys drops every row of a (res_id, inode)-keyed map naming exe, whatever the resource.
+// Keys only, as deleteResKeys.
+func deleteInoKeys(m *cilium.Map, exe GuardInodeKey) error {
+	var stale []GuardResInodeKey
+	var next GuardResInodeKey
+	var prev any
+	for {
+		err := m.NextKey(prev, &next)
+		if errors.Is(err, cilium.ErrKeyNotExist) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if next.Ino == exe {
+			stale = append(stale, next)
+		}
+		cur := next
+		prev = cur
+	}
+	for i := range stale {
+		if err := m.Delete(stale[i]); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 // deleteResKeys drops every row of a (res_id, inode)-keyed map belonging to res. It walks keys only

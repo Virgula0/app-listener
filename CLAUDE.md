@@ -237,8 +237,12 @@ nothing, so the process refuses to start instead.
 - **kprobes** (`monitor`) — observe all I/O regardless of syscall path (io_uring, splice,
   sendfile, mmap) plus metadata ops.
 - **LSM hooks** (`guard`, `network-guard`, `daemon`) — the only kernel mechanism that can
-  **deny**. ~23 hooks; only `file_open` + `file_permission` are mandatory, the rest are
-  best-effort (a missing hook logs a warning, enforcement continues).
+  **deny**. ~28 hooks; `file_open` + `file_permission` and the superseded-key set
+  (`inode_unlink`, `inode_rename`, `bprm_committed_creds`, the `sched_process_fork`
+  tracepoint) are mandatory, the rest are best-effort (a missing hook logs a warning,
+  enforcement continues). A replaced binary's old `dev:ino` key admits only processes
+  exec'd before the replacement and never a reused inode number (`exe_supersede.h`,
+  shared by the guard and trust objects).
 - **tracepoints / kretprobes** (`network-monitor`) — TCP/UDP/DNS.
 
 **Identity is the executable's inode, never its name or comm** — renaming or comm-spoofing

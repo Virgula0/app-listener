@@ -80,6 +80,8 @@ struct inode_key {
 	__u64 ino;
 };
 
+#include "exe_supersede.h"
+
 // One attached program set serves every guarded resource: each resource owns a slot in
 // guard_res_config and is identified by its res_id, resolved from the accessed inode. Attaching
 // per resource instead would cost one trampoline link per resource on each of the 26 attach
@@ -1077,8 +1079,12 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 		struct res_inode_key exe_ik = {};
 		exe_ik.res_id = res_id;
 		__u8 *action = NULL;
-		if (get_current_exe_inode(&exe_ik.ino))
+		if (get_current_exe_inode(&exe_ik.ino)) {
+			// A refused superseded image misses the lookup through an impossible res_id: a branch
+			// here would add a path at every call site of this body.
+			exe_ik.res_id = res_id | (0U - (__u32)exe_refused(task, &exe_ik.ino));
 			action = bpf_map_lookup_elem(&guard_exe_actions, &exe_ik);
+		}
 
 		if (mode_val == GUARD_MODE_BLACKLIST) {
 			is_blocked = action != NULL && *action == GUARD_BLOCK;
@@ -1125,6 +1131,8 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 						bpf_probe_read_kernel(&tdev, sizeof(tdev), &tsb->s_dev);
 						target_ik.ino.dev = tdev;
 					}
+					// This exec runs now, after any supersede of its image.
+					target_ik.res_id = res_id | (0U - (__u32)exe_is_superseded(&target_ik.ino));
 					target_action = bpf_map_lookup_elem(&guard_exe_actions, &target_ik);
 					if (target_action) {
 						if (is_allow_action(target_action)) {
@@ -2164,8 +2172,8 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 	// inode, never its pid.
 	if (!(mode & PTRACE_MODE_ATTACH)) {
 		struct res_inode_key child_ik = {};
-		child_ik.res_id = res;
 		if (get_task_exe_inode(child, &child_ik.ino)) {
+			child_ik.res_id = res | (0U - (__u32)exe_refused(child, &child_ik.ino));
 			__u8 *child_action = bpf_map_lookup_elem(&guard_exe_actions, &child_ik);
 			if (child_action && *child_action == GUARD_ALLOW_ROOT)
 				return 0;
@@ -2174,9 +2182,10 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 
 	// Child is tainted.  Check if the caller is whitelisted.
 	struct res_inode_key exe_ik = {};
-	exe_ik.res_id = res;
 	if (!get_current_exe_inode(&exe_ik.ino))
 		return emit_process_denial(GUARD_REASON_PTRACE, EVENT_READ, child, 0, mode, res);
+	exe_ik.res_id = res | (0U - (__u32)exe_refused((struct task_struct *)bpf_get_current_task(),
+						       &exe_ik.ino));
 
 	__u8 *action = bpf_map_lookup_elem(&guard_exe_actions, &exe_ik);
 	if (!is_allow_action(action))
@@ -2220,7 +2229,8 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	target_ik.dev = dev;
 
 	// Whitelisted for any resource: this hook is not reached through a guarded path, so there is
-	// no inode to resolve a resource from.
+	// no inode to resolve a resource from. A superseded image still counts: the union only ever
+	// adds protection (taint, the tracer check).
 	__u32 *union_res = bpf_map_lookup_elem(&guard_exe_union, &target_ik);
 	if (!union_res)
 		return 0;  // target is not whitelisted anywhere: not our concern
@@ -2260,9 +2270,9 @@ int guard_bprm_check_security(unsigned long long *ctx)
 		return emit_process_denial(GUARD_REASON_TRACED_EXEC, EVENT_OPEN, NULL, 0, 0, res);
 
 	struct res_inode_key tracer_ik = {};
-	tracer_ik.res_id = res;
 	if (!get_task_exe_inode(tracer, &tracer_ik.ino))
 		return emit_process_denial(GUARD_REASON_TRACED_EXEC, EVENT_OPEN, tracer, 0, 0, res);  // no resolvable identity: fail closed
+	tracer_ik.res_id = res | (0U - (__u32)exe_refused(tracer, &tracer_ik.ino));
 
 	__u8 *tracer_action = bpf_map_lookup_elem(&guard_exe_actions, &tracer_ik);
 	if (!is_allow_action(tracer_action))
@@ -2304,14 +2314,17 @@ int guard_inode_free(unsigned long long *ctx)
 		return 0;
 	__u64 dev = 0;
 	bpf_probe_read_kernel(&dev, sizeof(dev_t), &sb->s_dev);
-	if (!bpf_map_lookup_elem(&guard_fs_sbdevs, &dev))
-		return 0;
-
 	__u64 ino = 0;
 	bpf_probe_read_kernel(&ino, sizeof(ino), &inode->i_ino);
 	struct inode_key ikey = {};
 	ikey.dev = dev;
 	ikey.ino = ino;
+
+	// Binaries live on any filesystem, not only guarded ones: before the sbdevs gate.
+	exe_note_freed(&ikey, bpf_map_lookup_elem(&guard_exe_union, &ikey) != NULL);
+
+	if (!bpf_map_lookup_elem(&guard_fs_sbdevs, &dev))
+		return 0;
 
 	// Read the owning resource before dropping the entry: it names whose watch root this may be.
 	__u32 *val = bpf_map_lookup_elem(&guard_inodes, &ikey);
@@ -2346,6 +2359,8 @@ int guard_inode_free(unsigned long long *ctx)
 SEC("lsm/bprm_committed_creds")
 int guard_bprm_committed(unsigned long long *ctx)
 {
+	exe_stamp_exec();
+
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	__u32 *taint_res = bpf_map_lookup_elem(&guard_tainted_pids, &tgid);
 	if (!taint_res)
@@ -2407,6 +2422,8 @@ int guard_sched_process_fork(unsigned long long *ctx)
 	if (!parent || !child)
 		return 0;
 
+	exe_stamp_fork(parent, child);
+
 	__u32 parent_tgid = 0;
 	bpf_probe_read_kernel(&parent_tgid, sizeof(parent_tgid), &parent->tgid);
 	__u32 *parent_res = bpf_map_lookup_elem(&guard_tainted_pids, &parent_tgid);
@@ -2442,5 +2459,39 @@ int guard_task_free(unsigned long long *ctx)
 		return 0;
 
 	bpf_map_delete_elem(&guard_tainted_pids, &tgid);
+	exe_stamp_free(task, tgid);
 	return 0;
+}
+
+// Superseded keys (exe_supersede.h): a whitelisted binary losing its last link. Separate programs,
+// so guard_path_rename's verifier budget is untouched.
+SEC("lsm/inode_unlink")
+int guard_inode_unlink(unsigned long long *ctx)
+{
+	struct dentry *dentry = (struct dentry *)ctx[1];
+	if (!dentry)
+		return 0;
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+	struct inode_key k = {};
+	if (!exe_last_link_key(inode, &k) || !bpf_map_lookup_elem(&guard_exe_union, &k))
+		return 0;
+	return exe_note_supersede(&k, 0) ? -EPERM : 0;
+}
+
+// A rename over a file unlinks the victim with no inode_unlink. The hook carries no flags: for
+// RENAME_EXCHANGE it runs once per side, marking a whitelisted side that keeps its link (stricter:
+// later execs of it are refused).
+SEC("lsm/inode_rename")
+int guard_inode_rename(unsigned long long *ctx)
+{
+	struct dentry *new_dentry = (struct dentry *)ctx[3];
+	if (!new_dentry)
+		return 0;
+	struct inode *victim = NULL;
+	bpf_probe_read_kernel(&victim, sizeof(victim), &new_dentry->d_inode);
+	struct inode_key k = {};
+	if (!exe_last_link_key(victim, &k) || !bpf_map_lookup_elem(&guard_exe_union, &k))
+		return 0;
+	return exe_note_supersede(&k, 0) ? -EPERM : 0;
 }

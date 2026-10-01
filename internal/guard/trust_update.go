@@ -61,6 +61,7 @@ func (t *TrustGuard) AllowReplacement(path string, old, newKey GuardInodeKey) bo
 	if err := t.objs.GuardBinUpdaters.Lookup(o.Exe, &upd); err != nil || upd&owner == 0 {
 		return false
 	}
+	liftSuperseded(newKey)
 	if err := t.adoptRows(GuardTrustInodeKey{Dev: old.Dev, Ino: old.Ino}, nk); err != nil {
 		log.Warnf("trust guard: replacement of %s not re-admitted: %v", path, err)
 		return false
