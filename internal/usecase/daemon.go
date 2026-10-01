@@ -63,6 +63,9 @@ type DaemonUseCase interface {
 	// modify it for an authenticated live edit-protected session. One grant at a time. The returned
 	// revoke restores the read-only baseline; idempotent.
 	GrantEditAccess(resourcePath string) (revoke func() error, err error)
+	// ResyncBinaries re-syncs every guard's whitelist now, admitting replaced or new system
+	// binaries (the catalog watch saw a package install).
+	ResyncBinaries()
 }
 
 type daemonUseCase struct {
@@ -875,6 +878,19 @@ func (d *daemonUseCase) GrantEditAccess(resourcePath string) (func() error, erro
 		return rerr
 	}
 	return revoke, nil
+}
+
+func (d *daemonUseCase) ResyncBinaries() {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.stopping {
+		return
+	}
+	for i, g := range d.guards {
+		if _, err := g.ReSyncBinaries(); err != nil {
+			log.Errorf("daemon: re-syncing binary whitelist for %s: %v", d.resources[i].Path, err)
+		}
+	}
 }
 
 // Events returns the merged, per-resource tagged event stream.

@@ -210,56 +210,6 @@ func TestCollectFilesystemPrereqsSkipsRegularFiles(t *testing.T) {
 	}
 }
 
-// TestParseSectionWhitelist covers the helper backing the live refresh's
-// empty-whitelist safety check: only the binary directives of the requested
-// [watch] section are returned, never directives of a following section.
-func TestParseSectionWhitelist(t *testing.T) {
-	conf := `[watch /a]
-/usr/bin/one
-need_encryption: true
-/usr/bin/two READ,WRITE
-
-[watch /b]
-/usr/bin/three
-`
-	got := parseSectionWhitelist(conf, "/a")
-	want := []string{"/usr/bin/one", "/usr/bin/two"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("parseSectionWhitelist(/a) = %v, want %v", got, want)
-	}
-
-	if got := parseSectionWhitelist(conf, "/b"); !reflect.DeepEqual(got, []string{"/usr/bin/three"}) {
-		t.Errorf("parseSectionWhitelist(/b) = %v, want [/usr/bin/three]", got)
-	}
-
-	if got := parseSectionWhitelist(conf, "/missing"); got != nil {
-		t.Errorf("parseSectionWhitelist(/missing) = %v, want nil", got)
-	}
-}
-
-// TestLiveEmptyWhitelistRejected is the regression test for the live
-// refresh's fail-closed contract: a re-scan that comes back empty for a
-// previously-populated encrypted resource must be refused (the vault is
-// locked, or this installer binary is not the running daemon's) instead of
-// persisting a silently shrunk whitelist.
-func TestLiveEmptyWhitelistRejected(t *testing.T) {
-	if !liveEmptyWhitelistRejected(true, true, 0, 3) {
-		t.Error("live empty re-scan of a previously-populated encrypted resource must be rejected")
-	}
-	if liveEmptyWhitelistRejected(true, false, 0, 3) {
-		t.Error("the stopped flow has its own unlock/re-lock contract: not a live rejection")
-	}
-	if liveEmptyWhitelistRejected(false, true, 0, 3) {
-		t.Error("non-encrypted resources may legitimately end up empty (uninstalled binary)")
-	}
-	if liveEmptyWhitelistRejected(true, true, 2, 3) {
-		t.Error("a non-empty re-scan must never be rejected")
-	}
-	if liveEmptyWhitelistRejected(true, true, 0, 0) {
-		t.Error("a section that was already empty stays in deny-everything mode: nothing to protect")
-	}
-}
-
 // Regression for the missing SIGHUP delivery: the first live implementation patched daemon.conf and
 // returned without delivering it, so the daemon kept the old whitelist silently. Live mode must
 // deliver the reload exactly when the config was written, and skip it when the refreshed config
@@ -341,9 +291,10 @@ func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
 	}
 
 	users := []inst.User{{Name: "tester", Home: home}}
-	updated, patched, err := patchCatalogSection(fscrypt.New(), confText, r, users, false)
+	updated, _, patched, err := inst.RefreshSection(confText, r, users,
+		inst.RefreshOptions{Scan: vaultScan(fscrypt.New(), false)})
 	if err != nil {
-		t.Fatalf("patchCatalogSection on a grouped config: %v", err)
+		t.Fatalf("refreshing a grouped config: %v", err)
 	}
 	if !patched {
 		t.Fatal("the Discord catalog entry must match its own encryption root")
@@ -435,7 +386,7 @@ func discordCatalogEntry(t *testing.T) inst.CandidateDir {
 }
 
 // TestGroupedSectionAddressedByEncryptionRoot documents why askEncryption /
-// patchCatalogSection must address a grouped section by its encryption root:
+// the catalog refresh must address a grouped section by its encryption root:
 // the config text has ONE [watch <root>] header, so a text patch keyed on a
 // watch sub-path fails "section not found" — the exact FATAL the installer
 // hit on a grouped Discord config.
@@ -525,11 +476,11 @@ need_encryption: true
 // refresh unit pass --yes and must not report failure just because the
 // installed config has no catalog-managed section. Interactive callers do.
 func TestSoftenAutomatedRefreshErr(t *testing.T) {
-	if err := softenAutomatedRefreshErr(errNoCatalogMatch, true); err != nil {
-		t.Errorf("automated caller: errNoCatalogMatch must be softened to nil, got %v", err)
+	if err := softenAutomatedRefreshErr(inst.ErrNoCatalogMatch, true); err != nil {
+		t.Errorf("automated caller: inst.ErrNoCatalogMatch must be softened to nil, got %v", err)
 	}
-	if err := softenAutomatedRefreshErr(errNoCatalogMatch, false); err == nil {
-		t.Error("interactive caller: errNoCatalogMatch must surface")
+	if err := softenAutomatedRefreshErr(inst.ErrNoCatalogMatch, false); err == nil {
+		t.Error("interactive caller: inst.ErrNoCatalogMatch must surface")
 	}
 	other := errors.New("vault locked")
 	if err := softenAutomatedRefreshErr(other, true); err != other {

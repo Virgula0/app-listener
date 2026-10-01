@@ -307,8 +307,29 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	control := startControlManager(d)
 	defer control.close()
 
-	reload := makeReloadHandler(d, configPath, vault, pin, control, trust)
+	reload, stopRefresh := startCatalogRefresh(d, configPath, cfg, vault, pin, control, trust)
+	defer stopRefresh()
 	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
+}
+
+// startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) on the reload the
+// SIGHUP handler uses, and returns that handler.
+func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemonconfig.Config, vault *fscrypt.Vault,
+	pin pinCfg, control *controlManager, trust *trustManager) (reload, stop func()) {
+	var refresher *catalogRefresher
+	reloadCfg := makeReloadHandler(d, configPath, vault, pin, control, trust, func(next *daemonconfig.Config) {
+		if refresher != nil {
+			refresher.setConfig(next)
+		}
+	})
+	reload = func() { reloadCfg() }
+	refresher, err := newCatalogRefresher(configPath, cfg, reloadCfg, d.ResyncBinaries, control.sessionActive)
+	if err != nil {
+		log.Errorf("daemon: %v — new app versions wait for a reload", err)
+		return reload, func() {}
+	}
+	refresher.start()
+	return reload, refresher.stop
 }
 
 // runDaemonUI dispatches to the presentation chosen by flags: headless stderr, browser-mirrored
@@ -448,13 +469,18 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	return configPath, cfg, nil
 }
 
-// makeReloadHandler returns the SIGHUP handler: re-parse the config, rebuild every guard
-// (re-statting binaries so updated ones get new inodes) and hand the batch to the usecase, which
-// swaps without dropping protection. Any failure keeps the previous config running. The self
-// guards stay attached throughout: the reload only needs free resource slots, which reloadOnce
-// checks before building anything.
-func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, control *controlManager, trust *trustManager) func() {
-	return func() {
+// makeReloadHandler returns the reload: re-parse the config, rebuild every guard (re-statting
+// binaries so updated ones get new inodes) and hand the batch to the usecase, which swaps without
+// dropping protection. Any failure keeps the previous config running and returns nil; success
+// returns the config now running, after reloaded saw it. SIGHUP and the catalog refresh share it,
+// one reload at a time. The self guards stay attached throughout: the reload only needs free
+// resource slots, which reloadOnce checks before building anything.
+func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg,
+	control *controlManager, trust *trustManager, reloaded func(*daemonconfig.Config)) func() *daemonconfig.Config {
+	var mu sync.Mutex
+	return func() *daemonconfig.Config {
+		mu.Lock()
+		defer mu.Unlock()
 		// A reload rebuilds every guard, so end any live edit-protected grant first (its client
 		// gets EOF; the tree is read-only again before the swap).
 		control.endActiveSession("configuration reload")
@@ -465,7 +491,7 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		liveGen, cfg, err := reloadOnce(d, configPath, vault, pin.base)
 		if err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
-			return
+			return nil
 		}
 		// Rebuild the daemon-wide trusted set from the new config: a binary added by this reload
 		// must gain its library allowlist (#2) and write-protection (#1), or LD_PRELOAD works
@@ -482,7 +508,9 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 			log.Warnf("daemon: could not record pin state after reload (%v) — `daemon --lockdown` will not be "+
 				"able to widen self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 		}
+		reloaded(cfg)
 		log.Infof("daemon: configuration reloaded from %s", configPath)
+		return cfg
 	}
 }
 
@@ -929,8 +957,11 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
 	events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
 	var deferred []daemonconfig.BinaryRule
+	vetted := make(map[string]guard.GuardInodeKey, len(r.Binaries))
 	for _, b := range r.Binaries {
-		entry, err := ebpf.ComputeBinaryEntry(b.Path)
+		// One confined open: the key admitted is the inode hashed, never resolved again (a symlinked
+		// directory swapped after the catalog refresh vetted the path can't redirect it).
+		entry, key, err := guard.ConfinedEntry(b.Path)
 		if err != nil {
 			// Binary is in a still-locked tree (or gone): defer it; denied until resolved after
 			// unlock (fail closed).
@@ -939,6 +970,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 			continue
 		}
 		binaries = append(binaries, entry)
+		vetted[b.Path] = key
 		events[b.Path] = b.Events
 	}
 
@@ -969,6 +1001,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		guard.WithPinning(pin.prefix(r.Path)),
 		guard.WithBackingDevices(deviceSet),
 		guard.WithSystemPatterns(system),
+		guard.WithVettedKeys(vetted),
 	}
 	if headless && blockedOnly {
 		opts = append(opts, guard.WithoutAllowedEvents())

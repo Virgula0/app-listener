@@ -1,10 +1,8 @@
 package ebpf
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,17 +91,7 @@ func ComputeBinaryEntryFile(f *os.File, path string) (BinaryEntry, error) {
 		return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, err)
 	}
 	defer r.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, r); err != nil {
-		return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, err)
-	}
-	e := BinaryEntry{Path: path}
-	h.Sum(e.Hash[:0])
-	e.Comm = filepath.Base(path)
-	if len(e.Comm) > 15 {
-		e.Comm = e.Comm[:15]
-	}
-	return e, nil
+	return entryOf(r, path)
 }
 
 // StatFile is the (dev, ino) of the inode f holds, dev encoded by KernelDev.

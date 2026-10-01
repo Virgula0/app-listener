@@ -179,6 +179,8 @@ type Guard struct {
 	chmodDropWrite bool
 	// systemPatterns: WithSystemPatterns.
 	systemPatterns []daemonconfig.BinaryRule
+	// vetted: whitelist path -> the inode it was hashed from (binaryKey). Guarded by mu.
+	vetted map[string]GuardInodeKey
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -248,6 +250,16 @@ func WithoutAllowedEvents() GuardOption {
 func WithChmodDropWrite() GuardOption {
 	return func(g *Guard) {
 		g.chmodDropWrite = true
+	}
+}
+
+// WithVettedKeys pins whitelist paths to the inodes their entries were hashed from
+// (ConfinedEntry): the guard admits those inodes and never resolves the paths again.
+func WithVettedKeys(keys map[string]GuardInodeKey) GuardOption {
+	return func(g *Guard) {
+		for p, k := range keys {
+			g.vetted[p] = k
+		}
 	}
 }
 
@@ -353,6 +365,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		depth:          depth,
 		deployed:       make(map[string]GuardInodeKey),
 		keyPaths:       make(map[GuardInodeKey]string),
+		vetted:         make(map[string]GuardInodeKey),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -600,16 +613,25 @@ func guardModeKey(m Mode) (uint64, error) {
 	}
 }
 
+// binaryKey is the inode path was hashed from through a confined open (WithVettedKeys, or a
+// resolved deferred rule): never resolved again. Otherwise path resolved by StatConfined.
+func (g *Guard) binaryKey(path string) (GuardInodeKey, error) {
+	g.mu.Lock()
+	key, ok := g.vetted[path]
+	g.mu.Unlock()
+	if ok {
+		return key, nil
+	}
+	dev, ino, err := ebpf.StatConfined(path)
+	return GuardInodeKey{Dev: dev, Ino: ino}, err
+}
+
 // addBinaryActions stores per-binary allow/block flags in guard_exe_actions, keyed by filesystem inode.
 func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 	for _, b := range binaries {
-		dev, ino, err := ebpf.StatConfined(b.Path)
+		inodeKey, err := g.binaryKey(b.Path)
 		if err != nil {
 			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
-		}
-		inodeKey := GuardInodeKey{
-			Dev: dev,
-			Ino: ino,
 		}
 		action := uint8(GUARD_BLOCK)
 		if g.mode == ModeWhitelist || g.mode == ModeReadOnly {
@@ -870,11 +892,11 @@ func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf
 		if err != nil {
 			return fmt.Errorf("invalid event mask for binary %s: %w", b.Path, err)
 		}
-		dev, ino, err := ebpf.StatConfined(b.Path)
+		key, err := g.binaryKey(b.Path)
 		if err != nil {
 			return fmt.Errorf("cannot stat binary %s for event mask: %w", b.Path, err)
 		}
-		if err := g.objs().GuardExeEvents.Put(g.resKey(GuardInodeKey{Dev: dev, Ino: ino}), mask); err != nil {
+		if err := g.objs().GuardExeEvents.Put(g.resKey(key), mask); err != nil {
 			return fmt.Errorf("storing exe events for %s: %w", b.Path, err)
 		}
 	}
@@ -882,7 +904,7 @@ func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf
 }
 
 // resolveDeferred hashes every deferred rule now readable; returns entries, event lists (by
-// canonical path) and still-unreadable rules. Never mutates the guard.
+// canonical path) and still-unreadable rules. It only records each hashed inode (binaryKey).
 func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]ebpf.EventType, stillDeferred []deferredBinary) {
 	g.mu.Lock()
 	deferredList := append([]deferredBinary(nil), g.deferred...)
@@ -892,11 +914,7 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 	events = make(map[string][]ebpf.EventType, len(deferredList))
 	for _, deferred := range deferredList {
 		rule := deferred.rule
-		path, err := ebpf.ResolveConfined(rule.Path)
-		var entry BinaryEntry
-		if err == nil {
-			entry, err = ComputeBinaryEntry(path)
-		}
+		path, entry, key, err := confinedEntry(rule.Path)
 		if err != nil {
 			deferred.attempts++
 			if deferred.attempts >= maxResolveAttempts {
@@ -908,11 +926,50 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 			continue
 		}
 		resolved = append(resolved, entry)
+		g.mu.Lock()
+		if g.vetted == nil {
+			g.vetted = make(map[string]GuardInodeKey)
+		}
+		g.vetted[path] = key
+		g.mu.Unlock()
 		if len(rule.Events) > 0 {
 			events[path] = rule.Events
 		}
 	}
 	return resolved, events, stillDeferred
+}
+
+// confinedEntry opens path once (OpenConfined) and hashes the inode reached, returning its resolved
+// path, the entry and that inode's key.
+func confinedEntry(path string) (resolved string, entry BinaryEntry, key GuardInodeKey, err error) {
+	f, err := ebpf.OpenConfined(path)
+	if err != nil {
+		return "", entry, key, err
+	}
+	defer f.Close()
+	if resolved, err = os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); err != nil {
+		return "", entry, key, err
+	}
+	if key.Dev, key.Ino, err = ebpf.StatFile(f); err != nil {
+		return "", entry, key, err
+	}
+	entry, err = ebpf.ComputeBinaryEntryFile(f, resolved)
+	return resolved, entry, key, err
+}
+
+// ConfinedEntry hashes the inode a whitelist path reaches through one confined open and returns its
+// key; the entry keeps path as its name. Pass the keys to WithVettedKeys.
+func ConfinedEntry(path string) (entry BinaryEntry, key GuardInodeKey, err error) {
+	f, err := ebpf.OpenConfined(path)
+	if err != nil {
+		return entry, key, err
+	}
+	defer f.Close()
+	if key.Dev, key.Ino, err = ebpf.StatFile(f); err != nil {
+		return entry, key, err
+	}
+	entry, err = ebpf.ComputeBinaryEntryFile(f, path)
+	return entry, key, err
 }
 
 // ResolvePendingBinaries retries entries deferred while their resource was locked; run only after

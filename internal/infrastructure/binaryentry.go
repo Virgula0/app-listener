@@ -35,38 +35,24 @@ func ComputeBinaryEntry(path string) (BinaryEntry, error) {
 		return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, err)
 	}
 	defer f.Close()
+	return entryOf(f, path)
+}
 
+// entryOf hashes r into an entry named path.
+func entryOf(r io.Reader, path string) (BinaryEntry, error) {
 	h := sha256.New()
 	bufp := hashBufPool.Get().(*[]byte)
-	buf := *bufp
-	for {
-		n, readErr := f.Read(buf)
-		if n > 0 {
-			h.Write(buf[:n])
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			hashBufPool.Put(bufp)
-			return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, readErr)
-		}
-	}
+	_, err := io.CopyBuffer(h, r, *bufp)
 	hashBufPool.Put(bufp)
-
-	var hash [sha256.Size]byte
-	h.Sum(hash[:0])
-
-	comm := filepath.Base(path)
-	if len(comm) > 15 {
-		comm = comm[:15]
+	if err != nil {
+		return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, err)
 	}
-
-	return BinaryEntry{
-		Path: path,
-		Hash: hash,
-		Comm: comm,
-	}, nil
+	e := BinaryEntry{Path: path, Comm: filepath.Base(path)}
+	h.Sum(e.Hash[:0])
+	if len(e.Comm) > 15 {
+		e.Comm = e.Comm[:15]
+	}
+	return e, nil
 }
 
 // KernelDev encodes major:minor as the kernel's internal dev_t (sb->s_dev), which the BPF programs

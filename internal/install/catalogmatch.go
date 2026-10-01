@@ -77,3 +77,19 @@ func (c *CandidateDir) SystemWhitelist() []BinaryRule {
 	}
 	return out
 }
+
+// WatchPatterns returns the entry's patterns for user expanded to absolute paths: the binaries
+// (Whitelist and LibDirWriters, fixed or glob) and the lib dirs (LibDirRelPaths) a catalog refresh
+// would admit. The daemon watches their roots for new matches.
+func (c *CandidateDir) WatchPatterns(user, home string) (binaries, dirs []string) {
+	for _, r := range c.ExpandWhitelist(user, home) {
+		binaries = append(binaries, r.Path)
+	}
+	for _, w := range c.LibDirWriters {
+		binaries = append(binaries, expandPlaceholders(w, user, home))
+	}
+	for _, rel := range c.LibDirRelPaths {
+		dirs = append(dirs, filepath.Join(home, expandPlaceholders(rel, user, home)))
+	}
+	return binaries, dirs
+}

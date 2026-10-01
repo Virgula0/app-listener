@@ -596,7 +596,7 @@ func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
 		pattern := filepath.Join(home, expandPlaceholders(rel, user, home))
 		matches := []string{pattern}
 		if strings.ContainsAny(pattern, "*?[") {
-			m, err := filepath.Glob(pattern)
+			m, err := boundedGlob(pattern)
 			if err != nil {
 				continue
 			}
@@ -632,7 +632,7 @@ func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
 		pattern := expandPlaceholders(bin, user, home)
 		matches := []string{pattern}
 		if strings.ContainsAny(pattern, "*?[") {
-			m, err := filepath.Glob(pattern)
+			m, err := boundedGlob(pattern)
 			if err != nil {
 				continue // malformed pattern: skip the whole entry
 			}
@@ -814,7 +814,7 @@ func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
 	var out []BinaryRule
 	for _, rule := range c.Entry.ExpandWhitelist(c.User.Name, c.User.Home) {
 		if strings.ContainsAny(rule.Path, "*?[") {
-			matches, err := filepath.Glob(rule.Path)
+			matches, err := boundedGlob(rule.Path)
 			if err != nil {
 				continue // malformed pattern: skip the whole entry
 			}

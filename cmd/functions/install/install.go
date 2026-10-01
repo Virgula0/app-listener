@@ -395,7 +395,7 @@ func runUpdateCatalogOnly(autoConfirm, live bool) error {
 // automated callers (--yes: pacman/apt hooks, boot refresh unit): a package transaction or boot
 // must not fail because no section is catalog-managed. Interactive callers still see the error.
 func softenAutomatedRefreshErr(err error, autoConfirm bool) error {
-	if err != nil && autoConfirm && errors.Is(err, errNoCatalogMatch) {
+	if err != nil && autoConfirm && errors.Is(err, inst.ErrNoCatalogMatch) {
 		log.Infof("catalog refresh: %v — nothing to do", err)
 		return nil
 	}
