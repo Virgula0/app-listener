@@ -108,8 +108,8 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	for k := range flags {
 		liftSuperseded(k)
 	}
-	if err := t.keepSuperseded(flags); err != nil {
-		return fmt.Errorf("keeping superseded trusted files: %w", err)
+	if err := t.keepLive(flags); err != nil {
+		return fmt.Errorf("keeping live trusted files: %w", err)
 	}
 	if err := syncMap(t.objs.GuardTrustedFiles, flags); err != nil {
 		return fmt.Errorf("syncing trusted files: %w", err)
@@ -119,11 +119,12 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	return nil
 }
 
-// keepSuperseded adds to flags every trusted inode that lost its last link but still exists: a
-// process started before the update keeps its library allowlist across a reload, which rebuilds
-// the set from paths. Bit rows (owners, updaters, writers) are not kept: their bits are reassigned
-// per reload.
-func (t *TrustGuard) keepSuperseded(flags map[GuardInodeKey]uint8) error {
+// keepLive adds to flags every trusted inode a guard still admits without a config path naming it:
+// a system binary admitted live (admitSystemMatches), or a superseded one a process started before
+// its update still runs. A reload rebuilds the set from paths, and losing the flag would lift the
+// library allowlist from a process that holds its resource's secrets. Bit rows (owners, updaters,
+// writers) are not kept: their bits are reassigned per reload.
+func (t *TrustGuard) keepLive(flags map[GuardInodeKey]uint8) error {
 	var k GuardInodeKey
 	var f uint8
 	it := t.objs.GuardTrustedFiles.Iterate()
@@ -131,7 +132,7 @@ func (t *TrustGuard) keepSuperseded(flags map[GuardInodeKey]uint8) error {
 		if _, ok := flags[k]; ok {
 			continue
 		}
-		if mark, ok := supersededMark(k); ok && mark.Freed == 0 {
+		if mark, ok := supersededMark(k); (ok && mark.Freed == 0) || (!ok && sharedEngine.admitsExe(k)) {
 			flags[k] = f
 		}
 	}

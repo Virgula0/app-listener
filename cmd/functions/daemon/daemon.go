@@ -924,7 +924,8 @@ func resolveConfigPath() (string, error) {
 // buildOneGuard builds and attaches one resource's guard. Inputs (self, deviceSet, pin) are
 // read-only and precomputed, and it touches nothing beyond r and its result, so buildGuards runs it
 // concurrently.
-func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet []uint32, pin pinCfg) (*guard.Guard, error) {
+func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet []uint32, pin pinCfg,
+	system []daemonconfig.BinaryRule) (*guard.Guard, error) {
 	binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
 	events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
 	var deferred []daemonconfig.BinaryRule
@@ -967,6 +968,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		// Pin LSM links so a SIGKILL leaves the tree enforced until ExecStopPost locks the vault.
 		guard.WithPinning(pin.prefix(r.Path)),
 		guard.WithBackingDevices(deviceSet),
+		guard.WithSystemPatterns(system),
 	}
 	if headless && blockedOnly {
 		opts = append(opts, guard.WithoutAllowedEvents())
@@ -1016,6 +1018,7 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 	// resource's backing device, the rest opt out, avoiding N duplicate, misattributed stamps.
 	// Computed up front (pure function of resources); workers only read it.
 	rawDevices := backingDeviceUnion(resources)
+	system := systemPatterns(resources)
 
 	built := make([]*guard.Guard, len(resources))
 	errs := make([]error, len(resources))
@@ -1034,7 +1037,7 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			if i == 0 {
 				deviceSet = rawDevices
 			}
-			built[i], errs[i] = buildOneGuard(&resources[i], self, deviceSet, pin)
+			built[i], errs[i] = buildOneGuard(&resources[i], self, deviceSet, pin, system[i])
 		}(i)
 	}
 	wg.Wait()
@@ -1059,6 +1062,42 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 		guards[i] = g
 	}
 	return guards, nil
+}
+
+// systemPatterns returns, per resource, its catalog entry's absolute whitelist patterns with the
+// events they grant: a new system binary matching one is admitted by the re-sync, no reload
+// (guard.WithSystemPatterns). A pattern naming an unknown event is dropped rather than widened.
+func systemPatterns(resources []daemonconfig.Resource) [][]daemonconfig.BinaryRule {
+	out := make([][]daemonconfig.BinaryRule, len(resources))
+	users, err := install.ListUsers()
+	if err != nil {
+		log.Warnf("daemon: listing users (%v) — new system binaries wait for a reload", err)
+		return out
+	}
+	for i := range resources {
+		entry, _ := install.ResolveCatalogEntry(resources[i].EncryptionRootOrPath(), users)
+		if entry == nil || resources[i].ReadOnly {
+			continue
+		}
+		for _, r := range entry.SystemWhitelist() {
+			if rule, ok := systemRule(r); ok {
+				out[i] = append(out[i], rule)
+			}
+		}
+	}
+	return out
+}
+
+func systemRule(r install.BinaryRule) (daemonconfig.BinaryRule, bool) {
+	rule := daemonconfig.BinaryRule{Path: r.Path}
+	for _, e := range r.Events {
+		t, ok := ebpf.ParseEventType(e)
+		if !ok {
+			return rule, false
+		}
+		rule.Events = append(rule.Events, t)
+	}
+	return rule, true
 }
 
 // backingDeviceUnion is the deduplicated set of backing block devices in guard_fs_devices key form.

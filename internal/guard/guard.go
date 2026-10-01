@@ -177,6 +177,8 @@ type Guard struct {
 	dropAllowed bool
 	// chmodDropWrite: WithChmodDropWrite.
 	chmodDropWrite bool
+	// systemPatterns: WithSystemPatterns.
+	systemPatterns []daemonconfig.BinaryRule
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -246,6 +248,15 @@ func WithoutAllowedEvents() GuardOption {
 func WithChmodDropWrite() GuardOption {
 	return func(g *Guard) {
 		g.chmodDropWrite = true
+	}
+}
+
+// WithSystemPatterns lists the resource's absolute catalog whitelist patterns (fixed paths or
+// globs). ReSyncBinaries admits a new match only root could have installed with no reload
+// (admitSystemMatches).
+func WithSystemPatterns(rules []daemonconfig.BinaryRule) GuardOption {
+	return func(g *Guard) {
+		g.systemPatterns = rules
 	}
 }
 
@@ -950,7 +961,7 @@ func canonicalBinaryPath(path string) string {
 // its event mask to guard_exe_events.
 func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][]ebpf.EventType) error {
 	action := uint8(GUARD_BLOCK)
-	if g.mode == ModeWhitelist {
+	if g.mode == ModeWhitelist || g.mode == ModeReadOnly {
 		action = uint8(GUARD_ALLOW)
 	}
 	if err := g.putExeAction(key, action); err != nil {
@@ -1026,45 +1037,169 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 
 	var changed int
 	for _, b := range binaries {
-		path := canonicalBinaryPath(b.Path)
-		dev, ino, err := ebpf.StatConfined(b.Path)
+		ok, err := g.resyncOne(b.Path, exeEvents)
 		if err != nil {
-			// Vanished mid-update (rename, then removal) or re-pointed out of its tree; the previously
-			// deployed key stays valid.
-			continue
-		}
-		key := GuardInodeKey{Dev: dev, Ino: ino}
-
-		g.mu.Lock()
-		old := g.deployed[path]
-		g.mu.Unlock()
-		if old == key {
-			continue
-		}
-		// Re-admitting by path alone let anyone who could swap the path (or a parent directory)
-		// inherit the entry; only an inode its updater created qualifies. Reload is the
-		// operator's path for anything else.
-		if !replacementAllowed(b.Path, old, key) {
-			if g.refused.firstTime(path, key) {
-				log.Warnf("guard %s: replacement of %s (inode %d) was not created by its updater — "+
-					"not re-admitted; reload the daemon after verifying it", g.path, path, key.Ino)
-			}
-			continue
-		}
-		liftSuperseded(key)
-		if err := g.putBinaryKey(key, b.Path, exeEvents); err != nil {
 			return changed, err
 		}
-		g.mu.Lock()
-		g.deployed[path] = key
-		g.keyPaths[key] = b.Path
-		g.mu.Unlock()
-		changed++
+		if ok {
+			changed++
+		}
 	}
 	if changed > 0 {
 		log.Infof("guard %s: re-synced %d binary inode(s) after replacement", g.path, changed)
 	}
-	return changed, nil
+	added, err := g.admitSystemMatches()
+	return changed + added, err
+}
+
+// resyncOne admits the inode now at the whitelisted binPath when it replaced the deployed one and
+// the replacement check approves it. The key admitted is the one the check judged, from one
+// confined open: a rename after it cannot slip another inode in.
+func (g *Guard) resyncOne(binPath string, exeEvents map[string][]ebpf.EventType) (bool, error) {
+	path := canonicalBinaryPath(binPath)
+	f, err := ebpf.OpenConfined(binPath)
+	if err != nil {
+		// Vanished mid-update (rename, then removal) or re-pointed out of its tree; the previously
+		// deployed key stays valid.
+		return false, nil
+	}
+	defer f.Close()
+	dev, ino, err := ebpf.StatFile(f)
+	if err != nil {
+		return false, nil // unreadable now: keep the deployed key
+	}
+	key := GuardInodeKey{Dev: dev, Ino: ino}
+
+	g.mu.Lock()
+	old := g.deployed[path]
+	g.mu.Unlock()
+	if old == key {
+		return false, nil
+	}
+	// Re-admitting by path alone let anyone who could swap the path (or a parent directory)
+	// inherit the entry; only an inode its updater created, or a system file only root could
+	// have put there, qualifies. Reload is the operator's path for anything else.
+	if !replacementAllowed(binPath, f, old, key) {
+		if g.refused.firstTime(path, key) {
+			log.Warnf("guard %s: replacement of %s (inode %d) was neither created by its updater nor a "+
+				"root-owned system file — not re-admitted; reload the daemon after verifying it", g.path,
+				path, key.Ino)
+		}
+		return false, nil
+	}
+	liftSuperseded(key)
+	if err := g.putBinaryKey(key, binPath, exeEvents); err != nil {
+		return false, err
+	}
+	g.mu.Lock()
+	g.deployed[path] = key
+	g.keyPaths[key] = binPath
+	g.mu.Unlock()
+	return true, nil
+}
+
+// maxPatternMatches caps one system pattern's matches per re-sync.
+const maxPatternMatches = 64
+
+// admitSystemMatches admits each new match of the resource's absolute catalog patterns
+// (WithSystemPatterns) that is a system file, with no reload. Other matches wait for the catalog
+// refresh, which vets them by its own rules.
+func (g *Guard) admitSystemMatches() (int, error) {
+	g.mu.Lock()
+	patterns := g.systemPatterns
+	known := make(map[string]bool, len(g.binaries)+len(g.deferred))
+	for _, b := range g.binaries {
+		known[b.Path] = true
+	}
+	for _, d := range g.deferred {
+		known[d.rule.Path] = true
+	}
+	g.mu.Unlock()
+
+	added := 0
+	for _, r := range patterns {
+		for _, m := range patternMatches(r.Path) {
+			if known[m] {
+				continue
+			}
+			ok, err := g.admitSystemMatch(m, r.Events)
+			if err != nil {
+				return added, err
+			}
+			if ok {
+				known[m] = true
+				added++
+			}
+		}
+	}
+	return added, nil
+}
+
+// patternMatches expands a fixed path or glob, at most maxPatternMatches.
+func patternMatches(pattern string) []string {
+	if !strings.ContainsAny(pattern, "*?[") {
+		return []string{pattern}
+	}
+	m, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil
+	}
+	if len(m) > maxPatternMatches {
+		m = m[:maxPatternMatches]
+	}
+	return m
+}
+
+// admitSystemMatch admits path when the inode it opens to is a system file. Hash, key and resolved
+// path all come from that open.
+func (g *Guard) admitSystemMatch(path string, events []ebpf.EventType) (bool, error) {
+	f, err := ebpf.OpenConfined(path)
+	if err != nil {
+		return false, nil // not installed (any more)
+	}
+	defer f.Close()
+	dev, ino, err := ebpf.StatFile(f)
+	if err != nil {
+		return false, nil // unreadable now: next re-sync
+	}
+	key := GuardInodeKey{Dev: dev, Ino: ino}
+	resolved, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	if err != nil {
+		return false, nil // unreadable now: next re-sync
+	}
+	g.mu.Lock()
+	_, deployed := g.deployed[resolved]
+	g.mu.Unlock()
+	if deployed {
+		return false, nil // another whitelist line already names this file
+	}
+	if !replacementAllowed(path, f, GuardInodeKey{}, key) {
+		return false, nil
+	}
+	entry, err := ebpf.ComputeBinaryEntryFile(f, path)
+	if err != nil {
+		return false, nil // unreadable now: next re-sync
+	}
+	liftSuperseded(key)
+	if err := g.putBinaryKey(key, path, map[string][]ebpf.EventType{path: events}); err != nil {
+		return false, err
+	}
+	g.mu.Lock()
+	g.binaries = append(g.binaries, entry)
+	if g.exeEvents == nil {
+		g.exeEvents = make(map[string][]ebpf.EventType)
+	}
+	g.exeEvents[path] = events
+	g.canonicalPaths[path] = resolved
+	g.deployed[resolved] = key
+	g.keyPaths[key] = path
+	if g.binaryVerifyStates != nil {
+		g.binaryVerifyStates[resolved] = &binaryVerifyState{key: key, hash: entry.Hash}
+	}
+	g.mu.Unlock()
+	log.Infof("guard %s: admitted %s (inode %d): a new root-owned system binary matching a catalog pattern",
+		g.path, logging.SanitizeText(path), key.Ino)
+	return true, nil
 }
 
 // writeGuardConfig stores this resource's mode, recursion flag and depth limit in its slot,

@@ -23,9 +23,13 @@ func TestReSyncBinaries_RefusedReplacementKeepsOldKey(t *testing.T) {
 		deployed: map[string]GuardInodeKey{bin: old}}
 
 	var asked []GuardInodeKey
-	SetReplacementCheck(func(path string, o, n GuardInodeKey) bool {
+	SetReplacementCheck(func(path string, f *os.File, o, n GuardInodeKey) bool {
 		if path != bin || o != old {
 			t.Errorf("check got path=%s old=%+v", path, o)
+		}
+		// The check judges the very inode about to be admitted.
+		if d, i, err := ebpf.StatFile(f); err != nil || (GuardInodeKey{Dev: d, Ino: i}) != n {
+			t.Errorf("the check's fd holds %d:%d (%v), the key asked about is %+v", d, i, err, n)
 		}
 		asked = append(asked, n)
 		return false
