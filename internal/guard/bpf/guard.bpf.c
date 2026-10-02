@@ -2,6 +2,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <errno.h>
+#include "inode_dev.h"
 
 #define MAX_PATH 256
 // VFS access-mask bits for bpf_lsm_inode_permission/file_permission. This kernel (7.0-hardened)
@@ -118,6 +119,7 @@ struct res_config {
 	__u64 root_ino;
 	__u64 taint_set; // nonzero: a taint-set slot (no tree; only judges tainted processes)
 	__u64 chmod_drop_write; // lib_dir only: see chmod_only_drops_write
+	__u64 root_sbdev;       // the watch root's superblock (sb_dev): root_in_chain's same-fs test
 };
 
 struct {
@@ -301,16 +303,7 @@ static __always_inline int get_current_exe_inode(struct inode_key *ik)
 		return 0;
 
 	bpf_probe_read_kernel(&ik->ino, sizeof(ik->ino), &exe_inode->i_ino);
-
-	struct super_block *sb;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &exe_inode->i_sb);
-	if (!sb)
-		return 0;
-
-	dev_t dev;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	ik->dev = dev;
-
+	ik->dev = inode_dev((__u64)exe_inode);
 	return 1;
 }
 
@@ -337,16 +330,7 @@ static __always_inline int get_task_exe_inode(struct task_struct *task, struct i
 		return 0;
 
 	bpf_probe_read_kernel(&ik->ino, sizeof(ik->ino), &exe_inode->i_ino);
-
-	struct super_block *sb;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &exe_inode->i_sb);
-	if (!sb)
-		return 0;
-
-	dev_t dev;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	ik->dev = dev;
-
+	ik->dev = inode_dev((__u64)exe_inode);
 	return 1;
 }
 
@@ -369,14 +353,7 @@ static __always_inline int inode_key_of(struct inode *inode, struct inode_key *i
 		return 0;
 
 	bpf_probe_read_kernel(&ikey->ino, sizeof(ikey->ino), &inode->i_ino);
-
-	dev_t dev;
-	struct super_block *sb;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return 0;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	ikey->dev = dev;
+	ikey->dev = inode_dev((__u64)inode);
 	return 1;
 }
 
@@ -470,8 +447,8 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent, 
 		return 0;
 
 	// Perf gate: only files on a filesystem hosting a guarded root can have a guarded ancestor.
-	// guard_fs_sbdevs (populated unconditionally by Go, incl. anon tmpfs/overlayfs devs) lets other
-	// filesystems skip the walk with one lookup.
+	// guard_fs_sbdevs (superblock devices, populated unconditionally by Go, incl. anon
+	// tmpfs/overlayfs/btrfs ones) lets other filesystems skip the walk with one lookup.
 	struct super_block *sb;
 	bpf_probe_read_kernel(&sb, sizeof(sb), &parent_inode->i_sb);
 	if (sb) {
@@ -677,15 +654,7 @@ static __always_inline void evict_inode_from_guard(struct inode *inode)
 
 	struct inode_key ikey = {};
 	bpf_probe_read_kernel(&ikey.ino, sizeof(ikey.ino), &inode->i_ino);
-
-	struct super_block *sb;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return;
-
-	dev_t dev;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	ikey.dev = dev;
+	ikey.dev = inode_dev((__u64)inode);
 
 	bpf_map_delete_elem(&guard_inodes, &ikey);
 }
@@ -802,9 +771,10 @@ static __always_inline int emit_process_denial(__u32 reason, __u32 type, struct 
 // Fails closed in both ambiguous cases (root not configured; bound exhausted before the fs root):
 // the access is treated as rooted.
 //
-// The device is read once from the file's superblock; the watch root shares it, so a file on
-// another device can't have the root in its chain and the check is skipped. Per-ancestor probes are
-// inode-number only (probing every ancestor's superblock blew the verifier budget).
+// The superblock is read once from the file; the watch root's chain shares it, so a file on another
+// superblock can't have the root in its chain and the check is skipped. Per-ancestor probes are
+// inode-number only (probing every ancestor's superblock blew the verifier budget). Superblock, not
+// key device: a btrfs subvolume nested in the tree has its own key device but the root's chain.
 static __noinline int root_in_chain(struct dentry *dentry, struct inode *file_inode, int bound,
 					 __u32 res_id)
 {
@@ -814,31 +784,25 @@ static __noinline int root_in_chain(struct dentry *dentry, struct inode *file_in
 
 	__u64 want_dev = cfg->root_dev;
 	__u64 want_ino = cfg->root_ino;
-	if (!want_ino)
+	if (!want_ino || !cfg->root_sbdev)
 		return 1;  // root not yet recorded (pre-populate window): fail closed
 
 	bool on_dev = false;
 	__u64 ino = 0;
 	if (file_inode) {
 		bpf_probe_read_kernel(&ino, sizeof(ino), &file_inode->i_ino);
-		struct super_block *sb = NULL;
-		bpf_probe_read_kernel(&sb, sizeof(sb), &file_inode->i_sb);
-		if (sb) {
-			dev_t dev = 0;
-			bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-			if ((__u64)dev == want_dev && ino == want_ino)
-				return 1;
-			on_dev = ((__u64)dev == want_dev);
-		}
+		on_dev = sb_dev(file_inode) == cfg->root_sbdev;
+		if (on_dev && ino == want_ino && inode_dev((__u64)file_inode) == want_dev)
+			return 1;
 	}
-	// A chain from a file on a different device can never contain the watch root.
+	// A chain from a file on a different superblock can never contain the watch root.
 	if (file_inode && !on_dev)
 		return 0;
 	if (!dentry)
 		return 0;
 
 	// Walk up the chain (the file's own inode was checked above). All ancestors share the file's
-	// device, so only inodes are probed. Bound per hook: 32 for single-walk hooks (matching
+	// superblock, so only inodes are probed. Bound per hook: 32 for single-walk hooks (matching
 	// file_open), 16 for the verifier-tight two-walk hooks (unlink, link, rename); both exceed real
 	// path depth (deepest seen ~12). If exhausted, the final ancestor's parent is probed for the fs
 	// root, so a chain exactly at the bound still resolves; only deeper chains fail closed.
@@ -1124,13 +1088,7 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 					target_ik.res_id = res_id;
 					bpf_probe_read_kernel(&target_ik.ino.ino, sizeof(target_ik.ino.ino),
 							      &target->i_ino);
-					struct super_block *tsb;
-					bpf_probe_read_kernel(&tsb, sizeof(tsb), &target->i_sb);
-					if (tsb) {
-						dev_t tdev;
-						bpf_probe_read_kernel(&tdev, sizeof(tdev), &tsb->s_dev);
-						target_ik.ino.dev = tdev;
-					}
+					target_ik.ino.dev = inode_dev((__u64)target);
 					// This exec runs now, after any supersede of its image.
 					target_ik.res_id = res_id | (0U - (__u32)exe_is_superseded(&target_ik.ino));
 					target_action = bpf_map_lookup_elem(&guard_exe_actions, &target_ik);
@@ -2218,15 +2176,7 @@ int guard_bprm_check_security(unsigned long long *ctx)
 
 	struct inode_key target_ik = {};
 	bpf_probe_read_kernel(&target_ik.ino, sizeof(target_ik.ino), &inode->i_ino);
-
-	struct super_block *sb = NULL;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return 0;
-
-	dev_t dev = 0;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	target_ik.dev = dev;
+	target_ik.dev = inode_dev((__u64)inode);
 
 	// Whitelisted for any resource: this hook is not reached through a guarded path, so there is
 	// no inode to resolve a resource from. A superseded image still counts: the union only ever
@@ -2308,22 +2258,17 @@ int guard_inode_free(unsigned long long *ctx)
 	if (nlink != 0)
 		return 0; // live file leaving the cache, not a deletion
 
-	struct super_block *sb = NULL;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return 0;
-	__u64 dev = 0;
-	bpf_probe_read_kernel(&dev, sizeof(dev_t), &sb->s_dev);
 	__u64 ino = 0;
 	bpf_probe_read_kernel(&ino, sizeof(ino), &inode->i_ino);
 	struct inode_key ikey = {};
-	ikey.dev = dev;
+	ikey.dev = inode_dev((__u64)inode);
 	ikey.ino = ino;
 
 	// Binaries live on any filesystem, not only guarded ones: before the sbdevs gate.
 	exe_note_freed(&ikey, bpf_map_lookup_elem(&guard_exe_union, &ikey) != NULL);
 
-	if (!bpf_map_lookup_elem(&guard_fs_sbdevs, &dev))
+	__u64 sbdev = sb_dev(inode);
+	if (!bpf_map_lookup_elem(&guard_fs_sbdevs, &sbdev))
 		return 0;
 
 	// Read the owning resource before dropping the entry: it names whose watch root this may be.
@@ -2336,7 +2281,7 @@ int guard_inode_free(unsigned long long *ctx)
 	// next sweep.
 	if (owner < GUARD_MAX_RES) {
 		struct res_config *cfg = bpf_map_lookup_elem(&guard_res_config, &owner);
-		if (cfg && cfg->root_dev == dev && cfg->root_ino == ino)
+		if (cfg && cfg->root_dev == ikey.dev && cfg->root_ino == ino)
 			cfg->root_ino = 0;
 	}
 	return 0;
@@ -2380,13 +2325,7 @@ int guard_bprm_committed(unsigned long long *ctx)
 		return 0;
 	struct inode_key ik = {};
 	bpf_probe_read_kernel(&ik.ino, sizeof(ik.ino), &inode->i_ino);
-	struct super_block *sb = NULL;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return 0;
-	dev_t dev = 0;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	ik.dev = dev;
+	ik.dev = inode_dev((__u64)inode);
 
 	// Keep the taint while the new image may still read what the process holds: judged by the
 	// owning resource's whitelist, or — for content from several resources (GLOBAL, a taint set) —

@@ -1334,6 +1334,9 @@ func (g *Guard) populateMaps() error {
 	if err != nil {
 		return err
 	}
+	if err := checkBtrfsKeys(g.path, g.binaries); err != nil {
+		return err
+	}
 	if cfgErr := g.writeGuardConfig(modeKey); cfgErr != nil {
 		return cfgErr
 	}
@@ -1346,7 +1349,7 @@ func (g *Guard) populateMaps() error {
 		return fmt.Errorf("stating guard root %s: %w", g.path, rootErr)
 	}
 	root.close()
-	if keyErr := g.updateRootKey(root.key); keyErr != nil {
+	if keyErr := g.updateRootKey(root.key, root.sbdev); keyErr != nil {
 		return keyErr
 	}
 	g.mu.Lock()
@@ -1384,44 +1387,41 @@ func (g *Guard) populateMaps() error {
 	if err := g.addBackingBlockDevice(); err != nil {
 		log.Warnf("backing block device detection: %v", err)
 	}
-	if err := g.addFsDeviceGate(); err != nil {
+	if err := g.addFsDeviceGate(root.sbdev); err != nil {
 		return fmt.Errorf("filesystem device gate: %w", err)
 	}
 
 	return nil
 }
 
-// addFsDeviceGate records the path's fs device in guard_fs_sbdevs so the ancestor walk skips other
-// filesystems in one lookup (st_dev == i_sb->s_dev on all fs types, incl. anon
-// tmpfs/overlayfs/btrfs). Must not fail open: without its device the walk answers "not guarded" on
-// the whole filesystem, so rename/unlink/stat of an unmapped inode below the root go unchecked.
-func (g *Guard) addFsDeviceGate() error {
-	var s syscall.Stat_t
-	if err := syscall.Stat(g.path, &s); err != nil {
-		return fmt.Errorf("stating guarded path: %w", err)
-	}
-
-	major := unix.Major(s.Dev)
-	dev := uint64(major)<<20 | uint64(unix.Minor(s.Dev))
+// addFsDeviceGate records the root's superblock device in guard_fs_sbdevs so the ancestor walk
+// skips other filesystems in one lookup. The superblock's, not st_dev: on btrfs st_dev names the
+// subvolume. Must not fail open: without its device the walk answers "not guarded" on the whole
+// filesystem, so rename/unlink/stat of an unmapped inode below the root go unchecked.
+func (g *Guard) addFsDeviceGate(sbdev uint64) error {
 	var val uint8 = 1
-	if err := g.objs().GuardFsSbdevs.Put(dev, val); err != nil {
-		return fmt.Errorf("storing filesystem device %d:%d in map: %w", major, unix.Minor(s.Dev), err)
+	if err := g.objs().GuardFsSbdevs.Put(sbdev, val); err != nil {
+		return fmt.Errorf("storing filesystem device %d:%d in map: %w", sbdev>>20, sbdev&0xfffff, err)
 	}
 	return nil
 }
 
-// BackingDevice returns the guard_fs_devices key (dev_t, major<<20|minor) of path's backing block
-// device; false for tmpfs, overlayfs, procfs and other major-0 pseudo-filesystems.
-func BackingDevice(path string) (rdev uint32, hasDevice bool, err error) {
+// BackingDevices returns the guard_fs_devices keys (dev_t, major<<20|minor) of path's backing
+// block devices: every member device on btrfs, whose st_dev names none; nil for tmpfs, overlayfs,
+// procfs and other major-0 pseudo-filesystems.
+func BackingDevices(path string) ([]uint32, error) {
 	var s syscall.Stat_t
 	if statErr := syscall.Stat(path, &s); statErr != nil {
-		return 0, false, fmt.Errorf("stating %s: %w", path, statErr)
+		return nil, fmt.Errorf("stating %s: %w", path, statErr)
 	}
 	major := unix.Major(s.Dev)
-	if major == 0 {
-		return 0, false, nil
+	if major != 0 {
+		return []uint32{major<<20 | unix.Minor(s.Dev)}, nil
 	}
-	return major<<20 | unix.Minor(s.Dev), true, nil
+	if on, err := ebpf.OnBtrfs(path); err != nil || !on {
+		return nil, err
+	}
+	return ebpf.BtrfsDevices(path)
 }
 
 // addBackingBlockDevice populates guard_fs_devices so raw opens of the hosting block device(s) are
@@ -1431,15 +1431,11 @@ func (g *Guard) addBackingBlockDevice() error {
 	if g.rawDevicesSet {
 		return g.putBackingDevices(g.rawDevices)
 	}
-	rdev, hasDevice, err := BackingDevice(g.path)
+	rdevs, err := BackingDevices(g.path)
 	if err != nil {
 		return err
 	}
-	if !hasDevice {
-		// Pseudo-filesystem (tmpfs, overlay, procfs, etc.) — no backing block device.
-		return nil
-	}
-	return g.putBackingDevices([]uint32{rdev})
+	return g.putBackingDevices(rdevs)
 }
 
 func (g *Guard) putBackingDevices(rdevs []uint32) error {
@@ -1457,16 +1453,17 @@ func (g *Guard) putBackingDevices(rdevs []uint32) error {
 	return nil
 }
 
-// updateRootKey re-anchors the watch-root identity to newKey in guard_config[3..4] (root_in_chain)
-// and g.rootKey. Called from populateMaps and from SweepInodes when a single-file root is
-// recreated.
-func (g *Guard) updateRootKey(newKey GuardInodeKey) error {
+// updateRootKey re-anchors the watch-root identity to newKey on superblock sbdev in the resource's
+// config (root_in_chain) and g.rootKey. Called from populateMaps and from SweepInodes when a
+// single-file root is recreated.
+func (g *Guard) updateRootKey(newKey GuardInodeKey, sbdev uint64) error {
 	cfg, err := g.resConfig()
 	if err != nil {
 		return err
 	}
 	cfg.RootDev = newKey.Dev
 	cfg.RootIno = newKey.Ino
+	cfg.RootSbdev = sbdev
 	if putErr := g.objs().GuardResConfig.Put(g.resID, cfg); putErr != nil {
 		return fmt.Errorf("setting watch root in resource slot %d: %w", g.resID, putErr)
 	}
@@ -1581,7 +1578,7 @@ func (g *Guard) reanchorRoot(oldKey GuardInodeKey, root *rootHandle) error {
 	if err := g.scanRoot(root); err != nil {
 		return err
 	}
-	if err := g.updateRootKey(root.key); err != nil {
+	if err := g.updateRootKey(root.key, root.sbdev); err != nil {
 		return err
 	}
 	if delErr := g.objs().GuardInodes.Delete(oldKey); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {

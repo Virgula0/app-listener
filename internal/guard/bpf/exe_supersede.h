@@ -7,7 +7,7 @@
 // keeps admitting processes that exec'd it before, and refuses every later exec, the reused number's
 // included. One counter (exe_seq) orders execs against supersedes.
 //
-// Includer defines struct inode_key first.
+// Includer defines struct inode_key and includes inode_dev.h first.
 #ifndef EXE_SUPERSEDE_H
 #define EXE_SUPERSEDE_H
 
@@ -177,13 +177,7 @@ static __always_inline int exe_last_link_key(struct inode *inode, struct inode_k
 	if ((mode & 00170000) != 0100000 || nlink != 1)
 		return 0;
 	bpf_probe_read_kernel(&k->ino, sizeof(k->ino), &inode->i_ino);
-	struct super_block *sb = NULL;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return 0;
-	dev_t dev = 0;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	k->dev = dev;
+	k->dev = inode_dev((__u64)inode);
 	return 1;
 }
 

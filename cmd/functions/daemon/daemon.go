@@ -1147,23 +1147,24 @@ func systemRule(r install.BinaryRule) (daemonconfig.BinaryRule, bool) {
 }
 
 // backingDeviceUnion is the deduplicated set of backing block devices in guard_fs_devices key form.
-// Major-0 filesystems (tmpfs/overlay) have no device to raw-read and are skipped; un-stat-able
+// Pseudo-filesystems (tmpfs/overlay) have no device to raw-read and are skipped; un-stat-able
 // paths are reported and left uncovered rather than aborting.
 func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
 	seen := make(map[uint32]bool, len(resources))
 	out := make([]uint32, 0, len(resources))
 	for i := range resources {
 		r := &resources[i]
-		rdev, hasDevice, err := guard.BackingDevice(r.Path)
+		rdevs, err := guard.BackingDevices(r.Path)
 		if err != nil {
 			log.Warnf("daemon: raw block-device gate: %v (raw access to this device is not blocked)", err)
 			continue
 		}
-		if !hasDevice || seen[rdev] {
-			continue
+		for _, rdev := range rdevs {
+			if !seen[rdev] {
+				seen[rdev] = true
+				out = append(out, rdev)
+			}
 		}
-		seen[rdev] = true
-		out = append(out, rdev)
 	}
 	return out
 }

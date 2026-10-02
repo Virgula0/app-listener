@@ -27,6 +27,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <errno.h>
+#include "inode_dev.h"
 
 #define MAX_PATH 256
 #define PROT_EXEC 0x4
@@ -252,12 +253,13 @@ struct {
 	__type(value, __u8);
 } trust_code_suspect SEC(".maps");
 
-// guard_vouched_devs: sb->s_dev of every non-FUSE superblock with a mount WITHOUT nosuid in pid 1's
-// mount namespace, synced by userspace from /proc/1/mountinfo; value = the guard_dev_seq snapshot
-// taken before that read. Only root makes such a mount, so only there do on-disk root ownership bits
-// mean root wrote the file: udisks2/fusermount/fstab `user` force nosuid for user images. Judged per
-// superblock, not per mount, because sandboxes (bwrap, Flatpak, NoNewPrivileges units) remount the
-// same system superblocks nosuid in their own namespaces.
+// guard_vouched_devs: sb->s_dev (sb_dev; on btrfs no file's key device) of every non-FUSE
+// superblock with a mount WITHOUT nosuid in pid 1's mount namespace, synced by userspace from
+// /proc/1/mountinfo; value = the guard_dev_seq snapshot taken before that read. Only root makes
+// such a mount, so only there do on-disk root ownership bits mean root wrote the file:
+// udisks2/fusermount/fstab `user` force nosuid for user images. Judged per superblock, not per
+// mount, because sandboxes (bwrap, Flatpak, NoNewPrivileges units) remount the same system
+// superblocks nosuid in their own namespaces.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
@@ -310,20 +312,14 @@ struct {
 
 char LICENSE[] SEC("license") = "GPL";
 
-// fill_inode_key resolves inode's (dev, ino) with the same encoding as the rest of the guard (dev
-// from sb->s_dev). 0 if unreadable.
+// fill_inode_key resolves inode's (dev, ino) with the same encoding as the rest of the guard
+// (inode_dev). 0 if unreadable.
 static __always_inline int fill_inode_key(struct inode *inode, struct inode_key *k)
 {
 	if (!inode)
 		return 0;
 	bpf_probe_read_kernel(&k->ino, sizeof(k->ino), &inode->i_ino);
-	struct super_block *sb;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return 0;
-	dev_t dev = 0;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	k->dev = dev;
+	k->dev = inode_dev((__u64)inode);
 	return 1;
 }
 
@@ -465,33 +461,24 @@ static __always_inline int is_system_trusted(struct inode *inode, struct dentry 
 // nodev is not checked: snap squashfs mounts carry it. Missing entry or unreadable sb: untrusted.
 static __always_inline int mount_vouches_ownership(struct inode *inode)
 {
-	struct inode_key k = {};
-	if (!fill_inode_key(inode, &k))
+	__u64 dev = sb_dev(inode);
+	if (!dev)
 		return 0;
-	__u64 *synced = bpf_map_lookup_elem(&guard_vouched_devs, &k.dev);
+	__u64 *synced = bpf_map_lookup_elem(&guard_vouched_devs, &dev);
 	if (!synced)
 		return 0;
-	__u64 *died = bpf_map_lookup_elem(&guard_dead_devs, &k.dev);
+	__u64 *died = bpf_map_lookup_elem(&guard_dead_devs, &dev);
 	return !died || *died <= *synced;
 }
 
 // under_guarded_tree: the innermost guarded root at or above the file (guard_trusted_dirs) admits
-// the current exe. The tree shares the file's device, so the device is read once and only inode
-// numbers are compared per ancestor (same shape as root_in_chain).
+// the current exe. Each ancestor is keyed by its own inode_dev: a btrfs subvolume nested in the
+// tree has another key device than the root above it.
 static __always_inline int under_guarded_tree(struct inode *inode, struct dentry *dentry)
 {
 	if (!inode || !dentry)
 		return 0;
-	struct super_block *sb;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return 0;
-	dev_t dev = 0;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-
 	struct inode_key k = {};
-	k.dev = dev;
-
 	struct dentry *d = dentry;
 	for (int i = 0; i < 32; i++) {
 		if (!d)
@@ -500,6 +487,7 @@ static __always_inline int under_guarded_tree(struct inode *inode, struct dentry
 		bpf_probe_read_kernel(&di, sizeof(di), &d->d_inode);
 		if (di) {
 			bpf_probe_read_kernel(&k.ino, sizeof(k.ino), &di->i_ino);
+			k.dev = inode_dev((__u64)di);
 			__u64 *users = bpf_map_lookup_elem(&guard_trusted_dirs, &k);
 			if (users) {
 				if (*users & TRUSTED_DIR_ANY)
@@ -767,23 +755,16 @@ static __always_inline __u64 glob_name_bits(const unsigned char *name, __u32 n)
 	return bits;
 }
 
-// glob_root_bits: the reservations of dir and its ancestors. 32 steps cover any glob: a match sits
-// a fixed, shallow distance below its root.
+// glob_root_bits: the reservations of dir and its ancestors, each keyed by its own inode_dev (see
+// under_guarded_tree). 32 steps cover any glob: a match sits a fixed, shallow distance below its
+// root.
 static __always_inline __u64 glob_root_bits(struct dentry *dir)
 {
 	struct inode *inode = NULL;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dir->d_inode);
 	if (!inode)
 		return 0;
-	struct super_block *sb;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
-	if (!sb)
-		return 0;
-	dev_t dev = 0;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-
 	struct inode_key k = {};
-	k.dev = dev;
 	__u64 bits = 0;
 	struct dentry *d = dir;
 	for (int i = 0; i < 32; i++) {
@@ -791,6 +772,7 @@ static __always_inline __u64 glob_root_bits(struct dentry *dir)
 		bpf_probe_read_kernel(&di, sizeof(di), &d->d_inode);
 		if (di) {
 			bpf_probe_read_kernel(&k.ino, sizeof(k.ino), &di->i_ino);
+			k.dev = inode_dev((__u64)di);
 			__u64 *v = bpf_map_lookup_elem(&guard_glob_roots, &k);
 			if (v)
 				bits |= *v;
@@ -894,19 +876,21 @@ static __always_inline int mark_code_suspect(void)
 
 // under_secret_root: the innermost guarded root at or above dentry is whitelist-mode (a read-only
 // lib_dir holds world-readable code, not secrets). Nested roots are refused at config load.
+// Per-ancestor key devices: see under_guarded_tree.
 static __always_inline int under_secret_root(struct dentry *dentry)
 {
 	struct inode *inode = NULL;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
-	struct inode_key k = {};
-	if (!fill_inode_key(inode, &k))
+	if (!inode)
 		return 0;
+	struct inode_key k = {};
 	struct dentry *d = dentry;
 	for (int i = 0; i < 32; i++) {
 		struct inode *di = NULL;
 		bpf_probe_read_kernel(&di, sizeof(di), &d->d_inode);
 		if (di) {
 			bpf_probe_read_kernel(&k.ino, sizeof(k.ino), &di->i_ino);
+			k.dev = inode_dev((__u64)di);
 			__u64 *users = bpf_map_lookup_elem(&guard_trusted_dirs, &k);
 			if (users)
 				return (*users & TRUSTED_DIR_ANY) != 0;

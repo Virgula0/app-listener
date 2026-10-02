@@ -95,8 +95,9 @@ func (t *TrustGuard) updaterCreated(path string, old GuardInodeKey, nk GuardTrus
 
 // systemFile: path is root-placed (ebpf.OpenSystemPlaced: every directory and symlink hop leading
 // to it is root's) and ends on k, the inode f holds open so its number can't be reused meanwhile, on
-// a superblock root vouches for (mount_vouches_ownership). The name is judged, not only the inode:
-// a user can point a name it controls at any root-owned binary.
+// a superblock root vouches for (mount_vouches_ownership: by superblock device, which on btrfs is
+// not k.Dev). The name is judged, not only the inode: a user can point a name it controls at any
+// root-owned binary.
 func (t *TrustGuard) systemFile(path string, f *os.File, k GuardInodeKey) bool {
 	if f == nil {
 		return false
@@ -107,14 +108,18 @@ func (t *TrustGuard) systemFile(path string, f *os.File, k GuardInodeKey) bool {
 		return false
 	}
 	defer sp.Close()
-	if dev, ino, err := ebpf.StatFile(sp); err != nil || dev != k.Dev || ino != k.Ino {
+	if dev, ino, statErr := ebpf.StatFile(sp); statErr != nil || dev != k.Dev || ino != k.Ino {
+		return false
+	}
+	sbdev, err := ebpf.SuperblockDev(int(sp.Fd()))
+	if err != nil {
 		return false
 	}
 	var synced, died uint64
-	if t.objs.GuardVouchedDevs.Lookup(k.Dev, &synced) != nil {
+	if t.objs.GuardVouchedDevs.Lookup(sbdev, &synced) != nil {
 		return false
 	}
-	return t.objs.GuardDeadDevs.Lookup(k.Dev, &died) != nil || died <= synced
+	return t.objs.GuardDeadDevs.Lookup(sbdev, &died) != nil || died <= synced
 }
 
 // adoptRows copies every exe/target-keyed trust row of old to newKey. old must be a trusted file:

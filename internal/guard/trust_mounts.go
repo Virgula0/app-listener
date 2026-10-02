@@ -106,6 +106,8 @@ func (t *TrustGuard) SyncMounts() error {
 	if t.mountUntracked {
 		return errors.New("mount changes are no longer tracked; restart the daemon")
 	}
+	// A btrfs mounted since start may have just loaded the module and its BTF.
+	ensureBtrfsLayout()
 	n, err := t.syncVouchedDevs()
 	if err != nil {
 		if cerr := syncMap(t.objs.GuardVouchedDevs, map[uint64]uint64{}); cerr != nil {
