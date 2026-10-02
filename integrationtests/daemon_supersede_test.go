@@ -114,7 +114,7 @@ need_encryption: false
 	old := s.inodeOf(c, "/mnt/img/bin/app")
 	code, out = s.exec(c, []string{"sh", "-c", "rm -f /mnt/img/bin/app && " + nobodyRun + "cp " + swapReaderPath +
 		" /mnt/img/drop/evil && stat -c 'ino=%i' /mnt/img/drop/evil"})
-	s.Require().Equalf(0, code, "uninstall + an unprivileged copy: %s", out)
+	s.Require().Equalf(0, code, "uninstall + an unprivileged copy: %s\ndaemon log:\n%s", out, s.readDaemonLog(c))
 	m := regexp.MustCompile(`ino=(\d+)`).FindStringSubmatch(out)
 	s.Require().NotNil(m, out)
 	s.Require().Equalf(old, m[1], "fixture: ext4 must hand the freed number to the next file (old %s)", old)

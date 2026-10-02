@@ -327,10 +327,17 @@ static __always_inline int fill_inode_key(struct inode *inode, struct inode_key 
 	return 1;
 }
 
-static __always_inline __u8 trusted_flags_of(struct inode *inode)
+// protected_flags: inode's trust flags for protection #1. A freed key's number now names another
+// file, which inherits none of them; a key only superseded keeps them, as its inode may still be
+// linked (a failed unlink after the mark). A number reused before the freed mark lands stays
+// protected until it does: a false deny, never a gap.
+static __noinline __u8 protected_flags(struct inode *inode)
 {
 	struct inode_key k = {};
 	if (!fill_inode_key(inode, &k))
+		return 0;
+	struct exe_supersede *s = bpf_map_lookup_elem(&exe_superseded, &k);
+	if (s && s->freed)
 		return 0;
 	__u8 *f = bpf_map_lookup_elem(&guard_trusted_files, &k);
 	return f ? *f : 0;
@@ -961,7 +968,7 @@ int trust_mmap(unsigned long long *ctx)
 // Root-owned system binaries are exempt (package manager upgrades; non-root can't touch them).
 static __always_inline int protected_writable_target(struct inode *inode, struct dentry *dentry)
 {
-	if (!(trusted_flags_of(inode) & (TRUSTED_BINARY | TRUSTED_LIB)))
+	if (!(protected_flags(inode) & (TRUSTED_BINARY | TRUSTED_LIB)))
 		return 0;
 	if (is_system_trusted(inode, dentry))
 		return 0; // root-owned system binary: not our concern
