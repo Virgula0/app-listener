@@ -116,3 +116,50 @@ func TestRefreshCatalogUserSectionsOnly(t *testing.T) {
 		t.Fatalf("a config without catalog sections: err = %v, want ErrNoCatalogMatch", err)
 	}
 }
+
+func TestRefreshCatalogAdmitVetsOnlyNewLines(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".config", "discord")
+	var bins []string
+	for _, v := range []string{"0.0.1", "0.0.2"} {
+		if err := os.MkdirAll(filepath.Join(root, v), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		bins = append(bins, filepath.Join(root, v, "Discord"))
+		if err := os.WriteFile(bins[len(bins)-1], []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listed, added := bins[0], bins[1]
+	conf := "[watch " + root + "]\nneed_encryption: false\n" + listed + "\n"
+	confPath := filepath.Join(t.TempDir(), "daemon.conf")
+	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := daemonconfig.Load(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := func(_ *daemonconfig.Resource, expand func() []BinaryRule) ([]BinaryRule, bool, error) {
+		return expand(), false, nil
+	}
+	var asked []string
+	refuse := func(_ User, b BinaryRule) bool {
+		asked = append(asked, b.Path)
+		return false
+	}
+	text, changes, err := RefreshCatalog(conf, cfg, []User{{Name: "u", Home: home}},
+		RefreshOptions{Live: true, Scan: plain, Admit: refuse})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(asked, []string{added}) {
+		t.Errorf("Admit was asked about %v; want only the line the section doesn't list yet", asked)
+	}
+	if !strings.Contains(text, listed) || strings.Contains(text, added) {
+		t.Errorf("a refused new line must stay out and a listed one in:\n%s", text)
+	}
+	if len(changes) != 0 {
+		t.Errorf("changes = %+v, want none", changes)
+	}
+}

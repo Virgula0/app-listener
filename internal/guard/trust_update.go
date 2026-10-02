@@ -38,8 +38,8 @@ func (t *TrustGuard) SetUpdaters(p UpdaterPlan) error {
 }
 
 // AllowReplacement reports whether newKey, the inode f holds at the whitelisted path, may be
-// admitted in place of old: created by one of its updaters (updaterCreated) or a system file only
-// root could have put there (systemFile). On approval it inherits old's trust rows, so it keeps its
+// admitted in place of old: created by one of its updaters (updaterCreated) or a system file at a
+// name only root could have placed (systemFile). On approval it inherits old's trust rows, so it keeps its
 // write-protection, library allowlist and writer bits until the next reload; a row that can't be
 // copied refuses it.
 func (t *TrustGuard) AllowReplacement(path string, f *os.File, old, newKey GuardInodeKey) bool {
@@ -52,7 +52,7 @@ func (t *TrustGuard) AllowReplacement(path string, f *os.File, old, newKey Guard
 		}
 		return true
 	}
-	if !t.systemFile(f, newKey) {
+	if !t.systemFile(path, f, newKey) {
 		return false
 	}
 	liftSuperseded(newKey)
@@ -93,11 +93,21 @@ func (t *TrustGuard) updaterCreated(path string, old GuardInodeKey, nk GuardTrus
 	return t.objs.GuardBinUpdaters.Lookup(o.Exe, &upd) == nil && upd&owner != 0
 }
 
-// systemFile is the kernel's auto-trust rule (is_system_trusted + mount_vouches_ownership) on the
-// inode f holds: root-owned, in a root-owned directory, on a superblock mounted without nosuid in
-// pid 1's namespace.
-func (t *TrustGuard) systemFile(f *os.File, k GuardInodeKey) bool {
-	if f == nil || ebpf.CheckSystemTrusted(f) != nil {
+// systemFile: path is root-placed (ebpf.OpenSystemPlaced: every directory and symlink hop leading
+// to it is root's) and ends on k, the inode f holds open so its number can't be reused meanwhile, on
+// a superblock root vouches for (mount_vouches_ownership). The name is judged, not only the inode:
+// a user can point a name it controls at any root-owned binary.
+func (t *TrustGuard) systemFile(path string, f *os.File, k GuardInodeKey) bool {
+	if f == nil {
+		return false
+	}
+	sp, err := ebpf.OpenSystemPlaced(path)
+	if err != nil {
+		log.Debugf("trust guard: %s is not a system file: %v", path, err)
+		return false
+	}
+	defer sp.Close()
+	if dev, ino, err := ebpf.StatFile(sp); err != nil || dev != k.Dev || ino != k.Ino {
 		return false
 	}
 	var synced, died uint64

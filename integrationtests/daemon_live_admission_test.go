@@ -95,3 +95,85 @@ need_encryption: false
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
+
+const jetbrainsSecret = "/root/.config/JetBrains/secret"
+
+// startJetBrainsDaemon guards jetbrainsSecret (a catalog section, so /opt/*/jbr/bin/java is a
+// system pattern) with a root-installed /opt/idea/jbr/bin/java plus extra lines. The secret holds
+// "STOLEN|marker" so a plain reader (grep, sed) prints what the probes look for.
+func (s *IntegrationSuite) startJetBrainsDaemon(c testcontainers.Container, marker, setup string, extra ...string) {
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.copySwapFixtures(c)
+	cmd := "mkdir -p /etc/app-listener /root/.config/JetBrains /opt/idea/jbr/bin && printf 'STOLEN|" + marker +
+		"\\n' > " + jetbrainsSecret + " && cp " + swapReaderPath + " /opt/idea/jbr/bin/java"
+	if setup != "" {
+		cmd += " && " + setup
+	}
+	code, out := s.exec(c, []string{"sh", "-c", cmd + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[watch /root/.config/JetBrains]\nneed_encryption: false\n/opt/idea/jbr/bin/java\n"+
+		strings.Join(extra, "\n"))
+}
+
+// asNobody runs cmd as the unprivileged user and requires it to succeed: it is the attack's setup,
+// not what the guard must refuse.
+func (s *IntegrationSuite) asNobody(c testcontainers.Container, what, cmd string) {
+	code, out := s.exec(c, []string{"sh", "-c", nobodyRun + "sh -c " + shQuote(cmd) + " 2>&1"})
+	s.Require().Equalf(0, code, "fixture: %s as the user: %s", what, out)
+}
+
+// A whitelisted name in a directory the user owns is the user's to re-point. The trust guard keeps
+// the whitelisted inode itself, so the user swaps the parent directory and leaves a symlink to
+// root's grep; a glob match in a user-owned /opt dir is a symlink to root's sed. Both land on
+// root-owned files in root-owned dirs, but no root action placed the names: neither may be
+// admitted. A root package-style upgrade of the root-placed line is still admitted, live.
+func (s *IntegrationSuite) TestDaemon_LiveAdmission_UserPlacedNameRefused() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-USER-PLACED-3D9A"
+	s.startJetBrainsDaemon(c, marker, "mkdir -p /opt/uapp /opt/evil && chown 65534:65534 /opt/uapp /opt/evil && "+
+		nobodyRun+"sh -c 'mkdir /opt/uapp/bin && cp "+swapReaderPath+" /opt/uapp/bin/tool'", "/opt/uapp/bin/tool")
+	_, out := s.exec(c, []string{"sh", "-c", "/opt/uapp/bin/tool " + jetbrainsSecret + " 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+marker, "baseline: the user's whitelisted tool reads the resource: %s", out)
+
+	s.asNobody(c, "swapping the whitelisted tool's directory", "mv /opt/uapp/bin /opt/uapp/old && "+
+		"mkdir /opt/uapp/bin && ln -s /usr/bin/grep /opt/uapp/bin/tool")
+	s.asNobody(c, "planting a glob match", "mkdir -p /opt/evil/jbr/bin && ln -s /usr/bin/sed /opt/evil/jbr/bin/java")
+
+	old := s.inodeOf(c, "/opt/idea/jbr/bin/java")
+	code, out := s.exec(c, []string{"sh", "-c", "cp " + swapReaderPath + " /opt/idea/jbr/bin/.java.new && " +
+		"printf x >> /opt/idea/jbr/bin/.java.new && mv -f /opt/idea/jbr/bin/.java.new /opt/idea/jbr/bin/java 2>&1"})
+	s.Require().Equalf(0, code, "the upgrade: %s", out)
+	s.Require().NotEqual(old, s.inodeOf(c, "/opt/idea/jbr/bin/java"), "fixture: the upgrade must make a new inode")
+	ok, out := s.awaitStolen(c, "/opt/idea/jbr/bin/java", jetbrainsSecret, marker, 40*time.Second)
+	s.Require().Truef(ok, "control: the root-placed upgrade was not admitted live: %s\ndaemon log:\n%s", out,
+		s.readDaemonLog(c))
+
+	// The control's admission proves re-syncs judged both planted names.
+	s.assertNeverStolen(c, "/opt/uapp/bin/tool ''", jetbrainsSecret, marker)
+	s.assertNeverStolen(c, "/opt/evil/jbr/bin/java -n p", jetbrainsSecret, marker)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// The daemon's own catalog refresh (here the startup one) expands /opt/*/jbr/bin/java. A match the
+// user placed, a symlink to root's sed, must not be written to daemon.conf: the reload that follows
+// resolves it by path and would admit sed.
+func (s *IntegrationSuite) TestDaemon_CatalogRefresh_UserPlacedSystemMatchRefused() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-REFRESH-PLANT-71C4"
+	s.startJetBrainsDaemon(c, marker, "mkdir -p /opt/evil && chown 65534:65534 /opt/evil && "+nobodyRun+
+		"sh -c 'mkdir -p /opt/evil/jbr/bin && ln -s /usr/bin/sed /opt/evil/jbr/bin/java'")
+	s.Require().Truef(s.awaitLog(c, "re-scanned /root/.config/JetBrains", 30*time.Second),
+		"the startup catalog refresh did not run: %s", s.readDaemonLog(c))
+
+	s.assertNeverStolen(c, "/opt/evil/jbr/bin/java -n p", jetbrainsSecret, marker)
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().NotContainsf(conf, "/opt/evil", "the refresh wrote the user-placed match:\n%s", conf)
+	s.Require().NotContainsf(conf, "/usr/bin/sed", "the refresh wrote the match's target:\n%s", conf)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

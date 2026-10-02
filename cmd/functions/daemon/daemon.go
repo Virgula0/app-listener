@@ -969,7 +969,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
 	events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
 	var deferred []daemonconfig.BinaryRule
-	vetted := make(map[string]guard.GuardInodeKey, len(r.Binaries))
+	vetted := make(map[string]guard.VettedInode, len(r.Binaries))
 	for _, b := range r.Binaries {
 		// One confined open: the key admitted is the inode hashed, never resolved again (a symlinked
 		// directory swapped after the catalog refresh vetted the path can't redirect it).
@@ -982,6 +982,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 			continue
 		}
 		binaries = append(binaries, entry)
+		vetted[b.Path].Close() // a repeated line: keep one fd
 		vetted[b.Path] = key
 		events[b.Path] = b.Events
 	}

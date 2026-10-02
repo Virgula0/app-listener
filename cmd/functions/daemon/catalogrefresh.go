@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/logging"
 )
@@ -334,7 +335,7 @@ func (r *catalogRefresher) refreshOnce(cfg *daemonconfig.Config) error {
 	}
 	// A line the operator added that the catalog doesn't produce stays while its file exists.
 	text, changes, err := install.RefreshCatalog(string(cur), cfg, users,
-		install.RefreshOptions{Live: true, KeepExisting: true, Scan: live})
+		install.RefreshOptions{Live: true, KeepExisting: true, Scan: live, Admit: refreshAdmits})
 	if errors.Is(err, install.ErrNoCatalogMatch) || (err == nil && text == string(cur)) {
 		return nil
 	}
@@ -362,6 +363,25 @@ func (r *catalogRefresher) refreshOnce(cfg *daemonconfig.Config) error {
 		return errors.New("the reload of the refreshed configuration failed")
 	}
 	return nil
+}
+
+// refreshAdmits vets a match the refresh would add. One in the section user's home passes the
+// refresh's own rules (homeMatchConfined, the trust guard's name reservations); any other only when
+// root placed it, as for live admission (ebpf.OpenSystemPlaced): the reload that follows resolves
+// it by path, and a user can point a name it controls at any root-owned binary.
+func refreshAdmits(u install.User, b install.BinaryRule) bool {
+	if inHome(b.Path, u.Home) {
+		return true
+	}
+	f, err := ebpf.OpenSystemPlaced(b.Path)
+	if err != nil {
+		log.Warnf("daemon: catalog refresh: not admitting %s (%v) — only names root placed are admitted "+
+			"automatically; whitelist it by hand and reload if intended", logging.SanitizeText(b.Path),
+			logging.SanitizeText(err.Error()))
+		return false
+	}
+	f.Close()
+	return true
 }
 
 func sameConfig(a, b *daemonconfig.Config) bool {

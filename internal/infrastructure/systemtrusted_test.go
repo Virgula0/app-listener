@@ -3,6 +3,8 @@ package ebpf
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -16,39 +18,96 @@ func openConfined(t *testing.T, path string) *os.File {
 	return f
 }
 
-func TestCheckSystemTrustedRootOwnedBinary(t *testing.T) {
-	if err := CheckSystemTrusted(openConfined(t, "/usr/bin/true")); err != nil {
-		t.Fatalf("/usr/bin/true is a root-owned file in a root-owned dir: %v", err)
+func TestOpenSystemPlacedRootOwnedBinary(t *testing.T) {
+	paths := []string{"/usr/bin/true", "/usr/bin/../bin/./true", "//usr/bin/true"}
+	if fi, err := os.Lstat("/bin"); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		paths = append(paths, "/bin/true") // merged /usr: a root-owned link in a root-owned dir
+	}
+	want, err := os.Stat("/usr/bin/true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range paths {
+		f, err := OpenSystemPlaced(p)
+		if err != nil {
+			t.Errorf("OpenSystemPlaced(%s): %v", p, err)
+			continue
+		}
+		got, err := f.Stat()
+		f.Close()
+		if err != nil || !os.SameFile(got, want) {
+			t.Errorf("OpenSystemPlaced(%s) opened another inode (%v)", p, err)
+		}
 	}
 }
 
-func TestCheckSystemTrustedRefusesUserFile(t *testing.T) {
+// The test user owns its temp dir: whatever a name there points at, root did not place the name.
+func TestOpenSystemPlacedRefusesUserPlacedNames(t *testing.T) {
 	if os.Geteuid() == 0 {
-		t.Skip("root owns the temp file")
+		t.Skip("root owns the temp dir")
 	}
-	p := filepath.Join(t.TempDir(), "app")
-	if err := os.WriteFile(p, []byte("x"), 0o755); err != nil {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "app"), []byte("x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckSystemTrusted(openConfined(t, p)); err == nil {
-		t.Fatal("a user-owned file must not be a system file")
+	for l, target := range map[string]string{"link": "/usr/bin/true", "bin": "/usr/bin", "rel": "app"} {
+		if err := os.Symlink(target, filepath.Join(dir, l)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{"app", "link", "bin/true", "rel", "bin/../bin/true"} {
+		if f, err := OpenSystemPlaced(filepath.Join(dir, p)); err == nil {
+			f.Close()
+			t.Errorf("%s: a name in a user-owned directory was judged root-placed", p)
+		}
 	}
 }
 
-func TestCheckSystemTrustedFollowsLinkToSystemFile(t *testing.T) {
-	// The link is followed: the judged inode is /usr/bin/true in its own directory, not the link.
-	p := filepath.Join(t.TempDir(), "link")
-	if err := os.Symlink("/usr/bin/true", p); err != nil {
-		t.Fatal(err)
+func TestOpenSystemPlacedRefusesUserHome(t *testing.T) {
+	SetUserHomes([]string{"/usr/lib"})
+	t.Cleanup(func() { SetUserHomes(nil) })
+	if f, err := OpenSystemPlaced("/usr/bin/true"); err != nil {
+		t.Fatalf("/usr/bin/true is outside the home: %v", err)
+	} else {
+		f.Close()
 	}
-	if err := CheckSystemTrusted(openConfined(t, p)); err != nil {
-		t.Fatalf("a link to a system file reaches the system file: %v", err)
+	SetUserHomes([]string{"/usr"})
+	if f, err := OpenSystemPlaced("/usr/bin/true"); err == nil {
+		f.Close()
+		t.Fatal("a name in a user home was judged root-placed")
+	} else if !strings.Contains(err.Error(), "user home") {
+		t.Fatalf("refused for %v; want the user-home reason", err)
 	}
 }
 
-func TestCheckSystemTrustedRefusesDirectory(t *testing.T) {
-	if err := CheckSystemTrusted(openConfined(t, "/usr/bin")); err == nil {
-		t.Fatal("a directory is not a system binary")
+func TestOpenSystemPlacedRefusesNonFiles(t *testing.T) {
+	for _, p := range []string{"/usr/bin", "/", "usr/bin/true", "/usr/bin/true/x", "/nonexistent-app-listener"} {
+		if f, err := OpenSystemPlaced(p); err == nil {
+			f.Close()
+			t.Errorf("OpenSystemPlaced(%s) succeeded", p)
+		}
+	}
+}
+
+func TestGlobSystemPlaced(t *testing.T) {
+	if got := GlobSystemPlaced("/usr/bin/tru[e]", 8); !slices.Equal(got, []string{"/usr/bin/true"}) {
+		t.Errorf("root-placed glob = %v", got)
+	}
+	if got := GlobSystemPlaced("/usr/bin/*", 3); len(got) != 3 || !slices.IsSorted(got) {
+		t.Errorf("limit 3 = %v", got)
+	}
+	if got := GlobSystemPlaced("relative/*", 8); got != nil {
+		t.Errorf("relative pattern = %v", got)
+	}
+	if os.Geteuid() == 0 {
+		return
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "true"), nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := GlobSystemPlaced(filepath.Join(dir, "*"), 8); got != nil {
+		t.Errorf("a user-owned dir was expanded: %v", got)
 	}
 }
 

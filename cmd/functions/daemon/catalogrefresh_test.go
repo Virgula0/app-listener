@@ -108,3 +108,25 @@ func TestRefreshOnceKeepsOperatorLinesAndSkipsNoOps(t *testing.T) {
 			*reloads, got)
 	}
 }
+
+func TestRefreshAdmitsHomeMatchesAndRootPlacedNamesOnly(t *testing.T) {
+	home := t.TempDir()
+	u := install.User{Name: "u", Home: home}
+	if !refreshAdmits(u, install.BinaryRule{Path: filepath.Join(home, ".local", "bin", "app")}) {
+		t.Error("a match in the section user's home is the refresh's own rules to vet")
+	}
+	if !refreshAdmits(u, install.BinaryRule{Path: "/usr/bin/true"}) {
+		t.Error("a root-placed system binary must be admitted")
+	}
+	if os.Geteuid() == 0 {
+		return
+	}
+	other := t.TempDir()
+	link := filepath.Join(other, "java")
+	if err := os.Symlink("/usr/bin/true", link); err != nil {
+		t.Fatal(err)
+	}
+	if refreshAdmits(u, install.BinaryRule{Path: link}) {
+		t.Error("a user-placed link to a root-owned binary outside the home must not be admitted")
+	}
+}

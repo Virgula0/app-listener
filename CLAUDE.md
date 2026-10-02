@@ -260,9 +260,11 @@ pinned under `/sys/fs/bpf` so a `SIGKILL` leaves trees enforced until `ExecStopP
 re-locks the vaults. `systemctl reload` (SIGHUP) recomputes every binary's inode identity
 atomically — new guards attach before old ones detach; a broken config keeps the running
 one. The daemon keeps the catalog current itself (`catalogrefresh.go`/`catalogwatch.go`):
-inotify hints schedule the guards' re-sync (root-owned system binaries, admitted live by
-`AllowReplacement`'s system-file rule) or the shared `install.RefreshCatalog` plus an
-in-process reload (home apps), compare-and-swapped against the config it runs. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
+inotify hints schedule the guards' re-sync (system binaries, admitted live by
+`AllowReplacement`'s system-file rule — only at names root placed, `ebpf.OpenSystemPlaced`:
+every directory and symlink hop root's, outside user homes) or the shared
+`install.RefreshCatalog` plus an in-process reload (home apps; a new match outside the
+user's home must be root-placed too, `refreshAdmits`), compare-and-swapped against the config it runs. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
 edit-auth hash. When `edit-protected` has a password configured, `control.go` opens the
 live-edit control socket and `DaemonUseCase.GrantEditAccess` / the guard's
 `GrantSelfEditAccess`+`RevokeSelfEditAccess` implement the transient per-resource write

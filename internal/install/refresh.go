@@ -37,6 +37,8 @@ type RefreshOptions struct {
 	// so a line the catalog doesn't produce is dropped (`install --update-catalog-only`).
 	KeepExisting bool
 	Scan         SectionScan
+	// Admit, when set, vets each line the refresh would add to a section (one it doesn't list yet).
+	Admit func(u User, b BinaryRule) bool
 }
 
 // RefreshCatalog re-expands the whitelist of every catalog section of confText (the text cfg was
@@ -88,6 +90,9 @@ func RefreshSection(confText string, r *daemonconfig.Resource, users []User,
 	fresh, encrypted, err := opts.Scan(r, candidate.FilterExistingWhitelist)
 	if err != nil {
 		return "", change, false, err
+	}
+	if opts.Admit != nil {
+		fresh = admitNew(fresh, old, *user, opts.Admit)
 	}
 	if opts.KeepExisting {
 		fresh = keepExisting(fresh, r)
@@ -144,6 +149,17 @@ func keepExisting(fresh []BinaryRule, r *daemonconfig.Resource) []BinaryRule {
 	}
 	sort.Slice(fresh, func(i, j int) bool { return fresh[i].Path < fresh[j].Path })
 	return fresh
+}
+
+// admitNew drops each line of fresh that old doesn't list and admit refuses.
+func admitNew(fresh []BinaryRule, old []string, u User, admit func(User, BinaryRule) bool) []BinaryRule {
+	var out []BinaryRule
+	for _, b := range fresh {
+		if slices.Contains(old, b.Path) || admit(u, b) {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 func missingFrom(a, b []string) []string {

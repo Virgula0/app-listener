@@ -181,6 +181,9 @@ type Guard struct {
 	systemPatterns []daemonconfig.BinaryRule
 	// vetted: whitelist path -> the inode it was hashed from (binaryKey). Guarded by mu.
 	vetted map[string]GuardInodeKey
+	// held: an fd on each vetted inode not yet written to the maps, so its number can't be freed and
+	// reused in between. Guarded by mu.
+	held map[string]*os.File
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -253,14 +256,52 @@ func WithChmodDropWrite() GuardOption {
 	}
 }
 
+// VettedInode is the inode a whitelist path was hashed from (ConfinedEntry), held open until the
+// guard writes its key.
+type VettedInode struct {
+	Key GuardInodeKey
+	f   *os.File
+}
+
+// Close releases the inode; WithVettedKeys takes ownership instead.
+func (v VettedInode) Close() {
+	if v.f != nil {
+		v.f.Close()
+	}
+}
+
 // WithVettedKeys pins whitelist paths to the inodes their entries were hashed from
-// (ConfinedEntry): the guard admits those inodes and never resolves the paths again.
-func WithVettedKeys(keys map[string]GuardInodeKey) GuardOption {
+// (ConfinedEntry): the guard admits those inodes and never resolves the paths again. The guard
+// owns the inodes' fds from here.
+func WithVettedKeys(keys map[string]VettedInode) GuardOption {
 	return func(g *Guard) {
-		for p, k := range keys {
-			g.vetted[p] = k
+		for p, v := range keys {
+			g.vetted[p] = v.Key
+			g.holdLocked(p, v.f)
 		}
 	}
+}
+
+// holdLocked keeps f open until path's key is written (addBinaryActions). Caller holds mu, or owns g.
+func (g *Guard) holdLocked(path string, f *os.File) {
+	if g.held == nil {
+		g.held = make(map[string]*os.File)
+	}
+	if old := g.held[path]; old != nil && old != f {
+		old.Close()
+	}
+	if f == nil {
+		delete(g.held, path)
+		return
+	}
+	g.held[path] = f
+}
+
+func (g *Guard) releaseHeldLocked() {
+	for _, f := range g.held {
+		f.Close()
+	}
+	g.held = nil
 }
 
 // WithSystemPatterns lists the resource's absolute catalog whitelist patterns (fixed paths or
@@ -370,6 +411,11 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 	for _, opt := range opts {
 		opt(g)
 	}
+	defer func() {
+		g.mu.Lock()
+		g.releaseHeldLocked()
+		g.mu.Unlock()
+	}()
 	if g.chmodDropWrite && mode != ModeReadOnly {
 		return nil, fmt.Errorf("guard %s: WithChmodDropWrite needs ModeReadOnly (it would widen a secret tree)", path)
 	}
@@ -644,6 +690,7 @@ func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 		g.mu.Lock()
 		g.deployed[canonicalBinaryPath(b.Path)] = inodeKey
 		g.keyPaths[inodeKey] = b.Path
+		g.holdLocked(b.Path, nil)
 		g.mu.Unlock()
 	}
 	return nil
@@ -914,7 +961,7 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 	events = make(map[string][]ebpf.EventType, len(deferredList))
 	for _, deferred := range deferredList {
 		rule := deferred.rule
-		path, entry, key, err := confinedEntry(rule.Path)
+		path, entry, key, f, err := confinedEntry(rule.Path)
 		if err != nil {
 			deferred.attempts++
 			if deferred.attempts >= maxResolveAttempts {
@@ -931,6 +978,7 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 			g.vetted = make(map[string]GuardInodeKey)
 		}
 		g.vetted[path] = key
+		g.holdLocked(path, f)
 		g.mu.Unlock()
 		if len(rule.Events) > 0 {
 			events[path] = rule.Events
@@ -940,36 +988,40 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 }
 
 // confinedEntry opens path once (OpenConfined) and hashes the inode reached, returning its resolved
-// path, the entry and that inode's key.
-func confinedEntry(path string) (resolved string, entry BinaryEntry, key GuardInodeKey, err error) {
-	f, err := ebpf.OpenConfined(path)
+// path, the entry, that inode's key and the open fd holding it.
+func confinedEntry(path string) (resolved string, entry BinaryEntry, key GuardInodeKey, f *os.File, err error) {
+	f, err = ebpf.OpenConfined(path)
 	if err != nil {
-		return "", entry, key, err
+		return "", entry, key, nil, err
 	}
-	defer f.Close()
-	if resolved, err = os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); err != nil {
-		return "", entry, key, err
+	if resolved, err = os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); err == nil {
+		if key.Dev, key.Ino, err = ebpf.StatFile(f); err == nil {
+			entry, err = ebpf.ComputeBinaryEntryFile(f, resolved)
+		}
 	}
-	if key.Dev, key.Ino, err = ebpf.StatFile(f); err != nil {
-		return "", entry, key, err
+	if err != nil {
+		f.Close()
+		return "", entry, key, nil, err
 	}
-	entry, err = ebpf.ComputeBinaryEntryFile(f, resolved)
-	return resolved, entry, key, err
+	return resolved, entry, key, f, nil
 }
 
-// ConfinedEntry hashes the inode a whitelist path reaches through one confined open and returns its
-// key; the entry keeps path as its name. Pass the keys to WithVettedKeys.
-func ConfinedEntry(path string) (entry BinaryEntry, key GuardInodeKey, err error) {
+// ConfinedEntry hashes the inode a whitelist path reaches through one confined open and returns it
+// held open; the entry keeps path as its name. Pass it to WithVettedKeys, or Close it.
+func ConfinedEntry(path string) (entry BinaryEntry, v VettedInode, err error) {
 	f, err := ebpf.OpenConfined(path)
 	if err != nil {
-		return entry, key, err
+		return entry, v, err
 	}
-	defer f.Close()
-	if key.Dev, key.Ino, err = ebpf.StatFile(f); err != nil {
-		return entry, key, err
+	if v.Key.Dev, v.Key.Ino, err = ebpf.StatFile(f); err == nil {
+		entry, err = ebpf.ComputeBinaryEntryFile(f, path)
 	}
-	entry, err = ebpf.ComputeBinaryEntryFile(f, path)
-	return entry, key, err
+	if err != nil {
+		f.Close()
+		return entry, VettedInode{}, err
+	}
+	v.f = f
+	return entry, v, nil
 }
 
 // ResolvePendingBinaries retries entries deferred while their resource was locked; run only after
@@ -1134,12 +1186,12 @@ func (g *Guard) resyncOne(binPath string, exeEvents map[string][]ebpf.EventType)
 		return false, nil
 	}
 	// Re-admitting by path alone let anyone who could swap the path (or a parent directory)
-	// inherit the entry; only an inode its updater created, or a system file only root could
-	// have put there, qualifies. Reload is the operator's path for anything else.
+	// inherit the entry; only an inode its updater created, or a system file at a name only root
+	// could have placed, qualifies. Reload is the operator's path for anything else.
 	if !replacementAllowed(binPath, f, old, key) {
 		if g.refused.firstTime(path, key) {
 			log.Warnf("guard %s: replacement of %s (inode %d) was neither created by its updater nor a "+
-				"root-owned system file — not re-admitted; reload the daemon after verifying it", g.path,
+				"system file at a root-placed name — not re-admitted; reload the daemon after verifying it", g.path,
 				path, key.Ino)
 		}
 		return false, nil
@@ -1192,27 +1244,21 @@ func (g *Guard) admitSystemMatches() (int, error) {
 	return added, nil
 }
 
-// patternMatches expands a fixed path or glob, at most maxPatternMatches.
+// patternMatches expands a fixed path or glob through root-placed directories only
+// (ebpf.GlobSystemPlaced), at most maxPatternMatches.
 func patternMatches(pattern string) []string {
 	if !strings.ContainsAny(pattern, "*?[") {
 		return []string{pattern}
 	}
-	m, err := filepath.Glob(pattern)
-	if err != nil {
-		return nil
-	}
-	if len(m) > maxPatternMatches {
-		m = m[:maxPatternMatches]
-	}
-	return m
+	return ebpf.GlobSystemPlaced(pattern, maxPatternMatches)
 }
 
-// admitSystemMatch admits path when the inode it opens to is a system file. Hash, key and resolved
-// path all come from that open.
+// admitSystemMatch admits path when only root could have placed it (ebpf.OpenSystemPlaced). Hash,
+// key and resolved path all come from that open.
 func (g *Guard) admitSystemMatch(path string, events []ebpf.EventType) (bool, error) {
-	f, err := ebpf.OpenConfined(path)
+	f, err := ebpf.OpenSystemPlaced(path)
 	if err != nil {
-		return false, nil // not installed (any more)
+		return false, nil // not installed (any more), or a name a user could have placed
 	}
 	defer f.Close()
 	dev, ino, err := ebpf.StatFile(f)
@@ -1254,7 +1300,7 @@ func (g *Guard) admitSystemMatch(path string, events []ebpf.EventType) (bool, er
 		g.binaryVerifyStates[resolved] = &binaryVerifyState{key: key, hash: entry.Hash}
 	}
 	g.mu.Unlock()
-	log.Infof("guard %s: admitted %s (inode %d): a new root-owned system binary matching a catalog pattern",
+	log.Infof("guard %s: admitted %s (inode %d): a new system binary at a root-placed name matching a catalog pattern",
 		g.path, logging.SanitizeText(path), key.Ino)
 	return true, nil
 }
@@ -2252,6 +2298,7 @@ func (g *Guard) Stop() {
 		return
 	}
 	g.stopped = true
+	g.releaseHeldLocked()
 	if g.verifyStop != nil {
 		close(g.verifyStop)
 		g.verifyStop = nil
