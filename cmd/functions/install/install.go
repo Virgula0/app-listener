@@ -36,7 +36,7 @@ func init() {
 	InstallCmd.Flags().BoolVar(&allowMetadataOutput, "allow-metadata-output", false,
 		"Install the daemon unit WITHOUT --no-log-metadata-blocks, so denied metadata-only process inspections (op=PTRACE mode=READ) are logged; useful to diagnose an app that breaks with nothing logged")
 	InstallCmd.Flags().BoolP("yes", "y", false,
-		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. the pacman/apt hooks and the boot-time refresh unit)")
+		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. scripts)")
 }
 
 var InstallCmd = &cobra.Command{
@@ -78,23 +78,18 @@ The wizard walks through the whole installation:
      migrated — then encrypts the ones that need it (keeping a
      .app_listener.backup copy) while a progress bar shows the copy
      progress
-  8. installs the systemd units and the package-manager catalog-refresh
-     hook from the embedded daemon-samples and writes the config to
-     /etc/app-listener/daemon.conf (the binary is left as deployed). The
-     PATH symlink /usr/local/bin/app-listener is (re)created. The refresh
-     hook is chosen from the
-     host's package manager: pacman (/etc/pacman.d/hooks) or apt
-     (/etc/apt/apt.conf.d); dnf/zypper are reported and left to the
-     boot-time refresh. Already-installed files and an existing config are
+  8. installs the systemd units from the embedded daemon-samples and
+     writes the config to /etc/app-listener/daemon.conf (the binary is left
+     as deployed). The PATH symlink /usr/local/bin/app-listener is
+     (re)created. The pacman/apt catalog-refresh hooks and the boot-time
+     refresh unit an earlier version installed are removed: the daemon
+     refreshes the catalog itself. Already-installed files and an existing config are
      compared with the bundled ones: identical files are left alone,
      differing ones show the diff in the TUI and ask whether to overwrite.
      The per-user ssh-agent systemd unit (and the SSH_AUTH_SOCK block in the
      user's shell rc file) is installed for the users who accepted it in
      step 6a
-  9. enables the daemon across reboots and ensures it is running, and
-     enables app-listener-catalog-refresh.service — a boot-time --live
-     catalog refresh that catches package changes made while no hook ran
-     (offline installs, direct dpkg/pacman -U, a failed hook). When the
+  9. enables the daemon across reboots and ensures it is running. When the
      config changed on a running daemon it is reloaded with SIGHUP instead
      of restarted
  10. cleans up orphaned fscrypt metadata: policies and raw-key protectors
@@ -135,10 +130,13 @@ leaves the running daemon on its old (already-loaded) binary until you
 restart it yourself.
 
 Use --update-catalog-only to refresh the whitelist of every guarded
-directory from the catalog: encrypted vaults are unlocked, glob patterns
-are re-expanded (picking up new binaries and dropping deleted ones),
-and the diff is shown before overwriting. User-added sections (not in
-the catalog) are preserved as-is. Requires a previous installation.
+directory from the catalog by hand: encrypted vaults are unlocked, glob
+patterns are re-expanded (picking up new binaries and dropping every line
+the catalog does not produce), and the diff is shown before overwriting.
+User-added sections (not in the catalog) are preserved as-is. Requires a
+previous installation. The running daemon does this itself (it watches the
+catalog's directories and refreshes at startup, keeping lines whose binary
+still exists); this flag is for manual or debug use.
 
 Use --diff-catalog to add directories the catalog now discovers but the
 installed daemon.conf does not yet guard (a catalog update, or a newly
@@ -392,10 +390,10 @@ func runUpdateCatalogOnly(autoConfirm, live bool) error {
 }
 
 // softenAutomatedRefreshErr turns "all-manual config, nothing matched the catalog" into a no-op for
-// automated callers (--yes: pacman/apt hooks, boot refresh unit): a package transaction or boot
-// must not fail because no section is catalog-managed. Interactive callers still see the error.
+// automated callers (--yes): a script must not fail because no section is catalog-managed.
+// Interactive callers still see the error.
 func softenAutomatedRefreshErr(err error, autoConfirm bool) error {
-	if err != nil && autoConfirm && errors.Is(err, errNoCatalogMatch) {
+	if err != nil && autoConfirm && errors.Is(err, inst.ErrNoCatalogMatch) {
 		log.Infof("catalog refresh: %v — nothing to do", err)
 		return nil
 	}
@@ -565,10 +563,7 @@ func deploy(cfgText string, sshUsers []inst.User, bunUsers []bunUser, editPasswo
 	if err := writeEditPasswordHash(editPassword); err != nil {
 		return err
 	}
-	if err := systemd.EnableAndVerify(configChanged); err != nil {
-		return err
-	}
-	return systemd.EnableCatalogRefresh()
+	return systemd.EnableAndVerify(configChanged)
 }
 
 // preflightDeployedBinary runs `<installed binary> daemon --check` on the just-deployed binary and

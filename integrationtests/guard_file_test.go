@@ -346,7 +346,7 @@ printf 'LOOPDEV=%s\n' "$LOOP"
 	s.Require().Equalf(0, code, "pre-guard: raw block device read should succeed (bypass): %s", out)
 	s.Require().Containsf(out, marker, "pre-guard: exploit must recover the secret: %s", out)
 
-	// Single-file watch root — BackingDevice() stats the file directly.
+	// Single-file watch root — BackingDevices() stats the file directly.
 	s.startGuardStd(c, "/watch/secret.txt")
 	startLog := s.readGuardLog(c)
 	s.Require().Containsf(startLog, "blocking raw access to backing block device",

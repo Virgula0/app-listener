@@ -150,6 +150,22 @@ func (m *controlManager) endActiveSession(reason string) {
 	cs.endActiveSession(reason)
 }
 
+// sessionActive reports a live edit-protected session holding a write grant.
+func (m *controlManager) sessionActive() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	cs := m.cs
+	m.mu.Unlock()
+	if cs == nil {
+		return false
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.active != nil
+}
+
 func (m *controlManager) close() {
 	if m == nil {
 		return

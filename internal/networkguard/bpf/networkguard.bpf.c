@@ -3,6 +3,7 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 #include <errno.h>
+#include "inode_dev.h"
 
 #define AF_INET      2
 #define AF_INET6     10
@@ -116,16 +117,7 @@ static __always_inline int get_current_exe_inode(struct inode_key *ik)
 		return 0;
 
 	bpf_probe_read_kernel(&ik->ino, sizeof(ik->ino), &exe_inode->i_ino);
-
-	struct super_block *sb;
-	bpf_probe_read_kernel(&sb, sizeof(sb), &exe_inode->i_sb);
-	if (!sb)
-		return 0;
-
-	dev_t dev;
-	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-	ik->dev = dev;
-
+	ik->dev = inode_dev((__u64)exe_inode);
 	return 1;
 }
 

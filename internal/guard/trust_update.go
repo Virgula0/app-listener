@@ -3,6 +3,7 @@ package guard
 import (
 	"fmt"
 	"maps"
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -36,14 +37,46 @@ func (t *TrustGuard) SetUpdaters(p UpdaterPlan) error {
 	return nil
 }
 
-// AllowReplacement reports whether newKey, now at the whitelisted path, was created by an updater
-// of path's resources and never written by another exe since (guard_bin_origin). It also requires
-// the old inode's filesystem (a user FUSE mount serves chosen inode numbers and bytes without any
-// write-open) and a trusted old inode. On approval the new inode inherits old's trust rows, so the
-// updated binary keeps its write-protection, library allowlist and writer bits until the next
-// reload; if any row can't be copied the replacement is refused.
-func (t *TrustGuard) AllowReplacement(path string, old, newKey GuardInodeKey) bool {
-	if old == (GuardInodeKey{}) || old.Dev != newKey.Dev {
+// AllowReplacement reports whether newKey, the inode f holds at the whitelisted path, may be
+// admitted in place of old: created by one of its updaters (updaterCreated) or a system file at a
+// name only root could have placed (systemFile). On approval it inherits old's trust rows, so it keeps its
+// write-protection, library allowlist and writer bits until the next reload; a row that can't be
+// copied refuses it.
+func (t *TrustGuard) AllowReplacement(path string, f *os.File, old, newKey GuardInodeKey) bool {
+	nk := GuardTrustInodeKey{Dev: newKey.Dev, Ino: newKey.Ino}
+	if t.updaterCreated(path, old, nk) {
+		liftSuperseded(newKey)
+		if err := t.adoptRows(GuardTrustInodeKey{Dev: old.Dev, Ino: old.Ino}, nk); err != nil {
+			log.Warnf("trust guard: replacement of %s not re-admitted: %v", path, err)
+			return false
+		}
+		return true
+	}
+	if !t.systemFile(path, f, newKey) {
+		return false
+	}
+	liftSuperseded(newKey)
+	if old != (GuardInodeKey{}) && t.trusts(old) {
+		if err := t.adoptRows(GuardTrustInodeKey{Dev: old.Dev, Ino: old.Ino}, nk); err != nil {
+			log.Warnf("trust guard: system binary %s not admitted: %v", path, err)
+			return false
+		}
+		return true
+	}
+	// A new install: nothing to inherit. Protection #1 exempts system files, so only the library
+	// allowlist (TRUSTED_BINARY) applies.
+	if err := t.objs.GuardTrustedFiles.Put(nk, trustedBinary); err != nil {
+		log.Warnf("trust guard: system binary %s not admitted: %v", path, err)
+		return false
+	}
+	return true
+}
+
+// updaterCreated: newKey was created by an updater of path's resources and never written by another
+// exe since (guard_bin_origin), on old's filesystem (a user FUSE mount serves chosen inode numbers
+// and bytes without any write-open).
+func (t *TrustGuard) updaterCreated(path string, old GuardInodeKey, nk GuardTrustInodeKey) bool {
+	if old == (GuardInodeKey{}) || old.Dev != nk.Dev {
 		return false
 	}
 	t.ownerMu.Lock()
@@ -52,20 +85,41 @@ func (t *TrustGuard) AllowReplacement(path string, old, newKey GuardInodeKey) bo
 	if owner == 0 {
 		return false
 	}
-	nk := GuardTrustInodeKey{Dev: newKey.Dev, Ino: newKey.Ino}
 	var o GuardTrustBinOrigin
 	if err := t.objs.GuardBinOrigin.Lookup(nk, &o); err != nil || o.Tainted != 0 {
 		return false
 	}
 	var upd uint64
-	if err := t.objs.GuardBinUpdaters.Lookup(o.Exe, &upd); err != nil || upd&owner == 0 {
+	return t.objs.GuardBinUpdaters.Lookup(o.Exe, &upd) == nil && upd&owner != 0
+}
+
+// systemFile: path is root-placed (ebpf.OpenSystemPlaced: every directory and symlink hop leading
+// to it is root's) and ends on k, the inode f holds open so its number can't be reused meanwhile, on
+// a superblock root vouches for (mount_vouches_ownership: by superblock device, which on btrfs is
+// not k.Dev). The name is judged, not only the inode: a user can point a name it controls at any
+// root-owned binary.
+func (t *TrustGuard) systemFile(path string, f *os.File, k GuardInodeKey) bool {
+	if f == nil {
 		return false
 	}
-	if err := t.adoptRows(GuardTrustInodeKey{Dev: old.Dev, Ino: old.Ino}, nk); err != nil {
-		log.Warnf("trust guard: replacement of %s not re-admitted: %v", path, err)
+	sp, err := ebpf.OpenSystemPlaced(path)
+	if err != nil {
+		log.Debugf("trust guard: %s is not a system file: %v", path, err)
 		return false
 	}
-	return true
+	defer sp.Close()
+	if dev, ino, statErr := ebpf.StatFile(sp); statErr != nil || dev != k.Dev || ino != k.Ino {
+		return false
+	}
+	sbdev, err := ebpf.SuperblockDev(int(sp.Fd()))
+	if err != nil {
+		return false
+	}
+	var synced, died uint64
+	if t.objs.GuardVouchedDevs.Lookup(sbdev, &synced) != nil {
+		return false
+	}
+	return t.objs.GuardDeadDevs.Lookup(sbdev, &died) != nil || died <= synced
 }
 
 // adoptRows copies every exe/target-keyed trust row of old to newKey. old must be a trusted file:
@@ -101,8 +155,9 @@ func (t *TrustGuard) adoptRows(old, newKey GuardTrustInodeKey) error {
 	return nil
 }
 
-// ReplacementCheck approves re-admitting newKey at a whitelisted path whose admitted inode was old.
-type ReplacementCheck func(path string, old, newKey GuardInodeKey) bool
+// ReplacementCheck approves admitting newKey, the inode f holds, at a whitelisted path whose
+// admitted inode was old (zero for a new catalog match).
+type ReplacementCheck func(path string, f *os.File, old, newKey GuardInodeKey) bool
 
 var replacementCheck atomic.Pointer[ReplacementCheck]
 
@@ -116,9 +171,9 @@ func SetReplacementCheck(fn ReplacementCheck) {
 	replacementCheck.Store(&fn)
 }
 
-func replacementAllowed(path string, old, newKey GuardInodeKey) bool {
+func replacementAllowed(path string, f *os.File, old, newKey GuardInodeKey) bool {
 	fn := replacementCheck.Load()
-	return fn != nil && (*fn)(path, old, newKey)
+	return fn != nil && (*fn)(path, f, old, newKey)
 }
 
 // refusedReplacements remembers (path, inode) pairs already reported, so a denial-driven re-sync

@@ -18,6 +18,7 @@ import (
 type rootHandle struct {
 	fd       int
 	key      GuardInodeKey
+	sbdev    uint64 // the superblock's device (ebpf.SuperblockDev): differs from key.Dev on btrfs
 	resolved string // the kernel's d_path for fd: where the configured path resolved
 	dir      bool
 	proc     string
@@ -34,13 +35,18 @@ func openRoot(path string) (*rootHandle, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("stating guard root %s: %w", path, err)
 	}
+	sbdev, err := ebpf.SuperblockDev(fd)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("guard root %s: superblock device: %w", path, err)
+	}
 	proc := procFDDir + strconv.Itoa(fd)
 	resolved, err := os.Readlink(proc)
 	if err != nil {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("resolving guard root %s: %w", path, err)
 	}
-	return &rootHandle{fd: fd, key: st.key, resolved: resolved, dir: st.dir, proc: proc}, nil
+	return &rootHandle{fd: fd, key: st.key, sbdev: sbdev, resolved: resolved, dir: st.dir, proc: proc}, nil
 }
 
 const procFDDir = "/proc/self/fd/"

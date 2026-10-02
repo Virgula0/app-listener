@@ -168,8 +168,12 @@ func (e *engine) acquire(g *Guard) (uint32, error) {
 
 // startLocked loads the objects, attaches every LSM program once and starts the event reader.
 func (e *engine) startLocked() error {
+	shared, mapsErr := supersedeMaps()
+	if mapsErr != nil {
+		return mapsErr
+	}
 	var objs GuardObjects
-	if err := LoadGuardObjects(&objs, nil); err != nil {
+	if err := LoadGuardObjects(&objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
 		return fmt.Errorf("loading guard BPF objects: %w", err)
 	}
 	e.objs = objs
@@ -188,7 +192,10 @@ func (e *engine) startLocked() error {
 	}
 
 	lsmAttached := len(e.links)
-	e.attachForkTaintLocked()
+	if err := e.attachForkLocked(); err != nil {
+		e.stopLocked()
+		return err
+	}
 
 	// The reserved slot must exist before any decision can land on it: res_cfg() treats an
 	// inactive slot as unknown and denies, which would make the raw block-device gate refuse
@@ -210,6 +217,7 @@ func (e *engine) startLocked() error {
 	e.rd = rd
 	e.started = true
 	go e.readLoop(rd)
+	go supersedePruneLoop(e.done)
 
 	log.Infof("guard engine — %d/%d LSM hooks attached once for every resource", lsmAttached, total)
 	return nil
@@ -250,19 +258,17 @@ func (e *engine) attachLocked() (failedRequired []string, total int) {
 	return failedRequired, len(attachments)
 }
 
-// attachForkTaintLocked attaches guard_sched_process_fork (copies a tainted parent's taint to
-// forked children). Best-effort: failure only delays a child's tracking until its own guarded
-// access.
-func (e *engine) attachForkTaintLocked() {
+// attachForkLocked attaches guard_sched_process_fork, which copies a parent's taint and exec
+// stamp to its child. Required: a child without its parent's stamp would pass for a process
+// started before the guard, so a superseded image re-exec'd by its parent would admit the child.
+func (e *engine) attachForkLocked() error {
 	l, err := link.AttachTracing(link.TracingOptions{
 		Program:    e.objs.GuardSchedProcessFork,
 		AttachType: cilium.AttachTraceRawTp,
 	})
 	if err != nil {
-		log.Warnf("guard: skipping fork taint propagation (%v) — a forked child of a process that "+
-			"read guarded content is not taint-tracked until its own first guarded access; direct "+
-			"enforcement is unaffected", err)
-		return
+		return fmt.Errorf("required hook sched_process_fork failed to attach: %w — a forked child "+
+			"would lose its parent's exec stamp", err)
 	}
 	if e.pinPrefix != "" {
 		if pinErr := l.Pin(e.pinPrefix + "sched-process-fork"); pinErr != nil {
@@ -273,6 +279,20 @@ func (e *engine) attachForkTaintLocked() {
 	}
 	e.links = append(e.links, l)
 	e.linkNames = append(e.linkNames, "sched-process-fork")
+	return nil
+}
+
+// FreeResourceSlots is how many resource slots a new Guard can still claim.
+func FreeResourceSlots() int {
+	sharedEngine.mu.Lock()
+	defer sharedEngine.mu.Unlock()
+	free := 0
+	for id := 1; id < GuardMaxRes; id++ {
+		if sharedEngine.slots[id] == nil && sharedEngine.setAt[uint32(id)] == "" { //nolint:gosec // id < GuardMaxRes
+			free++
+		}
+	}
+	return free
 }
 
 // allocSlotLocked reserves a resource id for g. Slot 0 is reserved (resGlobal), and so is every
@@ -677,6 +697,49 @@ func (e *engine) noteDeny(res uint32, exe GuardInodeKey) error {
 	}
 	delete(e.allows[res], exe)
 	return e.syncSharedLocked()
+}
+
+// admitsExe reports whether any live resource allows exe.
+func (e *engine) admitsExe(exe GuardInodeKey) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, set := range e.allows {
+		if _, ok := set[exe]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// forgetExe drops every row naming exe, in every resource and the views derived from them, and has
+// each guard forget it (Guard.forgetExe).
+func (e *engine) forgetExe(exe GuardInodeKey) error {
+	e.mu.Lock()
+	if !e.started {
+		e.mu.Unlock()
+		return nil
+	}
+	for _, set := range e.allows {
+		delete(set, exe)
+	}
+	err := e.syncSharedLocked()
+	if err == nil {
+		err = deleteInoKeys(e.objs.GuardExeActions, exe)
+	}
+	if err == nil {
+		err = deleteInoKeys(e.objs.GuardExeEvents, exe)
+	}
+	var guards []*Guard
+	for _, g := range &e.slots {
+		if g != nil {
+			guards = append(guards, g)
+		}
+	}
+	e.mu.Unlock()
+	for _, g := range guards {
+		g.forgetExe(exe)
+	}
+	return err
 }
 
 // forgetResource drops res from the cross-resource views when its guard goes away.

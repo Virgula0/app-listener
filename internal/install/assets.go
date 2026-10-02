@@ -9,8 +9,8 @@ import (
 //go:embed all:daemon-samples
 var sampleFS embed.FS
 
-// SampleFiles lists the bundled daemon-samples files (service units, the
-// pacman reload hook and the sample config) shipped inside the binary.
+// SampleFiles lists the bundled daemon-samples files (service units and the sample config)
+// shipped inside the binary.
 func SampleFiles() ([]string, error) {
 	entries, err := fs.ReadDir(sampleFS, "daemon-samples")
 	if err != nil {

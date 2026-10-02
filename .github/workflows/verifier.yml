@@ -1,0 +1,117 @@
+name: Verifier gate
+
+# Loads every guard eBPF program into the runner kernel's verifier (tools/bpfstats, then the
+# binary's own `daemon --check`) and fails on any rejection, an over-budget program included
+# (E2BIG). The PR base's objects are built with the same pinned clang and measured alongside, so
+# the summary shows each program's change in verifier cost.
+#
+# GitHub's runners build BPF-LSM in (CONFIG_BPF_LSM=y) without enabling it on the boot command
+# line: LSM programs load and verify, they just never run. Hence `--verifier-only`, which skips
+# only the activation check. The verdict is this kernel's: the 1M-insn budget is the same
+# everywhere, but pruning differs between kernels, so run bpfstats locally too (CLAUDE.md).
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verifier-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verifier:
+    # Two kernels (24.04: 6.17, 26.04: 7.0): the budget is the same everywhere, pruning is not, and
+    # attach targets differ (6.17 has no memfd_alloc_file).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.runner }}
+    if: github.event.pull_request.draft != true
+    steps:
+      - name: Check out the PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+
+      - name: Check out the PR base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Runner kernel
+        run: |
+          set -euo pipefail
+          uname -r
+          echo "active LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown)"
+          test -r /sys/kernel/btf/vmlinux || { echo "::error::runner kernel has no readable BTF"; exit 1; }
+          cfg="/boot/config-$(uname -r)"
+          if [ -r "$cfg" ] && ! grep -q '^CONFIG_BPF_LSM=y' "$cfg"; then
+            echo "::error::runner kernel lacks CONFIG_BPF_LSM: LSM programs cannot even load here;" \
+              "the gate needs a VM step (virtme-ng) or a self-hosted runner"
+            exit 1
+          fi
+
+      # make build: pinned clang 22 builder image (docker/builder.Dockerfile), BPF built against
+      # this runner's BTF, binary at build/linux/app-listener.
+      - name: Build the PR (pinned builder image)
+        working-directory: head
+        run: make build
+
+      - name: Build the base's eBPF objects (same builder image)
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
+            -v "$PWD/base:/app/app-listener:rw" \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e GOCACHE=/tmp/.gocache -e GOPATH=/tmp/gopath -e GOMODCACHE=/tmp/gopath/pkg/mod \
+            -w /app/app-listener \
+            app-listener-builder:local \
+            make bpftool-headers generate
+
+      - name: Build bpfstats
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/head:/app/app-listener:rw" \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e GOCACHE=/tmp/.gocache -e GOPATH=/tmp/gopath -e GOMODCACHE=/tmp/gopath/pkg/mod \
+            -w /app/app-listener \
+            app-listener-builder:local \
+            go build -o build/bpfstats ./tools/bpfstats/
+
+      - name: Verifier cost, PR vs base
+        run: |
+          set -uo pipefail
+          status=0
+          {
+            echo "## Verifier cost (processed insns, budget 1,000,000) on ${{ matrix.runner }}, $(uname -r)"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          for obj in guard/embeds/guard_bpf.o guard/embeds/guardtrust_bpf.o networkguard/embeds/guardnet_bpf.o; do
+            args=("head/internal/$obj")
+            [ -f "base/internal/$obj" ] && args+=("base/internal/$obj")
+            sudo ./head/build/bpfstats "${args[@]}" | tee bpfstats.out || status=1
+            # The PR's programs (first section) within 10% of the budget: the next unrelated change
+            # may tip one over.
+            awk '/^== /{sec++} sec == 1 && $3 == "insns" && $2 > 900000 { print $1 }' bpfstats.out |
+              while read -r prog; do
+                echo "::warning::$prog is within 10% of the verifier budget"
+              done
+            { echo '```'; cat bpfstats.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+          sudo sh -c 'cat /tmp/bpfstats-*.log 2>/dev/null' || true
+          exit "$status"
+
+      - name: daemon --check (verifier only)
+        working-directory: head
+        run: sudo ./build/linux/app-listener daemon --check --verifier-only

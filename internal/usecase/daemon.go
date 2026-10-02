@@ -63,6 +63,9 @@ type DaemonUseCase interface {
 	// modify it for an authenticated live edit-protected session. One grant at a time. The returned
 	// revoke restores the read-only baseline; idempotent.
 	GrantEditAccess(resourcePath string) (revoke func() error, err error)
+	// ResyncBinaries re-syncs every guard's whitelist now, admitting replaced or new system
+	// binaries (the catalog watch saw a package install).
+	ResyncBinaries()
 }
 
 type daemonUseCase struct {
@@ -642,6 +645,7 @@ func (d *daemonUseCase) commitReload(resources []daemonconfig.Resource, guards [
 	// would drop process_vm_readv/ptrace protection for processes already holding a secret in
 	// memory.
 	d.carryTaintAcrossReload(resources, guards)
+	d.carrySupersededAcrossReload(resources, guards)
 
 	newStops := make([]chan struct{}, len(guards))
 	for i := range guards {
@@ -686,6 +690,33 @@ func (d *daemonUseCase) carryTaintAcrossReload(resources []daemonconfig.Resource
 		}
 		if err := guards[i].RestoreTaintedPIDs(pids); err != nil {
 			log.Warnf("daemon: carrying taint across reload for %s: %v", r.Path, err)
+		}
+	}
+}
+
+// carrySupersededAcrossReload copies each old guard's superseded keys into the new guard for the
+// same resource, so an app started before its binary was replaced keeps its access. Best-effort: a
+// failure only cuts such an app off until it restarts, never widens access.
+func (d *daemonUseCase) carrySupersededAcrossReload(resources []daemonconfig.Resource, guards []repository.GuardRepository) {
+	oldByPath := make(map[string]repository.GuardRepository, len(d.guards))
+	for i := range d.resources {
+		oldByPath[d.resources[i].Path] = d.guards[i]
+	}
+	for i := range resources {
+		old, ok := oldByPath[resources[i].Path]
+		if !ok {
+			continue
+		}
+		bins, err := old.SnapshotSuperseded()
+		if err != nil {
+			log.Warnf("daemon: reading superseded binaries for %s during reload: %v", resources[i].Path, err)
+			continue
+		}
+		if len(bins) == 0 {
+			continue
+		}
+		if err := guards[i].RestoreSuperseded(bins); err != nil {
+			log.Warnf("daemon: carrying superseded binaries across reload for %s: %v", resources[i].Path, err)
 		}
 	}
 }
@@ -847,6 +878,19 @@ func (d *daemonUseCase) GrantEditAccess(resourcePath string) (func() error, erro
 		return rerr
 	}
 	return revoke, nil
+}
+
+func (d *daemonUseCase) ResyncBinaries() {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.stopping {
+		return
+	}
+	for i, g := range d.guards {
+		if _, err := g.ReSyncBinaries(); err != nil {
+			log.Errorf("daemon: re-syncing binary whitelist for %s: %v", d.resources[i].Path, err)
+		}
+	}
 }
 
 // Events returns the merged, per-resource tagged event stream.

@@ -59,6 +59,7 @@ type fakeGuardRepo struct {
 	vaultAccessCalls int
 	events           chan guard.GuardEvent
 	taintedPIDs      []uint32
+	superseded       []guard.SupersededBinary
 	anchor           guard.GuardInodeKey
 	anchorAlive      bool
 }
@@ -131,6 +132,19 @@ func (f *fakeGuardRepo) SnapshotTaintedPIDs() ([]uint32, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]uint32(nil), f.taintedPIDs...), nil
+}
+
+func (f *fakeGuardRepo) SnapshotSuperseded() ([]guard.SupersededBinary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]guard.SupersededBinary(nil), f.superseded...), nil
+}
+
+func (f *fakeGuardRepo) RestoreSuperseded(bins []guard.SupersededBinary) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.superseded = append(f.superseded, bins...)
+	return nil
 }
 
 func (f *fakeGuardRepo) RootAnchor() (guard.GuardInodeKey, bool, error) {

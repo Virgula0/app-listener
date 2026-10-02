@@ -842,9 +842,7 @@ need_encryption: false
 	code, out = s.exec(c, []string{"sh", "-c", "echo x >> /etc/app-listener/fscrypt.key 2>&1"})
 	s.Require().NotEqualf(0, code, "writing fscrypt.key must be denied: %s", out)
 
-	// 7. SIGHUP reload: the self guards detach for the config swap (so the
-	// transient old+new guard count stays under the kernel's per-LSM-hook
-	// program cap) and re-attach afterwards. Self-protection must survive.
+	// 7. SIGHUP reload: self-protection must survive it.
 	_, pidOut := s.exec(c, []string{"sh", "-c", "cat /run/app-listener-daemon.pid"})
 	s.exec(c, []string{"sh", "-c", "kill -HUP " + strings.TrimSpace(pidOut)})
 	reloaded := false

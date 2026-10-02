@@ -5,7 +5,9 @@ package daemonconfig
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +25,9 @@ type Config struct {
 	// daemon-wide, so they belong to no resource; all go to the trust guard, which re-stats each
 	// after the vaults unlock.
 	SharedAllowLibs []string
+	// Raw is the file's content as parsed: the daemon's catalog refresh writes only over the
+	// version it runs (compare-and-swap).
+	Raw []byte
 }
 
 // Resource is one guarded tree (directory or vault root) with its own guard, whitelist and, via
@@ -138,14 +143,17 @@ type watchGroup struct {
 // are skipped with a warning; unreadable binaries go to PendingBinaries for post-unlock resolution.
 // Malformed directives in valid sections fail fast.
 func Load(path string) (*Config, error) {
-	file, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	return Parse(raw)
+}
 
-	cfg := &Config{}
-	if err := parseConfig(cfg, file); err != nil {
+// Parse parses config text as Load does.
+func Parse(raw []byte) (*Config, error) {
+	cfg := &Config{Raw: raw}
+	if err := parseConfig(cfg, bytes.NewReader(raw)); err != nil {
 		return nil, err
 	}
 	if err := validateResources(cfg); err != nil {
@@ -156,7 +164,7 @@ func Load(path string) (*Config, error) {
 
 // parseConfig reads the file into cfg, one Resource per guarded tree (a watch group emits one per
 // `watch:` path).
-func parseConfig(cfg *Config, file *os.File) error {
+func parseConfig(cfg *Config, file io.Reader) error {
 	var group *watchGroup
 
 	scanner := bufio.NewScanner(file)

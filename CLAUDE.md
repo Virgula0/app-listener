@@ -209,6 +209,11 @@ module including the fyne GUI, so CI installs `libgl1-mesa-dev xorg-dev libwayla
 libxkbcommon-dev` — a bare box will report GUI typecheck failures that aren't your change.
 
 CI (`.github/workflows/ci.yml`) runs `make lint` and `make test` on non-draft PRs only.
+`verifier.yml` loads the PR's and the base's guard objects into the verifier of two runner
+kernels (`ubuntu-24.04`: 6.17, `ubuntu-26.04`: 7.0) with `bpfstats` and
+`daemon --check --verifier-only`, and fails on any rejection; its summary has the per-program
+cost deltas. Those are those kernels' verdicts only — still run bpfstats locally. Every job pins
+an explicit runner label, never `ubuntu-latest`.
 Integration tests are **not** in CI — run them locally when touching BPF or enforcement.
 
 ## Architecture
@@ -237,8 +242,12 @@ nothing, so the process refuses to start instead.
 - **kprobes** (`monitor`) — observe all I/O regardless of syscall path (io_uring, splice,
   sendfile, mmap) plus metadata ops.
 - **LSM hooks** (`guard`, `network-guard`, `daemon`) — the only kernel mechanism that can
-  **deny**. ~23 hooks; only `file_open` + `file_permission` are mandatory, the rest are
-  best-effort (a missing hook logs a warning, enforcement continues).
+  **deny**. ~28 hooks; `file_open` + `file_permission` and the superseded-key set
+  (`inode_unlink`, `inode_rename`, `bprm_committed_creds`, the `sched_process_fork`
+  tracepoint) are mandatory, the rest are best-effort (a missing hook logs a warning,
+  enforcement continues). A replaced binary's old `dev:ino` key admits only processes
+  exec'd before the replacement and never a reused inode number (`exe_supersede.h`,
+  shared by the guard and trust objects).
 - **tracepoints / kretprobes** (`network-monitor`) — TCP/UDP/DNS.
 
 **Identity is the executable's inode, never its name or comm** — renaming or comm-spoofing
@@ -255,7 +264,12 @@ shutdown deprovisions fscrypt keys in passes *while guards still deny*. LSM link
 pinned under `/sys/fs/bpf` so a `SIGKILL` leaves trees enforced until `ExecStopPost`
 re-locks the vaults. `systemctl reload` (SIGHUP) recomputes every binary's inode identity
 atomically — new guards attach before old ones detach; a broken config keeps the running
-one. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
+one. The daemon keeps the catalog current itself (`catalogrefresh.go`/`catalogwatch.go`):
+inotify hints schedule the guards' re-sync (system binaries, admitted live by
+`AllowReplacement`'s system-file rule — only at names root placed, `ebpf.OpenSystemPlaced`:
+every directory and symlink hop root's, outside user homes) or the shared
+`install.RefreshCatalog` plus an in-process reload (home apps; a new match outside the
+user's home must be root-placed too, `refreshAdmits`), compare-and-swapped against the config it runs. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
 edit-auth hash. When `edit-protected` has a password configured, `control.go` opens the
 live-edit control socket and `DaemonUseCase.GrantEditAccess` / the guard's
 `GrantSelfEditAccess`+`RevokeSelfEditAccess` implement the transient per-resource write
@@ -272,9 +286,8 @@ grant. The `GuardRepository` port has daemon-specific methods (`PopulateInodes`,
 - `internal/fscrypt` — encryption lifecycle, xattr policy checks, orphan/migrate handling.
 - `internal/protected` — shared "is the daemon running / which dirs are encrypted with the
   master key" checks that gate `install`, `uninstall`, `edit-protected`.
-- `internal/systemd` — generates the systemd units, package-manager catalog-refresh hooks
-  (pacman `PostTransaction`, apt `DPkg::Post-Invoke`), per-user ssh-agent unit, boot-time
-  refresh service.
+- `internal/systemd` — generates the systemd units and the per-user ssh-agent unit, and removes
+  the legacy catalog-refresh triggers earlier versions installed (pacman/apt hooks, boot unit).
 - `scripts/install.sh` is the `curl … | sudo bash` installer: `check-compatibility` +
   Ed25519 signature / checksum / GitHub asset-digest verification before atomic install.
 

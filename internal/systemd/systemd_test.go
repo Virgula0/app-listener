@@ -3,6 +3,7 @@ package systemd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
@@ -194,5 +195,29 @@ func TestReplaceInstalledBinary(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o700 {
 		t.Fatalf("dst mode = %o, want 700", perm)
+	}
+}
+
+func TestRemoveLegacyRemovesPresentFilesOnly(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "50-app-listener-reload.hook")
+	if err := os.WriteFile(present, []byte("hook"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeLegacy([]string{present, filepath.Join(dir, "missing")}); err != nil {
+		t.Fatalf("removeLegacy: %v", err)
+	}
+	if _, err := os.Lstat(present); !os.IsNotExist(err) {
+		t.Fatalf("the legacy hook must be removed: %v", err)
+	}
+}
+
+func TestLegacyCatalogRefreshFilesCoverEveryTrigger(t *testing.T) {
+	got := strings.Join(LegacyCatalogRefreshFiles(), "\n")
+	for _, want := range []string{"/etc/pacman.d/hooks/50-app-listener-reload.hook",
+		"/etc/apt/apt.conf.d/95app-listener-reload", "/etc/systemd/system/app-listener-catalog-refresh.service"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("legacy files miss %s:\n%s", want, got)
+		}
 	}
 }

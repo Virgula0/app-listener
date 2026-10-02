@@ -133,10 +133,13 @@ type Guard struct {
 	verifyStop         chan struct{}
 	// degradeStop shuts the BPF degradation watcher down (startDegradeWatch).
 	degradeStop chan struct{}
-	// deployed: per canonical whitelisted path, the (dev, ino) in the BPF maps. Keys are never
-	// deleted, so a running pre-replacement process keeps admission; ReSyncBinaries rewrites stale
-	// ones.
+	// deployed: per canonical whitelisted path, the (dev, ino) in the BPF maps. A replaced key stays
+	// in the maps, admitting only processes started before its supersede, until its inode is gone
+	// (supersede.go).
 	deployed map[string]GuardInodeKey
+	// keyPaths: every key this guard admitted from a whitelist line, to that line's path. Outlives
+	// deployed's entry, so a superseded key can be carried across a reload (SnapshotSuperseded).
+	keyPaths map[GuardInodeKey]string
 	// refused: replacements ReSyncBinaries declined, reported once each.
 	refused refusedReplacements
 	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
@@ -174,6 +177,13 @@ type Guard struct {
 	dropAllowed bool
 	// chmodDropWrite: WithChmodDropWrite.
 	chmodDropWrite bool
+	// systemPatterns: WithSystemPatterns.
+	systemPatterns []daemonconfig.BinaryRule
+	// vetted: whitelist path -> the inode it was hashed from (binaryKey). Guarded by mu.
+	vetted map[string]GuardInodeKey
+	// held: an fd on each vetted inode not yet written to the maps, so its number can't be freed and
+	// reused in between. Guarded by mu.
+	held map[string]*os.File
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -246,6 +256,63 @@ func WithChmodDropWrite() GuardOption {
 	}
 }
 
+// VettedInode is the inode a whitelist path was hashed from (ConfinedEntry), held open until the
+// guard writes its key.
+type VettedInode struct {
+	Key GuardInodeKey
+	f   *os.File
+}
+
+// Close releases the inode; WithVettedKeys takes ownership instead.
+func (v VettedInode) Close() {
+	if v.f != nil {
+		v.f.Close()
+	}
+}
+
+// WithVettedKeys pins whitelist paths to the inodes their entries were hashed from
+// (ConfinedEntry): the guard admits those inodes and never resolves the paths again. The guard
+// owns the inodes' fds from here.
+func WithVettedKeys(keys map[string]VettedInode) GuardOption {
+	return func(g *Guard) {
+		for p, v := range keys {
+			g.vetted[p] = v.Key
+			g.holdLocked(p, v.f)
+		}
+	}
+}
+
+// holdLocked keeps f open until path's key is written (addBinaryActions). Caller holds mu, or owns g.
+func (g *Guard) holdLocked(path string, f *os.File) {
+	if g.held == nil {
+		g.held = make(map[string]*os.File)
+	}
+	if old := g.held[path]; old != nil && old != f {
+		old.Close()
+	}
+	if f == nil {
+		delete(g.held, path)
+		return
+	}
+	g.held[path] = f
+}
+
+func (g *Guard) releaseHeldLocked() {
+	for _, f := range g.held {
+		f.Close()
+	}
+	g.held = nil
+}
+
+// WithSystemPatterns lists the resource's absolute catalog whitelist patterns (fixed paths or
+// globs). ReSyncBinaries admits a new match only root could have installed with no reload
+// (admitSystemMatches).
+func WithSystemPatterns(rules []daemonconfig.BinaryRule) GuardOption {
+	return func(g *Guard) {
+		g.systemPatterns = rules
+	}
+}
+
 // WithPinning pins each LSM link at prefix+<hook> on bpffs so enforcement survives daemon death.
 // prefix must be unique per guard and encode the generation (PinPrefix). Stop() unpins;
 // CleanupStalePins retires leftovers.
@@ -286,10 +353,14 @@ func VerifyLoad() error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("removing memlock rlimit (need CAP_SYS_RESOURCE / root): %w", err)
 	}
+	trust := func() (*cilium.CollectionSpec, error) {
+		spec, _, err := trustSpec()
+		return spec, err
+	}
 	for _, obj := range []struct {
 		name string
 		load func() (*cilium.CollectionSpec, error)
-	}{{"guard", LoadGuard}, {"trust", LoadGuardTrust}} {
+	}{{"guard", LoadGuard}, {"trust", trust}} {
 		spec, err := obj.load()
 		if err != nil {
 			return fmt.Errorf("reading embedded %s objects: %w", obj.name, err)
@@ -338,10 +409,17 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		recursive:      recursive,
 		depth:          depth,
 		deployed:       make(map[string]GuardInodeKey),
+		keyPaths:       make(map[GuardInodeKey]string),
+		vetted:         make(map[string]GuardInodeKey),
 	}
 	for _, opt := range opts {
 		opt(g)
 	}
+	defer func() {
+		g.mu.Lock()
+		g.releaseHeldLocked()
+		g.mu.Unlock()
+	}()
 	if g.chmodDropWrite && mode != ModeReadOnly {
 		return nil, fmt.Errorf("guard %s: WithChmodDropWrite needs ModeReadOnly (it would widen a secret tree)", path)
 	}
@@ -457,8 +535,13 @@ func (g *Guard) resConfig() (GuardResConfig, error) {
 // PinDegraded reports that requested pinning was refused: enforcing, but won't survive SIGKILL.
 func (g *Guard) PinDegraded() bool { return SharedPinDegraded() }
 
-// requiredHooks: without these, files could be opened and read unchecked.
-var requiredHooks = map[string]bool{"file_open": true, "file_permission": true}
+// requiredHooks: without the first two, files could be opened and read unchecked; without the
+// rest, a superseded binary or a reused inode number would keep its whitelist entry
+// (exe_supersede.h).
+var requiredHooks = map[string]bool{
+	"file_open": true, "file_permission": true,
+	"inode_unlink": true, "inode_rename": true, "bprm_committed_creds": true,
+}
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
 // (g.pinPrefix+suffix); exported so `daemon --lockdown` (no live Guard) can reopen just those maps.
@@ -554,6 +637,8 @@ func guardLSMHooks(o *GuardObjects) []struct {
 		{o.GuardTaskFree, "task_free"},
 		{o.GuardInodeFree, "inode_free_security"},
 		{o.GuardBprmCommitted, "bprm_committed_creds"},
+		{o.GuardInodeUnlink, "inode_unlink"},
+		{o.GuardInodeRename, "inode_rename"},
 	}
 }
 
@@ -578,26 +663,38 @@ func guardModeKey(m Mode) (uint64, error) {
 	}
 }
 
+// binaryKey is the inode path was hashed from through a confined open (WithVettedKeys, or a
+// resolved deferred rule): never resolved again. Otherwise path resolved by StatConfined.
+func (g *Guard) binaryKey(path string) (GuardInodeKey, error) {
+	g.mu.Lock()
+	key, ok := g.vetted[path]
+	g.mu.Unlock()
+	if ok {
+		return key, nil
+	}
+	dev, ino, err := ebpf.StatConfined(path)
+	return GuardInodeKey{Dev: dev, Ino: ino}, err
+}
+
 // addBinaryActions stores per-binary allow/block flags in guard_exe_actions, keyed by filesystem inode.
 func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 	for _, b := range binaries {
-		dev, ino, err := ebpf.StatConfined(b.Path)
+		inodeKey, err := g.binaryKey(b.Path)
 		if err != nil {
 			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
-		}
-		inodeKey := GuardInodeKey{
-			Dev: dev,
-			Ino: ino,
 		}
 		action := uint8(GUARD_BLOCK)
 		if g.mode == ModeWhitelist || g.mode == ModeReadOnly {
 			action = uint8(GUARD_ALLOW)
 		}
+		liftSuperseded(inodeKey)
 		if err := g.putExeAction(inodeKey, action); err != nil {
 			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
 		}
 		g.mu.Lock()
 		g.deployed[canonicalBinaryPath(b.Path)] = inodeKey
+		g.keyPaths[inodeKey] = b.Path
+		g.holdLocked(b.Path, nil)
 		g.mu.Unlock()
 	}
 	return nil
@@ -846,11 +943,11 @@ func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf
 		if err != nil {
 			return fmt.Errorf("invalid event mask for binary %s: %w", b.Path, err)
 		}
-		dev, ino, err := ebpf.StatConfined(b.Path)
+		key, err := g.binaryKey(b.Path)
 		if err != nil {
 			return fmt.Errorf("cannot stat binary %s for event mask: %w", b.Path, err)
 		}
-		if err := g.objs().GuardExeEvents.Put(g.resKey(GuardInodeKey{Dev: dev, Ino: ino}), mask); err != nil {
+		if err := g.objs().GuardExeEvents.Put(g.resKey(key), mask); err != nil {
 			return fmt.Errorf("storing exe events for %s: %w", b.Path, err)
 		}
 	}
@@ -858,7 +955,7 @@ func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf
 }
 
 // resolveDeferred hashes every deferred rule now readable; returns entries, event lists (by
-// canonical path) and still-unreadable rules. Never mutates the guard.
+// canonical path) and still-unreadable rules. It only records each hashed inode (binaryKey).
 func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]ebpf.EventType, stillDeferred []deferredBinary) {
 	g.mu.Lock()
 	deferredList := append([]deferredBinary(nil), g.deferred...)
@@ -868,11 +965,7 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 	events = make(map[string][]ebpf.EventType, len(deferredList))
 	for _, deferred := range deferredList {
 		rule := deferred.rule
-		path, err := ebpf.ResolveConfined(rule.Path)
-		var entry BinaryEntry
-		if err == nil {
-			entry, err = ComputeBinaryEntry(path)
-		}
+		path, entry, key, f, err := confinedEntry(rule.Path)
 		if err != nil {
 			deferred.attempts++
 			if deferred.attempts >= maxResolveAttempts {
@@ -884,11 +977,55 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 			continue
 		}
 		resolved = append(resolved, entry)
+		g.mu.Lock()
+		if g.vetted == nil {
+			g.vetted = make(map[string]GuardInodeKey)
+		}
+		g.vetted[path] = key
+		g.holdLocked(path, f)
+		g.mu.Unlock()
 		if len(rule.Events) > 0 {
 			events[path] = rule.Events
 		}
 	}
 	return resolved, events, stillDeferred
+}
+
+// confinedEntry opens path once (OpenConfined) and hashes the inode reached, returning its resolved
+// path, the entry, that inode's key and the open fd holding it.
+func confinedEntry(path string) (resolved string, entry BinaryEntry, key GuardInodeKey, f *os.File, err error) {
+	f, err = ebpf.OpenConfined(path)
+	if err != nil {
+		return "", entry, key, nil, err
+	}
+	if resolved, err = os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); err == nil {
+		if key.Dev, key.Ino, err = ebpf.StatFile(f); err == nil {
+			entry, err = ebpf.ComputeBinaryEntryFile(f, resolved)
+		}
+	}
+	if err != nil {
+		f.Close()
+		return "", entry, key, nil, err
+	}
+	return resolved, entry, key, f, nil
+}
+
+// ConfinedEntry hashes the inode a whitelist path reaches through one confined open and returns it
+// held open; the entry keeps path as its name. Pass it to WithVettedKeys, or Close it.
+func ConfinedEntry(path string) (entry BinaryEntry, v VettedInode, err error) {
+	f, err := ebpf.OpenConfined(path)
+	if err != nil {
+		return entry, v, err
+	}
+	if v.Key.Dev, v.Key.Ino, err = ebpf.StatFile(f); err == nil {
+		entry, err = ebpf.ComputeBinaryEntryFile(f, path)
+	}
+	if err != nil {
+		f.Close()
+		return entry, VettedInode{}, err
+	}
+	v.f = f
+	return entry, v, nil
 }
 
 // ResolvePendingBinaries retries entries deferred while their resource was locked; run only after
@@ -937,7 +1074,7 @@ func canonicalBinaryPath(path string) string {
 // its event mask to guard_exe_events.
 func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][]ebpf.EventType) error {
 	action := uint8(GUARD_BLOCK)
-	if g.mode == ModeWhitelist {
+	if g.mode == ModeWhitelist || g.mode == ModeReadOnly {
 		action = uint8(GUARD_ALLOW)
 	}
 	if err := g.putExeAction(key, action); err != nil {
@@ -994,8 +1131,8 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 }
 
 // ReSyncBinaries re-stats whitelisted binaries and admits a replacement inode only when the
-// SetReplacementCheck check approves it. Stale keys are never deleted (running pre-replacement
-// processes stay admitted; vanished paths keep their key). Still-deferred rules are retried.
+// SetReplacementCheck check approves it. A replaced key stays admitted for processes started
+// before its supersede (supersede.go). Still-deferred rules are retried.
 func (g *Guard) ReSyncBinaries() (int, error) {
 	// Retry deferred rules first; addBinaryActions records newly resolved binaries in deployed, so the pass below skips them.
 	resolved, resolvedEvents, stillDeferred := g.resolveDeferred()
@@ -1013,43 +1150,163 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 
 	var changed int
 	for _, b := range binaries {
-		path := canonicalBinaryPath(b.Path)
-		dev, ino, err := ebpf.StatConfined(b.Path)
+		ok, err := g.resyncOne(b.Path, exeEvents)
 		if err != nil {
-			// Vanished mid-update (rename, then removal) or re-pointed out of its tree; the previously
-			// deployed key stays valid.
-			continue
-		}
-		key := GuardInodeKey{Dev: dev, Ino: ino}
-
-		g.mu.Lock()
-		old := g.deployed[path]
-		g.mu.Unlock()
-		if old == key {
-			continue
-		}
-		// Re-admitting by path alone let anyone who could swap the path (or a parent directory)
-		// inherit the entry; only an inode its updater created qualifies. Reload is the
-		// operator's path for anything else.
-		if !replacementAllowed(b.Path, old, key) {
-			if g.refused.firstTime(path, key) {
-				log.Warnf("guard %s: replacement of %s (inode %d) was not created by its updater — "+
-					"not re-admitted; reload the daemon after verifying it", g.path, path, key.Ino)
-			}
-			continue
-		}
-		if err := g.putBinaryKey(key, b.Path, exeEvents); err != nil {
 			return changed, err
 		}
-		g.mu.Lock()
-		g.deployed[path] = key
-		g.mu.Unlock()
-		changed++
+		if ok {
+			changed++
+		}
 	}
 	if changed > 0 {
 		log.Infof("guard %s: re-synced %d binary inode(s) after replacement", g.path, changed)
 	}
-	return changed, nil
+	added, err := g.admitSystemMatches()
+	return changed + added, err
+}
+
+// resyncOne admits the inode now at the whitelisted binPath when it replaced the deployed one and
+// the replacement check approves it. The key admitted is the one the check judged, from one
+// confined open: a rename after it cannot slip another inode in.
+func (g *Guard) resyncOne(binPath string, exeEvents map[string][]ebpf.EventType) (bool, error) {
+	path := canonicalBinaryPath(binPath)
+	f, err := ebpf.OpenConfined(binPath)
+	if err != nil {
+		// Vanished mid-update (rename, then removal) or re-pointed out of its tree; the previously
+		// deployed key stays valid.
+		return false, nil
+	}
+	defer f.Close()
+	dev, ino, err := ebpf.StatFile(f)
+	if err != nil {
+		return false, nil // unreadable now: keep the deployed key
+	}
+	key := GuardInodeKey{Dev: dev, Ino: ino}
+
+	g.mu.Lock()
+	old := g.deployed[path]
+	g.mu.Unlock()
+	if old == key {
+		return false, nil
+	}
+	// Re-admitting by path alone let anyone who could swap the path (or a parent directory)
+	// inherit the entry; only an inode its updater created, or a system file at a name only root
+	// could have placed, qualifies. Reload is the operator's path for anything else.
+	if !replacementAllowed(binPath, f, old, key) {
+		if g.refused.firstTime(path, key) {
+			log.Warnf("guard %s: replacement of %s (inode %d) was neither created by its updater nor a "+
+				"system file at a root-placed name — not re-admitted; reload the daemon after verifying it", g.path,
+				path, key.Ino)
+		}
+		return false, nil
+	}
+	liftSuperseded(key)
+	if err := g.putBinaryKey(key, binPath, exeEvents); err != nil {
+		return false, err
+	}
+	g.mu.Lock()
+	g.deployed[path] = key
+	g.keyPaths[key] = binPath
+	g.mu.Unlock()
+	return true, nil
+}
+
+// maxPatternMatches caps one system pattern's matches per re-sync.
+const maxPatternMatches = 64
+
+// admitSystemMatches admits each new match of the resource's absolute catalog patterns
+// (WithSystemPatterns) that is a system file, with no reload. Other matches wait for the catalog
+// refresh, which vets them by its own rules.
+func (g *Guard) admitSystemMatches() (int, error) {
+	g.mu.Lock()
+	patterns := g.systemPatterns
+	known := make(map[string]bool, len(g.binaries)+len(g.deferred))
+	for _, b := range g.binaries {
+		known[b.Path] = true
+	}
+	for _, d := range g.deferred {
+		known[d.rule.Path] = true
+	}
+	g.mu.Unlock()
+
+	added := 0
+	for _, r := range patterns {
+		for _, m := range patternMatches(r.Path) {
+			if known[m] {
+				continue
+			}
+			ok, err := g.admitSystemMatch(m, r.Events)
+			if err != nil {
+				return added, err
+			}
+			if ok {
+				known[m] = true
+				added++
+			}
+		}
+	}
+	return added, nil
+}
+
+// patternMatches expands a fixed path or glob through root-placed directories only
+// (ebpf.GlobSystemPlaced), at most maxPatternMatches.
+func patternMatches(pattern string) []string {
+	if !strings.ContainsAny(pattern, "*?[") {
+		return []string{pattern}
+	}
+	return ebpf.GlobSystemPlaced(pattern, maxPatternMatches)
+}
+
+// admitSystemMatch admits path when only root could have placed it (ebpf.OpenSystemPlaced). Hash,
+// key and resolved path all come from that open.
+func (g *Guard) admitSystemMatch(path string, events []ebpf.EventType) (bool, error) {
+	f, err := ebpf.OpenSystemPlaced(path)
+	if err != nil {
+		return false, nil // not installed (any more), or a name a user could have placed
+	}
+	defer f.Close()
+	dev, ino, err := ebpf.StatFile(f)
+	if err != nil {
+		return false, nil // unreadable now: next re-sync
+	}
+	key := GuardInodeKey{Dev: dev, Ino: ino}
+	resolved, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	if err != nil {
+		return false, nil // unreadable now: next re-sync
+	}
+	g.mu.Lock()
+	_, deployed := g.deployed[resolved]
+	g.mu.Unlock()
+	if deployed {
+		return false, nil // another whitelist line already names this file
+	}
+	if !replacementAllowed(path, f, GuardInodeKey{}, key) {
+		return false, nil
+	}
+	entry, err := ebpf.ComputeBinaryEntryFile(f, path)
+	if err != nil {
+		return false, nil // unreadable now: next re-sync
+	}
+	liftSuperseded(key)
+	if err := g.putBinaryKey(key, path, map[string][]ebpf.EventType{path: events}); err != nil {
+		return false, err
+	}
+	g.mu.Lock()
+	g.binaries = append(g.binaries, entry)
+	if g.exeEvents == nil {
+		g.exeEvents = make(map[string][]ebpf.EventType)
+	}
+	g.exeEvents[path] = events
+	g.canonicalPaths[path] = resolved
+	g.deployed[resolved] = key
+	g.keyPaths[key] = path
+	if g.binaryVerifyStates != nil {
+		g.binaryVerifyStates[resolved] = &binaryVerifyState{key: key, hash: entry.Hash}
+	}
+	g.mu.Unlock()
+	log.Infof("guard %s: admitted %s (inode %d): a new system binary at a root-placed name matching a catalog pattern",
+		g.path, logging.SanitizeText(path), key.Ino)
+	return true, nil
 }
 
 // writeGuardConfig stores this resource's mode, recursion flag and depth limit in its slot,
@@ -1081,6 +1338,9 @@ func (g *Guard) populateMaps() error {
 	if err != nil {
 		return err
 	}
+	if err := checkBtrfsKeys(g.path, g.binaries); err != nil {
+		return err
+	}
 	if cfgErr := g.writeGuardConfig(modeKey); cfgErr != nil {
 		return cfgErr
 	}
@@ -1093,7 +1353,7 @@ func (g *Guard) populateMaps() error {
 		return fmt.Errorf("stating guard root %s: %w", g.path, rootErr)
 	}
 	root.close()
-	if keyErr := g.updateRootKey(root.key); keyErr != nil {
+	if keyErr := g.updateRootKey(root.key, root.sbdev); keyErr != nil {
 		return keyErr
 	}
 	g.mu.Lock()
@@ -1131,44 +1391,41 @@ func (g *Guard) populateMaps() error {
 	if err := g.addBackingBlockDevice(); err != nil {
 		log.Warnf("backing block device detection: %v", err)
 	}
-	if err := g.addFsDeviceGate(); err != nil {
+	if err := g.addFsDeviceGate(root.sbdev); err != nil {
 		return fmt.Errorf("filesystem device gate: %w", err)
 	}
 
 	return nil
 }
 
-// addFsDeviceGate records the path's fs device in guard_fs_sbdevs so the ancestor walk skips other
-// filesystems in one lookup (st_dev == i_sb->s_dev on all fs types, incl. anon
-// tmpfs/overlayfs/btrfs). Must not fail open: without its device the walk answers "not guarded" on
-// the whole filesystem, so rename/unlink/stat of an unmapped inode below the root go unchecked.
-func (g *Guard) addFsDeviceGate() error {
-	var s syscall.Stat_t
-	if err := syscall.Stat(g.path, &s); err != nil {
-		return fmt.Errorf("stating guarded path: %w", err)
-	}
-
-	major := unix.Major(s.Dev)
-	dev := uint64(major)<<20 | uint64(unix.Minor(s.Dev))
+// addFsDeviceGate records the root's superblock device in guard_fs_sbdevs so the ancestor walk
+// skips other filesystems in one lookup. The superblock's, not st_dev: on btrfs st_dev names the
+// subvolume. Must not fail open: without its device the walk answers "not guarded" on the whole
+// filesystem, so rename/unlink/stat of an unmapped inode below the root go unchecked.
+func (g *Guard) addFsDeviceGate(sbdev uint64) error {
 	var val uint8 = 1
-	if err := g.objs().GuardFsSbdevs.Put(dev, val); err != nil {
-		return fmt.Errorf("storing filesystem device %d:%d in map: %w", major, unix.Minor(s.Dev), err)
+	if err := g.objs().GuardFsSbdevs.Put(sbdev, val); err != nil {
+		return fmt.Errorf("storing filesystem device %d:%d in map: %w", sbdev>>20, sbdev&0xfffff, err)
 	}
 	return nil
 }
 
-// BackingDevice returns the guard_fs_devices key (dev_t, major<<20|minor) of path's backing block
-// device; false for tmpfs, overlayfs, procfs and other major-0 pseudo-filesystems.
-func BackingDevice(path string) (rdev uint32, hasDevice bool, err error) {
+// BackingDevices returns the guard_fs_devices keys (dev_t, major<<20|minor) of path's backing
+// block devices: every member device on btrfs, whose st_dev names none; nil for tmpfs, overlayfs,
+// procfs and other major-0 pseudo-filesystems.
+func BackingDevices(path string) ([]uint32, error) {
 	var s syscall.Stat_t
 	if statErr := syscall.Stat(path, &s); statErr != nil {
-		return 0, false, fmt.Errorf("stating %s: %w", path, statErr)
+		return nil, fmt.Errorf("stating %s: %w", path, statErr)
 	}
 	major := unix.Major(s.Dev)
-	if major == 0 {
-		return 0, false, nil
+	if major != 0 {
+		return []uint32{major<<20 | unix.Minor(s.Dev)}, nil
 	}
-	return major<<20 | unix.Minor(s.Dev), true, nil
+	if on, err := ebpf.OnBtrfs(path); err != nil || !on {
+		return nil, err
+	}
+	return ebpf.BtrfsDevices(path)
 }
 
 // addBackingBlockDevice populates guard_fs_devices so raw opens of the hosting block device(s) are
@@ -1178,15 +1435,11 @@ func (g *Guard) addBackingBlockDevice() error {
 	if g.rawDevicesSet {
 		return g.putBackingDevices(g.rawDevices)
 	}
-	rdev, hasDevice, err := BackingDevice(g.path)
+	rdevs, err := BackingDevices(g.path)
 	if err != nil {
 		return err
 	}
-	if !hasDevice {
-		// Pseudo-filesystem (tmpfs, overlay, procfs, etc.) — no backing block device.
-		return nil
-	}
-	return g.putBackingDevices([]uint32{rdev})
+	return g.putBackingDevices(rdevs)
 }
 
 func (g *Guard) putBackingDevices(rdevs []uint32) error {
@@ -1204,16 +1457,17 @@ func (g *Guard) putBackingDevices(rdevs []uint32) error {
 	return nil
 }
 
-// updateRootKey re-anchors the watch-root identity to newKey in guard_config[3..4] (root_in_chain)
-// and g.rootKey. Called from populateMaps and from SweepInodes when a single-file root is
-// recreated.
-func (g *Guard) updateRootKey(newKey GuardInodeKey) error {
+// updateRootKey re-anchors the watch-root identity to newKey on superblock sbdev in the resource's
+// config (root_in_chain) and g.rootKey. Called from populateMaps and from SweepInodes when a
+// single-file root is recreated.
+func (g *Guard) updateRootKey(newKey GuardInodeKey, sbdev uint64) error {
 	cfg, err := g.resConfig()
 	if err != nil {
 		return err
 	}
 	cfg.RootDev = newKey.Dev
 	cfg.RootIno = newKey.Ino
+	cfg.RootSbdev = sbdev
 	if putErr := g.objs().GuardResConfig.Put(g.resID, cfg); putErr != nil {
 		return fmt.Errorf("setting watch root in resource slot %d: %w", g.resID, putErr)
 	}
@@ -1328,7 +1582,7 @@ func (g *Guard) reanchorRoot(oldKey GuardInodeKey, root *rootHandle) error {
 	if err := g.scanRoot(root); err != nil {
 		return err
 	}
-	if err := g.updateRootKey(root.key); err != nil {
+	if err := g.updateRootKey(root.key, root.sbdev); err != nil {
 		return err
 	}
 	if delErr := g.objs().GuardInodes.Delete(oldKey); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {
@@ -1869,20 +2123,24 @@ func (g *Guard) verifyBinaryHashesOnce() {
 		}
 		st.stat = fp
 		st.hashed = true
-		if st.demoted {
-			continue // once tampering is detected the entry stays blocked
-		}
-		if hash != st.hash {
-			// Same inode, different content: replaced in place. Demote to GUARD_BLOCK (fail
-			// closed).
-			if putErr := g.putExeAction(st.key, uint8(GUARD_BLOCK)); putErr != nil {
-				log.Errorf("guard %s: demoting in-place replaced binary %s: %v", g.path, canonical, putErr)
-				continue
-			}
-			st.demoted = true
-			log.Errorf("guard %s: whitelisted binary %s was modified in place (inode unchanged, hash changed) \u2014 whitelist entry demoted to BLOCK", g.path, canonical)
+		if !st.demoted && hash != st.hash {
+			g.demoteInPlace(canonical, st)
 		}
 	}
+}
+
+// demoteInPlace blocks st's key: same inode, different content, so it was rewritten in place (fail
+// closed). Once demoted the entry stays blocked.
+func (g *Guard) demoteInPlace(canonical string, st *binaryVerifyState) {
+	if exeGone(st.key) {
+		return // not in place: a new file reuses a freed inode's number (supersede.go)
+	}
+	if putErr := g.putExeAction(st.key, uint8(GUARD_BLOCK)); putErr != nil {
+		log.Errorf("guard %s: demoting in-place replaced binary %s: %v", g.path, canonical, putErr)
+		return
+	}
+	st.demoted = true
+	log.Errorf("guard %s: whitelisted binary %s was modified in place (inode unchanged, hash changed) \u2014 whitelist entry demoted to BLOCK", g.path, canonical)
 }
 
 // adoptReplacedIdentity re-pins st to a new inode at canonical. ReSyncBinaries owns re-admission,
@@ -2041,6 +2299,7 @@ func (g *Guard) Stop() {
 		return
 	}
 	g.stopped = true
+	g.releaseHeldLocked()
 	if g.verifyStop != nil {
 		close(g.verifyStop)
 		g.verifyStop = nil
@@ -2085,6 +2344,34 @@ func (g *Guard) dropResourceState() {
 			log.Warnf("guard %s: clearing watch path: %v", g.path, err)
 		}
 	}
+}
+
+// deleteInoKeys drops every row of a (res_id, inode)-keyed map naming exe, whatever the resource.
+// Keys only, as deleteResKeys.
+func deleteInoKeys(m *cilium.Map, exe GuardInodeKey) error {
+	var stale []GuardResInodeKey
+	var next GuardResInodeKey
+	var prev any
+	for {
+		err := m.NextKey(prev, &next)
+		if errors.Is(err, cilium.ErrKeyNotExist) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if next.Ino == exe {
+			stale = append(stale, next)
+		}
+		cur := next
+		prev = cur
+	}
+	for i := range stale {
+		if err := m.Delete(stale[i]); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 // deleteResKeys drops every row of a (res_id, inode)-keyed map belonging to res. It walks keys only

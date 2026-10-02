@@ -208,6 +208,14 @@ func (g *NetGuard) populateMaps() error {
 		return fmt.Errorf("setting throttle enabled: %w", err)
 	}
 
+	return g.putBinaries()
+}
+
+// putBinaries stores every binary's inode key with the mode's action.
+func (g *NetGuard) putBinaries() error {
+	if err := g.putBtrfsLayout(); err != nil {
+		return err
+	}
 	bpfVal := bpfBlock
 	if g.mode == ModeWhitelist {
 		bpfVal = bpfAllow
@@ -222,6 +230,28 @@ func (g *NetGuard) populateMaps() error {
 		}
 	}
 
+	return nil
+}
+
+// putBtrfsLayout lets inode_dev key btrfs inodes by subvolume, as stat does. Without it no btrfs
+// binary matches its entry, so one configured there refuses the start: a blacklisted one would
+// connect freely.
+func (g *NetGuard) putBtrfsLayout() error {
+	l, err := ebpf.ResolveBtrfsLayout()
+	if err != nil {
+		paths := make([]string, len(g.binaries))
+		for i, b := range g.binaries {
+			paths[i] = b.Path
+		}
+		if p := ebpf.FirstOnBtrfs(paths); p != "" {
+			return fmt.Errorf("%s is on btrfs, but the kernel's BTF does not describe btrfs: %w", p, err)
+		}
+		return nil
+	}
+	v := GuardNetBtrfsLayout{Valid: l.Valid, InodeRoot: l.InodeRoot, InodeVfs: l.InodeVfs, RootAnonDev: l.RootAnonDev}
+	if err := g.objs.BtrfsLayout.Put(uint32(0), v); err != nil {
+		return fmt.Errorf("storing the btrfs layout: %w", err)
+	}
 	return nil
 }
 
