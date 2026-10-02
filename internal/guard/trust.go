@@ -41,6 +41,7 @@ const (
 // always enforced once attached.
 type TrustGuard struct {
 	objs  GuardTrustObjects
+	memfd bool // trust_memfd_alloc's target exists (trustSpec)
 	links []link.Link
 	rd    *ringbuf.Reader
 	done  chan struct{}
@@ -77,7 +78,12 @@ func NewTrustGuard() (*TrustGuard, error) {
 		return nil, err
 	}
 	t := &TrustGuard{done: make(chan struct{}), mountFd: -1, mountStop: -1, vouched: -1}
-	if err := LoadGuardTrustObjects(&t.objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
+	spec, memfd, err := trustSpec()
+	if err != nil {
+		return nil, err
+	}
+	t.memfd = memfd
+	if err := spec.LoadAndAssign(&t.objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
 		return nil, fmt.Errorf("loading trust BPF objects: %w", err)
 	}
 	return t, nil
@@ -347,6 +353,12 @@ func (t *TrustGuard) attachSuspectFork() error {
 // Best-effort and fail-closed: without the record a memfd exec-map stays denied and the driver
 // falls through to O_TMPFILE/mkstemp, which file_open sees.
 func (t *TrustGuard) attachMemfdProvenance() {
+	if !t.memfd {
+		log.Warnf("trust guard: skipping memfd provenance (this kernel has no %s) — a whitelisted "+
+			"process's memfd-backed runtime code stays denied (GPU drivers fall back to their "+
+			"file-backed JIT paths, which are covered); every other protection is unaffected", memfdTarget)
+		return
+	}
 	l, err := link.AttachTracing(link.TracingOptions{
 		Program:    t.objs.TrustMemfdAlloc,
 		AttachType: cilium.AttachTraceFExit,

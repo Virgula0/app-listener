@@ -69,6 +69,12 @@ func measure(path string) map[string]int {
 	for _, name := range names {
 		insns, loadErr := loadOne(spec, name)
 		switch {
+		case spec.Programs[name].Type == cilium.Tracing && errors.Is(loadErr, cilium.ErrNotSupported):
+			// A missing fexit target, not a verifier verdict: the loader skips such best-effort
+			// programs (guard.trustSpec). Only tracing ones: an LSM program unsupported here means
+			// the kernel lacks BPF-LSM, and must fail.
+			out[name] = 0
+			fmt.Printf("  %-32s SKIPPED   %v\n", name, loadErr)
 		case loadErr != nil:
 			out[name] = -1
 			fmt.Printf("  %-32s REJECTED  %s\n", name, short(loadErr))

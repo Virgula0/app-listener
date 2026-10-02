@@ -353,10 +353,14 @@ func VerifyLoad() error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("removing memlock rlimit (need CAP_SYS_RESOURCE / root): %w", err)
 	}
+	trust := func() (*cilium.CollectionSpec, error) {
+		spec, _, err := trustSpec()
+		return spec, err
+	}
 	for _, obj := range []struct {
 		name string
 		load func() (*cilium.CollectionSpec, error)
-	}{{"guard", LoadGuard}, {"trust", LoadGuardTrust}} {
+	}{{"guard", LoadGuard}, {"trust", trust}} {
 		spec, err := obj.load()
 		if err != nil {
 			return fmt.Errorf("reading embedded %s objects: %w", obj.name, err)
