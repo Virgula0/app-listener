@@ -2249,7 +2249,7 @@ int guard_bprm_check_security(unsigned long long *ctx)
 SEC("lsm/inode_free_security")
 int guard_inode_free(unsigned long long *ctx)
 {
-	struct inode *inode = (struct inode *)ctx[0];
+	struct inode *inode = (struct inode *)ctx_ptr(ctx, 0);
 	if (!inode)
 		return 0;
 

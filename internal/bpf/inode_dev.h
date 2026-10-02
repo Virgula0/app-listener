@@ -29,7 +29,8 @@ struct {
 // btrfs, whose subvolumes share one superblock and repeat inode numbers. There stat reports the
 // subvolume's anonymous device, and so must every key, or a user's file in one subvolume would
 // carry the identity of another subvolume's binary. Global: the verifier checks it once, not at
-// every call site.
+// every call site, and requires inode to be a scalar: pass an address read with
+// bpf_probe_read_kernel or ctx_ptr, never a typed ctx pointer.
 __attribute__((noinline)) __u64 inode_dev(__u64 inode)
 {
 	struct super_block *sb = NULL;
@@ -55,6 +56,15 @@ __attribute__((noinline)) __u64 inode_dev(__u64 inode)
 		return INODE_DEV_UNKNOWN;
 	bpf_probe_read_kernel(&dev, sizeof(dev), (void *)(root + l->root_anon_dev));
 	return dev ? dev : INODE_DEV_UNKNOWN;
+}
+
+// ctx_ptr returns LSM argument i as a plain address. Read directly, an LSM program's pointer
+// arguments are typed kernel pointers (PTR_TO_BTF_ID), which inode_dev's scalar argument refuses.
+static __always_inline __u64 ctx_ptr(unsigned long long *ctx, int i)
+{
+	__u64 p = 0;
+	bpf_probe_read_kernel(&p, sizeof(p), &ctx[i]);
+	return p;
 }
 
 // sb_dev is the superblock's device: what mountinfo reports, the unit of mounts (vouched devs, the

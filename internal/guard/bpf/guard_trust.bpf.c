@@ -1308,7 +1308,7 @@ int trust_inode_rename(unsigned long long *ctx)
 SEC("lsm/inode_free_security")
 int trust_inode_free(unsigned long long *ctx)
 {
-	struct inode *inode = (struct inode *)ctx[0];
+	struct inode *inode = (struct inode *)ctx_ptr(ctx, 0);
 	unsigned int nlink = 1;
 	struct inode_key k = {};
 	if (!inode)
