@@ -195,6 +195,8 @@ sudo ./build/linux/app-listener daemon            # /etc/app-listener/daemon.con
 | `--blocked-only` | `false` | Print only denied attempts (presentational) |
 | `--no-log-metadata-blocks` | `false` | Don't log denied metadata-only process inspections (`op=PTRACE mode=READ`, e.g. the compositor or audio server reading `/proc/<pid>` of Steam); still denied. Without it they are logged once per caller/target and summarized per minute. Memory and file denials are always logged. Used by the systemd unit |
 | `--genkey` | `false` | Generate `/etc/app-listener/fscrypt.key` and exit (regeneration asks for confirmation) |
+| `--check` | `false` | Preflight: check BPF-LSM is active and load every guard eBPF program into this kernel's verifier, attaching nothing; exit non-zero on any rejection |
+| `--verifier-only` | `false` | With `--check`: skip the BPF-LSM activation check (CI hosts that build BPF-LSM in without enabling it). A pass then says the programs verify, not that the host enforces |
 | `--pprof <addr>` | — | Serve `net/http/pprof` on a loopback address for profiling |
 
 Config grammar (full template in `daemon-samples/daemon.conf`):

@@ -86,6 +86,7 @@ var (
 	genKeyFlag   bool
 	lockdownFlag bool
 	checkFlag    bool
+	verifierOnly bool
 	headless     bool
 	blockedOnly  bool
 	pprofAddr    string
@@ -170,6 +171,10 @@ func init() {
 			"Attaches nothing, changes nothing. The installer runs this against the deployed "+
 			"binary before enabling the service, so a kernel whose verifier rejects a guard "+
 			"program fails the install cleanly instead of crash-looping (or panicking) the daemon.")
+	DaemonCmd.Flags().BoolVarP(&verifierOnly, "verifier-only", "", false,
+		"With --check: skip the BPF-LSM activation check and only load the guard programs into the "+
+			"verifier. For CI hosts that compile BPF-LSM in without enabling it (lsm= boot parameter); "+
+			"never a sign that this host can enforce.")
 	DaemonCmd.Flags().BoolVarP(&lockdownFlag, "lockdown", "", false,
 		"Force-lock every encryption root in the config and exit. Wired into the systemd unit as ExecStopPost: "+
 			"systemd runs it after every exit (clean stop, crash, SIGKILL, startup timeout), so a daemon that died "+
@@ -233,6 +238,8 @@ func runOneShotMode() (bool, error) {
 	switch {
 	case genKeyFlag:
 		return true, runGenKey()
+	case verifierOnly && !checkFlag:
+		return true, errors.New("--verifier-only needs --check")
 	case checkFlag:
 		return true, runBPFCheck()
 	case lockdownFlag:
@@ -898,7 +905,10 @@ func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault, pinBase s
 // binary before enabling the service, so a verifier rejection fails the install cleanly instead of
 // at runtime.
 func runBPFCheck() error {
-	if lsmErr := common.CheckBPFLSM(); lsmErr != nil {
+	if verifierOnly {
+		log.Warn("--verifier-only: not checking that BPF-LSM is active — a pass says the programs " +
+			"verify, not that this host enforces them")
+	} else if lsmErr := common.CheckBPFLSM(); lsmErr != nil {
 		return fmt.Errorf("BPF-LSM preflight failed: %w", lsmErr)
 	}
 	if loadErr := guard.VerifyLoad(); loadErr != nil {
@@ -907,6 +917,10 @@ func runBPFCheck() error {
 			"rebuilt programs still fail, enforcement is not available on this kernel yet " +
 			"(`monitor` mode, kprobes/observe-only, is unaffected)")
 		return fmt.Errorf("guard eBPF preflight failed: %w", loadErr)
+	}
+	if verifierOnly {
+		log.Info("verifier preflight OK: every guard eBPF program is accepted by this kernel")
+		return nil
 	}
 	log.Info("BPF-LSM preflight OK: LSM stack active and every guard eBPF program is accepted by this kernel")
 	return nil

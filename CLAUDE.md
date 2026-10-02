@@ -209,6 +209,9 @@ module including the fyne GUI, so CI installs `libgl1-mesa-dev xorg-dev libwayla
 libxkbcommon-dev` — a bare box will report GUI typecheck failures that aren't your change.
 
 CI (`.github/workflows/ci.yml`) runs `make lint` and `make test` on non-draft PRs only.
+`verifier.yml` loads the PR's and the base's guard objects into the runner's verifier
+(`bpfstats`, `daemon --check --verifier-only`) and fails on any rejection; its summary has the
+per-program cost deltas. That is the runner kernel's verdict only — still run bpfstats locally.
 Integration tests are **not** in CI — run them locally when touching BPF or enforcement.
 
 ## Architecture

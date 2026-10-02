@@ -1,6 +1,7 @@
 // Command bpfstats loads each BPF program of an object file on its own and reports the verifier's
 // "processed N insns" count — the figure the 1M limit applies to, which program size only loosely
-// predicts. Development aid for keeping the guard programs inside the budget; needs root.
+// predicts. Development aid and CI gate for keeping the guard programs inside the budget; needs
+// root. Exits 1 when a program of the first object is rejected (over budget included: E2BIG).
 //
 //	sudo ./bpfstats new.o [base.o ...]
 package main
@@ -37,6 +38,16 @@ func main() {
 	}
 	if len(results) == 2 {
 		compare(results[0], results[1])
+	}
+	rejected := false
+	for name, n := range results[0] {
+		if n < 0 {
+			fmt.Fprintf(os.Stderr, "%s: %s rejected by this kernel's verifier\n", os.Args[1], name)
+			rejected = true
+		}
+	}
+	if rejected {
+		os.Exit(1)
 	}
 }
 
