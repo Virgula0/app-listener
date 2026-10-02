@@ -27,7 +27,13 @@ concurrency:
 
 jobs:
   verifier:
-    runs-on: ubuntu-latest
+    # Two kernels (24.04: 6.17, 26.04: 7.0): the budget is the same everywhere, pruning is not, and
+    # attach targets differ (6.17 has no memfd_alloc_file).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.runner }}
     if: github.event.pull_request.draft != true
     steps:
       - name: Check out the PR
@@ -88,7 +94,7 @@ jobs:
           set -uo pipefail
           status=0
           {
-            echo "## Verifier cost (processed insns, budget 1,000,000) on $(uname -r)"
+            echo "## Verifier cost (processed insns, budget 1,000,000) on ${{ matrix.runner }}, $(uname -r)"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
           for obj in guard/embeds/guard_bpf.o guard/embeds/guardtrust_bpf.o networkguard/embeds/guardnet_bpf.o; do
