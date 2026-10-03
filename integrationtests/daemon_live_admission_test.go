@@ -1,6 +1,7 @@
 package integrationtests
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -174,6 +175,58 @@ func (s *IntegrationSuite) TestDaemon_CatalogRefresh_UserPlacedSystemMatchRefuse
 	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
 	s.Require().NotContainsf(conf, "/opt/evil", "the refresh wrote the user-placed match:\n%s", conf)
 	s.Require().NotContainsf(conf, "/usr/bin/sed", "the refresh wrote the match's target:\n%s", conf)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// An updater replacing a binary several resources whitelist (Proton's wineserver: Steam's config,
+// registry.vdf, ...) is re-admitted by every one of them, including guards that re-sync only after
+// the prune forgot the freed old inode: they still judge the new inode a replacement of it. perl
+// stands in for the app: it is its own updater and swaps itself in by rename, as Steam does.
+func (s *IntegrationSuite) TestDaemon_LiveAdmission_UpdaterReplacementSurvivesPrune() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-PRUNE-RACE-71B3"
+	s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /tmp/apps && for i in 1 2 3 4; do mkdir -p /r$i &&" +
+		" printf '" + marker + "' > /r$i/secret; done && cp /usr/bin/perl /tmp/apps/app && chmod 755 /tmp/apps/app"})
+	var conf strings.Builder
+	for i := 1; i <= 4; i++ {
+		fmt.Fprintf(&conf, "[watch /r%d]\nneed_encryption: false\n/tmp/apps/app\n\n", i)
+	}
+	s.startDaemon(c, conf.String())
+
+	read := func(i int) string {
+		_, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+			`/tmp/apps/app -e 'open(F, "<", "/r%d/secret") or die "DENIED $!\n"; print "STOLEN|", <F>' 2>&1`, i)})
+		return out
+	}
+	for i := 1; i <= 4; i++ {
+		s.Require().Containsf(read(i), "STOLEN|"+marker, "baseline /r%d", i)
+	}
+
+	before := s.inodeOf(c, "/tmp/apps/app")
+	_, out := s.exec(c, []string{"sh", "-c", `/tmp/apps/app -e '
+open(I, "<", "/usr/bin/perl") or die "read $!\n"; binmode I;
+open(O, ">", "/tmp/apps/app.new") or die "create $!\n"; binmode O;
+{ local $/; print O <I>; } close O or die "close $!\n";
+chmod 0755, "/tmp/apps/app.new" or die "chmod $!\n";
+rename("/tmp/apps/app.new", "/tmp/apps/app") or die "rename $!\n"; print "UPDATED\n"' 2>&1`})
+	s.Require().Containsf(out, "UPDATED", "the app must update itself: %s", out)
+	s.Require().NotEqual(before, s.inodeOf(c, "/tmp/apps/app"), "the update must be a new inode")
+
+	// No read until the prune has forgotten the old inode: a denial would re-sync its guard first.
+	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 70*time.Second),
+		"the old inode was never pruned; daemon log:\n%s", s.readDaemonLog(c))
+	for i := 1; i <= 4; i++ {
+		deadline := time.Now().Add(45 * time.Second)
+		for time.Now().Before(deadline) && !strings.Contains(read(i), "STOLEN|"+marker) {
+			time.Sleep(2 * time.Second)
+		}
+		s.Require().Containsf(read(i), "STOLEN|"+marker,
+			"/r%d never re-admitted its updater's replacement; daemon log:\n%s", i, s.readDaemonLog(c))
+	}
+	s.Require().NotContains(s.readDaemonLog(c), "not re-admitted", "no guard may refuse the updater's inode")
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

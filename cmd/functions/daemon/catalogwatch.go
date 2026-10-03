@@ -165,10 +165,14 @@ func (s *watchSet) build(plan []*watchPattern) {
 	}
 }
 
+// trigger: a home file schedules the refresh, and a binary written there the re-sync too: an
+// updater replacing a whitelisted path in place (Proton's wineserver) leaves the config unchanged,
+// so only the re-sync admits the new inode, and it must not wait for the periodic sweep.
 func (s *watchSet) trigger(p *watchPattern) {
 	if p.home {
 		s.refresh = true
-	} else {
+	}
+	if !p.home || !p.dir {
 		s.resync = true
 	}
 }

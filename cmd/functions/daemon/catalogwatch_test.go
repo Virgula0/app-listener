@@ -64,8 +64,9 @@ func TestWatchSetBinaryWriteTriggersNotMkdir(t *testing.T) {
 		t.Fatal("a name the pattern does not match must not trigger")
 	}
 	s.handle(vdir, unix.IN_CLOSE_WRITE, "Discord")
-	if r, rs, _ := s.take(); !r || rs {
-		t.Fatalf("a completed write of the binary in a home pattern: refresh=%v resync=%v, want refresh only", r, rs)
+	// The re-sync too: an in-place update (same path) changes no config line for the refresh.
+	if r, rs, _ := s.take(); !r || !rs {
+		t.Fatalf("a completed write of the binary in a home pattern: refresh=%v resync=%v, want both", r, rs)
 	}
 }
 

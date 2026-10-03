@@ -174,6 +174,10 @@ type Guard struct {
 	// keyPaths: every key this guard admitted from a whitelist line, to that line's path. Outlives
 	// deployed's entry, so a superseded key can be carried across a reload (SnapshotSuperseded).
 	keyPaths map[GuardInodeKey]string
+	// retired: per canonical path, the deployed key forgetExe dropped once its inode was freed. A
+	// replacement re-synced after that prune is still judged against it (updaterCreated's same-dev
+	// test), not as a path that never had a binary.
+	retired map[string]GuardInodeKey
 	// refused: replacements ReSyncBinaries declined, reported once each.
 	refused refusedReplacements
 	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
@@ -1232,9 +1236,12 @@ func (g *Guard) resyncOne(binPath string, exeEvents map[string][]ebpf.EventType)
 	key := GuardInodeKey{Dev: dev, Ino: ino}
 
 	g.mu.Lock()
-	old := g.deployed[path]
+	old, deployed := g.deployed[path]
+	if !deployed {
+		old = g.retired[path] // a new file may reuse the freed number: still a replacement
+	}
 	g.mu.Unlock()
-	if old == key {
+	if deployed && old == key {
 		return false, nil
 	}
 	// Re-admitting by path alone let anyone who could swap the path (or a parent directory)
@@ -1254,6 +1261,7 @@ func (g *Guard) resyncOne(binPath string, exeEvents map[string][]ebpf.EventType)
 	}
 	g.mu.Lock()
 	g.deployed[path] = key
+	delete(g.retired, path)
 	g.keyPaths[key] = binPath
 	g.mu.Unlock()
 	return true, nil

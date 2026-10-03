@@ -56,6 +56,27 @@ type TrustGuard struct {
 	vouched   int
 	// mountUntracked: the watch died, so SyncMounts refuses to vouch anything again.
 	mountUntracked bool
+	// retiredMu guards retired: the rows forgetExe dropped for a freed key, so a replacement its
+	// guards re-sync only after that prune can still adopt them (adoptRows). Userspace only: a
+	// reused inode number gains nothing from them. Cleared by SetTrusted, which re-derives every row.
+	retiredMu sync.Mutex
+	retired   map[GuardTrustInodeKey]trustRows
+}
+
+// trustRows is one key's rows across guard_trusted_files and the bit maps (trustBitMaps order).
+type trustRows struct {
+	flags uint8
+	bits  [4]uint64
+	has   [4]bool
+}
+
+// maxRetiredRows bounds TrustGuard.retired; past it the oldest prune's rows are simply not kept
+// (a later replacement then waits for a reload: stricter).
+const maxRetiredRows = 1024
+
+func (t *TrustGuard) trustBitMaps() [4]*cilium.Map {
+	return [4]*cilium.Map{t.objs.GuardBinOwner, t.objs.GuardBinUpdaters, t.objs.GuardGlobWriters,
+		t.objs.GuardLibdirUsers}
 }
 
 // trustEvent mirrors struct trust_event in guard_trust.bpf.c.
@@ -114,6 +135,9 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	for k := range flags {
 		liftSuperseded(k)
 	}
+	t.retiredMu.Lock()
+	t.retired = nil
+	t.retiredMu.Unlock()
 	if err := t.keepLive(flags); err != nil {
 		return fmt.Errorf("keeping live trusted files: %w", err)
 	}
@@ -155,6 +179,7 @@ func (t *TrustGuard) trusts(k GuardInodeKey) bool {
 // kernel: every creation rewrites or drops its row (origin_record).
 func (t *TrustGuard) forgetExe(k GuardInodeKey) error {
 	key := GuardTrustInodeKey{Dev: k.Dev, Ino: k.Ino}
+	t.retire(key)
 	for _, m := range []*cilium.Map{t.objs.GuardTrustedFiles, t.objs.GuardBinOwner, t.objs.GuardBinUpdaters,
 		t.objs.GuardGlobWriters, t.objs.GuardLibdirUsers} {
 		if err := m.Delete(key); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
@@ -162,6 +187,40 @@ func (t *TrustGuard) forgetExe(k GuardInodeKey) error {
 		}
 	}
 	return nil
+}
+
+// retire stashes key's rows before forgetExe drops them, if it is a trusted file.
+func (t *TrustGuard) retire(key GuardTrustInodeKey) {
+	var r trustRows
+	if t.objs.GuardTrustedFiles.Lookup(key, &r.flags) != nil {
+		return
+	}
+	for i, m := range t.trustBitMaps() {
+		r.has[i] = m.Lookup(key, &r.bits[i]) == nil
+	}
+	t.retiredMu.Lock()
+	defer t.retiredMu.Unlock()
+	if t.retired == nil {
+		t.retired = make(map[GuardTrustInodeKey]trustRows)
+	}
+	if len(t.retired) < maxRetiredRows {
+		t.retired[key] = r
+	}
+}
+
+// rowsOf reads key's live rows, else the ones retire stashed. ok false: neither.
+func (t *TrustGuard) rowsOf(key GuardTrustInodeKey) (trustRows, bool) {
+	var r trustRows
+	if t.objs.GuardTrustedFiles.Lookup(key, &r.flags) == nil {
+		for i, m := range t.trustBitMaps() {
+			r.has[i] = m.Lookup(key, &r.bits[i]) == nil
+		}
+		return r, true
+	}
+	t.retiredMu.Lock()
+	defer t.retiredMu.Unlock()
+	r, ok := t.retired[key]
+	return r, ok
 }
 
 // trustedDirAny mirrors TRUSTED_DIR_ANY in guard_trust.bpf.c.

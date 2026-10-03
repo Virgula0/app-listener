@@ -234,13 +234,17 @@ func (g *Guard) carriesLine(path string) bool {
 }
 
 // forgetExe drops what this guard remembers about k's rows, so a file reusing the number at a
-// whitelisted path is judged as a new binary.
+// whitelisted path is judged as a replacement of k (retired), never as k itself.
 func (g *Guard) forgetExe(k GuardInodeKey) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for p, key := range g.deployed {
 		if key == k {
 			delete(g.deployed, p)
+			if g.retired == nil {
+				g.retired = make(map[string]GuardInodeKey)
+			}
+			g.retired[p] = k
 		}
 	}
 	for p, st := range g.binaryVerifyStates {

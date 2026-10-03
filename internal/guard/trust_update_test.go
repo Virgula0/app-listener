@@ -54,6 +54,40 @@ func TestReSyncBinaries_RefusedReplacementKeepsOldKey(t *testing.T) {
 	}
 }
 
+// The prune forgets a freed key before every guard has re-synced the path's replacement: those
+// guards must still judge it as a replacement of that key, or an updater's update is refused by
+// all but the first guard (Proton's wineserver, whitelisted by several Steam resources).
+func TestReSyncBinaries_ReplacementJudgedAgainstPrunedKey(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "app")
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dev, ino, err := ebpf.StatInode(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := GuardInodeKey{Dev: dev, Ino: ino + 1}
+	g := &Guard{path: "/protected", binaries: []BinaryEntry{{Path: bin}},
+		deployed: map[string]GuardInodeKey{bin: old}, keyPaths: map[GuardInodeKey]string{old: bin}}
+	g.forgetExe(old)
+
+	var got []GuardInodeKey
+	SetReplacementCheck(func(_ string, _ *os.File, o, _ GuardInodeKey) bool {
+		got = append(got, o)
+		return false
+	})
+	defer SetReplacementCheck(nil)
+	if _, err := g.ReSyncBinaries(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []GuardInodeKey{old}) {
+		t.Fatalf("the replacement must be judged against the pruned key %+v, got %+v", old, got)
+	}
+	if _, ok := g.deployed[bin]; ok {
+		t.Fatal("a refused replacement must not be deployed")
+	}
+}
+
 func TestRefusedReplacements_ReportsEachInodeOnce(t *testing.T) {
 	var r refusedReplacements
 	k := GuardInodeKey{Dev: 1, Ino: 2}

@@ -1,13 +1,13 @@
 package guard
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"sync"
 	"sync/atomic"
 
-	cilium "github.com/cilium/ebpf"
 	log "github.com/sirupsen/logrus"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -122,33 +122,37 @@ func (t *TrustGuard) systemFile(path string, f *os.File, k GuardInodeKey) bool {
 	return t.objs.GuardDeadDevs.Lookup(sbdev, &died) != nil || died <= synced
 }
 
-// adoptRows copies every exe/target-keyed trust row of old to newKey. old must be a trusted file:
-// admitting an inode without TRUSTED_BINARY would leave it outside protections #1 and #2. Any
-// failed copy removes the rows already written.
+// adoptRows copies every exe/target-keyed trust row of old to newKey. old must be a trusted file,
+// or one whose rows the prune retired: admitting an inode without TRUSTED_BINARY would leave it
+// outside protections #1 and #2. With neither, newKey qualifies only if a sibling guard's
+// admission of the same path already adopted them. Any failed copy removes the rows written.
 func (t *TrustGuard) adoptRows(old, newKey GuardTrustInodeKey) error {
-	var flags uint8
-	if err := t.objs.GuardTrustedFiles.Lookup(old, &flags); err != nil {
-		return fmt.Errorf("old inode is not a trusted file: %w", err)
+	r, ok := t.rowsOf(old)
+	if !ok {
+		var flags uint8
+		if t.objs.GuardTrustedFiles.Lookup(newKey, &flags) == nil {
+			return nil
+		}
+		return errors.New("old inode is not a trusted file")
 	}
-	bitMaps := []*cilium.Map{t.objs.GuardBinOwner, t.objs.GuardBinUpdaters,
-		t.objs.GuardGlobWriters, t.objs.GuardLibdirUsers}
+	bitMaps := t.trustBitMaps()
 	rollback := func() {
-		for _, m := range append([]*cilium.Map{t.objs.GuardTrustedFiles}, bitMaps...) {
+		_ = t.objs.GuardTrustedFiles.Delete(newKey)
+		for _, m := range bitMaps {
 			_ = m.Delete(newKey)
 		}
 	}
 	// Bit rows before the TRUSTED flag: a flagged inode with no owner row is already fail-closed.
-	for _, m := range bitMaps {
-		var bits uint64
-		if err := m.Lookup(old, &bits); err != nil {
+	for i, m := range bitMaps {
+		if !r.has[i] {
 			continue
 		}
-		if err := m.Put(newKey, bits); err != nil {
+		if err := m.Put(newKey, r.bits[i]); err != nil {
 			rollback()
 			return fmt.Errorf("copying %s row: %w", m, err)
 		}
 	}
-	if err := t.objs.GuardTrustedFiles.Put(newKey, flags); err != nil {
+	if err := t.objs.GuardTrustedFiles.Put(newKey, r.flags); err != nil {
 		rollback()
 		return fmt.Errorf("trusting the new inode: %w", err)
 	}
