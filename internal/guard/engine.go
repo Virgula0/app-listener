@@ -59,6 +59,8 @@ type engine struct {
 	rd         *ringbuf.Reader
 	done       chan struct{}
 	started    bool
+	// ioctlCompat: this kernel has file_ioctl_compat (6.8+), so guard_file_ioctl_compat attaches.
+	ioctlCompat bool
 
 	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
 	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).
@@ -172,11 +174,16 @@ func (e *engine) startLocked() error {
 	if mapsErr != nil {
 		return mapsErr
 	}
+	spec, ioctlCompat, specErr := guardSpec()
+	if specErr != nil {
+		return specErr
+	}
 	var objs GuardObjects
-	if err := LoadGuardObjects(&objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
+	if err := spec.LoadAndAssign(&objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
 		return fmt.Errorf("loading guard BPF objects: %w", err)
 	}
 	e.objs = objs
+	e.ioctlCompat = ioctlCompat
 	e.done = make(chan struct{})
 
 	failedRequired, total := e.attachLocked()
@@ -226,7 +233,7 @@ func (e *engine) startLocked() error {
 // attachLocked attaches every LSM program, pinning each at pinPrefix+<hook> when enabled. A pin
 // failure degrades (pinDegraded, CRITICAL log) and drops the pins rather than aborting.
 func (e *engine) attachLocked() (failedRequired []string, total int) {
-	attachments := guardLSMHooks(&e.objs)
+	attachments := guardLSMHooks(&e.objs, e.ioctlCompat)
 	for _, a := range attachments {
 		l, attachErr := link.AttachLSM(link.LSMOptions{Program: a.prog})
 		if attachErr != nil {

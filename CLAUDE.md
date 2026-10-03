@@ -35,7 +35,8 @@ every change to enforcement paths as security-sensitive:
   the operation is denied, and run `make test-integration` locally.
 - **Watch the well-known bypass classes** already defended against (see `memory/*` and the
   exploit corpus): io_uring, `open_by_handle_at`, `copy_file_range`/`splice`/`sendfile`,
-  `process_vm_readv`, raw block-device reads, bind-mount / rename-over-watchroot,
+  `process_vm_readv`, raw block-device reads, btrfs copy ioctls (snapshot / `SEND` /
+  `TREE_SEARCH`, gated superblock-wide), bind-mount / rename-over-watchroot,
   `SCM_RIGHTS` fd passing, `ptrace`, stat/metadata leaks. Don't reintroduce a gap a past
   commit closed.
 - **The live-edit grant is a real escalation path — keep it narrow.** `edit-protected`
@@ -242,12 +243,15 @@ nothing, so the process refuses to start instead.
 - **kprobes** (`monitor`) — observe all I/O regardless of syscall path (io_uring, splice,
   sendfile, mmap) plus metadata ops.
 - **LSM hooks** (`guard`, `network-guard`, `daemon`) — the only kernel mechanism that can
-  **deny**. ~28 hooks; `file_open` + `file_permission` and the superseded-key set
+  **deny**. ~30 hooks; `file_open` + `file_permission`, the superseded-key set
   (`inode_unlink`, `inode_rename`, `bprm_committed_creds`, the `sched_process_fork`
-  tracepoint) are mandatory, the rest are best-effort (a missing hook logs a warning,
-  enforcement continues). A replaced binary's old `dev:ino` key admits only processes
-  exec'd before the replacement and never a reused inode number (`exe_supersede.h`,
-  shared by the guard and trust objects).
+  tracepoint), and `file_ioctl` + `file_ioctl_compat` (the btrfs copy-ioctl gate; without
+  them a snapshot copies a guarded tree unguarded) are mandatory, the rest are best-effort
+  (a missing hook logs a warning, enforcement continues). `file_ioctl_compat` (6.8+) is
+  swapped for an inert program on kernels whose BTF lacks `bpf_lsm_file_ioctl_compat`
+  (`guard_spec.go`, resolved by BTF not version — a backport counts). A replaced binary's
+  old `dev:ino` key admits only processes exec'd before the replacement and never a reused
+  inode number (`exe_supersede.h`, shared by the guard and trust objects).
 - **tracepoints / kretprobes** (`network-monitor`) — TCP/UDP/DNS.
 
 **Identity is the executable's inode, never its name or comm** — renaming or comm-spoofing

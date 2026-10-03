@@ -22,13 +22,18 @@ func trustSpec() (*cilium.CollectionSpec, bool, error) {
 	if kernelHasFunc(memfdTarget) {
 		return spec, true, nil
 	}
-	spec.Programs[GuardTrustProgTrustMemfdAlloc] = &cilium.ProgramSpec{
-		Name:         GuardTrustProgTrustMemfdAlloc,
+	spec.Programs[GuardTrustProgTrustMemfdAlloc] = inertProgram(GuardTrustProgTrustMemfdAlloc)
+	return spec, false, nil
+}
+
+// inertProgram stands in for a program whose attach target this kernel lacks; never attached.
+func inertProgram(name string) *cilium.ProgramSpec {
+	return &cilium.ProgramSpec{
+		Name:         name,
 		Type:         cilium.SocketFilter,
 		License:      "GPL",
 		Instructions: asm.Instructions{asm.Mov.Imm(asm.R0, 0), asm.Return()},
 	}
-	return spec, false, nil
 }
 
 // kernelHasFunc reports whether vmlinux's BTF has function name. Unreadable BTF answers true: the

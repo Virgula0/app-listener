@@ -54,9 +54,9 @@ var ComputeBinaryEntry = ebpf.ComputeBinaryEntry
 type GuardEvent struct {
 	ebpf.FileEvent
 	Blocked bool
-	// RawDevice: the event is a raw block-device gate denial. The gate is device-granular, so the
-	// event names the device, not a resource; don't attribute it to a watched path.
-	RawDevice bool
+	// FsGate labels a filesystem-wide gate denial (RawDeviceResourceLabel, BtrfsIoctlResourceLabel):
+	// it names a device or filesystem, not a resource; don't attribute it to a watched path.
+	FsGate string
 	// Process names a process-gate denial ("PTRACE", "TRACED_EXEC", "PROC_MEM"): no file involved;
 	// Path is "pid=<n> comm=<name>" of the other task. Empty for path-keyed events.
 	Process string
@@ -68,6 +68,7 @@ const (
 	guardReasonPtrace     = 2
 	guardReasonTracedExec = 3
 	guardReasonProcMem    = 4
+	guardReasonBtrfsIoctl = 5
 )
 
 // processGateLabel maps a process-gate reason to its logged op label; "" for path-keyed events.
@@ -84,8 +85,23 @@ func processGateLabel(reason uint32) string {
 	}
 }
 
-// RawDeviceResourceLabel is the resource string logged for raw block-device denials.
-const RawDeviceResourceLabel = "raw-block-device"
+// Resource strings logged for filesystem-wide gate denials (GuardEvent.FsGate).
+const (
+	RawDeviceResourceLabel  = "raw-block-device"
+	BtrfsIoctlResourceLabel = "btrfs-ioctl"
+)
+
+// fsGateLabel maps a filesystem-wide gate reason to its label; "" for every other event.
+func fsGateLabel(reason uint32) string {
+	switch reason {
+	case guardReasonRawDevice:
+		return RawDeviceResourceLabel
+	case guardReasonBtrfsIoctl:
+		return BtrfsIoctlResourceLabel
+	default:
+		return ""
+	}
+}
 
 const maxResolveAttempts = 5
 
@@ -353,6 +369,10 @@ func VerifyLoad() error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("removing memlock rlimit (need CAP_SYS_RESOURCE / root): %w", err)
 	}
+	guard := func() (*cilium.CollectionSpec, error) {
+		spec, _, err := guardSpec()
+		return spec, err
+	}
 	trust := func() (*cilium.CollectionSpec, error) {
 		spec, _, err := trustSpec()
 		return spec, err
@@ -360,7 +380,7 @@ func VerifyLoad() error {
 	for _, obj := range []struct {
 		name string
 		load func() (*cilium.CollectionSpec, error)
-	}{{"guard", LoadGuard}, {"trust", trust}} {
+	}{{"guard", guard}, {"trust", trust}} {
 		spec, err := obj.load()
 		if err != nil {
 			return fmt.Errorf("reading embedded %s objects: %w", obj.name, err)
@@ -536,11 +556,12 @@ func (g *Guard) resConfig() (GuardResConfig, error) {
 func (g *Guard) PinDegraded() bool { return SharedPinDegraded() }
 
 // requiredHooks: without the first two, files could be opened and read unchecked; without the
-// rest, a superseded binary or a reused inode number would keep its whitelist entry
-// (exe_supersede.h).
+// inode/bprm ones, a superseded binary or a reused inode number would keep its whitelist entry
+// (exe_supersede.h); without the ioctl ones, a btrfs snapshot copies a guarded tree unguarded.
 var requiredHooks = map[string]bool{
 	"file_open": true, "file_permission": true,
 	"inode_unlink": true, "inode_rename": true, "bprm_committed_creds": true,
+	"file_ioctl": true, "file_ioctl_compat": true,
 }
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
@@ -603,11 +624,12 @@ func (g *Guard) unpinSelfMaps() {
 	}
 }
 
-func guardLSMHooks(o *GuardObjects) []struct {
+// guardLSMHooks lists the LSM programs to attach; ioctlCompat adds file_ioctl_compat (see guardSpec).
+func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []struct {
 	prog *cilium.Program
 	hook string
 } {
-	return []struct {
+	hooks := []struct {
 		prog *cilium.Program
 		hook string
 	}{
@@ -639,7 +661,15 @@ func guardLSMHooks(o *GuardObjects) []struct {
 		{o.GuardBprmCommitted, "bprm_committed_creds"},
 		{o.GuardInodeUnlink, "inode_unlink"},
 		{o.GuardInodeRename, "inode_rename"},
+		{o.GuardFileIoctl, "file_ioctl"},
 	}
+	if ioctlCompat {
+		hooks = append(hooks, struct {
+			prog *cilium.Program
+			hook string
+		}{o.GuardFileIoctlCompat, "file_ioctl_compat"})
+	}
+	return hooks
 }
 
 func modeString(mode Mode) string {
@@ -2175,7 +2205,7 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 	ge := &GuardEvent{
 		FileEvent: fe,
 		Blocked:   be.Blocked != 0,
-		RawDevice: be.Reason == guardReasonRawDevice,
+		FsGate:    fsGateLabel(be.Reason),
 		Process:   processGateLabel(be.Reason),
 	}
 	if ge.Process != "" {

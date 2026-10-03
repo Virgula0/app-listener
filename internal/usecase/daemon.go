@@ -386,15 +386,15 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 // dispatchGuardEvent re-syncs the binary whitelist on a throttled denial and forwards ev to the
 // event channel; false = the daemon or this guard is shutting down.
 func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRepository, ev *guard.GuardEvent, stop <-chan struct{}, lastResync *time.Time) bool {
-	// The raw block-device gate names a device, not this resource: label it so and skip the re-sync
-	// (never an in-place binary replacement).
+	// A filesystem-wide gate names a device or filesystem, not this resource: label it so and skip
+	// the re-sync (never an in-place binary replacement).
 	label := resource
-	if ev.RawDevice {
-		label = guard.RawDeviceResourceLabel
+	if ev.FsGate != "" {
+		label = ev.FsGate
 	}
 	// A denial usually means an in-place binary replacement: re-sync (throttled by
 	// resyncMinInterval) to admit the new inode. A process-gate denial is not one.
-	if ev.Blocked && !ev.RawDevice && ev.Process == "" && time.Since(*lastResync) >= resyncMinInterval {
+	if ev.Blocked && ev.FsGate == "" && ev.Process == "" && time.Since(*lastResync) >= resyncMinInterval {
 		if _, err := g.ReSyncBinaries(); err != nil {
 			log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
 		}

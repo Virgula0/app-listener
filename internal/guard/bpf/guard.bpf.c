@@ -46,6 +46,8 @@
 #define GUARD_REASON_PTRACE 2
 #define GUARD_REASON_TRACED_EXEC 3
 #define GUARD_REASON_PROC_MEM 4
+// btrfs ioctl gate denial (btrfs_copy_gate): filesystem-granular like RAW_DEVICE.
+#define GUARD_REASON_BTRFS_IOCTL 5
 
 enum event_type {
 	EVENT_OPEN,
@@ -1305,6 +1307,67 @@ int guard_file_open(unsigned long long *ctx)
 		return check_and_emit_ex(EVENT_OPEN, dentry, NULL, false, NULL, false, false, false, GUARD_REASON_RAW_DEVICE, GUARD_RES_GLOBAL);
 
 	return 0;
+}
+
+// btrfs ioctls that copy a filesystem's contents past the VFS: SNAP_CREATE (1), SNAP_CREATE_V2
+// (23), SEND (38, native and _32) and TREE_SEARCH[_V2] (17, raw btree items incl. inline file
+// data). A snapshot is a new subvolume (new st_dev, same inode numbers), so no guard key matches
+// its copy. Matched on magic + nr, ignoring the size bits that differ across struct versions.
+#define BTRFS_IOCTL_MAGIC 0x94
+static __always_inline bool is_btrfs_copy_ioctl(unsigned int cmd)
+{
+	if (((cmd >> 8) & 0xff) != BTRFS_IOCTL_MAGIC)
+		return false;
+	unsigned int nr = cmd & 0xff;
+	return nr == 1 || nr == 17 || nr == 23 || nr == 38;
+}
+
+// btrfs_copy_gate denies those ioctls on any btrfs superblock hosting a guarded root, judged by
+// GUARD_RES_GLOBAL as the raw block-device gate is. Superblock-wide, not per source subvolume:
+// SNAP_CREATE names its source by an fd inside the user args, which btrfs copies and resolves
+// only after this hook returns (a racing thread or dup2 would swap it), and btrfs refuses a
+// snapshot across superblocks.
+static __always_inline int btrfs_copy_gate(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct emit_args *ea = &ea_buf;
+	struct file *file = (struct file *)ctx[0];
+	if (!file || !is_btrfs_copy_ioctl((unsigned int)ctx[1]))
+		return 0;
+
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+	if (!inode)
+		return 0;
+	struct super_block *sb = NULL;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return 0;
+	unsigned long magic = 0;
+	bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
+	if (magic != BTRFS_SUPER_MAGIC)
+		return 0;
+	__u64 dev = sb_dev(inode);
+	if (!bpf_map_lookup_elem(&guard_fs_sbdevs, &dev))
+		return 0;
+
+	struct dentry *dentry = NULL;
+	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
+	return check_and_emit_ex(EVENT_READ, dentry, NULL, false, NULL, false, false, false,
+				 GUARD_REASON_BTRFS_IOCTL, GUARD_RES_GLOBAL);
+}
+
+SEC("lsm/file_ioctl")
+int guard_file_ioctl(unsigned long long *ctx)
+{
+	return btrfs_copy_gate(ctx);
+}
+
+// Since 6.8 a compat (32-bit) ioctl calls this hook instead of file_ioctl.
+SEC("lsm/file_ioctl_compat")
+int guard_file_ioctl_compat(unsigned long long *ctx)
+{
+	return btrfs_copy_gate(ctx);
 }
 
 SEC("lsm/mmap_file")
