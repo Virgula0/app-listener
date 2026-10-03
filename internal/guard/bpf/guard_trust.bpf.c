@@ -240,19 +240,6 @@ struct {
 	__type(value, struct bin_origin);
 } guard_bin_origin SEC(".maps");
 
-// trust_code_suspect: tgids that exec-mapped code trust_mmap would refuse a whitelisted binary,
-// while their exe was not TRUSTED_BINARY. trust_mmap judges only new mappings, so a process that
-// preloaded code before a reload whitelisted its exe would otherwise keep it and read the secrets;
-// trust_file_open refuses it every regular file below a whitelist-mode guarded root until it execs.
-// Inherited across fork, cleared on exec and on leader exit (guard_tainted_pids' lifecycle). A
-// mark that can't be recorded refuses the mapping (fail closed).
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 65536);
-	__type(key, __u32);
-	__type(value, __u8);
-} trust_code_suspect SEC(".maps");
-
 // guard_vouched_devs: sb->s_dev (sb_dev; on btrfs no file's key device) of every non-FUSE
 // superblock with a mount WITHOUT nosuid in pid 1's mount namespace, synced by userspace from
 // /proc/1/mountinfo; value = the guard_dev_seq snapshot taken before that read. Only root makes

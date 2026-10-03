@@ -24,7 +24,7 @@ var (
 
 // supersedeMaps returns the maps the guard and trust objects share, created once per process: a
 // stamp must outlive any one engine, and both objects must judge a key by the same stamps (and key
-// btrfs inodes by the same layout).
+// btrfs inodes by the same layout, and see the same code-suspect marks).
 func supersedeMaps() (map[string]*cilium.Map, error) {
 	supersedeMapsOnce.Do(func() {
 		spec, err := LoadGuard()
@@ -32,8 +32,10 @@ func supersedeMaps() (map[string]*cilium.Map, error) {
 			errSupersedeMaps = fmt.Errorf("reading embedded guard objects: %w", err)
 			return
 		}
-		out := make(map[string]*cilium.Map, 4)
-		for _, name := range []string{GuardMapExeSuperseded, GuardMapExeStamps, GuardMapExeSeq, GuardMapBtrfsLayout} {
+		names := []string{GuardMapExeSuperseded, GuardMapExeStamps, GuardMapExeSeq, GuardMapBtrfsLayout,
+			GuardMapTrustCodeSuspect}
+		out := make(map[string]*cilium.Map, len(names))
+		for _, name := range names {
 			m, err := cilium.NewMap(spec.Maps[name])
 			if err != nil {
 				errSupersedeMaps = fmt.Errorf("creating shared map %s: %w", name, err)

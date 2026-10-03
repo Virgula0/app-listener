@@ -60,6 +60,24 @@ type GuardEvent struct {
 	// Process names a process-gate denial ("PTRACE", "TRACED_EXEC", "PROC_MEM"): no file involved;
 	// Path is "pid=<n> comm=<name>" of the other task. Empty for path-keyed events.
 	Process string
+	// Scope labels a process-gate denial judged for several resources: MultipleResourceLabel (the
+	// GLOBAL slot) or a taint set's paths, comma-separated. Empty: the receiving guard's own.
+	Scope string
+}
+
+// MultipleResourceLabel is GuardEvent.Scope for the GLOBAL slot: the process holds content of
+// resources no taint set covers, and which ones is not recorded.
+const MultipleResourceLabel = "multiple"
+
+// ResourceLabel is what ev is logged under when delivered to the guard of resource.
+func (ev *GuardEvent) ResourceLabel(resource string) string {
+	switch {
+	case ev.FsGate != "":
+		return ev.FsGate
+	case ev.Scope != "":
+		return ev.Scope
+	}
+	return resource
 }
 
 // guard_event.reason values — mirror GUARD_REASON_* in guard.bpf.c.
@@ -2240,7 +2258,7 @@ func (g *Guard) dispatch(ev *GuardEvent) {
 	case <-g.done:
 	default:
 		if local.Blocked {
-			logBacklogDenial(g.path, &local) // audit data: never lost behind a flood of allowed events
+			logBacklogDenial(local.ResourceLabel(g.path), &local) // audit data: never lost behind a flood of allowed events
 			return
 		}
 		if dropped := g.eventsDropped.Add(1); dropped == 1 || dropped%1000 == 0 {

@@ -1420,3 +1420,64 @@ func TestLoadAcceptsSiblingRoots(t *testing.T) {
 		t.Fatalf("sibling roots sharing a name prefix must load: %v", err)
 	}
 }
+
+func TestInspectorsDefaultWithoutBlock(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "[watch "+t.TempDir()+"]\nneed_encryption: false\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.InspectorsDefault || strings.Join(cfg.Inspectors, ",") != strings.Join(DefaultInspectors, ",") {
+		t.Fatalf("no [inspectors] block must mean the defaults: %v default=%v", cfg.Inspectors, cfg.InspectorsDefault)
+	}
+}
+
+func TestInspectorsEmptyBlockGrantsNothing(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "[inspectors]\n\n[watch "+t.TempDir()+"]\nneed_encryption: false\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.InspectorsDefault || len(cfg.Inspectors) != 0 {
+		t.Fatalf("an empty block must disable the defaults: %v", cfg.Inspectors)
+	}
+}
+
+func TestInspectorsBlockParsed(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Load(writeConfig(t, "[watch "+dir+"]\nneed_encryption: false\n/usr/bin/ssh\n\n"+
+		"[inspectors]\n# portal\n\"/usr/lib/xdg-desktop-portal\"\n/opt/x/../bin/insp\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := strings.Join(cfg.Inspectors, ","); got != "/usr/lib/xdg-desktop-portal,/opt/bin/insp" {
+		t.Fatalf("Inspectors = %s", got)
+	}
+	if len(cfg.Resources) != 1 || len(cfg.Resources[0].Binaries) != 1 {
+		t.Fatalf("an [inspectors] block must not touch the watch sections: %+v", cfg.Resources)
+	}
+}
+
+func TestInspectorsBlockRejectsMalformedLines(t *testing.T) {
+	for name, line := range map[string]string{
+		"relative":      "bin/insp",
+		"event list":    "/usr/bin/insp READ",
+		"duplicate":     "/usr/bin/insp\n/usr/bin/insp",
+		"lib directive": "allow_lib /usr/lib/x.so",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, "[inspectors]\n"+line+"\n")); err == nil {
+				t.Fatalf("%q must be refused", line)
+			}
+		})
+	}
+}
+
+func TestInspectorsBlockBounded(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("[inspectors]\n")
+	for i := 0; i <= MaxInspectors; i++ {
+		b.WriteString("/usr/bin/insp" + strings.Repeat("x", i) + "\n")
+	}
+	if _, err := Load(writeConfig(t, b.String())); err == nil {
+		t.Fatal("more than MaxInspectors entries must be refused")
+	}
+}

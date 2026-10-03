@@ -342,7 +342,11 @@ func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemon
 		}
 	})
 	reload = func() { reloadCfg() }
-	refresher, err := newCatalogRefresher(configPath, cfg, reloadCfg, d.ResyncBinaries, control.sessionActive)
+	resync := func() {
+		d.ResyncBinaries()
+		trust.resyncInspectors()
+	}
+	refresher, err := newCatalogRefresher(configPath, cfg, reloadCfg, resync, control.sessionActive)
 	if err != nil {
 		log.Errorf("daemon: %v — new app versions wait for a reload", err)
 		return reload, func() {}

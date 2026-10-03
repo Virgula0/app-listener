@@ -229,6 +229,18 @@ struct {
 	__type(value, __u32);  // res_id, or GUARD_RES_GLOBAL
 } guard_exe_union SEC(".maps");
 
+// guard_inspectors: exe inodes of the root-placed system binaries in [inspectors]
+// (xdg-desktop-portal opens /proc/<pid>/root of every ScreenCast caller). They may inspect any
+// tainted process's PTRACE_MODE_READ view (root, exe, environ, fd, maps; also its unguarded fds'
+// contents via /proc/<pid>/fd and perf user-stack samples), never an ATTACH (ptrace, vm_readv, mem).
+// Attaching to an inspector, or tracing its exec, needs a GLOBAL-whitelisted caller.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} guard_inspectors SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	// Shared by every resource and never pruned; a guard whose device doesn't fit fails to build.
@@ -745,11 +757,16 @@ static __always_inline __u32 is_proc_mem_of_tainted(struct dentry *dentry, __u32
 // ptrace_may_access() mode bits (include/linux/ptrace.h).
 #define PTRACE_MODE_READ 0x01
 #define PTRACE_MODE_ATTACH 0x02
+#define PTRACE_MODE_NOAUDIT 0x04
 
 // emit_process_denial reports a process-gate denial (formerly a silent -EPERM, undiagnosable for
 // e.g. browser engines or Wine). `other` is the other task if at hand, else other_tgid names it.
+// A NOAUDIT probe (ps/pgrep reading /proc/<pid>/stat) is denied but not reported, as the kernel
+// itself does not audit it.
 static __always_inline int emit_process_denial(__u32 reason, __u32 type, struct task_struct *other, __u32 other_tgid, __u32 mode, __u32 res_id)
 {
+	if (mode & PTRACE_MODE_NOAUDIT)
+		return -EPERM;
 	struct guard_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
 	if (e) {
 		e->pid = bpf_get_current_pid_tgid() >> 32;
@@ -2169,8 +2186,29 @@ int guard_sb_mount(unsigned long long *ctx)
 	return 0;
 }
 
+// is_inspector: out of line so the answer is a scalar. Inlined, clang ORs the lookup's pointer into
+// a neighbouring NULL test, which the verifier rejects ("pointer |= pointer").
+static __noinline int is_inspector(struct inode_key *exe)
+{
+	return bpf_map_lookup_elem(&guard_inspectors, exe) != NULL;
+}
+
+// current_is_inspector: the caller runs an [inspectors] image it exec'd before any supersede, and
+// has mapped no code trust_mmap would refuse a trusted binary (the inspector is TRUSTED_BINARY from
+// its admission on; a process that predates it may carry a preload).
+static __always_inline int current_is_inspector(void)
+{
+	struct inode_key ik = {};
+	if (!get_current_exe_inode(&ik) || !is_inspector(&ik))
+		return 0;
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	if (bpf_map_lookup_elem(&trust_code_suspect, &tgid))
+		return 0;
+	return !exe_refused((struct task_struct *)bpf_get_current_task(), &ik);
+}
+
 // Block ptrace/process_vm_readv/writev against any tainted process (one holding guarded content in
-// memory) unless the caller is whitelisted.
+// memory) unless the caller is whitelisted, or only reads metadata and is an inspector.
 SEC("lsm/ptrace_access_check")
 int guard_ptrace_access_check(unsigned long long *ctx)
 {
@@ -2187,23 +2225,31 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 	__u32 pid;
 	bpf_probe_read_kernel(&pid, sizeof(pid), &child->tgid);
 
+	// Judge the caller by the whitelist of the resource whose content the target holds.
 	__u32 *val = bpf_map_lookup_elem(&guard_tainted_pids, &pid);
-	if (val) {
-		// Judge the caller by the whitelist of the resource whose content the target holds.
+	if (val)
 		res = *val;
-	} else {
-		// A read-only tree's writer is never tainted, but its image is what may write that tree
-		// (and the tree is trusted code): memory access needs a caller that tree also allows.
-		// Metadata-only inspection stays open.
-		if (!(mode & PTRACE_MODE_ATTACH))
-			return 0;
+	else if (!(mode & PTRACE_MODE_ATTACH))
+		return 0;
+
+	if (mode & PTRACE_MODE_ATTACH) {
 		struct inode_key child_ino = {};
-		if (!get_task_exe_inode(child, &child_ino))
+		if (get_task_exe_inode(child, &child_ino)) {
+			if (is_inspector(&child_ino)) {
+				// An inspector reads every resource's tainted processes: whoever takes over its
+				// memory must satisfy every guard.
+				res = GUARD_RES_GLOBAL;
+			} else if (res == GUARD_RES_NONE) {
+				// A read-only tree's writer is never tainted, but its image is what may write that
+				// tree (and the tree is trusted code): memory access needs a caller that tree also
+				// allows. Metadata-only inspection stays open.
+				__u32 *writer_res = bpf_map_lookup_elem(&guard_exe_union, &child_ino);
+				if (writer_res && is_readonly_mode(*writer_res))
+					res = *writer_res;
+			}
+		}
+		if (res == GUARD_RES_NONE)
 			return 0;
-		__u32 *writer_res = bpf_map_lookup_elem(&guard_exe_union, &child_ino);
-		if (!writer_res || !is_readonly_mode(*writer_res))
-			return 0;
-		res = *writer_res;
 	}
 
 	// The owner's process (the daemon: the guard's only GUARD_ALLOW_ROOT entry) is tainted because
@@ -2220,6 +2266,9 @@ int guard_ptrace_access_check(unsigned long long *ctx)
 				return 0;
 		}
 	}
+
+	if (!(mode & PTRACE_MODE_ATTACH) && current_is_inspector())
+		return 0;
 
 	// Child is tainted.  Check if the caller is whitelisted.
 	struct res_inode_key exe_ik = {};
@@ -2265,9 +2314,11 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	// no inode to resolve a resource from. A superseded image still counts: the union only ever
 	// adds protection (taint, the tracer check).
 	__u32 *union_res = bpf_map_lookup_elem(&guard_exe_union, &target_ik);
-	if (!union_res)
+	int inspector = is_inspector(&target_ik);
+	if (union_res)
+		res = *union_res;
+	else if (!inspector)
 		return 0;  // target is not whitelisted anywhere: not our concern
-	res = *union_res;
 
 	// Read-only guards (lib_dir trees, /etc/app-listener) don't taint, like every other taint site:
 	// their contents are world-readable code, and tainting their writers would lock most of e.g.
@@ -2279,8 +2330,12 @@ int guard_bprm_check_security(unsigned long long *ctx)
 	// Executing a whitelisted image taints the process IMMEDIATELY, so a tracer attaching after
 	// exec is denied even before the victim touches the tree. (Exec-open attribution in
 	// check_and_emit handles the open itself.)
-	if (!is_readonly_mode(res))
+	if (res != GUARD_RES_NONE && !is_readonly_mode(res))
 		mark_tainted(res);
+	// A traced inspector would hand its tracer every tainted process's metadata: the tracer must
+	// satisfy every guard, as for an attach to it.
+	if (inspector)
+		res = GUARD_RES_GLOBAL;
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	if (!task)

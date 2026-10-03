@@ -1,5 +1,5 @@
 // exe_supersede.h: a whitelisted binary's identity over time, shared by guard.bpf.c and
-// guard_trust.bpf.c. Userspace hands both objects the same three maps.
+// guard_trust.bpf.c. Userspace hands both objects the same maps.
 //
 // An exe key is (dev, ino), and both outlive the file. Once the last link goes, a process can still
 // exec the image through a held fd or /proc/<pid>/exe; once the inode is freed, the filesystem hands
@@ -48,6 +48,20 @@ struct {
 	__type(key, __u32);
 	__type(value, __u64);
 } exe_seq SEC(".maps");
+
+// trust_code_suspect: tgids that exec-mapped code trust_mmap would refuse a whitelisted binary,
+// while their exe was not TRUSTED_BINARY. trust_mmap judges only new mappings, so a process that
+// preloaded code before a reload whitelisted its exe would otherwise keep it and read the secrets;
+// trust_file_open refuses it every regular file below a whitelist-mode guarded root until it execs,
+// and guard_ptrace_access_check its inspector grant. Inherited across fork, cleared on exec and on
+// leader exit (guard_tainted_pids' lifecycle), all by the trust object. A mark that can't be
+// recorded refuses the mapping (fail closed).
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, __u32);
+	__type(value, __u8);
+} trust_code_suspect SEC(".maps");
 
 static __always_inline __u64 leader_start(struct task_struct *task)
 {

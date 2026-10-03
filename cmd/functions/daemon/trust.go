@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 
@@ -60,6 +61,10 @@ func buildTrustedSet(cfg *daemonconfig.Config) (binaries, libs []string, dirs []
 	for _, l := range cfg.SharedAllowLibs {
 		libSet[l] = struct{}{}
 	}
+	// An inspector reads every protected process's metadata: no preloaded code may ride it.
+	for _, p := range inspectorPaths(cfg, systemPlaced) {
+		binSet[p] = struct{}{}
+	}
 
 	rejected = closureRejections(binSet)
 
@@ -112,6 +117,15 @@ func closureRejections(binSet map[string]struct{}) map[string]*libRejection {
 }
 
 var libraryClosure = ebpf.LibraryClosure
+
+var systemPlaced = func(path string) bool {
+	f, err := ebpf.OpenSystemPlaced(path)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
+}
 
 type libRejection struct {
 	why  error
@@ -167,6 +181,10 @@ type trustManager struct {
 	tg       *guard.TrustGuard
 	binaries int
 	bunRoots map[inodeID]bool // Bun tmp dirs the last apply reserved (reserveGlobs)
+	// inspectMu guards inspectCfg, the config whose [inspectors] were last applied; nil until the
+	// trust guard is started (AdmitInspector needs its vouched superblocks).
+	inspectMu  sync.Mutex
+	inspectCfg *daemonconfig.Config
 }
 
 // startTrustGuard loads and attaches the daemon-wide trust guard — binary write-protection (#1), the
@@ -207,7 +225,35 @@ func (m *trustManager) afterUnlock(cfg *daemonconfig.Config) error {
 	}
 	log.Infof("trust guard: enforcing write-protection + library allowlist for %d whitelisted binary(ies)",
 		m.binaries)
+	if err := m.applyInspectors(cfg); err != nil {
+		return trustStartupError(err)
+	}
 	return nil
+}
+
+// applyInspectors grants cfg's [inspectors] after the trusted set made them TRUSTED_BINARY.
+func (m *trustManager) applyInspectors(cfg *daemonconfig.Config) error {
+	m.inspectMu.Lock()
+	defer m.inspectMu.Unlock()
+	if err := guard.SetInspectors(resolveInspectors(cfg, m.tg.AdmitInspector), cfg.Inspectors); err != nil {
+		return fmt.Errorf("granting inspectors: %w", err)
+	}
+	m.inspectCfg = cfg
+	return nil
+}
+
+// resyncInspectors re-resolves the inspectors (a package upgrade replaced one), on the catalog
+// watch's re-sync.
+func (m *trustManager) resyncInspectors() {
+	m.inspectMu.Lock()
+	cfg := m.inspectCfg
+	m.inspectMu.Unlock()
+	if cfg == nil {
+		return
+	}
+	if err := m.applyInspectors(cfg); err != nil {
+		log.Errorf("daemon: re-syncing inspectors: %v", err)
+	}
 }
 
 func trustStartupError(err error) error {
@@ -228,6 +274,10 @@ func (m *trustManager) reload(cfg *daemonconfig.Config) {
 		return
 	}
 	log.Infof("trust guard: trusted set rebuilt after reload (%d whitelisted binary(ies))", m.binaries)
+	if err := m.applyInspectors(cfg); err != nil {
+		log.Errorf("daemon: CRITICAL: reload could not apply [inspectors] (%v) — inspector grants may be "+
+			"stale until this is fixed", err)
+	}
 }
 
 func (m *trustManager) apply(cfg *daemonconfig.Config) error {

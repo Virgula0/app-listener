@@ -73,6 +73,9 @@ type engine struct {
 	memberRows map[GuardTaintMemberKey]struct{}
 	// successor mirrors guard_taint_successor: old slot -> its reload replacement (same path).
 	successor map[uint32]uint32
+	// inspectors mirrors guard_inspectors (SetInspectors). Daemon config, not engine state: kept
+	// across a stop and written again by the next start.
+	inspectors map[GuardInodeKey]string
 	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
 	// that registered the backing devices, whose consumer labels them as such. Delivering them to
 	// every guard duplicated each denial and let the self-guards label it with their own path.
@@ -252,6 +255,10 @@ func (e *engine) startLocked() error {
 	}); err != nil {
 		e.stopLocked()
 		return fmt.Errorf("initializing the shared resource slot: %w", err)
+	}
+	if err := e.syncInspectorsLocked(e.inspectors); err != nil {
+		e.stopLocked()
+		return err
 	}
 
 	rd, err := ringbuf.NewReader(e.objs.Rb)
@@ -665,15 +672,23 @@ func (e *engine) readLoop(rd *ringbuf.Reader) {
 }
 
 // deliver hands an event to its owning Guard. An event from the reserved slot belongs to no
-// resource; it goes to exactly one guard (see rawOwner), as the gate used to live in one guard.
+// resource; it goes to exactly one guard (see rawOwner), as the gate used to live in one guard. A
+// process-gate event from the reserved slot or a taint set carries its own Scope label: the guard it
+// reaches is only its reporter.
 func (e *engine) deliver(resID uint32, ev *GuardEvent) {
 	e.mu.Lock()
 	var target *Guard
 	switch {
 	case resID == resGlobal:
 		target = e.globalOwnerLocked()
+		if ev.Process != "" {
+			ev.Scope = MultipleResourceLabel
+		}
 	case e.setAt[resID] != "":
 		target = e.setOwnerLocked(resID)
+		if ev.Process != "" {
+			ev.Scope = strings.Join(setPaths(e.setAt[resID]), ",")
+		}
 	case resID < GuardMaxRes:
 		target = e.slots[resID]
 	}
@@ -746,10 +761,13 @@ func (e *engine) noteDeny(res uint32, exe GuardInodeKey) error {
 	return e.syncSharedLocked()
 }
 
-// admitsExe reports whether any live resource allows exe.
+// admitsExe reports whether any live resource allows exe, or exe is an inspector.
 func (e *engine) admitsExe(exe GuardInodeKey) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.isInspectorLocked(exe) {
+		return true
+	}
 	for _, set := range e.allows {
 		if _, ok := set[exe]; ok {
 			return true
@@ -762,9 +780,14 @@ func (e *engine) admitsExe(exe GuardInodeKey) bool {
 // each guard forget it (Guard.forgetExe).
 func (e *engine) forgetExe(exe GuardInodeKey) error {
 	e.mu.Lock()
+	delete(e.inspectors, exe)
 	if !e.started {
 		e.mu.Unlock()
 		return nil
+	}
+	if err := e.objs.GuardInspectors.Delete(exe); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+		e.mu.Unlock()
+		return err
 	}
 	for _, set := range e.allows {
 		delete(set, exe)

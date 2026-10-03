@@ -205,7 +205,7 @@ func (s *selfGuards) forward(resource string, g *guard.Guard, stop <-chan struct
 				return
 			}
 			select {
-			case s.events <- usecase.DaemonEvent{Resource: resource, Event: ev}:
+			case s.events <- usecase.DaemonEvent{Resource: ev.ResourceLabel(resource), Event: ev}:
 			case <-stop:
 				return
 			}

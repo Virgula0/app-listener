@@ -57,7 +57,7 @@ func (p *watchPattern) root() (dir string, next int) {
 
 // catalogWatchPlan lists what the daemon watches for cfg: every catalog pattern of a configured
 // resource (its user's home patterns and the absolute ones), and every whitelisted root-owned binary
-// with the file its path resolves to (package managers install by temp file + rename).
+// and inspector with the file its path resolves to.
 func catalogWatchPlan(cfg *daemonconfig.Config, users []install.User) []*watchPattern {
 	seen := map[string]bool{}
 	var out []*watchPattern
@@ -71,6 +71,9 @@ func catalogWatchPlan(cfg *daemonconfig.Config, users []install.User) []*watchPa
 		r := &cfg.Resources[i]
 		catalogPatterns(r, users, add)
 		systemBinaryPatterns(r, add)
+	}
+	for _, p := range cfg.Inspectors {
+		addSystemBinary(p, add)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
 	return out
@@ -94,14 +97,19 @@ func catalogPatterns(r *daemonconfig.Resource, users []install.User, add func(*w
 func systemBinaryPatterns(r *daemonconfig.Resource, add func(*watchPattern)) {
 	for _, list := range [][]daemonconfig.BinaryRule{r.Binaries, r.PendingBinaries} {
 		for _, b := range list {
-			if !ebpf.SystemTrusted(b.Path) {
-				continue
-			}
-			add(newWatchPattern(b.Path, false, false))
-			if resolved, err := filepath.EvalSymlinks(b.Path); err == nil && resolved != b.Path {
-				add(newWatchPattern(resolved, false, false))
+			if ebpf.SystemTrusted(b.Path) {
+				addSystemBinary(b.Path, add)
 			}
 		}
+	}
+}
+
+// addSystemBinary watches path and the file it resolves to (package managers install by temp file +
+// rename).
+func addSystemBinary(path string, add func(*watchPattern)) {
+	add(newWatchPattern(path, false, false))
+	if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != path {
+		add(newWatchPattern(resolved, false, false))
 	}
 }
 
