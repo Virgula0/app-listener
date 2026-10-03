@@ -71,6 +71,8 @@ type engine struct {
 	setRows    map[uint32]map[GuardInodeKey]uint8
 	unionRows  map[GuardInodeKey]uint32
 	memberRows map[GuardTaintMemberKey]struct{}
+	// successor mirrors guard_taint_successor: old slot -> its reload replacement (same path).
+	successor map[uint32]uint32
 	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
 	// that registered the backing devices, whose consumer labels them as such. Delivering them to
 	// every guard duplicated each denial and let the self-guards label it with their own path.
@@ -165,7 +167,43 @@ func (e *engine) acquire(g *Guard) (uint32, error) {
 		return 0, err
 	}
 	e.refs++
+	e.linkReloadTwinLocked(g, id)
 	return id, nil
+}
+
+// linkReloadTwinLocked records id as the replacement of every live slot guarding g's path, before
+// id claims any inode. Without it a process tainted under the old slot that reads the tree through
+// the new one before carryTaintAcrossReload moves it is merged to GLOBAL for life. A failed write
+// only leaves that merge (stricter), so it is logged, not fatal.
+func (e *engine) linkReloadTwinLocked(g *Guard, id uint32) {
+	for old := uint32(1); old < GuardMaxRes; old++ {
+		o := e.slots[old]
+		if old == id || o == nil || filepath.Clean(o.path) != filepath.Clean(g.path) {
+			continue
+		}
+		if err := e.objs.GuardTaintSuccessor.Put(old, id); err != nil {
+			log.Warnf("guard: linking reload slot %d to %d for %s: %v", old, id, g.path, err)
+			continue
+		}
+		if e.successor == nil {
+			e.successor = make(map[uint32]uint32)
+		}
+		e.successor[old] = id
+	}
+}
+
+// unlinkReloadTwinLocked drops every successor row naming id before the slot can be reused: a
+// stale row would collapse an unrelated resource's taint into id's.
+func (e *engine) unlinkReloadTwinLocked(id uint32) {
+	for old, next := range e.successor {
+		if old != id && next != id {
+			continue
+		}
+		if err := e.objs.GuardTaintSuccessor.Put(old, uint32(0)); err != nil {
+			log.Warnf("guard: clearing reload link of slot %d: %v", old, err)
+		}
+		delete(e.successor, old)
+	}
 }
 
 // startLocked loads the objects, attaches every LSM program once and starts the event reader.
@@ -560,6 +598,7 @@ func (e *engine) release(id uint32) {
 			if err := e.objs.GuardResConfig.Put(id, GuardResConfig{}); err != nil {
 				log.Warnf("guard: clearing resource slot %d: %v", id, err)
 			}
+			e.unlinkReloadTwinLocked(id)
 			// Drop the id from every taint set now: a later resource reusing it must not be
 			// judged as a member of a set it never joined.
 			if err := e.syncTaintLocked(); err != nil {
@@ -602,6 +641,7 @@ func (e *engine) stopLocked() {
 	e.done = nil
 	e.sets, e.setAt, e.setRows, e.unionRows, e.memberRows = nil, nil, nil, nil, nil
 	e.prevOwner = nil
+	e.successor = nil
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.

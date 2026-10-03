@@ -210,6 +210,15 @@ struct {
 	__type(value, __u8);
 } guard_taint_members SEC(".maps");
 
+// guard_taint_successor: old slot -> the reload replacement guarding the same path (0 = none),
+// set while both slots live. Same resource, so taint_merge must not widen the pair to GLOBAL.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, GUARD_MAX_RES);
+	__type(key, __u32);
+	__type(value, __u32);
+} guard_taint_successor SEC(".maps");
+
 // Union of every resource's whitelist: which resource allows this binary at all, or
 // GUARD_RES_GLOBAL when several do. bprm_committed_creds needs "whitelisted anywhere" to taint an
 // exec'd image, and scanning all resources per exec is not affordable in-kernel.
@@ -581,6 +590,17 @@ static __always_inline int inode_is_watch_root(struct inode *inode, __u32 *out_r
 // one of them is, else GLOBAL. Out of line: only the mismatch path pays for it.
 static __noinline __u32 taint_merge(__u32 cur, __u32 res)
 {
+	// A reload twin resolves to the OLD slot: carryTaintAcrossReload moves it on commit, and a
+	// refused reload keeps it live. The replacement's slot may be retired and later reused.
+	__u32 slot = cur;
+	__u32 *succ = bpf_map_lookup_elem(&guard_taint_successor, &slot);
+	if (succ && *succ && *succ == res)
+		return cur;
+	slot = res;
+	succ = bpf_map_lookup_elem(&guard_taint_successor, &slot);
+	if (succ && *succ && *succ == cur)
+		return res;
+
 	struct taint_member_key k = {};
 	k.set = cur;
 	k.member = res;

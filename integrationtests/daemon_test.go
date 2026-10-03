@@ -2825,3 +2825,58 @@ need_encryption: false
 	s.Require().Contains(s.readDaemonLog(c), "op=PTRACE", "the refusals must be logged")
 	s.exec(c, []string{"sh", "-c", "echo > /tmp/f; echo > /tmp/g; pkill -f 'app-listener daemon' || true"})
 }
+
+// A reload's replacement guard claims the tree before the old guard's tainted pids are carried to
+// it. A victim reading its tree in that window held both slots of one resource and was merged to
+// GLOBAL for life: its own resource's whitelisted inspectors were refused until it exited.
+func (s *IntegrationSuite) TestDaemon_TaintStaysOneResourceAcrossReload() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /r1 /r2 /etc/app-listener /opt/app /opt/pin /opt/pnone" +
+			" && echo s1 > /r1/secret && echo s2 > /r2/secret && cp /usr/bin/dash /opt/app/app" +
+			" && cp /usr/bin/readlink /opt/pin/readlink && cp /usr/bin/readlink /opt/pnone/readlink"})
+	// /r2 keeps /opt/pin/readlink out of GLOBAL's intersection whitelist.
+	s.startDaemon(c, `[watch /r1]
+need_encryption: false
+/opt/app/app
+/opt/pin/readlink
+
+[watch /r2]
+need_encryption: false
+/usr/bin/true`)
+
+	// Reads its tree nonstop, so every reload's overlap window sees reads through both slots.
+	s.exec(c, []string{"sh", "-c",
+		"(/opt/app/app -c 'while :; do read a < /r1/secret; done' &); sleep 1"})
+	_, pidOut := s.exec(c, []string{"sh", "-c", "pgrep -f 'app -c while' | head -1"})
+	pid := strings.TrimSpace(pidOut)
+	s.Require().NotEmptyf(pid, "the victim did not start: %q", pidOut)
+
+	assertJudgedByR1 := func(when string) {
+		_, out := s.exec(c, []string{"sh", "-c", probeExeAs("/opt/pin/readlink", pid)})
+		s.Require().Containsf(out, "rc=0 exe=/opt/app/app",
+			"%s: /r1's own inspector must inspect a process holding only /r1: %s", when, out)
+		_, out = s.exec(c, []string{"sh", "-c", probeExeAs("/opt/pnone/readlink", pid)})
+		s.Require().Containsf(out, "rc=1", "%s: the taint itself must survive: %s", when, out)
+	}
+	assertJudgedByR1("before the reloads")
+
+	const reloadDone = "configuration reloaded without dropping protection"
+	for i := 1; i <= 3; i++ {
+		s.sigDaemon(c, "HUP")
+		done := false
+		for dl := time.Now().Add(daemonShutdownTimeout); time.Now().Before(dl); {
+			if strings.Count(s.readDaemonLog(c), reloadDone) >= i {
+				done = true
+				break
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+		s.Require().Truef(done, "reload %d did not complete, daemon log:\n%s", i, s.readDaemonLog(c))
+		assertJudgedByR1(fmt.Sprintf("after reload %d", i))
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app -c while'; pkill -f 'app-listener daemon' || true"})
+}
