@@ -1,7 +1,6 @@
 package install
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -10,11 +9,8 @@ import (
 func TestSampleFilesPresent(t *testing.T) {
 	want := []string{
 		"app-listener-daemon.service",
-		"app-listener-catalog-refresh.service",
 		"ssh-agent.service",
 		"daemon.conf",
-		"50-app-listener-reload.hook", // pacman hook
-		"apt-app-listener-reload",     // apt hook sample
 	}
 
 	got, err := SampleFiles()
@@ -38,41 +34,17 @@ func TestSampleFilesPresent(t *testing.T) {
 	}
 }
 
-// TestCatalogRefreshUnitShape guards the two properties the boot-time refresh
-// relies on: it orders after the daemon and runs the --live refresh.
-func TestCatalogRefreshUnitShape(t *testing.T) {
-	b, err := SampleContent("app-listener-catalog-refresh.service")
+// The daemon refreshes its catalog itself: no package-manager hook or boot unit is shipped, so an
+// install never deploys one again.
+func TestNoLegacyCatalogRefreshSamples(t *testing.T) {
+	got, err := SampleFiles()
 	if err != nil {
 		t.Fatal(err)
 	}
-	unit := string(b)
-	for _, needle := range []string{
-		"After=app-listener-daemon.service",
-		"Requires=app-listener-daemon.service",
-		"--update-catalog-only --live --yes",
-		"Type=oneshot",
-	} {
-		if !strings.Contains(unit, needle) {
-			t.Errorf("catalog-refresh unit missing %q\n%s", needle, unit)
-		}
-	}
-}
-
-// TestAptHookShape: the apt hook must call --update-catalog-only and must not
-// fail an apt run on a refresh error.
-func TestAptHookShape(t *testing.T) {
-	b, err := SampleContent("apt-app-listener-reload")
-	if err != nil {
-		t.Fatal(err)
-	}
-	hook := string(b)
-	for _, needle := range []string{
-		"DPkg::Post-Invoke",
-		"install --update-catalog-only --yes",
-		"|| true",
-	} {
-		if !strings.Contains(hook, needle) {
-			t.Errorf("apt hook missing %q\n%s", needle, hook)
+	for _, n := range got {
+		switch n {
+		case "app-listener-catalog-refresh.service", "50-app-listener-reload.hook", "apt-app-listener-reload":
+			t.Errorf("daemon-samples still ships the legacy refresh trigger %s", n)
 		}
 	}
 }

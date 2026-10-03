@@ -59,6 +59,8 @@ type engine struct {
 	rd         *ringbuf.Reader
 	done       chan struct{}
 	started    bool
+	// ioctlCompat: this kernel has file_ioctl_compat (6.8+), so guard_file_ioctl_compat attaches.
+	ioctlCompat bool
 
 	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
 	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).
@@ -69,6 +71,11 @@ type engine struct {
 	setRows    map[uint32]map[GuardInodeKey]uint8
 	unionRows  map[GuardInodeKey]uint32
 	memberRows map[GuardTaintMemberKey]struct{}
+	// successor mirrors guard_taint_successor: old slot -> its reload replacement (same path).
+	successor map[uint32]uint32
+	// inspectors mirrors guard_inspectors (SetInspectors). Daemon config, not engine state: kept
+	// across a stop and written again by the next start.
+	inspectors map[GuardInodeKey]string
 	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
 	// that registered the backing devices, whose consumer labels them as such. Delivering them to
 	// every guard duplicated each denial and let the self-guards label it with their own path.
@@ -163,16 +170,61 @@ func (e *engine) acquire(g *Guard) (uint32, error) {
 		return 0, err
 	}
 	e.refs++
+	e.linkReloadTwinLocked(g, id)
 	return id, nil
+}
+
+// linkReloadTwinLocked records id as the replacement of every live slot guarding g's path, before
+// id claims any inode. Without it a process tainted under the old slot that reads the tree through
+// the new one before carryTaintAcrossReload moves it is merged to GLOBAL for life. A failed write
+// only leaves that merge (stricter), so it is logged, not fatal.
+func (e *engine) linkReloadTwinLocked(g *Guard, id uint32) {
+	for old := uint32(1); old < GuardMaxRes; old++ {
+		o := e.slots[old]
+		if old == id || o == nil || filepath.Clean(o.path) != filepath.Clean(g.path) {
+			continue
+		}
+		if err := e.objs.GuardTaintSuccessor.Put(old, id); err != nil {
+			log.Warnf("guard: linking reload slot %d to %d for %s: %v", old, id, g.path, err)
+			continue
+		}
+		if e.successor == nil {
+			e.successor = make(map[uint32]uint32)
+		}
+		e.successor[old] = id
+	}
+}
+
+// unlinkReloadTwinLocked drops every successor row naming id before the slot can be reused: a
+// stale row would collapse an unrelated resource's taint into id's.
+func (e *engine) unlinkReloadTwinLocked(id uint32) {
+	for old, next := range e.successor {
+		if old != id && next != id {
+			continue
+		}
+		if err := e.objs.GuardTaintSuccessor.Put(old, uint32(0)); err != nil {
+			log.Warnf("guard: clearing reload link of slot %d: %v", old, err)
+		}
+		delete(e.successor, old)
+	}
 }
 
 // startLocked loads the objects, attaches every LSM program once and starts the event reader.
 func (e *engine) startLocked() error {
+	shared, mapsErr := supersedeMaps()
+	if mapsErr != nil {
+		return mapsErr
+	}
+	spec, ioctlCompat, specErr := guardSpec()
+	if specErr != nil {
+		return specErr
+	}
 	var objs GuardObjects
-	if err := LoadGuardObjects(&objs, nil); err != nil {
+	if err := spec.LoadAndAssign(&objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
 		return fmt.Errorf("loading guard BPF objects: %w", err)
 	}
 	e.objs = objs
+	e.ioctlCompat = ioctlCompat
 	e.done = make(chan struct{})
 
 	failedRequired, total := e.attachLocked()
@@ -188,7 +240,10 @@ func (e *engine) startLocked() error {
 	}
 
 	lsmAttached := len(e.links)
-	e.attachForkTaintLocked()
+	if err := e.attachForkLocked(); err != nil {
+		e.stopLocked()
+		return err
+	}
 
 	// The reserved slot must exist before any decision can land on it: res_cfg() treats an
 	// inactive slot as unknown and denies, which would make the raw block-device gate refuse
@@ -201,6 +256,10 @@ func (e *engine) startLocked() error {
 		e.stopLocked()
 		return fmt.Errorf("initializing the shared resource slot: %w", err)
 	}
+	if err := e.syncInspectorsLocked(e.inspectors); err != nil {
+		e.stopLocked()
+		return err
+	}
 
 	rd, err := ringbuf.NewReader(e.objs.Rb)
 	if err != nil {
@@ -210,6 +269,7 @@ func (e *engine) startLocked() error {
 	e.rd = rd
 	e.started = true
 	go e.readLoop(rd)
+	go supersedePruneLoop(e.done)
 
 	log.Infof("guard engine — %d/%d LSM hooks attached once for every resource", lsmAttached, total)
 	return nil
@@ -218,7 +278,7 @@ func (e *engine) startLocked() error {
 // attachLocked attaches every LSM program, pinning each at pinPrefix+<hook> when enabled. A pin
 // failure degrades (pinDegraded, CRITICAL log) and drops the pins rather than aborting.
 func (e *engine) attachLocked() (failedRequired []string, total int) {
-	attachments := guardLSMHooks(&e.objs)
+	attachments := guardLSMHooks(&e.objs, e.ioctlCompat)
 	for _, a := range attachments {
 		l, attachErr := link.AttachLSM(link.LSMOptions{Program: a.prog})
 		if attachErr != nil {
@@ -250,19 +310,17 @@ func (e *engine) attachLocked() (failedRequired []string, total int) {
 	return failedRequired, len(attachments)
 }
 
-// attachForkTaintLocked attaches guard_sched_process_fork (copies a tainted parent's taint to
-// forked children). Best-effort: failure only delays a child's tracking until its own guarded
-// access.
-func (e *engine) attachForkTaintLocked() {
+// attachForkLocked attaches guard_sched_process_fork, which copies a parent's taint and exec
+// stamp to its child. Required: a child without its parent's stamp would pass for a process
+// started before the guard, so a superseded image re-exec'd by its parent would admit the child.
+func (e *engine) attachForkLocked() error {
 	l, err := link.AttachTracing(link.TracingOptions{
 		Program:    e.objs.GuardSchedProcessFork,
 		AttachType: cilium.AttachTraceRawTp,
 	})
 	if err != nil {
-		log.Warnf("guard: skipping fork taint propagation (%v) — a forked child of a process that "+
-			"read guarded content is not taint-tracked until its own first guarded access; direct "+
-			"enforcement is unaffected", err)
-		return
+		return fmt.Errorf("required hook sched_process_fork failed to attach: %w — a forked child "+
+			"would lose its parent's exec stamp", err)
 	}
 	if e.pinPrefix != "" {
 		if pinErr := l.Pin(e.pinPrefix + "sched-process-fork"); pinErr != nil {
@@ -273,6 +331,20 @@ func (e *engine) attachForkTaintLocked() {
 	}
 	e.links = append(e.links, l)
 	e.linkNames = append(e.linkNames, "sched-process-fork")
+	return nil
+}
+
+// FreeResourceSlots is how many resource slots a new Guard can still claim.
+func FreeResourceSlots() int {
+	sharedEngine.mu.Lock()
+	defer sharedEngine.mu.Unlock()
+	free := 0
+	for id := 1; id < GuardMaxRes; id++ {
+		if sharedEngine.slots[id] == nil && sharedEngine.setAt[uint32(id)] == "" { //nolint:gosec // id < GuardMaxRes
+			free++
+		}
+	}
+	return free
 }
 
 // allocSlotLocked reserves a resource id for g. Slot 0 is reserved (resGlobal), and so is every
@@ -533,6 +605,7 @@ func (e *engine) release(id uint32) {
 			if err := e.objs.GuardResConfig.Put(id, GuardResConfig{}); err != nil {
 				log.Warnf("guard: clearing resource slot %d: %v", id, err)
 			}
+			e.unlinkReloadTwinLocked(id)
 			// Drop the id from every taint set now: a later resource reusing it must not be
 			// judged as a member of a set it never joined.
 			if err := e.syncTaintLocked(); err != nil {
@@ -575,6 +648,7 @@ func (e *engine) stopLocked() {
 	e.done = nil
 	e.sets, e.setAt, e.setRows, e.unionRows, e.memberRows = nil, nil, nil, nil, nil
 	e.prevOwner = nil
+	e.successor = nil
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.
@@ -598,15 +672,23 @@ func (e *engine) readLoop(rd *ringbuf.Reader) {
 }
 
 // deliver hands an event to its owning Guard. An event from the reserved slot belongs to no
-// resource; it goes to exactly one guard (see rawOwner), as the gate used to live in one guard.
+// resource; it goes to exactly one guard (see rawOwner), as the gate used to live in one guard. A
+// process-gate event from the reserved slot or a taint set carries its own Scope label: the guard it
+// reaches is only its reporter.
 func (e *engine) deliver(resID uint32, ev *GuardEvent) {
 	e.mu.Lock()
 	var target *Guard
 	switch {
 	case resID == resGlobal:
 		target = e.globalOwnerLocked()
+		if ev.Process != "" {
+			ev.Scope = MultipleResourceLabel
+		}
 	case e.setAt[resID] != "":
 		target = e.setOwnerLocked(resID)
+		if ev.Process != "" {
+			ev.Scope = strings.Join(setPaths(e.setAt[resID]), ",")
+		}
 	case resID < GuardMaxRes:
 		target = e.slots[resID]
 	}
@@ -677,6 +759,57 @@ func (e *engine) noteDeny(res uint32, exe GuardInodeKey) error {
 	}
 	delete(e.allows[res], exe)
 	return e.syncSharedLocked()
+}
+
+// admitsExe reports whether any live resource allows exe, or exe is an inspector.
+func (e *engine) admitsExe(exe GuardInodeKey) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.isInspectorLocked(exe) {
+		return true
+	}
+	for _, set := range e.allows {
+		if _, ok := set[exe]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// forgetExe drops every row naming exe, in every resource and the views derived from them, and has
+// each guard forget it (Guard.forgetExe).
+func (e *engine) forgetExe(exe GuardInodeKey) error {
+	e.mu.Lock()
+	delete(e.inspectors, exe)
+	if !e.started {
+		e.mu.Unlock()
+		return nil
+	}
+	if err := e.objs.GuardInspectors.Delete(exe); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+		e.mu.Unlock()
+		return err
+	}
+	for _, set := range e.allows {
+		delete(set, exe)
+	}
+	err := e.syncSharedLocked()
+	if err == nil {
+		err = deleteInoKeys(e.objs.GuardExeActions, exe)
+	}
+	if err == nil {
+		err = deleteInoKeys(e.objs.GuardExeEvents, exe)
+	}
+	var guards []*Guard
+	for _, g := range &e.slots {
+		if g != nil {
+			guards = append(guards, g)
+		}
+	}
+	e.mu.Unlock()
+	for _, g := range guards {
+		g.forgetExe(exe)
+	}
+	return err
 }
 
 // forgetResource drops res from the cross-resource views when its guard goes away.

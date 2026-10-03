@@ -52,8 +52,8 @@ The wizard reverts everything the installer installed:
      plaintext copy completed, so a failure leaves it untouched
   4. cleans the orphaned fscrypt metadata left behind by the decrypted
      directories (still-encrypted directories keep their metadata)
-  5. reverts the installed systemd units (daemon + boot-time catalog
-     refresh), the pacman/apt catalog-refresh hook, binary, PATH symlink
+  5. reverts the installed systemd unit, the boot-time catalog-refresh unit
+     and pacman/apt hooks an earlier version left, binary, PATH symlink
      and config, and — after a final confirmation (default: no) and only
      for units whose content matches the bundled sample — the per-user
      ssh-agent systemd units and the SSH_AUTH_SOCK / AddKeysToAgent blocks

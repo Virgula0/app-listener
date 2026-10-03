@@ -5,7 +5,9 @@ package daemonconfig
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,7 +25,24 @@ type Config struct {
 	// daemon-wide, so they belong to no resource; all go to the trust guard, which re-stats each
 	// after the vaults unlock.
 	SharedAllowLibs []string
+	// Inspectors are the [inspectors] binaries: root-placed system programs that may read any
+	// protected process's /proc metadata (never its memory). DefaultInspectors without the block.
+	Inspectors []string
+	// InspectorsDefault: no [inspectors] block, so Inspectors is DefaultInspectors and an entry
+	// not installed on this host is expected.
+	InspectorsDefault bool
+	// Raw is the file's content as parsed: the daemon's catalog refresh writes only over the
+	// version it runs (compare-and-swap).
+	Raw []byte
 }
+
+// DefaultInspectors is xdg-desktop-portal (Arch; Debian and Fedora): it opens /proc/<pid>/root of
+// every screen-sharing caller to tell Flatpak and Snap apps apart, and refuses the request if it
+// can't.
+var DefaultInspectors = []string{"/usr/lib/xdg-desktop-portal", "/usr/libexec/xdg-desktop-portal"}
+
+// MaxInspectors bounds the [inspectors] entries (the kernel map also holds superseded versions).
+const MaxInspectors = 16
 
 // Resource is one guarded tree (directory or vault root) with its own guard, whitelist and, via
 // EncryptionRoot, a shared fscrypt lifecycle. Symlinks, hard-linked files and special files are
@@ -127,7 +146,9 @@ type watchGroup struct {
 	// libraryBlock marks a [libraries <name>] block: no watch root, only library directives; its
 	// lib_dirs are writable by its own lib_binary rules alone.
 	libraryBlock bool
-	blockName    string
+	// inspectorsBlock marks an [inspectors] block: one binary path per line, into Config.Inspectors.
+	inspectorsBlock bool
+	blockName       string
 	// skipped marks a section whose root is missing: its directives are warned and ignored, never
 	// fatal (the group is dropped at finalize).
 	skipped bool
@@ -138,14 +159,17 @@ type watchGroup struct {
 // are skipped with a warning; unreadable binaries go to PendingBinaries for post-unlock resolution.
 // Malformed directives in valid sections fail fast.
 func Load(path string) (*Config, error) {
-	file, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	return Parse(raw)
+}
 
-	cfg := &Config{}
-	if err := parseConfig(cfg, file); err != nil {
+// Parse parses config text as Load does.
+func Parse(raw []byte) (*Config, error) {
+	cfg := &Config{Raw: raw}
+	if err := parseConfig(cfg, bytes.NewReader(raw)); err != nil {
 		return nil, err
 	}
 	if err := validateResources(cfg); err != nil {
@@ -156,7 +180,7 @@ func Load(path string) (*Config, error) {
 
 // parseConfig reads the file into cfg, one Resource per guarded tree (a watch group emits one per
 // `watch:` path).
-func parseConfig(cfg *Config, file *os.File) error {
+func parseConfig(cfg *Config, file io.Reader) error {
 	var group *watchGroup
 
 	scanner := bufio.NewScanner(file)
@@ -175,6 +199,10 @@ func parseConfig(cfg *Config, file *os.File) error {
 		return err
 	}
 	finalizeGroup(cfg, group)
+	if cfg.Inspectors == nil {
+		cfg.Inspectors = append([]string(nil), DefaultInspectors...)
+		cfg.InspectorsDefault = true
+	}
 	return nil
 }
 
@@ -184,6 +212,14 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	if name, ok := parseLibrariesSection(line); ok {
 		finalizeGroup(cfg, *group)
 		*group = &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
+		return nil
+	}
+	if line == "[inspectors]" {
+		finalizeGroup(cfg, *group)
+		*group = &watchGroup{inspectorsBlock: true, lineNo: lineNo}
+		if cfg.Inspectors == nil {
+			cfg.Inspectors = []string{} // declared: an empty block grants nothing, not the default
+		}
 		return nil
 	}
 	dirPath, isSection, headerErr := parseWatchSection(line)
@@ -204,6 +240,9 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	g := *group
 	if g.libraryBlock {
 		return applyLibraryBlockDirective(g, line, lineNo)
+	}
+	if g.inspectorsBlock {
+		return applyInspector(cfg, line, lineNo)
 	}
 	if g.skipped {
 		log.Warnf("daemon config line %d: skipped section: ignoring directive %q", lineNo, line)
@@ -241,7 +280,7 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 
 // finalizeGroup materializes a closed group unless it was skipped.
 func finalizeGroup(cfg *Config, group *watchGroup) {
-	if group == nil || group.skipped {
+	if group == nil || group.skipped || group.inspectorsBlock {
 		return
 	}
 	if group.libraryBlock {
@@ -808,6 +847,33 @@ func applyLibBinary(group *watchGroup, value string, lineNo int) error {
 			"(%q): a library directory is guarded read-only, which carries no per-binary event mask", lineNo, rest)
 	}
 	recordBinaryRule(BinaryRule{Path: binPath, LibBinary: true}, &group.libBinaries, &group.libPending, lineNo)
+	return nil
+}
+
+// applyInspector records one [inspectors] line: an absolute binary path and nothing else. Whether
+// root placed it is the daemon's to check when it admits it (the name may resolve elsewhere by
+// then); a refused entry grants nothing.
+func applyInspector(cfg *Config, line string, lineNo int) error {
+	p, rest, err := splitPathAndRest(line)
+	if err != nil {
+		return fmt.Errorf("daemon config line %d: %w", lineNo, err)
+	}
+	if rest != "" {
+		return fmt.Errorf("daemon config line %d: an [inspectors] entry is a binary path only, got %q", lineNo, rest)
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("daemon config line %d: inspector %q is not an absolute path", lineNo, p)
+	}
+	p = filepath.Clean(p)
+	for _, have := range cfg.Inspectors {
+		if have == p {
+			return fmt.Errorf("daemon config line %d: duplicate inspector: %s", lineNo, p)
+		}
+	}
+	if len(cfg.Inspectors) >= MaxInspectors {
+		return fmt.Errorf("daemon config line %d: more than %d inspectors", lineNo, MaxInspectors)
+	}
+	cfg.Inspectors = append(cfg.Inspectors, p)
 	return nil
 }
 

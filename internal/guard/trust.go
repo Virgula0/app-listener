@@ -41,6 +41,7 @@ const (
 // always enforced once attached.
 type TrustGuard struct {
 	objs  GuardTrustObjects
+	memfd bool // trust_memfd_alloc's target exists (trustSpec)
 	links []link.Link
 	rd    *ringbuf.Reader
 	done  chan struct{}
@@ -55,6 +56,27 @@ type TrustGuard struct {
 	vouched   int
 	// mountUntracked: the watch died, so SyncMounts refuses to vouch anything again.
 	mountUntracked bool
+	// retiredMu guards retired: the rows forgetExe dropped for a freed key, so a replacement its
+	// guards re-sync only after that prune can still adopt them (adoptRows). Userspace only: a
+	// reused inode number gains nothing from them. Cleared by SetTrusted, which re-derives every row.
+	retiredMu sync.Mutex
+	retired   map[GuardTrustInodeKey]trustRows
+}
+
+// trustRows is one key's rows across guard_trusted_files and the bit maps (trustBitMaps order).
+type trustRows struct {
+	flags uint8
+	bits  [4]uint64
+	has   [4]bool
+}
+
+// maxRetiredRows bounds TrustGuard.retired; past it the oldest prune's rows are simply not kept
+// (a later replacement then waits for a reload: stricter).
+const maxRetiredRows = 1024
+
+func (t *TrustGuard) trustBitMaps() [4]*cilium.Map {
+	return [4]*cilium.Map{t.objs.GuardBinOwner, t.objs.GuardBinUpdaters, t.objs.GuardGlobWriters,
+		t.objs.GuardLibdirUsers}
 }
 
 // trustEvent mirrors struct trust_event in guard_trust.bpf.c.
@@ -72,8 +94,17 @@ func NewTrustGuard() (*TrustGuard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("trust guard: removing memlock rlimit: %v", err)
 	}
+	shared, err := supersedeMaps()
+	if err != nil {
+		return nil, err
+	}
 	t := &TrustGuard{done: make(chan struct{}), mountFd: -1, mountStop: -1, vouched: -1}
-	if err := LoadGuardTrustObjects(&t.objs, nil); err != nil {
+	spec, memfd, err := trustSpec()
+	if err != nil {
+		return nil, err
+	}
+	t.memfd = memfd
+	if err := spec.LoadAndAssign(&t.objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
 		return nil, fmt.Errorf("loading trust BPF objects: %w", err)
 	}
 	return t, nil
@@ -101,12 +132,95 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	for _, l := range libs {
 		add(l, trustedLib)
 	}
+	for k := range flags {
+		liftSuperseded(k)
+	}
+	t.retiredMu.Lock()
+	t.retired = nil
+	t.retiredMu.Unlock()
+	if err := t.keepLive(flags); err != nil {
+		return fmt.Errorf("keeping live trusted files: %w", err)
+	}
 	if err := syncMap(t.objs.GuardTrustedFiles, flags); err != nil {
 		return fmt.Errorf("syncing trusted files: %w", err)
 	}
 	log.Infof("trust guard: %d trusted inode(s) loaded (%d binaries, %d libraries requested)",
 		len(flags), len(binaries), len(libs))
 	return nil
+}
+
+// keepLive adds to flags every trusted inode a guard still admits without a config path naming it:
+// a system binary admitted live (admitSystemMatches), or a superseded one a process started before
+// its update still runs. A reload rebuilds the set from paths, and losing the flag would lift the
+// library allowlist from a process that holds its resource's secrets. Bit rows (owners, updaters,
+// writers) are not kept: their bits are reassigned per reload.
+func (t *TrustGuard) keepLive(flags map[GuardInodeKey]uint8) error {
+	var k GuardInodeKey
+	var f uint8
+	it := t.objs.GuardTrustedFiles.Iterate()
+	for it.Next(&k, &f) {
+		if _, ok := flags[k]; ok {
+			continue
+		}
+		if mark, ok := supersededMark(k); (ok && mark.Freed == 0) || (!ok && sharedEngine.admitsExe(k)) {
+			flags[k] = f
+		}
+	}
+	return it.Err()
+}
+
+// trusts reports whether k is a trusted file.
+func (t *TrustGuard) trusts(k GuardInodeKey) bool {
+	var f uint8
+	return t.objs.GuardTrustedFiles.Lookup(GuardTrustInodeKey{Dev: k.Dev, Ino: k.Ino}, &f) == nil
+}
+
+// forgetExe drops every trust row keyed by k (supersede.go). guard_bin_origin is left to the
+// kernel: every creation rewrites or drops its row (origin_record).
+func (t *TrustGuard) forgetExe(k GuardInodeKey) error {
+	key := GuardTrustInodeKey{Dev: k.Dev, Ino: k.Ino}
+	t.retire(key)
+	for _, m := range []*cilium.Map{t.objs.GuardTrustedFiles, t.objs.GuardBinOwner, t.objs.GuardBinUpdaters,
+		t.objs.GuardGlobWriters, t.objs.GuardLibdirUsers} {
+		if err := m.Delete(key); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// retire stashes key's rows before forgetExe drops them, if it is a trusted file.
+func (t *TrustGuard) retire(key GuardTrustInodeKey) {
+	var r trustRows
+	if t.objs.GuardTrustedFiles.Lookup(key, &r.flags) != nil {
+		return
+	}
+	for i, m := range t.trustBitMaps() {
+		r.has[i] = m.Lookup(key, &r.bits[i]) == nil
+	}
+	t.retiredMu.Lock()
+	defer t.retiredMu.Unlock()
+	if t.retired == nil {
+		t.retired = make(map[GuardTrustInodeKey]trustRows)
+	}
+	if len(t.retired) < maxRetiredRows {
+		t.retired[key] = r
+	}
+}
+
+// rowsOf reads key's live rows, else the ones retire stashed. ok false: neither.
+func (t *TrustGuard) rowsOf(key GuardTrustInodeKey) (trustRows, bool) {
+	var r trustRows
+	if t.objs.GuardTrustedFiles.Lookup(key, &r.flags) == nil {
+		for i, m := range t.trustBitMaps() {
+			r.has[i] = m.Lookup(key, &r.bits[i]) == nil
+		}
+		return r, true
+	}
+	t.retiredMu.Lock()
+	defer t.retiredMu.Unlock()
+	r, ok := t.retired[key]
+	return r, ok
 }
 
 // trustedDirAny mirrors TRUSTED_DIR_ANY in guard_trust.bpf.c.
@@ -221,6 +335,11 @@ func (t *TrustGuard) hooks() []trustHook {
 		// (attachSuspectFork), or a suspect process's children would escape the mark.
 		{t.objs.TrustBprmCommitted, "bprm_committed_creds", true},
 		{t.objs.TrustTaskFree, "task_free", true},
+		// Superseded keys for trusted libraries (exe_supersede.h): without them a freed library's
+		// number, reused by any file, would stay TRUSTED_LIB.
+		{t.objs.TrustInodeUnlink, "inode_unlink", true},
+		{t.objs.TrustInodeRename, "inode_rename", true},
+		{t.objs.TrustInodeFree, "inode_free_security", true},
 	}
 }
 
@@ -265,6 +384,7 @@ func (t *TrustGuard) Start() error {
 	}
 	t.rd = rd
 	go t.readLoop()
+	setSupersedeTrust(t)
 	return nil
 }
 
@@ -292,6 +412,12 @@ func (t *TrustGuard) attachSuspectFork() error {
 // Best-effort and fail-closed: without the record a memfd exec-map stays denied and the driver
 // falls through to O_TMPFILE/mkstemp, which file_open sees.
 func (t *TrustGuard) attachMemfdProvenance() {
+	if !t.memfd {
+		log.Warnf("trust guard: skipping memfd provenance (this kernel has no %s) — a whitelisted "+
+			"process's memfd-backed runtime code stays denied (GPU drivers fall back to their "+
+			"file-backed JIT paths, which are covered); every other protection is unaffected", memfdTarget)
+		return
+	}
 	l, err := link.AttachTracing(link.TracingOptions{
 		Program:    t.objs.TrustMemfdAlloc,
 		AttachType: cilium.AttachTraceFExit,
@@ -352,6 +478,11 @@ func (t *TrustGuard) Stop() {
 	default:
 		close(t.done)
 	}
+	supersede.mu.Lock()
+	if supersede.trust == t {
+		supersede.trust = nil
+	}
+	supersede.mu.Unlock()
 	if t.rd != nil {
 		_ = t.rd.Close()
 	}

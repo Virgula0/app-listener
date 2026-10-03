@@ -40,9 +40,8 @@ var errNoPinState = errors.New("no usable pin-state record found")
 // writePinState records pin's generation for the config guards just brought up or rotated to
 // (reload), IN PLACE on the file's existing inode (like editprotected/auth.go's WriteHashFile, same
 // reason): once the RO self-guard on /etc/app-listener is attached, only rewriting an EXISTING
-// entry is permitted. The first call per host runs before that guard exists (runDaemon: right after
-// startGuardedDaemonAbortable succeeds, before `go sg.attach(pin)`), so the create fallback runs at
-// most once. Best-effort: failure only means `--lockdown` can't recover this generation, never that
+// entry is permitted, so ensurePinStateFilePlaceholder creates it before that guard attaches and the
+// create fallback only covers a failed placeholder. Best-effort: failure only means `--lockdown` can't recover this generation, never that
 // startup/reload fails.
 func writePinState(pin pinCfg) error {
 	dir := filepath.Dir(pinStateFile)

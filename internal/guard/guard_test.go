@@ -1003,7 +1003,7 @@ func (s *guardUnitTest) TestReSyncBinariesReplacement() {
 	s.Require().Error(runTool(tool, seed), "an unapproved replacement must stay denied")
 
 	// Approved for exactly this old->new swap: re-admitted.
-	SetReplacementCheck(func(path string, o, n GuardInodeKey) bool {
+	SetReplacementCheck(func(path string, _ *os.File, o, n GuardInodeKey) bool {
 		return path == tool && o == oldKey && n == newKey
 	})
 	defer SetReplacementCheck(nil)

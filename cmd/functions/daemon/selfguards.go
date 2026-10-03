@@ -41,11 +41,9 @@ func selfProtectSpecs() []selfProtectSpec {
 // the usecase sweep cadence.
 const selfSweepEvery = 30 * time.Second
 
-// selfGuards holds the always-on guards over the daemon's own on-disk state, deliberately NOT part
-// of the usecase's guard set: on SIGHUP the config guards transiently double (new attaches before
-// old detaches) and that peak is bounded by the kernel's per-LSM-hook program limit
-// (BPF_MAX_TRAMP_LINKS, 38). Self guards step aside (detach() before, attach() after), so the
-// /etc/app-listener gap lasts only the admin-triggered reload.
+// selfGuards holds the always-on guards over the daemon's own on-disk state, outside the usecase's
+// guard set: a reload never rebuilds them, so fscrypt.key and edit-auth.hash stay sealed through it.
+// Every guard shares one LSM program set (guard/engine.go), so they cost resource slots, not links.
 //
 // A self guard that can't attach (LSM slot exhaustion, etc.) is logged and skipped: config-driven
 // protection is the core function and must never be blocked by this add-on.
@@ -207,7 +205,7 @@ func (s *selfGuards) forward(resource string, g *guard.Guard, stop <-chan struct
 				return
 			}
 			select {
-			case s.events <- usecase.DaemonEvent{Resource: resource, Event: ev}:
+			case s.events <- usecase.DaemonEvent{Resource: ev.ResourceLabel(resource), Event: ev}:
 			case <-stop:
 				return
 			}

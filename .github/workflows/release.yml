@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   meta:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       tag: ${{ steps.m.outputs.tag }}
       title: ${{ steps.m.outputs.title }}
@@ -53,7 +53,7 @@ jobs:
 
   release:
     needs: [meta, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:

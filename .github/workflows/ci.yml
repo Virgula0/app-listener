@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Lint runs only on non-draft pull requests (and on pushes to main).
     if: github.event.pull_request.draft != true
     steps:
@@ -31,7 +31,7 @@ jobs:
           # golangci-lint typechecks the whole module, including the
           # fyne GUI, which needs OpenGL and X11 development headers.
           packages: gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
-          version: 1.0
+          version: ubuntu-26.04-1
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -67,7 +67,7 @@ jobs:
         run: make lint
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: github.event.pull_request.draft != true
     steps:
       - name: Check out repository
@@ -80,7 +80,7 @@ jobs:
           # tests need a C toolchain and libc headers. The fyne GUI
           # needs OpenGL and X11 development headers to typecheck.
           packages: gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
-          version: 1.0
+          version: ubuntu-26.04-1
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0

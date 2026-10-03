@@ -27,9 +27,9 @@ type GuardRepository interface {
 	// (fail-closed).
 	ResolvePendingBinaries() error
 	// ReSyncBinaries re-stats every whitelisted binary and rewrites its inode-keyed entry after an
-	// in-place replacement (app update). Stale keys are never deleted, so pre-replacement processes
-	// keep working. Safe to repeat; also retries still-deferred binaries. Returns how many entries
-	// changed.
+	// in-place replacement (app update). A replaced key keeps admitting processes started before
+	// the replacement until its inode is gone. Safe to repeat; also retries still-deferred
+	// binaries. Returns how many entries changed.
 	ReSyncBinaries() (int, error)
 	// SweepInodes is the cheap periodic guard_inodes refresh: re-scans only when the watch root's
 	// fingerprint moved (recreated single-file root, or a directory that gained/lost a top-level
@@ -57,6 +57,11 @@ type GuardRepository interface {
 	// process_vm_readv/ptrace protection for processes that already read a guarded file.
 	SnapshotTaintedPIDs() ([]uint32, error)
 	RestoreTaintedPIDs(pids []uint32) error
+	// SnapshotSuperseded / RestoreSuperseded carry the keys of replaced binaries that processes
+	// started before the replacement still run: a reload rebuilds the whitelist from paths, which
+	// no longer name them.
+	SnapshotSuperseded() ([]guard.SupersededBinary, error)
+	RestoreSuperseded(bins []guard.SupersededBinary) error
 	// RootAnchor returns the watch root the guard is confined to and whether that inode still
 	// exists. Reload compares a kept resource's old and new anchors with it: a new root while the
 	// old one still exists means the path was re-pointed through an unguarded ancestor.

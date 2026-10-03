@@ -821,3 +821,18 @@ func TestFilterExistingWhitelistSkipsUnsafeName(t *testing.T) {
 		t.Errorf("FilterExistingWhitelist = %v, want only [%s]", got, want)
 	}
 }
+
+func TestSystemWhitelistKeepsOnlyAbsolutePatterns(t *testing.T) {
+	e := CandidateDir{Whitelist: map[string][]string{
+		"/opt/*/jbr/bin/java":     nil,
+		"/usr/bin/ssh":            {"READ"},
+		"%HOME%/.local/bin/x":     nil,
+		"/home/%USER%/bin/y":      nil,
+		"%HOME%/.config/d/*/Disc": nil,
+	}}
+	got := e.SystemWhitelist()
+	if len(got) != 2 || got[0].Path != "/opt/*/jbr/bin/java" || got[1].Path != "/usr/bin/ssh" ||
+		len(got[1].Events) != 1 {
+		t.Fatalf("SystemWhitelist = %+v, want the two absolute patterns with their events", got)
+	}
+}

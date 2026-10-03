@@ -748,6 +748,27 @@ func TestDaemonUseCaseReloadAllowsDeletedRootToMove(t *testing.T) {
 	}
 }
 
+func TestDaemonUseCaseReloadCarriesSupersededBinaries(t *testing.T) {
+	old := newFakeGuardRepo()
+	old.superseded = []guard.SupersededBinary{{Path: "/usr/bin/app", Key: guard.GuardInodeKey{Dev: 1, Ino: 7}, Action: 2}}
+	other := newFakeGuardRepo()
+	other.superseded = []guard.SupersededBinary{{Path: "/usr/bin/other", Key: guard.GuardInodeKey{Dev: 1, Ino: 9}, Action: 2}}
+	d := startDaemon(t, newFakeVault("/a", "/b"), []daemonconfig.Resource{resource("/a"), resource("/b")},
+		[]repository.GuardRepository{old, other})
+
+	nextA, nextB := newFakeGuardRepo(), newFakeGuardRepo()
+	if err := d.Reload([]daemonconfig.Resource{resource("/b"), resource("/a")},
+		[]repository.GuardRepository{nextB, nextA}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if len(nextA.superseded) != 1 || nextA.superseded[0].Key.Ino != 7 {
+		t.Errorf("/a's new guard must carry /a's superseded key, got %+v", nextA.superseded)
+	}
+	if len(nextB.superseded) != 1 || nextB.superseded[0].Key.Ino != 9 {
+		t.Errorf("/b's new guard must carry /b's superseded key only, got %+v", nextB.superseded)
+	}
+}
+
 func TestDaemonUseCaseReloadKeptResources(t *testing.T) {
 	vault := newFakeVault("/a")
 	old := newFakeGuardRepo()

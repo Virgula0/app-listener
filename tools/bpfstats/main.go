@@ -1,6 +1,7 @@
 // Command bpfstats loads each BPF program of an object file on its own and reports the verifier's
 // "processed N insns" count — the figure the 1M limit applies to, which program size only loosely
-// predicts. Development aid for keeping the guard programs inside the budget; needs root.
+// predicts. Development aid and CI gate for keeping the guard programs inside the budget; needs
+// root. Exits 1 when a program of the first object is rejected (over budget included: E2BIG).
 //
 //	sudo ./bpfstats new.o [base.o ...]
 package main
@@ -38,6 +39,16 @@ func main() {
 	if len(results) == 2 {
 		compare(results[0], results[1])
 	}
+	rejected := false
+	for name, n := range results[0] {
+		if n < 0 {
+			fmt.Fprintf(os.Stderr, "%s: %s rejected by this kernel's verifier\n", os.Args[1], name)
+			rejected = true
+		}
+	}
+	if rejected {
+		os.Exit(1)
+	}
 }
 
 // measure loads every program in the object separately, so one rejection does not hide the rest.
@@ -58,6 +69,12 @@ func measure(path string) map[string]int {
 	for _, name := range names {
 		insns, loadErr := loadOne(spec, name)
 		switch {
+		case spec.Programs[name].Type == cilium.Tracing && errors.Is(loadErr, cilium.ErrNotSupported):
+			// A missing fexit target, not a verifier verdict: the loader skips such best-effort
+			// programs (guard.trustSpec). Only tracing ones: an LSM program unsupported here means
+			// the kernel lacks BPF-LSM, and must fail.
+			out[name] = 0
+			fmt.Printf("  %-32s SKIPPED   %v\n", name, loadErr)
 		case loadErr != nil:
 			out[name] = -1
 			fmt.Printf("  %-32s REJECTED  %s\n", name, short(loadErr))

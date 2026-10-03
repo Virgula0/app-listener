@@ -86,6 +86,7 @@ var (
 	genKeyFlag   bool
 	lockdownFlag bool
 	checkFlag    bool
+	verifierOnly bool
 	headless     bool
 	blockedOnly  bool
 	pprofAddr    string
@@ -130,10 +131,21 @@ summary per minute.
 The guard itself never changes behavior — filtering is purely presentational.
 
 SIGHUP reloads the configuration: every resource's binary whitelist is
-recomputed (by inode, so pacman/system updates that replace binaries are
-picked up) and applied atomically — new guards attach before the old
-ones detach, so protection is never dropped. A malformed configuration
-keeps the previous one running.`,
+recomputed by inode and applied atomically — new guards attach before the
+old ones detach, so protection is never dropped. A malformed configuration
+keeps the previous one running.
+
+Updates need no reload and no hook. A root-owned whitelisted binary that a
+package manager replaces (temp file + rename) is re-admitted as soon as the
+daemon sees it, if the new file is root-owned in a root-owned directory; so
+is a new root-owned match of the catalog's absolute patterns. A new app
+version below a home directory (Discord, Steam, Claude) is admitted by the
+catalog refresh the daemon runs at startup and whenever it sees a binary
+written below a catalog pattern: daemon.conf is rewritten (only if it still
+holds the configuration the daemon runs) and reloaded in-process, logged as
+"DAEMON catalog-refresh resource=... admitted=... dropped=...". A process
+started from a binary before it was replaced keeps its access, a reload
+included; re-running the replaced image (held fd, /proc/<pid>/exe) does not.`,
 	Args: cobra.NoArgs,
 	RunE: runDaemon,
 }
@@ -159,6 +171,10 @@ func init() {
 			"Attaches nothing, changes nothing. The installer runs this against the deployed "+
 			"binary before enabling the service, so a kernel whose verifier rejects a guard "+
 			"program fails the install cleanly instead of crash-looping (or panicking) the daemon.")
+	DaemonCmd.Flags().BoolVarP(&verifierOnly, "verifier-only", "", false,
+		"With --check: skip the BPF-LSM activation check and only load the guard programs into the "+
+			"verifier. For CI hosts that compile BPF-LSM in without enabling it (lsm= boot parameter); "+
+			"never a sign that this host can enforce.")
 	DaemonCmd.Flags().BoolVarP(&lockdownFlag, "lockdown", "", false,
 		"Force-lock every encryption root in the config and exit. Wired into the systemd unit as ExecStopPost: "+
 			"systemd runs it after every exit (clean stop, crash, SIGKILL, startup timeout), so a daemon that died "+
@@ -200,8 +216,9 @@ func startPprof(addr string) {
 //   - SIGTERM/SIGINT: otherwise a signal during startup kills the process with no deferred Stop,
 //     leaving unlocked vault keys provisioned until ExecStopPost (guards are pinned, so trees stay
 //     enforced).
-//   - SIGHUP: a reload (`edit-protected --set-password`, catalog-refresh hook) can arrive seconds
-//     after start; SIGHUP's default is to terminate, so it would kill the daemon mid-startup.
+//   - SIGHUP: a reload (`edit-protected --set-password`, `install --update-catalog-only`) can arrive
+//     seconds after start; SIGHUP's default is to terminate, so it would kill the daemon
+//     mid-startup.
 //
 // Both channels are buffered: an early signal is queued, and runDaemonUI drains hup once startup
 // completes. Registered for the process lifetime; the caller defers the returned stop.
@@ -221,6 +238,8 @@ func runOneShotMode() (bool, error) {
 	switch {
 	case genKeyFlag:
 		return true, runGenKey()
+	case verifierOnly && !checkFlag:
+		return true, errors.New("--verifier-only needs --check")
 	case checkFlag:
 		return true, runBPFCheck()
 	case lockdownFlag:
@@ -256,11 +275,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// edit-auth.hash), attached synchronously HERE, before the config guards touch bpffs: otherwise
 	// a killed predecessor's self-guard pins (swept by CleanupStalePins, same pin.base) would leave
 	// a window with no replacements. pinstate.go's ensurePinStateFilePlaceholder keeps
-	// writePinState working under the live RO self-guard. Self guards stay OUT of the usecase's
-	// guard set so a SIGHUP reload's transient guard doubling stays under the kernel's per-LSM-hook
-	// program cap (selfGuards.detach/attach around reload). A failed self guard is logged CRITICAL
-	// but never aborts startup (config guards are the core function and compete for the same link
-	// slots).
+	// writePinState working under the live RO self-guard. They stay attached across every reload.
+	// A failed self guard is logged CRITICAL but never aborts startup.
 	sg := newSelfGuards()
 	sg.attach(pin)
 	defer sg.detach()
@@ -310,8 +326,33 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	control := startControlManager(d)
 	defer control.close()
 
-	reload := makeReloadHandler(d, configPath, vault, pin, sg, control, trust)
+	reload, stopRefresh := startCatalogRefresh(d, configPath, cfg, vault, pin, control, trust)
+	defer stopRefresh()
 	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
+}
+
+// startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) on the reload the
+// SIGHUP handler uses, and returns that handler.
+func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemonconfig.Config, vault *fscrypt.Vault,
+	pin pinCfg, control *controlManager, trust *trustManager) (reload, stop func()) {
+	var refresher *catalogRefresher
+	reloadCfg := makeReloadHandler(d, configPath, vault, pin, control, trust, func(next *daemonconfig.Config) {
+		if refresher != nil {
+			refresher.setConfig(next)
+		}
+	})
+	reload = func() { reloadCfg() }
+	resync := func() {
+		d.ResyncBinaries()
+		trust.resyncInspectors()
+	}
+	refresher, err := newCatalogRefresher(configPath, cfg, reloadCfg, resync, control.sessionActive)
+	if err != nil {
+		log.Errorf("daemon: %v — new app versions wait for a reload", err)
+		return reload, func() {}
+	}
+	refresher.start()
+	return reload, refresher.stop
 }
 
 // runDaemonUI dispatches to the presentation chosen by flags: headless stderr, browser-mirrored
@@ -451,11 +492,18 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	return configPath, cfg, nil
 }
 
-// makeReloadHandler returns the SIGHUP handler: re-parse the config, rebuild every guard
-// (re-statting binaries so updated ones get new inodes) and hand the batch to the usecase, which
-// swaps without dropping protection. Any failure keeps the previous config running.
-func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg, sg *selfGuards, control *controlManager, trust *trustManager) func() {
-	return func() {
+// makeReloadHandler returns the reload: re-parse the config, rebuild every guard (re-statting
+// binaries so updated ones get new inodes) and hand the batch to the usecase, which swaps without
+// dropping protection. Any failure keeps the previous config running and returns nil; success
+// returns the config now running, after reloaded saw it. SIGHUP and the catalog refresh share it,
+// one reload at a time. The self guards stay attached throughout: the reload only needs free
+// resource slots, which reloadOnce checks before building anything.
+func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg,
+	control *controlManager, trust *trustManager, reloaded func(*daemonconfig.Config)) func() *daemonconfig.Config {
+	var mu sync.Mutex
+	return func() *daemonconfig.Config {
+		mu.Lock()
+		defer mu.Unlock()
 		// A reload rebuilds every guard, so end any live edit-protected grant first (its client
 		// gets EOF; the tree is read-only again before the swap).
 		control.endActiveSession("configuration reload")
@@ -463,37 +511,42 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		// start/stop the control socket.
 		defer control.refresh()
 
-		// Self guards step aside for the reload: config guards briefly run old+new together, which
-		// must stay under the kernel's per-LSM-hook program cap (BPF_MAX_TRAMP_LINKS). Re-attached
-		// (best effort) after the swap, on both success and keep-previous paths.
-		sg.detach()
-
 		liveGen, cfg, err := reloadOnce(d, configPath, vault, pin.base)
 		if err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
-			sg.attach(pin)
-			return
+			return nil
 		}
 		// Rebuild the daemon-wide trusted set from the new config: a binary added by this reload
 		// must gain its library allowlist (#2) and write-protection (#1), or LD_PRELOAD works
 		// against it while it holds full access to the secrets.
 		trust.reload(cfg)
 		// The usecase's commit already unpinned the old generation's guards; sweep every other
-		// generation, keeping the live batch. Self guards are detached here, so their pins are gone
-		// and can't look stale.
-		if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{liveGen: true}); cleanErr != nil {
+		// generation, keeping the live batch and the self guards' (pin.gen never rotates).
+		if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{liveGen: true, pin.gen: true}); cleanErr != nil {
 			log.Warnf("daemon: could not sweep stale guard pins after reload: %v", cleanErr)
 		}
-		// The reload minted a fresh config-guard generation (not the self guards': pin.gen on this
-		// outer variable never changes): record it, or `daemon --lockdown` would recover the
-		// pre-reload generation whose pins CleanupStalePins just removed.
+		// The reload minted a fresh config-guard generation: record it, or `daemon --lockdown`
+		// would recover the pre-reload generation whose pins the commit just removed.
 		if pinErr := writePinState(pinCfg{base: pin.base, gen: liveGen}); pinErr != nil {
 			log.Warnf("daemon: could not record pin state after reload (%v) — `daemon --lockdown` will not be "+
 				"able to widen self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 		}
-		sg.attach(pin)
+		reloaded(cfg)
 		log.Infof("daemon: configuration reloaded from %s", configPath)
+		return cfg
 	}
+}
+
+// reloadSlotsNeeded is how many resource slots a reload of cfg claims on top of the live ones: one
+// per resource plus one ephemeral guard per pending group root (an upper bound).
+func reloadSlotsNeeded(cfg *daemonconfig.Config) int {
+	n := len(cfg.Resources)
+	for i := range cfg.Resources {
+		if cfg.Resources[i].PathPending {
+			n++
+		}
+	}
+	return n
 }
 
 // reloadOnce performs one SIGHUP reload: re-parse, unlock any newly added grouped vault under an
@@ -508,6 +561,12 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 	}
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("config contains no [watch] sections")
+	}
+	// Old and new guards overlap until the commit, with the self guards still attached: refuse up
+	// front rather than detach anything to make room.
+	if need, free := reloadSlotsNeeded(cfg), guard.FreeResourceSlots(); need > free {
+		return "", nil, fmt.Errorf("reload needs %d guard resource slots but only %d are free (max %d) — "+
+			"restart the daemon to apply this configuration", need, free, guard.GuardMaxRes-1)
 	}
 
 	pin := pinCfg{base: pinBase, gen: newPinGeneration()}
@@ -850,7 +909,10 @@ func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault, pinBase s
 // binary before enabling the service, so a verifier rejection fails the install cleanly instead of
 // at runtime.
 func runBPFCheck() error {
-	if lsmErr := common.CheckBPFLSM(); lsmErr != nil {
+	if verifierOnly {
+		log.Warn("--verifier-only: not checking that BPF-LSM is active — a pass says the programs " +
+			"verify, not that this host enforces them")
+	} else if lsmErr := common.CheckBPFLSM(); lsmErr != nil {
 		return fmt.Errorf("BPF-LSM preflight failed: %w", lsmErr)
 	}
 	if loadErr := guard.VerifyLoad(); loadErr != nil {
@@ -859,6 +921,10 @@ func runBPFCheck() error {
 			"rebuilt programs still fail, enforcement is not available on this kernel yet " +
 			"(`monitor` mode, kprobes/observe-only, is unaffected)")
 		return fmt.Errorf("guard eBPF preflight failed: %w", loadErr)
+	}
+	if verifierOnly {
+		log.Info("verifier preflight OK: every guard eBPF program is accepted by this kernel")
+		return nil
 	}
 	log.Info("BPF-LSM preflight OK: LSM stack active and every guard eBPF program is accepted by this kernel")
 	return nil
@@ -916,12 +982,16 @@ func resolveConfigPath() (string, error) {
 // buildOneGuard builds and attaches one resource's guard. Inputs (self, deviceSet, pin) are
 // read-only and precomputed, and it touches nothing beyond r and its result, so buildGuards runs it
 // concurrently.
-func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet []uint32, pin pinCfg) (*guard.Guard, error) {
+func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet []uint32, pin pinCfg,
+	system []daemonconfig.BinaryRule) (*guard.Guard, error) {
 	binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
 	events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
 	var deferred []daemonconfig.BinaryRule
+	vetted := make(map[string]guard.VettedInode, len(r.Binaries))
 	for _, b := range r.Binaries {
-		entry, err := ebpf.ComputeBinaryEntry(b.Path)
+		// One confined open: the key admitted is the inode hashed, never resolved again (a symlinked
+		// directory swapped after the catalog refresh vetted the path can't redirect it).
+		entry, key, err := guard.ConfinedEntry(b.Path)
 		if err != nil {
 			// Binary is in a still-locked tree (or gone): defer it; denied until resolved after
 			// unlock (fail closed).
@@ -930,6 +1000,8 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 			continue
 		}
 		binaries = append(binaries, entry)
+		vetted[b.Path].Close() // a repeated line: keep one fd
+		vetted[b.Path] = key
 		events[b.Path] = b.Events
 	}
 
@@ -959,6 +1031,8 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		// Pin LSM links so a SIGKILL leaves the tree enforced until ExecStopPost locks the vault.
 		guard.WithPinning(pin.prefix(r.Path)),
 		guard.WithBackingDevices(deviceSet),
+		guard.WithSystemPatterns(system),
+		guard.WithVettedKeys(vetted),
 	}
 	if headless && blockedOnly {
 		opts = append(opts, guard.WithoutAllowedEvents())
@@ -1008,6 +1082,7 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 	// resource's backing device, the rest opt out, avoiding N duplicate, misattributed stamps.
 	// Computed up front (pure function of resources); workers only read it.
 	rawDevices := backingDeviceUnion(resources)
+	system := systemPatterns(resources)
 
 	built := make([]*guard.Guard, len(resources))
 	errs := make([]error, len(resources))
@@ -1026,7 +1101,7 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			if i == 0 {
 				deviceSet = rawDevices
 			}
-			built[i], errs[i] = buildOneGuard(&resources[i], self, deviceSet, pin)
+			built[i], errs[i] = buildOneGuard(&resources[i], self, deviceSet, pin, system[i])
 		}(i)
 	}
 	wg.Wait()
@@ -1053,24 +1128,61 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 	return guards, nil
 }
 
+// systemPatterns returns, per resource, its catalog entry's absolute whitelist patterns with the
+// events they grant: a new system binary matching one is admitted by the re-sync, no reload
+// (guard.WithSystemPatterns). A pattern naming an unknown event is dropped rather than widened.
+func systemPatterns(resources []daemonconfig.Resource) [][]daemonconfig.BinaryRule {
+	out := make([][]daemonconfig.BinaryRule, len(resources))
+	users, err := install.ListUsers()
+	if err != nil {
+		log.Warnf("daemon: listing users (%v) — new system binaries wait for a reload", err)
+		return out
+	}
+	for i := range resources {
+		entry, _ := install.ResolveCatalogEntry(resources[i].EncryptionRootOrPath(), users)
+		if entry == nil || resources[i].ReadOnly {
+			continue
+		}
+		for _, r := range entry.SystemWhitelist() {
+			if rule, ok := systemRule(r); ok {
+				out[i] = append(out[i], rule)
+			}
+		}
+	}
+	return out
+}
+
+func systemRule(r install.BinaryRule) (daemonconfig.BinaryRule, bool) {
+	rule := daemonconfig.BinaryRule{Path: r.Path}
+	for _, e := range r.Events {
+		t, ok := ebpf.ParseEventType(e)
+		if !ok {
+			return rule, false
+		}
+		rule.Events = append(rule.Events, t)
+	}
+	return rule, true
+}
+
 // backingDeviceUnion is the deduplicated set of backing block devices in guard_fs_devices key form.
-// Major-0 filesystems (tmpfs/overlay) have no device to raw-read and are skipped; un-stat-able
+// Pseudo-filesystems (tmpfs/overlay) have no device to raw-read and are skipped; un-stat-able
 // paths are reported and left uncovered rather than aborting.
 func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
 	seen := make(map[uint32]bool, len(resources))
 	out := make([]uint32, 0, len(resources))
 	for i := range resources {
 		r := &resources[i]
-		rdev, hasDevice, err := guard.BackingDevice(r.Path)
+		rdevs, err := guard.BackingDevices(r.Path)
 		if err != nil {
 			log.Warnf("daemon: raw block-device gate: %v (raw access to this device is not blocked)", err)
 			continue
 		}
-		if !hasDevice || seen[rdev] {
-			continue
+		for _, rdev := range rdevs {
+			if !seen[rdev] {
+				seen[rdev] = true
+				out = append(out, rdev)
+			}
 		}
-		seen[rdev] = true
-		out = append(out, rdev)
 	}
 	return out
 }
