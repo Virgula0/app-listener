@@ -75,10 +75,10 @@ var launchRules = func() []launchRule {
 		rules = append(rules, launchRule{launchArg, "--" + a, trustedNode | trustedChromium, launchPresent},
 			launchRule{launchArg, "-" + a, trustedNode | trustedChromium, launchPresent})
 	}
-	// An Electron app loads code from these: userData (Discord's modules, V8 code cache) and VS Code's
-	// extension paths. A browser's other profile holds none of the guarded one's data.
-	for _, a := range []string{"--user-data-dir", "-user-data-dir", "--extensions-dir", "--extensionDevelopmentPath",
-		"--extensionTestsPath", "--install-extension"} {
+	// VS Code runs extensions from these. Not --user-data-dir: Electron apps pass it, with their own
+	// profile, to the child processes they start (VS Code's agent host).
+	for _, a := range []string{"--extensions-dir", "--extensionDevelopmentPath", "--extensionTestsPath",
+		"--install-extension"} {
 		rules = append(rules, launchRule{launchArg, a, trustedNode, launchPresent})
 	}
 	// A generic Electron's default_app runs --require/-r's module, and -i/--interactive/--repl a

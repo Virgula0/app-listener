@@ -93,7 +93,6 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 		{"-load-extension", "", launchProbe, []string{"-load-extension=/tmp/ext"}},
 		{"--renderer-cmd-prefix", "", launchProbe, []string{"--renderer-cmd-prefix=/tmp/w"}},
 		{"--browser-subprocess-path", "", launchProbe, []string{"--browser-subprocess-path=/tmp/w"}},
-		{"--user-data-dir", "", launchProbe, []string{"--user-data-dir=/tmp/p"}},
 		{"--extensionDevelopmentPath", "", launchProbe, []string{"--extensionDevelopmentPath=/tmp/e"}},
 		{"--env-file", "", launchProbe, []string{"--env-file=/tmp/.env"}},
 		{"NODE_REPL_EXTERNAL_MODULE", "NODE_REPL_EXTERNAL_MODULE=/tmp/m.js", launchProbe, nil},
