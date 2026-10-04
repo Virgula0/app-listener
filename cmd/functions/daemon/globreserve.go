@@ -77,6 +77,10 @@ func (b *globBuilder) addEntry(e *install.CandidateDir, u install.User) {
 	for _, g := range e.ReservedLibGlobs(u.Name, u.Home) {
 		b.reserve(g, e.Name+"\x00"+g.Name, writers)
 	}
+	// Per entry too: another app's binaries must not write this one's inputs.
+	for _, g := range e.ReservedNameGlobs(u.Name, u.Home) {
+		b.reserve(g, e.Name+"\x00name\x00"+g.Name, writers)
+	}
 }
 
 // reserveBunTmp reserves the shared Bun extraction name (.bun-*) under ~/.cache/app-listener/bun for
@@ -223,8 +227,8 @@ func (b *globBuilder) bit(key, name string) uint64 {
 // reserveChain reserves g.Name below the deepest existing directory on the way to g.Root, so a root
 // created later is covered from its parent until the next reload. Each existing fixed component is
 // also reserved in its parent: roots are inode-keyed, and a renamed-away root recreated by a
-// non-writer would otherwise be unregistered. A library root never falls back: "lib*" below all
-// of ~/.config would lock every other app out of those names.
+// non-writer would otherwise be unregistered. A library or input root never falls back: "lib*" or
+// "settings.json" below all of ~/.config would lock every other app out of those names.
 func reserveChain(g install.TrustGlob, mask uint64, roots map[string]uint64, children map[[2]string]uint64) {
 	dir := g.Home
 	for _, c := range g.Fixed {
@@ -240,8 +244,8 @@ func reserveChain(g install.TrustGlob, mask uint64, roots map[string]uint64, chi
 		}
 		dir = next
 	}
-	if g.Lib && dir != g.Root() {
-		log.Infof("trust guard: %s is missing, its %s libraries are not reserved", g.Root(), g.Name)
+	if (g.Lib || g.Input) && dir != g.Root() {
+		log.Infof("trust guard: %s is missing, its %s files are not reserved", g.Root(), g.Name)
 		return
 	}
 	roots[dir] |= mask

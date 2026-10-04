@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
@@ -25,7 +26,7 @@ type UpdaterPlan struct {
 // SetUpdaters (re)applies the updater scoping. Updaters are written before owners: an owner row
 // landing first only refuses its app's update for that instant, never grants a foreign one.
 func (t *TrustGuard) SetUpdaters(p UpdaterPlan) error {
-	if err := syncMap(t.objs.GuardBinUpdaters, resolveBits(p.Updaters, ebpf.StatConfined)); err != nil {
+	if err := syncMap(t.objs.GuardBinUpdaters, resolveBits(p.Updaters, t.statBinary())); err != nil {
 		return fmt.Errorf("binary updaters: %w", err)
 	}
 	if err := syncMap(t.objs.GuardBinOwner, resolveBits(p.Owners, ebpf.StatConfined)); err != nil {
@@ -35,6 +36,52 @@ func (t *TrustGuard) SetUpdaters(p UpdaterPlan) error {
 	t.ownerByPath = maps.Clone(p.Owners)
 	t.ownerMu.Unlock()
 	return nil
+}
+
+// SetBinaryResolver resolves updater and reserved-name writer paths to inodes through fn instead
+// of a fresh stat: the daemon passes the inode it hashed and approved for each path, so a binary
+// swapped in after the check, or one it refused, never gains write rights.
+func (t *TrustGuard) SetBinaryResolver(fn func(path string) (dev, ino uint64, err error)) {
+	t.ownerMu.Lock()
+	t.binaryStat = fn
+	t.ownerMu.Unlock()
+}
+
+func (t *TrustGuard) statBinary() statFunc {
+	t.ownerMu.Lock()
+	defer t.ownerMu.Unlock()
+	if t.binaryStat != nil {
+		return t.binaryStat
+	}
+	return ebpf.StatConfined
+}
+
+// CreatedByUpdater reports whether nk, the inode f holds, was created since this trust guard
+// started by an updater of the resources owning ownerPaths and never write-opened by another exe
+// (guard_bin_origin): how a new whitelist line with no previous inode (a fresh version directory)
+// proves its provenance. On the updater's own filesystem only, never FUSE: a user FUSE mount serves
+// chosen inode numbers and bytes without any write-open.
+func (t *TrustGuard) CreatedByUpdater(f *os.File, nk GuardInodeKey, ownerPaths []string) bool {
+	t.ownerMu.Lock()
+	var owner uint64
+	for _, p := range ownerPaths {
+		owner |= t.ownerByPath[p]
+	}
+	t.ownerMu.Unlock()
+	if owner == 0 || f == nil {
+		return false
+	}
+	var o GuardTrustBinOrigin
+	k := GuardTrustInodeKey{Dev: nk.Dev, Ino: nk.Ino}
+	if err := t.objs.GuardBinOrigin.Lookup(k, &o); err != nil || o.Tainted != 0 || o.Exe.Dev != nk.Dev {
+		return false
+	}
+	var fs unix.Statfs_t
+	if unix.Fstatfs(int(f.Fd()), &fs) != nil || fs.Type == unix.FUSE_SUPER_MAGIC {
+		return false
+	}
+	var upd uint64
+	return t.objs.GuardBinUpdaters.Lookup(o.Exe, &upd) == nil && upd&owner != 0
 }
 
 // AllowReplacement reports whether newKey, the inode f holds at the whitelisted path, may be
@@ -65,7 +112,7 @@ func (t *TrustGuard) AllowReplacement(path string, f *os.File, old, newKey Guard
 	}
 	// A new install: nothing to inherit. Protection #1 exempts system files, so only the library
 	// allowlist (TRUSTED_BINARY) applies.
-	if err := t.objs.GuardTrustedFiles.Put(nk, trustedBinary); err != nil {
+	if err := t.objs.GuardTrustedFiles.Put(nk, trustedBinary|runtimeClass(f, path)); err != nil {
 		log.Warnf("trust guard: system binary %s not admitted: %v", path, err)
 		return false
 	}

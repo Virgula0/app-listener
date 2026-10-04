@@ -8,6 +8,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
+	"github.com/Virgula0/app-listener/internal/binledger"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -22,7 +23,7 @@ type selfProtectSpec struct {
 
 // selfProtectSpecs are the guards over the daemon's own state, independent of any [watch] section:
 //
-//	/etc/app-listener                 ModeReadOnly: all may read (daemon.conf stays world-readable), only the app-listener binary may modify
+//	/etc/app-listener                 ModeReadOnly: all may read (daemon.conf stays world-readable), only the app-listener binary may modify (binaries.db, the binary ledger, included)
 //	/etc/app-listener/fscrypt.key     ModeWhitelist, empty list: readable only by the app-listener binary
 //	/etc/app-listener/edit-auth.hash  ModeWhitelist, empty list: sealed like the key so a non-app-listener root process can neither read it (offline crack) nor overwrite it (install its own password)
 //
@@ -104,6 +105,10 @@ func (s *selfGuards) Events() <-chan usecase.DaemonEvent { return s.events }
 func bootstrapSelfProtectPlaceholders() {
 	if err := ensureHashFilePlaceholder(); err != nil {
 		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — setting an edit-protected password while the daemon runs may fail until it does", editprotected.HashFile, err)
+	}
+	if err := binledger.EnsurePlaceholders(binledger.DefaultPath); err != nil {
+		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — the binary ledger cannot be "+
+			"written once /etc/app-listener is self-guarded", binledger.DefaultPath, err)
 	}
 	if err := ensurePinStateFilePlaceholder(); err != nil {
 		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — daemon --lockdown may not be able to recover this run's generation after a crash", pinStateFile, err)

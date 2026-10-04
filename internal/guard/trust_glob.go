@@ -137,7 +137,7 @@ func (t *TrustGuard) SetGlobReservations(r GlobReservations) error {
 		return err
 	}
 	// Writers are whitelisted binaries, resolved as the whitelist is; roots may be /proc/self/fd/N.
-	roots, writers := resolveBits(r.Roots, ebpf.StatInode), resolveBits(r.Writers, ebpf.StatConfined)
+	roots, writers := resolveBits(r.Roots, ebpf.StatInode), resolveBits(r.Writers, t.statBinary())
 
 	// Writers and names first: a root that lands before its writers would deny the app itself.
 	if err := syncMap(t.objs.GuardGlobWriters, writers); err != nil {
@@ -166,8 +166,16 @@ func (t *TrustGuard) SetGlobReservations(r GlobReservations) error {
 	return nil
 }
 
+// ErrUnconfirmed is a SetBinaryResolver result for a path whose binary was not approved: it gets no
+// row, quietly (the daemon reports the refusal itself).
+var ErrUnconfirmed = errors.New("not a confirmed whitelisted binary")
+
 func statKey(path string, stat statFunc) (GuardTrustInodeKey, bool) {
 	dev, ino, err := stat(path)
+	if errors.Is(err, ErrUnconfirmed) {
+		log.Debugf("trust guard: no rights for %s: %v", path, err)
+		return GuardTrustInodeKey{}, false
+	}
 	if err != nil {
 		log.Warnf("trust guard: skipping unresolvable %s: %v", path, err)
 		return GuardTrustInodeKey{}, false

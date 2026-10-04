@@ -13,6 +13,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
+	"github.com/Virgula0/app-listener/internal/binledger"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
@@ -515,7 +516,11 @@ func selectAndEditConfig() (string, *daemonconfig.Config, error) {
 	if len(candidates) == 0 {
 		return "", nil, errors.New("no directories selected: nothing to protect")
 	}
-	return editConfig(candidates)
+	text, cfg, err := editConfig(candidates)
+	if err == nil {
+		inst.WarnGeneralTools(cfg)
+	}
+	return text, cfg, err
 }
 
 // secureResources verifies encryption state (fatal: encrypted dir declared need_encryption: false,
@@ -563,7 +568,37 @@ func deploy(cfgText string, sshUsers []inst.User, bunUsers []bunUser, editPasswo
 	if err := writeEditPasswordHash(editPassword); err != nil {
 		return err
 	}
+	if err := grantNewBinaries(cfgText); err != nil {
+		return err
+	}
 	return systemd.EnableAndVerify(configChanged)
+}
+
+// grantNewBinaries lets the daemon's next start record every whitelist line the ledger doesn't
+// know yet (binledger.Grant): choosing a section in this wizard is the confirmation. Lines already
+// recorded keep their hash, so a binary that changed while the daemon was stopped for this install
+// still needs `trust-binaries`.
+func grantNewBinaries(cfgText string) error {
+	cfg, err := daemonconfig.Parse([]byte(cfgText))
+	if err != nil {
+		return err
+	}
+	l, err := binledger.Open(binledger.DefaultPath)
+	if err != nil {
+		return fmt.Errorf("opening the binary ledger: %w", err)
+	}
+	defer l.Close()
+	for _, line := range binledger.Lines(cfg) {
+		if _, found, err := l.Lookup(line); err != nil {
+			return err
+		} else if found {
+			continue
+		}
+		if err := l.Grant(line); err != nil {
+			return fmt.Errorf("granting %s in the binary ledger: %w", line, err)
+		}
+	}
+	return nil
 }
 
 // preflightDeployedBinary runs `<installed binary> daemon --check` on the just-deployed binary and

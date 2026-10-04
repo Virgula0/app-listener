@@ -226,6 +226,8 @@ type Guard struct {
 	// held: an fd on each vetted inode not yet written to the maps, so its number can't be freed and
 	// reused in between. Guarded by mu.
 	held map[string]*os.File
+	// admit: WithAdmissionCheck.
+	admit AdmissionCheck
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -305,6 +307,9 @@ type VettedInode struct {
 	f   *os.File
 }
 
+// File is the open inode, for checks that must judge exactly it.
+func (v VettedInode) File() *os.File { return v.f }
+
 // Close releases the inode; WithVettedKeys takes ownership instead.
 func (v VettedInode) Close() {
 	if v.f != nil {
@@ -322,6 +327,16 @@ func WithVettedKeys(keys map[string]VettedInode) GuardOption {
 			g.holdLocked(p, v.f)
 		}
 	}
+}
+
+// AdmissionCheck approves admitting the inode f holds (key, content hash) for a whitelist line
+// (rule.Link when the line is a symlink, else rule.Path) resolved to resolved.
+type AdmissionCheck func(rule daemonconfig.BinaryRule, resolved string, f *os.File, key GuardInodeKey, hash [32]byte) bool
+
+// WithAdmissionCheck judges every deferred whitelist entry once it resolves: one the check refuses
+// is dropped for this guard's lifetime (fail closed), never retried.
+func WithAdmissionCheck(fn AdmissionCheck) GuardOption {
+	return func(g *Guard) { g.admit = fn }
 }
 
 // holdLocked keeps f open until path's key is written (addBinaryActions). Caller holds mu, or owns g.
@@ -1037,6 +1052,10 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 				log.Warnf("guard %s: keeping binary deferred: %v", g.path, err)
 				stillDeferred = append(stillDeferred, deferred)
 			}
+			continue
+		}
+		if g.admit != nil && !g.admit(rule, path, f, key, entry.Hash) {
+			f.Close()
 			continue
 		}
 		resolved = append(resolved, entry)

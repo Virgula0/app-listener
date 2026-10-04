@@ -413,3 +413,40 @@ func TestBuildGlobReservations_WildcardLibDirTail(t *testing.T) {
 		t.Errorf("the Steam client must be a writer of the Proton tails: %v", r.Writers)
 	}
 }
+
+// Discord's updater inputs and version dirs are reserved for its binaries (issue #79): no other
+// process can create, replace or write settings.json/installer.db, or create an app-* dir.
+func TestBuildGlobReservations_DiscordUpdaterInputs(t *testing.T) {
+	home := t.TempDir()
+	discord := filepath.Join(home, ".config/discord")
+	mkdirs(t, discord)
+	cfg, bin := discordLibConfig(home)
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+
+	for _, name := range []string{"settings.json", "installer.db", "app-*"} {
+		bit := bitOf(t, r, name)
+		if r.Roots[discord]&bit == 0 {
+			t.Errorf("%s not reserved below %s: %v", name, discord, r.Roots)
+		}
+		if r.Writers[bin]&bit == 0 {
+			t.Errorf("Discord must write its %s", name)
+		}
+		if r.Writers["/usr/bin/ssh"]&bit != 0 {
+			t.Errorf("another entry's binary must not write Discord's %s", name)
+		}
+	}
+}
+
+// Falling back to ~/.config would make every app's settings.json Discord's.
+func TestBuildGlobReservations_MissingInputRootNotWidened(t *testing.T) {
+	home := t.TempDir()
+	mkdirs(t, filepath.Join(home, ".config"))
+	cfg, _ := discordLibConfig(home)
+	r, _ := buildGlobReservations(cfg, []install.User{{Name: "u", Home: home}})
+	bit := bitOf(t, r, "settings.json")
+	for root, bits := range r.Roots {
+		if bits&bit != 0 {
+			t.Errorf("settings.json reserved below %s although %s/.config/discord is missing", root, home)
+		}
+	}
+}

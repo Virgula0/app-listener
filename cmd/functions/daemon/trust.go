@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -179,6 +180,7 @@ func keys(m map[string]struct{}) []string {
 // still holding access to the secrets.
 type trustManager struct {
 	tg       *guard.TrustGuard
+	vet      *binaryVetter
 	binaries int
 	bunRoots map[inodeID]bool // Bun tmp dirs the last apply reserved (reserveGlobs)
 	// inspectMu guards inspectCfg, the config whose [inspectors] were last applied; nil until the
@@ -193,15 +195,28 @@ type trustManager struct {
 // judge a process by its exe inode alone, so without this guard code injected into a whitelisted
 // process (a preloaded library) or a whitelisted binary rewritten in place reads the secrets. Started
 // even with no whitelisted binary, so a reload that adds one has a guard to update.
-func startTrustGuard(cfg *daemonconfig.Config) (*trustManager, error) {
-	if err := injectedTrustFault("start"); err != nil {
-		return nil, trustStartupError(err)
+func startTrustGuard(cfg *daemonconfig.Config) (m *trustManager, err error) {
+	vet, err := openBinaryVetter(cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			vet.close()
+		}
+	}()
+	if fault := injectedTrustFault("start"); fault != nil {
+		return nil, trustStartupError(fault)
 	}
 	tg, err := guard.NewTrustGuard()
 	if err != nil {
 		return nil, trustStartupError(err)
 	}
-	m := &trustManager{tg: tg}
+	m = &trustManager{tg: tg, vet: vet}
+	// Before the first apply: until the guards' build approves a binary, it updates nothing and
+	// binds no reserved name.
+	tg.SetBinaryResolver(vet.resolve)
+	vet.setTrust(tg)
 	if err := m.apply(cfg); err != nil {
 		tg.Stop()
 		return nil, trustStartupError(err)
@@ -210,7 +225,13 @@ func startTrustGuard(cfg *daemonconfig.Config) (*trustManager, error) {
 		tg.Stop()
 		return nil, trustStartupError(err)
 	}
-	guard.SetReplacementCheck(tg.AllowReplacement)
+	guard.SetReplacementCheck(func(path string, f *os.File, old, newKey guard.GuardInodeKey) bool {
+		if !tg.AllowReplacement(path, f, old, newKey) {
+			return false
+		}
+		vet.recordLive(path, f, newKey)
+		return true
+	})
 	return m, nil
 }
 
@@ -225,9 +246,11 @@ func (m *trustManager) afterUnlock(cfg *daemonconfig.Config) error {
 	}
 	log.Infof("trust guard: enforcing write-protection + library allowlist for %d whitelisted binary(ies)",
 		m.binaries)
+	install.WarnGeneralTools(cfg)
 	if err := m.applyInspectors(cfg); err != nil {
 		return trustStartupError(err)
 	}
+	m.vet.endBootstrap()
 	return nil
 }
 
@@ -274,6 +297,7 @@ func (m *trustManager) reload(cfg *daemonconfig.Config) {
 		return
 	}
 	log.Infof("trust guard: trusted set rebuilt after reload (%d whitelisted binary(ies))", m.binaries)
+	install.WarnGeneralTools(cfg)
 	if err := m.applyInspectors(cfg); err != nil {
 		log.Errorf("daemon: CRITICAL: reload could not apply [inspectors] (%v) — inspector grants may be "+
 			"stale until this is fixed", err)
@@ -293,6 +317,9 @@ func (m *trustManager) stop() {
 	if m != nil && m.tg != nil {
 		guard.SetReplacementCheck(nil)
 		m.tg.Stop()
+	}
+	if m != nil && m.vet != nil {
+		m.vet.close()
 	}
 }
 

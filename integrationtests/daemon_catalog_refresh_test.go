@@ -135,3 +135,67 @@ need_encryption: false
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'bin/app hold'; pkill -f 'app-listener daemon' || true"})
 }
+
+// A code-suspect client (started with env or flags that run its caller's code) holds none of the
+// client's updater or reserved-name writer rights: it can neither plant a version binary the refresh
+// would admit as updater-made nor steer the updater's inputs. The same client started clean can.
+func (s *IntegrationSuite) TestDaemon_CatalogRefresh_SuspectClientPlantsNothing() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe"), launchProbeSrc, 0o755),
+		"copy launch_probe")
+	s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener " + discordDir + "/sentry $(dirname " + discordClient +
+		") && cp " + launchProbeSrc + " " + discordClient + " && printf '" + refreshMarker + "' > " + refreshSecret})
+	s.startDaemon(c, `[watch `+discordDir+`/sentry]
+need_encryption: false
+`+discordClient)
+	_, out := s.exec(c, []string{discordClient, "read", refreshSecret})
+	s.Require().Containsf(out, "STOLEN|"+refreshMarker, "baseline: %s\ndaemon log:\n%s", out, s.readDaemonLog(c))
+
+	const settings = discordDir + "/settings.json"
+	for i, risky := range []struct{ env, flag string }{
+		{"ELECTRON_RUN_AS_NODE=1", ""},
+		{"", "--remote-debugging-port=9222"},
+	} {
+		run := func(args ...string) string {
+			cmd := append(append([]string{"env"}, strings.Fields(risky.env)...), discordClient)
+			_, out := s.exec(c, append(append(cmd, args...), strings.Fields(risky.flag)...))
+			return out
+		}
+		dir := discordDir + "/0.0.9" + string(rune('0'+i))
+		run("mkdir", dir) // version names are free
+		out = run("copy", launchProbeSrc, dir+"/Discord")
+		s.Require().NotContainsf(out, "COPIED|", "a suspect client (%v) planted a version binary: %s", risky, out)
+		out = run("write", settings)
+		s.Require().NotContainsf(out, "WROTE|", "a suspect client (%v) wrote the updater's settings: %s", risky, out)
+	}
+	s.requireDenialLogged(c, "PLANT", "Discord")
+	s.requireDenialLogged(c, "PLANT", "settings.json")
+
+	time.Sleep(15 * time.Second) // past the refresh debounce
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().NotContainsf(conf, "0.0.9", "a suspect client's plant reached daemon.conf:\n%s", conf)
+	for _, v := range []string{"0.0.90", "0.0.91"} {
+		_, out = s.exec(c, []string{"sh", "-c", discordDir + "/" + v + "/Discord read " + refreshSecret + " 2>&1"})
+		s.Require().NotContains(out, refreshMarker, "a suspect client's plant read the resource")
+	}
+
+	// Control: the same client started clean installs a version and writes its settings.
+	bin := discordDir + "/0.0.80/Discord"
+	for _, step := range [][]string{{"mkdir", discordDir + "/0.0.80"}, {"copy", launchProbeSrc, bin}, {"write", settings}} {
+		code, out := s.exec(c, append([]string{discordClient}, step...))
+		s.Require().Equalf(0, code, "the clean client must %v: %s\ndaemon log:\n%s", step, out, s.readDaemonLog(c))
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, out = s.exec(c, []string{bin, "read", refreshSecret}); strings.Contains(out, "STOLEN|"+refreshMarker) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	s.Require().Containsf(out, "STOLEN|"+refreshMarker, "the clean client's update was not admitted: %s\ndaemon log:\n%s",
+		out, s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

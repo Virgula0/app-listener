@@ -286,3 +286,19 @@ func StatFile(f *os.File) (dev, ino uint64, err error) {
 	}
 	return KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), st.Ino, nil
 }
+
+// SystemPlacedInode reports whether path is root-placed (OpenSystemPlaced), ends on inode dev:ino
+// and lies on a mount root vouches for (mountVouchesOwnership): a file no user could have put
+// there, whatever happened while no guard ran.
+func SystemPlacedInode(path string, dev, ino uint64) bool {
+	f, err := OpenSystemPlaced(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if d, i, serr := StatFile(f); serr != nil || d != dev || i != ino {
+		return false
+	}
+	resolved, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	return err == nil && mountVouchesOwnership(resolved) == nil
+}

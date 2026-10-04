@@ -95,9 +95,47 @@ func watchPathsInConfig(config string) []string {
 // Split from startDaemon so a caller can start a racer right before this call and stop it once
 // awaitDaemonUp returns (daemon_toctou_test.go).
 func (s *IntegrationSuite) launchDaemon(c testcontainers.Container) {
+	s.confirmConfigBinaries(c)
+	s.launchDaemonUnconfirmed(c)
+}
+
+// launchDaemonUnconfirmed starts the daemon without confirming daemon.conf's binaries first: what
+// the binary ledger tests (daemon_ledger_test.go) need to see refused.
+func (s *IntegrationSuite) launchDaemonUnconfirmed(c testcontainers.Container) {
 	cmd := "nohup /app-listener daemon --config /etc/app-listener/daemon.conf --headless > /tmp/daemon.log 2>&1 &"
 	code, out := s.exec(c, []string{"sh", "-c", cmd})
 	s.Require().Equalf(0, code, "starting daemon: %s", out)
+}
+
+// confirmConfigBinaries runs `trust-binaries --yes --no-reload` on every binary line of daemon.conf, as the
+// operator who wrote it would: a test of another layer keeps its meaning under the binary ledger
+// (issue #80), which otherwise refuses a line added or a binary replaced since the last start.
+func (s *IntegrationSuite) confirmConfigBinaries(c testcontainers.Container) {
+	_, conf := s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/daemon.conf 2>/dev/null || true"})
+	paths := configBinaryLines(conf)
+	if len(paths) == 0 {
+		return
+	}
+	code, out := s.exec(c, append([]string{"/app-listener", "trust-binaries", "--yes", "--no-reload"}, paths...))
+	s.Require().Equalf(0, code, "confirming daemon.conf's binaries: %s", out)
+}
+
+// configBinaryLines are the binary paths of a daemon.conf: whitelist and lib_binary lines.
+func configBinaryLines(conf string) []string {
+	var out []string
+	for _, line := range strings.Split(conf, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "lib_binary"))
+		line = strings.TrimSpace(strings.TrimPrefix(line, ":"))
+		switch {
+		case strings.HasPrefix(line, `"`):
+			if end := strings.Index(line[1:], `"`); end >= 0 {
+				out = append(out, line[1:1+end])
+			}
+		case strings.HasPrefix(line, "/"):
+			out = append(out, strings.Fields(line)[0])
+		}
+	}
+	return out
 }
 
 // awaitDaemonUp polls until the guards are attached and event readers running for EVERY resource in
@@ -1242,6 +1280,9 @@ printf 'LOOPDEV=%%s\n' "$LOOP"
 // sigDaemon sends signal sig (e.g. "TERM", "KILL", "HUP") to the daemon
 // process by comm match.
 func (s *IntegrationSuite) sigDaemon(c testcontainers.Container, sig string) {
+	if sig == "HUP" {
+		s.confirmConfigBinaries(c)
+	}
 	s.exec(c, []string{"sh", "-c", "pkill -" + sig + " -f 'app-listener daemon' || true"})
 }
 
@@ -2719,7 +2760,8 @@ func (s *IntegrationSuite) TestDaemon_ReservedLib_NonWriterPlantDenied() {
 	s.requireDenialLogged(c, "PLANT", "evil.so")
 	s.requireDenialLogged(c, "PLANT", "libgood.so")
 
-	for _, p := range []string{deep + "/settings.json", "/tmp/free.so"} {
+	// Not settings.json: Discord's ReservedNames hold at any depth below its root.
+	for _, p := range []string{deep + "/notes.json", "/tmp/free.so"} {
 		code, out = s.exec(c, []string{"sh", "-c", "echo x > " + p})
 		s.Require().Equalf(0, code, "%s is not reserved and must stay writable: %s", p, out)
 	}

@@ -13,6 +13,7 @@ require (
 	github.com/google/fscrypt v0.3.6
 	github.com/gorilla/websocket v1.5.3
 	github.com/jezek/xgb v1.3.1
+	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/moby/moby/api v1.54.2
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 	github.com/sirupsen/logrus v1.9.4

@@ -421,7 +421,24 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 			"those binaries grant nothing (a lib_binary is a writer of this section's library directories only)", g.lineNo)
 	}
 	for _, dir := range g.libDirs {
+		// A lib_dir inside a grouped section's vault (Discord's app-* version dirs) shares its
+		// lifecycle like a watch path, and is invisible while the vault is locked: deferred, not
+		// dropped.
+		vault := vaultRootOf(cfg, g, dir)
+		inVault := vault != ""
 		if _, statErr := os.Lstat(dir); statErr != nil {
+			if inVault && findResource(cfg, dir) == nil {
+				log.Warnf("daemon config line %d: lib_dir not resolvable yet (encryption root %s locked?), "+
+					"deferring: %s", g.lineNo, vault, dir)
+				cfg.Resources = append(cfg.Resources, Resource{Path: dir, NeedEncryption: true,
+					EncryptionRoot: vault, PathPending: true, ReadOnly: true})
+				res := &cfg.Resources[len(cfg.Resources)-1]
+				res.Binaries = append(res.Binaries, libDirWriters(g.binaries)...)
+				res.PendingBinaries = append(res.PendingBinaries, libDirWriters(g.pending)...)
+				res.Binaries = append(res.Binaries, g.libBinaries...)
+				res.PendingBinaries = append(res.PendingBinaries, g.libPending...)
+				continue
+			}
 			log.Warnf("daemon config line %d: lib_dir not present, ignoring: %s", g.lineNo, dir)
 			continue
 		}
@@ -443,17 +460,36 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 			existing.PendingBinaries = append(existing.PendingBinaries, g.libPending...)
 			continue
 		}
-		res := addResource(cfg, dir, "", g.lineNo)
+		res := addResource(cfg, dir, vault, g.lineNo)
 		if res == nil {
 			continue
 		}
-		res.NeedEncryption = false
+		res.NeedEncryption = inVault
+		res.EncryptionRoot = vault
 		res.ReadOnly = true
 		res.Binaries = append(res.Binaries, libDirWriters(g.binaries)...)
 		res.PendingBinaries = append(res.PendingBinaries, libDirWriters(g.pending)...)
 		res.Binaries = append(res.Binaries, g.libBinaries...)
 		res.PendingBinaries = append(res.PendingBinaries, g.libPending...)
 	}
+}
+
+// vaultRootOf is the encryption root of the grouped, encrypted section whose vault holds dir: g's
+// own, or one materialized before ([libraries] blocks follow the watch sections). A section without
+// `watch:` is one guarded tree, which a lib_dir inside it would nest in.
+func vaultRootOf(cfg *Config, g *watchGroup, dir string) string {
+	if g.needEncryption && len(g.watchPaths) > 0 && isInsidePath(dir, g.root) {
+		return g.root
+	}
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
+		if r.NeedEncryption && r.EncryptionRoot != "" && isInsidePath(dir, r.EncryptionRoot) {
+			if fi, err := os.Lstat(r.EncryptionRoot); err == nil && fi.IsDir() {
+				return r.EncryptionRoot
+			}
+		}
+	}
+	return ""
 }
 
 // libDirWriters returns the section binaries allowed to WRITE a lib_dir: only unrestricted ones. An
@@ -497,17 +533,27 @@ func deferPendingWatchPath(cfg *Config, g *watchGroup, watchPath string) *Resour
 // unlocked: the sub-path must now resolve to a directory or unique regular file (symlinks,
 // hard-linked and special files refused as in addResource). A still-missing path is a hard error:
 // dropping it would leave a declared-protected directory unguarded.
+//
+// A pending lib_dir that doesn't validate is dropped with a warning instead, as at parse time: it
+// holds no secret (an app version removed while the daemon was down).
 func ResolvePendingPaths(cfg *Config) error {
+	kept := make([]Resource, 0, len(cfg.Resources))
 	for i := range cfg.Resources {
-		r := &cfg.Resources[i]
-		if !r.PathPending {
-			continue
+		r := cfg.Resources[i]
+		if r.PathPending {
+			if err := validateWatchTarget(r.Path, r.EncryptionRoot); err != nil {
+				if !r.ReadOnly {
+					return fmt.Errorf("grouped watch path %s (encryption root %s): %w", r.Path, r.EncryptionRoot, err)
+				}
+				log.Warnf("daemon config: lib_dir %s (encryption root %s) not usable after unlock, ignoring: %v",
+					r.Path, r.EncryptionRoot, err)
+				continue
+			}
+			r.PathPending = false
 		}
-		if err := validateWatchTarget(r.Path, r.EncryptionRoot); err != nil {
-			return fmt.Errorf("grouped watch path %s (encryption root %s): %w", r.Path, r.EncryptionRoot, err)
-		}
-		r.PathPending = false
+		kept = append(kept, r)
 	}
+	cfg.Resources = kept
 	return nil
 }
 

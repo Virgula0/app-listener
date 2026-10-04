@@ -14,7 +14,9 @@
 //     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
 //     - a #3 reserved name below its root, mapped by one of that name's writers (glob_lib_trusted).
 //   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused. A process that
-//   mapped such code before its exe was whitelisted is refused the secrets (trust_code_suspect).
+//   mapped such code before its exe was whitelisted is refused the secrets (trust_code_suspect), and
+//   so is a Node/Electron or JVM binary started with env or flags that run other code
+//   (NODE_OPTIONS=--require, ELECTRON_RUN_AS_NODE, JAVA_TOOL_OPTIONS, --inspect; trust_launch).
 //   #3 reserved glob names: the catalog refresh turns whitelist globs with user-writable wildcard
 //     dirs (Steam's common/*/files/bin/wineserver) into trust grants, so only the entry's own
 //     binaries may bind a name such a glob fixes anywhere below its fixed root (see glob_denied).
@@ -53,12 +55,21 @@
 // guard_trusted_files value flags.
 #define TRUSTED_BINARY 1 // a whitelisted application binary
 #define TRUSTED_LIB 2    // a user-writable library explicitly trusted (allow_lib)
+#define TRUSTED_NODE 4   // a whitelisted Node/Electron runtime (launch env/argv judged, trust_launch)
+#define TRUSTED_JVM 8    // a whitelisted JVM launcher (launch env judged, trust_launch)
+#define TRUSTED_CHROMIUM 16 // a whitelisted Chromium-based binary (launch argv judged, trust_launch)
+#define TRUSTED_RUNTIMES (TRUSTED_NODE | TRUSTED_JVM | TRUSTED_CHROMIUM)
 
 // trust_event.kind
 #define TRUST_LIBLOAD 0    // a whitelisted binary mapped an untrusted library
 #define TRUST_WRITEBLOCK 1 // a non-app tried to modify a protected binary
 #define TRUST_PLANT 2      // a non-writer tried to bind a reserved glob name
 #define TRUST_SUSPECT 3    // a code-suspect process of a whitelisted exe opened a guarded file
+#define TRUST_LAUNCH 4     // the same, marked for its launch env/argv (trust_launch)
+
+// trust_code_suspect values.
+#define SUSPECT_PRELOAD 1
+#define SUSPECT_LAUNCH 2
 
 struct inode_key {
 	__u64 dev;
@@ -296,6 +307,64 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 18); // 256 KiB — observe/deny events are low-rate
 } trust_rb SEC(".maps");
+
+// trust_launch: what in a runtime's launch makes it run code its caller chose. Filled by userspace
+// (guard.launchRules). An ENV name is risky set at all (LAUNCH_PRESENT) or unless every token of its
+// value is an OPT entry (LAUNCH_TOKENS). An ARG flag is looked up whole, then by its first word, then
+// its first two (--inspect-brk-extensions under "--inspect", --remote-debugging-port under
+// "--remote-debugging"); a whole-name LAUNCH_ALLOW entry exempts it. classes: the TRUSTED_RUNTIMES
+// it applies to.
+#define LAUNCH_ENV 1
+#define LAUNCH_ARG 2
+#define LAUNCH_OPT 3
+#define LAUNCH_PRESENT 1
+#define LAUNCH_TOKENS 2
+#define LAUNCH_ALLOW 3
+#define LAUNCH_KEY 44
+#define LAUNCH_BUF 256 // power of two: indexes are masked into it
+#define LAUNCH_STEPS 16384
+
+struct launch_key {
+	__u32 kind;
+	char name[LAUNCH_KEY];
+};
+
+struct launch_rule {
+	__u8 classes;
+	__u8 mode;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, struct launch_key);
+	__type(value, struct launch_rule);
+} trust_launch SEC(".maps");
+
+// launch_scan is trust_exec_launch's walk over the new image's argv and env strings, one bpf_loop
+// step at a time (kept in a per-CPU map: the callback re-reads it, see symlink_scan_step).
+struct launch_scan {
+	__u64 pos;     // user address of the next string
+	__u64 arg_end; // argv ends, env begins
+	__u64 env_end;
+	__u32 classes; // the exe's TRUSTED_NODE / TRUSTED_JVM bits
+	__u32 tok;     // >0: judging the tokens of buf's value from this offset
+	__u32 intok;   // inside a judged token: skipping to its end
+	__u32 vpos;    // offset of buf's value (after '=')
+	__u32 cont;    // the next read continues an over-long string
+	__u32 first;   // argv[0] not consumed yet
+	__u32 risky;
+	__u32 done;
+	struct launch_key key;
+	char buf[LAUNCH_BUF];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct launch_scan);
+} trust_launch_scan SEC(".maps");
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -706,6 +775,24 @@ static __always_inline __u64 current_writer_bits(void)
 	return v ? *v : 0;
 }
 
+// trust_suspect: the current thread group is code-suspect (trust_code_suspect). It runs code its
+// caller chose as its exe, so it holds none of the exe's writer or updater rights: otherwise a
+// marked Discord could plant a clean binary its catalog refresh admits as updater-made. Loading
+// what the app's writers made stays allowed. Global helpers: verified once (1M-insn budget).
+__noinline int trust_suspect(void)
+{
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	return bpf_map_lookup_elem(&trust_code_suspect, &tgid) != NULL;
+}
+
+// trust_writer_bits: the reserved-name bits the current process may bind.
+__noinline __u64 trust_writer_bits(void)
+{
+	if (trust_suspect())
+		return 0;
+	return current_writer_bits();
+}
+
 // glob_name_bits: the reserved patterns matching name (exact, then one probe per affix shape).
 static __always_inline __u64 glob_name_bits(const unsigned char *name, __u32 n)
 {
@@ -803,7 +890,7 @@ static __noinline int glob_denied(struct dentry *dir, struct dentry *dentry)
 		reserved |= glob_root_bits(dir) & bits;
 	if (!reserved)
 		return 0;
-	return (reserved & ~current_writer_bits()) != 0;
+	return (reserved & ~trust_writer_bits()) != 0;
 }
 
 // glob_move_denied: a directory moved under roots it was not already under carries its whole
@@ -818,7 +905,7 @@ static __noinline int glob_move_denied(struct dentry *from_dir, struct dentry *t
 	fresh &= ~glob_root_bits(from_dir);
 	if (!fresh)
 		return 0;
-	return (fresh & ~current_writer_bits()) != 0;
+	return (fresh & ~trust_writer_bits()) != 0;
 }
 
 // glob_lib_trusted: dentry's name is reserved below one of its ancestors for a bit the current exe
@@ -855,17 +942,25 @@ static __always_inline int deny_plant(struct dentry *dentry)
 static __always_inline int mark_code_suspect(void)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
-	__u8 one = 1;
-	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &one, BPF_ANY))
+	__u8 *cur = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
+	if (cur)
+		return 0; // already marked; a launch mark keeps its reason
+	__u8 v = SUSPECT_PRELOAD;
+	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
 		return -EPERM;
 	return 0;
 }
 
-// under_secret_root: the innermost guarded root at or above dentry is whitelist-mode (a read-only
-// lib_dir holds world-readable code, not secrets). Nested roots are refused at config load.
-// Per-ancestor key devices: see under_guarded_tree.
-static __always_inline int under_secret_root(struct dentry *dentry)
+#define ROOT_SECRET 1 // whitelist-mode: holds secrets
+#define ROOT_CODE 2   // read-only lib_dir: world-readable code only its writers may change
+
+// guarded_root_kind: ROOT_SECRET or ROOT_CODE for the innermost guarded root at or above dentry, 0
+// outside every root. Nested roots are refused at config load. Per-ancestor key devices: see
+// under_guarded_tree.
+static __noinline int guarded_root_kind(struct dentry *dentry)
 {
+	if (!dentry)
+		return 0;
 	struct inode *inode = NULL;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 	if (!inode)
@@ -880,7 +975,7 @@ static __always_inline int under_secret_root(struct dentry *dentry)
 			k.dev = inode_dev((__u64)di);
 			__u64 *users = bpf_map_lookup_elem(&guard_trusted_dirs, &k);
 			if (users)
-				return (*users & TRUSTED_DIR_ANY) != 0;
+				return (*users & TRUSTED_DIR_ANY) ? ROOT_SECRET : ROOT_CODE;
 		}
 		struct dentry *parent = NULL;
 		bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
@@ -889,6 +984,32 @@ static __always_inline int under_secret_root(struct dentry *dentry)
 		d = parent;
 	}
 	return 0;
+}
+
+// trust_suspect_denied: a code-suspect process (trust_code_suspect) is refused a regular file below
+// a secret root, and any change below an app's code tree: code it runs as a whitelisted binary
+// would plant an extension or module there for the next clean start to run. A non-whitelisted exe's
+// denial is the guard's to report. Global, so the verifier checks it once rather than at every call
+// site (1M-insn budget); callers return -EPERM themselves, as an LSM must return a known errno.
+__noinline int trust_suspect_denied(__u64 dir, int change)
+{
+	struct dentry *dentry = (struct dentry *)dir;
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *why = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
+	if (!why)
+		return 0;
+	__u32 kind = *why == SUSPECT_LAUNCH ? TRUST_LAUNCH : TRUST_SUSPECT;
+	int root = guarded_root_kind(dentry);
+	if (root != ROOT_SECRET && !(root == ROOT_CODE && change))
+		return 0;
+	if (current_exe_flags() & TRUSTED_BINARY)
+		emit(dentry, kind);
+	return 1;
+}
+
+static __always_inline int suspect_denied(struct dentry *dentry, int change)
+{
+	return trust_suspect_denied((__u64)dentry, change) ? -EPERM : 0;
 }
 
 // #2 library load allowlist: a whitelisted binary may map executable code only from a trusted
@@ -946,9 +1067,14 @@ static __always_inline int protected_writable_target(struct inode *inode, struct
 	return 1;
 }
 
-static __always_inline __u64 updater_bits_of(struct inode_key *exe)
+// trust_updater_bits: the resources whose binaries the current process may update (see
+// trust_suspect).
+__noinline __u64 trust_updater_bits(void)
 {
-	__u64 *v = bpf_map_lookup_elem(&guard_bin_updaters, exe);
+	struct inode_key ek = {};
+	if (trust_suspect() || !current_exe_key(&ek))
+		return 0;
+	__u64 *v = bpf_map_lookup_elem(&guard_bin_updaters, &ek);
 	return v ? *v : 0;
 }
 
@@ -956,11 +1082,10 @@ static __always_inline __u64 updater_bits_of(struct inode_key *exe)
 static __always_inline int caller_updates(struct inode *inode)
 {
 	struct inode_key tk = {};
-	struct inode_key ek = {};
-	if (!fill_inode_key(inode, &tk) || !current_exe_key(&ek))
+	if (!fill_inode_key(inode, &tk))
 		return 0;
 	__u64 *owner = bpf_map_lookup_elem(&guard_bin_owner, &tk);
-	return owner && (*owner & updater_bits_of(&ek));
+	return owner && (*owner & trust_updater_bits());
 }
 
 static __always_inline int deny_if_protected(struct inode *inode, struct dentry *dentry)
@@ -974,22 +1099,23 @@ static __always_inline int deny_if_protected(struct inode *inode, struct dentry 
 }
 
 // origin_record claims a just-created inode for the current exe when it is an updater. Any other
-// creator drops the row: it can only be a previous inode's whose number this one reuses.
+// creator (a code-suspect updater too) drops the row: it can only be a previous inode's whose number
+// this one reuses.
 static __always_inline void origin_record(struct inode *inode)
 {
 	struct inode_key k = {};
 	struct bin_origin o = {};
 	if (!fill_inode_key(inode, &k))
 		return;
-	if (!current_exe_key(&o.exe) || !updater_bits_of(&o.exe)) {
+	if (!trust_updater_bits() || !current_exe_key(&o.exe)) {
 		bpf_map_delete_elem(&guard_bin_origin, &k);
 		return;
 	}
 	bpf_map_update_elem(&guard_bin_origin, &k, &o, BPF_ANY);
 }
 
-// origin_taint_foreign: any other exe opening or truncating a recorded inode for writing makes its
-// content no longer the updater's. Permanent.
+// origin_taint_foreign: any other exe, or a code-suspect process of the updater's, opening or
+// truncating a recorded inode for writing makes its content no longer the updater's. Permanent.
 static __always_inline void origin_taint_foreign(struct inode *inode)
 {
 	struct inode_key k = {};
@@ -999,7 +1125,7 @@ static __always_inline void origin_taint_foreign(struct inode *inode)
 	if (!o)
 		return;
 	struct inode_key ek = {};
-	if (current_exe_key(&ek) && ek.dev == o->exe.dev && ek.ino == o->exe.ino)
+	if (!trust_suspect() && current_exe_key(&ek) && ek.dev == o->exe.dev && ek.ino == o->exe.ino)
 		return;
 	o->tainted = 1;
 }
@@ -1010,6 +1136,9 @@ int trust_path_unlink(unsigned long long *ctx)
 	struct dentry *dentry = (struct dentry *)ctx[1];
 	if (!dentry)
 		return 0;
+	int r = suspect_denied(path_dentry((void *)ctx[0]), 1);
+	if (r)
+		return r;
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 	return deny_if_protected(inode, dentry);
@@ -1044,6 +1173,11 @@ int trust_path_rename(unsigned long long *ctx)
 	// moves new_dentry's inode to the old name, so it is checked both ways.
 	struct dentry *old_dir = path_dentry((void *)ctx[0]);
 	struct dentry *new_dir = path_dentry((void *)ctx[2]);
+	int sr = suspect_denied(old_dir, 1);
+	if (!sr)
+		sr = suspect_denied(new_dir, 1);
+	if (sr)
+		return sr;
 	unsigned int flags = (unsigned int)ctx[4];
 	if (glob_denied(new_dir, new_dentry))
 		return deny_plant(new_dentry);
@@ -1086,12 +1220,10 @@ int trust_file_open(unsigned long long *ctx)
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
 	if (!dentry)
 		return 0;
-	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
-	if (bpf_map_lookup_elem(&trust_code_suspect, &tgid) && !dentry_is_dir(dentry) &&
-	    under_secret_root(dentry)) {
-		if (current_exe_flags() & TRUSTED_BINARY)
-			emit(dentry, TRUST_SUSPECT); // a non-whitelisted exe is the guard's to report
-		return -EPERM;
+	if (!dentry_is_dir(dentry)) {
+		int r = suspect_denied(dentry, (f_mode & FMODE_WRITE) != 0);
+		if (r)
+			return r;
 	}
 
 	if (!(f_mode & FMODE_WRITE))
@@ -1110,7 +1242,11 @@ int trust_path_mknod(unsigned long long *ctx)
 {
 	// Also regular-file creation: open(O_CREAT) reaches it via may_o_create().
 	struct dentry *dentry = (struct dentry *)ctx[1];
-	if (glob_denied(path_dentry((void *)ctx[0]), dentry))
+	struct dentry *dir = path_dentry((void *)ctx[0]);
+	int r = suspect_denied(dir, 1);
+	if (r)
+		return r;
+	if (glob_denied(dir, dentry))
 		return deny_plant(dentry);
 	return 0;
 }
@@ -1119,7 +1255,11 @@ SEC("lsm/path_mkdir")
 int trust_path_mkdir(unsigned long long *ctx)
 {
 	struct dentry *dentry = (struct dentry *)ctx[1];
-	if (glob_denied(path_dentry((void *)ctx[0]), dentry))
+	struct dentry *dir = path_dentry((void *)ctx[0]);
+	int r = suspect_denied(dir, 1);
+	if (r)
+		return r;
+	if (glob_denied(dir, dentry))
 		return deny_plant(dentry);
 	return 0;
 }
@@ -1128,7 +1268,11 @@ SEC("lsm/path_symlink")
 int trust_path_symlink(unsigned long long *ctx)
 {
 	struct dentry *dentry = (struct dentry *)ctx[1];
-	if (glob_denied(path_dentry((void *)ctx[0]), dentry))
+	struct dentry *dir = path_dentry((void *)ctx[0]);
+	int r = suspect_denied(dir, 1);
+	if (r)
+		return r;
+	if (glob_denied(dir, dentry))
 		return deny_plant(dentry);
 	return 0;
 }
@@ -1138,7 +1282,11 @@ int trust_path_link(unsigned long long *ctx)
 {
 	struct dentry *old_dentry = (struct dentry *)ctx[0];
 	struct dentry *new_dentry = (struct dentry *)ctx[2];
-	if (glob_denied(path_dentry((void *)ctx[1]), new_dentry))
+	struct dentry *dir = path_dentry((void *)ctx[1]);
+	int r = suspect_denied(dir, 1);
+	if (r)
+		return r;
+	if (glob_denied(dir, new_dentry))
 		return deny_plant(new_dentry);
 	// A second name for a not-yet-whitelisted match would let it be rewritten under that name.
 	if (old_dentry && glob_denied(dentry_parent(old_dentry), old_dentry))
@@ -1179,6 +1327,9 @@ int trust_path_truncate(unsigned long long *ctx)
 		return r;
 	if (glob_denied(dentry_parent(dentry), dentry))
 		return deny_plant(dentry);
+	// Last: first it costs path_truncate 2x the verifier steps (1M-insn budget).
+	if (trust_suspect_denied((__u64)dentry, 1))
+		return -EPERM;
 	origin_taint_foreign(inode);
 	return 0;
 }
@@ -1194,11 +1345,12 @@ int trust_sched_process_fork(unsigned long long *ctx)
 		return 0;
 	__u32 ptgid = 0, ctgid = 0;
 	bpf_probe_read_kernel(&ptgid, sizeof(ptgid), &parent->tgid);
-	if (!bpf_map_lookup_elem(&trust_code_suspect, &ptgid))
+	__u8 *why = bpf_map_lookup_elem(&trust_code_suspect, &ptgid);
+	if (!why)
 		return 0;
+	__u8 v = *why;
 	bpf_probe_read_kernel(&ctgid, sizeof(ctgid), &child->tgid);
-	__u8 one = 1;
-	bpf_map_update_elem(&trust_code_suspect, &ctgid, &one, BPF_ANY);
+	bpf_map_update_elem(&trust_code_suspect, &ctgid, &v, BPF_ANY);
 	return 0;
 }
 
@@ -1230,6 +1382,166 @@ int trust_sb_delete(unsigned long long *ctx)
 			__sync_fetch_and_add(lost, 1);
 	}
 	bpf_map_delete_elem(&guard_vouched_devs, &dev);
+	return 0;
+}
+
+// launch_rule_at reads the name at buf[off] into s->key (up to '=' or NUL; an OPT token also stops
+// at a space, and at a digit right after its 4th byte, so -Xmx4g is "-Xmx"; with words, a flag stops
+// at its words-th '-' past the leading two) and looks it up. A flag or option name reads '_' as '-',
+// as Node's parser does (--inspect_brk). A name too long for the key matches nothing. Sets s->vpos
+// past an ENV name's '='.
+static __noinline struct launch_rule *launch_rule_at(struct launch_scan *s, __u32 kind, __u32 off, __u32 words)
+{
+	int done = 0;
+	__u32 dashes = 0;
+	s->key.kind = kind;
+	if (kind == LAUNCH_ENV)
+		s->vpos = 0; // no '=': no value to judge
+	for (int j = 0; j < LAUNCH_KEY; j++) {
+		char c = 0;
+		if (!done) {
+			c = s->buf[(off + j) & (LAUNCH_BUF - 1)];
+			if (c == '=' && kind == LAUNCH_ENV)
+				s->vpos = off + j + 1;
+			if (c == '_' && j >= 2 && kind != LAUNCH_ENV)
+				c = '-';
+			if (c == '-' && j >= 2 && words)
+				dashes++;
+			if (c == 0 || c == '=' || (words && dashes == words) ||
+			    (kind == LAUNCH_OPT && (c == ' ' || (j == 4 && c >= '0' && c <= '9')))) {
+				done = 1;
+				c = 0;
+			}
+		}
+		s->key.name[j] = c;
+	}
+	if (!done)
+		return NULL;
+	return bpf_map_lookup_elem(&trust_launch, &s->key);
+}
+
+// launch_token judges buf's value one byte per step: at each token's start its name must be an OPT
+// entry for this runtime; then the token is skipped to the next separator. Every isspace() byte
+// separates, as in the JVM's option parser (Node splits on ' ' only: more tokens here, fail closed).
+// 1 stops the walk.
+static __always_inline long launch_token(struct launch_scan *s)
+{
+	__u32 off = s->tok;
+	char c = s->buf[off & (LAUNCH_BUF - 1)];
+	if (c == 0 || off >= LAUNCH_BUF) {
+		s->tok = 0;
+		return 0;
+	}
+	s->tok = off + 1;
+	if (c == ' ' || (c >= '\t' && c <= '\r')) {
+		s->intok = 0;
+		return 0;
+	}
+	if (s->intok)
+		return 0;
+	s->intok = 1;
+	struct launch_rule *r = launch_rule_at(s, LAUNCH_OPT, off, 0);
+	if (!r || !(r->classes & s->classes)) {
+		s->risky = 1;
+		return 1;
+	}
+	return 0;
+}
+
+// launch_step reads the next argv/env string (or judges a token of the last one). Strings longer
+// than the buffer are read in pieces; only a piece starting a string is judged, and a value to
+// tokenize must fit whole. Any read failure is risky (fail closed).
+static long launch_step(__u64 i, void *ctx)
+{
+	__u32 z = 0;
+	struct launch_scan *s = bpf_map_lookup_elem(&trust_launch_scan, &z);
+	if (!s)
+		return 1;
+	if (s->tok)
+		return launch_token(s);
+	if (s->pos >= s->env_end) {
+		s->done = 1;
+		return 1;
+	}
+	long n = bpf_probe_read_user_str(s->buf, LAUNCH_BUF, (void *)s->pos);
+	if (n <= 0) {
+		s->risky = 1;
+		return 1;
+	}
+	int argv = s->pos < s->arg_end;
+	int piece = s->cont;
+	s->cont = n == LAUNCH_BUF;
+	s->pos += s->cont ? LAUNCH_BUF - 1 : n;
+	if (piece)
+		return 0;
+	if (argv && s->first) {
+		s->first = 0;
+		return 0;
+	}
+	struct launch_rule *r;
+	if (argv) {
+		r = launch_rule_at(s, LAUNCH_ARG, 0, 0);
+		if (r && r->mode == LAUNCH_ALLOW)
+			return 0;
+		if (!r || !(r->classes & s->classes))
+			r = launch_rule_at(s, LAUNCH_ARG, 0, 1);
+		if (!r || !(r->classes & s->classes))
+			r = launch_rule_at(s, LAUNCH_ARG, 0, 2);
+	} else {
+		r = launch_rule_at(s, LAUNCH_ENV, 0, 0);
+	}
+	if (!r || !(r->classes & s->classes))
+		return 0;
+	if (r->mode != LAUNCH_TOKENS || s->cont) {
+		s->risky = 1;
+		return 1;
+	}
+	if (!s->vpos)
+		return 0;
+	s->tok = s->vpos;
+	s->intok = 0;
+	return 0;
+}
+
+// trust_exec_launch judges a whitelisted Node/Electron, Chromium or JVM runtime's launch: an env var or argv
+// flag that makes it run code its caller chose (trust_launch) marks the process code-suspect
+// (SUSPECT_LAUNCH), so it never reads a secret nor changes an app's code tree. sched_process_exec
+// fires after the new stack holds argv/env and before any user code runs, so nothing in the image
+// can rewrite them first (unlike /proc/<pid>/environ). bprm_committed_creds cleared the previous
+// image's mark just before. An unmarkable process is killed: the hook cannot refuse the exec.
+SEC("tp_btf/sched_process_exec")
+int trust_exec_launch(unsigned long long *ctx)
+{
+	struct task_struct *p = (struct task_struct *)ctx[0];
+	__u32 classes = current_exe_flags() & TRUSTED_RUNTIMES;
+	if (!p || !classes)
+		return 0;
+	__u32 z = 0;
+	struct launch_scan *s = bpf_map_lookup_elem(&trust_launch_scan, &z);
+	if (!s)
+		return 0;
+	struct mm_struct *mm = BPF_CORE_READ(p, mm);
+	if (!mm)
+		return 0;
+	s->pos = BPF_CORE_READ(mm, arg_start);
+	s->arg_end = BPF_CORE_READ(mm, arg_end);
+	s->env_end = BPF_CORE_READ(mm, env_end);
+	s->classes = classes;
+	s->tok = 0;
+	s->intok = 0;
+	s->vpos = 0;
+	s->cont = 0;
+	s->first = 1;
+	s->risky = 0;
+	s->done = 0;
+	long ret = bpf_loop(LAUNCH_STEPS, launch_step, NULL, 0);
+	s = bpf_map_lookup_elem(&trust_launch_scan, &z);
+	if (s && ret >= 0 && s->done && !s->risky)
+		return 0;
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 v = SUSPECT_LAUNCH;
+	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
+		bpf_send_signal(9); // SIGKILL
 	return 0;
 }
 

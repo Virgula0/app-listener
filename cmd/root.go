@@ -11,6 +11,7 @@ import (
 	"github.com/Virgula0/app-listener/cmd/functions/monitor"
 	"github.com/Virgula0/app-listener/cmd/functions/networkguard"
 	"github.com/Virgula0/app-listener/cmd/functions/networkmonitor"
+	"github.com/Virgula0/app-listener/cmd/functions/trustbinaries"
 	"github.com/Virgula0/app-listener/cmd/functions/uninstall"
 	"github.com/Virgula0/app-listener/cmd/functions/update"
 	"github.com/Virgula0/app-listener/internal/constants"
@@ -117,6 +118,7 @@ func init() {
 	rootCmd.AddCommand(uninstall.UninstallCmd)
 	rootCmd.AddCommand(update.UpdateCmd)
 	rootCmd.AddCommand(editprotected.EditProtectedCmd)
+	rootCmd.AddCommand(trustbinaries.TrustBinariesCmd)
 }
 
 // validateVerbose enforces the --verbose contract: any explicit value (even 0, errors-only) demands

@@ -6,9 +6,16 @@ After=local-fs.target
 # a SIGKILL; that mount must be up first.
 Wants=sys-fs-bpf.mount
 After=sys-fs-bpf.mount
+# Nothing guards a whitelisted binary's path until the guards attach, so no user code may run
+# before then (or after they detach at shutdown, the reverse order): logins, lingering user
+# managers (user@.service orders after systemd-user-sessions), cron and at jobs wait for READY=1.
+# Ordering only: a failed daemon start still lets users log in.
+Before=systemd-user-sessions.service cron.service crond.service cronie.service atd.service
 
 [Service]
-Type=simple
+# READY=1 is sent once every guard is attached and the vaults are unlocked (notifySystemdReady).
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/local/sbin/app-listener daemon --headless --blocked-only --no-log-metadata-blocks
 ExecReload=/bin/kill -HUP $MAINPID
 # Safety net for a SIGKILL / crash / startup timeout: the guard's LSM links
