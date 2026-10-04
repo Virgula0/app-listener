@@ -248,7 +248,8 @@ func planTrustedDirs(dirs []TrustedDir) (roots, loaders map[string]uint64, refus
 		}
 		set := append([]string(nil), d.Loaders...)
 		sort.Strings(set)
-		key := strings.Join(slices.Compact(set), "\x00")
+		set = slices.Compact(set) // zeroes the tail it drops: never range the uncompacted slice
+		key := strings.Join(set, "\x00")
 		bit, ok := bitOf[key]
 		if !ok {
 			if len(bitOf) >= 63 {
