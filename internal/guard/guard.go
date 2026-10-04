@@ -217,6 +217,8 @@ type Guard struct {
 	rawDevicesSet bool
 	// dropAllowed: no consumer wants allowed events (WithoutAllowedEvents).
 	dropAllowed bool
+	// quietPID: WithoutOwnAllowedEvents.
+	quietPID uint32
 	// chmodDropWrite: WithChmodDropWrite.
 	chmodDropWrite bool
 	// systemPatterns: WithSystemPatterns.
@@ -289,6 +291,15 @@ func WithBackingDevices(rdevs []uint32) GuardOption {
 func WithoutAllowedEvents() GuardOption {
 	return func(g *Guard) {
 		g.dropAllowed = true
+	}
+}
+
+// WithoutOwnAllowedEvents discards allowed events of this process (the kernel reports the tgid):
+// the daemon's own I/O on its state (the binary ledger's SQLite pages, populate walks) is noise
+// that otherwise floods the queue. Its denials are still reported.
+func WithoutOwnAllowedEvents() GuardOption {
+	return func(g *Guard) {
+		g.quietPID = uint32(os.Getpid()) //nolint:gosec // pids fit in 32 bits (PID_MAX_LIMIT 2^22)
 	}
 }
 
@@ -2292,11 +2303,11 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 // event and counts it, which costs only telemetry — enforcement already happened in the kernel,
 // synchronously, and the BPF ringbuf itself drops on overflow for the same reason.
 func (g *Guard) dispatch(ev *GuardEvent) {
-	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions
-	// key on exe inode).
-	if g.dropAllowed && !ev.Blocked {
+	if !g.Reports(ev) {
 		return
 	}
+	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions
+	// key on exe inode).
 	local := *ev
 	g.checkCommSpoof(&local)
 
@@ -2313,6 +2324,14 @@ func (g *Guard) dispatch(ev *GuardEvent) {
 				"enforcement is unaffected, only reporting", g.path, dropped)
 		}
 	}
+}
+
+// Reports reports whether the guard queues ev for its consumer; a denial always is.
+func (g *Guard) Reports(ev *GuardEvent) bool {
+	if ev.Blocked {
+		return true
+	}
+	return !g.dropAllowed && (g.quietPID == 0 || ev.PID != g.quietPID)
 }
 
 // logBacklogDenial prints ev in the daemon's DAEMON DENIED layout (scripts/trace-app-libs.sh

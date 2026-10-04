@@ -1052,9 +1052,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 			return vet.judge(r, rule, resolved, f, key, hash)
 		}),
 	}
-	if headless && blockedOnly {
-		opts = append(opts, guard.WithoutAllowedEvents())
-	}
+	opts = append(opts, eventFilterOptions()...)
 	if r.ReadOnly {
 		opts = append(opts, guard.WithChmodDropWrite())
 	}
@@ -1203,6 +1201,16 @@ func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
 		}
 	}
 	return out
+}
+
+// eventFilterOptions drops, before they queue, allowed events nobody reads: all of them under
+// headless --blocked-only, and the daemon's own I/O always. Denials are always queued.
+func eventFilterOptions() []guard.GuardOption {
+	opts := []guard.GuardOption{guard.WithoutOwnAllowedEvents()}
+	if headless && blockedOnly {
+		opts = append(opts, guard.WithoutAllowedEvents())
+	}
+	return opts
 }
 
 // notifySystemdReady sends READY=1: the unit is Type=notify, so logins and cron, ordered after it,

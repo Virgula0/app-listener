@@ -1,6 +1,10 @@
 package guard
 
-import "testing"
+import (
+	"testing"
+
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+)
 
 func TestDispatchFullChannelNeverDropsDenials(t *testing.T) {
 	g := &Guard{path: "/r", events: make(chan GuardEvent), done: make(chan struct{})}
@@ -74,4 +78,28 @@ func TestSetInspectorsBounded(t *testing.T) {
 func nextLabel(g *Guard) string {
 	ev := <-g.events
 	return ev.ResourceLabel(g.path)
+}
+
+func TestDispatchWithoutOwnAllowedEvents(t *testing.T) {
+	g := &Guard{path: "/etc/app-listener", events: make(chan GuardEvent, 4), done: make(chan struct{})}
+	WithoutOwnAllowedEvents()(g)
+	own := g.quietPID
+	if own == 0 {
+		t.Fatal("the option must record this process's pid")
+	}
+	g.dispatch(&GuardEvent{FileEvent: ebpf.FileEvent{PID: own}})
+	g.dispatch(&GuardEvent{FileEvent: ebpf.FileEvent{PID: own}, Blocked: true})
+	g.dispatch(&GuardEvent{FileEvent: ebpf.FileEvent{PID: own + 1}})
+	if len(g.events) != 2 {
+		t.Fatalf("only the daemon's own allowed I/O may be discarded: %d queued", len(g.events))
+	}
+	if ev := <-g.events; !ev.Blocked || ev.PID != own {
+		t.Fatalf("the daemon's own denial must be queued: %+v", ev)
+	}
+	if ev := <-g.events; ev.Blocked || ev.PID != own+1 {
+		t.Fatalf("another process's allowed access must be queued: %+v", ev)
+	}
+	if n := g.eventsDropped.Load(); n != 0 {
+		t.Fatalf("discarding own I/O is not a backlog: %d counted", n)
+	}
 }

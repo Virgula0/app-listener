@@ -142,14 +142,16 @@ func (s *selfGuards) attach(pin pinCfg) {
 		if _, statErr := os.Stat(spec.path); statErr != nil {
 			continue
 		}
-		g, gErr := guard.NewGuard(spec.path, spec.mode, nil, true, 0,
+		opts := append([]guard.GuardOption{
 			guard.WithEagerPopulate(),
 			// The daemon's own binary, uid-0 gated, every event: install /
-			// --genkey / --update-catalog-only write these paths.
+			// --genkey / the binary ledger write these paths.
 			guard.WithSelfAllowBinary(self, nil),
 			// Do NOT widen the raw block-device gate to the rootfs device.
 			guard.WithBackingDevices(nil),
-			guard.WithPinning(pin.prefix("self:"+spec.path)))
+			guard.WithPinning(pin.prefix("self:" + spec.path)),
+		}, eventFilterOptions()...)
+		g, gErr := guard.NewGuard(spec.path, spec.mode, nil, true, 0, opts...)
 		if gErr != nil {
 			log.Errorf("daemon: self-protection: CRITICAL: %s is NOT guarded (%v) — it is readable/writable by anything outside the app-listener binary until the next restart or reload; the daemon runs normally otherwise, config protection is unaffected", spec.path, gErr)
 			continue

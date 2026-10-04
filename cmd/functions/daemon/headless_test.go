@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -85,5 +86,36 @@ func TestWriteEventAllowedSuppressed(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Errorf("nothing should be written, got %q", buf.String())
+	}
+}
+
+func TestEventFilterOptions(t *testing.T) {
+	defer func(h, b bool) { headless, blockedOnly = h, b }(headless, blockedOnly)
+	own := uint32(os.Getpid()) //nolint:gosec // test pid
+	for _, tc := range []struct {
+		headless, blockedOnly, otherAllowed bool
+	}{
+		{false, false, true},
+		{true, false, true},
+		{false, true, true}, // --blocked-only only filters the headless writer
+		{true, true, false},
+	} {
+		headless, blockedOnly = tc.headless, tc.blockedOnly
+		g := &guard.Guard{}
+		for _, opt := range eventFilterOptions() {
+			opt(g)
+		}
+		ev := func(pid uint32, blocked bool) *guard.GuardEvent {
+			return &guard.GuardEvent{FileEvent: ebpf.FileEvent{PID: pid}, Blocked: blocked}
+		}
+		if !g.Reports(ev(own, true)) || !g.Reports(ev(own+1, true)) {
+			t.Fatalf("%+v: denials must always be reported", tc)
+		}
+		if g.Reports(ev(own, false)) {
+			t.Fatalf("%+v: the daemon's own allowed I/O must not be queued", tc)
+		}
+		if got := g.Reports(ev(own+1, false)); got != tc.otherAllowed {
+			t.Fatalf("%+v: another process's allowed event reported=%v", tc, got)
+		}
 	}
 }
