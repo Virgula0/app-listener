@@ -47,8 +47,8 @@ func (s *IntegrationSuite) launch(c testcontainers.Container, lc launchCase, ver
 }
 
 // A whitelisted runtime started with env or flags that load its caller's code is that code running
-// as the whitelisted inode: it must neither read the secret nor change the app's code tree, while
-// the same binary started cleanly, or with harmless options, does both.
+// as the whitelisted inode: it must neither read, stat nor list the secret nor change the app's code
+// tree, while the same binary started cleanly, or with harmless options, does all of it.
 func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -69,6 +69,10 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 				when, lc.what, out, s.readDaemonLog(c))
 			out = s.launch(c, lc, "write", launchExt)
 			s.Require().Containsf(out, "WROTE|", "%s: %s must write its code dir: %s", when, lc.what, out)
+			out = s.launch(c, lc, "stat", launchSecret)
+			s.Require().Containsf(out, "STAT|"+launchSecret, "%s: %s must stat its resource: %s", when, lc.what, out)
+			out = s.launch(c, lc, "ls", "/protected")
+			s.Require().Containsf(out, "ENTRY|secret", "%s: %s must list its resource: %s", when, lc.what, out)
 		}
 	}
 	assertClean("control")
@@ -87,6 +91,12 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 		// Chromium takes single-dash switches; Node reads '_' in a flag name as '-'.
 		{"-remote-debugging-port", "", launchProbe, []string{"-remote-debugging-port=9222"}},
 		{"-load-extension", "", launchProbe, []string{"-load-extension=/tmp/ext"}},
+		{"--renderer-cmd-prefix", "", launchProbe, []string{"--renderer-cmd-prefix=/tmp/w"}},
+		{"--browser-subprocess-path", "", launchProbe, []string{"--browser-subprocess-path=/tmp/w"}},
+		{"--user-data-dir", "", launchProbe, []string{"--user-data-dir=/tmp/p"}},
+		{"--extensionDevelopmentPath", "", launchProbe, []string{"--extensionDevelopmentPath=/tmp/e"}},
+		{"--env-file", "", launchProbe, []string{"--env-file=/tmp/.env"}},
+		{"NODE_REPL_EXTERNAL_MODULE", "NODE_REPL_EXTERNAL_MODULE=/tmp/m.js", launchProbe, nil},
 		{"--inspect_brk", "", launchProbe, []string{"--inspect_brk"}},
 		{"NODE_OPTIONS --experimental_loader", "NODE_OPTIONS=--experimental_loader=/tmp/x.mjs", launchProbe, nil},
 		{"JAVA_TOOL_OPTIONS -javaagent", "JAVA_TOOL_OPTIONS=-javaagent:/tmp/a.jar", launchJava, nil},
@@ -98,6 +108,11 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 		out := s.launch(c, lc, "read", launchSecret)
 		s.Require().NotContainsf(out, launchMarker, "launched with %s, the runtime read its resource: %s\ndaemon log:\n%s",
 			lc.what, out, s.readDaemonLog(c))
+		// Names and sizes leak too: the trust object refuses only regular-file opens.
+		out = s.launch(c, lc, "stat", launchSecret)
+		s.Require().NotContainsf(out, "STAT|", "launched with %s, the runtime stat'ed its resource: %s", lc.what, out)
+		out = s.launch(c, lc, "ls", "/protected")
+		s.Require().NotContainsf(out, "ENTRY|", "launched with %s, the runtime listed its resource: %s", lc.what, out)
 		for _, f := range []string{launchExt, launchCode + "/planted.js"} {
 			out = s.launch(c, lc, "write", f)
 			s.Require().NotContainsf(out, "WROTE|", "launched with %s, the runtime changed its code dir (%s): %s",
@@ -111,6 +126,70 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 	s.requireDenialLogged(c, "LAUNCH", "secret")
 
 	// The mark is the process's, never the binary's: a clean exec after them is judged afresh.
+	assertClean("after the risky launches")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A generic Electron (default_app.asar beside it, Arch's /usr/lib/electronNN) runs whatever app its
+// first positional argv names: whitelisted, it may be started only with an [electron_apps] entry root
+// placed. Any other app is its caller's code and gets nothing below the secret.
+func (s *IntegrationSuite) TestDaemon_LaunchScan_GenericElectronRunsOnlyListedApps() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const (
+		electron = "/usr/lib/electron99/electron"
+		app      = "/usr/lib/probe-app/app.asar"
+		userApp  = "/tmp/u/app.asar"
+	)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe"), launchProbeSrc, 0o755),
+		"copy launch_probe")
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener /usr/lib/electron99/resources " +
+		"/usr/lib/probe-app /usr/lib/other-app /tmp/u && printf '" + launchMarker + "' > " + launchSecret +
+		" && cp " + launchProbeSrc + " " + electron + " && : > /usr/lib/electron99/resources/default_app.asar" +
+		" && : > " + app + " && : > /usr/lib/other-app/app.asar && : > " + userApp + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, `[electron_apps]
+`+app+`
+`+userApp+`
+
+[watch /protected]
+need_encryption: false
+`+electron)
+	s.Require().Contains(s.readDaemonLog(c), "electron app "+userApp+" refused",
+		"an app a user could write must not be admitted")
+
+	run := func(args, verb, file string) string {
+		_, out := s.exec(c, []string{"sh", "-c", electron + " " + args + " " + verb + " " + file + " 2>&1"})
+		return out
+	}
+	assertClean := func(when string) {
+		out := run(app, "read", launchSecret)
+		s.Require().Containsf(out, "STOLEN|"+launchMarker, "%s: the listed app must read its resource: %s\ndaemon log:\n%s",
+			when, out, s.readDaemonLog(c))
+		s.Require().Containsf(run(app, "stat", launchSecret), "STAT|", "%s: the listed app must stat its resource", when)
+		s.Require().Containsf(run(app, "ls", "/protected"), "ENTRY|secret", "%s: the listed app must list its resource", when)
+	}
+	assertClean("control")
+
+	for what, args := range map[string]string{
+		"an unlisted app":                   "/tmp/evil.asar",
+		"an unlisted root-placed app":       "/usr/lib/other-app/app.asar",
+		"a listed app a user could write":   userApp,
+		"a path that resolves past its app": app + "=/../../../tmp/evil",
+		"a relative app":                    "app.asar",
+		"default_app's --require":           "-r /tmp/x.js " + app,
+		"default_app's REPL":                "-i " + app,
+		"an app after a switch and a --":    "--enable-logging -- /tmp/evil.asar",
+	} {
+		out := run(args, "read", launchSecret)
+		s.Require().NotContainsf(out, launchMarker, "started with %s, the generic Electron read its resource: %s\ndaemon log:\n%s",
+			what, out, s.readDaemonLog(c))
+		s.Require().NotContainsf(run(args, "stat", launchSecret), "STAT|", "started with %s, it stat'ed its resource", what)
+	}
+	s.requireDenialLogged(c, "LAUNCH", "secret")
 	assertClean("after the risky launches")
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})

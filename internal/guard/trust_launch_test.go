@@ -7,6 +7,9 @@ import (
 	"testing"
 )
 
+// testElectronApps are the LAUNCH_APP entries launchModel judges against.
+var testElectronApps = map[string]bool{"/usr/lib/signal-desktop/app.asar": true}
+
 // launchModel is trust_exec_launch's matching (guard_trust.bpf.c), so the rule table can be judged
 // without loading BPF.
 func launchModel(classes uint8, argv, env []string) bool {
@@ -39,7 +42,15 @@ func launchModel(classes uint8, argv, env []string) bool {
 		}
 		return string(b)
 	}
+	app := false
 	for _, a := range argv[1:] {
+		if classes&trustedElectron != 0 && !app && !strings.HasPrefix(a, "-") {
+			app = true
+			if len(a) >= launchKeyMax || !testElectronApps[a] {
+				return true
+			}
+			continue
+		}
 		r, ok := rule(launchArg, name(a, launchArg, 0))
 		if ok && r.mode == launchAllow {
 			continue
@@ -75,6 +86,7 @@ func launchModel(classes uint8, argv, env []string) bool {
 
 func TestLaunchRulesJudgeRuntimes(t *testing.T) {
 	electron := trustedNode | trustedChromium
+	generic := electron | trustedElectron
 	for _, c := range []struct {
 		name    string
 		classes uint8
@@ -112,6 +124,31 @@ func TestLaunchRulesJudgeRuntimes(t *testing.T) {
 		{"jvm agent", trustedJVM, []string{"java"}, []string{"JAVA_TOOL_OPTIONS=-javaagent:/tmp/a.jar"}, true},
 		{"jvm plugin path", trustedJVM, []string{"java"}, []string{"JDK_JAVA_OPTIONS=-Didea.plugins.path=/tmp/p"}, true},
 		{"not a runtime", 0, []string{"ssh", "--inspect"}, []string{"ELECTRON_RUN_AS_NODE=1", "NODE_OPTIONS=-r x"}, false},
+		{"generic electron, its app", generic, []string{"electron37", "/usr/lib/signal-desktop/app.asar", "/tmp/f"}, nil, false},
+		{"generic electron, switch before its app", generic,
+			[]string{"electron37", "--ozone-platform=wayland", "/usr/lib/signal-desktop/app.asar"}, nil, false},
+		{"generic electron, no app", generic, []string{"electron37", "--type=renderer"}, nil, false},
+		{"generic electron, another app", generic, []string{"electron37", "/tmp/evil"}, nil, true},
+		{"generic electron, app after --", generic, []string{"electron37", "--", "/tmp/evil"}, nil, true},
+		{"generic electron, relative app", generic, []string{"electron37", "app.asar"}, nil, true},
+		{"generic electron, '=' past its app", generic,
+			[]string{"electron37", "/usr/lib/signal-desktop/app.asar=/../../../tmp/x"}, nil, true},
+		{"generic electron, '_' in its app", generic, []string{"electron37", "/usr/lib/signal_desktop/app.asar"}, nil, true},
+		{"generic electron, require", generic, []string{"electron37", "-r", "/tmp/x.js", "/usr/lib/signal-desktop/app.asar"}, nil, true},
+		{"generic electron, repl", generic, []string{"electron37", "-i"}, nil, true},
+		{"bundled electron ignores its positional", electron, []string{"code", "/tmp/evil"}, nil, false},
+		{"renderer launcher", electron, []string{"discord", "--renderer-cmd-prefix=/tmp/w"}, nil, true},
+		{"utility launcher single dash", trustedChromium, []string{"chrome", "-utility-cmd-prefix=/tmp/w"}, nil, true},
+		{"subprocess path", trustedChromium, []string{"chrome", "--browser-subprocess-path=/tmp/w"}, nil, true},
+		{"gpu launcher", electron, []string{"code", "--gpu-launcher=/tmp/w"}, nil, true},
+		{"electron user data dir", electron, []string{"discord", "--user-data-dir=/tmp/p"}, nil, true},
+		{"browser user data dir", trustedChromium, []string{"chrome", "--user-data-dir=/tmp/p"}, nil, false},
+		{"vscode extensions dir", electron, []string{"code", "--extensions-dir", "/tmp/e"}, nil, true},
+		{"vscode extension development", electron, []string{"code", "--extensionDevelopmentPath=/tmp/e"}, nil, true},
+		{"vscode install extension", electron, []string{"code", "--install-extension", "/tmp/e.vsix"}, nil, true},
+		{"node env file", electron, []string{"node", "--env-file=/tmp/.env"}, nil, true},
+		{"node repl module", electron, []string{"node"}, []string{"NODE_REPL_EXTERNAL_MODULE=/tmp/m.js"}, true},
+		{"logging to a file", electron, []string{"code", "--enable-logging=file", "--log-file=/tmp/l"}, nil, false},
 	} {
 		if got := launchModel(c.classes, c.argv, c.env); got != c.risky {
 			t.Errorf("%s: risky = %v, want %v", c.name, got, c.risky)
@@ -164,5 +201,51 @@ func TestRuntimeClassMarkers(t *testing.T) {
 	}
 	if c := runtimeClass(write("ssh", []byte("ELF ssh")), "ssh"); c != 0 {
 		t.Errorf("ssh class = %d, want none", c)
+	}
+}
+
+func TestRuntimeClassGenericElectron(t *testing.T) {
+	exe := func(dir string, resources ...string) (*os.File, string) {
+		for _, r := range resources {
+			if err := os.MkdirAll(filepath.Join(dir, "resources", filepath.Dir(r)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "resources", r), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		p := filepath.Join(dir, "electron")
+		if err := os.WriteFile(p, []byte("ELF\x00ELECTRON_RUN_AS_NODE\x00"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		return f, p
+	}
+	f, p := exe(t.TempDir(), "default_app.asar")
+	if c := runtimeClass(f, p); c&trustedElectron == 0 || c&trustedNode == 0 {
+		t.Errorf("an Electron with default_app.asar beside it runs its argv's app: class %d", c)
+	}
+	// Electron falls back to default_app.asar when app.asar doesn't load: still generic.
+	f, p = exe(t.TempDir(), "default_app.asar", "app.asar")
+	if c := runtimeClass(f, p); c&trustedElectron == 0 {
+		t.Errorf("default_app.asar beside a bundled app is still reachable: class %d", c)
+	}
+	f, p = exe(t.TempDir(), "app.asar")
+	if c := runtimeClass(f, p); c&trustedElectron != 0 || c&trustedNode == 0 {
+		t.Errorf("a bundled app's Electron chooses no app from argv: class %d", c)
+	}
+	// The class follows the real exe, not the configured link (/usr/bin/electron37).
+	dir := t.TempDir()
+	f, p = exe(dir, "default_app.asar")
+	link := filepath.Join(t.TempDir(), "electron37")
+	if err := os.Symlink(p, link); err != nil {
+		t.Fatal(err)
+	}
+	if c := runtimeClass(f, link); c&trustedElectron == 0 {
+		t.Errorf("generic Electron through a link: class %d", c)
 	}
 }

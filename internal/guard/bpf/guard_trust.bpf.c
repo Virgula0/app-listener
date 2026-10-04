@@ -58,7 +58,8 @@
 #define TRUSTED_NODE 4   // a whitelisted Node/Electron runtime (launch env/argv judged, trust_launch)
 #define TRUSTED_JVM 8    // a whitelisted JVM launcher (launch env judged, trust_launch)
 #define TRUSTED_CHROMIUM 16 // a whitelisted Chromium-based binary (launch argv judged, trust_launch)
-#define TRUSTED_RUNTIMES (TRUSTED_NODE | TRUSTED_JVM | TRUSTED_CHROMIUM)
+#define TRUSTED_ELECTRON 32 // a generic Electron: runs the app its first positional argv names
+#define TRUSTED_RUNTIMES (TRUSTED_NODE | TRUSTED_JVM | TRUSTED_CHROMIUM | TRUSTED_ELECTRON)
 
 // trust_event.kind
 #define TRUST_LIBLOAD 0    // a whitelisted binary mapped an untrusted library
@@ -312,11 +313,13 @@ struct {
 // (guard.launchRules). An ENV name is risky set at all (LAUNCH_PRESENT) or unless every token of its
 // value is an OPT entry (LAUNCH_TOKENS). An ARG flag is looked up whole, then by its first word, then
 // its first two (--inspect-brk-extensions under "--inspect", --remote-debugging-port under
-// "--remote-debugging"); a whole-name LAUNCH_ALLOW entry exempts it. classes: the TRUSTED_RUNTIMES
-// it applies to.
+// "--remote-debugging"); a whole-name LAUNCH_ALLOW entry exempts it. A generic Electron's first argv
+// not starting with '-' is the app it runs: it must be a LAUNCH_APP entry, matched whole (no '='
+// cut, no '_' folding: Electron path.resolve()s it). classes: the TRUSTED_RUNTIMES it applies to.
 #define LAUNCH_ENV 1
 #define LAUNCH_ARG 2
 #define LAUNCH_OPT 3
+#define LAUNCH_APP 4
 #define LAUNCH_PRESENT 1
 #define LAUNCH_TOKENS 2
 #define LAUNCH_ALLOW 3
@@ -353,6 +356,7 @@ struct launch_scan {
 	__u32 vpos;    // offset of buf's value (after '=')
 	__u32 cont;    // the next read continues an over-long string
 	__u32 first;   // argv[0] not consumed yet
+	__u32 app;     // a generic Electron's app argument judged
 	__u32 risky;
 	__u32 done;
 	struct launch_key key;
@@ -1385,11 +1389,11 @@ int trust_sb_delete(unsigned long long *ctx)
 	return 0;
 }
 
-// launch_rule_at reads the name at buf[off] into s->key (up to '=' or NUL; an OPT token also stops
-// at a space, and at a digit right after its 4th byte, so -Xmx4g is "-Xmx"; with words, a flag stops
-// at its words-th '-' past the leading two) and looks it up. A flag or option name reads '_' as '-',
-// as Node's parser does (--inspect_brk). A name too long for the key matches nothing. Sets s->vpos
-// past an ENV name's '='.
+// launch_rule_at reads the name at buf[off] into s->key (up to '=' or NUL, an APP to NUL only; an
+// OPT token also stops at a space, and at a digit right after its 4th byte, so -Xmx4g is "-Xmx";
+// with words, a flag stops at its words-th '-' past the leading two) and looks it up. A flag or
+// option name reads '_' as '-', as Node's parser does (--inspect_brk). A name too long for the key
+// matches nothing. Sets s->vpos past an ENV name's '='.
 static __noinline struct launch_rule *launch_rule_at(struct launch_scan *s, __u32 kind, __u32 off, __u32 words)
 {
 	int done = 0;
@@ -1403,11 +1407,11 @@ static __noinline struct launch_rule *launch_rule_at(struct launch_scan *s, __u3
 			c = s->buf[(off + j) & (LAUNCH_BUF - 1)];
 			if (c == '=' && kind == LAUNCH_ENV)
 				s->vpos = off + j + 1;
-			if (c == '_' && j >= 2 && kind != LAUNCH_ENV)
+			if (c == '_' && j >= 2 && (kind == LAUNCH_ARG || kind == LAUNCH_OPT))
 				c = '-';
 			if (c == '-' && j >= 2 && words)
 				dashes++;
-			if (c == 0 || c == '=' || (words && dashes == words) ||
+			if (c == 0 || (c == '=' && kind != LAUNCH_APP) || (words && dashes == words) ||
 			    (kind == LAUNCH_OPT && (c == ' ' || (j == 4 && c >= '0' && c <= '9')))) {
 				done = 1;
 				c = 0;
@@ -1479,6 +1483,15 @@ static long launch_step(__u64 i, void *ctx)
 		return 0;
 	}
 	struct launch_rule *r;
+	if (argv && (s->classes & TRUSTED_ELECTRON) && !s->app && s->buf[0] != '-') {
+		s->app = 1;
+		r = launch_rule_at(s, LAUNCH_APP, 0, 0);
+		if (s->cont || !r || !(r->classes & TRUSTED_ELECTRON)) {
+			s->risky = 1;
+			return 1;
+		}
+		return 0;
+	}
 	if (argv) {
 		r = launch_rule_at(s, LAUNCH_ARG, 0, 0);
 		if (r && r->mode == LAUNCH_ALLOW)
@@ -1532,6 +1545,7 @@ int trust_exec_launch(unsigned long long *ctx)
 	s->vpos = 0;
 	s->cont = 0;
 	s->first = 1;
+	s->app = 0;
 	s->risky = 0;
 	s->done = 0;
 	long ret = bpf_loop(LAUNCH_STEPS, launch_step, NULL, 0);

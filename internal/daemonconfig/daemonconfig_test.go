@@ -1486,6 +1486,44 @@ func TestInspectorsBlockBounded(t *testing.T) {
 	}
 }
 
+func TestElectronAppsBlockParsed(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Load(writeConfig(t, "[electron_apps]\n\"/usr/lib/signal-desktop/app.asar\"\n/usr/lib/x/../obsidian/app.asar\n\n"+
+		"[watch "+dir+"]\nneed_encryption: false\n/usr/bin/ssh\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := strings.Join(cfg.ElectronApps, ","); got != "/usr/lib/signal-desktop/app.asar,/usr/lib/obsidian/app.asar" {
+		t.Fatalf("ElectronApps = %s", got)
+	}
+	if len(cfg.Resources) != 1 || len(cfg.Resources[0].Binaries) != 1 {
+		t.Fatalf("an [electron_apps] block must not touch the watch sections: %+v", cfg.Resources)
+	}
+}
+
+func TestElectronAppsBlockRejectsMalformedLines(t *testing.T) {
+	for name, line := range map[string]string{
+		"relative":     "lib/app.asar",
+		"trailing arg": "/usr/lib/a/app.asar --x",
+		"duplicate":    "/usr/lib/a/app.asar\n/usr/lib/a/app.asar",
+		"too long":     "/usr/lib/" + strings.Repeat("a", MaxElectronAppLen) + "/app.asar",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, "[electron_apps]\n"+line+"\n")); err == nil {
+				t.Fatalf("%q must be refused", line)
+			}
+		})
+	}
+	var b strings.Builder
+	b.WriteString("[electron_apps]\n")
+	for i := 0; i <= MaxElectronApps; i++ {
+		b.WriteString("/usr/lib/a" + strings.Repeat("x", i%30) + "/" + strings.Repeat("y", i/30+1) + "\n")
+	}
+	if _, err := Load(writeConfig(t, b.String())); err == nil {
+		t.Fatal("more than MaxElectronApps entries must be refused")
+	}
+}
+
 // A lib_dir inside a grouped vault (Discord's app-* dirs) is invisible while the vault is locked:
 // kept as a read-only PathPending resource of that vault, and dropped (not fatal) if the app
 // version is gone after unlock.

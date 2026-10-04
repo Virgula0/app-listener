@@ -250,6 +250,9 @@ func (m *trustManager) afterUnlock(cfg *daemonconfig.Config) error {
 	if err := m.applyInspectors(cfg); err != nil {
 		return trustStartupError(err)
 	}
+	if err := m.tg.SetElectronApps(cfg.ElectronApps); err != nil {
+		return trustStartupError(err)
+	}
 	m.vet.endBootstrap()
 	return nil
 }
@@ -301,6 +304,10 @@ func (m *trustManager) reload(cfg *daemonconfig.Config) {
 	if err := m.applyInspectors(cfg); err != nil {
 		log.Errorf("daemon: CRITICAL: reload could not apply [inspectors] (%v) — inspector grants may be "+
 			"stale until this is fixed", err)
+	}
+	if err := m.tg.SetElectronApps(cfg.ElectronApps); err != nil {
+		log.Errorf("daemon: CRITICAL: reload could not apply [electron_apps] (%v) — a removed app may still "+
+			"be admitted until this is fixed", err)
 	}
 }
 

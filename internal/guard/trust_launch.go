@@ -5,13 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/logging"
 )
 
 // trust_launch kinds, modes and key size (guard_trust.bpf.c).
@@ -19,6 +24,7 @@ const (
 	launchEnv     uint32 = 1
 	launchArg     uint32 = 2
 	launchOpt     uint32 = 3
+	launchApp     uint32 = 4
 	launchPresent uint8  = 1
 	launchTokens  uint8  = 2
 	launchAllow   uint8  = 3
@@ -46,19 +52,39 @@ var launchRules = func() []launchRule {
 	rules = append(rules,
 		launchRule{launchEnv, "ELECTRON_RUN_AS_NODE", trustedNode, launchPresent},
 		launchRule{launchEnv, "NODE_PATH", trustedNode, launchPresent},
+		launchRule{launchEnv, "NODE_REPL_EXTERNAL_MODULE", trustedNode, launchPresent},
 		launchRule{launchEnv, "NODE_OPTIONS", trustedNode, launchTokens},
 		launchRule{launchEnv, "JAVA_TOOL_OPTIONS", trustedJVM, launchTokens},
 		launchRule{launchEnv, "_JAVA_OPTIONS", trustedJVM, launchTokens},
 		launchRule{launchEnv, "JDK_JAVA_OPTIONS", trustedJVM, launchTokens},
 	)
+	// --env-file reads NODE_OPTIONS (and the rest) from a file argv names.
 	for _, a := range []string{"--inspect", "--eval", "--print", "--require", "--import", "--loader",
-		"--experimental-loader"} {
+		"--experimental-loader", "--env-file", "--env-file-if-exists", "--experimental-config-file"} {
 		rules = append(rules, launchRule{launchArg, a, trustedNode, launchPresent})
 	}
 	// The DevTools protocol runs script in the process and reads its cookies; an unpacked extension
 	// reads them too. Chromium takes "-" as a switch prefix as well as "--".
 	for _, a := range []string{"--remote-debugging", "--load-extension", "-remote-debugging", "-load-extension"} {
 		rules = append(rules, launchRule{launchArg, a, trustedNode | trustedChromium, launchPresent})
+	}
+	// Child-process launchers: the exe named runs as the app's renderer, utility (network service:
+	// brokered cookie fds) or GPU process and is handed what that process is handed.
+	for _, a := range []string{"renderer-cmd-prefix", "utility-cmd-prefix", "zygote-cmd-prefix",
+		"gpu-launcher", "browser-subprocess-path"} {
+		rules = append(rules, launchRule{launchArg, "--" + a, trustedNode | trustedChromium, launchPresent},
+			launchRule{launchArg, "-" + a, trustedNode | trustedChromium, launchPresent})
+	}
+	// An Electron app loads code from these: userData (Discord's modules, V8 code cache) and VS Code's
+	// extension paths. A browser's other profile holds none of the guarded one's data.
+	for _, a := range []string{"--user-data-dir", "-user-data-dir", "--extensions-dir", "--extensionDevelopmentPath",
+		"--extensionTestsPath", "--install-extension"} {
+		rules = append(rules, launchRule{launchArg, a, trustedNode, launchPresent})
+	}
+	// A generic Electron's default_app runs --require/-r's module, and -i/--interactive/--repl a
+	// Node REPL on stdin, in the main process.
+	for _, a := range []string{"-r", "-i", "--interactive", "--repl"} {
+		rules = append(rules, launchRule{launchArg, a, trustedElectron, launchPresent})
 	}
 	// Only set where an inspector would listen, if one were started.
 	for _, a := range []string{"--inspect-port", "--inspect-publish-uid"} {
@@ -130,12 +156,13 @@ func (t *TrustGuard) attachLaunchScan() error {
 }
 
 // Markers of a runtime whose launch env/argv can make it run other code. The java launcher's own
-// options live in libjli, so a JVM is also known by its name.
+// options live in libjli, so a JVM is also known by its name. trustedElectron here means any
+// Electron; runtimeClass keeps it only for a generic one.
 var runtimeMarkers = []struct {
 	marker []byte
 	class  uint8
 }{
-	{[]byte("ELECTRON_RUN_AS_NODE"), trustedNode},
+	{[]byte("ELECTRON_RUN_AS_NODE"), trustedNode | trustedElectron},
 	{[]byte("NODE_OPTIONS"), trustedNode},
 	{[]byte("remote-debugging-port"), trustedChromium},
 	{[]byte("JDK_JAVA_OPTIONS"), trustedJVM},
@@ -143,7 +170,7 @@ var runtimeMarkers = []struct {
 }
 
 // trustedRuntimes: every class runtimeClass reports.
-const trustedRuntimes = trustedNode | trustedJVM | trustedChromium
+const trustedRuntimes = trustedNode | trustedJVM | trustedChromium | trustedElectron
 
 type classCacheKey struct {
 	dev, ino     uint64
@@ -168,23 +195,96 @@ func runtimeClass(f *os.File, path string) uint8 {
 	classMu.Lock()
 	c, ok := classCache[key]
 	classMu.Unlock()
-	if ok {
-		return c
+	if !ok {
+		var err error
+		if c, err = scanRuntimeClass(f); err != nil {
+			return trustedRuntimes
+		}
+		if base := filepath.Base(path); base == "java" || base == "javaw" {
+			c |= trustedJVM
+		}
+		classMu.Lock()
+		if len(classCache) > 4096 {
+			classCache = map[classCacheKey]uint8{}
+		}
+		classCache[key] = c
+		classMu.Unlock()
 	}
-	c, err := scanRuntimeClass(f)
-	if err != nil {
-		return trustedRuntimes
+	if c&trustedElectron != 0 && !genericElectron(f) {
+		c &^= trustedElectron
 	}
-	if base := filepath.Base(path); base == "java" || base == "javaw" {
-		c |= trustedJVM
-	}
-	classMu.Lock()
-	if len(classCache) > 4096 {
-		classCache = map[classCacheKey]uint8{}
-	}
-	classCache[key] = c
-	classMu.Unlock()
 	return c
+}
+
+// genericElectron: Electron falls back to resources/default_app.asar beside its real exe, which
+// runs the app its first positional argv names, when no resources/app(.asar) loads (Arch's
+// /usr/lib/electronNN). A bundled app (Discord, VS Code) ships its own and drops default_app.asar.
+// Fail closed: anything but a clean ENOENT counts as generic.
+func genericElectron(f *os.File) bool {
+	exe, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	if err != nil {
+		return true
+	}
+	_, err = os.Lstat(filepath.Join(filepath.Dir(exe), "resources", "default_app.asar"))
+	return !errors.Is(err, fs.ErrNotExist)
+}
+
+// SetElectronApps replaces the apps a whitelisted generic Electron may be started with (its first
+// positional argv, matched as written). Only a path root placed, on a superblock root vouches for, is
+// admitted: a name a user controls could hold any code. A refused or missing app is logged; starting
+// the Electron with it marks the process code-suspect.
+func (t *TrustGuard) SetElectronApps(paths []string) error {
+	want := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		if err := t.admitElectronApp(p); err != nil {
+			log.Errorf("trust guard: electron app %s refused (%v) — a generic Electron started with it is "+
+				"refused its secrets; only a root-owned file in root-owned directories qualifies",
+				logging.SanitizeText(p), err)
+			continue
+		}
+		want[p] = true
+	}
+	t.appsMu.Lock()
+	defer t.appsMu.Unlock()
+	for p := range want {
+		k, err := launchKey(launchApp, p)
+		if err != nil {
+			return err
+		}
+		if err := t.objs.TrustLaunch.Put(k, GuardTrustLaunchRule{Classes: trustedElectron, Mode: launchPresent}); err != nil {
+			return fmt.Errorf("electron app %s: %w", p, err)
+		}
+	}
+	for p := range t.apps {
+		if want[p] {
+			continue
+		}
+		k, err := launchKey(launchApp, p)
+		if err != nil {
+			continue
+		}
+		if err := t.objs.TrustLaunch.Delete(k); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			return fmt.Errorf("revoking electron app %s: %w", p, err)
+		}
+	}
+	t.apps = want
+	return nil
+}
+
+func (t *TrustGuard) admitElectronApp(path string) error {
+	f, err := ebpf.OpenSystemPlaced(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	dev, ino, err := ebpf.StatFile(f)
+	if err != nil {
+		return err
+	}
+	if !t.systemFile(path, f, GuardInodeKey{Dev: dev, Ino: ino}) {
+		return errors.New("not on a filesystem root vouches for (nosuid or user mount)")
+	}
+	return nil
 }
 
 func scanRuntimeClass(f *os.File) (uint8, error) {

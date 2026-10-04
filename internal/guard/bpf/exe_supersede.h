@@ -54,7 +54,8 @@ struct {
 // (trust_mmap judges only new mappings, so a reload whitelisting the exe would not catch it).
 // SUSPECT_LAUNCH: a runtime started with env/argv that run its caller's code (trust_exec_launch).
 // Either is refused every regular file below a secret root, any change below a code tree, its exe's
-// writer and updater rights (trust_suspect) and guard_ptrace_access_check's inspector grant.
+// writer and updater rights (trust_suspect), guard_ptrace_access_check's inspector grant and, by the
+// guard's whitelist decision, any access below a secret (stat, readdir, xattrs).
 // Inherited across fork, cleared on exec and on leader exit (guard_tainted_pids' lifecycle), all by
 // the trust object. A mark that can't be recorded refuses the mapping / kills the launch.
 struct {

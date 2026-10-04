@@ -28,6 +28,7 @@ const (
 	trustedNode     uint8 = 4
 	trustedJVM      uint8 = 8
 	trustedChromium uint8 = 16
+	trustedElectron uint8 = 32
 )
 
 // trust_event.kind — must match guard_trust.bpf.c.
@@ -67,6 +68,9 @@ type TrustGuard struct {
 	// reused inode number gains nothing from them. Cleared by SetTrusted, which re-derives every row.
 	retiredMu sync.Mutex
 	retired   map[GuardTrustInodeKey]trustRows
+	// appsMu guards apps: the LAUNCH_APP keys in trust_launch (SetElectronApps).
+	appsMu sync.Mutex
+	apps   map[string]bool
 }
 
 // trustRows is one key's rows across guard_trusted_files and the bit maps (trustBitMaps order).

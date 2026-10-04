@@ -1028,6 +1028,12 @@ static __always_inline int is_allow_action(const __u8 *action)
 	return 0;
 }
 
+static __always_inline int code_suspect(void)
+{
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	return bpf_map_lookup_elem(&trust_code_suspect, &tgid) != NULL;
+}
+
 // emit_args bundles what a decision needs. BPF passes at most 5 arguments in registers, and this
 // carries ten — but more importantly it lets check_and_emit_args be ONE shared body instead of an
 // inline expansion per call site. path_rename alone has five, and each expansion re-explores the
@@ -1102,6 +1108,11 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 			}
 		} else {
 			is_blocked = !is_allow_action(action);
+			// A code-suspect tgid runs code its whitelisted exe doesn't vouch for: nothing below a
+			// secret, metadata included (the trust object refuses only its regular-file opens).
+			// The uid-0 self entry is not judged. An exec-open below still goes to its target.
+			if (!is_blocked && action && *action == GUARD_ALLOW && code_suspect())
+				is_blocked = 1;
 
 			// Exec-open attribution (whitelist mode only): executing a binary is an OPEN performed
 			// by the *launcher* (a shell wrapper runs via /bin/sh, whose exe inode isn't
