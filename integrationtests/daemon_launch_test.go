@@ -173,6 +173,7 @@ need_encryption: false
 	}
 	assertClean("control")
 
+	// A switch is followed by the listed app, or the probe's verb would be the positional (risky anyway).
 	for what, args := range map[string]string{
 		"an unlisted app":                   "/tmp/evil.asar",
 		"an unlisted root-placed app":       "/usr/lib/other-app/app.asar",
@@ -181,6 +182,8 @@ need_encryption: false
 		"a relative app":                    "app.asar",
 		"default_app's --require":           "-r /tmp/x.js " + app,
 		"default_app's REPL":                "-i " + app,
+		"default_app's --app= file":         "--app=/tmp/evil.js " + app,
+		"default_app's -repl":               "-repl " + app,
 		"an app after a switch and a --":    "--enable-logging -- /tmp/evil.asar",
 	} {
 		out := run(args, "read", launchSecret)

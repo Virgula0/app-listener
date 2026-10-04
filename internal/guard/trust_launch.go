@@ -81,9 +81,10 @@ var launchRules = func() []launchRule {
 		"--install-extension"} {
 		rules = append(rules, launchRule{launchArg, a, trustedNode, launchPresent})
 	}
-	// A generic Electron's default_app runs --require/-r's module, and -i/--interactive/--repl a
-	// Node REPL on stdin, in the main process.
-	for _, a := range []string{"-r", "-i", "--interactive", "--repl"} {
+	// A generic Electron's default_app runs, in the main process, --require/-r's module,
+	// -i/--interactive/-repl's Node REPL on stdin, and --app=<file> as the app (a dash arg, so the
+	// LAUNCH_APP positional check never sees it).
+	for _, a := range []string{"-r", "-i", "--interactive", "-repl", "--app"} {
 		rules = append(rules, launchRule{launchArg, a, trustedElectron, launchPresent})
 	}
 	// Only set where an inspector would listen, if one were started.
