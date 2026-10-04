@@ -687,12 +687,8 @@ func drainEphemeral(root string, g *guard.Guard, done <-chan struct{}) {
 			if !ev.Blocked || (noLogMetadataBlocks && foldable(&de)) {
 				continue
 			}
-			op := ev.Type.String()
-			if ev.Process != "" {
-				op = ev.Process
-			}
 			log.Warnf("daemon: ephemeral guard %s DENIED op=%s comm=%s pid=%d uid=%d path=%s",
-				logging.SanitizeText(root), op, logging.SanitizeText(ev.Comm), ev.PID, ev.UID,
+				logging.SanitizeText(root), ev.Op(), logging.SanitizeText(ev.Comm), ev.PID, ev.UID,
 				logging.SanitizeText(ev.Path))
 		case <-done:
 			return
@@ -1259,10 +1255,7 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 	resource := logging.SanitizeText(ev.Resource)
 	path := logging.SanitizeText(ev.Event.Path)
 	comm := logging.SanitizeText(ev.Event.Comm)
-	op := ev.Event.Type.String()
-	if ev.Event.Process != "" {
-		op = ev.Event.Process // PTRACE / TRACED_EXEC: no file involved
-	}
+	op := ev.Event.Op()
 	if ev.Event.Blocked {
 		// commFullPath is best-effort telemetry, not identity: comm/pid come off the kernel event
 		// and can be spoofed or recycled before this readlink (see checkCommSpoof); enforcement

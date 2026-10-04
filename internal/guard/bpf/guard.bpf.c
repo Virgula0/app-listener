@@ -48,6 +48,11 @@
 #define GUARD_REASON_PROC_MEM 4
 // btrfs ioctl gate denial (btrfs_copy_gate): filesystem-granular like RAW_DEVICE.
 #define GUARD_REASON_BTRFS_IOCTL 5
+// Bits 8-15: the trust_code_suspect mark (SUSPECT_*) behind a whitelist denial, logged as PRELOADED /
+// LAUNCH: an LSM chain stops at the first denial, so when the guard runs first the trust object's
+// report never does. Its own byte keeps a gate's label (RAW_DEVICE, BTRFS_IOCTL) in bits 0-7.
+#define GUARD_REASON_SUSPECT_SHIFT 8
+#define GUARD_REASON_GATE_MASK 0xff
 
 enum event_type {
 	EVENT_OPEN,
@@ -1028,10 +1033,10 @@ static __always_inline int is_allow_action(const __u8 *action)
 	return 0;
 }
 
-static __always_inline int code_suspect(void)
+static __always_inline __u8 *code_suspect(void)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
-	return bpf_map_lookup_elem(&trust_code_suspect, &tgid) != NULL;
+	return bpf_map_lookup_elem(&trust_code_suspect, &tgid);
 }
 
 // emit_args bundles what a decision needs. BPF passes at most 5 arguments in registers, and this
@@ -1111,8 +1116,13 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 			// A code-suspect tgid runs code its whitelisted exe doesn't vouch for: nothing below a
 			// secret, metadata included (the trust object refuses only its regular-file opens).
 			// The uid-0 self entry is not judged. An exec-open below still goes to its target.
-			if (!is_blocked && action && *action == GUARD_ALLOW && code_suspect())
-				is_blocked = 1;
+			if (!is_blocked && action && *action == GUARD_ALLOW) {
+				__u8 *why = code_suspect();
+				if (why) {
+					is_blocked = 1;
+					reason |= (__u32)*why << GUARD_REASON_SUSPECT_SHIFT;
+				}
+			}
 
 			// Exec-open attribution (whitelist mode only): executing a binary is an OPEN performed
 			// by the *launcher* (a shell wrapper runs via /bin/sh, whose exe inode isn't
@@ -1146,6 +1156,7 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 						if (is_allow_action(target_action)) {
 							exe_ik = target_ik;
 							is_blocked = 0;
+							reason &= GUARD_REASON_GATE_MASK;
 						}
 					}
 				}

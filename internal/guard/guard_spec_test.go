@@ -47,6 +47,32 @@ func TestGuardSpecKeepsIoctlCompatOnlyWhereKernelHasIt(t *testing.T) {
 	}
 }
 
+// A suspect mark rides in its own byte: a gate's label beside it survives.
+func TestParseGuardEventSuspectLabels(t *testing.T) {
+	for _, tc := range []struct {
+		reason     uint32
+		op, fsGate string
+	}{
+		{0, "OPEN", ""},
+		{suspectPreload << guardReasonSuspectShift, "PRELOADED", ""},
+		{suspectLaunch << guardReasonSuspectShift, "LAUNCH", ""},
+		{suspectPreload<<guardReasonSuspectShift | guardReasonRawDevice, "PRELOADED", RawDeviceResourceLabel},
+	} {
+		var buf bytes.Buffer
+		if err := binary.Write(&buf, binary.LittleEndian, bpfGuardEvent{Reason: tc.reason, Blocked: 1}); err != nil {
+			t.Fatal(err)
+		}
+		ev, _, ok := parseGuardEvent(buf.Bytes())
+		if !ok {
+			t.Fatalf("reason %#x: decode failed", tc.reason)
+		}
+		if ev.Op() != tc.op || ev.FsGate != tc.fsGate || ev.Process != "" {
+			t.Fatalf("reason %#x: Op=%q FsGate=%q Process=%q, want %q %q \"\"", tc.reason, ev.Op(), ev.FsGate,
+				ev.Process, tc.op, tc.fsGate)
+		}
+	}
+}
+
 func TestParseGuardEventFsGateLabels(t *testing.T) {
 	for reason, want := range map[uint32]string{
 		0:                     "",

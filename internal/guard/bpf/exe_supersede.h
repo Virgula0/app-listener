@@ -65,6 +65,10 @@ struct {
 	__type(value, __u8);
 } trust_code_suspect SEC(".maps");
 
+// trust_code_suspect values; also guard_event.reason bits 8-15 (guard.bpf.c).
+#define SUSPECT_PRELOAD 1
+#define SUSPECT_LAUNCH 2
+
 static __always_inline __u64 leader_start(struct task_struct *task)
 {
 	struct task_struct *leader = NULL;

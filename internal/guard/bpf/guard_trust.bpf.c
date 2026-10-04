@@ -68,10 +68,6 @@
 #define TRUST_SUSPECT 3    // a code-suspect process of a whitelisted exe opened a guarded file
 #define TRUST_LAUNCH 4     // the same, marked for its launch env/argv (trust_launch)
 
-// trust_code_suspect values.
-#define SUSPECT_PRELOAD 1
-#define SUSPECT_LAUNCH 2
-
 struct inode_key {
 	__u64 dev;
 	__u64 ino;

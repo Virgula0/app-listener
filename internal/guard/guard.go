@@ -64,6 +64,20 @@ type GuardEvent struct {
 	// Scope labels a process-gate denial judged for several resources: MultipleResourceLabel (the
 	// GLOBAL slot) or a taint set's paths, comma-separated. Empty: the receiving guard's own.
 	Scope string
+	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH"): it runs
+	// code its exe doesn't vouch for (trust_code_suspect). Empty otherwise.
+	Suspect string
+}
+
+// Op is the label ev is logged under: its process gate or suspect mark, else its event type.
+func (ev *GuardEvent) Op() string {
+	switch {
+	case ev.Process != "":
+		return ev.Process
+	case ev.Suspect != "":
+		return ev.Suspect
+	}
+	return ev.Type.String()
 }
 
 // MultipleResourceLabel is GuardEvent.Scope for the GLOBAL slot: the process holds content of
@@ -81,18 +95,36 @@ func (ev *GuardEvent) ResourceLabel(resource string) string {
 	return resource
 }
 
-// guard_event.reason values — mirror GUARD_REASON_* in guard.bpf.c.
+// guard_event.reason values — mirror GUARD_REASON_* in guard.bpf.c. Bits 0-7 hold the gate,
+// bits 8-15 the SUSPECT_* mark behind a whitelist denial.
 const (
 	guardReasonRawDevice  = 1
 	guardReasonPtrace     = 2
 	guardReasonTracedExec = 3
 	guardReasonProcMem    = 4
 	guardReasonBtrfsIoctl = 5
+
+	guardReasonGateMask     = 0xff
+	guardReasonSuspectShift = 8
+	suspectPreload          = 1
+	suspectLaunch           = 2
 )
+
+// suspectLabel maps a reason's SUSPECT_* mark to its logged op label; "" when unmarked.
+func suspectLabel(reason uint32) string {
+	switch (reason >> guardReasonSuspectShift) & 0xff {
+	case suspectPreload:
+		return "PRELOADED"
+	case suspectLaunch:
+		return "LAUNCH"
+	default:
+		return ""
+	}
+}
 
 // processGateLabel maps a process-gate reason to its logged op label; "" for path-keyed events.
 func processGateLabel(reason uint32) string {
-	switch reason {
+	switch reason & guardReasonGateMask {
 	case guardReasonPtrace:
 		return "PTRACE"
 	case guardReasonTracedExec:
@@ -112,7 +144,7 @@ const (
 
 // fsGateLabel maps a filesystem-wide gate reason to its label; "" for every other event.
 func fsGateLabel(reason uint32) string {
-	switch reason {
+	switch reason & guardReasonGateMask {
 	case guardReasonRawDevice:
 		return RawDeviceResourceLabel
 	case guardReasonBtrfsIoctl:
@@ -2283,6 +2315,7 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 		Blocked:   be.Blocked != 0,
 		FsGate:    fsGateLabel(be.Reason),
 		Process:   processGateLabel(be.Reason),
+		Suspect:   suspectLabel(be.Reason),
 	}
 	if ge.Process != "" {
 		// The kernel sends the other task's comm in path and its tgid in fd.
@@ -2337,10 +2370,7 @@ func (g *Guard) Reports(ev *GuardEvent) bool {
 // logBacklogDenial prints ev in the daemon's DAEMON DENIED layout (scripts/trace-app-libs.sh
 // parses it); commFullPath is best-effort telemetry, "~" when unresolved.
 func logBacklogDenial(resource string, ev *GuardEvent) {
-	op := ev.Type.String()
-	if ev.Process != "" {
-		op = ev.Process
-	}
+	op := ev.Op()
 	exe := "~"
 	if target, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", ev.PID)); err == nil {
 		exe = logging.SanitizeText(target)
