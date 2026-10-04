@@ -988,6 +988,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
 	var deferred []daemonconfig.BinaryRule
 	vetted := make(map[string]guard.VettedInode, len(r.Binaries))
+	links := make(map[string]string)
 	for _, b := range r.Binaries {
 		// One confined open: the key admitted is the inode hashed, never resolved again (a symlinked
 		// directory swapped after the catalog refresh vetted the path can't redirect it).
@@ -1003,6 +1004,9 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		vetted[b.Path].Close() // a repeated line: keep one fd
 		vetted[b.Path] = key
 		events[b.Path] = b.Events
+		if b.Link != "" {
+			links[b.Link] = b.Path
+		}
 	}
 
 	// File-vault resources stage a crash-recovery sidecar before every unlock/lock transform, which
@@ -1033,6 +1037,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		guard.WithBackingDevices(deviceSet),
 		guard.WithSystemPatterns(system),
 		guard.WithVettedKeys(vetted),
+		guard.WithBinaryLinks(links),
 	}
 	if headless && blockedOnly {
 		opts = append(opts, guard.WithoutAllowedEvents())

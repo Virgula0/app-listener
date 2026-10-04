@@ -230,3 +230,93 @@ rename("/tmp/apps/app.new", "/tmp/apps/app") or die "rename $!\n"; print "UPDATE
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
+
+const (
+	relinkMarker = "TOP-SECRET-RELINK-6E2D"
+	relinkLink   = "/tmp/apps/bin/app"
+	relinkRead   = relinkLink + " /tmp/read.pl"
+)
+
+// relinkScripts: read.pl prints the file it is given, hold.pl answers probeAsk's "read" as an app
+// left running across an update, relink.pl src dst is the updater: it writes dst from src unless
+// src is empty, then points the link at dst by symlink + rename, as Claude Code's installer does.
+const relinkScripts = `cat > /tmp/read.pl <<'PL'
+open(F, "<", $ARGV[0]) or die "DENIED $!\n"; print "STOLEN|", <F>;
+PL
+cat > /tmp/hold.pl <<'PL'
+while (1) {
+	if (unlink "/tmp/ctl/read") {
+		my $r = open(F, "<", "/r/secret") ? "STOLEN|" . join("", <F>) : "DENIED $!";
+		close F;
+		open(O, ">", "/tmp/ctl/read.tmp") or die; print O $r; close O;
+		rename "/tmp/ctl/read.tmp", "/tmp/ctl/read.out";
+	}
+	select(undef, undef, undef, 0.2);
+}
+PL
+cat > /tmp/relink.pl <<'PL'
+my ($src, $dst) = @ARGV;
+if ($src ne "") {
+	open(I, "<", $src) or die "read $!\n"; binmode I;
+	open(O, ">", $dst) or die "create $!\n"; binmode O;
+	{ local $/; print O <I>; } close O or die "close $!\n";
+	chmod 0755, $dst or die "chmod $!\n";
+}
+unlink "/tmp/apps/bin/.app.tmp";
+symlink($dst, "/tmp/apps/bin/.app.tmp") or die "symlink $!\n";
+rename("/tmp/apps/bin/.app.tmp", "/tmp/apps/bin/app") or die "rename $!\n";
+print "RELINKED\n";
+PL`
+
+// relink runs the updater through the link: the running version points it at dst.
+func (s *IntegrationSuite) relink(c testcontainers.Container, src, dst string) {
+	_, out := s.exec(c, []string{"sh", "-c", relinkLink + " /tmp/relink.pl " + shQuote(src) + " " + dst + " 2>&1"})
+	s.Require().Containsf(out, "RELINKED", "the updater must re-point its link: %s", out)
+}
+
+// An updater re-points its whitelisted link at a version it wrote (Claude Code's
+// ~/.local/bin/claude -> versions/<v>): the new target is admitted live, no reload, and the old one
+// keeps only the process started before, across a reload too. A target the updater did not create
+// stays refused even when the updater itself points the link at it.
+func (s *IntegrationSuite) TestDaemon_LiveAdmission_UpdaterRepointsLink() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /r /tmp/apps/versions /tmp/apps/bin " +
+		supersedeCtl + " && printf '" + relinkMarker + "' > /r/secret && cp /usr/bin/perl /tmp/apps/versions/1 && " +
+		"ln -s /tmp/apps/versions/1 " + relinkLink + " && " + relinkScripts + "\necho READY"})
+	s.Require().Truef(code == 0 && strings.Contains(out, "READY"), "setup: %s", out)
+	s.startDaemon(c, "[watch /r]\nneed_encryption: false\n"+relinkLink)
+	_, out = s.exec(c, []string{"sh", "-c", relinkRead + " /r/secret 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+relinkMarker, "baseline: the linked binary reads its resource: %s", out)
+	s.exec(c, []string{"sh", "-c", "nohup " + relinkLink + " /tmp/hold.pl >/dev/null 2>&1 &"})
+	s.Require().Contains(s.probeAsk(c, "read"), "STOLEN|"+relinkMarker, "baseline: the running app reads")
+
+	s.relink(c, "/usr/bin/perl", "/tmp/apps/versions/2")
+	ok, out := s.awaitStolen(c, relinkRead, "/r/secret", relinkMarker, 40*time.Second)
+	s.Require().Truef(ok, "the version the updater linked was not admitted: %s\ndaemon log:\n%s", out, s.readDaemonLog(c))
+	s.Require().Contains(s.readDaemonLog(c), "re-pointed to /tmp/apps/versions/2", "admitted by following the link")
+	s.Require().NotContains(s.readDaemonLog(c), "configuration reloaded", "admission must need no reload")
+
+	assertOldSplit := func(when string) {
+		s.Require().Containsf(s.probeAsk(c, "read"), "STOLEN|"+relinkMarker,
+			"%s: the app started before the update lost its resource", when)
+		_, out := s.exec(c, []string{"sh", "-c", "/tmp/apps/versions/1 /tmp/read.pl /r/secret 2>&1"})
+		s.Require().NotContainsf(out, relinkMarker, "%s: a new exec of the previous target read the resource: %s",
+			when, out)
+	}
+	assertOldSplit("after the update")
+	s.reloadAndAwait(c)
+	s.Require().Contains(s.readDaemonLog(c), reloadEnd, "the reload must commit")
+	assertOldSplit("after a reload")
+	_, out = s.exec(c, []string{"sh", "-c", relinkRead + " /r/secret 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+relinkMarker, "after a reload the linked version lost its resource: %s", out)
+
+	// A file root's cp wrote has no updater provenance: the updater linking it admits nothing.
+	s.exec(c, []string{"cp", "/usr/bin/perl", "/tmp/apps/versions/3"})
+	s.relink(c, "", "/tmp/apps/versions/3")
+	s.assertNeverStolen(c, relinkRead, "/r/secret", relinkMarker)
+	s.Require().Contains(s.readDaemonLog(c), "which was neither created by its updater", "the planted target is refused")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f hold.pl; pkill -f 'app-listener daemon' || true"})
+}

@@ -44,6 +44,21 @@ func TestPlanUpdaters_ScopedToOwnResources(t *testing.T) {
 	}
 }
 
+// AllowReplacement judges a re-pointed link's new target by the link: it must own the bit.
+func TestPlanUpdaters_LinkOwnsItsResourceBit(t *testing.T) {
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{{Path: "/protected", Binaries: []daemonconfig.BinaryRule{
+		{Path: "/home/u/.local/share/app/versions/2", Link: "/home/u/.local/bin/app"},
+	}}}}
+	p := planUpdaters(cfg)
+	bit := p.Owners["/home/u/.local/share/app/versions/2"]
+	if bit == 0 || p.Owners["/home/u/.local/bin/app"] != bit {
+		t.Fatalf("the link must own its target's bit: %v", p.Owners)
+	}
+	if _, ok := p.Updaters["/home/u/.local/bin/app"]; ok {
+		t.Errorf("the link adds no updater row (it resolves to the target): %v", p.Updaters)
+	}
+}
+
 func TestIsGeneralTool(t *testing.T) {
 	for path, want := range map[string]bool{
 		"/usr/bin/python3.12": true, "/usr/bin/node": true, "/bin/sh": true,

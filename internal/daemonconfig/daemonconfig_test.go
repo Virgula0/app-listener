@@ -157,6 +157,9 @@ func TestLoadBinarySymlinkResolved(t *testing.T) {
 	if r.Binaries[0].Path != target {
 		t.Errorf("symlink should resolve to real path %q, got %q", target, r.Binaries[0].Path)
 	}
+	if r.Binaries[0].Link != link {
+		t.Errorf("the configured link must be kept: got %q, want %q", r.Binaries[0].Link, link)
+	}
 	if len(r.PendingBinaries) != 0 {
 		t.Errorf("readable symlink must not be deferred: %+v", r.PendingBinaries)
 	}

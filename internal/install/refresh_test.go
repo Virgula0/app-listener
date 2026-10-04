@@ -100,6 +100,61 @@ func TestRefreshCatalogReportsVersionBump(t *testing.T) {
 	}
 }
 
+// The refresh keeps a symlink line as the link, never adding the target the parse resolved it to:
+// that target would stay whitelisted after the link moves on.
+func TestRefreshCatalogKeepsSymlinkLineNotTarget(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".claude")
+	versions := filepath.Join(home, ".local", "share", "claude", "versions")
+	bin := filepath.Join(home, ".local", "bin")
+	for _, p := range []string{root, versions, bin} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, v := range []string{"1", "2"} {
+		if err := os.WriteFile(filepath.Join(versions, v), []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(bin, "claude")
+	if err := os.Symlink(filepath.Join(versions, "1"), link); err != nil {
+		t.Fatal(err)
+	}
+	conf := "[watch " + root + "]\nneed_encryption: false\n" + link + "\n"
+	confPath := filepath.Join(t.TempDir(), "daemon.conf")
+	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := daemonconfig.Load(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := func(_ *daemonconfig.Resource, expand func() []BinaryRule) ([]BinaryRule, bool, error) {
+		return expand(), false, nil
+	}
+	refresh := func() (string, []SectionChange) {
+		text, changes, err := RefreshCatalog(conf, cfg, []User{{Name: "u", Home: home}},
+			RefreshOptions{Live: true, KeepExisting: true, Scan: plain})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return text, changes
+	}
+	if text, changes := refresh(); strings.Contains(text, versions) || len(changes) != 0 {
+		t.Fatalf("the link's target was written as a line (changes %+v):\n%s", changes, text)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(versions, "2"), link); err != nil {
+		t.Fatal(err)
+	}
+	if text, changes := refresh(); strings.Contains(text, versions) || len(changes) != 0 {
+		t.Fatalf("after the link moved, a target was written as a line (changes %+v):\n%s", changes, text)
+	}
+}
+
 func TestRefreshCatalogUserSectionsOnly(t *testing.T) {
 	dir := t.TempDir()
 	conf := "[watch " + dir + "]\nneed_encryption: false\n/usr/bin/true\n"

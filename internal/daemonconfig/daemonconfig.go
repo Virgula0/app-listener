@@ -118,6 +118,9 @@ func (c *Config) EncryptionGroups() []*Resource {
 // BinaryRule is one whitelisted binary inside a resource section.
 type BinaryRule struct {
 	Path string
+	// Link is the configured path when it is a symlink to Path (an updater's ~/.local/bin/claude ->
+	// versions/<v>): the guard follows a re-pointed link live, and the config keeps naming the link.
+	Link string
 	// Events restricts the operations this binary may perform; empty means every type.
 	Events []ebpf.EventType
 	// LibBinary marks a `lib_binary` directive: a writer of its section's lib_dirs only.
@@ -707,7 +710,7 @@ func recordBinaryRule(rule BinaryRule, resolved, deferred *[]BinaryRule, lineNo 
 	}
 	if target != rule.Path {
 		log.Infof("daemon config line %d: binary symlink resolved: %s -> %s", lineNo, rule.Path, target)
-		rule.Path = target
+		rule.Link, rule.Path = rule.Path, target
 	}
 	*resolved = append(*resolved, rule)
 }

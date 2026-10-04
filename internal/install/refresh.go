@@ -125,7 +125,8 @@ func RefreshSection(confText string, r *daemonconfig.Resource, users []User,
 	return EnsureLibraryBlock(migrated, &block), change, true, nil
 }
 
-// keepExisting adds to fresh every whitelist line of r whose file still exists, events kept.
+// keepExisting adds to fresh every whitelist line of r whose file still exists, events kept. A
+// symlink line is kept as the link: its parse-time target is not a line of the config.
 func keepExisting(fresh []BinaryRule, r *daemonconfig.Resource) []BinaryRule {
 	have := make(map[string]bool, len(fresh))
 	for _, b := range fresh {
@@ -133,14 +134,18 @@ func keepExisting(fresh []BinaryRule, r *daemonconfig.Resource) []BinaryRule {
 	}
 	for _, list := range [][]daemonconfig.BinaryRule{r.Binaries, r.PendingBinaries} {
 		for _, b := range list {
-			if b.LibBinary || have[b.Path] {
+			line := b.Path
+			if b.Link != "" {
+				line = b.Link
+			}
+			if b.LibBinary || have[line] {
 				continue
 			}
-			if _, err := os.Stat(b.Path); err != nil {
+			if _, err := os.Stat(line); err != nil {
 				continue
 			}
-			have[b.Path] = true
-			rule := BinaryRule{Path: b.Path}
+			have[line] = true
+			rule := BinaryRule{Path: line}
 			for _, e := range b.Events {
 				rule.Events = append(rule.Events, e.String())
 			}

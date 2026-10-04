@@ -216,6 +216,10 @@ func (g *Guard) RestoreSuperseded(bins []SupersededBinary) error {
 
 func (g *Guard) carriesLine(path string) bool {
 	g.mu.Lock()
+	if _, ok := g.links[path]; ok {
+		g.mu.Unlock()
+		return true
+	}
 	for _, b := range g.binaries {
 		if b.Path == path {
 			g.mu.Unlock()

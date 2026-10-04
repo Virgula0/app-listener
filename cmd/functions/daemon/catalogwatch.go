@@ -25,7 +25,9 @@ type watchPattern struct {
 	// admits it (system files only).
 	home bool
 	// dir: a lib dir, whose appearance is the trigger. Otherwise a binary: only a write that
-	// completes (IN_CLOSE_WRITE) or a rename onto the name (IN_MOVED_TO) triggers, never a mkdir.
+	// completes (IN_CLOSE_WRITE), a rename onto the name (IN_MOVED_TO) or a symlink created there
+	// (complete at IN_CREATE: unlink + symlink() re-points a link with no other event) triggers.
+	// Never a mkdir, nor a regular file's IN_CREATE (its content is not written yet).
 	dir bool
 }
 
@@ -93,12 +95,17 @@ func catalogPatterns(r *daemonconfig.Resource, users []install.User, add func(*w
 	}
 }
 
-// systemBinaryPatterns: each whitelisted root-owned binary, and the file its path resolves to.
+// systemBinaryPatterns: each whitelisted root-owned binary, the file its path resolves to, and the
+// configured link naming it (re-pointing it re-syncs, guard.resyncLink).
 func systemBinaryPatterns(r *daemonconfig.Resource, add func(*watchPattern)) {
 	for _, list := range [][]daemonconfig.BinaryRule{r.Binaries, r.PendingBinaries} {
 		for _, b := range list {
-			if ebpf.SystemTrusted(b.Path) {
-				addSystemBinary(b.Path, add)
+			if !ebpf.SystemTrusted(b.Path) {
+				continue
+			}
+			addSystemBinary(b.Path, add)
+			if b.Link != "" {
+				addSystemBinary(b.Link, add)
 			}
 		}
 	}
@@ -243,12 +250,18 @@ func (s *watchSet) match(dir string, pos watchPos, mask uint32, name string) {
 			s.trigger(pos.p)
 		}
 	case last:
-		if !isDir && mask&(unix.IN_CLOSE_WRITE|unix.IN_MOVED_TO) != 0 {
+		if !isDir && (mask&(unix.IN_CLOSE_WRITE|unix.IN_MOVED_TO) != 0 ||
+			mask&unix.IN_CREATE != 0 && isSymlink(filepath.Join(dir, name))) {
 			s.trigger(pos.p)
 		}
 	case isDir && arrived:
 		s.follow(filepath.Join(dir, name), watchPos{pos.p, pos.next + 1})
 	}
+}
+
+func isSymlink(path string) bool {
+	fi, err := os.Lstat(path)
+	return err == nil && fi.Mode()&os.ModeSymlink != 0
 }
 
 // handle applies one inotify event.

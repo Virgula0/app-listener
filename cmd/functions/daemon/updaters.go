@@ -90,6 +90,11 @@ func planUpdaters(cfg *daemonconfig.Config) guard.UpdaterPlan {
 		for _, l := range append(slices.Clone(res.AllowLibs), res.PendingLibs...) {
 			p.Owners[l] |= bit
 		}
+		// A link line owns the bit too: a re-pointed link's new target is judged by the link
+		// (guard.resyncLink -> AllowReplacement). It resolves to a target above, so no new row.
+		for _, l := range resourceLinks(res) {
+			p.Owners[l] |= bit
+		}
 		if tools := generalToolsToWarn(set); len(tools) > 0 {
 			log.Warnf("trust guard: %s whitelists general tool(s) %s beside user-writable binaries — "+
 				"they are not allowed to update those binaries, but any arguments given to them reach %s",
@@ -108,6 +113,16 @@ func resourceBinaries(res *daemonconfig.Resource) []string {
 	}
 	sort.Strings(set)
 	return slices.Compact(set)
+}
+
+func resourceLinks(res *daemonconfig.Resource) []string {
+	var out []string
+	for _, b := range res.Binaries {
+		if b.Link != "" {
+			out = append(out, b.Link)
+		}
+	}
+	return out
 }
 
 func libBinaries(res *daemonconfig.Resource) map[string]bool {

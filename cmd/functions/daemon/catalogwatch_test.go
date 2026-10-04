@@ -70,6 +70,34 @@ func TestWatchSetBinaryWriteTriggersNotMkdir(t *testing.T) {
 	}
 }
 
+// An updater re-pointing its link by unlink + symlink() emits IN_CREATE only; a regular file's
+// IN_CREATE still waits for its write.
+func TestWatchSetSymlinkCreateTriggers(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), ".local", "bin")
+	mkdirs(t, bin)
+	fi := newFakeInotify()
+	s := fi.set()
+	s.build([]*watchPattern{newWatchPattern(filepath.Join(bin, "claude"), true, false)})
+
+	if err := os.WriteFile(filepath.Join(bin, "claude"), nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.handle(fi.wds[bin], unix.IN_CREATE, "claude")
+	if r, rs, _ := s.take(); r || rs {
+		t.Fatal("a regular file's IN_CREATE must not trigger before its write completes")
+	}
+	if err := os.Remove(filepath.Join(bin, "claude")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../share/claude/versions/2", filepath.Join(bin, "claude")); err != nil {
+		t.Fatal(err)
+	}
+	s.handle(fi.wds[bin], unix.IN_CREATE, "claude")
+	if r, rs, _ := s.take(); !r || !rs {
+		t.Fatalf("a symlink created at the binary's name: refresh=%v resync=%v, want both", r, rs)
+	}
+}
+
 func TestWatchSetVersionDirMovedInWhole(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "discord")
 	mkdirs(t, root, filepath.Join(root, "0.0.3"))

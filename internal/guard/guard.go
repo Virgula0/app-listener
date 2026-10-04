@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,6 +179,9 @@ type Guard struct {
 	// replacement re-synced after that prune is still judged against it (updaterCreated's same-dev
 	// test), not as a path that never had a binary.
 	retired map[string]GuardInodeKey
+	// links: per whitelist line that is a symlink, the target admitted for it (linkresync.go).
+	// Guarded by mu.
+	links map[string]string
 	// refused: replacements ReSyncBinaries declined, reported once each.
 	refused refusedReplacements
 	// eagerPopulate scans the whole guarded tree into guard_inodes while LSM hooks are detached (see WithEagerPopulate).
@@ -453,6 +457,7 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		deployed:       make(map[string]GuardInodeKey),
 		keyPaths:       make(map[GuardInodeKey]string),
 		vetted:         make(map[string]GuardInodeKey),
+		links:          make(map[string]string),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -1008,16 +1013,22 @@ func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf
 
 // resolveDeferred hashes every deferred rule now readable; returns entries, event lists (by
 // canonical path) and still-unreadable rules. It only records each hashed inode (binaryKey).
-func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]ebpf.EventType, stillDeferred []deferredBinary) {
+func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]ebpf.EventType,
+	links map[string]string, stillDeferred []deferredBinary) {
 	g.mu.Lock()
 	deferredList := append([]deferredBinary(nil), g.deferred...)
 	g.mu.Unlock()
 
 	resolved = make([]BinaryEntry, 0, len(deferredList))
 	events = make(map[string][]ebpf.EventType, len(deferredList))
+	links = make(map[string]string)
 	for _, deferred := range deferredList {
 		rule := deferred.rule
-		path, entry, key, f, err := confinedEntry(rule.Path)
+		line := rule.Path
+		if rule.Link != "" {
+			line = rule.Link // resolve the configured link now, not where it pointed at parse time
+		}
+		path, entry, key, f, err := confinedEntry(line)
 		if err != nil {
 			deferred.attempts++
 			if deferred.attempts >= maxResolveAttempts {
@@ -1039,8 +1050,11 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 		if len(rule.Events) > 0 {
 			events[path] = rule.Events
 		}
+		if path != line {
+			links[line] = path
+		}
 	}
-	return resolved, events, stillDeferred
+	return resolved, events, links, stillDeferred
 }
 
 // confinedEntry opens path once (OpenConfined) and hashes the inode reached, returning its resolved
@@ -1093,8 +1107,8 @@ func (g *Guard) ResolvePendingBinaries() error {
 	}
 
 	// Maps stay writable while attached; inode-keyed entries make the write idempotent by construction.
-	resolved, events, stillDeferred := g.resolveDeferred()
-	if err := g.retryDeferredBinaries(resolved, events, stillDeferred); err != nil {
+	resolved, events, links, stillDeferred := g.resolveDeferred()
+	if err := g.retryDeferredBinaries(resolved, events, links, stillDeferred); err != nil {
 		return err
 	}
 	if len(resolved) == 0 {
@@ -1148,7 +1162,8 @@ func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][
 
 // retryDeferredBinaries admits deferred rules that became readable (map entries + bookkeeping).
 // Shared by ResolvePendingBinaries and ReSyncBinaries.
-func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map[string][]ebpf.EventType, stillDeferred []deferredBinary) error {
+func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map[string][]ebpf.EventType,
+	links map[string]string, stillDeferred []deferredBinary) error {
 	g.mu.Lock()
 	g.deferred = stillDeferred
 	g.mu.Unlock()
@@ -1169,6 +1184,7 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 	for path, types := range resolvedEvents {
 		g.exeEvents[path] = types
 	}
+	maps.Copy(g.links, links)
 	// Pin the freshly resolved binaries so in-place replacement detection covers them.
 	if g.binaryVerifyStates != nil {
 		for i := range resolved {
@@ -1187,8 +1203,8 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 // before its supersede (supersede.go). Still-deferred rules are retried.
 func (g *Guard) ReSyncBinaries() (int, error) {
 	// Retry deferred rules first; addBinaryActions records newly resolved binaries in deployed, so the pass below skips them.
-	resolved, resolvedEvents, stillDeferred := g.resolveDeferred()
-	if err := g.retryDeferredBinaries(resolved, resolvedEvents, stillDeferred); err != nil {
+	resolved, resolvedEvents, links, stillDeferred := g.resolveDeferred()
+	if err := g.retryDeferredBinaries(resolved, resolvedEvents, links, stillDeferred); err != nil {
 		return 0, err
 	}
 
@@ -1213,8 +1229,12 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 	if changed > 0 {
 		log.Infof("guard %s: re-synced %d binary inode(s) after replacement", g.path, changed)
 	}
+	relinked, err := g.resyncLinks(exeEvents)
+	if err != nil {
+		return changed + relinked, err
+	}
 	added, err := g.admitSystemMatches()
-	return changed + added, err
+	return changed + relinked + added, err
 }
 
 // resyncOne admits the inode now at the whitelisted binPath when it replaced the deployed one and

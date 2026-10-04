@@ -471,17 +471,26 @@ func (s *guardUnitTest) TestResolveDeferred() {
 	dir := s.T().TempDir()
 	binaryPath := filepath.Join(dir, "tool")
 	s.Require().NoError(os.WriteFile(binaryPath, []byte("#!/bin/sh\nexit 0"), 0o755))
+	// A link re-pointed since the parse resolved it: the link is resolved again, not the stale target.
+	current := filepath.Join(dir, "tool-2")
+	s.Require().NoError(os.WriteFile(current, []byte("#!/bin/sh\nexit 2"), 0o755))
+	link := filepath.Join(dir, "link")
+	s.Require().NoError(os.Symlink(current, link))
 
 	g := &Guard{
-		path: dir,
+		path:  dir,
+		links: map[string]string{},
 		deferred: []deferredBinary{
 			{rule: daemonconfig.BinaryRule{Path: binaryPath, Events: []ebpf.EventType{ebpf.EventRead}}},
 			{rule: daemonconfig.BinaryRule{Path: filepath.Join(dir, "still-locked"), Events: []ebpf.EventType{ebpf.EventRead}}},
+			{rule: daemonconfig.BinaryRule{Path: filepath.Join(dir, "tool-1"), Link: link}},
 		},
 	}
 
-	resolved, events, stillDeferred := g.resolveDeferred()
-	s.Require().Len(resolved, 1, "only the readable rule resolves")
+	resolved, events, links, stillDeferred := g.resolveDeferred()
+	s.Require().Len(resolved, 2, "only the readable rules resolve")
+	s.Require().Equal(current, resolved[1].Path)
+	s.Require().Equal(map[string]string{link: current}, links, "the link is recorded with its current target")
 	s.Require().Equal(binaryPath, resolved[0].Path)
 	s.Require().NotEqual([32]byte{}, resolved[0].Hash, "resolved entry carries the binary hash")
 	s.Require().Equal(filepath.Base(binaryPath), resolved[0].Comm, "comm derives from the binary basename")
