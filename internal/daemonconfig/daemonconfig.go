@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -31,6 +32,10 @@ type Config struct {
 	// InspectorsDefault: no [inspectors] block, so Inspectors is DefaultInspectors and an entry
 	// not installed on this host is expected.
 	InspectorsDefault bool
+	// ElectronApps are the [electron_apps] entries: the apps a whitelisted generic Electron (one
+	// that runs the app its argv names, /usr/lib/electronNN) may be started with. Any other is code
+	// its caller chose; root placement is the daemon's to check.
+	ElectronApps []string
 	// Raw is the file's content as parsed: the daemon's catalog refresh writes only over the
 	// version it runs (compare-and-swap).
 	Raw []byte
@@ -43,6 +48,13 @@ var DefaultInspectors = []string{"/usr/lib/xdg-desktop-portal", "/usr/libexec/xd
 
 // MaxInspectors bounds the [inspectors] entries (the kernel map also holds superseded versions).
 const MaxInspectors = 16
+
+// MaxElectronApps bounds [electron_apps]; MaxElectronAppLen is the longest path the kernel's
+// launch-rule key holds (guard_trust.bpf.c LAUNCH_KEY, NUL included).
+const (
+	MaxElectronApps   = 32
+	MaxElectronAppLen = 43
+)
 
 // Resource is one guarded tree (directory or vault root) with its own guard, whitelist and, via
 // EncryptionRoot, a shared fscrypt lifecycle. Symlinks, hard-linked files and special files are
@@ -151,7 +163,9 @@ type watchGroup struct {
 	libraryBlock bool
 	// inspectorsBlock marks an [inspectors] block: one binary path per line, into Config.Inspectors.
 	inspectorsBlock bool
-	blockName       string
+	// electronAppsBlock marks an [electron_apps] block: one app path per line.
+	electronAppsBlock bool
+	blockName         string
 	// skipped marks a section whose root is missing: its directives are warned and ignored, never
 	// fatal (the group is dropped at finalize).
 	skipped bool
@@ -212,17 +226,9 @@ func parseConfig(cfg *Config, file io.Reader) error {
 // applyConfigLine dispatches one line: section headers close the previous group and open a new one;
 // directives mutate the open group.
 func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) error {
-	if name, ok := parseLibrariesSection(line); ok {
+	if next := openBlock(cfg, line, lineNo); next != nil {
 		finalizeGroup(cfg, *group)
-		*group = &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
-		return nil
-	}
-	if line == "[inspectors]" {
-		finalizeGroup(cfg, *group)
-		*group = &watchGroup{inspectorsBlock: true, lineNo: lineNo}
-		if cfg.Inspectors == nil {
-			cfg.Inspectors = []string{} // declared: an empty block grants nothing, not the default
-		}
+		*group = next
 		return nil
 	}
 	dirPath, isSection, headerErr := parseWatchSection(line)
@@ -247,6 +253,9 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	if g.inspectorsBlock {
 		return applyInspector(cfg, line, lineNo)
 	}
+	if g.electronAppsBlock {
+		return applyElectronApp(cfg, line, lineNo)
+	}
 	if g.skipped {
 		log.Warnf("daemon config line %d: skipped section: ignoring directive %q", lineNo, line)
 		return nil
@@ -269,6 +278,24 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	return applyDirective(g, line, lineNo)
 }
 
+// openBlock returns the group a [libraries <name>], [inspectors] or [electron_apps] header opens,
+// nil for any other line.
+func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
+	if name, ok := parseLibrariesSection(line); ok {
+		return &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
+	}
+	switch line {
+	case "[inspectors]":
+		if cfg.Inspectors == nil {
+			cfg.Inspectors = []string{} // declared: an empty block grants nothing, not the default
+		}
+		return &watchGroup{inspectorsBlock: true, lineNo: lineNo}
+	case "[electron_apps]":
+		return &watchGroup{electronAppsBlock: true, lineNo: lineNo}
+	}
+	return nil
+}
+
 // newWatchGroup probes the section root: a missing root skips the whole group (directives warned,
 // never fatal).
 func newWatchGroup(dirPath string, lineNo int) *watchGroup {
@@ -283,7 +310,7 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 
 // finalizeGroup materializes a closed group unless it was skipped.
 func finalizeGroup(cfg *Config, group *watchGroup) {
-	if group == nil || group.skipped || group.inspectorsBlock {
+	if group == nil || group.skipped || group.inspectorsBlock || group.electronAppsBlock {
 		return
 	}
 	if group.libraryBlock {
@@ -421,7 +448,24 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 			"those binaries grant nothing (a lib_binary is a writer of this section's library directories only)", g.lineNo)
 	}
 	for _, dir := range g.libDirs {
+		// A lib_dir inside a grouped section's vault (Discord's app-* version dirs) shares its
+		// lifecycle like a watch path, and is invisible while the vault is locked: deferred, not
+		// dropped.
+		vault := vaultRootOf(cfg, g, dir)
+		inVault := vault != ""
 		if _, statErr := os.Lstat(dir); statErr != nil {
+			if inVault && findResource(cfg, dir) == nil {
+				log.Warnf("daemon config line %d: lib_dir not resolvable yet (encryption root %s locked?), "+
+					"deferring: %s", g.lineNo, vault, dir)
+				cfg.Resources = append(cfg.Resources, Resource{Path: dir, NeedEncryption: true,
+					EncryptionRoot: vault, PathPending: true, ReadOnly: true})
+				res := &cfg.Resources[len(cfg.Resources)-1]
+				res.Binaries = append(res.Binaries, libDirWriters(g.binaries)...)
+				res.PendingBinaries = append(res.PendingBinaries, libDirWriters(g.pending)...)
+				res.Binaries = append(res.Binaries, g.libBinaries...)
+				res.PendingBinaries = append(res.PendingBinaries, g.libPending...)
+				continue
+			}
 			log.Warnf("daemon config line %d: lib_dir not present, ignoring: %s", g.lineNo, dir)
 			continue
 		}
@@ -443,17 +487,36 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 			existing.PendingBinaries = append(existing.PendingBinaries, g.libPending...)
 			continue
 		}
-		res := addResource(cfg, dir, "", g.lineNo)
+		res := addResource(cfg, dir, vault, g.lineNo)
 		if res == nil {
 			continue
 		}
-		res.NeedEncryption = false
+		res.NeedEncryption = inVault
+		res.EncryptionRoot = vault
 		res.ReadOnly = true
 		res.Binaries = append(res.Binaries, libDirWriters(g.binaries)...)
 		res.PendingBinaries = append(res.PendingBinaries, libDirWriters(g.pending)...)
 		res.Binaries = append(res.Binaries, g.libBinaries...)
 		res.PendingBinaries = append(res.PendingBinaries, g.libPending...)
 	}
+}
+
+// vaultRootOf is the encryption root of the grouped, encrypted section whose vault holds dir: g's
+// own, or one materialized before ([libraries] blocks follow the watch sections). A section without
+// `watch:` is one guarded tree, which a lib_dir inside it would nest in.
+func vaultRootOf(cfg *Config, g *watchGroup, dir string) string {
+	if g.needEncryption && len(g.watchPaths) > 0 && isInsidePath(dir, g.root) {
+		return g.root
+	}
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
+		if r.NeedEncryption && r.EncryptionRoot != "" && isInsidePath(dir, r.EncryptionRoot) {
+			if fi, err := os.Lstat(r.EncryptionRoot); err == nil && fi.IsDir() {
+				return r.EncryptionRoot
+			}
+		}
+	}
+	return ""
 }
 
 // libDirWriters returns the section binaries allowed to WRITE a lib_dir: only unrestricted ones. An
@@ -497,17 +560,27 @@ func deferPendingWatchPath(cfg *Config, g *watchGroup, watchPath string) *Resour
 // unlocked: the sub-path must now resolve to a directory or unique regular file (symlinks,
 // hard-linked and special files refused as in addResource). A still-missing path is a hard error:
 // dropping it would leave a declared-protected directory unguarded.
+//
+// A pending lib_dir that doesn't validate is dropped with a warning instead, as at parse time: it
+// holds no secret (an app version removed while the daemon was down).
 func ResolvePendingPaths(cfg *Config) error {
+	kept := make([]Resource, 0, len(cfg.Resources))
 	for i := range cfg.Resources {
-		r := &cfg.Resources[i]
-		if !r.PathPending {
-			continue
+		r := cfg.Resources[i]
+		if r.PathPending {
+			if err := validateWatchTarget(r.Path, r.EncryptionRoot); err != nil {
+				if !r.ReadOnly {
+					return fmt.Errorf("grouped watch path %s (encryption root %s): %w", r.Path, r.EncryptionRoot, err)
+				}
+				log.Warnf("daemon config: lib_dir %s (encryption root %s) not usable after unlock, ignoring: %v",
+					r.Path, r.EncryptionRoot, err)
+				continue
+			}
+			r.PathPending = false
 		}
-		if err := validateWatchTarget(r.Path, r.EncryptionRoot); err != nil {
-			return fmt.Errorf("grouped watch path %s (encryption root %s): %w", r.Path, r.EncryptionRoot, err)
-		}
-		r.PathPending = false
+		kept = append(kept, r)
 	}
+	cfg.Resources = kept
 	return nil
 }
 
@@ -877,6 +950,33 @@ func applyInspector(cfg *Config, line string, lineNo int) error {
 		return fmt.Errorf("daemon config line %d: more than %d inspectors", lineNo, MaxInspectors)
 	}
 	cfg.Inspectors = append(cfg.Inspectors, p)
+	return nil
+}
+
+// applyElectronApp records one [electron_apps] line: an absolute path, matched against argv as
+// written, so it must fit the kernel's key.
+func applyElectronApp(cfg *Config, line string, lineNo int) error {
+	p, rest, err := splitPathAndRest(line)
+	if err != nil {
+		return fmt.Errorf("daemon config line %d: %w", lineNo, err)
+	}
+	if rest != "" {
+		return fmt.Errorf("daemon config line %d: an [electron_apps] entry is an app path only, got %q", lineNo, rest)
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("daemon config line %d: electron app %q is not an absolute path", lineNo, p)
+	}
+	p = filepath.Clean(p)
+	if len(p) > MaxElectronAppLen {
+		return fmt.Errorf("daemon config line %d: electron app %s is longer than %d bytes", lineNo, p, MaxElectronAppLen)
+	}
+	if slices.Contains(cfg.ElectronApps, p) {
+		return fmt.Errorf("daemon config line %d: duplicate electron app: %s", lineNo, p)
+	}
+	if len(cfg.ElectronApps) >= MaxElectronApps {
+		return fmt.Errorf("daemon config line %d: more than %d electron apps", lineNo, MaxElectronApps)
+	}
+	cfg.ElectronApps = append(cfg.ElectronApps, p)
 	return nil
 }
 

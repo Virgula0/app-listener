@@ -59,6 +59,10 @@ type CandidateDir struct {
 	// below dir for the entry's whitelisted binaries (guard_trust.bpf.c #3), which may then load such
 	// files with no allow_lib. dir must exist when the daemon (re)loads, or nothing is reserved.
 	ReservedLibs []string
+	// ReservedNames are %HOME% patterns "<dir>/<name>" (as ReservedLibs) for files an app's code or
+	// updater trusts as input: reserved below dir for the entry's binaries (guard_trust.bpf.c #3), so
+	// no other process creates, replaces or writes one. Unlike ReservedLibs, never loadable code.
+	ReservedNames []string
 	// BunLaunchers marks a Bun-based app whose runtime extracts a native library to
 	// $TMPDIR/.bun-<uid>-<hash>.so and dlopen()s it — untrustable on world-writable /tmp. The listed
 	// command names get a $TMPDIR-scoping launcher wrapper at install (opt-in), pointing them at the
@@ -177,12 +181,21 @@ var Catalog = []CandidateDir{
 			// install/update).
 			"/opt/visual-studio-code/resources/app/node_modules/@vscode/vsce-sign/bin/vsce-sign": nil,
 			"/usr/share/code/resources/app/node_modules/@vscode/vsce-sign/bin/vsce-sign":         nil,
-		}},
+		},
+		// Extensions (and argv.json) run inside the whitelisted Code process: read-only to everything
+		// but Code, or a same-user process edits an extension and reads the config through it. A
+		// [libraries] lib_dir inherits no whitelist: Code's own ELF binaries are its writers.
+		LibDirRelPaths: []string{".vscode"},
+		LibDirWriters: []string{"/opt/visual-studio-code/code", "/usr/share/code/code", "/usr/local/bin/code",
+			"%HOME%/.local/bin/code"}},
 	{Name: "VS Code Insiders config", RelPaths: []string{".config/Code - Insiders"},
 		Whitelist: map[string][]string{
 			"/usr/bin/code-insiders": nil, "/usr/local/bin/code-insiders": nil,
 			"%HOME%/.local/bin/code-insiders": nil, "/opt/visual-studio-code/bin/code": nil,
-		}},
+		},
+		LibDirRelPaths: []string{".vscode-insiders"},
+		LibDirWriters: []string{"/opt/visual-studio-code-insiders/code-insiders", "/usr/share/code-insiders/code-insiders",
+			"/usr/local/bin/code-insiders", "%HOME%/.local/bin/code-insiders"}},
 	{Name: "VS Code server (remote development)", RelPaths: []string{".vscode-server"},
 		Whitelist: map[string][]string{
 			"/usr/bin/code": nil, "/usr/local/bin/code": nil,
@@ -193,7 +206,9 @@ var Catalog = []CandidateDir{
 		}},
 	{Name: "VSCodium config", RelPaths: []string{".config/VSCodium"},
 		Whitelist: map[string][]string{"/usr/bin/codium": nil, "/usr/local/bin/codium": nil,
-			"/opt/vscodium/chrome_crashpad_handler": nil, "/usr/share/vscodium/chrome_crashpad_handler": nil}},
+			"/opt/vscodium/chrome_crashpad_handler": nil, "/usr/share/vscodium/chrome_crashpad_handler": nil},
+		LibDirRelPaths: []string{".vscode-oss"},
+		LibDirWriters:  []string{"/opt/vscodium/codium", "/usr/share/vscodium/codium", "/usr/local/bin/codium"}},
 	{Name: "JetBrains IDEs", RelPaths: []string{".config/JetBrains"},
 		// IDEs run as the bundled JBR java, so the JBR and its fsnotifier are whitelisted (globs
 		// cover /opt installs). Toolbox apps stay unguarded (no credentials; those live in
@@ -207,7 +222,12 @@ var Catalog = []CandidateDir{
 			"/opt/*/bin/fsnotifier":         nil,
 			"%HOME%/.goland/jbr/bin/java":   nil,
 			"%HOME%/.goland/bin/fsnotifier": nil,
-		}},
+		},
+		// Plugins run inside the IDE's java: read-only to everything but the IDEs and Toolbox, which
+		// installs and updates them.
+		LibDirRelPaths: []string{".local/share/JetBrains"},
+		LibDirWriters: []string{"/opt/*/jbr/bin/java", "%HOME%/.goland/jbr/bin/java",
+			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox"}},
 	// Config (~/.config/zed) and data (~/.local/share/zed, holds the auth token): one resource, two
 	// watch roots.
 	{Name: "Zed editor", RelPaths: []string{".config/zed", ".local/share/zed"},
@@ -260,8 +280,7 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/rclone": nil}},
 	{Name: "Ollama config", RelPaths: []string{".ollama"},
 		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
-	{Name: "npm data", RelPaths: []string{".npm"},
-		Whitelist: map[string][]string{"/usr/bin/npm": nil, "/usr/bin/npx": nil, "/usr/bin/node": nil}},
+	// No npm entry: npm runs as node, and whitelisting node lets `node -e` read the tree (issue #79).
 	// pip is a #!/usr/bin/python script (inert like gcloud); documentation only.
 	{Name: "pip config", RelPaths: []string{".config/pip"},
 		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
@@ -389,6 +408,22 @@ var Catalog = []CandidateDir{
 			"%HOME%/.config/discord/*/chrome-sandbox":          nil,
 			"%HOME%/.config/discord/*/chrome_crashpad_handler": nil,
 		},
+		// The versioned app dirs hold code the whitelisted Discord runs (resources/app.asar, modules/,
+		// V8 snapshots): read-only to everything but Discord, and only Discord may create one (the
+		// app-* name is reserved). Inside the vault, so deferred until it is unlocked.
+		LibDirRelPaths: []string{".config/discord/app-*"},
+		// Writers: Discord itself (its updater runs in-process), and the root-owned bootstrap
+		// /usr/bin/discord runs when the host is missing (it creates the first app-* dir and
+		// installer.db): a writer only, never a reader of the secrets.
+		LibDirWriters: []string{"%HOME%/.config/discord/*/Discord",
+			"/usr/share/discord/updater_bootstrap", "/opt/discord/updater_bootstrap"},
+		// The updater's inputs (settings.json names the update endpoint, installer.db what is
+		// installed): steering them makes the real updater install chosen code with genuine
+		// provenance. Readable, but only Discord's binaries may write them.
+		ReservedNames: []string{
+			"%HOME%/.config/discord/settings.json",
+			"%HOME%/.config/discord/installer.db",
+		},
 		// Self-updated native modules (discord_voice.node, ...) and bundled libs (libffmpeg.so).
 		ReservedLibs: []string{
 			"%HOME%/.config/discord/*.so",
@@ -467,6 +502,8 @@ var Catalog = []CandidateDir{
 			// files/share/default_pfx each launch, so guarding the whole folder would refuse every
 			// Valve-Proton game. GE-Proton needs no entry (compatibilitytools.d is guarded above).
 			".local/share/Steam/steamapps/common/Proton*/files/lib",
+			// The client's update staging: what it downloads here it unpacks into the dirs above.
+			".local/share/Steam/package",
 		},
 		// pressure-vessel OWNS the runtime trees above and rewrites them every launch: it hardlinks
 		// the runtime's ~6.6k files into a fresh `var/tmp-XXXXXX`, capsule-capture-libs symlinks
@@ -664,12 +701,11 @@ func (c *CandidateDir) LibraryBlockFor(user, home string) LibraryBlock {
 	if user != "" {
 		name += " (" + user + ")"
 	}
-	return LibraryBlock{
-		Name:       name,
-		Libs:       c.ExpandLibs(user, home),
-		LibDirs:    c.ExpandLibDirs(user, home),
-		LibWriters: c.ExpandLibDirWriters(user, home),
+	b := LibraryBlock{Name: name, Libs: c.ExpandLibs(user, home), LibDirs: c.ExpandLibDirs(user, home)}
+	if len(b.LibDirs) > 0 {
+		b.LibWriters = c.ExpandLibDirWriters(user, home) // a writer of no lib_dir grants nothing
 	}
+	return b
 }
 
 // homeMatchConfined reports whether match, expanded from a catalog pattern under home, stays below

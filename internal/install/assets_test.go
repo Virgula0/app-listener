@@ -1,6 +1,7 @@
 package install
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -45,6 +46,23 @@ func TestNoLegacyCatalogRefreshSamples(t *testing.T) {
 		switch n {
 		case "app-listener-catalog-refresh.service", "50-app-listener-reload.hook", "apt-app-listener-reload":
 			t.Errorf("daemon-samples still ships the legacy refresh trigger %s", n)
+		}
+	}
+}
+
+// No user code may run before the guards attach (issue #80): the unit must signal readiness only
+// once enforcing and order logins, user managers and cron after it.
+func TestDaemonUnitOrdersUserCodeAfterReadiness(t *testing.T) {
+	unit, err := SampleContent("app-listener-daemon.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"\nType=notify\n",
+		"Before=systemd-user-sessions.service cron.service crond.service cronie.service atd.service\n",
+	} {
+		if !strings.Contains(string(unit), want) {
+			t.Errorf("daemon unit lacks %q", strings.TrimSpace(want))
 		}
 	}
 }

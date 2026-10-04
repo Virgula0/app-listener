@@ -9,12 +9,13 @@ import (
 // TrustGlob is a Whitelist/LibDirWriters glob under a home whose matches the catalog refresh turns
 // into trust grants. Fixed are the wildcard-free components between Home and the first wildcard
 // one; Name is the last component. The daemon reserves Name below Root (guard_trust.bpf.c #3).
-// Lib marks a ReservedLibs pattern.
+// Lib marks a ReservedLibs pattern, Input a ReservedNames one.
 type TrustGlob struct {
 	Home  string
 	Fixed []string
 	Name  string
 	Lib   bool
+	Input bool
 }
 
 // LibDirGlob is a LibDirGlobs pattern: Tail holds its components after the wildcard Name.
@@ -69,11 +70,20 @@ func (c *CandidateDir) FixedBinaryGlobs(user, home string) []TrustGlob {
 
 // ReservedLibGlobs returns the entry's %HOME% ReservedLibs patterns for one user, with Lib set.
 func (c *CandidateDir) ReservedLibGlobs(user, home string) []TrustGlob {
-	out := make([]TrustGlob, 0, len(c.ReservedLibs))
-	for _, p := range c.ReservedLibs {
+	return reservedGlobs(c.ReservedLibs, true, user, home)
+}
+
+// ReservedNameGlobs returns the entry's %HOME% ReservedNames patterns for one user.
+func (c *CandidateDir) ReservedNameGlobs(user, home string) []TrustGlob {
+	return reservedGlobs(c.ReservedNames, false, user, home)
+}
+
+func reservedGlobs(pats []string, lib bool, user, home string) []TrustGlob {
+	out := make([]TrustGlob, 0, len(pats))
+	for _, p := range pats {
 		if rel, ok := strings.CutPrefix(p, "%HOME%/"); ok {
 			g := splitTrustGlob(home, expandPlaceholders(rel, user, home))
-			g.Lib = true
+			g.Lib, g.Input = lib, !lib
 			out = append(out, g)
 		}
 	}

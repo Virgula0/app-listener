@@ -49,19 +49,25 @@ struct {
 	__type(value, __u64);
 } exe_seq SEC(".maps");
 
-// trust_code_suspect: tgids that exec-mapped code trust_mmap would refuse a whitelisted binary,
-// while their exe was not TRUSTED_BINARY. trust_mmap judges only new mappings, so a process that
-// preloaded code before a reload whitelisted its exe would otherwise keep it and read the secrets;
-// trust_file_open refuses it every regular file below a whitelist-mode guarded root until it execs,
-// and guard_ptrace_access_check its inspector grant. Inherited across fork, cleared on exec and on
-// leader exit (guard_tainted_pids' lifecycle), all by the trust object. A mark that can't be
-// recorded refuses the mapping (fail closed).
+// trust_code_suspect: tgids running code their exe's identity doesn't vouch for. SUSPECT_PRELOAD:
+// exec-mapped code trust_mmap would refuse a whitelisted binary while the exe was not TRUSTED_BINARY
+// (trust_mmap judges only new mappings, so a reload whitelisting the exe would not catch it).
+// SUSPECT_LAUNCH: a runtime started with env/argv that run its caller's code (trust_exec_launch).
+// Either is refused every regular file below a secret root, any change below a code tree, its exe's
+// writer and updater rights (trust_suspect), guard_ptrace_access_check's inspector grant and, by the
+// guard's whitelist decision, any access below a secret (stat, readdir, xattrs).
+// Inherited across fork, cleared on exec and on leader exit (guard_tainted_pids' lifecycle), all by
+// the trust object. A mark that can't be recorded refuses the mapping / kills the launch.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 65536);
 	__type(key, __u32);
 	__type(value, __u8);
 } trust_code_suspect SEC(".maps");
+
+// trust_code_suspect values; also guard_event.reason bits 8-15 (guard.bpf.c).
+#define SUSPECT_PRELOAD 1
+#define SUSPECT_LAUNCH 2
 
 static __always_inline __u64 leader_start(struct task_struct *task)
 {

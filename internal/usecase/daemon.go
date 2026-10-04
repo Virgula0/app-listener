@@ -390,8 +390,9 @@ func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRe
 	// resources, not this one: label it so. Neither is an in-place binary replacement to re-sync.
 	label := ev.ResourceLabel(resource)
 	// A denial usually means an in-place binary replacement: re-sync (throttled by
-	// resyncMinInterval) to admit the new inode. A process-gate denial is not one.
-	if ev.Blocked && ev.FsGate == "" && ev.Process == "" && time.Since(*lastResync) >= resyncMinInterval {
+	// resyncMinInterval) to admit the new inode. A process-gate or code-suspect denial is not one.
+	if ev.Blocked && ev.FsGate == "" && ev.Process == "" && ev.Suspect == "" &&
+		time.Since(*lastResync) >= resyncMinInterval {
 		if _, err := g.ReSyncBinaries(); err != nil {
 			log.Errorf("daemon: re-syncing binary whitelist for %s: %v", resource, err)
 		}

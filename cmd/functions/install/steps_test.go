@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -318,16 +319,28 @@ func TestPatchCatalogSectionGroupedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("refreshed grouped config does not parse: %v", err)
 	}
-	if len(reparsed.Resources) != 2 {
-		t.Fatalf("want 2 grouped resources after refresh, got %+v", reparsed.Resources)
-	}
+	var watched int
+	appDir := filepath.Dir(appBin)
 	for _, res := range reparsed.Resources {
 		if res.EncryptionRoot != root {
 			t.Errorf("resource %s lost its encryption root: %+v", res.Path, res)
 		}
+		if res.ReadOnly {
+			// The app-* version dir: read-only code tree in the vault, written by Discord (issue #79).
+			if res.Path != appDir || !slices.ContainsFunc(res.Binaries, func(b daemonconfig.BinaryRule) bool {
+				return b.Path == appBin
+			}) {
+				t.Errorf("lib_dir %s: want %s written by %s: %+v", res.Path, appDir, appBin, res.Binaries)
+			}
+			continue
+		}
+		watched++
 		if len(res.Binaries) != 1 || res.Binaries[0].Path != appBin {
 			t.Errorf("resource %s: shared whitelist not applied: %+v", res.Path, res.Binaries)
 		}
+	}
+	if watched != 2 {
+		t.Fatalf("want 2 grouped resources after refresh, got %+v", reparsed.Resources)
 	}
 }
 

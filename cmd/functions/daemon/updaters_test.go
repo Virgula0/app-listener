@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	"github.com/Virgula0/app-listener/internal/install"
 )
 
 func rules(paths ...string) []daemonconfig.BinaryRule {
@@ -111,14 +112,13 @@ func TestGeneralToolsToWarn_HardLinkIsNoUpdaterButNoWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := generalToolsToWarn([]string{app, linked}); len(got) != 0 {
+	res := &daemonconfig.Resource{Binaries: rules(app, linked)}
+	if got := install.GeneralToolsOf(res); len(got) != 0 {
 		t.Errorf("hard-linked non-tool must not warn: %v", got)
 	}
-	if got := generalToolsToWarn([]string{app, linked, git}); len(got) != 1 || got[0] != git {
-		t.Errorf("named tool beside a user-writable binary must warn alone: %v", got)
-	}
-	if got := generalToolsToWarn([]string{git}); len(got) != 0 {
-		t.Errorf("no user-writable sibling, no warning: %v", got)
+	res.Binaries = rules(git)
+	if got := install.GeneralToolsOf(res); len(got) != 1 || got[0] != git {
+		t.Errorf("a whitelisted general tool warns, alone or not (issue #79): %v", got)
 	}
 
 	p := planUpdaters(&daemonconfig.Config{Resources: []daemonconfig.Resource{

@@ -64,6 +64,20 @@ type GuardEvent struct {
 	// Scope labels a process-gate denial judged for several resources: MultipleResourceLabel (the
 	// GLOBAL slot) or a taint set's paths, comma-separated. Empty: the receiving guard's own.
 	Scope string
+	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH"): it runs
+	// code its exe doesn't vouch for (trust_code_suspect). Empty otherwise.
+	Suspect string
+}
+
+// Op is the label ev is logged under: its process gate or suspect mark, else its event type.
+func (ev *GuardEvent) Op() string {
+	switch {
+	case ev.Process != "":
+		return ev.Process
+	case ev.Suspect != "":
+		return ev.Suspect
+	}
+	return ev.Type.String()
 }
 
 // MultipleResourceLabel is GuardEvent.Scope for the GLOBAL slot: the process holds content of
@@ -81,18 +95,36 @@ func (ev *GuardEvent) ResourceLabel(resource string) string {
 	return resource
 }
 
-// guard_event.reason values — mirror GUARD_REASON_* in guard.bpf.c.
+// guard_event.reason values — mirror GUARD_REASON_* in guard.bpf.c. Bits 0-7 hold the gate,
+// bits 8-15 the SUSPECT_* mark behind a whitelist denial.
 const (
 	guardReasonRawDevice  = 1
 	guardReasonPtrace     = 2
 	guardReasonTracedExec = 3
 	guardReasonProcMem    = 4
 	guardReasonBtrfsIoctl = 5
+
+	guardReasonGateMask     = 0xff
+	guardReasonSuspectShift = 8
+	suspectPreload          = 1
+	suspectLaunch           = 2
 )
+
+// suspectLabel maps a reason's SUSPECT_* mark to its logged op label; "" when unmarked.
+func suspectLabel(reason uint32) string {
+	switch (reason >> guardReasonSuspectShift) & 0xff {
+	case suspectPreload:
+		return "PRELOADED"
+	case suspectLaunch:
+		return "LAUNCH"
+	default:
+		return ""
+	}
+}
 
 // processGateLabel maps a process-gate reason to its logged op label; "" for path-keyed events.
 func processGateLabel(reason uint32) string {
-	switch reason {
+	switch reason & guardReasonGateMask {
 	case guardReasonPtrace:
 		return "PTRACE"
 	case guardReasonTracedExec:
@@ -112,7 +144,7 @@ const (
 
 // fsGateLabel maps a filesystem-wide gate reason to its label; "" for every other event.
 func fsGateLabel(reason uint32) string {
-	switch reason {
+	switch reason & guardReasonGateMask {
 	case guardReasonRawDevice:
 		return RawDeviceResourceLabel
 	case guardReasonBtrfsIoctl:
@@ -217,6 +249,8 @@ type Guard struct {
 	rawDevicesSet bool
 	// dropAllowed: no consumer wants allowed events (WithoutAllowedEvents).
 	dropAllowed bool
+	// quietPID: WithoutOwnAllowedEvents.
+	quietPID uint32
 	// chmodDropWrite: WithChmodDropWrite.
 	chmodDropWrite bool
 	// systemPatterns: WithSystemPatterns.
@@ -226,6 +260,8 @@ type Guard struct {
 	// held: an fd on each vetted inode not yet written to the maps, so its number can't be freed and
 	// reused in between. Guarded by mu.
 	held map[string]*os.File
+	// admit: WithAdmissionCheck.
+	admit AdmissionCheck
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -290,6 +326,15 @@ func WithoutAllowedEvents() GuardOption {
 	}
 }
 
+// WithoutOwnAllowedEvents discards allowed events of this process (the kernel reports the tgid):
+// the daemon's own I/O on its state (the binary ledger's SQLite pages, populate walks) is noise
+// that otherwise floods the queue. Its denials are still reported.
+func WithoutOwnAllowedEvents() GuardOption {
+	return func(g *Guard) {
+		g.quietPID = uint32(os.Getpid()) //nolint:gosec // pids fit in 32 bits (PID_MAX_LIMIT 2^22)
+	}
+}
+
 // WithChmodDropWrite lets any process clear write bits of a non-root-owned regular file in a
 // ModeReadOnly tree (a lib_dir); see chmod_only_drops_write in guard.bpf.c.
 func WithChmodDropWrite() GuardOption {
@@ -304,6 +349,9 @@ type VettedInode struct {
 	Key GuardInodeKey
 	f   *os.File
 }
+
+// File is the open inode, for checks that must judge exactly it.
+func (v VettedInode) File() *os.File { return v.f }
 
 // Close releases the inode; WithVettedKeys takes ownership instead.
 func (v VettedInode) Close() {
@@ -322,6 +370,16 @@ func WithVettedKeys(keys map[string]VettedInode) GuardOption {
 			g.holdLocked(p, v.f)
 		}
 	}
+}
+
+// AdmissionCheck approves admitting the inode f holds (key, content hash) for a whitelist line
+// (rule.Link when the line is a symlink, else rule.Path) resolved to resolved.
+type AdmissionCheck func(rule daemonconfig.BinaryRule, resolved string, f *os.File, key GuardInodeKey, hash [32]byte) bool
+
+// WithAdmissionCheck judges every deferred whitelist entry once it resolves: one the check refuses
+// is dropped for this guard's lifetime (fail closed), never retried.
+func WithAdmissionCheck(fn AdmissionCheck) GuardOption {
+	return func(g *Guard) { g.admit = fn }
 }
 
 // holdLocked keeps f open until path's key is written (addBinaryActions). Caller holds mu, or owns g.
@@ -1037,6 +1095,10 @@ func (g *Guard) resolveDeferred() (resolved []BinaryEntry, events map[string][]e
 				log.Warnf("guard %s: keeping binary deferred: %v", g.path, err)
 				stillDeferred = append(stillDeferred, deferred)
 			}
+			continue
+		}
+		if g.admit != nil && !g.admit(rule, path, f, key, entry.Hash) {
+			f.Close()
 			continue
 		}
 		resolved = append(resolved, entry)
@@ -2253,6 +2315,7 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 		Blocked:   be.Blocked != 0,
 		FsGate:    fsGateLabel(be.Reason),
 		Process:   processGateLabel(be.Reason),
+		Suspect:   suspectLabel(be.Reason),
 	}
 	if ge.Process != "" {
 		// The kernel sends the other task's comm in path and its tgid in fd.
@@ -2273,11 +2336,11 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 // event and counts it, which costs only telemetry — enforcement already happened in the kernel,
 // synchronously, and the BPF ringbuf itself drops on overflow for the same reason.
 func (g *Guard) dispatch(ev *GuardEvent) {
-	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions
-	// key on exe inode).
-	if g.dropAllowed && !ev.Blocked {
+	if !g.Reports(ev) {
 		return
 	}
+	// comm is telemetry: the spoof warning is diagnostic only, never enforcement (BPF decisions
+	// key on exe inode).
 	local := *ev
 	g.checkCommSpoof(&local)
 
@@ -2296,13 +2359,18 @@ func (g *Guard) dispatch(ev *GuardEvent) {
 	}
 }
 
+// Reports reports whether the guard queues ev for its consumer; a denial always is.
+func (g *Guard) Reports(ev *GuardEvent) bool {
+	if ev.Blocked {
+		return true
+	}
+	return !g.dropAllowed && (g.quietPID == 0 || ev.PID != g.quietPID)
+}
+
 // logBacklogDenial prints ev in the daemon's DAEMON DENIED layout (scripts/trace-app-libs.sh
 // parses it); commFullPath is best-effort telemetry, "~" when unresolved.
 func logBacklogDenial(resource string, ev *GuardEvent) {
-	op := ev.Type.String()
-	if ev.Process != "" {
-		op = ev.Process
-	}
+	op := ev.Op()
 	exe := "~"
 	if target, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", ev.PID)); err == nil {
 		exe = logging.SanitizeText(target)

@@ -66,6 +66,7 @@ func collectDiffAdditions() (mergedText string, mergedCfg *daemonconfig.Config, 
 	if editErr != nil {
 		return "", nil, false, editErr
 	}
+	inst.WarnGeneralTools(parsed)
 	return text, parsed, true, nil
 }
 

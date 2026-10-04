@@ -289,7 +289,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	defer trust.stop()
 
-	d, err := startGuardedDaemonAbortable(termSig, cfg, vault, pin)
+	d, err := startGuardedDaemonAbortable(termSig, cfg, vault, pin, trust.vet)
 	if err != nil {
 		return err
 	}
@@ -336,7 +336,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemonconfig.Config, vault *fscrypt.Vault,
 	pin pinCfg, control *controlManager, trust *trustManager) (reload, stop func()) {
 	var refresher *catalogRefresher
-	reloadCfg := makeReloadHandler(d, configPath, vault, pin, control, trust, func(next *daemonconfig.Config) {
+	reloadCfg := makeReloadHandler(d, configPath, vault, pin, control, trust, trust.vet, func(next *daemonconfig.Config) {
 		if refresher != nil {
 			refresher.setConfig(next)
 		}
@@ -377,9 +377,10 @@ func runDaemonUI(events <-chan usecase.DaemonEvent, cfg *daemonconfig.Config, re
 // syscalls (fscrypt unlock, BPF attach) can't be interrupted, so on a signal it reaches the next
 // consistent point, then runs the secure lockdown (Stop keeps guards attached until every vault is
 // keyless). Returns (nil, nil) if aborted.
-func startGuardedDaemonAbortable(termSig <-chan os.Signal, cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg) (usecase.DaemonUseCase, error) {
+func startGuardedDaemonAbortable(termSig <-chan os.Signal, cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg,
+	vet *binaryVetter) (usecase.DaemonUseCase, error) {
 	return awaitStartupOrSignal(termSig, func() (usecase.DaemonUseCase, error) {
-		return startGuardedDaemon(cfg, vault, pin)
+		return startGuardedDaemon(cfg, vault, pin, vet)
 	})
 }
 
@@ -499,7 +500,7 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 // one reload at a time. The self guards stay attached throughout: the reload only needs free
 // resource slots, which reloadOnce checks before building anything.
 func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg,
-	control *controlManager, trust *trustManager, reloaded func(*daemonconfig.Config)) func() *daemonconfig.Config {
+	control *controlManager, trust *trustManager, vet *binaryVetter, reloaded func(*daemonconfig.Config)) func() *daemonconfig.Config {
 	var mu sync.Mutex
 	return func() *daemonconfig.Config {
 		mu.Lock()
@@ -511,7 +512,7 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		// start/stop the control socket.
 		defer control.refresh()
 
-		liveGen, cfg, err := reloadOnce(d, configPath, vault, pin.base)
+		liveGen, cfg, err := reloadOnce(d, configPath, vault, pin.base, vet)
 		if err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
 			return nil
@@ -553,7 +554,8 @@ func reloadSlotsNeeded(cfg *daemonconfig.Config) int {
 // ephemeral guard (only after a manual edit; install restarts the daemon), rebuild the guards under
 // a fresh pin generation and hand them to the usecase. On failure the freshly unlocked vaults are
 // locked back and the previous config keeps running. Returns the live pin generation.
-func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pinBase string) (string, *daemonconfig.Config, error) {
+func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pinBase string,
+	vet *binaryVetter) (string, *daemonconfig.Config, error) {
 	setConfinedHomes()
 	cfg, err := daemonconfig.Load(configPath)
 	if err != nil {
@@ -583,7 +585,10 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 		return "", nil, resolveErr
 	}
 	awaitReloadGate()
-	newGuards, buildErr := buildGuards(cfg.Resources, pin)
+	// Verdicts judge the new config against the running trust plan: a new line's creator must be an
+	// updater of its resource now (binaryVetter.decide).
+	vet.begin(cfg)
+	newGuards, buildErr := buildGuards(cfg.Resources, pin, vet)
 	if buildErr != nil {
 		pending.lockRoots(vault)
 		return "", nil, buildErr
@@ -601,7 +606,7 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 // ephemeral guards, re-validate the now-visible sub-paths, build the real guards, then start the
 // usecase (attach -> unlock -> populate). Ephemeral guards retire once the real ones are attached
 // and populated. Every error path locks freshly unlocked vaults back first.
-func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg) (usecase.DaemonUseCase, error) {
+func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg, vet *binaryVetter) (usecase.DaemonUseCase, error) {
 	relockStaleVaults(cfg, vault, pin.base)
 
 	// Retire pins a killed predecessor left. relockStaleVaults (and ExecStopPost --lockdown)
@@ -623,7 +628,7 @@ func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinC
 		return nil, resolveErr
 	}
 
-	guards, buildErr := buildGuards(cfg.Resources, pin)
+	guards, buildErr := buildGuards(cfg.Resources, pin, vet)
 	if buildErr != nil {
 		pending.lockRoots(vault)
 		return nil, buildErr
@@ -682,12 +687,8 @@ func drainEphemeral(root string, g *guard.Guard, done <-chan struct{}) {
 			if !ev.Blocked || (noLogMetadataBlocks && foldable(&de)) {
 				continue
 			}
-			op := ev.Type.String()
-			if ev.Process != "" {
-				op = ev.Process
-			}
 			log.Warnf("daemon: ephemeral guard %s DENIED op=%s comm=%s pid=%d uid=%d path=%s",
-				logging.SanitizeText(root), op, logging.SanitizeText(ev.Comm), ev.PID, ev.UID,
+				logging.SanitizeText(root), ev.Op(), logging.SanitizeText(ev.Comm), ev.PID, ev.UID,
 				logging.SanitizeText(ev.Path))
 		case <-done:
 			return
@@ -983,7 +984,7 @@ func resolveConfigPath() (string, error) {
 // read-only and precomputed, and it touches nothing beyond r and its result, so buildGuards runs it
 // concurrently.
 func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet []uint32, pin pinCfg,
-	system []daemonconfig.BinaryRule) (*guard.Guard, error) {
+	system []daemonconfig.BinaryRule, vet *binaryVetter) (*guard.Guard, error) {
 	binaries := make([]guard.BinaryEntry, 0, len(r.Binaries)+1)
 	events := make(map[string][]ebpf.EventType, len(r.Binaries)+1)
 	var deferred []daemonconfig.BinaryRule
@@ -998,6 +999,10 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 			// unlock (fail closed).
 			log.Warnf("binary %q for %s not readable yet, deferring: %v", b.Path, r.Path, err)
 			deferred = append(deferred, b)
+			continue
+		}
+		if !vet.judge(r, b, b.Path, key.File(), key.Key, entry.Hash) {
+			key.Close()
 			continue
 		}
 		binaries = append(binaries, entry)
@@ -1038,10 +1043,12 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		guard.WithSystemPatterns(system),
 		guard.WithVettedKeys(vetted),
 		guard.WithBinaryLinks(links),
+		guard.WithAdmissionCheck(func(rule daemonconfig.BinaryRule, resolved string, f *os.File,
+			key guard.GuardInodeKey, hash [32]byte) bool {
+			return vet.judge(r, rule, resolved, f, key, hash)
+		}),
 	}
-	if headless && blockedOnly {
-		opts = append(opts, guard.WithoutAllowedEvents())
-	}
+	opts = append(opts, eventFilterOptions()...)
 	if r.ReadOnly {
 		opts = append(opts, guard.WithChmodDropWrite())
 	}
@@ -1076,7 +1083,7 @@ func buildConcurrency(n int) int {
 // guard, incl. every member of a shared-vault `watch:` group, attached). On failure every guard
 // built so far (a later resource can finish before an earlier one fails) is detached, so none stays
 // attached across an error return.
-func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.GuardRepository, error) {
+func buildGuards(resources []daemonconfig.Resource, pin pinCfg, vet *binaryVetter) ([]repository.GuardRepository, error) {
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")
 	if err != nil {
 		return nil, fmt.Errorf("resolving daemon executable: %w", err)
@@ -1106,7 +1113,7 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg) ([]repository.Gu
 			if i == 0 {
 				deviceSet = rawDevices
 			}
-			built[i], errs[i] = buildOneGuard(&resources[i], self, deviceSet, pin, system[i])
+			built[i], errs[i] = buildOneGuard(&resources[i], self, deviceSet, pin, system[i], vet)
 		}(i)
 	}
 	wg.Wait()
@@ -1192,18 +1199,34 @@ func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
 	return out
 }
 
-// notifySystemdReady tells systemd the daemon is up (NOTIFY_SOCKET handshake).
+// eventFilterOptions drops, before they queue, allowed events nobody reads: all of them under
+// headless --blocked-only, and the daemon's own I/O always. Denials are always queued.
+func eventFilterOptions() []guard.GuardOption {
+	opts := []guard.GuardOption{guard.WithoutOwnAllowedEvents()}
+	if headless && blockedOnly {
+		opts = append(opts, guard.WithoutAllowedEvents())
+	}
+	return opts
+}
+
+// notifySystemdReady sends READY=1: the unit is Type=notify, so logins and cron, ordered after it,
+// wait until every guard is attached.
 func notifySystemdReady() {
 	socket := os.Getenv("NOTIFY_SOCKET")
 	if socket == "" {
 		return
 	}
-	conn, err := (&net.Dialer{}).DialContext(context.Background(), "unixgram", socket)
-	if err != nil {
-		return
+	if strings.HasPrefix(socket, "@") {
+		socket = "\x00" + socket[1:] // abstract namespace
 	}
-	defer conn.Close()
-	_, _ = conn.Write([]byte("READY=1\n"))
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "unixgram", socket)
+	if err == nil {
+		defer conn.Close()
+		_, err = conn.Write([]byte("READY=1\n"))
+	}
+	if err != nil {
+		log.Warnf("daemon: could not notify systemd of readiness (%v) — the unit's start will time out", err)
+	}
 }
 
 func writePidFile() error {
@@ -1232,10 +1255,7 @@ func writeEvent(w io.Writer, blockedOnly bool, uidr *common.UIDResolver, ev *use
 	resource := logging.SanitizeText(ev.Resource)
 	path := logging.SanitizeText(ev.Event.Path)
 	comm := logging.SanitizeText(ev.Event.Comm)
-	op := ev.Event.Type.String()
-	if ev.Event.Process != "" {
-		op = ev.Event.Process // PTRACE / TRACED_EXEC: no file involved
-	}
+	op := ev.Event.Op()
 	if ev.Event.Blocked {
 		// commFullPath is best-effort telemetry, not identity: comm/pid come off the kernel event
 		// and can be spoofed or recycled before this readlink (see checkCommSpoof); enforcement

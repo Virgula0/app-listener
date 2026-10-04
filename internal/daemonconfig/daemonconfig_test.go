@@ -3,6 +3,7 @@ package daemonconfig
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -1482,5 +1483,162 @@ func TestInspectorsBlockBounded(t *testing.T) {
 	}
 	if _, err := Load(writeConfig(t, b.String())); err == nil {
 		t.Fatal("more than MaxInspectors entries must be refused")
+	}
+}
+
+func TestElectronAppsBlockParsed(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Load(writeConfig(t, "[electron_apps]\n\"/usr/lib/signal-desktop/app.asar\"\n/usr/lib/x/../obsidian/app.asar\n\n"+
+		"[watch "+dir+"]\nneed_encryption: false\n/usr/bin/ssh\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := strings.Join(cfg.ElectronApps, ","); got != "/usr/lib/signal-desktop/app.asar,/usr/lib/obsidian/app.asar" {
+		t.Fatalf("ElectronApps = %s", got)
+	}
+	if len(cfg.Resources) != 1 || len(cfg.Resources[0].Binaries) != 1 {
+		t.Fatalf("an [electron_apps] block must not touch the watch sections: %+v", cfg.Resources)
+	}
+}
+
+func TestElectronAppsBlockRejectsMalformedLines(t *testing.T) {
+	for name, line := range map[string]string{
+		"relative":     "lib/app.asar",
+		"trailing arg": "/usr/lib/a/app.asar --x",
+		"duplicate":    "/usr/lib/a/app.asar\n/usr/lib/a/app.asar",
+		"too long":     "/usr/lib/" + strings.Repeat("a", MaxElectronAppLen) + "/app.asar",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, "[electron_apps]\n"+line+"\n")); err == nil {
+				t.Fatalf("%q must be refused", line)
+			}
+		})
+	}
+	var b strings.Builder
+	b.WriteString("[electron_apps]\n")
+	for i := 0; i <= MaxElectronApps; i++ {
+		b.WriteString("/usr/lib/a" + strings.Repeat("x", i%30) + "/" + strings.Repeat("y", i/30+1) + "\n")
+	}
+	if _, err := Load(writeConfig(t, b.String())); err == nil {
+		t.Fatal("more than MaxElectronApps entries must be refused")
+	}
+}
+
+// A lib_dir inside a grouped vault (Discord's app-* dirs) is invisible while the vault is locked:
+// kept as a read-only PathPending resource of that vault, and dropped (not fatal) if the app
+// version is gone after unlock.
+func TestLoadLibDirInLockedVaultDeferred(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(t.TempDir(), "Discord")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app, gone := root+"/app-1.0.160", root+"/app-1.0.159"
+	cfg, err := Load(writeConfig(t, `[watch `+root+`]
+watch: `+root+`/Local Storage
+`+bin+`
+need_encryption: true
+lib_dir `+app+`
+lib_dir `+gone+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var libs []Resource
+	for _, r := range cfg.Resources {
+		if r.ReadOnly {
+			libs = append(libs, r)
+		}
+	}
+	if len(libs) != 2 {
+		t.Fatalf("want both vault lib_dirs deferred, got %+v", cfg.Resources)
+	}
+	for _, r := range libs {
+		if !r.PathPending || r.EncryptionRoot != root || !r.NeedEncryption {
+			t.Errorf("lib_dir %s: pending=%v root=%q enc=%v, want a pending member of the vault", r.Path,
+				r.PathPending, r.EncryptionRoot, r.NeedEncryption)
+		}
+		if len(r.Binaries) != 1 || r.Binaries[0].Path != bin {
+			t.Errorf("lib_dir %s: writers %+v, want the section's binary", r.Path, r.Binaries)
+		}
+	}
+
+	for _, d := range []string{root + "/Local Storage", app} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ResolvePendingPaths(cfg); err != nil {
+		t.Fatalf("a missing lib_dir must not fail the start: %v", err)
+	}
+	var paths []string
+	for _, r := range cfg.Resources {
+		if r.PathPending {
+			t.Errorf("%s still pending", r.Path)
+		}
+		paths = append(paths, r.Path)
+	}
+	if !slices.Contains(paths, app) || slices.Contains(paths, gone) {
+		t.Errorf("resources after unlock = %v, want %s kept and %s dropped", paths, app, gone)
+	}
+}
+
+// Parsed while the vault is unlocked (a reload), the same lib_dir joins the vault's lifecycle.
+func TestLoadLibDirInUnlockedVaultJoinsVault(t *testing.T) {
+	root := t.TempDir()
+	app := root + "/app-1.0.160"
+	for _, d := range []string{root + "/Local Storage", app} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := Load(writeConfig(t, `[watch `+root+`]
+watch: `+root+`/Local Storage
+/usr/bin/example
+need_encryption: true
+lib_dir `+app+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, r := range cfg.Resources {
+		if r.Path == app && (!r.ReadOnly || r.EncryptionRoot != root || !r.NeedEncryption || r.PathPending) {
+			t.Errorf("lib_dir %+v, want a resolved read-only member of the vault", r)
+		}
+	}
+}
+
+// The installer writes catalog lib_dirs in the app's [libraries] block, apart from its watch
+// section: a lib_dir there inside an encrypted group's vault is deferred with that vault too.
+func TestLoadLibrariesBlockLibDirInLockedVault(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(t.TempDir(), "Discord")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app := root + "/app-1.0.160"
+	cfg, err := Load(writeConfig(t, `[watch `+root+`]
+watch: `+root+`/Local Storage
+`+bin+`
+need_encryption: true
+
+[libraries "Discord"]
+lib_dir `+app+`
+lib_binary `+bin+`
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var lib *Resource
+	for i := range cfg.Resources {
+		if cfg.Resources[i].Path == app {
+			lib = &cfg.Resources[i]
+		}
+	}
+	if lib == nil || !lib.ReadOnly || !lib.PathPending || lib.EncryptionRoot != root || !lib.NeedEncryption {
+		t.Fatalf("lib_dir in a locked vault not deferred with it: %+v", cfg.Resources)
+	}
+	if len(lib.Binaries) != 1 || lib.Binaries[0].Path != bin {
+		t.Errorf("lib_dir writers = %+v, want the block's lib_binary", lib.Binaries)
 	}
 }

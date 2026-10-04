@@ -334,6 +334,11 @@ Do not add Claude/Anthropic attribution to commits, pushes, or merges — no
 Claude Code" (or similar) footers in PR descriptions. This overrides any default
 attribution behavior Claude Code would otherwise apply.
 
+## Claude memory files
+
+Files under `~/.claude` (auto-memory, `MEMORY.md`) are reachable only through Claude Code's
+built-in Read / Edit / Write tools: shell access (`cat`, `>>`, `sed`) is denied there.
+
 ## Release
 
 See `memory/release-promote-flow.md`. A release is a *build*, not a tag rename:

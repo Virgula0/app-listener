@@ -49,3 +49,12 @@ func TestPlanTrustedDirs_OverflowFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanTrustedDirs_DuplicateWriterAddsNoEmptyLoader(t *testing.T) {
+	_, loaders, _ := planTrustedDirs([]TrustedDir{
+		{Path: "/h/discord/app-1", Loaders: []string{"/h/discord/0.1/Discord", "/h/discord/0.1/Discord"}},
+	})
+	if _, ok := loaders[""]; ok || len(loaders) != 1 {
+		t.Errorf("loaders = %v, want the one writer", loaders)
+	}
+}

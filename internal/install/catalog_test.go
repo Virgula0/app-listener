@@ -836,3 +836,42 @@ func TestSystemWhitelistKeepsOnlyAbsolutePatterns(t *testing.T) {
 		t.Fatalf("SystemWhitelist = %+v, want the two absolute patterns with their events", got)
 	}
 }
+
+// App code and updater inputs that whitelisted processes run or trust are read-only to everything
+// but the app (issue #79); npm is gone because its whitelist was node itself.
+func TestCatalogGuardsAppCodeAndUpdaterInputs(t *testing.T) {
+	byName := map[string]*CandidateDir{}
+	for i := range Catalog {
+		byName[Catalog[i].Name] = &Catalog[i]
+	}
+	if _, ok := byName["npm data"]; ok {
+		t.Error("the npm entry whitelists node: any `node -e` reads it")
+	}
+	wantLibDirs := map[string]string{
+		"Discord":                 ".config/discord/app-*",
+		"VS Code config":          ".vscode",
+		"VS Code Insiders config": ".vscode-insiders",
+		"VSCodium config":         ".vscode-oss",
+		"JetBrains IDEs":          ".local/share/JetBrains",
+		"Steam":                   ".local/share/Steam/package",
+	}
+	for name, dir := range wantLibDirs {
+		e := byName[name]
+		if e == nil {
+			t.Errorf("catalog entry %q missing", name)
+			continue
+		}
+		if !slices.Contains(e.LibDirRelPaths, dir) {
+			t.Errorf("%s: %s is not a read-only lib_dir: %v", name, dir, e.LibDirRelPaths)
+		}
+	}
+	d := byName["Discord"]
+	for _, in := range []string{"%HOME%/.config/discord/settings.json", "%HOME%/.config/discord/installer.db"} {
+		if !slices.Contains(d.ReservedNames, in) {
+			t.Errorf("Discord updater input %s is not reserved: %v", in, d.ReservedNames)
+		}
+	}
+	if !slices.Contains(d.LibDirWriters, "/usr/share/discord/updater_bootstrap") {
+		t.Errorf("Discord's bootstrap must stay able to create the first app dir: %v", d.LibDirWriters)
+	}
+}

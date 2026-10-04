@@ -21,10 +21,14 @@ import (
 	"github.com/Virgula0/app-listener/internal/logging"
 )
 
-// guard_trusted_files value flags — must match guard_trust.bpf.c.
+// guard_trusted_files flags — must match guard_trust.bpf.c.
 const (
-	trustedBinary uint8 = 1
-	trustedLib    uint8 = 2
+	trustedBinary   uint8 = 1
+	trustedLib      uint8 = 2
+	trustedNode     uint8 = 4
+	trustedJVM      uint8 = 8
+	trustedChromium uint8 = 16
+	trustedElectron uint8 = 32
 )
 
 // trust_event.kind — must match guard_trust.bpf.c.
@@ -33,6 +37,7 @@ const (
 	trustWriteblock uint32 = 1
 	trustPlant      uint32 = 2
 	trustSuspect    uint32 = 3
+	trustLaunch     uint32 = 4
 )
 
 // TrustGuard owns guard_trusted_files and the daemon-wide trusted-binary/library protections
@@ -48,6 +53,8 @@ type TrustGuard struct {
 	// ownerByPath: UpdaterPlan.Owners, for AllowReplacement.
 	ownerMu     sync.Mutex
 	ownerByPath map[string]uint64
+	// binaryStat: SetBinaryResolver; nil = ebpf.StatConfined. Guarded by ownerMu.
+	binaryStat statFunc
 	// guard_vouched_devs upkeep (trust_mounts.go).
 	mountMu   sync.Mutex
 	mountFd   int
@@ -61,6 +68,9 @@ type TrustGuard struct {
 	// reused inode number gains nothing from them. Cleared by SetTrusted, which re-derives every row.
 	retiredMu sync.Mutex
 	retired   map[GuardTrustInodeKey]trustRows
+	// appsMu guards apps: the LAUNCH_APP keys in trust_launch (SetElectronApps).
+	appsMu sync.Mutex
+	apps   map[string]bool
 }
 
 // trustRows is one key's rows across guard_trusted_files and the bit maps (trustBitMaps order).
@@ -126,8 +136,17 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 		}
 		flags[GuardInodeKey{Dev: dev, Ino: ino}] |= flag
 	}
+	// One open per binary: the runtime class is read from the inode the key names.
 	for _, b := range binaries {
-		add(b, trustedBinary)
+		f, err := ebpf.OpenConfined(b)
+		if err != nil {
+			log.Warnf("trust guard: skipping unresolvable %s: %v", b, err)
+			continue
+		}
+		if dev, ino, err := ebpf.StatFile(f); err == nil {
+			flags[GuardInodeKey{Dev: dev, Ino: ino}] |= trustedBinary | runtimeClass(f, b)
+		}
+		f.Close()
 	}
 	for _, l := range libs {
 		add(l, trustedLib)
@@ -248,7 +267,8 @@ func planTrustedDirs(dirs []TrustedDir) (roots, loaders map[string]uint64, refus
 		}
 		set := append([]string(nil), d.Loaders...)
 		sort.Strings(set)
-		key := strings.Join(slices.Compact(set), "\x00")
+		set = slices.Compact(set) // zeroes the tail it drops: never range the uncompacted slice
+		key := strings.Join(set, "\x00")
 		bit, ok := bitOf[key]
 		if !ok {
 			if len(bitOf) >= 63 {
@@ -372,6 +392,10 @@ func (t *TrustGuard) Start() error {
 		t.detachLinks()
 		return err
 	}
+	if err := t.attachLaunchScan(); err != nil {
+		t.detachLinks()
+		return err
+	}
 	t.attachMemfdProvenance()
 	if err := t.startMountWatch(); err != nil {
 		t.detachLinks()
@@ -455,6 +479,11 @@ func (t *TrustGuard) readLoop() {
 		case trustSuspect:
 			logTrustDenied("PRELOADED", comm, ev.PID, ev.UID, path,
 				"this process mapped untrusted code before its binary was whitelisted; restart it")
+		case trustLaunch:
+			logTrustDenied("LAUNCH", comm, ev.PID, ev.UID, path,
+				"this process was started with an env var or flag that runs other code in it "+
+					"(NODE_OPTIONS, ELECTRON_RUN_AS_NODE, JAVA_TOOL_OPTIONS, --inspect, --remote-debugging-port, "+
+					"--load-extension); start it without")
 		default:
 			logTrustDenied("LIBLOAD", comm, ev.PID, ev.UID, path,
 				"a whitelisted binary tried to exec-map an untrusted file "+

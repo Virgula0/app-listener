@@ -9,6 +9,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
+	"github.com/Virgula0/app-listener/internal/binledger"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/systemd"
@@ -36,6 +37,8 @@ func revertSystemFiles() error {
 		systemd.InstallBinaryPath,
 		systemd.SystemConfigPath,
 		editprotected.HashFile,
+		binledger.DefaultPath,
+		binledger.JournalPath(binledger.DefaultPath),
 	}, systemd.LegacyCatalogRefreshFiles()...) {
 		if _, err := os.Lstat(path); os.IsNotExist(err) {
 			continue

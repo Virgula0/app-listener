@@ -721,10 +721,11 @@ need_encryption: false
 	s.exec(c, []string{"rmdir", discordDir + "/direct"})
 
 	// Attack, as a non-whitelisted process: the binaries live outside every reserved root, and only
-	// an unreserved directory name (a symlink) is created inside the user's tree.
+	// an unreserved directory name (a symlink) is created inside the user's tree. Not app-*: that is
+	// Discord's lib_dir name, reserved.
 	code, out := s.exec(c, []string{"sh", "-c",
 		"mkdir -p /tmp/x /tmp/y && cp /exploits/xres_move /tmp/x/Discord && cp /exploits/xres_move /tmp/y/claude" +
-			" && ln -s /tmp/x " + discordDir + "/app-0.0.999 && ln -s /tmp/y /root/.local/bin 2>&1"})
+			" && ln -s /tmp/x " + discordDir + "/0.0.999 && ln -s /tmp/y /root/.local/bin 2>&1"})
 	s.Require().Equalf(0, code, "planting the symlinks: %s", out)
 
 	for _, tc := range []struct{ bin, secret, marker string }{
