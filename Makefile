@@ -4,6 +4,9 @@ BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
 GEN_DIR     = build/generated
 BUILD_IMAGE = app-listener-builder:local
+# Host dirs 'make build' keeps Go's module and build caches in across runs. Go keys the build cache on
+# content, so changed sources always recompile; only downloads and unchanged packages are reused.
+BUILD_CACHE ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/app-listener-build
 
 # VERSION is injected into the binary by the release workflow
 # (pre-<date>-<sha>); when empty the embedded constants.Version default
@@ -28,6 +31,10 @@ require-kernel51:
 # pinned to the caller's uid:gid (--user); under rootless that flag maps to an
 # unwritable subordinate uid, so it is dropped and the container's namespaced
 # root — which already maps back to the host user — writes the artifacts.
+# The Go caches are bind-mounted from $(BUILD_CACHE), created here by the host
+# user, so they are writable under both for the same reason (a named volume
+# would be created root-owned and refuse the rootful --user). -modcacherw keeps
+# the module cache deletable with a plain rm (make clean-build-cache).
 build:
 	@if ! command -v docker >/dev/null 2>&1; then \
 		echo "ERROR: docker not found — 'make build' needs Docker (rootful or rootless)"; \
@@ -47,7 +54,12 @@ build:
 		echo "       sudo chown -R $$(id -u):$$(id -g) $(OUTPUT_DIR)"; \
 		exit 1; \
 	fi
-	@mkdir -p $(OUTPUT_DIR)
+	@mkdir -p $(OUTPUT_DIR) "$(BUILD_CACHE)/gomod" "$(BUILD_CACHE)/gocache"
+	@if [ ! -w "$(BUILD_CACHE)/gomod" ] || [ ! -w "$(BUILD_CACHE)/gocache" ]; then \
+		echo "ERROR: $(BUILD_CACHE) is not writable by user $$(id -u) — fix ownership with:"; \
+		echo "       sudo chown -R $$(id -u):$$(id -g) $(BUILD_CACHE)"; \
+		exit 1; \
+	fi
 	$(MAKE) build-image
 	@if docker info -f '{{println .SecurityOptions}}' 2>/dev/null | grep -q rootless; then \
 		user_arg=""; \
@@ -60,11 +72,14 @@ build:
 	docker run --rm \
 		-v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
 		-v "$$PWD:/app/app-listener:rw" \
+		-v "$(BUILD_CACHE)/gomod:/cache/gomod:rw" \
+		-v "$(BUILD_CACHE)/gocache:/cache/gocache:rw" \
 		$$user_arg \
 		-e HOME=/tmp \
-		-e GOCACHE=/tmp/.gocache \
+		-e GOCACHE=/cache/gocache \
 		-e GOPATH=/tmp/gopath \
-		-e GOMODCACHE=/tmp/gopath/pkg/mod \
+		-e GOMODCACHE=/cache/gomod \
+		-e GOFLAGS=-modcacherw \
 		-e VERSION="$(VERSION)" \
 		-w /app/app-listener \
 		$(BUILD_IMAGE) \
@@ -278,6 +293,11 @@ deploy-down:
 tidy:
 	go mod tidy
 .PHONY: tidy
+
+# Drops make build's Go module and build caches (the next build re-downloads).
+clean-build-cache:
+	rm -rf "$(BUILD_CACHE)"
+.PHONY: clean-build-cache
 
 clean:
 	rm -rf $(OUTPUT_DIR) build/test build/pprof \
