@@ -273,6 +273,7 @@ sudo app-listener edit-protected --set-password         # set/rotate the passwor
 sudo app-listener edit-protected --clear-password       # remove it (disables live mode)
 sudo app-listener edit-protected --forward -w <bin> [-e EVENTS]  # temporary access for other binaries (see below)
 sudo app-listener edit-protected --timeout-session 10m  # revoke a live session after 10 idle minutes (default 30m)
+sudo app-listener edit-protected --edit-config         # edit the running daemon.conf; saving reloads it (live mode)
 
 # non-interactive live write (automation): password from $APP_LISTENER_EDIT_PASSWORD
 echo "new contents" | sudo APP_LISTENER_EDIT_PASSWORD=… \
@@ -295,6 +296,10 @@ Things to know before admitting a binary:
 - Revocation re-checks already-open files on their next read or write, but memory a process already mapped stays mapped.
 - Identity is the binary's inode, resolved by the daemon. A binary already whitelisted on a resource is left untouched by `-w`, and one that isn't is untouched by `-b`. The daemon's own binary, inspectors and tamper-demoted binaries are refused.
 - If the daemon is killed mid-grant, its pinned guards keep enforcing *with* the temporary allows. `daemon --lockdown` (ExecStopPost) and the next start strip them using `/etc/app-listener/temp-grants.json`, written before any allow.
+
+**`--edit-config`** (live mode only, same password) opens the running daemon's `daemon.conf` in the editor. Ctrl+S shows the diff and asks for confirmation; then the daemon writes the file and reloads, exactly like `systemctl reload`. If the reload fails (for example the new configuration has no `[watch]` section, or needs more guard slots than are free), the daemon keeps running the previous configuration, puts the previous `daemon.conf` back, and tells you why; you can edit again or discard. If the file changed while you were editing, nothing is overwritten. `--content-file <file>` replaces the configuration without the editor (password from `$APP_LISTENER_EDIT_PASSWORD`). Binaries added this way are vetted like any reload: a binary that isn't root-placed still needs `app-listener trust-binaries`.
+
+The editors (edit-protected, `--edit-config`, the installer's config step) and the diff/changelog viewers open at the first line. Tab / Shift+Tab indent and dedent by four spaces, PgUp/PgDn page, and Ctrl+←/→ jump between words and punctuation, across lines.
 
 Before exiting, both modes audit the edited tree against `daemon.conf` and warn (advisory, acknowledged once) about anything that would sit outside the daemon's protection: a file created outside every guarded watch path of a grouped vault, a new symlink, a world-readable new secret, a freshly dropped executable.
 

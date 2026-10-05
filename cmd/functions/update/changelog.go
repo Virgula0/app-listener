@@ -7,6 +7,8 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Virgula0/app-listener/internal/codeedit"
 )
 
 const (
@@ -41,15 +43,10 @@ type changelogModel struct {
 }
 
 func newChangelogModel(title, notes string) changelogModel {
-	ta := textarea.New()
-	ta.SetValue(notes)
+	ta := codeedit.New()
 	ta.SetHeight(24)
-	ta.ShowLineNumbers = true
 	ta.Focus()
-	ta.KeyMap.LineNext.SetKeys("down", "ctrl+n")
-	ta.KeyMap.LinePrevious.SetKeys("up", "ctrl+p")
-	ta.KeyMap.CharacterBackward.SetKeys("left")
-	ta.KeyMap.CharacterForward.SetKeys("right")
+	codeedit.SetText(&ta, notes)
 	return changelogModel{textarea: ta, title: title}
 }
 
@@ -66,6 +63,9 @@ func (m *changelogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "esc", "enter", "ctrl+q":
 			return m, tea.Quit
+		}
+		if codeedit.Navigate(&m.textarea, msg) {
+			return m, nil
 		}
 	}
 	var cmd tea.Cmd

@@ -11,11 +11,13 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Virgula0/app-listener/internal/codeedit"
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
@@ -156,11 +158,7 @@ func newFileEditModel(root string) *fileEditModel {
 		leftW:  40,
 		rightW: 39,
 	}
-	m.editor = textarea.New()
-	m.editor.ShowLineNumbers = true
-	// Word jumps are the vim-style ctrl+left/right the legend promises (alt+ defaults stay).
-	m.editor.KeyMap.WordBackward.SetKeys("ctrl+left", "alt+left", "alt+b")
-	m.editor.KeyMap.WordForward.SetKeys("ctrl+right", "alt+right", "alt+f")
+	m.editor = codeedit.New()
 	m.editor.Blur()
 
 	vault, vaultErr := openVault(root)
@@ -335,7 +333,9 @@ func (m *fileEditModel) updateEditKey(msg tea.KeyMsg) (textarea.Model, tea.Cmd) 
 		m.mode = modeNav
 	default:
 		var cmd tea.Cmd
-		m.editor, cmd = m.editor.Update(msg)
+		if !codeedit.Edit(&m.editor, msg) {
+			m.editor, cmd = m.editor.Update(msg)
+		}
 		if m.editor.Value() != m.original {
 			m.dirty = true
 		}
@@ -591,7 +591,7 @@ func (m *fileEditModel) previewFile(path string) error {
 	}
 	m.editPath = path
 	m.original = string(data)
-	m.editor.SetValue(m.original)
+	codeedit.SetText(&m.editor, m.original)
 	m.previewOK = true
 	m.dirty = false
 	if m.mode != modeEdit {
@@ -638,6 +638,7 @@ func (m *fileEditModel) beginCreate(kind fileKind) {
 		dir = n.parent.path
 	}
 	m.input = textinput.New()
+	m.input.Cursor.SetMode(cursor.CursorStatic)
 	m.input.Width = max(m.paneWidth()-12, 4)
 	m.input.Placeholder = "name"
 	m.input.Focus()
@@ -728,6 +729,7 @@ func (m *fileEditModel) beginChmod() {
 	}
 	m.chmodPath = n.path
 	m.chmodInput = textinput.New()
+	m.chmodInput.Cursor.SetMode(cursor.CursorStatic)
 	m.chmodInput.Width = max(m.paneWidth()-12, 4)
 	m.chmodInput.Prompt = "mode: "
 	m.chmodInput.Placeholder = "0644"
@@ -1058,6 +1060,8 @@ var legendHints = map[fileEditMode][]hint{
 		{"ctrl+s", "save & close"},
 		{"esc", "close"},
 		{"ctrl+←/→", "word jump"},
+		{"pgup/pgdn", "page"},
+		{"tab/⇧tab", "indent"},
 	},
 	modeInput: {
 		{"↵", "create"},

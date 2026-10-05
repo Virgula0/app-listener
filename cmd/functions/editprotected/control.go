@@ -37,6 +37,9 @@ const ControlSocket = "/run/app-listener-daemon.control"
 //	client -> PING\n …                                 (activity: resets the idle timeout)
 //	client -> END\n                                   (session finished)
 //
+// or a configuration edit: CONFIG -> OK <n>\n<daemon.conf>; then END, or PUT <m>\n<bytes> -> OK |
+// ERR (the daemon reloads it, and restores the file if the reload fails).
+//
 // The password is checked before any resource path is disclosed. The server revokes the grant on
 // EOF or after the idle timeout with neither a PING nor (FORWARD) a granted binary's event, and
 // closes the connection when it revokes on its own.
@@ -48,6 +51,8 @@ const (
 	ctrlEvent   = "EVENT"
 	ctrlPing    = "PING"
 	ctrlEnd     = "END"
+	ctrlConfig  = "CONFIG"
+	ctrlPut     = "PUT"
 	ctrlOK      = "OK"
 	ctrlErr     = "ERR"
 )
@@ -58,6 +63,9 @@ const (
 	SessionTimeoutDefault = 30 * time.Minute
 	SessionTimeoutMax     = 24 * time.Hour
 )
+
+// configReloadTimeout bounds the wait for a PUT's reload: each guard attach is a verifier pass.
+const configReloadTimeout = 5 * time.Minute
 
 // controlIOTimeout bounds each control-socket read/write.
 const controlIOTimeout = 10 * time.Second
@@ -196,6 +204,54 @@ func (s *liveSession) Select(resource string) error {
 		return errors.New(msg)
 	}
 	return fmt.Errorf("unexpected select response %q", line)
+}
+
+// Config fetches the daemon's daemon.conf. The daemon then waits for PutConfig or End.
+func (s *liveSession) Config() ([]byte, error) {
+	_ = s.conn.SetDeadline(time.Now().Add(controlIOTimeout))
+	if _, err := fmt.Fprintf(s.conn, "%s\n", ctrlConfig); err != nil {
+		return nil, fmt.Errorf("sending the config request: %w", err)
+	}
+	line, err := s.readLine()
+	if err != nil {
+		return nil, fmt.Errorf("reading the config response: %w", err)
+	}
+	if msg, isErr := parseErr(line); isErr {
+		return nil, errors.New(msg)
+	}
+	rest, ok := strings.CutPrefix(line, ctrlOK+" ")
+	n, err := strconv.Atoi(rest)
+	if !ok || err != nil || n < 0 {
+		return nil, fmt.Errorf("unexpected config response %q", line)
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(s.r, body); err != nil {
+		return nil, fmt.Errorf("reading the configuration: %w", err)
+	}
+	s.selected = true // End tells the daemon nothing is coming
+	return body, nil
+}
+
+// PutConfig sends the new daemon.conf; a nil error means the daemon reloaded it. On a refusal
+// the daemon's file and running configuration are unchanged.
+func (s *liveSession) PutConfig(next []byte) error {
+	// The daemon reloads before it answers: every guard is rebuilt.
+	_ = s.conn.SetDeadline(time.Now().Add(configReloadTimeout))
+	if _, err := fmt.Fprintf(s.conn, "%s %d\n%s", ctrlPut, len(next), next); err != nil {
+		return fmt.Errorf("sending the configuration: %w", err)
+	}
+	s.selected = false
+	line, err := s.readLine()
+	if err != nil {
+		return fmt.Errorf("reading the daemon's answer: %w", err)
+	}
+	if line == ctrlOK {
+		return nil
+	}
+	if msg, isErr := parseErr(line); isErr {
+		return errors.New(msg)
+	}
+	return fmt.Errorf("unexpected answer %q", line)
 }
 
 func (s *liveSession) timeoutLine() string {

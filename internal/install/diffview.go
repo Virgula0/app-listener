@@ -10,6 +10,8 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/pmezard/go-difflib/difflib"
+
+	"github.com/Virgula0/app-listener/internal/codeedit"
 )
 
 // UnifiedDiff renders a unified diff between two file contents, labeled
@@ -68,15 +70,10 @@ type diffModel struct {
 }
 
 func newDiffModel(title, diff string) diffModel {
-	ta := textarea.New()
-	ta.SetValue(diff)
+	ta := codeedit.New()
 	ta.SetHeight(24)
-	ta.ShowLineNumbers = true
 	ta.Focus()
-	ta.KeyMap.LineNext.SetKeys("down", "ctrl+n")
-	ta.KeyMap.LinePrevious.SetKeys("up", "ctrl+p")
-	ta.KeyMap.CharacterBackward.SetKeys("left")
-	ta.KeyMap.CharacterForward.SetKeys("right")
+	codeedit.SetText(&ta, diff)
 	return diffModel{textarea: ta, title: title}
 }
 
@@ -93,6 +90,9 @@ func (m *diffModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "esc", "enter", "ctrl+q":
 			return m, tea.Quit
+		}
+		if codeedit.Navigate(&m.textarea, msg) {
+			return m, nil
 		}
 	}
 	var cmd tea.Cmd

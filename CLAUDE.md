@@ -61,7 +61,10 @@ every change to enforcement paths as security-sensitive:
   revoked on disconnect / SIGHUP / an idle timeout (`TIMEOUT`, default 30m, daemon-capped at
   24h) that only client `PING`s and, for `FORWARD`, the granted binaries' own events reset.
   `FORWARD` streams those events (`EVENT` lines, via `Guard.SetEventTap`, matched by
-  `/proc/<pid>/exe` inode for display only — never a policy input). The password hash
+  `/proc/<pid>/exe` inode for display only — never a policy input). `CONFIG`
+  (`--edit-config`, `configedit.go`) is the other post-AUTH path: the daemon writes
+  daemon.conf only while it still holds what it sent (compare-and-swap), reloads, and puts
+  the old bytes back if the reload fails; refused while a grant session is active. The password hash
   (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded like `fscrypt.key`.
   Don't loosen any of: the peer-exe check, AUTH-before-disclosure, the single-session lock,
   the auth lockout, the `origin=install` guard on `--set-password`, the mask being restored

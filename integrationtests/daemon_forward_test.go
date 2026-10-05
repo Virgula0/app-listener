@@ -228,3 +228,40 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_IdleTimeout() {
 
 	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
 }
+
+// edit-protected --edit-config: a valid edit is written and reloaded live; one the reload refuses
+// leaves the running configuration and is rolled back on disk.
+func (s *IntegrationSuite) TestDaemon_EditProtected_EditConfig() {
+	c := s.forwardSetup()
+	defer c.Terminate(s.ctx)
+
+	const added = "[watch /protected]\nneed_encryption: false\n/usr/bin/head\n/usr/bin/cat\n"
+	editConfig := func(content string) (int, string) {
+		s.exec(c, []string{"sh", "-c", "printf '%s' " + shQuote(content) + " > /tmp/new.conf"})
+		return s.exec(c, []string{"sh", "-c", "APP_LISTENER_EDIT_PASSWORD=" + forwardPassword +
+			" /app-listener edit-protected --edit-config --content-file /tmp/new.conf 2>&1"})
+	}
+
+	s.requireRead(c, "cat /protected/secret", false, "baseline: cat is not whitelisted")
+	code, out := editConfig(added)
+	s.Require().Equalf(0, code, "--edit-config: %s", out)
+	s.Require().Contains(out, "saved and reloaded")
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Equal(added, conf)
+	s.requireRead(c, "cat /protected/secret", true, "cat after the live config edit")
+
+	// Parses, but the daemon can't run it: no [watch] section.
+	code, out = editConfig("# nothing to guard\n")
+	s.Require().NotEqualf(0, code, "an unloadable configuration must be refused: %s", out)
+	s.Require().Containsf(out, "restored", "%s", out)
+	_, conf = s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Equal(added, conf, "a refused edit must leave daemon.conf as it was")
+	s.requireRead(c, "cat /protected/secret", true, "cat: the running configuration is unchanged")
+
+	code, out = s.exec(c, []string{"sh", "-c", "APP_LISTENER_EDIT_PASSWORD=wrong-Pass-1234" +
+		" /app-listener edit-protected --edit-config --content-file /tmp/new.conf 2>&1"})
+	s.Require().NotEqualf(0, code, "a wrong password must be refused: %s", out)
+	s.Require().Contains(out, "authentication failed")
+
+	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
+}

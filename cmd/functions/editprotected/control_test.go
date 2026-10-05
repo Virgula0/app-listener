@@ -2,6 +2,7 @@ package editprotected
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -45,5 +46,49 @@ func TestLiveSessionWatchAndPinger(t *testing.T) {
 	case <-ended:
 	case <-time.After(2 * time.Second):
 		t.Fatal("a closed connection did not end the watch")
+	}
+}
+
+func TestLiveSessionConfigAndPut(t *testing.T) {
+	client, server := net.Pipe()
+	s := &liveSession{conn: client, r: bufio.NewReader(client)}
+	sr := bufio.NewReader(server)
+	go func() {
+		line, _ := sr.ReadString('\n')
+		if line != "CONFIG\n" {
+			_, _ = server.Write([]byte("ERR bad request\n"))
+			return
+		}
+		_, _ = server.Write([]byte("OK 5\nhello"))
+		put, _ := sr.ReadString('\n')
+		body := make([]byte, 3)
+		_, _ = io.ReadFull(sr, body)
+		if put == "PUT 3\n" && string(body) == "bye" {
+			_, _ = server.Write([]byte("ERR the reload failed: boom — restored\n"))
+		}
+	}()
+	got, err := s.Config()
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("Config = %q, %v", got, err)
+	}
+	if err := s.PutConfig([]byte("bye")); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("PutConfig err = %v, want the daemon's refusal", err)
+	}
+}
+
+func TestValidateFlagsEditConfig(t *testing.T) {
+	t.Cleanup(func() { editConfigFlag, forwardFlag, whitelistFlags, resourceFlags = false, false, nil, nil })
+	timeoutSession = SessionTimeoutDefault
+	editConfigFlag = true
+	if err := validateFlags(); err != nil {
+		t.Fatalf("--edit-config alone: %v", err)
+	}
+	forwardFlag, whitelistFlags = true, []string{"/bin/x"}
+	if err := validateFlags(); err == nil {
+		t.Fatal("--edit-config --forward accepted")
+	}
+	forwardFlag, whitelistFlags, resourceFlags = false, nil, []string{"/r"}
+	if err := validateFlags(); err == nil {
+		t.Fatal("--edit-config --resource accepted")
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Virgula0/app-listener/internal/codeedit"
 )
 
 // ErrEditCanceled is returned by EditText when the user aborts the
@@ -53,18 +55,11 @@ type editorModel struct {
 }
 
 func newEditorModel(title, initial string) editorModel {
-	ta := textarea.New()
-	ta.SetValue(initial)
+	ta := codeedit.New()
 	ta.SetHeight(24)
-	ta.ShowLineNumbers = true
 	ta.Placeholder = "Type your configuration here..."
 	ta.Focus()
-	ta.KeyMap.LineNext.SetKeys("down", "ctrl+n")
-	ta.KeyMap.LinePrevious.SetKeys("up", "ctrl+p")
-	ta.KeyMap.CharacterBackward.SetKeys("left")
-	ta.KeyMap.CharacterForward.SetKeys("right")
-	ta.KeyMap.WordBackward.SetKeys("ctrl+left", "alt+left", "alt+b")
-	ta.KeyMap.WordForward.SetKeys("ctrl+right", "alt+right", "alt+f")
+	codeedit.SetText(&ta, initial)
 	return editorModel{textarea: ta, title: title}
 }
 
@@ -86,6 +81,9 @@ func (m *editorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.canceled = true
 			return m, tea.Quit
 		}
+		if codeedit.Edit(&m.textarea, msg) {
+			return m, nil
+		}
 	}
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
@@ -101,7 +99,7 @@ func (m *editorModel) View() string {
 	b.WriteString("\n\n")
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color("240")).
-		Render("Ctrl+S save  ·  Esc cancel (no changes are kept)"))
+		Render("Ctrl+S save  ·  Esc cancel (no changes are kept)  ·  Ctrl+←/→ word  ·  PgUp/PgDn page  ·  Tab indent"))
 	b.WriteString("\n\n")
 	b.WriteString(m.textarea.View())
 	return b.String()

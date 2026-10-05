@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -54,6 +55,13 @@ const (
 //	client -> PING\n …                                 (activity)
 //	client -> END\n                                   (or EOF / idle timeout)
 //
+// or, after AUTH, a configuration edit (configedit.go):
+//
+//	client -> CONFIG\n
+//	server -> OK <n>\n<daemon.conf, n bytes>
+//	client -> END\n | PUT <m>\n<m bytes>
+//	server -> OK\n | ERR <reason>\n                    (reloaded | refused, file restored)
+//
 // The password is verified BEFORE any resource path is disclosed, so an unauthenticated caller
 // learns nothing about the protected directories.
 const (
@@ -64,6 +72,8 @@ const (
 	ctrlEvent   = "EVENT"
 	ctrlPing    = "PING"
 	ctrlEnd     = "END"
+	ctrlConfig  = "CONFIG"
+	ctrlPut     = "PUT"
 	// maxForwardResources / maxForwardBinaries bound one FORWARD request.
 	maxForwardResources = 64
 	maxForwardBinaries  = 32
@@ -79,6 +89,8 @@ type controlServer struct {
 	selfDev  uint64
 	selfIno  uint64
 	hashPath string
+	// configEditor: the manager's, nil until the reload exists.
+	configEditor func() *configEditor
 
 	mu        sync.Mutex
 	active    *editControlSession
@@ -126,6 +138,8 @@ type controlManager struct {
 	uc usecase.DaemonUseCase
 	mu sync.Mutex
 	cs *controlServer
+	// configEdit: set once the reload exists (setConfigEditor); nil until then.
+	configEdit atomic.Pointer[configEditor]
 }
 
 func newControlManager(uc usecase.DaemonUseCase) *controlManager {
@@ -156,7 +170,7 @@ func (m *controlManager) refresh() {
 	defer m.mu.Unlock()
 	switch {
 	case exists && m.cs == nil:
-		cs, startErr := startControlServer(m.uc)
+		cs, startErr := startControlServer(m.uc, m.configEdit.Load)
 		if startErr != nil {
 			log.Errorf("daemon: edit-protected control socket unavailable (live editing disabled): %v", startErr)
 			return
@@ -208,7 +222,7 @@ func (m *controlManager) close() {
 
 // startControlServer opens the control socket. The socket is 0600 and the
 // handler still verifies SO_PEERCRED and the peer executable per connection.
-func startControlServer(uc usecase.DaemonUseCase) (*controlServer, error) {
+func startControlServer(uc usecase.DaemonUseCase, configEditor func() *configEditor) (*controlServer, error) {
 	selfDev, selfIno, err := ebpf.StatInode("/proc/self/exe")
 	if err != nil {
 		return nil, fmt.Errorf("resolving own executable for the control socket: %w", err)
@@ -229,7 +243,8 @@ func startControlServer(uc usecase.DaemonUseCase) (*controlServer, error) {
 		return nil, fmt.Errorf("securing control socket %s: %w", editprotected.ControlSocket, chErr)
 	}
 
-	cs := &controlServer{uc: uc, ln: ln, selfDev: selfDev, selfIno: selfIno, hashPath: editprotected.HashFile}
+	cs := &controlServer{uc: uc, ln: ln, selfDev: selfDev, selfIno: selfIno, hashPath: editprotected.HashFile,
+		configEditor: configEditor}
 	go cs.acceptLoop()
 	log.Infof("daemon: edit-protected control socket ready at %s", editprotected.ControlSocket)
 	return cs, nil
@@ -304,12 +319,21 @@ func (cs *controlServer) handle(conn net.Conn) {
 		return
 	}
 
-	// Phase 2 — SELECT or FORWARD; the client has been navigating a picker.
+	cs.serveRequest(conn, reader)
+}
+
+// serveRequest is phase 2: SELECT or FORWARD (a grant session), or CONFIG; the client has been
+// navigating a picker.
+func (cs *controlServer) serveRequest(conn net.Conn, reader *bufio.Reader) {
 	_ = conn.SetDeadline(time.Now().Add(controlSelectTimeout))
 	req, err := readGrantRequest(reader)
 	if err != nil {
 		_ = cs.reply(conn, false, "malformed request")
 		log.Warnf("daemon: control: malformed grant request: %v", err)
+		return
+	}
+	if req.config {
+		cs.runConfigEdit(conn, reader)
 		return
 	}
 
@@ -478,6 +502,8 @@ type grantRequest struct {
 	resource string
 	forward  *forwardRequest
 	timeout  time.Duration
+	// config: CONFIG, an edit of daemon.conf (runConfigEdit), not a grant.
+	config bool
 }
 
 type forwardRequest struct {
@@ -520,6 +546,12 @@ func readGrantRequest(reader *bufio.Reader) (*grantRequest, error) {
 	}
 	fields := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 2)
 	switch fields[0] {
+	case ctrlConfig:
+		if len(fields) != 1 {
+			return nil, fmt.Errorf("expected bare %q", ctrlConfig)
+		}
+		req.config = true
+		return req, nil
 	case ctrlSelect:
 		if len(fields) != 2 || strings.TrimSpace(fields[1]) == "" {
 			return nil, fmt.Errorf("expected %q <resource-path>", ctrlSelect)
@@ -535,7 +567,7 @@ func readGrantRequest(reader *bufio.Reader) (*grantRequest, error) {
 		}
 		return req, nil
 	}
-	return nil, fmt.Errorf("expected %q or %q", ctrlSelect, ctrlForward)
+	return nil, fmt.Errorf("expected %q, %q or %q", ctrlSelect, ctrlForward, ctrlConfig)
 }
 
 func readForwardRequest(reader *bufio.Reader, header string) (*forwardRequest, error) {

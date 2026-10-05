@@ -33,6 +33,7 @@ var (
 	eventsFlags       []string
 	yesFlag           bool
 	timeoutSession    time.Duration
+	editConfigFlag    bool
 )
 
 // editPasswordEnv carries the password for the non-interactive live apply
@@ -61,6 +62,11 @@ Before exiting, both modes audit the edited tree against daemon.conf and
 warn about anything that would sit outside the daemon's protection (a file
 created outside every guarded watch path, a new symlink, a world-readable
 new secret, a freshly dropped executable).
+
+--edit-config edits the running daemon's daemon.conf (live mode only, same
+password): saving shows the diff, then the daemon writes it and reloads. If the
+reload fails, the daemon keeps the current configuration, restores the file,
+and you can edit again. --content-file <file> replaces it without the editor.
 
 Use --set-password to set or rotate the edit-protected password (only when
 it was not chosen during installation — rotating that one requires
@@ -98,7 +104,7 @@ func init() {
 	EditProtectedCmd.Flags().StringVar(&putFlag, "put", "",
 		"Non-interactive live mode: write this file (must be inside --resource) from --content-file/stdin, authenticating with $"+editPasswordEnv)
 	EditProtectedCmd.Flags().StringVar(&contentFileFlag, "content-file", "",
-		"Source of the --put content (default: stdin)")
+		"Source of the --put content (default: stdin), or the new daemon.conf for --edit-config")
 	EditProtectedCmd.Flags().BoolVar(&forwardFlag, "forward", false,
 		"Run no editor: grant the -w/-b binaries temporary access to the picked guarded directories (live mode)")
 	EditProtectedCmd.Flags().StringSliceVarP(&whitelistFlags, "whitelist", "w", nil,
@@ -110,6 +116,9 @@ func init() {
 	EditProtectedCmd.Flags().DurationVar(&timeoutSession, "timeout-session", SessionTimeoutDefault,
 		"Live sessions: revoke the access after this long without activity (editor input, or with "+
 			"--forward a granted binary touching the directory), e.g. 10m or 45s")
+	EditProtectedCmd.Flags().BoolVar(&editConfigFlag, "edit-config", false,
+		"Edit the running daemon's daemon.conf (live mode): saving reloads it; a configuration that fails to "+
+			"reload is not kept (with --content-file: replace it non-interactively)")
 	EditProtectedCmd.Flags().BoolVar(&yesFlag, "yes", false,
 		"With --forward: don't ask before admitting a binary that isn't root-placed (required without a terminal)")
 }
@@ -126,6 +135,9 @@ func validateFlags() error {
 	}
 	if timeoutSession < time.Second || timeoutSession > SessionTimeoutMax {
 		return fmt.Errorf("--timeout-session must be between 1s and %s", SessionTimeoutMax)
+	}
+	if editConfigFlag && (forwardFlag || putFlag != "" || setPasswordFlag || clearPasswordFlag || len(resourceFlags) > 0) {
+		return errors.New("--edit-config can't be combined with --forward, --put, --resource, --set-password or --clear-password")
 	}
 	return nil
 }
@@ -153,6 +165,14 @@ func runEditProtected(cmd *cobra.Command, args []string) error {
 	// precondition for live mode, independent of whether systemd supervises the daemon.
 	liveReady := LiveModeAvailable()
 
+	if editConfigFlag {
+		if !liveReady {
+			return errors.New("--edit-config needs the daemon running with an edit-protected password configured " +
+				"(the control socket " + ControlSocket + " is not present); with the daemon stopped, edit " +
+				"/etc/app-listener/daemon.conf directly")
+		}
+		return runEditConfig()
+	}
 	if forwardFlag {
 		if !liveReady {
 			return errors.New("--forward needs the daemon running with an edit-protected password configured " +
