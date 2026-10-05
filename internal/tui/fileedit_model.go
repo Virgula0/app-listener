@@ -106,6 +106,7 @@ type fileEditModel struct {
 	mode fileEditMode
 
 	editor    textarea.Model
+	hl        *codeedit.Highlighter
 	editPath  string
 	original  string
 	dirty     bool
@@ -591,6 +592,7 @@ func (m *fileEditModel) previewFile(path string) error {
 	}
 	m.editPath = path
 	m.original = string(data)
+	m.hl = codeedit.NewHighlighter(path, m.original)
 	codeedit.SetText(&m.editor, m.original)
 	m.previewOK = true
 	m.dirty = false
@@ -957,7 +959,7 @@ func (m *fileEditModel) renderTree(width, height int) string {
 func (m *fileEditModel) renderRight(width, height int) string {
 	switch m.mode {
 	case modeEdit:
-		return m.editor.View()
+		return m.hl.View(&m.editor)
 	case modeInput:
 		kind := "file"
 		if m.inputKind == createDir {

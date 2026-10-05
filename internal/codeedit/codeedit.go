@@ -1,7 +1,7 @@
 // Package codeedit gives the bubbles textarea the code-editor behavior the TUIs share: a steady
 // cursor, content opening at its first line, Enter keeping the indentation, Tab/Shift+Tab indent,
-// PgUp/PgDn page, and
-// Ctrl+Left/Right stopping at word and punctuation boundaries across lines.
+// PgUp/PgDn page, Ctrl+Left/Right stopping at word and punctuation boundaries across lines, and
+// (Highlighter.View) a fixed-width line-number gutter plus syntax highlighting.
 package codeedit
 
 import (
@@ -20,7 +20,11 @@ const indent = "    "
 // New returns a focused-ready textarea with line numbers and the shared key bindings.
 func New() textarea.Model {
 	ta := textarea.New()
-	ta.ShowLineNumbers = true
+	// The textarea sizes its number column by MaxHeight's digits (1 here), so each extra digit
+	// shifted the text right: Highlighter.View draws the numbers in a fixed-width prompt instead.
+	ta.ShowLineNumbers = false
+	blank := ta.Prompt + gutterLabel(minGutterDigits, "")
+	setGutter(&ta, minGutterDigits, func(int) string { return blank })
 	ta.Cursor.SetMode(cursor.CursorStatic)
 	// The default caps the buffer at 99 lines: Enter does nothing past it.
 	ta.MaxHeight = 0

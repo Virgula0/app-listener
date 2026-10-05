@@ -66,6 +66,7 @@ func ShowDiff(title, diff string) error {
 
 type diffModel struct {
 	textarea textarea.Model
+	hl       *codeedit.Highlighter
 	title    string
 }
 
@@ -74,7 +75,7 @@ func newDiffModel(title, diff string) diffModel {
 	ta.SetHeight(24)
 	ta.Focus()
 	codeedit.SetText(&ta, diff)
-	return diffModel{textarea: ta, title: title}
+	return diffModel{textarea: ta, hl: codeedit.NewHighlighter("changes.diff", diff), title: title}
 }
 
 func (m *diffModel) Init() tea.Cmd {
@@ -111,6 +112,6 @@ func (m *diffModel) View() string {
 		Foreground(lipgloss.Color("240")).
 		Render("q / Esc / Enter: continue"))
 	b.WriteString("\n\n")
-	b.WriteString(m.textarea.View())
+	b.WriteString(m.hl.View(&m.textarea))
 	return b.String()
 }

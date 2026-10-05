@@ -39,6 +39,7 @@ func showChangelog(title, notes string) error {
 
 type changelogModel struct {
 	textarea textarea.Model
+	hl       *codeedit.Highlighter
 	title    string
 }
 
@@ -47,7 +48,7 @@ func newChangelogModel(title, notes string) changelogModel {
 	ta.SetHeight(24)
 	ta.Focus()
 	codeedit.SetText(&ta, notes)
-	return changelogModel{textarea: ta, title: title}
+	return changelogModel{textarea: ta, hl: codeedit.NewHighlighter("CHANGELOG.md", notes), title: title}
 }
 
 func (m *changelogModel) Init() tea.Cmd {
@@ -84,6 +85,6 @@ func (m *changelogModel) View() string {
 		Foreground(lipgloss.Color(changelogHintStyle)).
 		Render("q / Esc / Enter: continue"))
 	b.WriteString("\n\n")
-	b.WriteString(m.textarea.View())
+	b.WriteString(m.hl.View(&m.textarea))
 	return b.String()
 }

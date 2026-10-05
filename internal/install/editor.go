@@ -29,10 +29,11 @@ const (
 	editorSidePadding = 4
 )
 
-// EditText opens the embedded multiline editor pre-filled with initial. Ctrl+S saves and returns
-// the text; Esc aborts with ErrEditCanceled.
-func EditText(title, initial string) (string, error) {
-	m := newEditorModel(title, initial)
+// EditText opens the embedded multiline editor pre-filled with initial, highlighted as the file
+// name names (see codeedit.NewHighlighter). Ctrl+S saves and returns the text; Esc aborts with
+// ErrEditCanceled.
+func EditText(title, name, initial string) (string, error) {
+	m := newEditorModel(title, name, initial)
 	p := tea.NewProgram(&m, tea.WithAltScreen())
 	result, err := p.Run()
 	if err != nil {
@@ -50,17 +51,18 @@ func EditText(title, initial string) (string, error) {
 
 type editorModel struct {
 	textarea textarea.Model
+	hl       *codeedit.Highlighter
 	title    string
 	canceled bool
 }
 
-func newEditorModel(title, initial string) editorModel {
+func newEditorModel(title, name, initial string) editorModel {
 	ta := codeedit.New()
 	ta.SetHeight(24)
 	ta.Placeholder = "Type your configuration here..."
 	ta.Focus()
 	codeedit.SetText(&ta, initial)
-	return editorModel{textarea: ta, title: title}
+	return editorModel{textarea: ta, hl: codeedit.NewHighlighter(name, initial), title: title}
 }
 
 func (m *editorModel) Init() tea.Cmd {
@@ -101,6 +103,6 @@ func (m *editorModel) View() string {
 		Foreground(lipgloss.Color("240")).
 		Render("Ctrl+S save  ·  Esc cancel (no changes are kept)  ·  Ctrl+←/→ word  ·  PgUp/PgDn page  ·  Tab indent"))
 	b.WriteString("\n\n")
-	b.WriteString(m.textarea.View())
+	b.WriteString(m.hl.View(&m.textarea))
 	return b.String()
 }

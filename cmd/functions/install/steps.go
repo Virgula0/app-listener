@@ -246,7 +246,7 @@ func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, erro
 func runConfigEditor(title, initial string) (string, *daemonconfig.Config, error) {
 	confText := initial
 	for {
-		edited, err := inst.EditText(title, confText)
+		edited, err := inst.EditText(title, "daemon.conf", confText)
 		if err != nil {
 			return "", nil, fmt.Errorf("config editing aborted: %w", err)
 		}

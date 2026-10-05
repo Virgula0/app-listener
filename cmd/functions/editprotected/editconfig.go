@@ -92,7 +92,7 @@ func nextConfig(text string, interactive bool) (string, error) {
 		data, err := os.ReadFile(contentFileFlag)
 		return string(data), err
 	}
-	edited, err := inst.EditText("daemon.conf (live — Ctrl+S reviews, applies and reloads)", text)
+	edited, err := inst.EditText("daemon.conf (live — Ctrl+S reviews, applies and reloads)", "daemon.conf", text)
 	if errors.Is(err, inst.ErrEditCanceled) {
 		log.Info("edit canceled — the configuration is unchanged")
 		return "", errAborted
