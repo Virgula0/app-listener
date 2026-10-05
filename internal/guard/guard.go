@@ -67,6 +67,8 @@ type GuardEvent struct {
 	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH"): it runs
 	// code its exe doesn't vouch for (trust_code_suspect). Empty otherwise.
 	Suspect string
+	// Exe is the acting process's exe inode as the kernel judged it; zero for a process gate.
+	Exe GuardInodeKey
 }
 
 // Op is the label ev is logged under: its process gate or suspect mark, else its event type.
@@ -262,6 +264,8 @@ type Guard struct {
 	held map[string]*os.File
 	// admit: WithAdmissionCheck.
 	admit AdmissionCheck
+	// tap: SetEventTap.
+	tap atomic.Pointer[func(GuardEvent)]
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -2316,6 +2320,7 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 		FsGate:    fsGateLabel(be.Reason),
 		Process:   processGateLabel(be.Reason),
 		Suspect:   suspectLabel(be.Reason),
+		Exe:       GuardInodeKey{Dev: be.ExeDev, Ino: be.ExeIno},
 	}
 	if ge.Process != "" {
 		// The kernel sends the other task's comm in path and its tgid in fd.
@@ -2336,6 +2341,9 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 // event and counts it, which costs only telemetry — enforcement already happened in the kernel,
 // synchronously, and the BPF ringbuf itself drops on overflow for the same reason.
 func (g *Guard) dispatch(ev *GuardEvent) {
+	if tap := g.tap.Load(); tap != nil {
+		(*tap)(*ev)
+	}
 	if !g.Reports(ev) {
 		return
 	}
@@ -2357,6 +2365,16 @@ func (g *Guard) dispatch(ev *GuardEvent) {
 				"enforcement is unaffected, only reporting", g.path, dropped)
 		}
 	}
+}
+
+// SetEventTap hands fn every event this guard reads, allowed ones included whatever the consumer
+// filters (WithoutAllowedEvents); nil removes it. fn runs on the ringbuf reader: it must not block.
+func (g *Guard) SetEventTap(fn func(GuardEvent)) {
+	if fn == nil {
+		g.tap.Store(nil)
+		return
+	}
+	g.tap.Store(&fn)
 }
 
 // Reports reports whether the guard queues ev for its consumer; a denial always is.
@@ -2556,6 +2574,8 @@ type bpfGuardEvent struct {
 	Blocked uint32
 	Reason  uint32
 	ResID   uint32
+	ExeDev  uint64
+	ExeIno  uint64
 	Comm    [16]byte
 	Path    [256]byte
 	Dest    [256]byte

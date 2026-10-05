@@ -168,12 +168,18 @@ func runGuardHeadless(uc usecase.GuardUseCase) {
 			if !ok {
 				return
 			}
-			log.Infof("GUARD|%s|%s|%s|%d|%s|%t|%d",
-				ev.Type.String(), logging.SanitizeText(ev.Comm), logging.SanitizeText(ev.Path), ev.PID, logging.SanitizeText(ev.Dest), ev.Blocked, ev.UID)
+			log.Info(HeadlessLine(&ev))
 		case <-sig:
 			return
 		}
 	}
+}
+
+// HeadlessLine is ev in the stable GUARD| format --headless prints (the integration tests parse it).
+func HeadlessLine(ev *guard.GuardEvent) string {
+	return fmt.Sprintf("GUARD|%s|%s|%s|%d|%s|%t|%d",
+		ev.Type.String(), logging.SanitizeText(ev.Comm), logging.SanitizeText(ev.Path), ev.PID,
+		logging.SanitizeText(ev.Dest), ev.Blocked, ev.UID)
 }
 
 func runGuardTUI(uc usecase.GuardUseCase, guardPath string, mode guard.Mode, binaries []guard.BinaryEntry) error {

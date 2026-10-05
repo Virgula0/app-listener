@@ -392,14 +392,19 @@ func sameConfig(a, b *daemonconfig.Config) bool {
 
 // swap writes next over the config only while it still holds want.
 func (r *catalogRefresher) swap(want, next []byte) error {
-	cur, err := os.ReadFile(r.configPath)
+	return swapFile(r.configPath, want, next)
+}
+
+// swapFile writes next over path, in place, only while it still holds want.
+func swapFile(path string, want, next []byte) error {
+	cur, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	if !bytes.Equal(cur, want) {
-		return fmt.Errorf("%s changed while being refreshed — not overwriting it", r.configPath)
+		return fmt.Errorf("%s changed meanwhile — not overwriting it", path)
 	}
-	return os.WriteFile(r.configPath, next, 0o600)
+	return os.WriteFile(path, next, 0o600)
 }
 
 // logRefreshChange prints one refreshed section as a journal line.

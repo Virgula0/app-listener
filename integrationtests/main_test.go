@@ -240,6 +240,24 @@ func (s *IntegrationSuite) exec(c testcontainers.Container, cmd []string) (int, 
 	return exitCode, strings.TrimSpace(string(b))
 }
 
+// requireDistinctExes fails unless every path is its own dev:ino. Policy keys on the exe inode, so
+// multicall coreutils (uutils, busybox: cat, head, mkdir... are one inode) make a "whitelisted"
+// and a "not whitelisted" fixture the same key, and the test passes or fails for the wrong reason.
+func (s *IntegrationSuite) requireDistinctExes(c testcontainers.Container, paths ...string) {
+	code, out := s.exec(c, append([]string{"stat", "-Lc", "%d:%i %n"}, paths...))
+	s.Require().Equalf(0, code, "stat %v: %s", paths, out)
+	owner := make(map[string]string, len(paths))
+	for line := range strings.SplitSeq(out, "\n") {
+		id, name, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if prev, dup := owner[id]; dup {
+			s.Require().Failf("fixture binaries share an inode",
+				"%s and %s are both %s (a multicall binary?): pick binaries with their own inode", prev, name, id)
+		}
+		owner[id] = name
+	}
+	s.Require().Lenf(owner, len(paths), "stat output: %s", out)
+}
+
 func (s *IntegrationSuite) logs(c testcontainers.Container) string {
 	r, err := c.Logs(s.ctx)
 	s.Require().NoError(err)

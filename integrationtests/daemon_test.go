@@ -1090,9 +1090,10 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_LiveMode() {
 			"ln -s /outside/victim /protected/escape && " +
 			"printf '%s\\n' " + shQuote(hash) + " > /etc/app-listener/edit-auth.hash && chmod 600 /etc/app-listener/edit-auth.hash"})
 
+	// cat reads the result back: whitelist it by name, not through a multicall applet's shared inode.
 	s.startDaemon(c, `[watch /protected]
 need_encryption: false
-/usr/bin/sleep`)
+/usr/bin/cat`)
 
 	// The control socket comes up during startup.
 	socketReady := false
@@ -1815,7 +1816,7 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 	// (see the function doc comment) without touching secretFile itself.
 	s.exec(c, []string{"sh", "-c", "dd if=/dev/zero of=/tmp/put_content.bin bs=1M count=512 status=none"})
 
-	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n/usr/bin/sleep")
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n/usr/bin/cat")
 
 	socketReady := false
 	for dl := time.Now().Add(20 * time.Second); time.Now().Before(dl); {
@@ -1865,7 +1866,7 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 	// A fresh instance comes back at the read-only baseline: no residual
 	// session, and a plain write attempt outside any control-socket session
 	// is denied exactly like it would be on a first-ever start.
-	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n/usr/bin/sleep")
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n/usr/bin/cat")
 	code, out = s.exec(c, []string{"sh", "-c", "echo pwned > " + secretFile + " 2>&1"})
 	s.Require().NotEqualf(0, code, "a restarted daemon must not carry over the killed session's grant: %s", out)
 

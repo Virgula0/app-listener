@@ -177,10 +177,14 @@ func (t *TrustGuard) adoptRows(old, newKey GuardTrustInodeKey) error {
 	r, ok := t.rowsOf(old)
 	if !ok {
 		var flags uint8
-		if t.objs.GuardTrustedFiles.Lookup(newKey, &flags) == nil {
+		if t.objs.GuardTrustedFiles.Lookup(newKey, &flags) == nil && flags&trustedBinary != 0 {
 			return nil
 		}
 		return errors.New("old inode is not a trusted file")
+	}
+	// A temporary grant's row carries runtime bits only (tempgrant.go): not a whitelisted binary's.
+	if r.flags&trustedBinary == 0 {
+		return errors.New("old inode is not a trusted binary")
 	}
 	bitMaps := t.trustBitMaps()
 	rollback := func() {

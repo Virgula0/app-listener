@@ -7,6 +7,8 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Virgula0/app-listener/internal/codeedit"
 )
 
 const (
@@ -37,20 +39,22 @@ func showChangelog(title, notes string) error {
 
 type changelogModel struct {
 	textarea textarea.Model
+	hl       *codeedit.Highlighter
+	find     codeedit.Finder
 	title    string
 }
 
 func newChangelogModel(title, notes string) changelogModel {
-	ta := textarea.New()
-	ta.SetValue(notes)
+	ta := codeedit.New()
 	ta.SetHeight(24)
-	ta.ShowLineNumbers = true
 	ta.Focus()
-	ta.KeyMap.LineNext.SetKeys("down", "ctrl+n")
-	ta.KeyMap.LinePrevious.SetKeys("up", "ctrl+p")
-	ta.KeyMap.CharacterBackward.SetKeys("left")
-	ta.KeyMap.CharacterForward.SetKeys("right")
-	return changelogModel{textarea: ta, title: title}
+	codeedit.SetText(&ta, notes)
+	return changelogModel{
+		textarea: ta,
+		hl:       codeedit.NewHighlighter("CHANGELOG.md", notes),
+		find:     codeedit.NewFinder(false),
+		title:    title,
+	}
 }
 
 func (m *changelogModel) Init() tea.Cmd {
@@ -63,9 +67,15 @@ func (m *changelogModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetHeight(max(msg.Height-changelogChrome, changelogMinHeight))
 	}
 	if msg, ok := msg.(tea.KeyMsg); ok {
+		if m.find.Update(&m.textarea, msg) {
+			return m, nil
+		}
 		switch msg.String() {
 		case "q", "esc", "enter", "ctrl+q":
 			return m, tea.Quit
+		}
+		if codeedit.Navigate(&m.textarea, msg) {
+			return m, nil
 		}
 	}
 	var cmd tea.Cmd
@@ -82,8 +92,8 @@ func (m *changelogModel) View() string {
 	b.WriteString("\n\n")
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color(changelogHintStyle)).
-		Render("q / Esc / Enter: continue"))
+		Render("q / Esc / Enter: continue  ·  Ctrl+F find"))
 	b.WriteString("\n\n")
-	b.WriteString(m.textarea.View())
+	b.WriteString(m.find.View(m.hl, &m.textarea))
 	return b.String()
 }

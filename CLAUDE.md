@@ -44,20 +44,43 @@ every change to enforcement paths as security-sensitive:
   authenticates over a `0600` root-only unix socket that *also* checks `SO_PEERCRED`
   uid 0 **and** that the peer's exe inode is the daemon's own binary. The protocol is
   two-phase — `AUTH` (password) must succeed **before** the daemon discloses any
-  watch path, then `SELECT <resource>` activates the grant — so an unauthenticated
-  caller learns nothing about the protected directories. The grant transiently widens
-  **only** that one resource's `GUARD_ALLOW_ROOT` self event-mask (never the
-  whitelist), one session at a time, 30-min hard cap, revoked on disconnect / SIGHUP.
-  The password hash (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded
-  like `fscrypt.key`. Don't loosen any of: the peer-exe check, AUTH-before-disclosure,
-  the single-session lock, the auth lockout, the `origin=install` guard on
-  `--set-password`, or the mask being restored in `RevokeSelfEditAccess`.
+  watch path, then `SELECT <resource>` or `FORWARD` activates the grant — so an
+  unauthenticated caller learns nothing about the protected directories. `SELECT`
+  transiently widens **only** that one resource's `GUARD_ALLOW_ROOT` self event-mask.
+  `FORWARD` (`edit-protected --forward -w/-b [-e]`, `internal/guard/tempgrant.go`) is the
+  one path that writes **whitelist rows** for other binaries: `-w` only where the resource
+  has no row (never over a tamper-demoted `GUARD_BLOCK`, never the self key or an
+  inspector), `-b` only over an existing `GUARD_ALLOW`. The daemon resolves every path
+  itself (`OpenConfined`) and holds the inode open for the session, and the use case
+  revokes the whole grant when a granted binary's content changes in place. Revoke is
+  compare-and-swap: it restores a row only while it still holds what the grant wrote and the
+  permanent whitelist hasn't claimed (or the tamper detector demoted) the key. `-w` rows are
+  journaled to `/etc/app-listener/temp-grants.json` **before** the write, so
+  `daemon --lockdown` / the next start strip them from a SIGKILLed daemon's pinned maps
+  (strip-only: a forged journal can deny, never admit). Both kinds: one session at a time,
+  revoked on disconnect / SIGHUP / an idle timeout (`TIMEOUT`, default 30m, daemon-capped at
+  24h) that only client `PING`s and, for `FORWARD`, the granted binaries' own events reset.
+  `FORWARD` streams those events (`EVENT` lines, via `Guard.SetEventTap`, matched by
+  `/proc/<pid>/exe` inode for display only — never a policy input). `CONFIG`
+  (`--edit-config`, `configedit.go`) is the other post-AUTH path: the daemon writes
+  daemon.conf only while it still holds what it sent (compare-and-swap), reloads, and puts
+  the old bytes back if the reload fails; refused while a grant session is active. The password hash
+  (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded like `fscrypt.key`.
+  Don't loosen any of: the peer-exe check, AUTH-before-disclosure, the single-session lock,
+  the auth lockout, the `origin=install` guard on `--set-password`, the mask being restored
+  in `RevokeSelfEditAccess`, or the journal-before-write and CAS-restore rules above.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
   key + edit-auth hash (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.
 - Run `/security-review` on diffs that touch `internal/guard`, `internal/networkguard`,
   `internal/usecase/daemon.go`, `internal/fscrypt`, `internal/protected`, or any
   `*.bpf.c`.
+- **`/security-review` scope excludes `graphify-out/`.** `graph.json` / `GRAPH_REPORT.md`
+  are generated navigation aids, not code: never review, report findings on, or read their
+  diff, whether they changed or not (`.gitattributes` marks them `-diff`, so `git diff` shows
+  `Binary files differ`). Do use `graphify query/path/explain` during the review to find
+  callers and related files quickly; then confirm each one in source (see "graphify in this
+  repo": the graph misses interface-dispatch callers, so it can't prove a path is unreachable).
 
 ## Build
 
@@ -344,3 +367,33 @@ built-in Read / Edit / Write tools: shell access (`cat`, `>>`, `sed`) is denied 
 See `memory/release-promote-flow.md`. A release is a *build*, not a tag rename:
 `release.yml` cuts a `pre-*` pre-release per push to main; `promote-release.yml` rebuilds
 a stable `vX.Y.Z`. `_build-release.yml` is the reusable build job.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+
+## graphify in this repo
+
+The graph is a map, not proof — a missed caller of an enforcement path is a bypass.
+
+- Go calls through an interface value are not edges. Usecase → engine goes through
+  `repository.*`, so `affected`/`path` undercount (`affected` on `RevokeSelfEditAccess` is
+  empty; `internal/usecase/daemon.go` calls it). Enumerate callers with grep/LSP before
+  changing enforcement code.
+- Method labels are ambiguous (`.Grant()`, `.Forward()`): pass the node id
+  (`graphify explain usecase_daemonusecase_granteditaccess`).
+- Go ↔ BPF links (bpf2go bindings, LSM attach) are absent — the generated bindings are
+  gitignored. Trace hooks through `guard_spec.go` and the `*.bpf.c` sources.
+- Freshness: git hooks rebuild on commit/checkout; `.claude/hooks/graphify-refresh.sh`
+  (`UserPromptSubmit`) rebuilds for uncommitted edits. Run `graphify update .` after a pull.
+  Code rebuilds re-cluster, so community names are auto-derived. Doc/GIF nodes refresh only
+  via `/graphify . --update`.
+- Only `graphify-out/graph.json` and `GRAPH_REPORT.md` are tracked (`git add -f`).
+  Both are `-diff linguist-generated` in `.gitattributes`: their diffs (100k+ lines) would
+  swamp `/security-review` and PR diffs. `git diff --text` still shows them.

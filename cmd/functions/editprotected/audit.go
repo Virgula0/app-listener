@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/tui"
 )
 
 // auditAfterEdit loads the installed daemon.conf (if any) and audits the edited tree. interactive
@@ -45,25 +45,12 @@ func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string, interac
 		return
 	}
 
-	// A one-way acknowledgement, not a decision: the edit is already written; the prompt only
-	// ensures the operator saw the warnings.
-	_ = huh.NewForm(huh.NewGroup(
-		huh.NewNote().
-			Title("Post-edit audit — review the warnings above").
-			Description("Advisory only: the edit was saved and nothing here is changed or blocked.\n\n" +
-				strings.Join(bullet(findings), "\n")).
-			Next(true).
-			NextLabel("OK"),
-	)).Run()
-}
-
-// bullet prefixes each finding with "  • " for the acknowledgement note.
-func bullet(findings []string) []string {
-	out := make([]string, len(findings))
-	for i, f := range findings {
-		out[i] = "  • " + f
+	// A one-way acknowledgement, not a decision: the edit is already written; the notice only
+	// ensures the operator saw the warnings (also logged above, so they stay in the scrollback).
+	if err := tui.ShowNotice("Post-edit audit — potential issues",
+		"Advisory only: the edit was saved and nothing here is changed or blocked.", findings); err != nil {
+		log.Warnf("could not show the post-edit audit: %v", err)
 	}
-	return out
 }
 
 // auditTree walks resource and flags symlinks, group/other-accessible files,

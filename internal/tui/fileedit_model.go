@@ -11,11 +11,13 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Virgula0/app-listener/internal/codeedit"
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
@@ -104,6 +106,8 @@ type fileEditModel struct {
 	mode fileEditMode
 
 	editor    textarea.Model
+	hl        *codeedit.Highlighter
+	find      codeedit.Finder
 	editPath  string
 	original  string
 	dirty     bool
@@ -156,12 +160,9 @@ func newFileEditModel(root string) *fileEditModel {
 		leftW:  40,
 		rightW: 39,
 	}
-	m.editor = textarea.New()
-	m.editor.ShowLineNumbers = true
-	// Word jumps are the vim-style ctrl+left/right the legend promises (alt+ defaults stay).
-	m.editor.KeyMap.WordBackward.SetKeys("ctrl+left", "alt+left", "alt+b")
-	m.editor.KeyMap.WordForward.SetKeys("ctrl+right", "alt+right", "alt+f")
+	m.editor = codeedit.New()
 	m.editor.Blur()
+	m.find = codeedit.NewFinder(true)
 
 	vault, vaultErr := openVault(root)
 	if vaultErr != nil {
@@ -323,11 +324,16 @@ func (m *fileEditModel) navAction(msg tea.KeyMsg) bool {
 }
 
 func (m *fileEditModel) updateEditKey(msg tea.KeyMsg) (textarea.Model, tea.Cmd) {
+	if m.find.Update(&m.editor, msg) {
+		m.dirty = m.editor.Value() != m.original
+		return m.editor, nil
+	}
 	switch msg.String() {
 	case "ctrl+s":
 		if err := m.save(); err != nil {
 			m.status = err.Error()
 		}
+		m.find.Close()
 		m.editor.Blur()
 		m.mode = modeNav
 	case keyEsc:
@@ -335,7 +341,9 @@ func (m *fileEditModel) updateEditKey(msg tea.KeyMsg) (textarea.Model, tea.Cmd) 
 		m.mode = modeNav
 	default:
 		var cmd tea.Cmd
-		m.editor, cmd = m.editor.Update(msg)
+		if !codeedit.Edit(&m.editor, msg) {
+			m.editor, cmd = m.editor.Update(msg)
+		}
 		if m.editor.Value() != m.original {
 			m.dirty = true
 		}
@@ -591,7 +599,9 @@ func (m *fileEditModel) previewFile(path string) error {
 	}
 	m.editPath = path
 	m.original = string(data)
-	m.editor.SetValue(m.original)
+	m.hl = codeedit.NewHighlighter(path, m.original)
+	m.find.Close()
+	codeedit.SetText(&m.editor, m.original)
 	m.previewOK = true
 	m.dirty = false
 	if m.mode != modeEdit {
@@ -638,6 +648,7 @@ func (m *fileEditModel) beginCreate(kind fileKind) {
 		dir = n.parent.path
 	}
 	m.input = textinput.New()
+	m.input.Cursor.SetMode(cursor.CursorStatic)
 	m.input.Width = max(m.paneWidth()-12, 4)
 	m.input.Placeholder = "name"
 	m.input.Focus()
@@ -728,6 +739,7 @@ func (m *fileEditModel) beginChmod() {
 	}
 	m.chmodPath = n.path
 	m.chmodInput = textinput.New()
+	m.chmodInput.Cursor.SetMode(cursor.CursorStatic)
 	m.chmodInput.Width = max(m.paneWidth()-12, 4)
 	m.chmodInput.Prompt = "mode: "
 	m.chmodInput.Placeholder = "0644"
@@ -955,7 +967,7 @@ func (m *fileEditModel) renderTree(width, height int) string {
 func (m *fileEditModel) renderRight(width, height int) string {
 	switch m.mode {
 	case modeEdit:
-		return m.editor.View()
+		return m.find.View(m.hl, &m.editor)
 	case modeInput:
 		kind := "file"
 		if m.inputKind == createDir {
@@ -1057,7 +1069,11 @@ var legendHints = map[fileEditMode][]hint{
 	modeEdit: {
 		{"ctrl+s", "save & close"},
 		{"esc", "close"},
+		{"ctrl+f", "find"},
+		{"ctrl+r", "replace"},
 		{"ctrl+←/→", "word jump"},
+		{"pgup/pgdn", "page"},
+		{"tab/⇧tab", "indent"},
 	},
 	modeInput: {
 		{"↵", "create"},

@@ -341,12 +341,17 @@ func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemon
 			refresher.setConfig(next)
 		}
 	})
-	reload = func() { reloadCfg() }
+	reload = func() { _, _ = reloadCfg() }
+	control.setConfigEditor(&configEditor{path: configPath, reload: reloadCfg})
 	resync := func() {
 		d.ResyncBinaries()
 		trust.resyncInspectors()
 	}
-	refresher, err := newCatalogRefresher(configPath, cfg, reloadCfg, resync, control.sessionActive)
+	reloadOrNil := func() *daemonconfig.Config {
+		next, _ := reloadCfg()
+		return next
+	}
+	refresher, err := newCatalogRefresher(configPath, cfg, reloadOrNil, resync, control.sessionActive)
 	if err != nil {
 		log.Errorf("daemon: %v — new app versions wait for a reload", err)
 		return reload, func() {}
@@ -495,14 +500,14 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 
 // makeReloadHandler returns the reload: re-parse the config, rebuild every guard (re-statting
 // binaries so updated ones get new inodes) and hand the batch to the usecase, which swaps without
-// dropping protection. Any failure keeps the previous config running and returns nil; success
+// dropping protection. Any failure keeps the previous config running and returns its error; success
 // returns the config now running, after reloaded saw it. SIGHUP and the catalog refresh share it,
 // one reload at a time. The self guards stay attached throughout: the reload only needs free
 // resource slots, which reloadOnce checks before building anything.
 func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault, pin pinCfg,
-	control *controlManager, trust *trustManager, vet *binaryVetter, reloaded func(*daemonconfig.Config)) func() *daemonconfig.Config {
+	control *controlManager, trust *trustManager, vet *binaryVetter, reloaded func(*daemonconfig.Config)) func() (*daemonconfig.Config, error) {
 	var mu sync.Mutex
-	return func() *daemonconfig.Config {
+	return func() (*daemonconfig.Config, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		// A reload rebuilds every guard, so end any live edit-protected grant first (its client
@@ -515,7 +520,7 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		liveGen, cfg, err := reloadOnce(d, configPath, vault, pin.base, vet)
 		if err != nil {
 			log.Errorf("daemon: reload failed, keeping previous configuration: %v", err)
-			return nil
+			return nil, err
 		}
 		// Rebuild the daemon-wide trusted set from the new config: a binary added by this reload
 		// must gain its library allowlist (#2) and write-protection (#1), or LD_PRELOAD works
@@ -534,7 +539,7 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		}
 		reloaded(cfg)
 		log.Infof("daemon: configuration reloaded from %s", configPath)
-		return cfg
+		return cfg, nil
 	}
 }
 
@@ -607,6 +612,7 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 // usecase (attach -> unlock -> populate). Ephemeral guards retire once the real ones are attached
 // and populated. Every error path locks freshly unlocked vaults back first.
 func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg, vet *binaryVetter) (usecase.DaemonUseCase, error) {
+	stripTempJournal("daemon", pin.base)
 	relockStaleVaults(cfg, vault, pin.base)
 
 	// Retire pins a killed predecessor left. relockStaleVaults (and ExecStopPost --lockdown)
@@ -776,6 +782,7 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 // guard.pinSelfMaps, guard.WithPinnedSelfVaultAccess).
 func runLockdown() {
 	configureDaemonLogging()
+	stripTempJournal("lockdown", guard.ResolvePinBase(bpffsMount))
 
 	configPath, err := resolveConfigPath()
 	if err != nil {

@@ -1,0 +1,2 @@
+graphify-out/graph.json merge=graphify -diff linguist-generated
+graphify-out/GRAPH_REPORT.md -diff linguist-generated

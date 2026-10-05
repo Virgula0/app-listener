@@ -3,6 +3,7 @@ package guard
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -251,5 +252,36 @@ func TestRuntimeClassGenericElectron(t *testing.T) {
 	}
 	if c := runtimeClass(f, link); c&trustedElectron == 0 {
 		t.Errorf("generic Electron through a link: class %d", c)
+	}
+}
+
+// A temporary grant classes the inode it pins: trustTempRuntime puts these bits, never TRUSTED_BINARY.
+func TestResolveTempBinaryClassesRuntime(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    uint8
+		names   []string
+	}{
+		{"code", "ELF\x00NODE_OPTIONS\x00", trustedNode, []string{"Node"}},
+		{"chrome", "ELF\x00remote-debugging-port\x00", trustedChromium, []string{"Chromium"}},
+		{"tool", "ELF plain", 0, nil},
+	} {
+		p := filepath.Join(dir, tc.name)
+		if err := os.WriteFile(p, []byte(tc.content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		b, err := ResolveTempBinary(p)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if b.Runtime != tc.want || b.Runtime&trustedBinary != 0 {
+			t.Errorf("%s: Runtime = %d, want %d", tc.name, b.Runtime, tc.want)
+		}
+		if got := b.RuntimeNames(); !slices.Equal(got, tc.names) {
+			t.Errorf("%s: RuntimeNames = %v, want %v", tc.name, got, tc.names)
+		}
+		b.Close()
 	}
 }

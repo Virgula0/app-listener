@@ -44,34 +44,39 @@ var errNoPinState = errors.New("no usable pin-state record found")
 // create fallback only covers a failed placeholder. Best-effort: failure only means `--lockdown` can't recover this generation, never that
 // startup/reload fails.
 func writePinState(pin pinCfg) error {
-	dir := filepath.Dir(pinStateFile)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("creating %s: %w", dir, err)
-	}
 	encoded, err := json.Marshal(pinStateRecord{PID: os.Getpid(), Gen: pin.gen, UpdatedAt: time.Now().UTC()})
 	if err != nil {
 		return fmt.Errorf("encoding pin state: %w", err)
 	}
+	return writeInPlace(pinStateFile, encoded)
+}
 
-	f, err := os.OpenFile(pinStateFile, os.O_RDWR, 0o600)
+// writeInPlace replaces path's content on its existing inode, creating it 0600 only if missing
+// (see writePinState).
+func writeInPlace(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return fmt.Errorf("opening %s: %w", pinStateFile, err)
+			return fmt.Errorf("opening %s: %w", path, err)
 		}
-		f, err = os.OpenFile(pinStateFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
-			return fmt.Errorf("creating %s: %w", pinStateFile, err)
+			return fmt.Errorf("creating %s: %w", path, err)
 		}
 	}
 	defer f.Close()
 	if err := f.Truncate(0); err != nil {
-		return fmt.Errorf("truncating %s: %w", pinStateFile, err)
+		return fmt.Errorf("truncating %s: %w", path, err)
 	}
-	if _, err := f.WriteAt(encoded, 0); err != nil {
-		return fmt.Errorf("writing %s: %w", pinStateFile, err)
+	if _, err := f.WriteAt(data, 0); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	if err := f.Chmod(0o600); err != nil {
-		return fmt.Errorf("chmod %s: %w", pinStateFile, err)
+		return fmt.Errorf("chmod %s: %w", path, err)
 	}
 	return f.Sync()
 }
@@ -82,15 +87,20 @@ func writePinState(pin pinCfg) error {
 // writePinState's create fallback would run. No-op if /etc/app-listener is missing or the file
 // exists.
 func ensurePinStateFilePlaceholder() error {
-	if _, err := os.Stat(pinStateFile); err == nil {
+	return ensurePlaceholder(pinStateFile)
+}
+
+// ensurePlaceholder creates path empty (0600) if missing; no-op when its directory doesn't exist.
+func ensurePlaceholder(path string) error {
+	if _, err := os.Stat(path); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	if _, statErr := os.Stat(filepath.Dir(pinStateFile)); statErr != nil {
+	if _, statErr := os.Stat(filepath.Dir(path)); statErr != nil {
 		return nil //nolint:nilerr // no /etc/app-listener yet (nothing installed): nothing to bootstrap, not an error for the caller
 	}
-	f, err := os.OpenFile(pinStateFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
 			return nil

@@ -10,6 +10,8 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/pmezard/go-difflib/difflib"
+
+	"github.com/Virgula0/app-listener/internal/codeedit"
 )
 
 // UnifiedDiff renders a unified diff between two file contents, labeled
@@ -64,20 +66,22 @@ func ShowDiff(title, diff string) error {
 
 type diffModel struct {
 	textarea textarea.Model
+	hl       *codeedit.Highlighter
+	find     codeedit.Finder
 	title    string
 }
 
 func newDiffModel(title, diff string) diffModel {
-	ta := textarea.New()
-	ta.SetValue(diff)
+	ta := codeedit.New()
 	ta.SetHeight(24)
-	ta.ShowLineNumbers = true
 	ta.Focus()
-	ta.KeyMap.LineNext.SetKeys("down", "ctrl+n")
-	ta.KeyMap.LinePrevious.SetKeys("up", "ctrl+p")
-	ta.KeyMap.CharacterBackward.SetKeys("left")
-	ta.KeyMap.CharacterForward.SetKeys("right")
-	return diffModel{textarea: ta, title: title}
+	codeedit.SetText(&ta, diff)
+	return diffModel{
+		textarea: ta,
+		hl:       codeedit.NewHighlighter("changes.diff", diff),
+		find:     codeedit.NewFinder(false),
+		title:    title,
+	}
 }
 
 func (m *diffModel) Init() tea.Cmd {
@@ -90,9 +94,15 @@ func (m *diffModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetHeight(max(msg.Height-editorChromeLines, editMinHeight))
 	}
 	if msg, ok := msg.(tea.KeyMsg); ok {
+		if m.find.Update(&m.textarea, msg) {
+			return m, nil
+		}
 		switch msg.String() {
 		case "q", "esc", "enter", "ctrl+q":
 			return m, tea.Quit
+		}
+		if codeedit.Navigate(&m.textarea, msg) {
+			return m, nil
 		}
 	}
 	var cmd tea.Cmd
@@ -109,8 +119,8 @@ func (m *diffModel) View() string {
 	b.WriteString("\n\n")
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color("240")).
-		Render("q / Esc / Enter: continue"))
+		Render("q / Esc / Enter: continue  ·  Ctrl+F find"))
 	b.WriteString("\n\n")
-	b.WriteString(m.textarea.View())
+	b.WriteString(m.find.View(m.hl, &m.textarea))
 	return b.String()
 }

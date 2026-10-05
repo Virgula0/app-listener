@@ -11,6 +11,7 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	"github.com/Virgula0/app-listener/internal/guard"
 	"github.com/Virgula0/app-listener/internal/repository"
 	"github.com/Virgula0/app-listener/internal/usecase"
 )
@@ -29,6 +30,10 @@ func (f *fakeDaemon) Events() <-chan usecase.DaemonEvent { return nil }
 func (f *fakeDaemon) Resources() []daemonconfig.Resource { return nil }
 func (f *fakeDaemon) GrantEditAccess(string) (func() error, error) {
 	return func() error { return nil }, nil
+}
+func (f *fakeDaemon) GrantTemporaryAccess([]string, []string, guard.TempRule,
+	func([]guard.GuardResInodeKey) error) (*usecase.TemporaryAccess, error) {
+	return nil, errors.New("unused")
 }
 
 // TestAwaitStartupOrSignalCompletes: no signal — the started daemon is passed
