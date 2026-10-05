@@ -10,7 +10,6 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/guard"
-	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/repository"
 )
@@ -243,38 +242,16 @@ func watchTempBinaries(bins []*guard.TempBinary, every time.Duration, stop <-cha
 	}
 }
 
-// exeTapTTL bounds how long a pid's exe verdict is reused: an exec changes it under the same pid.
-const exeTapTTL = time.Second
-
-type exeVerdict struct {
-	match bool
-	at    time.Time
-}
-
-// newExeTap returns a guard event tap forwarding, without blocking, the events whose process
-// runs one of bins. The pid's exe is read from /proc after the fact: this feeds a display, never a
-// policy decision (those are the kernel's, by inode).
+// newExeTap returns a guard event tap forwarding, without blocking, the events whose acting exe is
+// one of bins, by the inode the kernel reported (GuardEvent.Exe). This feeds a display and the idle
+// timer, never a policy decision.
 func newExeTap(bins []*guard.TempBinary, out chan<- guard.GuardEvent) func(guard.GuardEvent) {
 	keys := make(map[guard.GuardInodeKey]bool, len(bins))
 	for _, b := range bins {
 		keys[b.Key] = true
 	}
-	var mu sync.Mutex
-	seen := make(map[uint32]exeVerdict)
 	return func(ev guard.GuardEvent) {
-		now := time.Now()
-		mu.Lock()
-		v, ok := seen[ev.PID]
-		if !ok || now.Sub(v.at) > exeTapTTL {
-			dev, ino, err := ebpf.StatInode(fmt.Sprintf("/proc/%d/exe", ev.PID))
-			v = exeVerdict{match: err == nil && keys[guard.GuardInodeKey{Dev: dev, Ino: ino}], at: now}
-			if len(seen) > 4096 {
-				clear(seen)
-			}
-			seen[ev.PID] = v
-		}
-		mu.Unlock()
-		if !v.match {
+		if !keys[ev.Exe] {
 			return
 		}
 		select {

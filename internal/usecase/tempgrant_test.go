@@ -3,7 +3,6 @@ package usecase
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -214,7 +213,7 @@ func TestGrantTemporaryAccessStreamsOnlyGrantedExeEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The granted binary is this test binary, so this process's events match by exe inode.
+	// The granted binary is this test binary.
 	acc, err := d.GrantTemporaryAccess([]string{"/res/a"}, []string{self}, guard.TempRule{Allow: true}, journalTo(trace))
 	if err != nil {
 		t.Fatal(err)
@@ -226,13 +225,15 @@ func TestGrantTemporaryAccessStreamsOnlyGrantedExeEvents(t *testing.T) {
 		t.Fatal("no event tap installed on the granted resource's guard")
 	}
 
-	other := exec.Command("sleep", "5")
-	if err := other.Start(); err != nil {
+	granted, err := guard.ResolveTempBinary(self)
+	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = other.Process.Kill(); _ = other.Wait() }()
-	tap(guard.GuardEvent{FileEvent: ebpf.FileEvent{PID: uint32(other.Process.Pid), Path: "/res/a/x"}}) //nolint:gosec // test pid
-	tap(guard.GuardEvent{FileEvent: ebpf.FileEvent{PID: uint32(os.Getpid()), Path: "/res/a/mine"}})    //nolint:gosec // test pid
+	granted.Close()
+	// Matched by the kernel-reported exe, never the pid: a short-lived process is gone from /proc.
+	tap(guard.GuardEvent{FileEvent: ebpf.FileEvent{PID: 1, Path: "/res/a/x"},
+		Exe: guard.GuardInodeKey{Dev: granted.Key.Dev, Ino: granted.Key.Ino + 1}})
+	tap(guard.GuardEvent{FileEvent: ebpf.FileEvent{PID: 999999, Path: "/res/a/mine"}, Exe: granted.Key})
 
 	select {
 	case ev := <-acc.Events:

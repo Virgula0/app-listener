@@ -78,6 +78,10 @@ struct guard_event {
 	__u32 blocked;
 	__u32 reason;  // GUARD_REASON_* — how userspace should attribute the event
 	__u32 res_id;  // owning resource; userspace routes the event to that resource's reader
+	// The acting exe's key as the decision saw it (0 for process gates): /proc/<pid>/exe is gone
+	// once a short-lived process exits, before userspace reads the event.
+	__u64 exe_dev;
+	__u64 exe_ino;
 	char comm[16];
 	char path[MAX_PATH];
 	char dest[MAX_PATH];
@@ -781,6 +785,8 @@ static __always_inline int emit_process_denial(__u32 reason, __u32 type, struct 
 		e->blocked = 1;
 		e->reason = reason;
 		e->res_id = res_id;
+		e->exe_dev = 0;
+		e->exe_ino = 0;
 		bpf_get_current_comm(e->comm, sizeof(e->comm));
 		e->path[0] = '\0';
 		if (other) {
@@ -1087,10 +1093,10 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 		bpf_probe_read_kernel(&current_mm, sizeof(current_mm), &task->mm);
 
 	int is_blocked;
+	struct res_inode_key exe_ik = {};
 	if (!current_mm) {
 		is_blocked = 1;
 	} else {
-		struct res_inode_key exe_ik = {};
 		exe_ik.res_id = res_id;
 		__u8 *action = NULL;
 		if (get_current_exe_inode(&exe_ik.ino)) {
@@ -1188,6 +1194,8 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 		e->blocked = is_blocked ? 1 : 0;
 		e->reason = reason;
 		e->res_id = res_id;
+		e->exe_dev = exe_ik.ino.dev;
+		e->exe_ino = exe_ik.ino.ino;
 		bpf_get_current_comm(e->comm, sizeof(e->comm));
 
 		fill_path(dentry, e->path);

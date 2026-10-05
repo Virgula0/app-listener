@@ -67,6 +67,8 @@ type GuardEvent struct {
 	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH"): it runs
 	// code its exe doesn't vouch for (trust_code_suspect). Empty otherwise.
 	Suspect string
+	// Exe is the acting process's exe inode as the kernel judged it; zero for a process gate.
+	Exe GuardInodeKey
 }
 
 // Op is the label ev is logged under: its process gate or suspect mark, else its event type.
@@ -2318,6 +2320,7 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 		FsGate:    fsGateLabel(be.Reason),
 		Process:   processGateLabel(be.Reason),
 		Suspect:   suspectLabel(be.Reason),
+		Exe:       GuardInodeKey{Dev: be.ExeDev, Ino: be.ExeIno},
 	}
 	if ge.Process != "" {
 		// The kernel sends the other task's comm in path and its tgid in fd.
@@ -2571,6 +2574,8 @@ type bpfGuardEvent struct {
 	Blocked uint32
 	Reason  uint32
 	ResID   uint32
+	ExeDev  uint64
+	ExeIno  uint64
 	Comm    [16]byte
 	Path    [256]byte
 	Dest    [256]byte
