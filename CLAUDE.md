@@ -75,6 +75,12 @@ every change to enforcement paths as security-sensitive:
 - Run `/security-review` on diffs that touch `internal/guard`, `internal/networkguard`,
   `internal/usecase/daemon.go`, `internal/fscrypt`, `internal/protected`, or any
   `*.bpf.c`.
+- **`/security-review` scope excludes `graphify-out/`.** `graph.json` / `GRAPH_REPORT.md`
+  are generated navigation aids, not code: never review, report findings on, or read their
+  diff, whether they changed or not (`.gitattributes` marks them `-diff`, so `git diff` shows
+  `Binary files differ`). Do use `graphify query/path/explain` during the review to find
+  callers and related files quickly; then confirm each one in source (see "graphify in this
+  repo": the graph misses interface-dispatch callers, so it can't prove a path is unreachable).
 
 ## Build
 
@@ -389,3 +395,5 @@ The graph is a map, not proof — a missed caller of an enforcement path is a by
   Code rebuilds re-cluster, so community names are auto-derived. Doc/GIF nodes refresh only
   via `/graphify . --update`.
 - Only `graphify-out/graph.json` and `GRAPH_REPORT.md` are tracked (`git add -f`).
+  Both are `-diff linguist-generated` in `.gitattributes`: their diffs (100k+ lines) would
+  swamp `/security-review` and PR diffs. `git diff --text` still shows them.
