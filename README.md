@@ -263,7 +263,7 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 Two modes, chosen automatically:
 
 - **offline** (default) — refuses while the daemon runs; re-scans the catalog, unlocks one vault with the master key, edits, re-locks it on exit (a vault never stays open).
-- **live** — when an *edit-protected password* was chosen during `sudo app-listener install` **and** the daemon is running: you enter the password **once, first**; only then does the daemon (over a local root-only control socket, `/run/app-listener-daemon.control`) return the list of guarded directories to pick from. It briefly grants write access to the one you pick, you edit, and the grant is dropped. The daemon keeps running and the fscrypt vaults are never touched. An unauthenticated caller learns **nothing** about which directories are protected. Grants are one-at-a-time, capped at 30 min, and revoked on disconnect or a SIGHUP reload; the socket locks out after 5 failed attempts.
+- **live** — when an *edit-protected password* was chosen during `sudo app-listener install` **and** the daemon is running: you enter the password **once, first**; only then does the daemon (over a local root-only control socket, `/run/app-listener-daemon.control`) return the list of guarded directories to pick from. It briefly grants write access to the one you pick, you edit, and the grant is dropped. The daemon keeps running and the fscrypt vaults are never touched. An unauthenticated caller learns **nothing** about which directories are protected. Grants are one-at-a-time and revoked on disconnect, on a SIGHUP reload, or after `--timeout-session` (default `30m`, up to `24h`; e.g. `10m`, `45s`) without activity. Every editor keypress resets that timer. The socket locks out after 5 failed attempts.
 
 The password is **separate from the fscrypt master key** — it only authenticates `edit-protected`. Its PBKDF2 hash lives at `/etc/app-listener/edit-auth.hash` (`0600` root), guarded by the running daemon the same way as `fscrypt.key` (readable/writable only by the app-listener binary).
 
@@ -271,11 +271,30 @@ The password is **separate from the fscrypt master key** — it only authenticat
 sudo app-listener edit-protected                       # auto: live if a password is set + daemon up, else offline
 sudo app-listener edit-protected --set-password         # set/rotate the password (refused if it was set at install — re-run install to rotate that)
 sudo app-listener edit-protected --clear-password       # remove it (disables live mode)
+sudo app-listener edit-protected --forward -w <bin> [-e EVENTS]  # temporary access for other binaries (see below)
+sudo app-listener edit-protected --timeout-session 10m  # revoke a live session after 10 idle minutes (default 30m)
 
 # non-interactive live write (automation): password from $APP_LISTENER_EDIT_PASSWORD
 echo "new contents" | sudo APP_LISTENER_EDIT_PASSWORD=… \
   app-listener edit-protected --resource /home/alice/.ssh --put config
 ```
+
+**`--forward`** (live mode only) opens no editor. It gives *other* binaries temporary access to the guarded directories you pick, using `guard`'s `-w`/`-b`/`-e` syntax: `-w` admits binaries the resource doesn't whitelist, `-b` denies whitelisted ones, and `-e` limits the rule to those events (default: all). `-w` and `-b` are mutually exclusive. The password is asked first, then a multi-select picks the directories (or pass `--resource` once per directory). While the grant is active, the terminal shows the granted binaries' accesses to those directories, allowed and denied, in the same view as `guard`; without a terminal they're printed as `GUARD|` lines. The access lasts until you quit (`q` or Ctrl+C). It is also revoked when the client dies, on a daemon reload, when a granted binary's content changes on disk, or after `--timeout-session` passes with neither a granted binary touching the directories nor a keypress.
+
+```bash
+# let graphify (a uv-managed python script) create its skill under a guarded ~/.claude
+sudo app-listener edit-protected --forward \
+  -w ~/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/bin/python3.12 \
+  -e OPEN,READ,STAT,MKDIR,WRITE
+```
+
+Things to know before admitting a binary:
+- A `-w` grant covers **every user** running that binary, like a `daemon.conf` whitelist line.
+- Admitting an **interpreter** (python, node, bash) admits every script it runs. A script's process is its interpreter, so the script itself is not what the guard sees.
+- A binary that isn't root-placed (anything under a home directory) can be rewritten in place by its owner. You're asked to confirm it (`--yes` skips the question and is required without a terminal), and the daemon revokes the grant if its content changes.
+- Revocation re-checks already-open files on their next read or write, but memory a process already mapped stays mapped.
+- Identity is the binary's inode, resolved by the daemon. A binary already whitelisted on a resource is left untouched by `-w`, and one that isn't is untouched by `-b`. The daemon's own binary, inspectors and tamper-demoted binaries are refused.
+- If the daemon is killed mid-grant, its pinned guards keep enforcing *with* the temporary allows. `daemon --lockdown` (ExecStopPost) and the next start strip them using `/etc/app-listener/temp-grants.json`, written before any allow.
 
 Before exiting, both modes audit the edited tree against `daemon.conf` and warn (advisory, acknowledged once) about anything that would sit outside the daemon's protection: a file created outside every guarded watch path of a grouped vault, a new symlink, a world-readable new secret, a freshly dropped executable.
 

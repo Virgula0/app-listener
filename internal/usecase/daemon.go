@@ -63,6 +63,11 @@ type DaemonUseCase interface {
 	// modify it for an authenticated live edit-protected session. One grant at a time. The returned
 	// revoke restores the read-only baseline; idempotent.
 	GrantEditAccess(resourcePath string) (revoke func() error, err error)
+	// GrantTemporaryAccess applies rule to binaryPaths on every listed resource for an
+	// authenticated `edit-protected --forward` session; shares GrantEditAccess's one-at-a-time slot.
+	// journal is called with the allow rows before any write, and with nil once they are revoked.
+	GrantTemporaryAccess(resourcePaths, binaryPaths []string, rule guard.TempRule,
+		journal func([]guard.GuardResInodeKey) error) (*TemporaryAccess, error)
 	// ResyncBinaries re-syncs every guard's whitelist now, admitting replaced or new system
 	// binaries (the catalog watch saw a package install).
 	ResyncBinaries()
@@ -90,8 +95,8 @@ type daemonUseCase struct {
 	// couldn't be locked back within the rollback budget. They stay attached (denying) and are
 	// retired by Stop after its lockdown (rollbackReload).
 	orphans []repository.GuardRepository
-	// editGrantActive is set while a live edit-protected session holds a write grant
-	// (GrantEditAccess); one at a time.
+	// editGrantActive is set while a live edit-protected session holds a grant (GrantEditAccess or
+	// GrantTemporaryAccess); one at a time.
 	editGrantActive bool
 }
 

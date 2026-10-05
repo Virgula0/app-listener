@@ -32,6 +32,7 @@ func runLiveEdit() error {
 		return err
 	}
 	defer session.End()
+	session.timeout = timeoutSession
 
 	resources, err := session.Authenticate(password)
 	if err != nil {
@@ -46,28 +47,35 @@ func runLiveEdit() error {
 		return err
 	}
 
-	if err := session.Select(chosen); err != nil {
-		return fmt.Errorf("activating live edit access to %s: %w", chosen, err)
+	if serr := session.Select(chosen); serr != nil {
+		return fmt.Errorf("activating live edit access to %s: %w", chosen, serr)
 	}
 
-	log.Infof("editing %s LIVE — the daemon keeps guarding it; write access is granted only for this session", chosen)
-	if err := tui.RunFileEditor(chosen); err != nil {
+	log.Infof("editing %s LIVE — the daemon keeps guarding it; write access is granted only for this session "+
+		"and revoked after %s without input", chosen, timeoutSession)
+	_, ended := session.Watch()
+	byDaemon, err := tui.RunFileEditorSession(chosen, session.Pinger(pingInterval()), ended)
+	if err != nil {
 		return fmt.Errorf("edit %s: %w", chosen, err)
 	}
 
 	session.End() // narrow the guard back before the audit reads the tree
 	auditAfterEdit(chosen, true)
+	if byDaemon {
+		return errors.New("the daemon ended the live edit session (idle timeout or reload) — " +
+			"saves made before it are kept, later ones were not written")
+	}
 	return nil
 }
 
 // chooseResource honors --resource when given (validating it against the
 // daemon's list), otherwise prompts.
 func chooseResource(resources []string) (string, error) {
-	if resourceFlag != "" {
-		if slices.Contains(resources, resourceFlag) {
-			return resourceFlag, nil
+	if len(resourceFlags) > 0 {
+		if slices.Contains(resources, resourceFlags[0]) {
+			return resourceFlags[0], nil
 		}
-		return "", fmt.Errorf("%s is not a guarded directory in the running daemon", resourceFlag)
+		return "", fmt.Errorf("%s is not a guarded directory in the running daemon", resourceFlags[0])
 	}
 	if len(resources) == 1 {
 		log.Infof("only one guarded directory: %s", resources[0])
@@ -93,9 +101,10 @@ func chooseResource(resources []string) (string, error) {
 // runNonInteractiveLivePut performs one authenticated live write without any
 // TUI: content from --content-file or stdin, password from the environment.
 func runNonInteractiveLivePut() error {
-	if resourceFlag == "" {
+	if len(resourceFlags) == 0 {
 		return errors.New("--put requires --resource")
 	}
+	resource := resourceFlags[0]
 	password := os.Getenv(editPasswordEnv)
 	if password == "" {
 		return fmt.Errorf("$%s is empty — set it to the edit-protected password for non-interactive --put", editPasswordEnv)
@@ -103,12 +112,12 @@ func runNonInteractiveLivePut() error {
 
 	dest := putFlag
 	if !filepath.IsAbs(dest) {
-		dest = filepath.Join(resourceFlag, dest)
+		dest = filepath.Join(resource, dest)
 	}
 	// Lexical containment is only a first gate; writeWithin re-checks every component with
 	// O_NOFOLLOW so a symlink in the tree can't redirect the write outside the guarded resource.
-	if !within(resourceFlag, dest) {
-		return fmt.Errorf("--put target %s is outside the resource %s", dest, resourceFlag)
+	if !within(resource, dest) {
+		return fmt.Errorf("--put target %s is outside the resource %s", dest, resource)
 	}
 	content, err := readPutContent()
 	if err != nil {
@@ -120,26 +129,27 @@ func runNonInteractiveLivePut() error {
 		return err
 	}
 	defer session.End()
+	session.timeout = timeoutSession
 
 	resources, err := session.Authenticate(password)
 	if err != nil {
 		return fmt.Errorf("authentication failed: %w", err)
 	}
-	if !slices.Contains(resources, resourceFlag) {
-		return fmt.Errorf("%s is not a guarded directory in the running daemon", resourceFlag)
+	if !slices.Contains(resources, resource) {
+		return fmt.Errorf("%s is not a guarded directory in the running daemon", resource)
 	}
 
-	if err := session.Select(resourceFlag); err != nil {
-		return fmt.Errorf("activating live edit access to %s: %w", resourceFlag, err)
+	if err := session.Select(resource); err != nil {
+		return fmt.Errorf("activating live edit access to %s: %w", resource, err)
 	}
 
-	if err := writeWithin(resourceFlag, dest, content); err != nil {
+	if err := writeWithin(resource, dest, content); err != nil {
 		return err
 	}
 	log.Infof("wrote %d bytes to %s (live)", len(content), dest)
 
 	session.End()
-	auditAfterEdit(resourceFlag, false)
+	auditAfterEdit(resource, false)
 	return nil
 }
 

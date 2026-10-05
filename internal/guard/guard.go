@@ -262,6 +262,8 @@ type Guard struct {
 	held map[string]*os.File
 	// admit: WithAdmissionCheck.
 	admit AdmissionCheck
+	// tap: SetEventTap.
+	tap atomic.Pointer[func(GuardEvent)]
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -2336,6 +2338,9 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 // event and counts it, which costs only telemetry — enforcement already happened in the kernel,
 // synchronously, and the BPF ringbuf itself drops on overflow for the same reason.
 func (g *Guard) dispatch(ev *GuardEvent) {
+	if tap := g.tap.Load(); tap != nil {
+		(*tap)(*ev)
+	}
 	if !g.Reports(ev) {
 		return
 	}
@@ -2357,6 +2362,16 @@ func (g *Guard) dispatch(ev *GuardEvent) {
 				"enforcement is unaffected, only reporting", g.path, dropped)
 		}
 	}
+}
+
+// SetEventTap hands fn every event this guard reads, allowed ones included whatever the consumer
+// filters (WithoutAllowedEvents); nil removes it. fn runs on the ringbuf reader: it must not block.
+func (g *Guard) SetEventTap(fn func(GuardEvent)) {
+	if fn == nil {
+		g.tap.Store(nil)
+		return
+	}
+	g.tap.Store(&fn)
 }
 
 // Reports reports whether the guard queues ev for its consumer; a denial always is.

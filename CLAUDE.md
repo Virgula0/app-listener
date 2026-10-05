@@ -44,14 +44,28 @@ every change to enforcement paths as security-sensitive:
   authenticates over a `0600` root-only unix socket that *also* checks `SO_PEERCRED`
   uid 0 **and** that the peer's exe inode is the daemon's own binary. The protocol is
   two-phase — `AUTH` (password) must succeed **before** the daemon discloses any
-  watch path, then `SELECT <resource>` activates the grant — so an unauthenticated
-  caller learns nothing about the protected directories. The grant transiently widens
-  **only** that one resource's `GUARD_ALLOW_ROOT` self event-mask (never the
-  whitelist), one session at a time, 30-min hard cap, revoked on disconnect / SIGHUP.
-  The password hash (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded
-  like `fscrypt.key`. Don't loosen any of: the peer-exe check, AUTH-before-disclosure,
-  the single-session lock, the auth lockout, the `origin=install` guard on
-  `--set-password`, or the mask being restored in `RevokeSelfEditAccess`.
+  watch path, then `SELECT <resource>` or `FORWARD` activates the grant — so an
+  unauthenticated caller learns nothing about the protected directories. `SELECT`
+  transiently widens **only** that one resource's `GUARD_ALLOW_ROOT` self event-mask.
+  `FORWARD` (`edit-protected --forward -w/-b [-e]`, `internal/guard/tempgrant.go`) is the
+  one path that writes **whitelist rows** for other binaries: `-w` only where the resource
+  has no row (never over a tamper-demoted `GUARD_BLOCK`, never the self key or an
+  inspector), `-b` only over an existing `GUARD_ALLOW`. The daemon resolves every path
+  itself (`OpenConfined`) and holds the inode open for the session, and the use case
+  revokes the whole grant when a granted binary's content changes in place. Revoke is
+  compare-and-swap: it restores a row only while it still holds what the grant wrote and the
+  permanent whitelist hasn't claimed (or the tamper detector demoted) the key. `-w` rows are
+  journaled to `/etc/app-listener/temp-grants.json` **before** the write, so
+  `daemon --lockdown` / the next start strip them from a SIGKILLed daemon's pinned maps
+  (strip-only: a forged journal can deny, never admit). Both kinds: one session at a time,
+  revoked on disconnect / SIGHUP / an idle timeout (`TIMEOUT`, default 30m, daemon-capped at
+  24h) that only client `PING`s and, for `FORWARD`, the granted binaries' own events reset.
+  `FORWARD` streams those events (`EVENT` lines, via `Guard.SetEventTap`, matched by
+  `/proc/<pid>/exe` inode for display only — never a policy input). The password hash
+  (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded like `fscrypt.key`.
+  Don't loosen any of: the peer-exe check, AUTH-before-disclosure, the single-session lock,
+  the auth lockout, the `origin=install` guard on `--set-password`, the mask being restored
+  in `RevokeSelfEditAccess`, or the journal-before-write and CAS-restore rules above.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
   key + edit-auth hash (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.

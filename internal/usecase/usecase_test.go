@@ -57,6 +57,8 @@ type fakeGuardRepo struct {
 	editGranted      bool
 	editGrantErr     error
 	vaultAccessCalls int
+	tap              func(guard.GuardEvent)
+	tempPlan         func(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error)
 	events           chan guard.GuardEvent
 	taintedPIDs      []uint32
 	superseded       []guard.SupersededBinary
@@ -112,6 +114,19 @@ func (f *fakeGuardRepo) GrantSelfEditAccess() error {
 func (f *fakeGuardRepo) RevokeSelfEditAccess() error {
 	f.editGranted = false
 	return nil
+}
+
+func (f *fakeGuardRepo) PlanTemporaryGrant(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error) {
+	if f.tempPlan == nil {
+		return nil, errBoom
+	}
+	return f.tempPlan(bins, rule)
+}
+
+func (f *fakeGuardRepo) SetEventTap(fn func(guard.GuardEvent)) {
+	f.mu.Lock()
+	f.tap = fn
+	f.mu.Unlock()
 }
 
 func (f *fakeGuardRepo) WithSelfVaultAccess(fn func() error) error {

@@ -607,6 +607,7 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 // usecase (attach -> unlock -> populate). Ephemeral guards retire once the real ones are attached
 // and populated. Every error path locks freshly unlocked vaults back first.
 func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg, vet *binaryVetter) (usecase.DaemonUseCase, error) {
+	stripTempJournal("daemon", pin.base)
 	relockStaleVaults(cfg, vault, pin.base)
 
 	// Retire pins a killed predecessor left. relockStaleVaults (and ExecStopPost --lockdown)
@@ -776,6 +777,7 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 // guard.pinSelfMaps, guard.WithPinnedSelfVaultAccess).
 func runLockdown() {
 	configureDaemonLogging()
+	stripTempJournal("lockdown", guard.ResolvePinBase(bpffsMount))
 
 	configPath, err := resolveConfigPath()
 	if err != nil {

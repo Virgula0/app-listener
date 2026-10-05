@@ -113,6 +113,10 @@ func bootstrapSelfProtectPlaceholders() {
 	if err := ensurePinStateFilePlaceholder(); err != nil {
 		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — daemon --lockdown may not be able to recover this run's generation after a crash", pinStateFile, err)
 	}
+	if err := ensurePlaceholder(tempJournalFile); err != nil {
+		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — edit-protected --forward "+
+			"grants will be refused", tempJournalFile, err)
+	}
 }
 
 // attach builds and starts the self guards, pinned under pin.gen. Safe in its own goroutine: a

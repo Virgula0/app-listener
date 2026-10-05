@@ -89,6 +89,12 @@ func (e *engine) isInspectorLocked(exe GuardInodeKey) bool {
 	return ok
 }
 
+func (e *engine) isInspector(exe GuardInodeKey) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.isInspectorLocked(exe)
+}
+
 // AdmitInspector resolves path to an inspector key: a system file at a name only root could have
 // placed, on a superblock root vouches for (systemFile), and TRUSTED_BINARY before it is returned, so
 // trust_mmap refuses it untrusted code (LD_PRELOAD) from its first exec on.
