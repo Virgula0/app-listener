@@ -284,3 +284,42 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_EditConfig() {
 
 	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
 }
+
+// A runtime admitted by -w is judged at launch like a whitelisted one (trust_exec_launch keys on
+// guard_trusted_files' runtime bits): started with env or flags that load its caller's code it gets
+// nothing, started cleanly it reads. launch_probe's marker strings class it a Node runtime.
+func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_RuntimeLaunchJudged() {
+	c := s.forwardSetup()
+	defer c.Terminate(s.ctx)
+
+	const probe = "/opt/rt/bin/launch_probe"
+	s.exec(c, []string{"mkdir", "-p", "/opt/rt/bin"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe"), probe, 0o755),
+		"copy launch_probe")
+	read := func(env, flags string) string {
+		_, out := s.exec(c, []string{"sh", "-c", env + " " + probe + " read /protected/secret " + flags + " 2>&1"})
+		return out
+	}
+	s.Require().NotContains(read("", ""), "STOLEN|", "baseline: launch_probe is not whitelisted")
+
+	s.startForward(c, "-w "+probe, 1)
+	s.Require().Containsf(read("", ""), "STOLEN|SECRET", "a clean launch under -w must read:\n%s", s.readDaemonLog(c))
+	for _, lc := range []struct{ what, env, flags string }{
+		{"ELECTRON_RUN_AS_NODE", "ELECTRON_RUN_AS_NODE=1", ""},
+		{"NODE_OPTIONS --require", "NODE_OPTIONS='--require /tmp/x.js'", ""},
+		{"--inspect", "", "--inspect=9229"},
+	} {
+		out := read(lc.env, lc.flags)
+		s.Require().NotContainsf(out, "STOLEN|", "launched with %s, the granted runtime read the secret: %s\ndaemon log:\n%s",
+			lc.what, out, s.readDaemonLog(c))
+		s.Require().Containsf(out, "open denied: Operation not permitted", "%s: expected the kernel's refusal: %s", lc.what, out)
+	}
+	s.requireDenialLogged(c, "LAUNCH", "secret")
+	s.Require().Containsf(read("", ""), "STOLEN|SECRET", "the mark is the process's: a clean launch reads again")
+
+	s.stopForward(c, "TERM", 1)
+	s.Require().NotContains(read("", ""), "STOLEN|", "launch_probe after the client exited")
+	s.Require().NotContains(s.readDaemonLog(c), "restoring the trust row", "the revoke left a trust row behind")
+
+	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
+}

@@ -292,6 +292,7 @@ sudo app-listener edit-protected --forward \
 Things to know before admitting a binary:
 - A `-w` grant covers **every user** running that binary, like a `daemon.conf` whitelist line.
 - Admitting an **interpreter** (python, node, bash) admits every script it runs. A script's process is its interpreter, so the script itself is not what the guard sees.
+- A granted **Node/Electron, Chromium or JVM runtime** is judged at launch like a whitelisted one: started with env or flags that load its caller's code (`ELECTRON_RUN_AS_NODE`, `NODE_OPTIONS=--require`, `--inspect`, `--remote-debugging-port`, `JAVA_TOOL_OPTIONS=-javaagent`, …), it is refused the directories (`TRUST DENIED op=LAUNCH`). This covers an app that embeds a runtime (VS Code, Discord); it doesn't cover `node script.js` or a JVM given a class path, which run the script they're given.
 - A binary that isn't root-placed (anything under a home directory) can be rewritten in place by its owner. You're asked to confirm it (`--yes` skips the question and is required without a terminal), and the daemon revokes the grant if its content changes.
 - Revocation re-checks already-open files on their next read or write, but memory a process already mapped stays mapped.
 - Identity is the binary's inode, resolved by the daemon. A binary already whitelisted on a resource is left untouched by `-w`, and one that isn't is untouched by `-b`. The daemon's own binary, inspectors and tamper-demoted binaries are refused.

@@ -28,6 +28,9 @@ type TempBinary struct {
 	// SystemPlaced: only root could have placed it (ebpf.SystemPlacedInode). Otherwise its owner
 	// can rewrite it in place during the window; Changed catches that.
 	SystemPlaced bool
+	// Runtime: the launch-injectable runtimes the image embeds (runtimeClass), set on the inode for
+	// the session so trust_exec_launch judges its launches as it does a whitelisted one's.
+	Runtime uint8
 
 	// mu: the grant's watcher runs Changed while a revoke may Close.
 	mu   sync.Mutex
@@ -62,7 +65,22 @@ func ResolveTempBinary(path string) (*TempBinary, error) {
 	}
 	b.hash = entry.Hash
 	b.SystemPlaced = ebpf.SystemPlacedInode(path, b.Key.Dev, b.Key.Ino)
+	b.Runtime = runtimeClass(f, path)
 	return b, nil
+}
+
+// RuntimeNames names the runtimes in b.Runtime, for a prompt.
+func (b *TempBinary) RuntimeNames() []string {
+	var out []string
+	for _, c := range []struct {
+		bit  uint8
+		name string
+	}{{trustedNode, "Node"}, {trustedElectron, "Electron"}, {trustedChromium, "Chromium"}, {trustedJVM, "JVM"}} {
+		if b.Runtime&c.bit != 0 {
+			out = append(out, c.name)
+		}
+	}
+	return out
 }
 
 func binaryStatOf(st *unix.Stat_t) ebpf.BinaryStat {
@@ -150,6 +168,11 @@ type tempRow struct {
 	maskOp    tempMaskOp
 	newMask   uint32
 	applied   bool
+	// The guard_trusted_files row as trustTempRuntime found it, and the bits it ORed in.
+	trust      *TrustGuard
+	trustHad   bool
+	trustPrior uint8
+	trustAdded uint8
 }
 
 type tempMaskOp int
@@ -304,17 +327,18 @@ func (t *tempGrant) JournalRows() []GuardResInodeKey {
 func (t *tempGrant) Report() []string { return t.report }
 
 // Apply runs under g.mu so Stop can't retire (and a reload reuse) the slot between the check and
-// the writes.
+// the writes. The trust guard is looked up first: PruneSuperseded takes supersede.mu, then g.mu.
 func (t *tempGrant) Apply() error {
 	g := t.g
+	trust := liveTrust()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.stopped {
 		return fmt.Errorf("guard %s is stopped", g.path)
 	}
 	for _, r := range t.rows {
-		if err := g.applyTempRow(r); err != nil {
-			if rerr := t.revokeLocked(); rerr != nil {
+		if err := g.applyTempRow(r, trust); err != nil {
+			if rerr := t.revokeLocked(trust); rerr != nil {
 				log.Errorf("guard %s: undoing a partly applied temporary grant: %v", g.path, rerr)
 			}
 			return err
@@ -323,7 +347,7 @@ func (t *tempGrant) Apply() error {
 	return nil
 }
 
-func (g *Guard) applyTempRow(r *tempRow) error {
+func (g *Guard) applyTempRow(r *tempRow, trust *TrustGuard) error {
 	cur, err := g.readExeRow(r.bin.Key)
 	if err != nil {
 		return err
@@ -332,7 +356,7 @@ func (g *Guard) applyTempRow(r *tempRow) error {
 		return fmt.Errorf("%s: the whitelist row of %s changed while the grant was prepared — retry", g.path, r.bin.Path)
 	}
 	r.applied = true
-	if err := g.writeTempRow(r); err != nil {
+	if err := g.writeTempRow(r, trust); err != nil {
 		return fmt.Errorf("%s: temporary row of %s: %w", g.path, r.bin.Path, err)
 	}
 	return nil
@@ -340,7 +364,7 @@ func (g *Guard) applyTempRow(r *tempRow) error {
 
 // writeTempRow puts an allow's mask in first and a block's action first: no moment is wider than
 // the final state.
-func (g *Guard) writeTempRow(r *tempRow) error {
+func (g *Guard) writeTempRow(r *tempRow, trust *TrustGuard) error {
 	k := r.bin.Key
 	if r.newAction == GUARD_BLOCK {
 		if err := g.putExeAction(k, GUARD_BLOCK); err != nil {
@@ -358,36 +382,111 @@ func (g *Guard) writeTempRow(r *tempRow) error {
 		}
 	}
 	if r.newAction == GUARD_ALLOW {
+		if err := r.trustTempRuntime(trust); err != nil {
+			return err
+		}
 		return g.putExeAction(k, GUARD_ALLOW)
 	}
 	return nil
 }
 
+// liveTrust is the attached trust guard; nil before its Start and after its Stop.
+func liveTrust() *TrustGuard {
+	supersede.mu.Lock()
+	defer supersede.mu.Unlock()
+	return supersede.trust
+}
+
+// trustTempRuntime ORs the binary's runtime classes into guard_trusted_files before its allow row
+// lands: trust_exec_launch judges only exes carrying them, so ELECTRON_RUN_AS_NODE, NODE_OPTIONS or
+// --inspect would otherwise run the caller's code with the grant. Never TRUSTED_BINARY, and never
+// over a row that has it: that is the permanent whitelist's. No trust guard, no allow (trust_mmap's
+// code-suspect marking and the launch checks both live in it).
+func (r *tempRow) trustTempRuntime(t *TrustGuard) error {
+	if t == nil {
+		return errors.New("the trust guard is not running — refusing to admit a binary without its launch checks")
+	}
+	if r.bin.Runtime == 0 {
+		return nil
+	}
+	k := GuardTrustInodeKey{Dev: r.bin.Key.Dev, Ino: r.bin.Key.Ino}
+	var flags uint8
+	err := t.objs.GuardTrustedFiles.Lookup(k, &flags)
+	had := err == nil
+	switch {
+	case had:
+		if flags&trustedBinary != 0 || flags&r.bin.Runtime == r.bin.Runtime {
+			return nil
+		}
+		err = t.objs.GuardTrustedFiles.Update(k, flags|r.bin.Runtime, cilium.UpdateExist)
+	case errors.Is(err, cilium.ErrKeyNotExist):
+		err = t.objs.GuardTrustedFiles.Update(k, r.bin.Runtime, cilium.UpdateNoExist)
+	}
+	if err != nil {
+		return fmt.Errorf("marking %s's runtime launches for judging: %w", r.bin.Path, err)
+	}
+	r.trust, r.trustHad, r.trustPrior, r.trustAdded = t, had, flags, r.bin.Runtime&^flags
+	return nil
+}
+
+// untrustTempRuntime takes back the bits trustTempRuntime added, after the allow row is gone, and
+// only while the row holds exactly what it wrote and no guard admits the key: a row SetTrusted,
+// AllowReplacement or another admission rewrote since is theirs to keep (extra bits only judge more).
+func (r *tempRow) untrustTempRuntime(live *TrustGuard) error {
+	t, added := r.trust, r.trustAdded
+	r.trust, r.trustAdded = nil, 0
+	if added == 0 || t != live || sharedEngine.admitsExe(r.bin.Key) {
+		return nil
+	}
+	k := GuardTrustInodeKey{Dev: r.bin.Key.Dev, Ino: r.bin.Key.Ino}
+	var cur uint8
+	if err := t.objs.GuardTrustedFiles.Lookup(k, &cur); err != nil {
+		if errors.Is(err, cilium.ErrKeyNotExist) {
+			return nil
+		}
+		return err
+	}
+	if cur != r.trustPrior|added {
+		return nil
+	}
+	if r.trustHad {
+		return t.objs.GuardTrustedFiles.Update(k, r.trustPrior, cilium.UpdateExist)
+	}
+	if err := t.objs.GuardTrustedFiles.Delete(k); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+		return err
+	}
+	return nil
+}
+
 func (t *tempGrant) Revoke() error {
+	trust := liveTrust() // before g.mu: see Apply
 	t.g.mu.Lock()
 	defer t.g.mu.Unlock()
-	return t.revokeLocked()
+	return t.revokeLocked(trust)
 }
 
 // revokeLocked runs under g.mu. A stopped guard's rows were dropped with its slot, which a later
-// guard may own: nothing is written then.
-func (t *tempGrant) revokeLocked() error {
+// guard may own: none is written then. trust: the live trust guard (a stopped one's map is gone).
+func (t *tempGrant) revokeLocked(trust *TrustGuard) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.revoked {
 		return nil
 	}
 	t.revoked = true
-	if t.g.stopped {
-		return nil
-	}
 	var errs []error
 	for _, r := range slices.Backward(t.rows) {
 		if !r.applied {
 			continue
 		}
-		if err := t.g.restoreTempRowLocked(r); err != nil {
-			errs = append(errs, fmt.Errorf("%s: restoring the whitelist row of %s: %w", t.g.path, r.bin.Path, err))
+		// A stopped guard's whitelist rows went with its slot; the trust row is daemon-wide.
+		if !t.g.stopped {
+			if err := t.g.restoreTempRowLocked(r); err != nil {
+				errs = append(errs, fmt.Errorf("%s: restoring the whitelist row of %s: %w", t.g.path, r.bin.Path, err))
+			}
+		}
+		if err := r.untrustTempRuntime(trust); err != nil {
+			errs = append(errs, fmt.Errorf("%s: restoring the trust row of %s: %w", t.g.path, r.bin.Path, err))
 		}
 	}
 	return errors.Join(errs...)

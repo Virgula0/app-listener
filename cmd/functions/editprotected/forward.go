@@ -149,6 +149,11 @@ func confirmUserPlaced(bins []string) error {
 		if !b.SystemPlaced {
 			risky = append(risky, p)
 		}
+		if names := b.RuntimeNames(); len(names) > 0 {
+			log.Infof("%s is a %s runtime: started with code-loading env or flags (NODE_OPTIONS, "+
+				"ELECTRON_RUN_AS_NODE, --inspect, JAVA_TOOL_OPTIONS, …) it is refused the directories", p,
+				strings.Join(names, "/"))
+		}
 		b.Close()
 	}
 	if len(risky) == 0 || yesFlag {
@@ -156,7 +161,8 @@ func confirmUserPlaced(bins []string) error {
 	}
 	msg := "Not root-placed (a user can rewrite them while the grant is active; it is revoked if their " +
 		"content changes):\n  " + strings.Join(risky, "\n  ") +
-		"\nThe grant covers every user running them, and an interpreter admits every script it runs."
+		"\nThe grant covers every user running them, and an interpreter (python, bash, node) admits " +
+		"every script it is given."
 	if !term.IsTerminal(os.Stdin.Fd()) {
 		return errors.New(msg + "\nRe-run with --yes to admit them anyway.")
 	}

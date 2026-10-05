@@ -989,8 +989,9 @@ static __noinline int guarded_root_kind(struct dentry *dentry)
 // trust_suspect_denied: a code-suspect process (trust_code_suspect) is refused a regular file below
 // a secret root, and any change below an app's code tree: code it runs as a whitelisted binary
 // would plant an extension or module there for the next clean start to run. A non-whitelisted exe's
-// denial is the guard's to report. Global, so the verifier checks it once rather than at every call
-// site (1M-insn budget); callers return -EPERM themselves, as an LSM must return a known errno.
+// denial is the guard's to report; a runtime-only row is a temporary grant's (tempgrant.go). Global,
+// so the verifier checks it once rather than at every call site (1M-insn budget); callers return
+// -EPERM themselves, as an LSM must return a known errno.
 __noinline int trust_suspect_denied(__u64 dir, int change)
 {
 	struct dentry *dentry = (struct dentry *)dir;
@@ -1002,7 +1003,7 @@ __noinline int trust_suspect_denied(__u64 dir, int change)
 	int root = guarded_root_kind(dentry);
 	if (root != ROOT_SECRET && !(root == ROOT_CODE && change))
 		return 0;
-	if (current_exe_flags() & TRUSTED_BINARY)
+	if (current_exe_flags() & (TRUSTED_BINARY | TRUSTED_RUNTIMES))
 		emit(dentry, kind);
 	return 1;
 }
