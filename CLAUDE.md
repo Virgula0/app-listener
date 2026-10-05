@@ -361,3 +361,31 @@ built-in Read / Edit / Write tools: shell access (`cat`, `>>`, `sed`) is denied 
 See `memory/release-promote-flow.md`. A release is a *build*, not a tag rename:
 `release.yml` cuts a `pre-*` pre-release per push to main; `promote-release.yml` rebuilds
 a stable `vX.Y.Z`. `_build-release.yml` is the reusable build job.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+
+## graphify in this repo
+
+The graph is a map, not proof — a missed caller of an enforcement path is a bypass.
+
+- Go calls through an interface value are not edges. Usecase → engine goes through
+  `repository.*`, so `affected`/`path` undercount (`affected` on `RevokeSelfEditAccess` is
+  empty; `internal/usecase/daemon.go` calls it). Enumerate callers with grep/LSP before
+  changing enforcement code.
+- Method labels are ambiguous (`.Grant()`, `.Forward()`): pass the node id
+  (`graphify explain usecase_daemonusecase_granteditaccess`).
+- Go ↔ BPF links (bpf2go bindings, LSM attach) are absent — the generated bindings are
+  gitignored. Trace hooks through `guard_spec.go` and the `*.bpf.c` sources.
+- Freshness: git hooks rebuild on commit/checkout; `.claude/hooks/graphify-refresh.sh`
+  (`UserPromptSubmit`) rebuilds for uncommitted edits. Run `graphify update .` after a pull.
+  Code rebuilds re-cluster, so community names are auto-derived. Doc/GIF nodes refresh only
+  via `/graphify . --update`.
+- Only `graphify-out/graph.json` and `GRAPH_REPORT.md` are tracked (`git add -f`).

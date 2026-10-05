@@ -43,3 +43,10 @@ integrationtests/exploits/*
 # Denial traces from scripts/trace-app-libs.sh (contain home-directory paths)
 scripts/app-trace-*.log
 scripts/lib-trace-*.log
+
+# graphify knowledge graph: only graph.json + GRAPH_REPORT.md are tracked (git add -f);
+# cache/, graph.html and .graphify_python/.graphify_root (absolute paths) stay local.
+graphify-out/
+
+# Claude Code per-machine settings (graphify hooks use this machine's absolute exe path)
+.claude/settings.local.json
