@@ -67,6 +67,7 @@ func ShowDiff(title, diff string) error {
 type diffModel struct {
 	textarea textarea.Model
 	hl       *codeedit.Highlighter
+	find     codeedit.Finder
 	title    string
 }
 
@@ -75,7 +76,12 @@ func newDiffModel(title, diff string) diffModel {
 	ta.SetHeight(24)
 	ta.Focus()
 	codeedit.SetText(&ta, diff)
-	return diffModel{textarea: ta, hl: codeedit.NewHighlighter("changes.diff", diff), title: title}
+	return diffModel{
+		textarea: ta,
+		hl:       codeedit.NewHighlighter("changes.diff", diff),
+		find:     codeedit.NewFinder(false),
+		title:    title,
+	}
 }
 
 func (m *diffModel) Init() tea.Cmd {
@@ -88,6 +94,9 @@ func (m *diffModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetHeight(max(msg.Height-editorChromeLines, editMinHeight))
 	}
 	if msg, ok := msg.(tea.KeyMsg); ok {
+		if m.find.Update(&m.textarea, msg) {
+			return m, nil
+		}
 		switch msg.String() {
 		case "q", "esc", "enter", "ctrl+q":
 			return m, tea.Quit
@@ -110,8 +119,8 @@ func (m *diffModel) View() string {
 	b.WriteString("\n\n")
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color("240")).
-		Render("q / Esc / Enter: continue"))
+		Render("q / Esc / Enter: continue  ·  Ctrl+F find"))
 	b.WriteString("\n\n")
-	b.WriteString(m.hl.View(&m.textarea))
+	b.WriteString(m.find.View(m.hl, &m.textarea))
 	return b.String()
 }

@@ -107,6 +107,7 @@ type fileEditModel struct {
 
 	editor    textarea.Model
 	hl        *codeedit.Highlighter
+	find      codeedit.Finder
 	editPath  string
 	original  string
 	dirty     bool
@@ -161,6 +162,7 @@ func newFileEditModel(root string) *fileEditModel {
 	}
 	m.editor = codeedit.New()
 	m.editor.Blur()
+	m.find = codeedit.NewFinder(true)
 
 	vault, vaultErr := openVault(root)
 	if vaultErr != nil {
@@ -322,11 +324,16 @@ func (m *fileEditModel) navAction(msg tea.KeyMsg) bool {
 }
 
 func (m *fileEditModel) updateEditKey(msg tea.KeyMsg) (textarea.Model, tea.Cmd) {
+	if m.find.Update(&m.editor, msg) {
+		m.dirty = m.editor.Value() != m.original
+		return m.editor, nil
+	}
 	switch msg.String() {
 	case "ctrl+s":
 		if err := m.save(); err != nil {
 			m.status = err.Error()
 		}
+		m.find.Close()
 		m.editor.Blur()
 		m.mode = modeNav
 	case keyEsc:
@@ -593,6 +600,7 @@ func (m *fileEditModel) previewFile(path string) error {
 	m.editPath = path
 	m.original = string(data)
 	m.hl = codeedit.NewHighlighter(path, m.original)
+	m.find.Close()
 	codeedit.SetText(&m.editor, m.original)
 	m.previewOK = true
 	m.dirty = false
@@ -959,7 +967,7 @@ func (m *fileEditModel) renderTree(width, height int) string {
 func (m *fileEditModel) renderRight(width, height int) string {
 	switch m.mode {
 	case modeEdit:
-		return m.hl.View(&m.editor)
+		return m.find.View(m.hl, &m.editor)
 	case modeInput:
 		kind := "file"
 		if m.inputKind == createDir {
@@ -1061,6 +1069,8 @@ var legendHints = map[fileEditMode][]hint{
 	modeEdit: {
 		{"ctrl+s", "save & close"},
 		{"esc", "close"},
+		{"ctrl+f", "find"},
+		{"ctrl+r", "replace"},
 		{"ctrl+←/→", "word jump"},
 		{"pgup/pgdn", "page"},
 		{"tab/⇧tab", "indent"},

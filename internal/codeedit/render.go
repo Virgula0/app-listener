@@ -223,9 +223,8 @@ func (h *Highlighter) renderRow(
 		wrapped = []rune(strings.TrimSuffix(string(wrapped), " "))
 		padding -= width - strwidth
 	}
-	cls := h.classes[l]
 	if l == row && li.RowOffset == wl {
-		h.paint(&b, &style, wrapped[:li.ColumnOffset], cls, start)
+		h.paint(&b, &style, wrapped[:li.ColumnOffset], l, start)
 		cur := ta.Cursor
 		cur.TextStyle = st.cursorLine
 		if li.StartColumn+li.ColumnOffset >= lineLen(h.wraps[l]) && li.CharOffset >= width {
@@ -234,10 +233,10 @@ func (h *Highlighter) renderRow(
 		} else {
 			cur.SetChar(string(wrapped[li.ColumnOffset]))
 			b.WriteString(style.Render(cur.View()))
-			h.paint(&b, &style, wrapped[li.ColumnOffset+1:], cls, start+li.ColumnOffset+1)
+			h.paint(&b, &style, wrapped[li.ColumnOffset+1:], l, start+li.ColumnOffset+1)
 		}
 	} else {
-		h.paint(&b, &style, wrapped, cls, start)
+		h.paint(&b, &style, wrapped, l, start)
 	}
 	b.WriteString(style.Render(strings.Repeat(" ", max(0, padding))))
 	return b.String()
@@ -252,9 +251,11 @@ func lineLen(rows [][]rune) int {
 	return n
 }
 
-// paint writes seg (runes from offset start of the line) in runs of one token class, each run's
-// color layered over the row's style. An all-unstyled segment is one Render, as textarea does.
-func (h *Highlighter) paint(b *strings.Builder, row *lipgloss.Style, seg []rune, cls []uint8, start int) {
+// paint writes seg (runes from offset start of line l) in runs of one token class and find mark,
+// each run's color layered over the row's style. An all-unstyled segment is one Render, as
+// textarea does.
+func (h *Highlighter) paint(b *strings.Builder, row *lipgloss.Style, seg []rune, l, start int) {
+	cls := h.classes[l]
 	classAt := func(i int) uint8 {
 		if j := start + i; j < len(cls) {
 			return cls[j]
@@ -266,18 +267,61 @@ func (h *Highlighter) paint(b *strings.Builder, row *lipgloss.Style, seg []rune,
 		return
 	}
 	for i := 0; i < len(seg); {
-		c := classAt(i)
+		c, mk := classAt(i), h.markAt(l, start+i)
 		j := i + 1
-		for j < len(seg) && classAt(j) == c {
+		for j < len(seg) && classAt(j) == c && h.markAt(l, start+j) == mk {
 			j++
 		}
-		style := *row
-		if c != clsNone {
-			style = tokenStyles[c].Inherit(*row)
-		}
-		b.WriteString(style.Render(string(seg[i:j])))
+		b.WriteString(markStyle(c, mk).Inherit(*row).Render(string(seg[i:j])))
 		i = j
 	}
+}
+
+const (
+	markNone = iota
+	markMatch
+	markCurrent
+)
+
+func (h *Highlighter) markAt(l, col int) int {
+	if h.hasCurrent && h.current.line == l && col >= h.current.start && col < h.current.end {
+		return markCurrent
+	}
+	for _, m := range h.marks[l] {
+		if col >= m.start && col < m.end {
+			return markMatch
+		}
+	}
+	return markNone
+}
+
+// markStyle is token class c's color; a find match keeps it (plain text takes the keyword color),
+// underlined and bold, and the current match is reversed so the color becomes its background.
+func markStyle(c uint8, mk int) lipgloss.Style {
+	if mk == markNone {
+		return tokenStyles[c]
+	}
+	if c == clsNone || c >= clsStrong && c <= clsEmph {
+		c = clsKeyword
+	}
+	s := tokenStyles[c].Underline(true).Bold(true)
+	if mk == markCurrent {
+		s = s.Reverse(true)
+	}
+	return s
+}
+
+// cursorScreenRow is the cursor's row in the last View, -1 when unknown.
+func (h *Highlighter) cursorScreenRow(ta *textarea.Model) int {
+	vp, ok := viewportOf(ta)
+	if !ok || ta.Line() >= len(h.wraps) {
+		return -1
+	}
+	d := ta.LineInfo().RowOffset
+	for _, w := range h.wraps[:ta.Line()] {
+		d += len(w)
+	}
+	return d - vp.yOffset
 }
 
 // viewportView is viewport.Model.View for rows (the visible slice) with its default, frameless

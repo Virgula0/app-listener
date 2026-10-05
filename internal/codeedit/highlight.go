@@ -31,6 +31,11 @@ type Highlighter struct {
 	// Gutter: the textarea's Prompt, then a number column digits wide.
 	bar    string
 	digits int
+
+	// Find marks (Finder.View): underlined spans per line; current is also reversed.
+	marks      map[int][]span
+	current    span
+	hasCurrent bool
 }
 
 // NewHighlighter picks the language from name (base name or extension; daemon.conf has its own

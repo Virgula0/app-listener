@@ -52,6 +52,7 @@ func EditText(title, name, initial string) (string, error) {
 type editorModel struct {
 	textarea textarea.Model
 	hl       *codeedit.Highlighter
+	find     codeedit.Finder
 	title    string
 	canceled bool
 }
@@ -62,7 +63,12 @@ func newEditorModel(title, name, initial string) editorModel {
 	ta.Placeholder = "Type your configuration here..."
 	ta.Focus()
 	codeedit.SetText(&ta, initial)
-	return editorModel{textarea: ta, hl: codeedit.NewHighlighter(name, initial), title: title}
+	return editorModel{
+		textarea: ta,
+		hl:       codeedit.NewHighlighter(name, initial),
+		find:     codeedit.NewFinder(true),
+		title:    title,
+	}
 }
 
 func (m *editorModel) Init() tea.Cmd {
@@ -75,6 +81,9 @@ func (m *editorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetHeight(max(msg.Height-editorChromeLines, editMinHeight))
 	}
 	if msg, ok := msg.(tea.KeyMsg); ok {
+		if m.find.Update(&m.textarea, msg) {
+			return m, nil
+		}
 		switch msg.String() {
 		case editSaveKey:
 			m.canceled = false
@@ -101,8 +110,9 @@ func (m *editorModel) View() string {
 	b.WriteString("\n\n")
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color("240")).
-		Render("Ctrl+S save  ·  Esc cancel (no changes are kept)  ·  Ctrl+←/→ word  ·  PgUp/PgDn page  ·  Tab indent"))
+		Render("Ctrl+S save  ·  Esc cancel (no changes are kept)  ·  Ctrl+F find  ·  Ctrl+R replace  ·  " +
+			"Ctrl+←/→ word  ·  PgUp/PgDn page  ·  Tab indent"))
 	b.WriteString("\n\n")
-	b.WriteString(m.hl.View(&m.textarea))
+	b.WriteString(m.find.View(m.hl, &m.textarea))
 	return b.String()
 }
