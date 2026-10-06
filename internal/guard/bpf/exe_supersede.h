@@ -23,11 +23,21 @@ struct {
 	__type(value, struct exe_supersede);
 } exe_superseded SEC(".maps");
 
+// A multicall exe's key carries its applet in dev bits 32-47 (dev_t is 32 bits, so a tagged key
+// never names a real file): one inode, one identity per applet (guard.bpf.c, guard_exec_applet).
+// MC_TAG_NONE: an exec whose applet was not attested, which no whitelist row names.
+#define MC_TAG_SHIFT 32
+#define MC_TAG_MASK (0xffffULL << MC_TAG_SHIFT)
+#define MC_TAG_NONE 0xffff
+
 // start is the thread-group leader's start_time: a pid can be reused before task_free runs for its
-// previous owner, whose row must not pass for the new process's.
+// previous owner, whose row must not pass for the new process's. tag: the applet attested at the
+// last exec, MC_TAG_NONE until then.
 struct exec_stamp {
 	__u64 seq;
 	__u64 start;
+	__u32 tag;
+	__u32 pad;
 };
 
 // exe_stamps: tgid -> exe_seq at its last exec. Inherited on fork, rewritten on exec, cleared on
@@ -83,7 +93,9 @@ static __always_inline __u64 leader_start(struct task_struct *task)
 // be trusted. Callers fold the result into a lookup key instead of branching on it.
 static __noinline int exe_refused(struct task_struct *task, struct inode_key *exe)
 {
-	struct exe_supersede *s = bpf_map_lookup_elem(&exe_superseded, exe);
+	struct inode_key real = *exe;
+	real.dev &= ~MC_TAG_MASK; // an applet key follows its file's supersede
+	struct exe_supersede *s = bpf_map_lookup_elem(&exe_superseded, &real);
 	if (!s)
 		return 0;
 	if (!task)
@@ -100,7 +112,9 @@ static __noinline int exe_refused(struct task_struct *task, struct inode_key *ex
 
 static __noinline int exe_is_superseded(struct inode_key *exe)
 {
-	return bpf_map_lookup_elem(&exe_superseded, exe) != NULL;
+	struct inode_key real = *exe;
+	real.dev &= ~MC_TAG_MASK;
+	return bpf_map_lookup_elem(&exe_superseded, &real) != NULL;
 }
 
 static __always_inline void exe_stamp_lost(__u32 tgid)
@@ -125,6 +139,7 @@ static __always_inline void exe_stamp_exec(void)
 		struct exec_stamp st = {};
 		st.seq = *seq;
 		st.start = leader_start(task);
+		st.tag = MC_TAG_NONE;
 		if (!bpf_map_update_elem(&exe_stamps, &tgid, &st, BPF_ANY))
 			return;
 	}
@@ -146,7 +161,9 @@ static __always_inline void exe_stamp_fork(struct task_struct *parent, struct ta
 		return;
 	}
 	struct exec_stamp st = {};
-	st.seq = pst->start == leader_start(parent) ? pst->seq : ~0ULL;
+	int same = pst->start == leader_start(parent);
+	st.seq = same ? pst->seq : ~0ULL;
+	st.tag = same ? pst->tag : MC_TAG_NONE;
 	st.start = leader_start(child);
 	if (bpf_map_update_elem(&exe_stamps, &ctgid, &st, BPF_ANY))
 		exe_stamp_lost(ctgid);

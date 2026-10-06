@@ -795,11 +795,15 @@ func (g *Guard) binaryKey(path string) (GuardInodeKey, error) {
 	return GuardInodeKey{Dev: dev, Ino: ino}, err
 }
 
-// addBinaryActions stores per-binary allow/block flags in guard_exe_actions, keyed by filesystem inode.
+// addBinaryActions stores per-binary allow/block flags in guard_exe_actions, keyed by filesystem inode
+// (by applet for a uutils multicall, ExeKey).
 func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 	for _, b := range binaries {
 		inodeKey, err := g.binaryKey(b.Path)
 		if err != nil {
+			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
+		}
+		if inodeKey, err = ExeKey(b.Path, nil, inodeKey); err != nil {
 			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
 		}
 		action := uint8(GUARD_BLOCK)
@@ -1327,13 +1331,17 @@ func (g *Guard) resyncOne(binPath string, exeEvents map[string][]ebpf.EventType)
 		old = g.retired[path] // a new file may reuse the freed number: still a replacement
 	}
 	g.mu.Unlock()
-	if deployed && old == key {
+	if deployed && old.Real() == key {
+		return false, nil
+	}
+	exe, ok := g.appletKeyOrRefuse(binPath, f, key)
+	if !ok {
 		return false, nil
 	}
 	// Re-admitting by path alone let anyone who could swap the path (or a parent directory)
 	// inherit the entry; only an inode its updater created, or a system file at a name only root
 	// could have placed, qualifies. Reload is the operator's path for anything else.
-	if !replacementAllowed(binPath, f, old, key) {
+	if !replacementAllowed(binPath, f, old.Real(), key) {
 		if g.refused.firstTime(path, key) {
 			log.Warnf("guard %s: replacement of %s (inode %d) was neither created by its updater nor a "+
 				"system file at a root-placed name — not re-admitted; reload the daemon after verifying it", g.path,
@@ -1342,13 +1350,13 @@ func (g *Guard) resyncOne(binPath string, exeEvents map[string][]ebpf.EventType)
 		return false, nil
 	}
 	liftSuperseded(key)
-	if err := g.putBinaryKey(key, binPath, exeEvents); err != nil {
+	if err := g.putBinaryKey(exe, binPath, exeEvents); err != nil {
 		return false, err
 	}
 	g.mu.Lock()
-	g.deployed[path] = key
+	g.deployed[path] = exe
 	delete(g.retired, path)
-	g.keyPaths[key] = binPath
+	g.keyPaths[exe] = binPath
 	g.mu.Unlock()
 	return true, nil
 }
@@ -1428,6 +1436,10 @@ func (g *Guard) admitSystemMatch(path string, events []ebpf.EventType) (bool, er
 	entry, err := ebpf.ComputeBinaryEntryFile(f, path)
 	if err != nil {
 		return false, nil // unreadable now: next re-sync
+	}
+	key, ok := g.appletKeyOrRefuse(path, f, key)
+	if !ok {
+		return false, nil
 	}
 	liftSuperseded(key)
 	if err := g.putBinaryKey(key, path, map[string][]ebpf.EventType{path: events}); err != nil {
@@ -2250,7 +2262,7 @@ func (g *Guard) verifyBinaryHashesOnce() {
 
 		// Same inode and size/mtime/ctime: an in-place overwrite always bumps mtime/ctime, so
 		// unchanged. No read.
-		if st.hashed && freshKey == st.key && fp == st.stat {
+		if st.hashed && freshKey == st.key.Real() && fp == st.stat {
 			continue
 		}
 
@@ -2259,7 +2271,7 @@ func (g *Guard) verifyBinaryHashesOnce() {
 			continue // unreadable right now: keep the current decision
 		}
 
-		if freshKey != st.key {
+		if freshKey != st.key.Real() {
 			g.adoptReplacedIdentity(canonical, st, fp, hash)
 			continue
 		}
@@ -2290,12 +2302,12 @@ func (g *Guard) demoteInPlace(canonical string, st *binaryVerifyState) {
 func (g *Guard) adoptReplacedIdentity(canonical string, st *binaryVerifyState, fp ebpf.BinaryStat, hash [32]byte) {
 	freshKey := GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
 	g.mu.Lock()
-	admitted := g.deployed[canonical] == freshKey
+	deployedKey := g.deployed[canonical]
 	g.mu.Unlock()
-	if !admitted {
+	if deployedKey.Real() != freshKey {
 		return
 	}
-	st.key = freshKey
+	st.key = deployedKey
 	st.stat = fp
 	st.hash = hash
 	st.hashed = true
@@ -2522,7 +2534,7 @@ func deleteInoKeys(m *cilium.Map, exe GuardInodeKey) error {
 		if err != nil {
 			return err
 		}
-		if next.Ino == exe {
+		if next.Ino.Real() == exe {
 			stale = append(stale, next)
 		}
 		cur := next
@@ -2608,6 +2620,17 @@ func (g *Guard) resKey(ik GuardInodeKey) GuardResInodeKey {
 // putExeAction records a whitelist/blacklist decision for this resource, keeping the shared
 // cross-resource views in step when it is an allow.
 func (g *Guard) putExeAction(ik GuardInodeKey, action uint8) error {
+	if ik.tagged() {
+		if err := sharedEngine.ensureMulticall(ik.Real()); err != nil {
+			return err
+		}
+		// A blacklist also blocks the exec whose applet wasn't attested: `exec -a x cat` runs cat.
+		if action == GUARD_BLOCK && g.mode == ModeBlacklist {
+			if err := g.objs().GuardExeActions.Put(g.resKey(ik.withTag(mcTagNone)), action); err != nil {
+				return err
+			}
+		}
+	}
 	if err := g.objs().GuardExeActions.Put(g.resKey(ik), action); err != nil {
 		return err
 	}

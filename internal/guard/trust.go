@@ -300,7 +300,7 @@ func (t *TrustGuard) SetGuardedDirs(dirs []TrustedDir) error {
 			"trusted for no one", p)
 	}
 	userBits := make(map[GuardInodeKey]uint64)
-	for path, bits := range loaders {
+	for path, bits := range singleBinaryPaths(loaders, "lib_dir loader") {
 		dev, ino, err := ebpf.StatConfined(path)
 		if err != nil {
 			log.Warnf("trust guard: skipping unresolvable lib_dir writer %s: %v", path, err)

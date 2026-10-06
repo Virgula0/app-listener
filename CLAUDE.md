@@ -268,7 +268,8 @@ nothing, so the process refuses to start instead.
 - **LSM hooks** (`guard`, `network-guard`, `daemon`) — the only kernel mechanism that can
   **deny**. ~30 hooks; `file_open` + `file_permission`, the superseded-key set
   (`inode_unlink`, `inode_rename`, `bprm_committed_creds`, the `sched_process_fork`
-  tracepoint), and `file_ioctl` + `file_ioctl_compat` (the btrfs copy-ioctl gate; without
+  tracepoint), the `sched_process_exec` tracepoint (`guard_exec_applet`: multicall applet
+  identity), and `file_ioctl` + `file_ioctl_compat` (the btrfs copy-ioctl gate; without
   them a snapshot copies a guarded tree unguarded) are mandatory, the rest are best-effort
   (a missing hook logs a warning, enforcement continues). `file_ioctl_compat` (6.8+) is
   swapped for an inert program on kernels whose BTF lacks `bpf_lsm_file_ioctl_compat`
@@ -279,7 +280,12 @@ nothing, so the process refuses to start instead.
 
 **Identity is the executable's inode, never its name or comm** — renaming or comm-spoofing
 a binary cannot move it past policy. Guard whitelist/blacklist entries, the network guard,
-and the daemon all key on `dev:ino`.
+and the daemon all key on `dev:ino`. One exception, still kernel-attested: a uutils
+multicall's key carries its applet in dev bits 32-47 (`guard_exec_applet` tags an exec only
+when the basenames of `bprm->filename` and `argv[0]` are the same applet of that build's
+`--list`; anything else is `MC_TAG_NONE`). Userspace adds the tag only via `guard.ExeKey`
+(`internal/guard/multicall.go`); supersede marks, trust rows and exec-time hooks keep the
+real key (`GuardInodeKey.Real()`). BusyBox/toybox are refused.
 
 ### The daemon (`internal/usecase/daemon.go`, `cmd/functions/daemon`)
 

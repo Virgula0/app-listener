@@ -137,7 +137,8 @@ func (t *TrustGuard) SetGlobReservations(r GlobReservations) error {
 		return err
 	}
 	// Writers are whitelisted binaries, resolved as the whitelist is; roots may be /proc/self/fd/N.
-	roots, writers := resolveBits(r.Roots, ebpf.StatInode), resolveBits(r.Writers, t.statBinary())
+	roots := resolveBits(r.Roots, ebpf.StatInode)
+	writers := resolveBits(singleBinaryPaths(r.Writers, "reserved-name writer"), t.statBinary())
 
 	// Writers and names first: a root that lands before its writers would deny the app itself.
 	if err := syncMap(t.objs.GuardGlobWriters, writers); err != nil {

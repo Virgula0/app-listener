@@ -1948,8 +1948,9 @@ func (s *IntegrationSuite) TestGuard_ExecAttribution_Blacklist() {
 	// pooled: terminated at suite end
 
 	s.exec(c, []string{"mkdir", "-p", "/watch/bin"})
-	// mycat: a blacklisted executable inside the guarded tree.
-	s.exec(c, []string{"sh", "-c", "cp /bin/cat /watch/bin/mycat && chmod +x /watch/bin/mycat"})
+	// mycat: a blacklisted executable inside the guarded tree. GNU cat: a uutils copy under a
+	// non-applet name is a multicall the guard refuses (it runs whatever argv[0] names).
+	s.exec(c, []string{"sh", "-c", "cp /usr/bin/gnucat /watch/bin/mycat && chmod +x /watch/bin/mycat"})
 	s.exec(c, []string{"sh", "-c", "echo 'secret' > /watch/secret.txt"})
 
 	s.startGuardStd(c, "/watch", "-b", "/watch/bin/mycat")
