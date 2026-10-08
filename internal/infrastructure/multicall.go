@@ -27,7 +27,8 @@ const (
 	// which the guard attests at exec (guard_exec_applet). Applets lists the build's own.
 	UutilsMulticall
 	// OpaqueMulticall runs applets the guard can't tell apart (busybox and toybox also dispatch
-	// in-process, without an exec; a uutils build that won't list its applets).
+	// in-process, without an exec; a uutils build that won't list its applets; any other binary
+	// calling itself a multi-call binary, e.g. a future uutils diffutils, until it is vetted).
 	OpaqueMulticall
 )
 
@@ -41,7 +42,7 @@ const multicallScanMax = 64 << 20
 // Multicall is the classification of one executable inode.
 type Multicall struct {
 	Kind    MulticallKind
-	Family  string   // "uutils", "busybox", "toybox"; empty for SingleBinary
+	Family  string   // "uutils", "busybox", "toybox", FamilyUnrecognized; empty for SingleBinary
 	Applets []string // UutilsMulticall only: the build's `--list` that fits MulticallNameMax
 }
 
@@ -55,6 +56,14 @@ var multicallMarkers = []struct {
 	{"busybox", [][]byte{reversed("v xoBysuB")}},
 	{"toybox", [][]byte{reversed("gnol--[ xobyot")}},
 }
+
+// FamilyUnrecognized: the binary says it is a multi-call binary but matches no vetted family. It
+// is refused (fail closed): a new multicall family must be vetted before its applets get identities.
+const FamilyUnrecognized = "unrecognized"
+
+// genericMulticallMarker is what uutils projects print in their usage text; matched after the
+// vetted families, so only an unvetted multicall falls through to it.
+var genericMulticallMarker = reversed("yranib llac-itlum")
 
 func reversed(s string) []byte {
 	b := []byte(s)
@@ -124,6 +133,7 @@ func scanMulticallFamily(f *os.File) (string, error) {
 	for i, m := range multicallMarkers {
 		found[i] = make([]bool, len(m.all))
 	}
+	generic := false
 	const chunk, overlap = 1 << 20, 32
 	buf := make([]byte, chunk+overlap)
 	carry := 0
@@ -135,6 +145,7 @@ func scanMulticallFamily(f *os.File) (string, error) {
 				found[i][j] = found[i][j] || bytes.Contains(window, marker)
 			}
 		}
+		generic = generic || bytes.Contains(window, genericMulticallMarker)
 		if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
 			break
 		}
@@ -143,16 +154,21 @@ func scanMulticallFamily(f *os.File) (string, error) {
 		}
 		carry = copy(buf, window[len(window)-overlap:])
 	}
+	return familyOf(found, generic), nil
+}
+
+// familyOf is the first vetted family whose markers were all found, else FamilyUnrecognized for a
+// binary that only calls itself a multi-call binary, else "".
+func familyOf(found [][]bool, generic bool) string {
 	for i, m := range multicallMarkers {
-		all := true
-		for _, ok := range found[i] {
-			all = all && ok
-		}
-		if all {
-			return m.family, nil
+		if !slices.Contains(found[i], false) {
+			return m.family
 		}
 	}
-	return "", nil
+	if generic {
+		return FamilyUnrecognized
+	}
+	return ""
 }
 
 // listUutilsApplets runs the build's own `coreutils --list`: its link names differ from its applet

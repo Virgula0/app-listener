@@ -110,14 +110,25 @@ func (s *IntegrationSuite) monitorContainer() testcontainers.Container {
 // assertions) and per-test server logs.
 func (s *IntegrationSuite) netguardContainer() testcontainers.Container {
 	c := s.acquirePool("netguard")
-	s.exec(c, []string{"sh", "-c", "rm -f /tmp/go /tmp/guard.log /tmp/server.log /tmp/delayed.log /tmp/send.log /tmp/recv.log /tmp/resolved.log"})
+	s.exec(c, []string{"sh", "-c", "rm -f /tmp/go /tmp/guard.log /tmp/server.log /tmp/delayed.log /tmp/send.log /tmp/recv.log /tmp/resolved.log; rm -rf " + netMcDir})
+	return c
+}
+
+// multicallContainer is the pool for daemon_multicall_test.go: drops the probe trees, the applet
+// symlinks the tests plant in /usr/local/bin (empty in the image) and the exploit copies, and moves
+// the uutils multicall to the writable layer once (uutilsToUpperLayer).
+func (s *IntegrationSuite) multicallContainer() testcontainers.Container {
+	c := s.acquirePool("multicall")
+	s.exec(c, []string{"sh", "-c", "rm -rf " + mcRoot + " " + mcBypassRoot + " " + mcProbeTable +
+		" /exploits /usr/local/bin/* /mc-fixtures /mcopq; mkdir -p /etc/app-listener"})
+	s.uutilsToUpperLayer(c)
 	return c
 }
 
 // netmonContainer is the pool for networkmonitor_test.go.
 func (s *IntegrationSuite) netmonContainer() testcontainers.Container {
 	c := s.acquirePool("netmon")
-	s.exec(c, []string{"sh", "-c", "rm -f /tmp/monitor.log /tmp/server.log"})
+	s.exec(c, []string{"sh", "-c", "rm -f /tmp/monitor.log /tmp/server.log; rm -rf " + netMcDir})
 	return c
 }
 

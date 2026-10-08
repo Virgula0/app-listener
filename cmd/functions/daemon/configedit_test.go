@@ -8,15 +8,18 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 )
 
+// newConf adds a path that doesn't exist: a host binary may be a uutils applet, which a non-root
+// test classifies as opaque (its --list runs as nobody) and apply refuses.
 const (
 	oldConf = "[watch /a]\nneed_encryption: false\n/usr/bin/cat\n"
-	newConf = "[watch /a]\nneed_encryption: false\n/usr/bin/cat\n/usr/bin/head\n"
+	newConf = "[watch /a]\nneed_encryption: false\n/usr/bin/cat\n/nonexistent/app-listener-test-tool\n"
 )
 
 func newTestConfigEditor(t *testing.T, reloadErr error) (*configEditor, *int) {
@@ -138,4 +141,41 @@ func TestReadGrantRequestConfig(t *testing.T) {
 	if _, err := readGrantRequest(bufio.NewReader(strings.NewReader("CONFIG /x\n"))); err == nil {
 		t.Fatal("CONFIG with an argument accepted")
 	}
+}
+
+func TestConfigEditorRefusesNewMulticallLine(t *testing.T) {
+	bb := writeBusyboxMarked(t, "wget")
+	base := "[watch " + t.TempDir() + "]\nneed_encryption: false\n/usr/bin/cat\n"
+	ed, reloads := newTestConfigEditor(t, nil)
+	if err := os.WriteFile(ed.path, []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := ed.apply([]byte(base), []byte(base+bb+"\n"))
+	if err == nil || !strings.Contains(err.Error(), "busybox multicall") {
+		t.Fatalf("a new busybox line was applied: %v", err)
+	}
+	if *reloads != 0 || readFile(t, ed.path) != base {
+		t.Fatalf("a refused edit touched state: reloads=%d file=%q", *reloads, readFile(t, ed.path))
+	}
+	// A line the running config already has is the load's to drop, not an edit's to refuse.
+	ed.reload = func() (*daemonconfig.Config, error) { return nil, nil }
+	withBB := base + bb + "\n"
+	if err := os.WriteFile(ed.path, []byte(withBB), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ed.apply([]byte(withBB), []byte(withBB+"/nonexistent/app-listener-test-tool\n")); err != nil {
+		t.Fatalf("an existing multicall line blocked an unrelated edit: %v", err)
+	}
+}
+
+// writeBusyboxMarked writes a file carrying the busybox marker (an opaque multicall) named name.
+func writeBusyboxMarked(t *testing.T, name string) string {
+	t.Helper()
+	marker := []byte("v xoBysuB") // reversed: spelled forward it would be in this test binary
+	slices.Reverse(marker)
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, append([]byte("\x7fELF...."), marker...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

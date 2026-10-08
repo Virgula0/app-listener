@@ -6,10 +6,13 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+
+	"github.com/Virgula0/app-listener/internal/guard"
 )
 
 // CandidateDir describes one critical directory type the installer probes.
@@ -865,5 +868,12 @@ func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
 			out = append(out, rule)
 		}
 	}
-	return out
+	// A multicall the daemon can't key per applet would be dropped at load: never write it.
+	return slices.DeleteFunc(out, func(r BinaryRule) bool {
+		err := guard.MulticallRefusal(r.Path)
+		if err != nil {
+			log.Warnf("%s: whitelist entry skipped — %v", c.Entry.Name, err)
+		}
+		return err != nil
+	})
 }

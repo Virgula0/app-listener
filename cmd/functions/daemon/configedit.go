@@ -16,6 +16,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	"github.com/Virgula0/app-listener/internal/guard"
 	"github.com/Virgula0/app-listener/internal/logging"
 )
 
@@ -35,8 +36,16 @@ type configEditor struct {
 func (e *configEditor) apply(base, next []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, err := daemonconfig.Parse(next); err != nil {
+	cfg, err := daemonconfig.Parse(next)
+	if err != nil {
 		return fmt.Errorf("the new configuration does not parse: %w", err)
+	}
+	prev, err := daemonconfig.Parse(base)
+	if err != nil {
+		prev = nil // every line is checked
+	}
+	if err := guard.RefuseMulticallLines(cfg, prev); err != nil {
+		return fmt.Errorf("the new configuration whitelists a multicall binary the daemon would drop: %w", err)
 	}
 	if err := swapFile(e.path, base, next); err != nil {
 		return err

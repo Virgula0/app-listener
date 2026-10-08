@@ -277,6 +277,16 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_EditConfig() {
 	s.Require().Equal(strings.TrimSpace(added), conf, "a refused edit must leave daemon.conf as it was")
 	s.requireRead(c, unlistedRead, true, "sed: the running configuration is unchanged")
 
+	// A uutils multicall under a non-applet name would be dropped at load: refused before writing.
+	reloads := strings.Count(s.readDaemonLog(c), "replaced via edit-protected --edit-config")
+	code, out = editConfig(added + uutilsMulticall + "\n")
+	s.Require().NotEqualf(0, code, "a non-applet multicall line must be refused: %s", out)
+	s.Require().Containsf(out, `"coreutils" is not one of its applets`, "%s", out)
+	_, conf = s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Equal(strings.TrimSpace(added), conf, "a refused edit must leave daemon.conf as it was")
+	s.Require().Equalf(reloads, strings.Count(s.readDaemonLog(c), "replaced via edit-protected --edit-config"),
+		"a refused multicall edit was written:\n%s", s.readDaemonLog(c))
+
 	code, out = s.exec(c, []string{"sh", "-c", "APP_LISTENER_EDIT_PASSWORD=wrong-Pass-1234" +
 		" timeout 60 /app-listener edit-protected --edit-config --content-file /tmp/new.conf 2>&1"})
 	s.Require().NotEqualf(0, code, "a wrong password must be refused: %s", out)

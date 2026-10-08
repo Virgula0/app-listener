@@ -50,6 +50,11 @@ func TestClassifyMulticall(t *testing.T) {
 		{"uutils that won't list", at(chunkEdge, fwd(")yranib llac-itlum( slitueroc"), fwd("0.8.0 )slitueroc slituu( tac")),
 			OpaqueMulticall, "uutils"},
 		{"one uutils marker only", at(200, fwd(")slitueroc slituu(")), SingleBinary, ""},
+		// A multicall of no vetted family (a future uutils diffutils): refused until vetted.
+		{"unvetted multicall", at(chunkEdge, fwd(")yranib llac-itlum("), fwd(")slituffid slituu(")),
+			OpaqueMulticall, FamilyUnrecognized},
+		{"busybox calling itself multi-call", at(300, fwd("1.63.1v xoBysuB"), fwd("yranib llac-itlum")),
+			OpaqueMulticall, "busybox"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := classifyBytes(t, tc.content)
@@ -67,6 +72,9 @@ func TestMulticallMarkersReversed(t *testing.T) {
 		if string(m.all[0]) != want[m.family] {
 			t.Errorf("%s marker decodes to %q, want %q", m.family, m.all[0], want[m.family])
 		}
+	}
+	if string(genericMulticallMarker) != fwd("yranib llac-itlum") {
+		t.Errorf("generic marker decodes to %q", genericMulticallMarker)
 	}
 }
 

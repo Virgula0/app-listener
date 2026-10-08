@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	logtest "github.com/sirupsen/logrus/hooks/test"
+
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
@@ -102,5 +105,97 @@ func TestExeKeyRefusesOpaqueMulticall(t *testing.T) {
 		if refused && !strings.Contains(err.Error(), "busybox") {
 			t.Fatalf("refusal must name the siblings: %v", err)
 		}
+	}
+}
+
+func TestRefuseMulticallLines(t *testing.T) {
+	dir := t.TempDir()
+	bb := filepath.Join(dir, "wget")
+	marker := []byte("v xoBysuB") // reversed: see TestExeKeyRefusesOpaqueMulticall
+	slices.Reverse(marker)
+	if err := os.WriteFile(bb, append([]byte("\x7fELF...."), marker...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plain := filepath.Join(dir, "tool")
+	if err := os.WriteFile(plain, []byte("\x7fELF plain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := MulticallRefusal(bb); !IsMulticallRefusal(err) {
+		t.Fatalf("busybox: %v", err)
+	}
+	for _, p := range []string{plain, filepath.Join(dir, "missing")} {
+		if err := MulticallRefusal(p); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+	}
+	cfgOf := func(paths ...string) *daemonconfig.Config {
+		r := daemonconfig.Resource{Path: dir}
+		for _, p := range paths {
+			r.Binaries = append(r.Binaries, daemonconfig.BinaryRule{Path: p})
+		}
+		return &daemonconfig.Config{Resources: []daemonconfig.Resource{r}}
+	}
+	if err := RefuseMulticallLines(cfgOf(plain, bb), nil); !IsMulticallRefusal(err) {
+		t.Fatalf("a new busybox line must be refused: %v", err)
+	}
+	if err := RefuseMulticallLines(cfgOf(plain, bb), cfgOf(bb)); err != nil {
+		t.Fatalf("a line prev already has must stay: %v", err)
+	}
+	libOnly := cfgOf()
+	libOnly.Resources[0].Binaries = []daemonconfig.BinaryRule{{Path: bb, LibBinary: true}}
+	if err := RefuseMulticallLines(libOnly, nil); err != nil {
+		t.Fatalf("a lib_binary writer is no whitelist identity: %v", err)
+	}
+}
+
+func TestExeKeyRefusesUnrecognizedMulticall(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cmp")
+	marker := []byte("yranib llac-itlum") // reversed: see TestExeKeyRefusesOpaqueMulticall
+	slices.Reverse(marker)
+	if err := os.WriteFile(p, append([]byte("\x7fELF...."), marker...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dev, ino, err := ebpf.StatInode(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ExeKey(p, nil, GuardInodeKey{Dev: dev, Ino: ino})
+	if !IsMulticallRefusal(err) || !strings.Contains(err.Error(), "is an unrecognized multicall binary") {
+		t.Fatalf("an unvetted multicall must be refused: %v", err)
+	}
+}
+
+func TestWarnMultiLinkedOncePerInode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "perl")
+	if err := os.WriteFile(p, []byte("\x7fELF plain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(p, filepath.Join(dir, "perl5.40")); err != nil {
+		t.Fatal(err)
+	}
+	single := filepath.Join(dir, "tool")
+	if err := os.WriteFile(single, []byte("\x7fELF plain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	for _, path := range []string{p, p, single} {
+		dev, ino, err := ebpf.StatInode(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ExeKey(path, nil, GuardInodeKey{Dev: dev, Ino: ino}); err != nil {
+			t.Fatalf("%s: a single binary is never refused: %v", path, err)
+		}
+	}
+	var warned []string
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "hard links") {
+			warned = append(warned, e.Message)
+		}
+	}
+	if len(warned) != 1 || !strings.Contains(warned[0], "also: perl5.40") {
+		t.Fatalf("want one warning naming perl5.40, got %q", warned)
 	}
 }

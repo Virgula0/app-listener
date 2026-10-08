@@ -11,7 +11,9 @@ import (
 
 	cilium "github.com/cilium/ebpf"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/logging"
 )
@@ -89,7 +91,11 @@ type MulticallError struct {
 }
 
 func (e *MulticallError) Error() string {
-	msg := fmt.Sprintf("%s is a %s multicall binary: %s", e.Path, e.Family, e.Reason)
+	article := "a"
+	if e.Family == ebpf.FamilyUnrecognized {
+		article = "an"
+	}
+	msg := fmt.Sprintf("%s is %s %s multicall binary: %s", e.Path, article, e.Family, e.Reason)
 	if len(e.Siblings) > 0 {
 		msg += fmt.Sprintf(" (the same file also runs as: %s)", strings.Join(e.Siblings, ", "))
 	}
@@ -141,10 +147,15 @@ func ExeKey(path string, f *os.File, file GuardInodeKey) (GuardInodeKey, error) 
 	}
 	switch m.Kind {
 	case ebpf.SingleBinary:
+		warnMultiLinked(path, f, file)
 		return file, nil
 	case ebpf.OpaqueMulticall:
-		return file, &MulticallError{Path: path, Family: m.Family, Siblings: siblingNames(f),
-			Reason: "its applets cannot be told apart, so whitelisting one would admit them all"}
+		reason := "its applets cannot be told apart, so whitelisting one would admit them all"
+		if m.Family == ebpf.FamilyUnrecognized {
+			reason = "not a vetted multicall family, so its applets cannot be told apart yet and " +
+				"whitelisting one would admit them all"
+		}
+		return file, &MulticallError{Path: path, Family: m.Family, Siblings: siblingNames(f), Reason: reason}
 	}
 	resolved, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
 	if err != nil {
@@ -161,6 +172,130 @@ func ExeKey(path string, f *os.File, file GuardInodeKey) (GuardInodeKey, error) 
 	}
 	registerBuild(file, m.Applets)
 	return file.withTag(tag), nil
+}
+
+// multiLinkWarned: inodes warnMultiLinked already reported (ExeKey runs at every re-sync).
+var multiLinkWarned struct {
+	mu   sync.Mutex
+	seen map[GuardInodeKey]bool
+}
+
+// warnMultiLinked flags a whitelisted single binary with several hard links: every name shares its
+// identity. Harmless for one program under several names (perl, e2fsck); a multicall that prints
+// no marker the classifier knows would admit all its programs. A warning, never a refusal.
+func warnMultiLinked(path string, f *os.File, file GuardInodeKey) {
+	var st unix.Stat_t
+	if unix.Fstat(int(f.Fd()), &st) != nil || st.Nlink < 2 {
+		return
+	}
+	multiLinkWarned.mu.Lock()
+	if multiLinkWarned.seen == nil || len(multiLinkWarned.seen) > 4096 {
+		multiLinkWarned.seen = make(map[GuardInodeKey]bool)
+	}
+	first := !multiLinkWarned.seen[file]
+	multiLinkWarned.seen[file] = true
+	multiLinkWarned.mu.Unlock()
+	if !first {
+		return
+	}
+	also := ""
+	if sib := siblingNames(f); len(sib) > 0 {
+		also = " (also: " + strings.Join(sib, ", ") + ")"
+	}
+	log.Warnf("%s has %d hard links%s: every name is the same whitelist identity — expected for one "+
+		"program under several names, but if it picks what it runs by its name it is a multicall "+
+		"this build doesn't recognize, and whitelisting it admits all of them",
+		logging.SanitizeText(path), st.Nlink, logging.SanitizeText(also))
+}
+
+// Tagged reports whether k carries an applet tag (a uutils multicall identity).
+func (k GuardInodeKey) Tagged() bool { return k.tagged() }
+
+// Unattested is the key a process of multicall k has when the kernel attested no applet at its exec.
+func (k GuardInodeKey) Unattested() GuardInodeKey { return k.withTag(mcTagNone) }
+
+// MulticallNameTags maps every applet of the multicall inode file (classified by a prior ExeKey call)
+// to its tag, so another object (the network guard/monitor) fills its kernel name table with the
+// numbering ExeKey used.
+func MulticallNameTags(file GuardInodeKey) (map[string]uint32, error) {
+	applets, ok := buildOf(file)
+	if !ok {
+		return nil, fmt.Errorf("multicall inode %d was never classified", file.Ino)
+	}
+	out := make(map[string]uint32, len(applets))
+	for _, a := range applets {
+		t, err := appletTag(a)
+		if err != nil {
+			return nil, err
+		}
+		out[a] = t
+	}
+	return out, nil
+}
+
+// MulticallRefusal is the MulticallError the daemon would drop a whitelist line naming path with at
+// load (an opaque multicall, or a uutils path not named as one of its applets), so writers of
+// daemon.conf can refuse it up front. nil for anything else, including a path unreadable now: the
+// load defers that one and judges it when it resolves.
+func MulticallRefusal(path string) error {
+	f, err := ebpf.OpenConfined(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	dev, ino, err := ebpf.StatFile(f)
+	if err != nil {
+		return nil
+	}
+	if _, err := ExeKey(path, f, GuardInodeKey{Dev: dev, Ino: ino}); IsMulticallRefusal(err) {
+		return err
+	}
+	return nil
+}
+
+// RefuseMulticallLines refuses cfg when a whitelist line it adds over prev (nil: every line) would be
+// dropped at load by MulticallRefusal. Lines prev already has stay: refusing them would block any
+// unrelated edit after a distro swapped a whitelisted binary for a multicall.
+func RefuseMulticallLines(cfg, prev *daemonconfig.Config) error {
+	had := map[string]bool{}
+	if prev != nil {
+		for _, l := range whitelistLines(prev) {
+			had[l] = true
+		}
+	}
+	var errs []error
+	for _, l := range whitelistLines(cfg) {
+		if had[l] {
+			continue
+		}
+		had[l] = true
+		if err := MulticallRefusal(l); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// whitelistLines are the configured paths (a symlink line as written) of cfg's whitelists;
+// lib_binary writers are no whitelist identity.
+func whitelistLines(cfg *daemonconfig.Config) []string {
+	var out []string
+	for i := range cfg.Resources {
+		r := &cfg.Resources[i]
+		for _, list := range [][]daemonconfig.BinaryRule{r.Binaries, r.PendingBinaries} {
+			for _, b := range list {
+				if b.LibBinary {
+					continue
+				}
+				if b.Link != "" {
+					out = append(out, b.Link)
+				} else {
+					out = append(out, b.Path)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // siblingNames lists up to 8 other hard links of f's inode in its directory, for a refusal message.

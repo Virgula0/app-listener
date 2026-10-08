@@ -397,6 +397,26 @@ func TestFilterExistingWhitelist(t *testing.T) {
 	}
 }
 
+func TestFilterExistingWhitelistSkipsOpaqueMulticall(t *testing.T) {
+	dir := t.TempDir()
+	bb := filepath.Join(dir, "wget")
+	marker := []byte("v xoBysuB") // busybox marker, reversed so this test binary doesn't carry it
+	slices.Reverse(marker)
+	if err := os.WriteFile(bb, append([]byte("\x7fELF...."), marker...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plain := filepath.Join(dir, "tool")
+	if err := os.WriteFile(plain, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := Candidate{User: User{Name: "tester", Home: "/home/tester"},
+		Entry: CandidateDir{Whitelist: map[string][]string{bb: nil, plain: nil}}}
+	got := c.FilterExistingWhitelist()
+	if len(got) != 1 || got[0].Path != plain {
+		t.Errorf("FilterExistingWhitelist = %v, want [%s]: a multicall the daemon drops is never written", got, plain)
+	}
+}
+
 // TestExpandWhitelistUsesPasswdHome verifies the %HOME% fix: whitelist
 // paths must expand to the real /etc/passwd home directory, never to a
 // path derived from the username (a login name whose home differs, e.g.

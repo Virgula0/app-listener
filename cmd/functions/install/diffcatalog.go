@@ -161,9 +161,13 @@ func appendSectionsAndEdit(oldText string, picked []inst.Candidate) (string, *da
 	for _, block := range libraryBlocksFromCandidates(picked) {
 		merged = inst.EnsureLibraryBlock(merged, &block)
 	}
+	prev, err := daemonconfig.Parse([]byte(oldText))
+	if err != nil {
+		prev = nil // every line is checked
+	}
 	return runConfigEditor(
 		"app-listener daemon.conf — new sections appended, review and save (Ctrl+S)",
-		merged)
+		merged, prev)
 }
 
 // restoreDaemonAfterDiffAbort restarts the daemon on the existing config when the run is aborted

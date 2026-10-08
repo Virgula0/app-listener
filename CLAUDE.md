@@ -285,7 +285,11 @@ multicall's key carries its applet in dev bits 32-47 (`guard_exec_applet` tags a
 when the basenames of `bprm->filename` and `argv[0]` are the same applet of that build's
 `--list`; anything else is `MC_TAG_NONE`). Userspace adds the tag only via `guard.ExeKey`
 (`internal/guard/multicall.go`); supersede marks, trust rows and exec-time hooks keep the
-real key (`GuardInodeKey.Real()`). BusyBox/toybox are refused.
+real key (`GuardInodeKey.Real()`). BusyBox/toybox are refused. A blacklisted applet also needs
+its `MC_TAG_NONE` row (`Unattested()`): uutils can still run it from `argv[0]`. The network
+objects share `internal/bpf/mc_tag.h` (guard.bpf.c keeps its own copy: pinned verifier cost);
+writers of daemon.conf refuse new non-applet lines up front (`guard.RefuseMulticallLines`).
+Stamps are per process: a multicall process exec'd before a guard (re)started keys as NONE.
 
 ### The daemon (`internal/usecase/daemon.go`, `cmd/functions/daemon`)
 
