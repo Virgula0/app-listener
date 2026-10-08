@@ -657,19 +657,23 @@ func (s *IntegrationSuite) TestDaemon_Multicall_UpgradeKeepsAppletIdentity() {
 }
 
 // A daemon.conf line naming a multicall whose applets can't be told apart is dropped (CRITICAL)
-// and stays denied; the daemon still starts and enforces every other line.
+// and stays denied; the daemon still starts and enforces every other line. A uutils build a user
+// could have placed is one: its `--list` is never run, so its applets are unknown.
 func (s *IntegrationSuite) TestDaemon_Multicall_OpaqueLineDropped() {
 	c := s.multicallContainer()
 	s.requireDistinctExes(c, "/usr/bin/dash", "/usr/bin/gnuhead", "/usr/bin/gnucat")
-	const dir, opq = "/mcopq", "/mc-fixtures/opq/wget"
+	const dir, opq, userUu = "/mcopq", "/mc-fixtures/opq/wget", "/mc-fixtures/user/head"
 	s.exec(c, []string{"mkdir", "-p", "/mc-fixtures/opq"})
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/netmc_opaque"), opq, 0o755),
 		"copy netmc_opaque (run make -C integrationtests/exploits)")
+	code, out := s.exec(c, []string{"sh", "-c", "set -e; mkdir -p /mc-fixtures/user; cp " + uutilsMulticall + " " +
+		userUu + "; chown -R 65534:65534 /mc-fixtures/user"})
+	s.Require().Equalf(0, code, "user-owned uutils copy: %s", out)
 	s.mcPrecreate(c, dir, 2)
 
-	config := "[watch " + dir + "]\nneed_encryption: false\n/usr/bin/dash\n/usr/bin/gnuhead\n" + opq + "\n"
+	config := "[watch " + dir + "]\nneed_encryption: false\n/usr/bin/dash\n/usr/bin/gnuhead\n" + opq + "\n" + userUu + "\n"
 	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + config + "\nEOF"})
-	code, out := s.exec(c, []string{"/app-listener", "trust-binaries", "--yes", "--no-reload",
+	code, out = s.exec(c, []string{"/app-listener", "trust-binaries", "--yes", "--no-reload",
 		"/usr/bin/dash", "/usr/bin/gnuhead"})
 	s.Require().Equalf(0, code, "confirming the single binaries: %s", out)
 	s.launchDaemonUnconfirmed(c)
@@ -679,6 +683,8 @@ func (s *IntegrationSuite) TestDaemon_Multicall_OpaqueLineDropped() {
 	log := s.readDaemonLog(c)
 	s.Require().Containsf(log, "CRITICAL: "+dir+" whitelist line "+opq+" dropped", "daemon log:\n%s", log)
 	s.Require().Contains(log, "cannot be told apart")
+	s.Require().Containsf(log, "CRITICAL: "+dir+" whitelist line "+userUu+" dropped",
+		"a user-owned uutils build must be opaque:\n%s", log)
 	s.Require().Equal([]bool{true, false}, s.mcLanded(c, dir, "/usr/bin/gnuhead --version", "/usr/bin/gnucat --version"),
 		"the other lines stay enforced: gnuhead admitted, gnucat not")
 }
@@ -715,4 +721,37 @@ func (s *IntegrationSuite) TestGuard_Multicall_BusyboxRefused() {
 		s.Require().Containsf(out, "busybox multicall binary", "guard %s: %s", flag, out)
 		s.Require().Containsf(out, "the same file also runs as:", "guard %s: siblings not named: %s", flag, out)
 	}
+}
+
+// A per-binary event list binds a uutils applet too: its mask row is written under the applet's
+// tagged key, the one the hooks look up (a mask under the plain inode is never read, leaving the
+// applet unrestricted). The same applet unrestricted in a second resource proves it is admitted.
+func (s *IntegrationSuite) TestDaemon_Multicall_AppletEventMaskEnforced() {
+	c := s.multicallContainer()
+	s.requireDistinctExes(c, uutilsMulticall, "/usr/bin/dash", "/usr/bin/gnuhead")
+	const masked, open, dd = "/mcmask", "/mcmask2", uutilsDir + "/dd"
+	code, out := s.exec(c, []string{"sh", "-c", "set -e; for d in " + masked + " " + open + "; do mkdir -p $d; " +
+		"echo MASK-SECRET > $d/secret; : > $d/out; done; rm -f /tmp/leak*"})
+	s.Require().Equalf(0, code, "fixture: %s", out)
+	s.startDaemon(c, "[watch "+masked+"]\nneed_encryption: false\n/usr/bin/gnuhead\n"+dd+" OPEN,WRITE,STAT\n\n"+
+		"[watch "+open+"]\nneed_encryption: false\n"+dd+"\n")
+	defer s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
+
+	_, out = s.exec(c, []string{"sh", "-c", dd + " if=" + open + "/secret of=/tmp/leak-open 2>&1; cat /tmp/leak-open"})
+	s.Require().Containsf(out, "MASK-SECRET", "baseline: unrestricted dd must read in %s: %s", open, out)
+
+	_, out = s.exec(c, []string{"sh", "-c", dd + " if=" + masked + "/secret of=/tmp/leak 2>&1; cat /tmp/leak 2>/dev/null"})
+	s.Require().NotContainsf(out, "MASK-SECRET", "dd granted OPEN,WRITE,STAT read %s/secret", masked)
+	s.Require().Regexpf("Permission denied|not permitted", out, "the read must be refused by the kernel: %s", out)
+
+	_, out = s.exec(c, []string{"sh", "-c", "printf WROTE | " + dd + " of=" + masked + "/out conv=notrunc 2>&1; " +
+		"/usr/bin/gnuhead -c5 " + masked + "/out"})
+	s.Require().Containsf(out, "WROTE", "dd granted WRITE must write %s/out: %s", masked, out)
+
+	denied := false
+	for _, ev := range parseDaemonEvents(s.readDaemonLog(c)) {
+		denied = denied || (ev.Denied && ev.Comm == "dd" && ev.Path == masked+"/secret" && ev.Op == "READ")
+	}
+	s.Require().Truef(denied, "no DAEMON DENIED op=READ comm=dd for %s/secret:\n%s", masked,
+		tailLast(s.readDaemonLog(c), 40))
 }

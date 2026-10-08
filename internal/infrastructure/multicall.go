@@ -108,6 +108,9 @@ func ClassifyMulticall(f *os.File) (Multicall, error) {
 		m = Multicall{Kind: SingleBinary}
 	case "uutils":
 		m = Multicall{Kind: OpaqueMulticall, Family: family}
+		if !rootPlacedFile(f) {
+			break
+		}
 		if applets, lerr := listUutilsApplets(f); lerr == nil && len(applets) > 0 {
 			m = Multicall{Kind: UutilsMulticall, Family: family, Applets: applets}
 		}
@@ -169,6 +172,17 @@ func familyOf(found [][]bool, generic bool) string {
 		return FamilyUnrecognized
 	}
 	return ""
+}
+
+// rootPlacedFile: only root could have placed the file f holds (SystemPlacedInode), checked before
+// listUutilsApplets executes it. Anything else stays OpaqueMulticall: refused, never run.
+func rootPlacedFile(f *os.File) bool {
+	dev, ino, err := StatFile(f)
+	if err != nil {
+		return false
+	}
+	resolved, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	return err == nil && SystemPlacedInode(resolved, dev, ino)
 }
 
 // listUutilsApplets runs the build's own `coreutils --list`: its link names differ from its applet

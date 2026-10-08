@@ -795,9 +795,13 @@ func (g *Guard) binaryKey(path string) (GuardInodeKey, error) {
 	return GuardInodeKey{Dev: dev, Ino: ino}, err
 }
 
-// addBinaryActions stores per-binary allow/block flags in guard_exe_actions, keyed by filesystem inode
-// (by applet for a uutils multicall, ExeKey).
-func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
+// addBinaryActions stores per-binary allow/block flags and event masks, keyed by filesystem inode (by
+// applet for a uutils multicall, ExeKey). Action and mask share one key write: a mask under another
+// key is never looked up, which leaves the binary unrestricted.
+func (g *Guard) addBinaryActions(binaries []BinaryEntry, events map[string][]ebpf.EventType) error {
+	if err := g.checkBinaryEvents(binaries, events); err != nil {
+		return err
+	}
 	for _, b := range binaries {
 		inodeKey, err := g.binaryKey(b.Path)
 		if err != nil {
@@ -806,13 +810,9 @@ func (g *Guard) addBinaryActions(binaries []BinaryEntry) error {
 		if inodeKey, err = ExeKey(b.Path, nil, inodeKey); err != nil {
 			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
 		}
-		action := uint8(GUARD_BLOCK)
-		if g.mode == ModeWhitelist || g.mode == ModeReadOnly {
-			action = uint8(GUARD_ALLOW)
-		}
 		liftSuperseded(inodeKey)
-		if err := g.putExeAction(inodeKey, action); err != nil {
-			return fmt.Errorf("storing exe action for %s: %w", b.Path, err)
+		if err := g.putBinaryKey(inodeKey, b.Path, events); err != nil {
+			return err
 		}
 		g.mu.Lock()
 		g.deployed[canonicalBinaryPath(b.Path)] = inodeKey
@@ -1050,9 +1050,9 @@ func WithPinnedSelfVaultAccess(pinPrefix, sharedPrefix string, fn func() error) 
 	return fn()
 }
 
-// addBinaryEvents stores per-binary event bitmasks in guard_exe_events (explicit lists only; a
-// missing entry means all events allowed).
-func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf.EventType) error {
+// checkBinaryEvents refuses event lists that can't be stored, before any row is written: a
+// restriction outside whitelist mode would be silently dropped (widening the binary).
+func (g *Guard) checkBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf.EventType) error {
 	for _, b := range binaries {
 		types, ok := events[b.Path]
 		// Empty list = no restriction, valid in every mode.
@@ -1062,16 +1062,8 @@ func (g *Guard) addBinaryEvents(binaries []BinaryEntry, events map[string][]ebpf
 		if g.mode != ModeWhitelist {
 			return fmt.Errorf("per-binary event restrictions are only supported in whitelist mode (binary %s)", b.Path)
 		}
-		mask, err := eventMask(types)
-		if err != nil {
+		if _, err := eventMask(types); err != nil {
 			return fmt.Errorf("invalid event mask for binary %s: %w", b.Path, err)
-		}
-		key, err := g.binaryKey(b.Path)
-		if err != nil {
-			return fmt.Errorf("cannot stat binary %s for event mask: %w", b.Path, err)
-		}
-		if err := g.objs().GuardExeEvents.Put(g.resKey(key), mask); err != nil {
-			return fmt.Errorf("storing exe events for %s: %w", b.Path, err)
 		}
 	}
 	return nil
@@ -1184,10 +1176,6 @@ func (g *Guard) ResolvePendingBinaries() error {
 	if len(resolved) == 0 {
 		return nil
 	}
-	if err := g.addBinaryEvents(resolved, events); err != nil {
-		return err
-	}
-
 	g.mu.Lock()
 	for _, b := range resolved {
 		g.canonicalPaths[b.Path] = b.Path
@@ -1206,15 +1194,12 @@ func canonicalBinaryPath(path string) string {
 	return path
 }
 
-// putBinaryKey writes a binary's allow/block action to guard_exe_actions and, in whitelist mode,
-// its event mask to guard_exe_events.
+// putBinaryKey writes, in whitelist mode, a binary's event mask to guard_exe_events, then its
+// allow/block action to guard_exe_actions: an ALLOW row is never live without its mask.
 func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][]ebpf.EventType) error {
 	action := uint8(GUARD_BLOCK)
 	if g.mode == ModeWhitelist || g.mode == ModeReadOnly {
 		action = uint8(GUARD_ALLOW)
-	}
-	if err := g.putExeAction(key, action); err != nil {
-		return fmt.Errorf("storing exe action for %s: %w", path, err)
 	}
 	if g.mode == ModeWhitelist {
 		if types, ok := events[path]; ok && len(types) > 0 {
@@ -1226,6 +1211,9 @@ func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][
 				return fmt.Errorf("storing exe events for %s: %w", path, err)
 			}
 		}
+	}
+	if err := g.putExeAction(key, action); err != nil {
+		return fmt.Errorf("storing exe action for %s: %w", path, err)
 	}
 	return nil
 }
@@ -1241,7 +1229,7 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 	if len(resolved) == 0 {
 		return nil
 	}
-	if err := g.addBinaryActions(resolved); err != nil {
+	if err := g.addBinaryActions(resolved, resolvedEvents); err != nil {
 		return err
 	}
 
@@ -1521,12 +1509,8 @@ func (g *Guard) populateMaps() error {
 		return fmt.Errorf("stating guarded path %s: %w", g.path, statErr)
 	}
 
-	if binErr := g.addBinaryActions(g.binaries); binErr != nil {
+	if binErr := g.addBinaryActions(g.binaries, g.exeEvents); binErr != nil {
 		return binErr
-	}
-
-	if eventsErr := g.addBinaryEvents(g.binaries, g.exeEvents); eventsErr != nil {
-		return eventsErr
 	}
 
 	if g.selfBinary != nil {

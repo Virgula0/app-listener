@@ -46,7 +46,7 @@ func TestClassifyMulticall(t *testing.T) {
 		{"plain binary", at(100, "\x7fELF"), SingleBinary, ""},
 		{"busybox", at(chunkEdge, fwd("1.63.1v xoBysuB")), OpaqueMulticall, "busybox"},
 		{"toybox", at(5000, fwd("]pleh-- | gnol--[ xobyot :egasu")), OpaqueMulticall, "toybox"},
-		// Both uutils markers, but --list can't run this file: applets unknown, so opaque.
+		// Both uutils markers, but not root-placed (a temp dir): never run, so opaque.
 		{"uutils that won't list", at(chunkEdge, fwd(")yranib llac-itlum( slitueroc"), fwd("0.8.0 )slitueroc slituu( tac")),
 			OpaqueMulticall, "uutils"},
 		{"one uutils marker only", at(200, fwd(")slitueroc slituu(")), SingleBinary, ""},
