@@ -1252,18 +1252,20 @@ func (s *IntegrationSuite) TestDaemon_Bypass_LibDirSweepTakesOverResource() {
 		"mkdir -p /etc/app-listener /root/.ssh /root/app/lib /tmp/sshw /tmp/appw" +
 			" && printf '" + marker + "' > " + secret + " && chmod 644 " + secret +
 			" && echo LIB-CONTENT-OK > " + libF +
-			" && cp /usr/bin/cat /tmp/sshw/cat && cp /usr/bin/dash /tmp/sshw/dash && cp /usr/bin/dash /tmp/appw/dash"})
+			" && cp /usr/bin/grep /tmp/sshw/grep && cp /usr/bin/dash /tmp/sshw/dash && cp /usr/bin/dash /tmp/appw/dash"})
 	s.startDaemon(c, `[libraries "App"]
 lib_dir /root/app/lib
 lib_binary /tmp/appw/dash
 
 [watch /root/.ssh]
 need_encryption: false
-/tmp/sshw/cat
+/tmp/sshw/grep
 /tmp/sshw/dash`)
 
+	// grep, not cat: a copy of ubuntu:latest's multi-call cat outside root-placed dirs is opaque, so
+	// the daemon drops its whitelist line.
 	readAs := func(bin, path string) string {
-		_, out := s.exec(c, []string{"sh", "-c", bin + " " + path + " 2>&1; echo rc=$?"})
+		_, out := s.exec(c, []string{"sh", "-c", bin + " -h . " + path + " 2>&1; echo rc=$?"})
 		return out
 	}
 	code, out := s.exec(c, []string{"/tmp/sshw/dash", "-c", "printf '" + marker + "' > " + later})
@@ -1271,10 +1273,10 @@ need_encryption: false
 	// Controls: the secrets are denied to a non-whitelisted reader and served to the whitelisted one;
 	// the lib_dir's own content is world-readable.
 	for _, f := range []string{secret, later} {
-		s.Require().NotContainsf(readAs("cat", f), marker, "baseline: non-whitelisted cat must be denied %s", f)
-		s.Require().Containsf(readAs("/tmp/sshw/cat", f), marker, "control: whitelisted cat must read %s", f)
+		s.Require().NotContainsf(readAs("grep", f), marker, "baseline: non-whitelisted grep must be denied %s", f)
+		s.Require().Containsf(readAs("/tmp/sshw/grep", f), marker, "control: whitelisted grep must read %s", f)
 	}
-	s.Require().Contains(readAs("cat", libF), "LIB-CONTENT-OK", "control: the lib_dir is readable")
+	s.Require().Contains(readAs("grep", libF), "LIB-CONTENT-OK", "control: the lib_dir is readable")
 
 	// Attack, as a non-whitelisted process: only unguarded names change (the lib_dir's parent and a
 	// new entry in its place). A relative target is not a watch-root path for path_symlink.
@@ -1285,14 +1287,14 @@ need_encryption: false
 	// Past at least two sweep ticks (resyncSweepEvery = 30s).
 	for dl := time.Now().Add(75 * time.Second); time.Now().Before(dl); time.Sleep(3 * time.Second) {
 		for _, f := range []string{secret, later} {
-			out = readAs("cat", f)
+			out = readAs("grep", f)
 			s.Require().NotContainsf(out, marker,
 				"the lib_dir sweep re-anchored onto /root/.ssh and made %s readable to every process: %s\n"+
 					"daemon log:\n%s", f, out, s.readDaemonLog(c))
 		}
 	}
 	for _, f := range []string{secret, later} {
-		s.Require().Containsf(readAs("/tmp/sshw/cat", f), marker, "control: whitelisted cat must still read %s", f)
+		s.Require().Containsf(readAs("/tmp/sshw/grep", f), marker, "control: whitelisted grep must still read %s", f)
 	}
 	log := s.readDaemonLog(c)
 	s.Require().Containsf(log, "refusing to re-anchor",
