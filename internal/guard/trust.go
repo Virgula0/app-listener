@@ -55,14 +55,8 @@ type TrustGuard struct {
 	ownerByPath map[string]uint64
 	// binaryStat: SetBinaryResolver; nil = ebpf.StatConfined. Guarded by ownerMu.
 	binaryStat statFunc
-	// guard_vouched_devs upkeep (trust_mounts.go).
-	mountMu   sync.Mutex
-	mountFd   int
-	mountStop int
-	mountDone chan struct{}
-	vouched   int
-	// mountUntracked: the watch died, so SyncMounts refuses to vouch anything again.
-	mountUntracked bool
+	// mounts: guard_vouched_devs upkeep (trust_mounts.go).
+	mounts *MountVouch
 	// retiredMu guards retired: the rows forgetExe dropped for a freed key, so a replacement its
 	// guards re-sync only after that prune can still adopt them (adoptRows). Userspace only: a
 	// reused inode number gains nothing from them. Cleared by SetTrusted, which re-derives every row.
@@ -108,7 +102,7 @@ func NewTrustGuard() (*TrustGuard, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &TrustGuard{done: make(chan struct{}), mountFd: -1, mountStop: -1, vouched: -1}
+	t := &TrustGuard{done: make(chan struct{})}
 	spec, memfd, err := trustSpec()
 	if err != nil {
 		return nil, err
@@ -117,6 +111,8 @@ func NewTrustGuard() (*TrustGuard, error) {
 	if err := spec.LoadAndAssign(&t.objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
 		return nil, fmt.Errorf("loading trust BPF objects: %w", err)
 	}
+	t.mounts = NewMountVouch("trust guard", "daemon", t.objs.GuardVouchedDevs, t.objs.GuardDeadDevs,
+		t.objs.GuardDevSeq)
 	return t, nil
 }
 
@@ -397,7 +393,7 @@ func (t *TrustGuard) Start() error {
 		return err
 	}
 	t.attachMemfdProvenance()
-	if err := t.startMountWatch(); err != nil {
+	if err := t.mounts.StartWatch(); err != nil {
 		t.detachLinks()
 		return err
 	}
@@ -516,7 +512,7 @@ func (t *TrustGuard) Stop() {
 		_ = t.rd.Close()
 	}
 	t.detachLinks()
-	t.stopMountWatch()
+	t.mounts.Stop()
 	_ = t.objs.Close()
 }
 

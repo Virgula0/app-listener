@@ -55,6 +55,13 @@ func TestClassifyMulticall(t *testing.T) {
 			OpaqueMulticall, FamilyUnrecognized},
 		{"busybox calling itself multi-call", at(300, fwd("1.63.1v xoBysuB"), fwd("yranib llac-itlum")),
 			OpaqueMulticall, "busybox"},
+		// Prints no "multi-call": its own marker family.
+		{"GNU coreutils-single", at(chunkEdge, fwd(" ...]SRETEMARAP[ EMAN_MARGORP=gorp-slitueroc-- :egasU")),
+			OpaqueMulticall, FamilyGNUCoreutils},
+		// Fedora's applets are #! scripts run by that binary.
+		{"GNU coreutils-single applet script", []byte(fwd("\ntac=gnabehs-gorp-slitueroc-- slitueroc/nib/rsu/!#")),
+			OpaqueMulticall, FamilyGNUCoreutils},
+		{"script of another interpreter", []byte("#!/bin/sh\nexec cat \"$@\"\n"), SingleBinary, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := classifyBytes(t, tc.content)
@@ -67,7 +74,8 @@ func TestClassifyMulticall(t *testing.T) {
 
 // The markers must not be spelled in this package's own binary, or it classifies itself.
 func TestMulticallMarkersReversed(t *testing.T) {
-	want := map[string]string{"uutils": fwd(")yranib llac-itlum("), "busybox": fwd("v xoBysuB"), "toybox": fwd("gnol--[ xobyot")}
+	want := map[string]string{"uutils": fwd(")yranib llac-itlum("), "busybox": fwd("v xoBysuB"), "toybox": fwd("gnol--[ xobyot"),
+		FamilyGNUCoreutils: fwd("gorp-slitueroc--")}
 	for _, m := range multicallMarkers {
 		if string(m.all[0]) != want[m.family] {
 			t.Errorf("%s marker decodes to %q, want %q", m.family, m.all[0], want[m.family])

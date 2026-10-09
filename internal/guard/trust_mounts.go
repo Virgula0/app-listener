@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	cilium "github.com/cilium/ebpf"
@@ -77,93 +78,117 @@ func isFuseType(fstype string) bool {
 	return fstype == "fuse" || fstype == "fuseblk" || strings.HasPrefix(fstype, "fuse.")
 }
 
-// startMountVouch attaches trust_sb_delete, then fills guard_vouched_devs from pid 1's mount table.
-// Both precede trust_mmap's attach, so no library is judged against an empty or unguarded map. The
-// watch fd is opened before the first read so no mount change after it goes unseen.
-func (t *TrustGuard) startMountVouch() error {
-	l, err := link.AttachLSM(link.LSMOptions{Program: t.objs.TrustSbDelete})
-	if err != nil {
-		return fmt.Errorf("required trust hook sb_delete failed to attach: %w — a reused device "+
-			"number could inherit a dead superblock's system-library trust", err)
-	}
-	t.links = append(t.links, l)
+// MountVouch keeps an object's vouched-dev maps (guard_vouched_devs, guard_dead_devs,
+// guard_dev_seq; the network guard's netg_* copies) in step with pid 1's mount table: only a
+// superblock root mounted without nosuid vouches for root ownership bits. The object's sb_delete
+// program must be attached before Open, so no superblock dies unseen after the first read.
+type MountVouch struct {
+	name                   string // log prefix
+	vouchMap, deadMap, seq *cilium.Map
+	restart                string // what the operator restarts once mount changes are untracked
+
+	mu        sync.Mutex
+	fd, stop  int
+	done      chan struct{}
+	count     int
+	devs      map[uint64]struct{}
+	untracked bool // the watch died, so Sync refuses to vouch anything again
+}
+
+// NewMountVouch tracks the given maps; name prefixes its log lines, restart names the process to
+// restart once mount changes can no longer be tracked.
+func NewMountVouch(name, restart string, vouched, dead, seq *cilium.Map) *MountVouch {
+	return &MountVouch{name: name, restart: restart, vouchMap: vouched, deadMap: dead, seq: seq,
+		fd: -1, stop: -1, count: -1}
+}
+
+// Open fills the vouched set from pid 1's mount table. The watch fd is opened before the first read
+// so no mount change after it goes unseen.
+func (v *MountVouch) Open() error {
 	fd, err := unix.Open(hostMountinfo, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", hostMountinfo, err)
 	}
-	t.mountFd = fd
-	if err := t.SyncMounts(); err != nil {
-		return fmt.Errorf("vouching system-library mounts: %w", err)
-	}
-	return nil
+	v.fd = fd
+	return v.Sync()
 }
 
-// SyncMounts re-syncs guard_vouched_devs to pid 1's current mount table. On failure it drops every
-// vouched dev (system libraries become untrusted) rather than keep a possibly stale one.
-func (t *TrustGuard) SyncMounts() error {
-	t.mountMu.Lock()
-	defer t.mountMu.Unlock()
-	if t.mountUntracked {
-		return errors.New("mount changes are no longer tracked; restart the daemon")
+// Vouched reports whether the last successful sync vouched superblock dev.
+func (v *MountVouch) Vouched(dev uint64) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	_, ok := v.devs[dev]
+	return ok
+}
+
+// Sync re-syncs the vouched set to pid 1's current mount table. On failure it drops every vouched
+// dev (system libraries become untrusted) rather than keep a possibly stale one.
+func (v *MountVouch) Sync() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.untracked {
+		return fmt.Errorf("mount changes are no longer tracked; restart the %s", v.restart)
 	}
 	// A btrfs mounted since start may have just loaded the module and its BTF.
 	ensureBtrfsLayout()
-	n, err := t.syncVouchedDevs()
+	devs, err := v.syncVouchedDevs()
 	if err != nil {
-		if cerr := syncMap(t.objs.GuardVouchedDevs, map[uint64]uint64{}); cerr != nil {
+		v.devs = nil
+		if cerr := syncMap(v.vouchMap, map[uint64]uint64{}); cerr != nil {
 			err = fmt.Errorf("%w; clearing the vouched set also failed: %w", err, cerr)
 		}
 		return err
 	}
+	v.devs = devs
 	// Container and snap churn remounts constantly: only the first count is worth an info line.
-	if t.vouched < 0 {
-		log.Infof("trust guard: %d superblock(s) vouched for system-library auto-trust "+
-			"(mounted without nosuid in pid 1's namespace)", n)
-	} else if n != t.vouched {
-		log.Debugf("trust guard: %d superblock(s) vouched after a mount change", n)
+	if v.count < 0 {
+		log.Infof("%s: %d superblock(s) vouched for system-library auto-trust "+
+			"(mounted without nosuid in pid 1's namespace)", v.name, len(devs))
+	} else if len(devs) != v.count {
+		log.Debugf("%s: %d superblock(s) vouched after a mount change", v.name, len(devs))
 	}
-	t.vouched = n
+	v.count = len(devs)
 	return nil
 }
 
 // syncVouchedDevs: seq snapshot → mountinfo → delete stale → put → prune tombstones. Stale devs go
-// first because a dev can be reused by another superblock; entries carry the snapshot so
-// trust_mmap refuses one whose superblock died after it (guard_dead_devs).
-func (t *TrustGuard) syncVouchedDevs() (int, error) {
+// first because a dev can be reused by another superblock; entries carry the snapshot so the
+// kernel refuses one whose superblock died after it (the dead-devs map).
+func (v *MountVouch) syncVouchedDevs() (map[uint64]struct{}, error) {
 	var seq, lost uint64
-	if err := t.objs.GuardDevSeq.Lookup(devSeqNow, &seq); err != nil {
-		return 0, fmt.Errorf("reading the shutdown sequence: %w", err)
+	if err := v.seq.Lookup(devSeqNow, &seq); err != nil {
+		return nil, fmt.Errorf("reading the shutdown sequence: %w", err)
 	}
-	if err := t.objs.GuardDevSeq.Lookup(devSeqLost, &lost); err != nil {
-		return 0, fmt.Errorf("reading the lost-tombstone count: %w", err)
+	if err := v.seq.Lookup(devSeqLost, &lost); err != nil {
+		return nil, fmt.Errorf("reading the lost-tombstone count: %w", err)
 	}
 	data, err := os.ReadFile(hostMountinfo)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	devs, err := vouchedDevs(data)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if err := deleteKeys(t.objs.GuardVouchedDevs, func(dev, _ uint64) bool { _, ok := devs[dev]; return !ok }); err != nil {
-		return 0, fmt.Errorf("dropping unmounted devs: %w", err)
+	if err := deleteKeys(v.vouchMap, func(dev, _ uint64) bool { _, ok := devs[dev]; return !ok }); err != nil {
+		return nil, fmt.Errorf("dropping unmounted devs: %w", err)
 	}
 	for dev := range devs {
-		if err := t.objs.GuardVouchedDevs.Put(dev, seq); err != nil {
-			return 0, fmt.Errorf("vouching dev %d:%d: %w", dev>>20, dev&0xfffff, err)
+		if err := v.vouchMap.Put(dev, seq); err != nil {
+			return nil, fmt.Errorf("vouching dev %d:%d: %w", dev>>20, dev&0xfffff, err)
 		}
 	}
-	if err := deleteKeys(t.objs.GuardDeadDevs, func(_, died uint64) bool { return died <= seq }); err != nil {
-		return 0, fmt.Errorf("pruning tombstones: %w", err)
+	if err := deleteKeys(v.deadMap, func(_, died uint64) bool { return died <= seq }); err != nil {
+		return nil, fmt.Errorf("pruning tombstones: %w", err)
 	}
 	var lostNow uint64
-	if err := t.objs.GuardDevSeq.Lookup(devSeqLost, &lostNow); err != nil {
-		return 0, fmt.Errorf("reading the lost-tombstone count: %w", err)
+	if err := v.seq.Lookup(devSeqLost, &lostNow); err != nil {
+		return nil, fmt.Errorf("reading the lost-tombstone count: %w", err)
 	}
 	if lostNow != lost {
-		return 0, errors.New("a superblock died during the sync and its tombstone could not be recorded")
+		return nil, errors.New("a superblock died during the sync and its tombstone could not be recorded")
 	}
-	return len(devs), nil
+	return devs, nil
 }
 
 func deleteKeys(m *cilium.Map, drop func(k, v uint64) bool) error {
@@ -188,66 +213,88 @@ func deleteKeys(m *cilium.Map, drop func(k, v uint64) bool) error {
 	return nil
 }
 
-// watchMounts re-syncs on every change to pid 1's mount table (POLLPRI on mountinfo) and every
+// watch re-syncs on every change to pid 1's mount table (POLLPRI on mountinfo) and every
 // mountResyncInterval, which also prunes tombstones of superblocks that never had a host mount.
-func (t *TrustGuard) watchMounts(stopFd int) {
-	defer close(t.mountDone)
+func (v *MountVouch) watch(stopFd int) {
+	defer close(v.done)
 	timeout := mountResyncInterval
 	for {
 		fds := []unix.PollFd{
-			{Fd: int32(t.mountFd), Events: unix.POLLPRI}, //nolint:gosec // fds are < RLIMIT_NOFILE
-			{Fd: int32(stopFd), Events: unix.POLLIN},     //nolint:gosec // same
+			{Fd: int32(v.fd), Events: unix.POLLPRI},  //nolint:gosec // fds are < RLIMIT_NOFILE
+			{Fd: int32(stopFd), Events: unix.POLLIN}, //nolint:gosec // same
 		}
 		if _, err := unix.Poll(fds, int(timeout.Milliseconds())); err != nil && !errors.Is(err, unix.EINTR) {
-			t.failMounts(fmt.Errorf("polling %s: %w", hostMountinfo, err))
+			v.fail(fmt.Errorf("polling %s: %w", hostMountinfo, err))
 			return
 		}
 		if fds[1].Revents != 0 {
 			return
 		}
 		timeout = mountResyncInterval
-		if err := t.SyncMounts(); err != nil {
-			log.Errorf("trust guard: CRITICAL: mount re-sync failed (%v) — system libraries are refused "+
-				"to whitelisted binaries until it succeeds", err)
+		if err := v.Sync(); err != nil {
+			log.Errorf("%s: CRITICAL: mount re-sync failed (%v) — system libraries are refused "+
+				"to whitelisted binaries until it succeeds", v.name, err)
 			timeout = mountRetryInterval
 		}
 	}
 }
 
-// failMounts empties guard_vouched_devs for good: without the watch a later sync could not be
-// trusted to stay current.
-func (t *TrustGuard) failMounts(err error) {
-	t.mountMu.Lock()
-	defer t.mountMu.Unlock()
-	t.mountUntracked = true
-	_ = syncMap(t.objs.GuardVouchedDevs, map[uint64]uint64{})
-	log.Errorf("trust guard: CRITICAL: %v — mount changes are no longer tracked; system libraries are "+
-		"refused to whitelisted binaries until the daemon restarts", err)
+// fail empties the vouched set for good: without the watch a later sync could not be trusted to
+// stay current.
+func (v *MountVouch) fail(err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.untracked = true
+	v.devs = nil
+	_ = syncMap(v.vouchMap, map[uint64]uint64{})
+	log.Errorf("%s: CRITICAL: %v — mount changes are no longer tracked; system libraries are "+
+		"refused to whitelisted binaries until the %s restarts", v.name, err, v.restart)
 }
 
-// startMountWatch runs watchMounts until stopMountWatch.
-func (t *TrustGuard) startMountWatch() error {
+// StartWatch runs the re-sync loop until Stop.
+func (v *MountVouch) StartWatch() error {
 	efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC)
 	if err != nil {
 		return fmt.Errorf("creating the mount watch stop fd: %w", err)
 	}
-	t.mountStop = efd
-	t.mountDone = make(chan struct{})
-	go t.watchMounts(efd)
+	v.stop = efd
+	v.done = make(chan struct{})
+	go v.watch(efd)
 	return nil
 }
 
-func (t *TrustGuard) stopMountWatch() {
-	if t.mountDone != nil {
+// Stop ends the watch and closes its fds.
+func (v *MountVouch) Stop() {
+	if v.done != nil {
 		one := []byte{1, 0, 0, 0, 0, 0, 0, 0}
-		_, _ = unix.Write(t.mountStop, one)
-		<-t.mountDone
-		t.mountDone = nil
+		_, _ = unix.Write(v.stop, one)
+		<-v.done
+		v.done = nil
 	}
-	for _, fd := range []*int{&t.mountStop, &t.mountFd} {
+	for _, fd := range []*int{&v.stop, &v.fd} {
 		if *fd >= 0 {
 			_ = unix.Close(*fd)
 			*fd = -1
 		}
 	}
+}
+
+// startMountVouch attaches trust_sb_delete, then fills guard_vouched_devs from pid 1's mount table.
+// Both precede trust_mmap's attach, so no library is judged against an empty or unguarded map.
+func (t *TrustGuard) startMountVouch() error {
+	l, err := link.AttachLSM(link.LSMOptions{Program: t.objs.TrustSbDelete})
+	if err != nil {
+		return fmt.Errorf("required trust hook sb_delete failed to attach: %w — a reused device "+
+			"number could inherit a dead superblock's system-library trust", err)
+	}
+	t.links = append(t.links, l)
+	if err := t.mounts.Open(); err != nil {
+		return fmt.Errorf("vouching system-library mounts: %w", err)
+	}
+	return nil
+}
+
+// SyncMounts re-syncs guard_vouched_devs to pid 1's current mount table (MountVouch.Sync).
+func (t *TrustGuard) SyncMounts() error {
+	return t.mounts.Sync()
 }

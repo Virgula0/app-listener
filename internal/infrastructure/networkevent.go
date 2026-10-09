@@ -18,6 +18,10 @@ const (
 	NetDNS
 	NetBind
 	NetListen
+	// NetPtrace and NetTracedExec are the network guard's process gates: memory access to, or a
+	// traced exec of, a whitelisted process. Always reported; not -e event types.
+	NetPtrace
+	NetTracedExec
 )
 
 func (t NetEventType) String() string {
@@ -38,6 +42,10 @@ func (t NetEventType) String() string {
 		return "BIND"
 	case NetListen:
 		return "LISTEN"
+	case NetPtrace:
+		return "PTRACE"
+	case NetTracedExec:
+		return "TRACED_EXEC"
 	default:
 		return unknownLabel
 	}

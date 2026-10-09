@@ -99,6 +99,9 @@ func (e *MulticallError) Error() string {
 	if len(e.Siblings) > 0 {
 		msg += fmt.Sprintf(" (the same file also runs as: %s)", strings.Join(e.Siblings, ", "))
 	}
+	if e.Family == ebpf.FamilyGNUCoreutils {
+		return msg + "; whitelist a dedicated binary instead (on Fedora, `dnf swap coreutils-single coreutils`)"
+	}
 	return msg + "; whitelist a dedicated binary instead (on Ubuntu, the GNU gnu* tools or coreutils-from-gnu)"
 }
 

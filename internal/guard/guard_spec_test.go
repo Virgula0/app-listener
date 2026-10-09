@@ -35,7 +35,7 @@ func TestGuardSpecKeepsIoctlCompatOnlyWhereKernelHasIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if compat != kernelHasFunc(ioctlCompatTarget) {
+	if compat != KernelHasFunc(ioctlCompatTarget) {
 		t.Fatalf("compat=%v disagrees with the kernel's BTF", compat)
 	}
 	p := spec.Programs[GuardProgGuardFileIoctlCompat]
