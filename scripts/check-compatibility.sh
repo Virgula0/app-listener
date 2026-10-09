@@ -26,7 +26,7 @@
 # --binary program's guard eBPF is rejected by this kernel).
 #
 # Test hooks (not for end users):
-#   CHECK_KERNEL / CHECK_BTF_PATH / CHECK_LSM_PATH / CHECK_CONFIG_PATH /
+#   CHECK_KERNEL / CHECK_ARCH / CHECK_BTF_PATH / CHECK_LSM_PATH / CHECK_CONFIG_PATH /
 #   CHECK_CMDLINE_PATH / CHECK_OS_RELEASE — override the probed sources.
 
 set -uo pipefail
@@ -61,6 +61,8 @@ version_at_least() { [ "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
 ##############################################################################
 
 KERNEL_RELEASE="${CHECK_KERNEL:-$(uname -r)}"
+HOST_ARCH="${CHECK_ARCH:-$(uname -m)}"
+[ "$HOST_ARCH" = arm64 ] && HOST_ARCH=aarch64
 KVER="$(printf '%s' "$KERNEL_RELEASE" | grep -oE '^[0-9]+\.[0-9]+' || true)"
 BTF_PATH="${CHECK_BTF_PATH:-/sys/kernel/btf/vmlinux}"
 LSM_PATH="${CHECK_LSM_PATH:-/sys/kernel/security/lsm}"
@@ -157,7 +159,16 @@ else
 		fail "kernel $KERNEL_RELEASE < 5.17 — guard / daemon need the bpf_loop helper (their eBPF would not load)"
 	fi
 	version_at_least "6.2" "$KVER" || warn "kernel < 6.2 — the file_truncate LSM hook is unavailable (ftruncate on a pre-opened fd is not denied; path truncate still is)"
+	# BPF-LSM programs attach through the BPF trampoline, which arm64 gained only in 6.0.
+	if [ "$HOST_ARCH" = aarch64 ] && ! version_at_least "6.0" "$KVER"; then
+		fail "kernel $KERNEL_RELEASE < 6.0 on aarch64 — no arm64 BPF trampoline, so the guard / daemon / network-guard LSM programs cannot attach"
+	fi
 fi
+
+case "$HOST_ARCH" in
+x86_64 | aarch64) pass "architecture $HOST_ARCH (prebuilt releases: x86_64, aarch64)" ;;
+*) warn "architecture $HOST_ARCH — no prebuilt release; build from source (make build), the eBPF is untested here" ;;
+esac
 
 ##############################################################################
 section "BTF (required to load the pre-compiled CO-RE eBPF programs)"

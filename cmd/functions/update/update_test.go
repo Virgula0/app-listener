@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -51,20 +52,24 @@ func signedChecksum(t *testing.T, priv ed25519.PrivateKey, name string, data []b
 func TestParseChecksum(t *testing.T) {
 	sum := strings.Repeat("ab", 32)
 	cases := []struct {
-		name    string
-		data    string
-		want    string
-		wantErr bool
+		name     string
+		data     string
+		want     string
+		wantName string
+		wantErr  bool
 	}{
-		{"sha256sum format", sum + "  app-listener\n", sum, false},
-		{"uppercase hex", strings.ToUpper(sum) + "  app-listener\n", strings.ToUpper(sum), false},
-		{"empty", "", "", true},
-		{"too short", "deadbeef  app-listener\n", "", true},
-		{"not hex", strings.Repeat("zz", 32) + "  app-listener\n", "", true},
+		{"sha256sum format", sum + "  app-listener\n", sum, "app-listener", false},
+		{"binary mode marker", sum + " *app-listener-arm64\n", sum, "app-listener-arm64", false},
+		{"uppercase hex", strings.ToUpper(sum) + "  app-listener\n", strings.ToUpper(sum), "app-listener", false},
+		{"empty", "", "", "", true},
+		{"no name", sum + "\n", "", "", true},
+		{"two lines", sum + "  app-listener\n" + sum + "  app-listener-arm64\n", "", "", true},
+		{"too short", "deadbeef  app-listener\n", "", "", true},
+		{"not hex", strings.Repeat("zz", 32) + "  app-listener\n", "", "", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := parseChecksum([]byte(c.data))
+			got, gotName, err := parseChecksum([]byte(c.data))
 			if c.wantErr {
 				if err == nil {
 					t.Fatalf("parseChecksum(%q) = %q, want error", c.data, got)
@@ -74,8 +79,8 @@ func TestParseChecksum(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseChecksum(%q): %v", c.data, err)
 			}
-			if got != c.want {
-				t.Fatalf("parseChecksum(%q) = %q, want %q", c.data, got, c.want)
+			if got != c.want || gotName != c.wantName {
+				t.Fatalf("parseChecksum(%q) = %q, %q, want %q, %q", c.data, got, gotName, c.want, c.wantName)
 			}
 		})
 	}
@@ -138,40 +143,49 @@ func TestVerifyRelease(t *testing.T) {
 	sigPath := write("app-listener.sha256.sig", sig)
 
 	// Valid release: signature, checksum and digest all match.
-	if err := verifyReleaseWithKey(binPath, checksumPath, sigPath, "sha256:"+digest, pub); err != nil {
+	if err := verifyReleaseWithKey(binPath, checksumPath, sigPath, "sha256:"+digest, "app-listener", pub); err != nil {
 		t.Fatalf("verifyRelease on a valid release: %v", err)
 	}
 	// Digest absent (older GitHub API responses) is fine.
-	if err := verifyReleaseWithKey(binPath, checksumPath, sigPath, "", pub); err != nil {
+	if err := verifyReleaseWithKey(binPath, checksumPath, sigPath, "", "app-listener", pub); err != nil {
 		t.Fatalf("verifyRelease without a digest: %v", err)
 	}
 
 	// Tampered binary.
 	tampered := write("tampered", []byte("tampered payload"))
-	if err := verifyReleaseWithKey(tampered, checksumPath, sigPath, "", pub); err == nil {
+	if err := verifyReleaseWithKey(tampered, checksumPath, sigPath, "", "app-listener", pub); err == nil {
 		t.Fatal("verifyRelease accepted a binary whose sha256 does not match the checksum")
 	}
 
 	// Signature over the wrong checksum file.
 	_, otherChecksum, otherSig := signedChecksum(t, priv, "app-listener", []byte("other"))
-	if err := verifyReleaseWithKey(binPath, write("other.sha256", otherChecksum), write("other.sha256.sig", otherSig), "", pub); err == nil {
+	if err := verifyReleaseWithKey(binPath, write("other.sha256", otherChecksum), write("other.sha256.sig", otherSig), "", "app-listener", pub); err == nil {
 		t.Fatal("verifyRelease accepted a signature over the wrong checksum file")
 	}
 
 	// Signature made with a different key.
 	otherPriv, _, _ := testKeyPair(t)
 	forgedSig := ed25519.Sign(otherPriv, checksum)
-	if err := verifyReleaseWithKey(binPath, checksumPath, write("forged.sig", forgedSig), "", pub); err == nil {
+	if err := verifyReleaseWithKey(binPath, checksumPath, write("forged.sig", forgedSig), "", "app-listener", pub); err == nil {
 		t.Fatal("verifyRelease accepted a signature from the wrong key")
 	}
 
 	// GitHub digest disagreeing with the signed checksum.
-	if err := verifyReleaseWithKey(binPath, checksumPath, sigPath, "sha256:"+strings.Repeat("cd", 32), pub); err == nil {
+	if err := verifyReleaseWithKey(binPath, checksumPath, sigPath, "sha256:"+strings.Repeat("cd", 32), "app-listener", pub); err == nil {
 		t.Fatal("verifyRelease accepted a GitHub digest that contradicts the signed checksum")
 	}
 
+	// Validly signed pair of another asset (the arm64 or GUI build) served under this name.
+	_, armChecksum, armSig := signedChecksum(t, priv, "app-listener-arm64", bin)
+	if err := verifyReleaseWithKey(binPath, write("arm.sha256", armChecksum), write("arm.sha256.sig", armSig), "", "app-listener", pub); err == nil {
+		t.Fatal("verifyRelease accepted a checksum signed for another asset name")
+	}
+	if err := verifyReleaseWithKey(binPath, write("arm.sha256", armChecksum), write("arm.sha256.sig", armSig), "", "app-listener-arm64", pub); err != nil {
+		t.Fatalf("verifyRelease on a valid arm64 release: %v", err)
+	}
+
 	// Garbage signature.
-	if err := verifyReleaseWithKey(binPath, checksumPath, write("garbage.sig", []byte("garbage")), "", pub); err == nil {
+	if err := verifyReleaseWithKey(binPath, checksumPath, write("garbage.sig", []byte("garbage")), "", "app-listener", pub); err == nil {
 		t.Fatal("verifyRelease accepted a garbage signature")
 	}
 }
@@ -378,7 +392,7 @@ func TestDownloadFileMode0700(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dst := filepath.Join(t.TempDir(), releaseAssetBinary)
+	dst := filepath.Join(t.TempDir(), "app-listener")
 	if err := downloadFile(srv.Client(), srv.URL, dst, nil, "Downloading app-listener"); err != nil {
 		t.Fatalf("downloadFile: %v", err)
 	}
@@ -445,5 +459,82 @@ func TestReadInstalledVersion(t *testing.T) {
 	}
 	if got := readInstalledVersion(bin); got != "unknown" {
 		t.Fatalf("readInstalledVersion on a non-executable = %q, want unknown", got)
+	}
+}
+
+func TestAssetsFor(t *testing.T) {
+	amd, err := assetsFor("amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Older binaries' `update` fetches these exact names: renaming them strands every amd64 install.
+	if amd.binary != "app-listener" || amd.checksum != "app-listener.sha256" || amd.signature != "app-listener.sha256.sig" || amd.machine != elf.EM_X86_64 {
+		t.Fatalf("amd64 assets = %+v", amd)
+	}
+	arm, err := assetsFor("arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if arm.binary != "app-listener-arm64" || arm.checksum != "app-listener-arm64.sha256" || arm.signature != "app-listener-arm64.sha256.sig" || arm.machine != elf.EM_AARCH64 {
+		t.Fatalf("arm64 assets = %+v", arm)
+	}
+	if _, err := assetsFor("riscv64"); err == nil {
+		t.Fatal("assetsFor accepted an architecture with no published release")
+	}
+}
+
+func TestResolveAssetsPicksArch(t *testing.T) {
+	r := &githubRelease{TagName: "v1.0.0"}
+	for _, n := range []string{"app-listener", "app-listener.sha256", "app-listener.sha256.sig",
+		"app-listener-arm64", "app-listener-arm64.sha256", "app-listener-arm64.sha256.sig"} {
+		r.Assets = append(r.Assets, struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+			Digest             string `json:"digest"`
+		}{Name: n, BrowserDownloadURL: "https://example.invalid/" + n, Digest: "sha256:" + n})
+	}
+	arm, _ := assetsFor("arm64")
+	bin, digest, sum, sig, err := resolveAssets(r, arm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(bin, "/app-listener-arm64") || digest != "sha256:app-listener-arm64" ||
+		!strings.HasSuffix(sum, "/app-listener-arm64.sha256") || !strings.HasSuffix(sig, "/app-listener-arm64.sha256.sig") {
+		t.Fatalf("resolveAssets(arm64) = %s %s %s %s", bin, digest, sum, sig)
+	}
+
+	r.Assets = r.Assets[:3] // a release published before arm64 builds existed
+	if _, _, _, _, err := resolveAssets(r, arm); err == nil {
+		t.Fatal("resolveAssets(arm64) succeeded on a release without arm64 assets")
+	}
+}
+
+func TestSanityCheckBinaryRefusesOtherMachine(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := elf.Open(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := f.Machine
+	f.Close()
+
+	other := elf.EM_AARCH64
+	if machine == elf.EM_AARCH64 {
+		other = elf.EM_X86_64
+	}
+	err = sanityCheckBinary(self, "v-never", other)
+	if err == nil || !strings.Contains(err.Error(), "built for") {
+		t.Fatalf("sanityCheckBinary with a foreign machine = %v, want a machine refusal", err)
+	}
+
+	notELF := filepath.Join(t.TempDir(), "app-listener")
+	if err := os.WriteFile(notELF, []byte("#!/bin/sh\necho v1.0.0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanityCheckBinary(notELF, "v1.0.0", machine); err == nil {
+		t.Fatal("sanityCheckBinary accepted a non-ELF file")
 	}
 }

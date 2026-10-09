@@ -1,11 +1,16 @@
 name: Build & sign release assets
 
 # Reusable build core for release.yml and promote-release.yml. Checks out
-# `ref`, compiles the linux/amd64 binaries with `version` embedded, then
-# sha256s and Ed25519-signs each. `app-listener` is the default build that
-# install.sh and `app-listener update` consume (by exact asset name);
-# `app-listener-gui` (make build-linux GUI=1) is best-effort and for manual
-# download only. Assets are uploaded as the `release-assets` artifact.
+# `ref`, compiles the linux/amd64 and linux/arm64 binaries with `version`
+# embedded, then sha256s and Ed25519-signs each. Each arch builds natively on
+# its own runner: the eBPF is compiled against that runner kernel's BTF and
+# register layout, so it cannot be cross-built. Asset names (install.sh and
+# `app-listener update` pick theirs by exact name):
+#   amd64: app-listener, app-listener-gui              (unsuffixed: older
+#          binaries' `update` looks these names up)
+#   arm64: app-listener-arm64, app-listener-gui-arm64
+# The GUI builds (make build-linux GUI=1) are best-effort and for manual
+# download only. Each arch uploads a `release-assets-<arch>` artifact.
 
 on:
   workflow_call:
@@ -28,7 +33,20 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-26.04
+    # Every leg must pass: the publishing jobs `needs:` this one, so one failed
+    # arch publishes no release at all rather than a half-populated one.
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+            suffix: ""
+            elf_machine: X86-64
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+            suffix: -arm64
+            elf_machine: AArch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out the ref being released
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,7 +59,7 @@ jobs:
           # CGO for the fscrypt mlock dependency; GUI additionally links
           # fyne/glfw against OpenGL + X11 + Wayland.
           packages: gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
-          version: ubuntu-26.04-1
+          version: ubuntu-26.04-${{ matrix.arch }}-1
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -76,37 +94,52 @@ jobs:
       - name: Build default binary
         env:
           VERSION: ${{ inputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
         run: |
           set -euo pipefail
           mkdir -p dist
           make build-linux VERSION="$VERSION"
-          mv build/linux/app-listener dist/app-listener
+          mv build/linux/app-listener "dist/app-listener$SUFFIX"
 
       - name: Build GUI binary (best-effort)
         env:
           VERSION: ${{ inputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
         run: |
           set -euo pipefail
           if make build-linux GUI=1 VERSION="$VERSION"; then
-            mv build/linux/app-listener dist/app-listener-gui
+            mv build/linux/app-listener "dist/app-listener-gui$SUFFIX"
           else
-            echo "::warning title=GUI build failed::app-listener-gui is omitted from this release"
+            echo "::warning title=GUI build failed::app-listener-gui$SUFFIX is omitted from this release"
           fi
 
       - name: Sanity-check the default binary
         env:
           VERSION: ${{ inputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
+          ELF_MACHINE: ${{ matrix.elf_machine }}
         run: |
           set -euo pipefail
-          chmod +x dist/app-listener
-          got="$(dist/app-listener --version 2>&1)"
+          bin="dist/app-listener$SUFFIX"
+          chmod +x "$bin"
+          readelf -h "$bin" | grep -E '^ *Machine:' | grep -qF -- "$ELF_MACHINE" \
+            || { echo "::error::$bin is not a $ELF_MACHINE ELF: $(readelf -h "$bin" | grep Machine)"; exit 1; }
+          got="$("$bin" --version 2>&1)"
           printf '%s\n' "$got"
           printf '%s' "$got" | grep -qF -- "$VERSION" \
             || { echo "::error::default binary reports '$got', expected '$VERSION'"; exit 1; }
 
+      # Verifies the exact objects being shipped (rebuilt here, not the PR's). GitHub's runners build
+      # BPF-LSM in without activating it, hence --verifier-only (see verifier.yml).
+      - name: Guard eBPF loads into the runner kernel's verifier
+        env:
+          SUFFIX: ${{ matrix.suffix }}
+        run: sudo "dist/app-listener$SUFFIX" daemon --check --verifier-only
+
       - name: Checksum and Ed25519-sign the binaries
         env:
           SIGNING_KEY: ${{ secrets.signing-key }}
+          SUFFIX: ${{ matrix.suffix }}
         run: |
           set -euo pipefail
           if [ -z "${SIGNING_KEY:-}" ]; then
@@ -116,7 +149,8 @@ jobs:
           key="$RUNNER_TEMP/app-listener-signing-key.pem"
           printf '%s\n' "$SIGNING_KEY" > "$key"
           chmod 600 "$key"
-          for b in app-listener app-listener-gui; do
+          # sha256sum records the asset name; `update` checks it against the name it fetched.
+          for b in "app-listener$SUFFIX" "app-listener-gui$SUFFIX"; do
             [ -f "dist/$b" ] || continue
             ( cd dist && sha256sum "$b" > "$b.sha256" )
             openssl pkeyutl -sign -rawin -inkey "$key" \
@@ -131,7 +165,7 @@ jobs:
       - name: Upload release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-assets
+          name: release-assets-${{ matrix.arch }}
           path: dist
           if-no-files-found: error
           retention-days: 1

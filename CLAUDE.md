@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A single Go binary (`app-listener`) that monitors or **denies** filesystem and network
 operations with eBPF, to protect credential directories (SSH keys, GPG, browser
 profiles, AI-agent tokens) from info-stealers and supply-chain attacks. Runs as root
-on Linux only; `linux/amd64` is the released target.
+on Linux only; `linux/amd64` and `linux/arm64` are released (amd64 assets keep the unsuffixed
+names older `update` binaries fetch; arm64's carry `-arm64`).
 
 `README.md` is the user-facing reference for every subcommand and flag — consult it
 before changing CLI surface. This is a "vibe-coding experiment, not for production".
@@ -92,7 +93,8 @@ needs cgo (`mlock`). A `CGO_ENABLED=0` build no longer compiles.
 | `make build` | Full pipeline in a **rootful Docker** container: dumps `vmlinux.h` from the host BTF, regenerates BPF bindings, builds to `build/linux/app-listener`. Nothing but Docker needed on the host. |
 | `make build-host` | Same pipeline on the host — needs a **recent** `clang`/LLVM (`docker/builder.Dockerfile` pins clang 22; clang 14 emits a `guard_path_rename` that overflows the BPF verifier's 1M-insn budget on modern kernels — issue #45), `bpftool`, Go 1.26+, GCC. |
 | `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui` (fyne desktop window for `monitor --gui`, ~20 MiB larger, X11/OpenGL deps) — off by default because the daemon shares this binary. |
-| `make generate` | Regenerate BPF bindings (`bpf2go`). Needs `bpftool` + readable `/sys/kernel/btf/vmlinux`. |
+| `make generate` | Regenerate BPF bindings (`bpf2go`). Needs `bpftool` + readable `/sys/kernel/btf/vmlinux`. `ARCH` (amd64/arm64) defaults to the host's and must equal it: vmlinux.h and `__TARGET_ARCH_*` (PT_REGS layout) are the host's, so the eBPF never cross-builds. |
+| `make vuln` | govulncheck (pinned `GOVULNCHECK_VERSION`) over the module; `GUI=1` scans the `-tags gui` build. Needs generated bindings. |
 | `make check-compatibility` | Static host check (kernel version, `.config`, BTF, BPF-LSM activation, fscrypt prereqs). Run before building/running on a new host. `--binary <path>` (as root) also loads that binary's guard eBPF into the running verifier (`daemon --check`), catching a prebuilt/kernel mismatch; `scripts/install.sh` runs this against the downloaded release before installing anything. |
 
 BPF C sources live in `internal/<mode>/bpf/*.bpf.c`. `make generate` compiles each with
@@ -232,9 +234,10 @@ site and check each argument's declared type.
 module including the fyne GUI, so CI installs `libgl1-mesa-dev xorg-dev libwayland-dev
 libxkbcommon-dev` — a bare box will report GUI typecheck failures that aren't your change.
 
-CI (`.github/workflows/ci.yml`) runs `make lint` and `make test` on non-draft PRs only.
-`verifier.yml` loads the PR's and the base's guard objects into the verifier of two runner
-kernels (`ubuntu-24.04`: 6.17, `ubuntu-26.04`: 7.0) with `bpfstats` and
+CI (`.github/workflows/ci.yml`) runs `make lint` and `make test` on non-draft PRs only;
+`vuln.yml` runs `make vuln` (default + GUI build) on non-draft PRs and weekly on main.
+`verifier.yml` loads the PR's and the base's guard objects into the verifier of three runners
+(`ubuntu-24.04`: 6.17, `ubuntu-26.04`: 7.0, `ubuntu-26.04-arm`: arm64) with `bpfstats` and
 `daemon --check --verifier-only`, and fails on any rejection; its summary has the per-program
 cost deltas. Those are those kernels' verdicts only — still run bpfstats locally. Every job pins
 an explicit runner label, never `ubuntu-latest`.
@@ -376,7 +379,9 @@ built-in Read / Edit / Write tools: shell access (`cat`, `>>`, `sed`) is denied 
 
 See `memory/release-promote-flow.md`. A release is a *build*, not a tag rename:
 `release.yml` cuts a `pre-*` pre-release per push to main; `promote-release.yml` rebuilds
-a stable `vX.Y.Z`. `_build-release.yml` is the reusable build job.
+a stable `vX.Y.Z`. `_build-release.yml` is the reusable build job: one native leg per arch
+(`ubuntu-26.04` / `ubuntu-26.04-arm`), each running `daemon --check --verifier-only` on the
+objects it ships; any failed leg publishes nothing.
 
 ## graphify
 

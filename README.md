@@ -34,7 +34,7 @@ Run `make check-compatibility` first — it performs every static check (kernel 
 
 **Kernel floor:** `monitor` needs ≥ 5.8 (BPF ring buffer); `network-guard` needs ≥ 5.10 (BPF-LSM) for `-b`, ≥ 5.17 for `-w` (its code-integrity hooks use `bpf_loop`); `guard` / `daemon` need ≥ 5.17 (BPF-LSM plus the `bpf_loop` helper). Ubuntu 20.04 (kernel 5.4) is not supported. Mandatory hooks: `file_open`, `file_permission`, and `inode_unlink`, `inode_rename`, `bprm_committed_creds` plus the `sched_process_fork` tracepoint (replaced-binary tracking), and the `sched_process_exec` tracepoint (launch scan of whitelisted runtimes) — every other LSM hook is best-effort: a kernel that lacks one logs a warning and keeps enforcing the rest.
 
-**Stock Ubuntu and cloud images compile `CONFIG_BPF_LSM=y` but do not activate it** — without the cmdline change the LSM hooks attach but never deny. `linux/amd64` is the released target; `linux/arm64` cross-compiles but is untested.
+**Stock Ubuntu and cloud images compile `CONFIG_BPF_LSM=y` but do not activate it** — without the cmdline change the LSM hooks attach but never deny. Releases ship for `linux/amd64` (`x86_64`) and `linux/arm64` (`aarch64`); `install.sh` and `update` pick the host's. On arm64 the LSM modes (`guard`, `daemon`, `network-guard`) need kernel ≥ 6.0 (the arm64 BPF trampoline). Source builds are native only: the eBPF is compiled against the build host's BTF, so build arm64 on an arm64 host.
 
 ## Quick Start
 
@@ -244,7 +244,7 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 
 ### install.sh / install / uninstall / update / edit-protected
 
-**`scripts/install.sh`** (the `curl … | sudo bash` one-liner) — runs `check-compatibility` and aborts if it fails; downloads the latest release of `--channel` (`release` [default] / `prerelease`) from GitHub; verifies the Ed25519 signature of the checksum against the embedded release key, the checksum against the binary, and the GitHub asset digest; then atomically installs `/usr/local/sbin/app-listener` + the PATH symlink. It does **not** install the daemon — it prints the reminder to run `sudo app-listener install` yourself.
+**`scripts/install.sh`** (the `curl … | sudo bash` one-liner) — runs `check-compatibility` and aborts if it fails; downloads the latest release of `--channel` (`release` [default] / `prerelease`) from GitHub for the host's architecture (`app-listener` on x86_64, `app-listener-arm64` on aarch64); verifies the Ed25519 signature of the checksum against the embedded release key, that it was signed for that asset name, the checksum against the binary, the GitHub asset digest, and the ELF machine; then atomically installs `/usr/local/sbin/app-listener` + the PATH symlink. It does **not** install the daemon — it prints the reminder to run `sudo app-listener install` yourself.
 
 **install** — TUI wizard, in safe order: stop a running daemon → build → generate the fscrypt key (existing kept) → pick users → probe a built-in catalog of critical directories (`internal/install/catalog.go`: SSH, GPG, AI agents, browsers, VPNs, password stores…) → encrypt selected directories (backup first, verified against the master key) → deploy systemd units, binary and config (removing the pacman/apt catalog-refresh hooks and the boot-time refresh unit an earlier version installed: the daemon refreshes the catalog itself). The per-user ssh-agent unit is offered only when that user's `~/.ssh` ends up guarded (one question per user, naming the user and the unit path, asked before encryption), together with `AddKeysToAgent yes` at the top of the user's `~/.ssh/config` (created if missing, an existing `AddKeysToAgent` kept; written before `~/.ssh` is encrypted, so `ssh` loads a key into the agent on first use), and with a marked `SSH_AUTH_SOCK` block appended to that user's shell startup file (`~/.zshrc` / `~/.bashrc` / fish `conf.d`; login shell's is created if missing, an existing own `SSH_AUTH_SOCK` line or an already-set variable is never overridden, and `uninstall` removes the block); skipped entirely otherwise. The daemon never loads keys itself. When a selected app is Bun-based (e.g. **opencode**), Bun extracts a bundled native library to `$TMPDIR/.bun-<uid>-<hash>.so` and `dlopen`s it — on world-writable `/tmp` the trust guard denies that load (it can't tell the app's own extraction from a planted `.so`). The wizard offers, per user, to redirect it: it creates a private `~/.cache/app-listener/bun` (`0700`) and adds a marked shell-function wrapper for each launcher (`~/.zshrc` / `~/.bashrc` / fish `conf.d`) that runs the command with `$TMPDIR` pointed there. The daemon then reserves the `.bun-*` name below that dir for the app's binaries (`guard_trust.bpf.c` #3), so the app loads its own extraction while no other process can plant or load one. A dir the daemon has not reserved yet (at every start, and when it first appears) may already hold a plant, so the daemon first replaces it with an empty one — the app re-extracts on its next launch; ordinary temp files the app's subprocesses write to that dir are unaffected (only the reserved name is gated). Interactive shells only — a Bun app launched from a desktop menu still uses `/tmp`; `uninstall` removes the wrappers.
 
@@ -262,7 +262,7 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 
 **uninstall** — refuses while the daemon runs; re-scans the catalog; decrypts in place by default; deletes the master key only with `--delete-key`; at the end, lists any `.app_listener.backup` migration copies and offers to delete them (all preselected, one confirmation — plain unencrypted copies, harmless to keep).
 
-**update** — self-updates from the latest signed `pre-YYYYMMDD-<sha>` GitHub pre-release (Ed25519 signature + checksum + asset digest all verified before anything is written).
+**update** — self-updates from the latest signed release of `--channel` (`stable` [default] / `pre-release`), fetching the asset for the running binary's architecture (Ed25519 signature + signed asset name + checksum + asset digest + ELF machine all verified before anything is written).
 
 **edit-protected** — edit a protected directory in a two-pane editor. `Ctrl+S` saves atomically; binaries, symlinks and files > 2 MiB refused.
 
@@ -339,6 +339,7 @@ A wrong/old key fails immediately with "invalid wrapping key" — the daemon nev
 | `make build-linux` | Build the Go binary only (`GUI=1` links the desktop GUI) |
 | `make check-compatibility` | Static host check — can it run app-listener? |
 | `make test` / `make lint` | Unit tests / golangci-lint |
+| `make vuln` | govulncheck over the module (`GUI=1` scans the GUI build; run `make generate` first) |
 | `make test-integration` | Docker integration + bypass suite (rootful Docker) |
 | `make generate` | Regenerate BPF bindings |
 | `make clean` | Remove build artifacts |

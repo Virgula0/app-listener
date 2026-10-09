@@ -11,7 +11,8 @@
 #      nothing.
 #   2. downloads the latest release of the selected --channel from GitHub
 #      (release [default] | prerelease — same channel model as
-#      `app-listener update`).
+#      `app-listener update`) for this host's architecture (x86_64 or
+#      aarch64).
 #   3. verifies the release the same way `app-listener update` does: the
 #      Ed25519 signature of the sha256 checksum against the embedded release
 #      public key, then the checksum against the downloaded binary, then the
@@ -43,9 +44,6 @@ API_BASE="https://api.github.com"
 REF="${APP_LISTENER_REF:-main}"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}"
 
-RELEASE_ASSET_BINARY="app-listener"
-RELEASE_ASSET_CHECKSUM="app-listener.sha256"
-RELEASE_ASSET_SIGNATURE="app-listener.sha256.sig"
 
 INSTALL_PATH="/usr/local/sbin/app-listener"   # systemd.InstallBinaryPath
 SYMLINK_PATH="/usr/local/bin/app-listener"    # systemd.BinSymlinkPath
@@ -113,9 +111,15 @@ if [ -n "$missing" ]; then
      Arch:          pacman -S curl jq openssl coreutils"
 fi
 
-if [ "$(uname -m)" != "x86_64" ]; then
-	die "the published release is linux/amd64 only; this host is $(uname -m)"
-fi
+# Asset names as in .github/workflows/_build-release.yml (amd64 keeps the unsuffixed ones);
+# ELF_MACHINE is the expected e_machine (little-endian hex).
+case "$(uname -m)" in
+x86_64)          RELEASE_ASSET_BINARY="app-listener";       ELF_MACHINE="3e00" ;;
+aarch64 | arm64) RELEASE_ASSET_BINARY="app-listener-arm64"; ELF_MACHINE="b700" ;;
+*)               die "releases are published for x86_64 and aarch64 only; this host is $(uname -m) — build from source (make build)" ;;
+esac
+RELEASE_ASSET_CHECKSUM="$RELEASE_ASSET_BINARY.sha256"
+RELEASE_ASSET_SIGNATURE="$RELEASE_ASSET_BINARY.sha256.sig"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/app-listener-install.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -153,14 +157,15 @@ releases_json="$(curl -fsSL --proto '=https' --tlsv1.2 \
 	"$API_BASE/repos/$REPO/releases?per_page=100")" \
 	|| die "could not list releases of $REPO"
 
-line="$(printf '%s' "$releases_json" | jq -r --argjson pre "$WANT_PRERELEASE" '
+line="$(printf '%s' "$releases_json" | jq -r --argjson pre "$WANT_PRERELEASE" \
+	--arg bin "$RELEASE_ASSET_BINARY" --arg sum "$RELEASE_ASSET_CHECKSUM" --arg sig "$RELEASE_ASSET_SIGNATURE" '
 	([ .[] | select(.prerelease == $pre) ] | sort_by(.published_at) | reverse | .[0]) as $r
 	| if $r == null then "" else
 		[ $r.tag_name,
-		  ( [ $r.assets[] | select(.name=="app-listener")            | .browser_download_url ] | first // "" ),
-		  ( [ $r.assets[] | select(.name=="app-listener")            | .digest ]              | first // "" ),
-		  ( [ $r.assets[] | select(.name=="app-listener.sha256")     | .browser_download_url ] | first // "" ),
-		  ( [ $r.assets[] | select(.name=="app-listener.sha256.sig") | .browser_download_url ] | first // "" )
+		  ( [ $r.assets[] | select(.name==$bin) | .browser_download_url ] | first // "" ),
+		  ( [ $r.assets[] | select(.name==$bin) | .digest ]               | first // "" ),
+		  ( [ $r.assets[] | select(.name==$sum) | .browser_download_url ] | first // "" ),
+		  ( [ $r.assets[] | select(.name==$sig) | .browser_download_url ] | first // "" )
 		] | @tsv
 	  end
 ')" || die "could not parse the GitHub API response"
@@ -170,7 +175,7 @@ line="$(printf '%s' "$releases_json" | jq -r --argjson pre "$WANT_PRERELEASE" '
 IFS=$'\t' read -r TAG BIN_URL BIN_DIGEST SHA_URL SIG_URL <<<"$line" || true
 
 [ -n "${TAG:-}" ]     || die "could not read the release tag from the GitHub API response"
-[ -n "${BIN_URL:-}" ] || die "release $TAG has no '$RELEASE_ASSET_BINARY' asset"
+[ -n "${BIN_URL:-}" ] || die "release $TAG has no '$RELEASE_ASSET_BINARY' asset (published before $(uname -m) builds existed?)"
 [ -n "${SHA_URL:-}" ] || die "release $TAG has no '$RELEASE_ASSET_CHECKSUM' asset"
 [ -n "${SIG_URL:-}" ] || die "release $TAG has no '$RELEASE_ASSET_SIGNATURE' asset"
 
@@ -182,7 +187,7 @@ download() {
 		|| die "download failed: $1"
 }
 
-info "fetching release assets (~45 MiB) ..."
+info "fetching $RELEASE_ASSET_BINARY (~45 MiB) ..."
 download "$BIN_URL" "$TMP/$RELEASE_ASSET_BINARY"
 download "$SHA_URL" "$TMP/$RELEASE_ASSET_CHECKSUM"
 download "$SIG_URL" "$TMP/$RELEASE_ASSET_SIGNATURE"
@@ -206,6 +211,12 @@ case "$expected_sha" in
 *[!0-9a-f]* | "") die "malformed checksum file" ;;
 esac
 [ "${#expected_sha}" -eq 64 ] || die "malformed checksum file (expected a 64-hex sha256)"
+# Every arch's checksum is signed by the same key: the signed name stops another arch's (or the
+# GUI's) validly signed pair from being served under this asset's name.
+[ "$(wc -l < "$TMP/$RELEASE_ASSET_CHECKSUM")" -eq 1 ] || die "malformed checksum file (expected one line)"
+signed_name="$(awk 'NR==1{sub(/^\*/, "", $2); print $2}' "$TMP/$RELEASE_ASSET_CHECKSUM")"
+[ "$signed_name" = "$RELEASE_ASSET_BINARY" ] \
+	|| die "the signed checksum is for '$signed_name', not '$RELEASE_ASSET_BINARY'. The download is rejected."
 
 actual_sha="$(sha256sum "$TMP/$RELEASE_ASSET_BINARY" | awk '{print tolower($1)}')"
 [ "$actual_sha" = "$expected_sha" ] \
@@ -223,6 +234,8 @@ fi
 
 magic="$(od -An -tx1 -N4 "$TMP/$RELEASE_ASSET_BINARY" | tr -d ' \n')"
 [ "$magic" = "7f454c46" ] || die "the downloaded file is not an ELF executable"
+machine="$(od -An -tx1 -j18 -N2 "$TMP/$RELEASE_ASSET_BINARY" | tr -d ' \n')"
+[ "$machine" = "$ELF_MACHINE" ] || die "the downloaded binary is not built for $(uname -m) (e_machine $machine)"
 
 chmod 0700 "$TMP/$RELEASE_ASSET_BINARY"
 if ! ver_out="$("$TMP/$RELEASE_ASSET_BINARY" --version 2>&1)"; then
