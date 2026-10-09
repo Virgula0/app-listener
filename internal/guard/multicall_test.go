@@ -165,6 +165,32 @@ func TestExeKeyRefusesUnrecognizedMulticall(t *testing.T) {
 	}
 }
 
+func TestExeKeyRefusesGNUCoreutilsSingle(t *testing.T) {
+	dir := t.TempDir()
+	marker := []byte("gorp-slitueroc--") // reversed: see TestExeKeyRefusesOpaqueMulticall
+	slices.Reverse(marker)
+	bin := filepath.Join(dir, "coreutils")
+	if err := os.WriteFile(bin, append([]byte("\x7fELF...."), marker...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "cat")
+	content := "#!" + bin + " " + string(marker) + "-shebang=cat\n"
+	if err := os.WriteFile(script, []byte(content), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{bin, script} {
+		dev, ino, err := ebpf.StatInode(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = ExeKey(p, nil, GuardInodeKey{Dev: dev, Ino: ino})
+		if !IsMulticallRefusal(err) || !strings.Contains(err.Error(), "is a gnu-coreutils multicall binary") ||
+			!strings.Contains(err.Error(), "dnf swap coreutils-single coreutils") {
+			t.Fatalf("%s: GNU coreutils-single must be refused: %v", p, err)
+		}
+	}
+}
+
 func TestWarnMultiLinkedOncePerInode(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "perl")

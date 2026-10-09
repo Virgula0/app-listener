@@ -192,6 +192,9 @@ func (m *netGuardModel) formatEvent(ev *networkguard.NetGuardEvent) string {
 	if ev.Size > 0 {
 		details += fmt.Sprintf(" size=%d", ev.Size)
 	}
+	if ev.Reason != "" {
+		details += " " + sanitizeTerminalText(ev.Reason)
+	}
 
 	return fmt.Sprintf("[%d] %s %s %s %s %s%s %s",
 		m.eventID,

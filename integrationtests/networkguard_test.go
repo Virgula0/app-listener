@@ -93,7 +93,7 @@ func netGuardHasBlockedEvent(logContent, expectedComm, expectedType string) bool
 			continue
 		}
 		rest := line[idx+len("NETGUARD|"):]
-		parts := strings.SplitN(rest, "|", 10)
+		parts := strings.SplitN(rest, "|", 11) // 11th: the optional |<reason>
 		if len(parts) < 10 {
 			continue
 		}
@@ -129,7 +129,7 @@ func netGuardBlockedEventCount(logContent, comm, typ string) int {
 			continue
 		}
 		rest := line[idx+len("NETGUARD|"):]
-		parts := strings.SplitN(rest, "|", 10)
+		parts := strings.SplitN(rest, "|", 11) // 11th: the optional |<reason>
 		if len(parts) < 10 {
 			continue
 		}
@@ -189,7 +189,7 @@ func guardNetTypesForComm(logContent, comm string) []string {
 			continue
 		}
 		rest := line[idx+len("NETGUARD|"):]
-		parts := strings.SplitN(rest, "|", 10)
+		parts := strings.SplitN(rest, "|", 11) // 11th: the optional |<reason>
 		if len(parts) < 10 || parts[1] != comm || strings.TrimSpace(parts[9]) != "true" {
 			continue
 		}

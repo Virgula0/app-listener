@@ -19,15 +19,15 @@ func trustSpec() (*cilium.CollectionSpec, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("reading embedded trust objects: %w", err)
 	}
-	if kernelHasFunc(memfdTarget) {
+	if KernelHasFunc(memfdTarget) {
 		return spec, true, nil
 	}
-	spec.Programs[GuardTrustProgTrustMemfdAlloc] = inertProgram(GuardTrustProgTrustMemfdAlloc)
+	spec.Programs[GuardTrustProgTrustMemfdAlloc] = InertProgram(GuardTrustProgTrustMemfdAlloc)
 	return spec, false, nil
 }
 
-// inertProgram stands in for a program whose attach target this kernel lacks; never attached.
-func inertProgram(name string) *cilium.ProgramSpec {
+// InertProgram stands in for a program whose attach target this kernel lacks; never attached.
+func InertProgram(name string) *cilium.ProgramSpec {
 	return &cilium.ProgramSpec{
 		Name:         name,
 		Type:         cilium.SocketFilter,
@@ -36,9 +36,9 @@ func inertProgram(name string) *cilium.ProgramSpec {
 	}
 }
 
-// kernelHasFunc reports whether vmlinux's BTF has function name. Unreadable BTF answers true: the
+// KernelHasFunc reports whether vmlinux's BTF has function name. Unreadable BTF answers true: the
 // load then reports the real error.
-func kernelHasFunc(name string) bool {
+func KernelHasFunc(name string) bool {
 	spec, err := btf.LoadKernelSpec()
 	if err != nil {
 		return true

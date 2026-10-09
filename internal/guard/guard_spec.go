@@ -17,9 +17,9 @@ func guardSpec() (*cilium.CollectionSpec, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("reading embedded guard objects: %w", err)
 	}
-	if kernelHasFunc(ioctlCompatTarget) {
+	if KernelHasFunc(ioctlCompatTarget) {
 		return spec, true, nil
 	}
-	spec.Programs[GuardProgGuardFileIoctlCompat] = inertProgram(GuardProgGuardFileIoctlCompat)
+	spec.Programs[GuardProgGuardFileIoctlCompat] = InertProgram(GuardProgGuardFileIoctlCompat)
 	return spec, false, nil
 }

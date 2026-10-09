@@ -39,6 +39,9 @@ var ComputeBinaryEntry = ebpf.ComputeBinaryEntry
 type NetGuardEvent struct {
 	ebpf.NetEvent
 	Blocked bool
+	// Reason says why a whitelisted binary's process was refused ("" for any other event): see
+	// reasonText. A gate event (PTRACE, TRACED_EXEC) names the other process instead.
+	Reason string
 }
 
 type NetGuard struct {
@@ -53,9 +56,12 @@ type NetGuard struct {
 	binaries     []BinaryEntry
 	unsafe       bool
 	eventset     []ebpf.NetEventType
-	ownPID       int
+	ownPID       int // as events carry it: the kernel tgid (resolveOwnPID)
 	throttle     bool
 	hasMulticall bool // a uutils multicall applet is configured: the exec tagger must attach
+	memfd        bool // netg_memfd_alloc's target exists (netSpec)
+	mounts       *guard.MountVouch
+	lostSeen     [2]uint64 // suspect marks / exec stamps the kernel reported lost (warnDegraded)
 }
 
 func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType, unsafe, throttle bool) (*NetGuard, error) {
@@ -82,17 +88,64 @@ func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType
 		throttle: throttle,
 	}
 
-	var objs GuardNetObjects
-	if err := LoadGuardNetObjects(&objs, nil); err != nil {
+	spec, memfd, err := netSpec(mode == ModeWhitelist)
+	if err != nil {
+		return nil, err
+	}
+	g.memfd = memfd
+	if err := spec.LoadAndAssign(&g.objs, nil); err != nil {
+		if mode == ModeWhitelist {
+			return nil, fmt.Errorf("loading network guard BPF objects: %w — whitelist mode's code-integrity "+
+				"hooks need kernel >= 5.17 (bpf_loop)", err)
+		}
 		return nil, fmt.Errorf("loading network guard BPF objects: %w", err)
 	}
-	g.objs = objs
 
-	if err := g.populateMaps(); err != nil {
+	if err := g.setup(); err != nil {
 		g.cleanup()
-		return nil, fmt.Errorf("populating BPF maps: %w", err)
+		return nil, err
 	}
 
+	log.Infof("network guard created (mode=%s) \u2014 %d LSM hooks attached, binaries: %d, events: %v",
+		modeLabel(mode, unsafe), len(g.links), len(binaries), eventsetSummary(es))
+	return g, nil
+}
+
+// setup orders the attach so no window admits what the finished guard would refuse: the
+// lifecycle hooks (superseded keys, exec stamps, suspect marks) and, whitelisting, the code-integrity
+// hooks attach before any row exists, so a row's inode can't be unlinked or a protected process
+// inject code unseen; processes older than the hooks are judged once the rows exist; the socket
+// hooks, which act on the rows, attach last.
+func (g *NetGuard) setup() error {
+	if err := g.populateConfig(); err != nil {
+		return fmt.Errorf("populating BPF maps: %w", err)
+	}
+	if err := g.resolveOwnPID(); err != nil {
+		log.Warnf("network guard: own events may show (%v)", err)
+	}
+	if err := g.attachRequired(g.lifecycleHooks(), "binary identity would follow a reused inode number"); err != nil {
+		return err
+	}
+	if g.mode == ModeWhitelist {
+		if err := g.attachIntegrity(); err != nil {
+			return err
+		}
+	}
+	if err := g.putBinaries(); err != nil {
+		return fmt.Errorf("populating BPF maps: %w", err)
+	}
+	if err := g.attachMulticallTagger(); err != nil {
+		return err
+	}
+	if g.mode == ModeWhitelist {
+		if err := g.markPreexisting(); err != nil {
+			return fmt.Errorf("judging processes started before the network guard: %w", err)
+		}
+	}
+	return g.attachSocketHooks()
+}
+
+func (g *NetGuard) attachSocketHooks() error {
 	required := map[string]bool{
 		"socket_connect": true,
 		"socket_bind":    true,
@@ -128,23 +181,13 @@ func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType
 	}
 
 	if len(failedRequired) > 0 {
-		g.cleanup()
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"required LSM hooks failed to attach: %v — network blocking unavailable; "+
 				"ensure your kernel supports BPF LSM (CONFIG_BPF_LSM=y) and LSM=bpf is in the "+
 				"boot command line (/sys/kernel/security/lsm)",
 			failedRequired)
 	}
-
-	hooks := len(g.links)
-	if err := g.attachMulticallTagger(); err != nil {
-		g.cleanup()
-		return nil, err
-	}
-
-	log.Infof("network guard created (mode=%s) \u2014 %d/%d LSM hooks attached, binaries: %d, events: %v",
-		modeLabel(mode, unsafe), hooks, len(attachments), len(binaries), eventsetSummary(es))
-	return g, nil
+	return nil
 }
 
 func modeLabel(mode Mode, unsafe bool) string {
@@ -158,38 +201,20 @@ func modeLabel(mode Mode, unsafe bool) string {
 	return l
 }
 
-// attachMulticallTagger attaches the uutils applet attestation programs (mc_tag.h) when a multicall
-// applet is configured: exec stamps each multicall process with the applet it ran as, fork inherits
-// it, task_free drops it. All three are required then: without the tagger every multicall process
-// keys as MC_TAG_NONE (a whitelisted applet silently denied), and without task_free leaked stamps
-// fill the map until no exec can be attested.
+// attachMulticallTagger attaches the uutils applet attestation program (mc_tag.h) when a multicall
+// applet is configured: exec stamps each multicall process with the applet it ran as (fork and
+// task_free, which carry and drop the stamp, are lifecycle hooks). Required then: without it every
+// multicall process keys as MC_TAG_NONE (a whitelisted applet silently denied).
 func (g *NetGuard) attachMulticallTagger() error {
 	if !g.hasMulticall {
 		return nil
 	}
-	progs := []struct {
-		prog *cilium.Program
-		name string
-		lsm  bool
-	}{
-		{g.objs.NetgExecApplet, "sched_process_exec", false},
-		{g.objs.NetgSchedFork, "sched_process_fork", false},
-		{g.objs.NetgTaskFree, "task_free", true},
+	l, err := link.AttachTracing(link.TracingOptions{Program: g.objs.NetgExecApplet})
+	if err != nil {
+		return fmt.Errorf("attaching multicall applet tagger (sched_process_exec): %w — a uutils applet is "+
+			"configured but its per-applet identity cannot be attested on this kernel", err)
 	}
-	for _, a := range progs {
-		var l link.Link
-		var err error
-		if a.lsm {
-			l, err = link.AttachLSM(link.LSMOptions{Program: a.prog})
-		} else {
-			l, err = link.AttachTracing(link.TracingOptions{Program: a.prog})
-		}
-		if err != nil {
-			return fmt.Errorf("attaching multicall applet tagger (%s): %w — a uutils applet is "+
-				"configured but its per-applet identity cannot be attested on this kernel", a.name, err)
-		}
-		g.links = append(g.links, l)
-	}
+	g.links = append(g.links, l)
 	return nil
 }
 
@@ -205,12 +230,16 @@ const (
 	bpfBlock uint8 = 1
 	bpfAllow uint8 = 2
 
+	// mc_multicall value bits — must match networkguard.bpf.c.
+	mcPresent  uint32 = 1
+	mcHasAllow uint32 = 2
+
 	// Default actions for guard_net_config[0]
 	defaultAllow uint64 = 0
 	defaultBlock uint64 = 1
 )
 
-func (g *NetGuard) populateMaps() error {
+func (g *NetGuard) populateConfig() error {
 	for _, et := range g.eventset {
 		key, err := eventTypeKey(et)
 		if err != nil {
@@ -244,7 +273,7 @@ func (g *NetGuard) populateMaps() error {
 		return fmt.Errorf("setting unsafe families: %w", err)
 	}
 
-	// Config[3]: throttle_enabled — rate-limit events per (type, comm) to
+	// Config[3]: throttle_enabled — rate-limit events per (type, verdict, comm) to
 	// protect the ring buffer from flooding; disabled with --no-throttle.
 	throttleEnabled := uint64(0)
 	if g.throttle {
@@ -253,8 +282,8 @@ func (g *NetGuard) populateMaps() error {
 	if err := g.objs.GuardNetConfig.Put(uint32(3), throttleEnabled); err != nil {
 		return fmt.Errorf("setting throttle enabled: %w", err)
 	}
-
-	return g.putBinaries()
+	// Before any hook keys an inode: without it every btrfs key would read INODE_DEV_UNKNOWN.
+	return g.putBtrfsLayout()
 }
 
 // putBinaries stores every binary's inode key with the mode's action. A uutils multicall applet is
@@ -263,9 +292,6 @@ func (g *NetGuard) populateMaps() error {
 // (busybox/toybox, or a uutils build whose applets can't be told apart) is refused — one identity
 // there would admit every applet. Non-multicall binaries keep their plain inode key, unchanged.
 func (g *NetGuard) putBinaries() error {
-	if err := g.putBtrfsLayout(); err != nil {
-		return err
-	}
 	bpfVal := bpfBlock
 	if g.mode == ModeWhitelist {
 		bpfVal = bpfAllow
@@ -326,7 +352,11 @@ func (g *NetGuard) syncMulticall(file guard.GuardInodeKey) error {
 		}
 	}
 	g.hasMulticall = true
-	return g.objs.McMulticall.Put(exe, uint32(1))
+	presence := mcPresent
+	if g.mode == ModeWhitelist {
+		presence |= mcHasAllow
+	}
+	return g.objs.McMulticall.Put(exe, presence)
 }
 
 // mcNameKey encodes an applet name into the kernel name-table key (mc_tag.h mc_name_key).
@@ -462,6 +492,7 @@ func (g *NetGuard) Start() error {
 	}
 	log.Infof("network guard started (mode=%s%s) \u2014 %d binaries", modeLabel, unsafeLabel, len(g.binaries))
 	go g.readLoop(rd)
+	go g.watchDegraded(g.done)
 	return nil
 }
 
@@ -513,6 +544,7 @@ func (g *NetGuard) readEvent(rd *ringbuf.Reader) (*NetGuardEvent, bool) {
 		NetNS    uint64
 		CgroupID uint64
 		Blocked  uint32
+		Reason   uint32
 	}
 	if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &be); err != nil {
 		log.Errorf("decode net guard event: %v", err)
@@ -541,6 +573,13 @@ func (g *NetGuard) readEvent(rd *ringbuf.Reader) (*NetGuardEvent, bool) {
 			Timestamp: time.Now().UnixNano(),
 		},
 		Blocked: be.Blocked != 0,
+		Reason:  reasonText(be.Reason),
+	}
+	switch ev.Type {
+	case ebpf.NetPtrace:
+		ev.Reason = fmt.Sprintf("target=%d", be.FD)
+	case ebpf.NetTracedExec:
+		ev.Reason = fmt.Sprintf("tracer=%d", be.FD)
 	}
 
 	ev.SrcAddr = ebpf.FormatAddr(be.AF, be.Saddr[:], be.Sport)
@@ -566,5 +605,8 @@ func (g *NetGuard) cleanup() {
 		l.Close()
 	}
 	g.links = nil
+	if g.mounts != nil {
+		g.mounts.Stop()
+	}
 	g.objs.Close()
 }

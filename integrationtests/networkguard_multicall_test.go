@@ -135,3 +135,25 @@ func (s *IntegrationSuite) TestNetworkMonitor_Multicall_PerApplet() {
 			"sibling applet posing as the watched one was reported: %+v", e)
 	}
 }
+
+// TestNetworkGuard_Multicall_GNUCoreutilsSingle: Fedora's coreutils-single runs every applet as one
+// inode and prints no "multi-call"; whitelisting or blacklisting it, or an applet of it, is refused.
+// The image ships split coreutils: the fixture swaps in coreutils-single, whose applets are
+// `#!/usr/bin/coreutils --coreutils-prog-shebang=<applet>` scripts.
+func (s *IntegrationSuite) TestNetworkGuard_Multicall_GNUCoreutilsSingle() {
+	c := s.startContainer("fedora:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	code, out := s.exec(c, []string{"sh", "-c", "rpm -q coreutils-single >/dev/null || " +
+		"timeout 300 dnf -y -q swap coreutils coreutils-single >/dev/null 2>&1; " +
+		"rpm -q coreutils-single && /usr/bin/coreutils --coreutils-prog=true && " +
+		"head -n1 /usr/bin/cat | grep -qx '#!/usr/bin/coreutils --coreutils-prog-shebang=cat'"})
+	s.Require().Equalf(0, code, "fixture: coreutils-single with shebang applets: %s", out)
+
+	for _, flags := range []string{"-w /usr/bin/coreutils", "-w /usr/bin/cat", "-b /usr/bin/cat"} {
+		_, out := s.exec(c, []string{"sh", "-c",
+			"timeout 20 /app-listener network-guard " + flags + " --headless 2>&1; echo rc=$?"})
+		s.Require().NotContainsf(out, "rc=0", "%s: network-guard started: %s", flags, out)
+		s.Require().NotContainsf(out, "rc=124", "%s: network-guard ran until the timeout: %s", flags, out)
+		s.Require().Containsf(out, "is a gnu-coreutils multicall binary", "%s: %s", flags, out)
+	}
+}

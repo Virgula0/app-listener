@@ -231,16 +231,19 @@ Continue? [y/N] `)
 }
 
 // runHeadless prints guard events. With throttle on, the BPF layer already rate-limits per (type,
-// comm) and this printer also dedupes repeats within 1s; --no-throttle prints every event.
+// verdict, comm) and this printer also dedupes repeats within 1s; --no-throttle prints every event.
 func runHeadless(uc usecase.NetworkGuardUseCase, throttle bool) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	// Rate-limit per (type, comm): the LSM hooks are global, so in whitelist mode every blocked
-	// socket op of noisy host processes (mDNS, IDE workers) would flood the log.
+	// Rate-limit per (type, verdict, comm): the LSM hooks are global, so in whitelist mode every
+	// blocked socket op of noisy host processes (mDNS, IDE workers) would flood the log. The
+	// verdict is in the key so an allowed event never hides a refusal of the same comm.
 	type eventKey struct {
-		typ  string
-		comm string
+		typ     string
+		comm    string
+		blocked bool
+		reason  string
 	}
 	lastLog := make(map[eventKey]time.Time)
 
@@ -251,16 +254,22 @@ func runHeadless(uc usecase.NetworkGuardUseCase, throttle bool) {
 				return
 			}
 			if throttle {
-				k := eventKey{typ: ev.Type.String(), comm: ev.Comm}
+				k := eventKey{typ: ev.Type.String(), comm: ev.Comm, blocked: ev.Blocked, reason: ev.Reason}
 				now := time.Now()
 				if prev, seen := lastLog[k]; seen && now.Sub(prev) < time.Second {
 					continue
 				}
 				lastLog[k] = now
 			}
-			log.Infof("NETGUARD|%s|%s|%s|%s|%s|%d|%d|%d|%d|%t",
+			// A refused whitelisted process, or a process gate, appends |<reason>.
+			reason := ""
+			if ev.Reason != "" {
+				reason = "|" + ev.Reason
+			}
+			log.Infof("NETGUARD|%s|%s|%s|%s|%s|%d|%d|%d|%d|%t%s",
 				ev.Type.String(), logging.SanitizeText(ev.Comm), ebpf.ProtocolString(ev.Protocol),
-				logging.SanitizeText(ev.SrcAddr), logging.SanitizeText(ev.DstAddr), ev.Size, ev.PID, ev.TID, ev.NetNS, ev.Blocked)
+				logging.SanitizeText(ev.SrcAddr), logging.SanitizeText(ev.DstAddr), ev.Size, ev.PID, ev.TID, ev.NetNS,
+				ev.Blocked, reason)
 		case <-sig:
 			return
 		}

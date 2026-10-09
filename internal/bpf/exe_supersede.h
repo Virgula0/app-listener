@@ -1,5 +1,6 @@
-// exe_supersede.h: a whitelisted binary's identity over time, shared by guard.bpf.c and
-// guard_trust.bpf.c. Userspace hands both objects the same maps.
+// exe_supersede.h: a whitelisted binary's identity over time, shared by guard.bpf.c,
+// guard_trust.bpf.c and networkguard.bpf.c. Userspace hands the guard and trust objects the same
+// maps; the network guard's are its own.
 //
 // An exe key is (dev, ino), and both outlive the file. Once the last link goes, a process can still
 // exec the image through a held fd or /proc/<pid>/exe; once the inode is freed, the filesystem hands
@@ -68,6 +69,8 @@ struct {
 // guard's whitelist decision, any access below a secret (stat, readdir, xattrs).
 // Inherited across fork, cleared on exec and on leader exit (guard_tainted_pids' lifecycle), all by
 // the trust object. A mark that can't be recorded refuses the mapping / kills the launch.
+// networkguard.bpf.c keeps its own instance with the same values and lifecycle: a marked process
+// loses its exe's network whitelist.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 65536);

@@ -27,8 +27,9 @@ const (
 	// which the guard attests at exec (guard_exec_applet). Applets lists the build's own.
 	UutilsMulticall
 	// OpaqueMulticall runs applets the guard can't tell apart (busybox and toybox also dispatch
-	// in-process, without an exec; a uutils build that won't list its applets; any other binary
-	// calling itself a multi-call binary, e.g. a future uutils diffutils, until it is vetted).
+	// in-process, without an exec; a uutils build that won't list its applets; GNU coreutils-single;
+	// any other binary calling itself a multi-call binary, e.g. a future uutils diffutils, until it
+	// is vetted).
 	OpaqueMulticall
 )
 
@@ -42,7 +43,7 @@ const multicallScanMax = 64 << 20
 // Multicall is the classification of one executable inode.
 type Multicall struct {
 	Kind    MulticallKind
-	Family  string   // "uutils", "busybox", "toybox", FamilyUnrecognized; empty for SingleBinary
+	Family  string   // "uutils", "busybox", "toybox", FamilyGNUCoreutils, FamilyUnrecognized; "" if single
 	Applets []string // UutilsMulticall only: the build's `--list` that fits MulticallNameMax
 }
 
@@ -55,7 +56,15 @@ var multicallMarkers = []struct {
 	{"uutils", [][]byte{reversed(")yranib llac-itlum("), reversed(")slitueroc slituu(")}},
 	{"busybox", [][]byte{reversed("v xoBysuB")}},
 	{"toybox", [][]byte{reversed("gnol--[ xobyot")}},
+	// No "multi-call" in its usage. Also matches the 50-byte `#!/usr/bin/coreutils
+	// --coreutils-prog-shebang=cat` scripts Fedora installs as its applets: their processes run as
+	// that one binary, so whitelisting one would match nothing and blacklisting it block nothing.
+	{FamilyGNUCoreutils, [][]byte{reversed("gorp-slitueroc--")}},
 }
+
+// FamilyGNUCoreutils is GNU coreutils built --enable-single-binary (Fedora's coreutils-single): it
+// runs the applet named by argv[0], --coreutils-prog= or a #! script's --coreutils-prog-shebang=.
+const FamilyGNUCoreutils = "gnu-coreutils"
 
 // FamilyUnrecognized: the binary says it is a multi-call binary but matches no vetted family. It
 // is refused (fail closed): a new multicall family must be vetted before its applets get identities.
