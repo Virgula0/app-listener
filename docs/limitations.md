@@ -5,10 +5,11 @@ where that answer stops is part of using it well.
 
 ## Whitelisted programs that disclose on request
 
-A whitelisted program that hands out its secret when asked still does: `gh auth token`,
-`git credential fill`, `ssh-add -L`, an app's own export or debug command. The guard authorizes
-which executable opens the file, not why. Any process that can run the whitelisted binary with
-arguments of its choosing gets whatever that binary prints.
+A whitelisted program that hands out its secret when asked still does. With `/usr/bin/aws`
+whitelisted on `~/.aws`, `aws configure export-credentials` prints the access key and secret to
+whoever runs it; many apps have a similar export, debug or "show token" command. The guard
+authorizes which executable opens the file, not why. Any process that can run the whitelisted
+binary with arguments of its choosing gets whatever that binary prints.
 
 - Whitelist only what needs the resource.
 - Prefer apps that keep secrets in a running agent.

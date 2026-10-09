@@ -102,9 +102,10 @@ with `sudo app-listener edit-protected`.
 
 ## Limits
 
-app-listener decides *which program* may read a file, not *why*. A whitelisted tool that prints its
-secret on request (`gh auth token`, `ssh-add -L`) still does, so never whitelist shells,
-interpreters or general tools like `git` or `cp`. It does not defend against an attacker who
+app-listener decides *which program* may read a file, not *why*. If the AWS CLI is allowed into
+`~/.aws`, then any script can run `aws configure export-credentials` and get the keys printed,
+because it is the AWS CLI reading them. Allow only the programs a directory really needs, and
+never shells, interpreters or general tools like `git` or `cp`. It does not defend against an attacker who
 already has root. See [Limitations](docs/limitations.md).
 
 ## Documentation
