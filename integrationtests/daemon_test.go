@@ -1642,7 +1642,7 @@ func (s *IntegrationSuite) installFakeSystemctl(c testcontainers.Container) {
 // (/etc/wireguard, whitelisting /usr/bin/nmcli), not a raw shell rewrite of daemon.conf: the
 // /etc/app-listener self-guard (issue #53 follow-up) denies any non-daemon-binary write there, so a
 // NEW [watch] section can't be hand-added while the daemon runs (and adding a genuinely new
-// resource always stops the daemon first, per README.md). `--update-catalog-only --live` is the one
+// resource always stops the daemon first, per docs/installation.md). `--update-catalog-only --live` is the one
 // documented live path: it re-expands an EXISTING section's whitelist from the daemon's own binary
 // (GUARD_ALLOW_ROOT, same exe inode) and delivers via SIGHUP, with no external process writing the
 // guarded config.

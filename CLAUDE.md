@@ -10,8 +10,9 @@ profiles, AI-agent tokens) from info-stealers and supply-chain attacks. Runs as 
 on Linux only; `linux/amd64` and `linux/arm64` are released (amd64 assets keep the unsuffixed
 names older `update` binaries fetch; arm64's carry `-arm64`).
 
-`README.md` is the user-facing reference for every subcommand and flag — consult it
-before changing CLI surface. This is a "vibe-coding experiment, not for production".
+`README.md` is the short user-facing tour; `docs/` (index `docs/README.md`) is the reference for
+every subcommand, flag and config option. Consult it before changing CLI surface, and update the
+matching `docs/*.md` page with any flag or behavior change. Docs prose avoids em/en dashes. This is a "vibe-coding experiment, not for production".
 
 ## Security is the product — do not regress it
 
