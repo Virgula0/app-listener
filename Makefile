@@ -1,4 +1,4 @@
-.PHONY: build build-host build-image build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint test test-integration check-compatibility deploy deploy-down tidy clean pprof
+.PHONY: build build-host build-image build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint vuln test test-integration check-compatibility deploy deploy-down tidy clean pprof
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
@@ -7,6 +7,20 @@ BUILD_IMAGE = app-listener-builder:local
 # Host dirs 'make build' keeps Go's module and build caches in across runs. Go keys the build cache on
 # content, so changed sources always recompile; only downloads and unchanged packages are reused.
 BUILD_CACHE ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/app-listener-build
+
+# ARCH is the Go architecture to build (amd64 | arm64), the host's by default. The eBPF is not
+# portable across it: vmlinux.h is dumped from this host's BTF and the PT_REGS_* kprobe macros pick
+# the register layout from __TARGET_ARCH_*, so `generate` refuses an ARCH other than the host's.
+HOST_ARCH := $(shell uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/')
+ARCH      ?= $(HOST_ARCH)
+ifeq ($(ARCH),amd64)
+BPF_TARGET_ARCH = x86
+LIBC_TRIPLET    = x86_64-linux-gnu
+else ifeq ($(ARCH),arm64)
+BPF_TARGET_ARCH = arm64
+LIBC_TRIPLET    = aarch64-linux-gnu
+endif
+BPF_CFLAGS = -O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_$(BPF_TARGET_ARCH) -I internal/bpf -I/usr/include/$(LIBC_TRIPLET)
 
 # VERSION is injected into the binary by the release workflow
 # (pre-<date>-<sha>); when empty the embedded constants.Version default
@@ -98,7 +112,7 @@ build-image:
 # subcommands share this binary and must not carry a GUI toolkit.
 GUI ?=
 build-linux:
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(if $(GUI),-tags gui,) $(if $(VERSION),-ldflags "-X github.com/Virgula0/app-listener/internal/constants.Version=$(VERSION)",) -o $(OUTPUT_DIR)/$(BINARY_NAME) .
+	CGO_ENABLED=1 GOOS=linux GOARCH=$(ARCH) go build $(if $(GUI),-tags gui,) $(if $(VERSION),-ldflags "-X github.com/Virgula0/app-listener/internal/constants.Version=$(VERSION)",) -o $(OUTPUT_DIR)/$(BINARY_NAME) .
 .PHONY: build-linux
 
 # Ensure the shared vmlinux.h is dumped before any BPF module is compiled
@@ -106,9 +120,9 @@ generate: bpftool-headers generate-monitor generate-guard generate-networkmonito
 
 generate-monitor: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/monitor/embeds
-	GOPACKAGE=monitor GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=monitor go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
+		-cflags "$(BPF_CFLAGS)" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		Monitor ./internal/monitor/bpf/monitor.bpf.c
@@ -121,18 +135,18 @@ generate-monitor: bpftool-headers
 
 generate-guard: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/guard/embeds
-	GOPACKAGE=guard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=guard go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
+		-cflags "$(BPF_CFLAGS)" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		Guard ./internal/guard/bpf/guard.bpf.c
 	@mv $(GEN_DIR)/guard_bpf.go internal/guard/guard_bpf.go
 	@mv $(GEN_DIR)/guard_bpf.o internal/guard/embeds/guard_bpf.o
 	@sed -i 's|guard_bpf\.o|embeds/guard_bpf.o|' internal/guard/guard_bpf.go
-	GOPACKAGE=guard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=guard go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
+		-cflags "$(BPF_CFLAGS)" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		GuardTrust ./internal/guard/bpf/guard_trust.bpf.c
@@ -145,9 +159,9 @@ generate-guard: bpftool-headers
 
 generate-networkmonitor: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/networkmonitor/embeds
-	GOPACKAGE=networkmonitor GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=networkmonitor go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
+		-cflags "$(BPF_CFLAGS)" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		NetMon ./internal/networkmonitor/bpf/networkmonitor.bpf.c
@@ -160,9 +174,9 @@ generate-networkmonitor: bpftool-headers
 
 generate-networkguard: bpftool-headers
 	@mkdir -p $(GEN_DIR) internal/networkguard/embeds
-	GOPACKAGE=networkguard GOOS=linux GOARCH=amd64 go run github.com/cilium/ebpf/cmd/bpf2go \
+	GOPACKAGE=networkguard go run github.com/cilium/ebpf/cmd/bpf2go \
 		-cc clang \
-		-cflags "-O2 -g -Wall -Wno-visibility -Wno-attributes -D__TARGET_ARCH_x86 -I internal/bpf -I/usr/include/x86_64-linux-gnu" \
+		-cflags "$(BPF_CFLAGS)" \
 		-target bpf \
 		-output-dir $(GEN_DIR) \
 		GuardNet ./internal/networkguard/bpf/networkguard.bpf.c
@@ -174,6 +188,14 @@ generate-networkguard: bpftool-headers
 .PHONY: generate-networkguard
 
 bpftool-headers:
+	@if [ -z "$(BPF_TARGET_ARCH)" ]; then \
+		echo "ERROR: unsupported ARCH '$(ARCH)': the eBPF builds for amd64 and arm64 only"; \
+		exit 1; \
+	fi
+	@if [ "$(ARCH)" != "$(HOST_ARCH)" ]; then \
+		echo "ERROR: ARCH=$(ARCH) but this host is $(HOST_ARCH): the eBPF is compiled against this host's BTF and register layout — build on a $(ARCH) host"; \
+		exit 1; \
+	fi
 	@if ! command -v bpftool >/dev/null 2>&1; then \
 		echo "ERROR: bpftool not found — install it (Ubuntu: apt install linux-tools-generic; Arch: pacman -S bpftool)"; \
 		exit 1; \
@@ -216,6 +238,13 @@ run-networkguard:
 lint:
 	@golangci-lint run
 .PHONY: lint
+
+# govulncheck, pinned; `go run` fetches it into the module cache, nothing is installed. It
+# typechecks every package, so run `make generate` first. GUI=1 scans the `-tags gui` build.
+GOVULNCHECK_VERSION ?= v1.8.0
+vuln:
+	CGO_ENABLED=1 go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) $(if $(GUI),-tags gui,) ./...
+.PHONY: vuln
 
 test:
 	CGO_ENABLED=1 go test $$(go list ./... | grep -v /integrationtests) --count=1 -p 1

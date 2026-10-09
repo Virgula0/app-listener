@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -22,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -40,10 +42,6 @@ const (
 	// Only repo the updater trusts: its workflow signs assets with the key
 	// embedded in this binary, so others cannot be trusted.
 	defaultRepo = "Virgula0/app-listener"
-	// Release asset names produced by .github/workflows/release.yml.
-	releaseAssetBinary    = "app-listener"
-	releaseAssetChecksum  = "app-listener.sha256"
-	releaseAssetSignature = "app-listener.sha256.sig"
 	// Matches pre-YYYYMMDD-<sha7> tags from the release workflow.
 	preVersionPattern = `^pre-(\d{8})-([0-9a-f]{7})$`
 	// Matches vX.Y.Z semver stable tags.
@@ -85,7 +83,8 @@ or pre-release, default stable), compares it with the version embedded
 in the installed binary at /usr/local/sbin/app-listener, and when a
 newer one exists:
 
-  1. downloads the release binary and its sha256 checksum
+  1. downloads this architecture's release binary (linux/amd64 or
+     linux/arm64) and its sha256 checksum
   2. verifies the Ed25519 signature of the checksum against the public key
      compiled into this binary (certificates/app-listener-release.pub),
      then the checksum against the downloaded binary, and the
@@ -107,6 +106,28 @@ cron jobs). The repository is fixed: only releases of the signing
 repository are accepted.`,
 	Args: cobra.NoArgs,
 	RunE: runUpdate,
+}
+
+// releaseAssets names one architecture's release assets (.github/workflows/_build-release.yml).
+type releaseAssets struct {
+	binary, checksum, signature string
+	machine                     elf.Machine
+}
+
+// assetsFor maps a Go architecture to its release assets. amd64 keeps the unsuffixed names: older
+// binaries' `update` looks them up.
+func assetsFor(goarch string) (releaseAssets, error) {
+	var bin string
+	var machine elf.Machine
+	switch goarch {
+	case "amd64":
+		bin, machine = "app-listener", elf.EM_X86_64
+	case "arm64":
+		bin, machine = "app-listener-arm64", elf.EM_AARCH64
+	default:
+		return releaseAssets{}, fmt.Errorf("no release is published for linux/%s: build from source (make build)", goarch)
+	}
+	return releaseAssets{binary: bin, checksum: bin + ".sha256", signature: bin + ".sha256.sig", machine: machine}, nil
 }
 
 // githubRelease mirrors the updater-relevant fields of the releases API.
@@ -133,14 +154,9 @@ func validateChannel(ch string) error {
 // runUpdate drives the update flow: every check runs first; changelog and
 // confirmation come last unless --yes skips them.
 func runUpdate(cmd *cobra.Command, args []string) error {
-	if os.Geteuid() != 0 {
-		return errors.New("update must be run as root: sudo app-listener update")
-	}
-	if err := validateChannel(channelFlag); err != nil {
+	assets, err := checkUpdatePreconditions()
+	if err != nil {
 		return err
-	}
-	if _, err := os.Lstat(systemd.InstallBinaryPath); err != nil {
-		return fmt.Errorf("the daemon is not installed (no %s): run `app-listener install` first", systemd.InstallBinaryPath)
 	}
 
 	installed := readInstalledVersion(systemd.InstallBinaryPath)
@@ -169,7 +185,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&latest)
+	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&latest, assets)
 	if err != nil {
 		return err
 	}
@@ -182,7 +198,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	binPath, err := downloadAndVerify(tmp, &latest, binURL, binDigest, checksumURL, sigURL)
+	binPath, err := downloadAndVerify(tmp, &latest, assets, binURL, binDigest, checksumURL, sigURL)
 	if err != nil {
 		return err
 	}
@@ -199,27 +215,46 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	return applyUpdate(binPath)
 }
 
+// checkUpdatePreconditions refuses non-root, a bad --channel, an arch with no release, or a
+// missing install; it returns this arch's release assets.
+func checkUpdatePreconditions() (releaseAssets, error) {
+	if os.Geteuid() != 0 {
+		return releaseAssets{}, errors.New("update must be run as root: sudo app-listener update")
+	}
+	if err := validateChannel(channelFlag); err != nil {
+		return releaseAssets{}, err
+	}
+	assets, err := assetsFor(runtime.GOARCH)
+	if err != nil {
+		return releaseAssets{}, err
+	}
+	if _, err := os.Lstat(systemd.InstallBinaryPath); err != nil {
+		return releaseAssets{}, fmt.Errorf("the daemon is not installed (no %s): run `app-listener install` first", systemd.InstallBinaryPath)
+	}
+	return assets, nil
+}
+
 // downloadAndVerify downloads the three assets into the caller-owned staging dir and runs every
 // verification (signature, checksum, digest, binary sanity) before anything reaches the user;
 // progress on the TUI bar.
-func downloadAndVerify(tmp string, r *githubRelease, binURL, binDigest, checksumURL, sigURL string) (string, error) {
+func downloadAndVerify(tmp string, r *githubRelease, assets releaseAssets, binURL, binDigest, checksumURL, sigURL string) (string, error) {
 	var binPath, checksumPath, sigPath string
 	err := wizard.WithBottomBar(func(bar *wizard.BottomBar) error {
 		var dlErr error
-		binPath, checksumPath, sigPath, dlErr = downloadReleaseFiles(updateHTTPClient(), tmp, binURL, checksumURL, sigURL, bar)
+		binPath, checksumPath, sigPath, dlErr = downloadReleaseFiles(updateHTTPClient(), tmp, assets, binURL, checksumURL, sigURL, bar)
 		return dlErr
 	})
 	if err != nil {
 		return "", err
 	}
 
-	err = verifyRelease(binPath, checksumPath, sigPath, binDigest)
+	err = verifyRelease(binPath, checksumPath, sigPath, binDigest, assets.binary)
 	if err != nil {
 		return "", fmt.Errorf("release verification failed: %w — the download is rejected; fix the release before updating", err)
 	}
 	log.Infof("release %s verified: Ed25519 signature, sha256 checksum and GitHub digest match", r.TagName)
 
-	err = sanityCheckBinary(binPath, r.TagName)
+	err = sanityCheckBinary(binPath, r.TagName, assets.machine)
 	if err != nil {
 		return "", err
 	}
@@ -257,9 +292,9 @@ func isTerminal(f *os.File) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-// resolveAssets returns the binary/checksum/signature URLs and the
+// resolveAssets returns this arch's binary/checksum/signature URLs and the
 // GitHub-provided binary digest when present.
-func resolveAssets(r *githubRelease) (binURL, binDigest, checksumURL, sigURL string, err error) {
+func resolveAssets(r *githubRelease, assets releaseAssets) (binURL, binDigest, checksumURL, sigURL string, err error) {
 	asset := func(name string) (url, digest string, ok bool) {
 		for i := range r.Assets {
 			if r.Assets[i].Name == name {
@@ -269,30 +304,30 @@ func resolveAssets(r *githubRelease) (binURL, binDigest, checksumURL, sigURL str
 		return "", "", false
 	}
 	var ok bool
-	if binURL, binDigest, ok = asset(releaseAssetBinary); !ok {
-		return "", "", "", "", fmt.Errorf("release %s has no %s asset", r.TagName, releaseAssetBinary)
+	if binURL, binDigest, ok = asset(assets.binary); !ok {
+		return "", "", "", "", fmt.Errorf("release %s has no %s asset", r.TagName, assets.binary)
 	}
-	if checksumURL, _, ok = asset(releaseAssetChecksum); !ok {
-		return "", "", "", "", fmt.Errorf("release %s has no %s asset", r.TagName, releaseAssetChecksum)
+	if checksumURL, _, ok = asset(assets.checksum); !ok {
+		return "", "", "", "", fmt.Errorf("release %s has no %s asset", r.TagName, assets.checksum)
 	}
-	if sigURL, _, ok = asset(releaseAssetSignature); !ok {
-		return "", "", "", "", fmt.Errorf("release %s has no %s asset", r.TagName, releaseAssetSignature)
+	if sigURL, _, ok = asset(assets.signature); !ok {
+		return "", "", "", "", fmt.Errorf("release %s has no %s asset", r.TagName, assets.signature)
 	}
 	return binURL, binDigest, checksumURL, sigURL, nil
 }
 
 // downloadReleaseFiles downloads the three assets into dir, reporting
 // progress on bar when non-nil.
-func downloadReleaseFiles(client *http.Client, dir, binURL, checksumURL, sigURL string, bar *wizard.BottomBar) (binPath, checksumPath, sigPath string, err error) {
-	binPath = filepath.Join(dir, releaseAssetBinary)
-	if err := downloadFile(client, binURL, binPath, bar, "Downloading app-listener"); err != nil {
+func downloadReleaseFiles(client *http.Client, dir string, assets releaseAssets, binURL, checksumURL, sigURL string, bar *wizard.BottomBar) (binPath, checksumPath, sigPath string, err error) {
+	binPath = filepath.Join(dir, assets.binary)
+	if err := downloadFile(client, binURL, binPath, bar, "Downloading "+assets.binary); err != nil {
 		return "", "", "", err
 	}
-	checksumPath = filepath.Join(dir, releaseAssetChecksum)
+	checksumPath = filepath.Join(dir, assets.checksum)
 	if err := downloadFile(client, checksumURL, checksumPath, bar, "Downloading checksum"); err != nil {
 		return "", "", "", err
 	}
-	sigPath = filepath.Join(dir, releaseAssetSignature)
+	sigPath = filepath.Join(dir, assets.signature)
 	if err := downloadFile(client, sigURL, sigPath, bar, "Downloading signature"); err != nil {
 		return "", "", "", err
 	}
@@ -534,18 +569,18 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// verifyRelease checks the checksum's Ed25519 signature against the embedded
-// key, then the checksum against the binary, then the GitHub asset digest.
-func verifyRelease(binPath, checksumPath, sigPath, assetDigest string) error {
+// verifyRelease checks the checksum's Ed25519 signature against the embedded key, that it was
+// signed for assetName, then the checksum against the binary, then the GitHub asset digest.
+func verifyRelease(binPath, checksumPath, sigPath, assetDigest, assetName string) error {
 	pub, err := parsePublicKey(certificates.ReleasePublicKeyPEM)
 	if err != nil {
 		return fmt.Errorf("parsing the embedded release public key: %w", err)
 	}
-	return verifyReleaseWithKey(binPath, checksumPath, sigPath, assetDigest, pub)
+	return verifyReleaseWithKey(binPath, checksumPath, sigPath, assetDigest, assetName, pub)
 }
 
 // verifyReleaseWithKey is verifyRelease with an explicit public key.
-func verifyReleaseWithKey(binPath, checksumPath, sigPath, assetDigest string, pub ed25519.PublicKey) error {
+func verifyReleaseWithKey(binPath, checksumPath, sigPath, assetDigest, assetName string, pub ed25519.PublicKey) error {
 	bin, err := os.ReadFile(binPath)
 	if err != nil {
 		return err
@@ -562,9 +597,14 @@ func verifyReleaseWithKey(binPath, checksumPath, sigPath, assetDigest string, pu
 		return errors.New("the Ed25519 signature of the checksum does not match the release public key")
 	}
 
-	expected, err := parseChecksum(checksum)
+	expected, signedName, err := parseChecksum(checksum)
 	if err != nil {
 		return fmt.Errorf("parsing the signed checksum file: %w", err)
+	}
+	// Every arch's checksum is signed by the same key: the signed name stops another arch's (or
+	// the GUI's) validly signed pair from being served under this asset's name.
+	if signedName != assetName {
+		return fmt.Errorf("the signed checksum is for %q, not %q", signedName, assetName)
 	}
 	actual := sha256.Sum256(bin)
 	if !strings.EqualFold(hex.EncodeToString(actual[:]), expected) {
@@ -597,34 +637,36 @@ func parsePublicKey(pemBytes []byte) (ed25519.PublicKey, error) {
 	return ed, nil
 }
 
-// parseChecksum extracts the validated sha256 hex token of a checksum file.
-func parseChecksum(data []byte) (string, error) {
+// parseChecksum extracts the validated sha256 hex token and the file name of a one-line
+// `sha256sum` checksum file.
+func parseChecksum(data []byte) (sum, name string, err error) {
 	fields := strings.Fields(string(data))
 	if len(fields) == 0 {
-		return "", errors.New("the checksum file is empty")
+		return "", "", errors.New("the checksum file is empty")
+	}
+	if len(fields) != 2 {
+		return "", "", fmt.Errorf("expected one \"<sha256>  <name>\" line, got %d fields", len(fields))
 	}
 	if len(fields[0]) != 64 {
-		return "", fmt.Errorf("expected a 64-hex-char sha256, got %q", fields[0])
+		return "", "", fmt.Errorf("expected a 64-hex-char sha256, got %q", fields[0])
 	}
 	if _, err := hex.DecodeString(fields[0]); err != nil {
-		return "", fmt.Errorf("invalid sha256 hex %q: %w", fields[0], err)
+		return "", "", fmt.Errorf("invalid sha256 hex %q: %w", fields[0], err)
 	}
-	return fields[0], nil
+	return fields[0], strings.TrimPrefix(fields[1], "*"), nil
 }
 
-// sanityCheckBinary refuses non-ELF files whose --version misses the wanted tag.
-func sanityCheckBinary(path, wantVersion string) error {
-	f, err := os.Open(path)
+// sanityCheckBinary refuses a file that is not an ELF for machine or whose --version misses the
+// wanted tag.
+func sanityCheckBinary(path, wantVersion string, machine elf.Machine) error {
+	f, err := elf.Open(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s is not an ELF executable: %w", path, err)
 	}
-	defer f.Close()
-	magic := make([]byte, 4)
-	if _, readErr := io.ReadFull(f, magic); readErr != nil {
-		return fmt.Errorf("reading %s: %w", path, readErr)
-	}
-	if string(magic) != "\x7fELF" {
-		return fmt.Errorf("%s is not an ELF executable", path)
+	got := f.Machine
+	f.Close()
+	if got != machine {
+		return fmt.Errorf("%s is built for %s, this host runs %s — refusing to deploy", path, got, machine)
 	}
 	cmd := exec.CommandContext(context.Background(), path, "--version")
 	out, err := cmd.CombinedOutput()

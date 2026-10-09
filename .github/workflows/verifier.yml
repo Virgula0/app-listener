@@ -28,11 +28,12 @@ concurrency:
 jobs:
   verifier:
     # Two kernels (24.04: 6.17, 26.04: 7.0): the budget is the same everywhere, pruning is not, and
-    # attach targets differ (6.17 has no memfd_alloc_file).
+    # attach targets differ (6.17 has no memfd_alloc_file). 26.04-arm: the arm64 build (own BTF,
+    # PT_REGS layout and JIT) gets the same PR-time verdict.
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-26.04]
+        runner: [ubuntu-24.04, ubuntu-26.04, ubuntu-26.04-arm]
     runs-on: ${{ matrix.runner }}
     if: github.event.pull_request.draft != true
     steps:
@@ -66,17 +67,22 @@ jobs:
         working-directory: head
         run: make build
 
+      # Comparison only: a base that cannot build here (one predating arm64 support, on the arm leg)
+      # leaves no base objects and the next step reports the PR's costs without deltas.
       - name: Build the base's eBPF objects (same builder image)
         run: |
-          set -euo pipefail
-          docker run --rm \
+          set -uo pipefail
+          if ! docker run --rm \
             -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
             -v "$PWD/base:/app/app-listener:rw" \
             --user "$(id -u):$(id -g)" \
             -e HOME=/tmp -e GOCACHE=/tmp/.gocache -e GOPATH=/tmp/gopath -e GOMODCACHE=/tmp/gopath/pkg/mod \
             -w /app/app-listener \
             app-listener-builder:local \
-            make bpftool-headers generate
+            make bpftool-headers generate; then
+            echo "::warning::the PR base does not build on ${{ matrix.runner }}: no verifier-cost deltas"
+            rm -rf base/internal/*/embeds
+          fi
 
       - name: Build bpfstats
         run: |

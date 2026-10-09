@@ -18,8 +18,7 @@ const (
 	osReleasePath       = "/proc/sys/kernel/osrelease"
 )
 
-// requireKernel51 checks the kernel is 5.x+: the pre-compiled BPF .o targets x86_64 and needs CO-RE
-// (BTF).
+// requireKernel51 checks the kernel is 5.x+: the embedded BPF objects need CO-RE (BTF).
 func requireKernel51() error {
 	data, err := os.ReadFile(osReleasePath)
 	if err != nil {

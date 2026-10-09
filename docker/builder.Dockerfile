@@ -53,7 +53,6 @@ RUN retry() { \
         bpftool \
         libbpf-dev \
         libc6-dev \
-        libc6-dev-i386 \
         make \
         gcc \
         pkg-config \
@@ -62,6 +61,11 @@ RUN retry() { \
         libwayland-dev \
         libxkbcommon-dev \
         git \
+    # -target bpf defines no __x86_64__, so x86 glibc's <errno.h> pulls gnu/stubs-32.h; aarch64
+    # glibc picks stubs-lp64.h from __LP64__ and needs no extra package.
+    && if [ "$(dpkg --print-architecture)" = amd64 ]; then \
+        retry apt-get install -y --no-install-recommends libc6-dev-i386; \
+    fi \
     && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
 
 # Fail the image build if clang did not end up at the pinned major version.

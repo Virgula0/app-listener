@@ -1,0 +1,82 @@
+name: Vulnerability scan
+
+# govulncheck (`make vuln`) over the module: fails when a known Go vulnerability is reachable from
+# this code, in a dependency or in the Go standard library of the go.mod toolchain. Runs on
+# non-draft PRs like CI, and weekly on main so a newly published advisory surfaces without a push.
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+  schedule:
+    # Mondays 05:23 UTC; scheduled runs use the default branch (main).
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vuln-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-26.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache and install apt packages
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          # cgo (fscrypt mlock) needs a C toolchain; the GUI needs the fyne
+          # OpenGL/X11/Wayland headers.
+          packages: pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+          version: ubuntu-26.04-2
+
+      # The cache holds only what apt newly unpacked on the run that saved its key, and the key
+      # ignores the runner image: a newer image can leave headers out of a restored cache. Fall back
+      # to apt, and bump `version` above so the next run saves a complete cache.
+      - name: Check the GUI build headers
+        run: |
+          set -uo pipefail
+          mods="gl x11 xrandr xcursor xinerama xi xxf86vm wayland-client wayland-cursor wayland-egl xkbcommon"
+          pkg-config --exists $mods 2>/dev/null && exit 0
+          echo "::warning::the apt cache lacks GUI headers: installing them with apt (bump the cache-apt-pkgs version)"
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+          pkg-config --exists $mods
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # govulncheck typechecks every package, so the gitignored eBPF bindings (and the objects they
+      # //go:embed) must exist. Same pinned builder image as ci.yml.
+      - name: Regenerate eBPF bindings (pinned builder image)
+        run: |
+          set -euo pipefail
+          test -r /sys/kernel/btf/vmlinux || { echo "::error::runner has no readable BTF"; exit 1; }
+          make build-image
+          docker run --rm \
+            -v /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro \
+            -v "$PWD:/app/app-listener:rw" \
+            -e HOME=/tmp -e GOCACHE=/tmp/.gocache -e GOPATH=/tmp/gopath -e GOMODCACHE=/tmp/gopath/pkg/mod \
+            -w /app/app-listener \
+            app-listener-builder:local \
+            make generate
+
+      - name: govulncheck (default build)
+        run: make vuln
+
+      # The released app-listener-gui links fyne and its dependency tree.
+      - name: govulncheck (GUI build)
+        if: ${{ !cancelled() }}
+        run: make vuln GUI=1
