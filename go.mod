@@ -2,6 +2,8 @@ module github.com/Virgula0/app-listener
 
 go 1.26.3
 
+toolchain go1.26.9
+
 require (
 	fyne.io/fyne/v2 v2.8.0
 	github.com/alecthomas/chroma/v2 v2.27.0
@@ -121,8 +123,8 @@ require (
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa // indirect
-	golang.org/x/image v0.41.0 // indirect
+	golang.org/x/image v0.43.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

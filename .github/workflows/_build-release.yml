@@ -56,10 +56,24 @@ jobs:
       - name: Cache and install apt packages
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
-          # CGO for the fscrypt mlock dependency; GUI additionally links
-          # fyne/glfw against OpenGL + X11 + Wayland.
-          packages: gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
-          version: ubuntu-26.04-${{ matrix.arch }}-1
+          # cgo (fscrypt mlock) needs a C toolchain; the GUI needs the fyne
+          # OpenGL/X11/Wayland headers.
+          packages: pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+          version: ubuntu-26.04-2
+
+      # The cache holds only what apt newly unpacked on the run that saved its key, and the key
+      # ignores the runner image: a newer image can leave headers out of a restored cache. Fall back
+      # to apt, and bump `version` above so the next run saves a complete cache.
+      - name: Check the GUI build headers
+        run: |
+          set -uo pipefail
+          mods="gl x11 xrandr xcursor xinerama xi xxf86vm wayland-client wayland-cursor wayland-egl xkbcommon"
+          pkg-config --exists $mods 2>/dev/null && exit 0
+          echo "::warning::the apt cache lacks GUI headers: installing them with apt (bump the cache-apt-pkgs version)"
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+          pkg-config --exists $mods
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0

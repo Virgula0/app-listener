@@ -30,8 +30,8 @@ jobs:
         with:
           # golangci-lint typechecks the whole module, including the
           # fyne GUI, which needs OpenGL and X11 development headers.
-          packages: gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
-          version: ubuntu-26.04-1
+          packages: pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+          version: ubuntu-26.04-2
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -79,8 +79,8 @@ jobs:
           # CGO is enabled for the fscrypt mlock dependency, so the
           # tests need a C toolchain and libc headers. The fyne GUI
           # needs OpenGL and X11 development headers to typecheck.
-          packages: gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
-          version: ubuntu-26.04-1
+          packages: pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+          version: ubuntu-26.04-2
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
