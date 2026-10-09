@@ -48,6 +48,10 @@ struct inode_key {
 	__u64 ino;
 };
 
+// Per-applet identity for uutils multicall binaries: a multicall exe's key carries its attested
+// applet in dev bits 32-47, so whitelisting one applet does not admit the other ~108. See mc_tag.h.
+#include "mc_tag.h"
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 8);
@@ -118,6 +122,9 @@ static __always_inline int get_current_exe_inode(struct inode_key *ik)
 
 	bpf_probe_read_kernel(&ik->ino, sizeof(ik->ino), &exe_inode->i_ino);
 	ik->dev = inode_dev((__u64)exe_inode);
+	// For a multicall exe, fold in the applet this process attested at exec: a whitelist row for one
+	// applet must not admit the others. Non-multicall exes keep their plain key (mc_tag_bits == 0).
+	ik->dev |= mc_tag_bits(task, ik);
 	return 1;
 }
 
@@ -569,5 +576,41 @@ int guard_net_socket_recvmsg(unsigned long long *ctx)
 		emit_event(&e);
 	if (action == WATCH_BLOCK && should_block())
 		return -EPERM;
+	return 0;
+}
+
+// Multicall applet attestation (mc_tag.h): the exec tracepoint stamps a multicall process with the
+// applet it was invoked as (or MC_TAG_NONE), fork inherits it, task_free drops it. get_current_exe_inode
+// reads the stamp back into the exe key. Mandatory for whitelist mode to tell uutils applets apart;
+// a multicall process that exec'd before this object attached keys as NONE (denied in whitelist mode).
+SEC("tp_btf/sched_process_exec")
+int netg_exec_applet(unsigned long long *ctx)
+{
+	mc_attest(ctx);
+	return 0;
+}
+
+SEC("tp_btf/sched_process_fork")
+int netg_sched_fork(unsigned long long *ctx)
+{
+	struct task_struct *parent = (struct task_struct *)ctx[0];
+	struct task_struct *child = (struct task_struct *)ctx[1];
+	if (parent && child)
+		mc_stamp_fork(parent, child);
+	return 0;
+}
+
+SEC("lsm/task_free")
+int netg_task_free(unsigned long long *ctx)
+{
+	struct task_struct *task = (struct task_struct *)ctx[0];
+	if (!task)
+		return 0;
+	// Keyed on tgid: drop only when the GROUP LEADER exits (task_free fires per thread).
+	__u32 pid = 0, tgid = 0;
+	bpf_probe_read_kernel(&pid, sizeof(pid), &task->pid);
+	bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
+	if (pid == tgid)
+		mc_stamp_free(task, tgid);
 	return 0;
 }

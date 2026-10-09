@@ -109,6 +109,14 @@ func (t *TrustGuard) AdmitInspector(path string) (GuardInodeKey, error) {
 		return GuardInodeKey{}, err
 	}
 	k := GuardInodeKey{Dev: dev, Ino: ino}
+	// guard_inspectors is matched by the caller's key, which for a multicall is its applet's.
+	if m, cerr := ebpf.ClassifyMulticall(f); cerr != nil || m.Kind != ebpf.SingleBinary {
+		if cerr != nil {
+			return GuardInodeKey{}, cerr
+		}
+		return GuardInodeKey{}, &MulticallError{Path: path, Family: m.Family, Siblings: siblingNames(f),
+			Reason: "an inspector must be a single binary"}
+	}
 	if !t.systemFile(path, f, k) {
 		return GuardInodeKey{}, errors.New("not on a filesystem root vouches for (nosuid or user mount)")
 	}

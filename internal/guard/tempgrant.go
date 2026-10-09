@@ -24,7 +24,8 @@ import (
 // the number can't be freed and reused by another file while the rows name it.
 type TempBinary struct {
 	Path string
-	Key  GuardInodeKey
+	// Key is what the grant's rows name (ExeKey: a uutils applet's own key); Key.Real() the file.
+	Key GuardInodeKey
 	// SystemPlaced: only root could have placed it (ebpf.SystemPlacedInode). Otherwise its owner
 	// can rewrite it in place during the window; Changed catches that.
 	SystemPlaced bool
@@ -57,15 +58,19 @@ func ResolveTempBinary(path string) (*TempBinary, error) {
 		return nil, fmt.Errorf("%s is not an executable regular file", path)
 	}
 	b.stat = binaryStatOf(&st)
-	b.Key = GuardInodeKey{Dev: b.stat.Dev, Ino: b.stat.Ino}
+	file := GuardInodeKey{Dev: b.stat.Dev, Ino: b.stat.Ino}
 	entry, err := ebpf.ComputeBinaryEntryFile(f, path)
 	if err != nil {
 		b.Close()
 		return nil, err
 	}
 	b.hash = entry.Hash
-	b.SystemPlaced = ebpf.SystemPlacedInode(path, b.Key.Dev, b.Key.Ino)
+	b.SystemPlaced = ebpf.SystemPlacedInode(path, file.Dev, file.Ino)
 	b.Runtime = runtimeClass(f, path)
+	if b.Key, err = ExeKey(path, f, file); err != nil {
+		b.Close()
+		return nil, err
+	}
 	return b, nil
 }
 
@@ -409,7 +414,8 @@ func (r *tempRow) trustTempRuntime(t *TrustGuard) error {
 	if r.bin.Runtime == 0 {
 		return nil
 	}
-	k := GuardTrustInodeKey{Dev: r.bin.Key.Dev, Ino: r.bin.Key.Ino}
+	file := r.bin.Key.Real()
+	k := GuardTrustInodeKey{Dev: file.Dev, Ino: file.Ino}
 	var flags uint8
 	err := t.objs.GuardTrustedFiles.Lookup(k, &flags)
 	had := err == nil
@@ -435,10 +441,11 @@ func (r *tempRow) trustTempRuntime(t *TrustGuard) error {
 func (r *tempRow) untrustTempRuntime(live *TrustGuard) error {
 	t, added := r.trust, r.trustAdded
 	r.trust, r.trustAdded = nil, 0
-	if added == 0 || t != live || sharedEngine.admitsExe(r.bin.Key) {
+	if added == 0 || t != live || sharedEngine.admitsExe(r.bin.Key.Real()) {
 		return nil
 	}
-	k := GuardTrustInodeKey{Dev: r.bin.Key.Dev, Ino: r.bin.Key.Ino}
+	file := r.bin.Key.Real()
+	k := GuardTrustInodeKey{Dev: file.Dev, Ino: file.Ino}
 	var cur uint8
 	if err := t.objs.GuardTrustedFiles.Lookup(k, &cur); err != nil {
 		if errors.Is(err, cilium.ErrKeyNotExist) {

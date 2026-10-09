@@ -17,6 +17,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
@@ -35,9 +36,10 @@ type NetworkMonitor struct {
 	mu     sync.Mutex
 	stop   bool
 
-	binaries   []BinaryEntry
-	ownPID     int
-	eventTypes atomic.Value
+	binaries     []BinaryEntry
+	ownPID       int
+	eventTypes   atomic.Value
+	hasMulticall bool // a watched binary is a uutils applet: the exec tagger must attach
 }
 
 func NewNetworkMonitor(binaries []BinaryEntry) (*NetworkMonitor, error) {
@@ -101,8 +103,14 @@ func NewNetworkMonitor(binaries []BinaryEntry) (*NetworkMonitor, error) {
 		m.links = append(m.links, l)
 	}
 
+	probes := len(m.links)
+	if err := m.attachMulticallTagger(); err != nil {
+		m.cleanup()
+		return nil, err
+	}
+
 	log.Infof("network monitor created \u2014 %d/%d probes/tracepoints attached, watching: %s",
-		len(m.links), len(attachments), binariesSummary(binaries))
+		probes, len(attachments), binariesSummary(binaries))
 	return m, nil
 }
 
@@ -124,9 +132,71 @@ func (m *NetworkMonitor) populateMaps() error {
 			log.Warnf("cannot stat binary %s: %v \u2014 using comm-only matching for %q", b.Path, err, b.Comm)
 			continue
 		}
-		if err := m.objs.WatchExeInodes.Put(ik, val); err != nil {
+		key, err := m.watchKey(b.Path, ik)
+		if err != nil {
+			return err
+		}
+		if err := m.objs.WatchExeInodes.Put(key, val); err != nil {
 			return fmt.Errorf("storing exe inode for %s: %w", b.Path, err)
 		}
+	}
+	return nil
+}
+
+// watchKey is ik for a single binary, and for a uutils applet ik tagged with the applet the kernel
+// attests at exec (its name table registered first), so its siblings are not reported as it. A
+// multicall without applet identity keeps the plain key: observe-only, so it is a warning.
+func (m *NetworkMonitor) watchKey(path string, ik *NetMonInodeKey) (*NetMonInodeKey, error) {
+	file := guard.GuardInodeKey{Dev: ik.Dev, Ino: ik.Ino}
+	exe, err := guard.ExeKey(path, nil, file)
+	if err != nil {
+		log.Warnf("%v \u2014 watching it by its inode: every program it runs may be reported as %s",
+			err, path)
+		return ik, nil
+	}
+	if !exe.Tagged() {
+		return ik, nil
+	}
+	if err := m.syncMulticall(file); err != nil {
+		return nil, fmt.Errorf("registering multicall binary %s: %w", path, err)
+	}
+	return &NetMonInodeKey{Dev: exe.Dev, Ino: exe.Ino}, nil
+}
+
+// syncMulticall writes the multicall inode's applet name table, then its presence row.
+func (m *NetworkMonitor) syncMulticall(file guard.GuardInodeKey) error {
+	tags, err := guard.MulticallNameTags(file)
+	if err != nil {
+		return err
+	}
+	exe := NetMonInodeKey{Dev: file.Dev, Ino: file.Ino}
+	for name, tag := range tags {
+		k := NetMonMcNameKey{Exe: exe}
+		for i := 0; i < len(name) && i < len(k.Name)-1; i++ {
+			k.Name[i] = int8(name[i]) //nolint:gosec // applet names are ASCII (validAppletName)
+		}
+		if err := m.objs.McMulticallNames.Put(k, tag); err != nil {
+			return fmt.Errorf("writing multicall applet %s: %w", name, err)
+		}
+	}
+	m.hasMulticall = true
+	return m.objs.McMulticall.Put(exe, uint32(1))
+}
+
+// attachMulticallTagger attaches the applet attestation (mc_tag.h) when a watched binary is a uutils
+// applet. Required then: without it every process of that multicall keys as MC_TAG_NONE and the
+// watched applet would silently never be reported.
+func (m *NetworkMonitor) attachMulticallTagger() error {
+	if !m.hasMulticall {
+		return nil
+	}
+	for _, p := range []*cilium.Program{m.objs.NetmExecApplet, m.objs.NetmSchedFork} {
+		l, err := link.AttachTracing(link.TracingOptions{Program: p})
+		if err != nil {
+			return fmt.Errorf("attaching multicall applet tagger: %w \u2014 a watched uutils applet "+
+				"cannot be told apart from its siblings on this kernel", err)
+		}
+		m.links = append(m.links, l)
 	}
 	return nil
 }

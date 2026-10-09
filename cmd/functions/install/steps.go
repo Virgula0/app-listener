@@ -238,12 +238,13 @@ func libraryBlocksFromCandidates(candidates []inst.Candidate) []inst.LibraryBloc
 func editConfig(candidates []inst.Candidate) (string, *daemonconfig.Config, error) {
 	return runConfigEditor(
 		"app-listener daemon.conf — review and save (Ctrl+S)",
-		inst.GenerateConf(sectionsFromCandidates(candidates), libraryBlocksFromCandidates(candidates)))
+		inst.GenerateConf(sectionsFromCandidates(candidates), libraryBlocksFromCandidates(candidates)), nil)
 }
 
 // runConfigEditor opens initial in the embedded editor and validates the result with the daemon's
-// strict parser; an invalid config re-opens the editor until it parses or the user aborts (Esc).
-func runConfigEditor(title, initial string) (string, *daemonconfig.Config, error) {
+// strict parser; an invalid config re-opens the editor until it parses or the user aborts (Esc). A
+// whitelist line not in prev (nil: any) that the daemon would drop as a multicall is invalid too.
+func runConfigEditor(title, initial string, prev *daemonconfig.Config) (string, *daemonconfig.Config, error) {
 	confText := initial
 	for {
 		edited, err := inst.EditText(title, "daemon.conf", confText)
@@ -252,6 +253,9 @@ func runConfigEditor(title, initial string) (string, *daemonconfig.Config, error
 		}
 
 		cfg, err := validateConfigText(edited)
+		if err == nil {
+			err = guard.RefuseMulticallLines(cfg, prev)
+		}
 		if err != nil {
 			log.Errorf("config is invalid: %v — fix it and save again (or press Esc to abort)", err)
 			confText = edited

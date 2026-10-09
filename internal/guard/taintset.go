@@ -151,7 +151,7 @@ func (e *engine) syncTaintLocked() error {
 	}
 	info := e.liveResInfoLocked()
 	union := make(map[GuardInodeKey]uint32)
-	for exe, o := range planTaintOwners(e.allows, info) {
+	for exe, o := range planTaintOwners(withRealKeys(e.allows), info) {
 		if o.setKey == "" {
 			union[exe] = o.res
 			continue

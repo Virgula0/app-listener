@@ -66,7 +66,7 @@ func supersededMark(k GuardInodeKey) (GuardExeSupersede, bool) {
 	if err != nil {
 		return v, false
 	}
-	return v, maps[GuardMapExeSuperseded].Lookup(k, &v) == nil
+	return v, maps[GuardMapExeSuperseded].Lookup(k.Real(), &v) == nil
 }
 
 // exeGone reports a superseded key whose inode was freed.
@@ -137,6 +137,7 @@ func dropSupersededLocked(k GuardInodeKey) {
 // previous file whose number k reuses: its rows and mark go, so they neither refuse nor admit the
 // new file. A mark on a live inode stays: the file just stat'ed may be the one being unlinked.
 func liftSuperseded(k GuardInodeKey) {
+	k = k.Real()
 	supersede.mu.Lock()
 	defer supersede.mu.Unlock()
 	if exeGone(k) {
@@ -237,13 +238,13 @@ func (g *Guard) carriesLine(path string) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-// forgetExe drops what this guard remembers about k's rows, so a file reusing the number at a
-// whitelisted path is judged as a replacement of k (retired), never as k itself.
+// forgetExe drops what this guard remembers about k's rows (k a real key: its applet keys too), so a
+// file reusing the number at a whitelisted path is judged as a replacement of k (retired), never as k.
 func (g *Guard) forgetExe(k GuardInodeKey) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for p, key := range g.deployed {
-		if key == k {
+		if key.Real() == k {
 			delete(g.deployed, p)
 			if g.retired == nil {
 				g.retired = make(map[string]GuardInodeKey)
@@ -252,11 +253,15 @@ func (g *Guard) forgetExe(k GuardInodeKey) {
 		}
 	}
 	for p, st := range g.binaryVerifyStates {
-		if st.key == k {
+		if st.key.Real() == k {
 			delete(g.binaryVerifyStates, p)
 		}
 	}
-	delete(g.keyPaths, k)
+	for key := range g.keyPaths {
+		if key.Real() == k {
+			delete(g.keyPaths, key)
+		}
+	}
 }
 
 const supersedePruneEvery = 30 * time.Second

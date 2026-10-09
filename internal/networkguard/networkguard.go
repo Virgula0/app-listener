@@ -18,6 +18,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
@@ -48,12 +49,13 @@ type NetGuard struct {
 	mu     sync.Mutex
 	stop   bool
 
-	mode     Mode
-	binaries []BinaryEntry
-	unsafe   bool
-	eventset []ebpf.NetEventType
-	ownPID   int
-	throttle bool
+	mode         Mode
+	binaries     []BinaryEntry
+	unsafe       bool
+	eventset     []ebpf.NetEventType
+	ownPID       int
+	throttle     bool
+	hasMulticall bool // a uutils multicall applet is configured: the exec tagger must attach
 }
 
 func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType, unsafe, throttle bool) (*NetGuard, error) {
@@ -134,17 +136,61 @@ func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType
 			failedRequired)
 	}
 
-	modeLabel := "blacklist"
-	if mode == ModeWhitelist {
-		modeLabel = "whitelist"
+	hooks := len(g.links)
+	if err := g.attachMulticallTagger(); err != nil {
+		g.cleanup()
+		return nil, err
 	}
-	unsafeLabel := ""
-	if unsafe {
-		unsafeLabel = " [UNSAFE]"
-	}
-	log.Infof("network guard created (mode=%s%s) \u2014 %d/%d LSM hooks attached, binaries: %d, events: %v",
-		modeLabel, unsafeLabel, len(g.links), len(attachments), len(binaries), eventsetSummary(es))
+
+	log.Infof("network guard created (mode=%s) \u2014 %d/%d LSM hooks attached, binaries: %d, events: %v",
+		modeLabel(mode, unsafe), hooks, len(attachments), len(binaries), eventsetSummary(es))
 	return g, nil
+}
+
+func modeLabel(mode Mode, unsafe bool) string {
+	l := "blacklist"
+	if mode == ModeWhitelist {
+		l = "whitelist"
+	}
+	if unsafe {
+		l += " [UNSAFE]"
+	}
+	return l
+}
+
+// attachMulticallTagger attaches the uutils applet attestation programs (mc_tag.h) when a multicall
+// applet is configured: exec stamps each multicall process with the applet it ran as, fork inherits
+// it, task_free drops it. All three are required then: without the tagger every multicall process
+// keys as MC_TAG_NONE (a whitelisted applet silently denied), and without task_free leaked stamps
+// fill the map until no exec can be attested.
+func (g *NetGuard) attachMulticallTagger() error {
+	if !g.hasMulticall {
+		return nil
+	}
+	progs := []struct {
+		prog *cilium.Program
+		name string
+		lsm  bool
+	}{
+		{g.objs.NetgExecApplet, "sched_process_exec", false},
+		{g.objs.NetgSchedFork, "sched_process_fork", false},
+		{g.objs.NetgTaskFree, "task_free", true},
+	}
+	for _, a := range progs {
+		var l link.Link
+		var err error
+		if a.lsm {
+			l, err = link.AttachLSM(link.LSMOptions{Program: a.prog})
+		} else {
+			l, err = link.AttachTracing(link.TracingOptions{Program: a.prog})
+		}
+		if err != nil {
+			return fmt.Errorf("attaching multicall applet tagger (%s): %w — a uutils applet is "+
+				"configured but its per-applet identity cannot be attested on this kernel", a.name, err)
+		}
+		g.links = append(g.links, l)
+	}
+	return nil
 }
 
 func eventsetSummary(es []ebpf.NetEventType) string {
@@ -211,7 +257,11 @@ func (g *NetGuard) populateMaps() error {
 	return g.putBinaries()
 }
 
-// putBinaries stores every binary's inode key with the mode's action.
+// putBinaries stores every binary's inode key with the mode's action. A uutils multicall applet is
+// keyed by its attested applet (guard.ExeKey), so whitelisting one applet does not admit the other
+// ~108; its inode's name table is written first (the kernel tagger needs it). An opaque multicall
+// (busybox/toybox, or a uutils build whose applets can't be told apart) is refused — one identity
+// there would admit every applet. Non-multicall binaries keep their plain inode key, unchanged.
 func (g *NetGuard) putBinaries() error {
 	if err := g.putBtrfsLayout(); err != nil {
 		return err
@@ -221,16 +271,71 @@ func (g *NetGuard) putBinaries() error {
 		bpfVal = bpfAllow
 	}
 	for _, b := range g.binaries {
-		ik, err := statInodeKey(b.Path)
+		keys, err := g.exeKeys(b.Path)
 		if err != nil {
-			return fmt.Errorf("stating binary %s: %w", b.Path, err)
+			return err
 		}
-		if err := g.objs.GuardNetExeActions.Put(ik, bpfVal); err != nil {
-			return fmt.Errorf("storing exe inode for %s: %w", b.Path, err)
+		for _, k := range keys {
+			if err := g.objs.GuardNetExeActions.Put(k, bpfVal); err != nil {
+				return fmt.Errorf("storing exe inode for %s: %w", b.Path, err)
+			}
 		}
 	}
 
 	return nil
+}
+
+// exeKeys returns the rows path's action is stored under, registering a multicall's applet table
+// first. A blacklisted applet also gets its inode's unattested key (fexecve, exec -a, a full stamp
+// map): uutils may still run the blacklisted applet from argv[0].
+func (g *NetGuard) exeKeys(path string) ([]GuardNetInodeKey, error) {
+	ik, err := statInodeKey(path)
+	if err != nil {
+		return nil, fmt.Errorf("stating binary %s: %w", path, err)
+	}
+	file := guard.GuardInodeKey{Dev: ik.Dev, Ino: ik.Ino}
+	exe, err := guard.ExeKey(path, nil, file)
+	if err != nil {
+		return nil, fmt.Errorf("resolving binary %s: %w", path, err)
+	}
+	keys := []GuardNetInodeKey{{Dev: exe.Dev, Ino: exe.Ino}}
+	if !exe.Tagged() {
+		return keys, nil
+	}
+	if err := g.syncMulticall(file); err != nil {
+		return nil, fmt.Errorf("registering multicall binary %s: %w", path, err)
+	}
+	if g.mode == ModeBlacklist {
+		u := file.Unattested()
+		keys = append(keys, GuardNetInodeKey{Dev: u.Dev, Ino: u.Ino})
+	}
+	return keys, nil
+}
+
+// syncMulticall writes the multicall inode's applet name table, then its presence row, before any
+// tagged exe-action row of it: a process of a multicall missing from the presence map keys as NONE.
+func (g *NetGuard) syncMulticall(file guard.GuardInodeKey) error {
+	tags, err := guard.MulticallNameTags(file)
+	if err != nil {
+		return err
+	}
+	exe := GuardNetInodeKey{Dev: file.Dev, Ino: file.Ino}
+	for name, tag := range tags {
+		if err := g.objs.McMulticallNames.Put(mcNameKey(exe, name), tag); err != nil {
+			return fmt.Errorf("writing multicall applet %s: %w", name, err)
+		}
+	}
+	g.hasMulticall = true
+	return g.objs.McMulticall.Put(exe, uint32(1))
+}
+
+// mcNameKey encodes an applet name into the kernel name-table key (mc_tag.h mc_name_key).
+func mcNameKey(exe GuardNetInodeKey, name string) GuardNetMcNameKey {
+	k := GuardNetMcNameKey{Exe: exe}
+	for i := 0; i < len(name) && i < len(k.Name)-1; i++ {
+		k.Name[i] = int8(name[i]) //nolint:gosec // applet names are ASCII (validAppletName)
+	}
+	return k
 }
 
 // putBtrfsLayout lets inode_dev key btrfs inodes by subvolume, as stat does. Without it no btrfs

@@ -71,10 +71,14 @@ func (g *Guard) resyncLink(link, target string, exeEvents map[string][]ebpf.Even
 		old = g.retired[target]
 	}
 	g.mu.Unlock()
-	if key == old {
+	if key == old.Real() {
 		return false, nil
 	}
-	if !replacementAllowed(link, f, old, key) {
+	exe, ok := g.appletKeyOrRefuse(link, f, key)
+	if !ok {
+		return false, nil
+	}
+	if !replacementAllowed(link, f, old.Real(), key) {
 		if g.refused.firstTime(link, key) {
 			log.Warnf("guard %s: %s now points at %s (inode %d), which was neither created by its updater nor a "+
 				"system file at a root-placed name — not admitted; reload the daemon after verifying it", g.path,
@@ -87,10 +91,10 @@ func (g *Guard) resyncLink(link, target string, exeEvents map[string][]ebpf.Even
 		return false, nil
 	}
 	liftSuperseded(key)
-	if err := g.putBinaryKey(key, target, exeEvents); err != nil {
+	if err := g.putBinaryKey(exe, target, exeEvents); err != nil {
 		return false, err
 	}
-	g.retargetLink(link, target, entry, key, old, deployed)
+	g.retargetLink(link, target, entry, exe, old, deployed)
 	supersedeUnnamed(old)
 	log.Infof("guard %s: %s re-pointed to %s (inode %d): admitted, the previous target kept only for processes "+
 		"started before", g.path, logging.SanitizeText(link), logging.SanitizeText(resolved), key.Ino)
@@ -151,6 +155,7 @@ func (g *Guard) retargetLink(link, target string, entry BinaryEntry, key, old Gu
 // link had gone, it keeps admitting processes exec'd before and refuses every later exec
 // (exe_supersede.h). Its rows go when its inode does (PruneSuperseded).
 func supersedeUnnamed(k GuardInodeKey) {
+	k = k.Real() // marks are per file: kept while any applet of it is still named
 	if k == (GuardInodeKey{}) || sharedEngine.namesExe(k) {
 		return
 	}
@@ -173,7 +178,7 @@ func supersedeUnnamed(k GuardInodeKey) {
 	}
 }
 
-// namesExe reports whether any guard's whitelist line still resolves to exe.
+// namesExe reports whether any guard's whitelist line still resolves to exe (a real key).
 func (e *engine) namesExe(exe GuardInodeKey) bool {
 	e.mu.Lock()
 	var guards []*Guard
@@ -187,7 +192,7 @@ func (e *engine) namesExe(exe GuardInodeKey) bool {
 		g.mu.Lock()
 		named := false
 		for _, k := range g.deployed {
-			named = named || k == exe
+			named = named || k.Real() == exe
 		}
 		g.mu.Unlock()
 		if named {

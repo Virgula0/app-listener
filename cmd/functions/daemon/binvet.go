@@ -126,6 +126,13 @@ func (v *binaryVetter) resolve(path string) (dev, ino uint64, err error) {
 func (v *binaryVetter) judge(res *daemonconfig.Resource, rule daemonconfig.BinaryRule, resolved string,
 	f *os.File, key guard.GuardInodeKey, hash [32]byte) bool {
 	line := binledger.Line(rule)
+	if err := multicallAdmissible(rule, f, key); err != nil {
+		// Dropped, never fatal: a line whitelisted before a distro switched to a multicall must not
+		// keep the daemon from protecting everything else.
+		log.Errorf("daemon: CRITICAL: %s whitelist line %s dropped — it stays denied: %v",
+			logging.SanitizeText(res.Path), logging.SanitizeText(line), err)
+		return false
+	}
 	v.mu.Lock()
 	prev, seen := v.decided[resolved]
 	v.mu.Unlock()
@@ -182,6 +189,20 @@ func (v *binaryVetter) decide(res *daemonconfig.Resource, line, resolved string,
 	}
 	v.refuse(res, line, resolved, hash, found)
 	return false
+}
+
+// multicallAdmissible refuses a line reaching a multicall whose applets can't be told apart, or a
+// uutils applet named through a symlink of another name: its process is keyed by the name exec'd.
+func multicallAdmissible(rule daemonconfig.BinaryRule, f *os.File, key guard.GuardInodeKey) error {
+	exe, err := guard.ExeKey(rule.Path, f, key)
+	if err != nil {
+		return err
+	}
+	if exe != key && rule.Link != "" && filepath.Base(rule.Link) != filepath.Base(rule.Path) {
+		return fmt.Errorf("%s names multicall applet %s: whitelist the applet's own link",
+			rule.Link, filepath.Base(rule.Path))
+	}
+	return nil
 }
 
 // takeGrant: the install wizard added line since the last start (binledger.Grant). Only during

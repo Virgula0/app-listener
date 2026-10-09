@@ -76,6 +76,8 @@ type engine struct {
 	// inspectors mirrors guard_inspectors (SetInspectors). Daemon config, not engine state: kept
 	// across a stop and written again by the next start.
 	inspectors map[GuardInodeKey]string
+	// mcNames: the applets written to guard_multicall_names per multicall inode (ensureMulticall).
+	mcNames map[GuardInodeKey][]string
 	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
 	// that registered the backing devices, whose consumer labels them as such. Delivering them to
 	// every guard duplicated each denial and let the self-guards label it with their own path.
@@ -244,6 +246,10 @@ func (e *engine) startLocked() error {
 		e.stopLocked()
 		return err
 	}
+	if err := e.attachExecAppletLocked(); err != nil {
+		e.stopLocked()
+		return err
+	}
 
 	// The reserved slot must exist before any decision can land on it: res_cfg() treats an
 	// inactive slot as unknown and denies, which would make the raw block-device gate refuse
@@ -331,6 +337,29 @@ func (e *engine) attachForkLocked() error {
 	}
 	e.links = append(e.links, l)
 	e.linkNames = append(e.linkNames, "sched-process-fork")
+	return nil
+}
+
+// attachExecAppletLocked attaches guard_exec_applet, which attests a multicall exec's applet.
+// Required: without it every multicall process is MC_TAG_NONE, so a whitelisted applet is denied.
+func (e *engine) attachExecAppletLocked() error {
+	l, err := link.AttachTracing(link.TracingOptions{
+		Program:    e.objs.GuardExecApplet,
+		AttachType: cilium.AttachTraceRawTp,
+	})
+	if err != nil {
+		return fmt.Errorf("required hook sched_process_exec failed to attach: %w — multicall applets "+
+			"could not be told apart", err)
+	}
+	if e.pinPrefix != "" {
+		if pinErr := l.Pin(e.pinPrefix + "sched-process-exec"); pinErr != nil {
+			log.Warnf("guard: pinning multicall applet attestation failed (%v) — it will not survive a "+
+				"SIGKILL (multicall applets are then denied); enforcement links are unaffected", pinErr)
+			_ = l.Unpin()
+		}
+	}
+	e.links = append(e.links, l)
+	e.linkNames = append(e.linkNames, "sched-process-exec")
 	return nil
 }
 
@@ -649,6 +678,7 @@ func (e *engine) stopLocked() {
 	e.sets, e.setAt, e.setRows, e.unionRows, e.memberRows = nil, nil, nil, nil, nil
 	e.prevOwner = nil
 	e.successor = nil
+	e.mcNames = nil
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.
@@ -761,7 +791,8 @@ func (e *engine) noteDeny(res uint32, exe GuardInodeKey) error {
 	return e.syncSharedLocked()
 }
 
-// admitsExe reports whether any live resource allows exe, or exe is an inspector.
+// admitsExe reports whether any live resource allows exe (a real key: any of its applet keys
+// counts), or exe is an inspector.
 func (e *engine) admitsExe(exe GuardInodeKey) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -769,15 +800,17 @@ func (e *engine) admitsExe(exe GuardInodeKey) bool {
 		return true
 	}
 	for _, set := range e.allows {
-		if _, ok := set[exe]; ok {
-			return true
+		for k := range set {
+			if k.Real() == exe {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// forgetExe drops every row naming exe, in every resource and the views derived from them, and has
-// each guard forget it (Guard.forgetExe).
+// forgetExe drops every row naming exe (a real key: its applet keys too), in every resource and the
+// views derived from them, and has each guard forget it (Guard.forgetExe).
 func (e *engine) forgetExe(exe GuardInodeKey) error {
 	e.mu.Lock()
 	delete(e.inspectors, exe)
@@ -790,7 +823,11 @@ func (e *engine) forgetExe(exe GuardInodeKey) error {
 		return err
 	}
 	for _, set := range e.allows {
-		delete(set, exe)
+		for k := range set {
+			if k.Real() == exe {
+				delete(set, k)
+			}
+		}
 	}
 	err := e.syncSharedLocked()
 	if err == nil {

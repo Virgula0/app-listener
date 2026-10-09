@@ -313,6 +313,60 @@ struct {
 
 char LICENSE[] SEC("license") = "GPL";
 
+// Multicall exes whose applets are told apart (uutils; exe_supersede.h MC_TAG_*): presence only.
+// Userspace writes an inode's names before this row, and drops none of either while running.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u32);
+} guard_multicall SEC(".maps");
+
+#define MC_NAME 16 // applet name, NUL-padded; MulticallNameMax in userspace
+
+struct mc_name_key {
+	struct inode_key exe; // the multicall's real key
+	char name[MC_NAME];
+};
+
+// guard_multicall_names: that build's applets, by the basename that runs each, to their tag.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 2048);
+	__type(key, struct mc_name_key);
+	__type(value, __u32);
+} guard_multicall_names SEC(".maps");
+
+struct mc_scratch {
+	char path[MAX_PATH];
+	struct mc_name_key argv0;
+	struct mc_name_key execfn;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct mc_scratch);
+} mc_scratch SEC(".maps");
+
+// exe_tag_bits: what a multicall exe's key ORs into dev: the applet its process's exec attested
+// (guard_exec_applet), MC_TAG_NONE if none was. 0 for every other exe, whose key stays its inode.
+static __noinline __u64 exe_tag_bits(struct task_struct *task, struct inode_key *exe)
+{
+	if (!bpf_map_lookup_elem(&guard_multicall, exe))
+		return 0;
+	__u64 tag = MC_TAG_NONE;
+	__u32 tgid = 0;
+	if (task) {
+		bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
+		struct exec_stamp *st = bpf_map_lookup_elem(&exe_stamps, &tgid);
+		if (st && st->tag && st->start == leader_start(task))
+			tag = st->tag;
+	}
+	return tag << MC_TAG_SHIFT;
+}
+
 // Read the exe file inode of the current process for anti-spoof verification.
 static __always_inline int get_current_exe_inode(struct inode_key *ik)
 {
@@ -336,6 +390,7 @@ static __always_inline int get_current_exe_inode(struct inode_key *ik)
 
 	bpf_probe_read_kernel(&ik->ino, sizeof(ik->ino), &exe_inode->i_ino);
 	ik->dev = inode_dev((__u64)exe_inode);
+	ik->dev |= exe_tag_bits(task, ik);
 	return 1;
 }
 
@@ -363,6 +418,7 @@ static __always_inline int get_task_exe_inode(struct task_struct *task, struct i
 
 	bpf_probe_read_kernel(&ik->ino, sizeof(ik->ino), &exe_inode->i_ino);
 	ik->dev = inode_dev((__u64)exe_inode);
+	ik->dev |= exe_tag_bits(task, ik);
 	return 1;
 }
 
@@ -2434,6 +2490,8 @@ int guard_inode_free(unsigned long long *ctx)
 
 	// Binaries live on any filesystem, not only guarded ones: before the sbdevs gate.
 	exe_note_freed(&ikey, bpf_map_lookup_elem(&guard_exe_union, &ikey) != NULL);
+	// A file reusing the number is not that multicall.
+	bpf_map_delete_elem(&guard_multicall, &ikey);
 
 	__u64 sbdev = sb_dev(inode);
 	if (!bpf_map_lookup_elem(&guard_fs_sbdevs, &sbdev))
@@ -2495,6 +2553,11 @@ int guard_bprm_committed(unsigned long long *ctx)
 	bpf_probe_read_kernel(&ik.ino, sizeof(ik.ino), &inode->i_ino);
 	ik.dev = inode_dev((__u64)inode);
 
+	// A multicall's applet is attested only after this hook (guard_exec_applet): keep the taint
+	// while any of its applets is whitelisted (userspace unions them under the real key).
+	if (bpf_map_lookup_elem(&guard_multicall, &ik) && bpf_map_lookup_elem(&guard_exe_union, &ik))
+		return 0;
+
 	// Keep the taint while the new image may still read what the process holds: judged by the
 	// owning resource's whitelist, or — for content from several resources (GLOBAL, a taint set) —
 	// by whether ANY resource allows it. A set's whitelist is an intersection: clearing on it would
@@ -2513,6 +2576,97 @@ int guard_bprm_committed(unsigned long long *ctx)
 	}
 
 	bpf_map_delete_elem(&guard_tainted_pids, &tgid);
+	return 0;
+}
+
+// mc_basename copies the last '/'-separated component of the string read into s (n: the read's
+// return, NUL included) into name, NUL-padded. 0 when it is empty, too long for name, or the read
+// may have been truncated: such an exec gets no applet.
+static __always_inline int mc_basename(const char *s, long n, char *name)
+{
+	if (n <= 1 || n >= MAX_PATH)
+		return 0;
+	long len = n - 1;
+	long start = -1;
+	for (int k = 1; k <= MC_NAME; k++) {
+		long idx = len - k;
+		if (idx < 0) {
+			start = 0;
+			break;
+		}
+		if (s[idx & (MAX_PATH - 1)] == '/') {
+			start = idx + 1;
+			break;
+		}
+	}
+	long blen = len - start;
+	if (start < 0 || blen <= 0 || blen >= MC_NAME)
+		return 0;
+	for (int k = 0; k < MC_NAME; k++)
+		name[k] = k < blen ? s[(start + k) & (MAX_PATH - 1)] : 0;
+	return 1;
+}
+
+// guard_exec_applet attests which applet a multicall exec runs, before any of its code does. uutils
+// takes the applet from the basename of AT_EXECFN (bprm->filename) or of argv[0], by rules that vary
+// between builds; when both basenames are the same applet name every rule picks it, so that is the
+// only exec tagged with it. Anything else (exec -a, fexecve, a script, a suffix name like gcat, the
+// coreutils name with argv[1]) stays MC_TAG_NONE, which no row admits.
+SEC("tp_btf/sched_process_exec")
+int guard_exec_applet(unsigned long long *ctx)
+{
+	struct task_struct *p = (struct task_struct *)ctx[0];
+	struct linux_binprm *bprm = (struct linux_binprm *)ctx[2];
+	if (!p || !bprm)
+		return 0;
+	struct file *file = NULL;
+	bpf_probe_read_kernel(&file, sizeof(file), &bprm->file);
+	if (!file)
+		return 0;
+	struct inode *inode = NULL;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+	if (!inode)
+		return 0;
+	struct inode_key real = {};
+	bpf_probe_read_kernel(&real.ino, sizeof(real.ino), &inode->i_ino);
+	real.dev = inode_dev((__u64)inode);
+	if (!bpf_map_lookup_elem(&guard_multicall, &real))
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	struct exec_stamp *st = bpf_map_lookup_elem(&exe_stamps, &tgid);
+	if (!st || st->start != leader_start(task))
+		return 0;
+	// A script or binfmt_misc image runs with an argv the kernel rewrote.
+	const char *filename = NULL, *interp = NULL;
+	bpf_probe_read_kernel(&filename, sizeof(filename), &bprm->filename);
+	bpf_probe_read_kernel(&interp, sizeof(interp), &bprm->interp);
+	if (!filename || filename != interp)
+		return 0;
+
+	__u32 z = 0;
+	struct mc_scratch *s = bpf_map_lookup_elem(&mc_scratch, &z);
+	if (!s)
+		return 0;
+	s->execfn.exe = real;
+	s->argv0.exe = real;
+	long n = bpf_probe_read_kernel_str(s->path, MAX_PATH, filename);
+	if (!mc_basename(s->path, n, s->execfn.name))
+		return 0;
+	struct mm_struct *mm = BPF_CORE_READ(p, mm);
+	if (!mm)
+		return 0;
+	unsigned long arg_start = BPF_CORE_READ(mm, arg_start);
+	n = bpf_probe_read_user_str(s->path, MAX_PATH, (void *)arg_start);
+	if (!mc_basename(s->path, n, s->argv0.name))
+		return 0;
+	__u64 *a = (__u64 *)s->argv0.name, *b = (__u64 *)s->execfn.name;
+	if (a[0] != b[0] || a[1] != b[1])
+		return 0;
+	__u32 *tag = bpf_map_lookup_elem(&guard_multicall_names, &s->execfn);
+	if (tag)
+		st->tag = *tag;
 	return 0;
 }
 

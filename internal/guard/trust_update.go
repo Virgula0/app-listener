@@ -26,7 +26,8 @@ type UpdaterPlan struct {
 // SetUpdaters (re)applies the updater scoping. Updaters are written before owners: an owner row
 // landing first only refuses its app's update for that instant, never grants a foreign one.
 func (t *TrustGuard) SetUpdaters(p UpdaterPlan) error {
-	if err := syncMap(t.objs.GuardBinUpdaters, resolveBits(p.Updaters, t.statBinary())); err != nil {
+	updaters := resolveBits(singleBinaryPaths(p.Updaters, "updater"), t.statBinary())
+	if err := syncMap(t.objs.GuardBinUpdaters, updaters); err != nil {
 		return fmt.Errorf("binary updaters: %w", err)
 	}
 	if err := syncMap(t.objs.GuardBinOwner, resolveBits(p.Owners, ebpf.StatConfined)); err != nil {

@@ -3,6 +3,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
+#include "inode_dev.h"
 
 #define MAX_COMM_LEN 16
 #define AF_INET      2
@@ -49,6 +50,12 @@ struct inode_key {
 	__u64 dev;
 	__u64 ino;
 };
+
+// Per-applet identity for uutils multicall binaries (see mc_tag.h): a watched applet's key carries
+// its attested applet, so a sibling applet renamed to its comm is not reported as it. No task_free
+// here (LSM programs would make the monitor need BPF-LSM): leaked stamps are LRU-evicted instead.
+#define MC_STAMPS_MAP_TYPE BPF_MAP_TYPE_LRU_HASH
+#include "mc_tag.h"
 
 struct comm_key {
 	char comm[MAX_COMM_LEN];
@@ -136,6 +143,7 @@ static __always_inline int is_watched_binary(void)
 	dev_t dev;
 	bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
 	ik.dev = dev;
+	ik.dev |= mc_tag_bits(task, &ik);
 
 	found = bpf_map_lookup_elem(&watch_exe_inodes, &ik);
 	if (!found)
@@ -571,5 +579,23 @@ int BPF_KRETPROBE(trace_inet_csk_accept)
 	e.daddr[0] = daddr;
 
 	emit_event(&e);
+	return 0;
+}
+
+// Multicall applet attestation (mc_tag.h); attached only when a watched binary is a uutils applet.
+SEC("tp_btf/sched_process_exec")
+int netm_exec_applet(unsigned long long *ctx)
+{
+	mc_attest(ctx);
+	return 0;
+}
+
+SEC("tp_btf/sched_process_fork")
+int netm_sched_fork(unsigned long long *ctx)
+{
+	struct task_struct *parent = (struct task_struct *)ctx[0];
+	struct task_struct *child = (struct task_struct *)ctx[1];
+	if (parent && child)
+		mc_stamp_fork(parent, child);
 	return 0;
 }
