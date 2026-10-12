@@ -140,6 +140,16 @@ struct {
 	__type(value, struct res_config);
 } guard_res_config SEC(".maps");
 
+// guard_quiet_allow: nonzero = nobody reads this resource's allowed events, so they are not
+// emitted (denials always are). Its own map, not a res_config field: userspace rewrites res_config
+// read-modify-write from several paths, and a racing flag write could lose a root re-anchor.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, GUARD_MAX_RES);
+	__type(key, __u32);  // res_id
+	__type(value, __u8);
+} guard_quiet_allow SEC(".maps");
+
 // guard_root_moved records a watch root an allowed operation released: renamed aside or replaced
 // by its whitelisted app, or deleted. Userspace may then re-anchor although the old root inode may
 // still exist; a root that moved only because an unguarded ancestor was swapped is never recorded
@@ -961,6 +971,34 @@ static __always_inline int guarded_map_hit(struct dentry *dentry, struct inode *
 	return 1;
 }
 
+// sb_unguarded: inode's superblock is known and hosts no guarded root (guard_fs_sbdevs).
+static __always_inline bool sb_unguarded(struct inode *inode)
+{
+	struct super_block *sb = NULL;
+	if (!inode)
+		return false;
+	bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+	if (!sb)
+		return false;
+	__u64 dev = 0;
+	bpf_probe_read_kernel(&dev, sizeof(dev_t), &sb->s_dev);
+	return !bpf_map_lookup_elem(&guard_fs_sbdevs, &dev);
+}
+
+// off_guarded_fs is a fast "not guarded" for the per-read/stat hooks (pipes, sockets, tmpfs...):
+// is_guarded_access answers 0 there anyway, root_in_chain judging file_inode's superblock and the
+// ancestor walk the dentry's. Both must be unguarded: an overlayfs backing file's f_inode and
+// f_path differ. Sound because every root superblock is in guard_fs_sbdevs before its resource
+// owns any guard_inodes row (populateMaps, fail-closed) and is never removed.
+static __always_inline bool off_guarded_fs(struct dentry *dentry, struct inode *file_inode)
+{
+	if (!dentry || !sb_unguarded(file_inode))
+		return false;
+	struct inode *d_inode = NULL;
+	bpf_probe_read_kernel(&d_inode, sizeof(d_inode), &dentry->d_inode);
+	return d_inode == file_inode || sb_unguarded(d_inode);
+}
+
 static __always_inline int is_guarded_access(struct dentry *dentry, struct inode *file_inode,
 					     __u32 *out_res)
 {
@@ -1238,6 +1276,11 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 	// and would flood the log with allowed STATs). Denials are always reported.
 	if (!is_blocked && quiet_allow)
 		return 0;
+	if (!is_blocked) {
+		__u8 *quiet = bpf_map_lookup_elem(&guard_quiet_allow, &res_id);
+		if (quiet && *quiet)
+			return 0;
+	}
 
 	struct guard_event *e;
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
@@ -1549,7 +1592,7 @@ int guard_file_permission(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
-	if (!is_guarded_access(dentry, inode, &res))
+	if (off_guarded_fs(dentry, inode) || !is_guarded_access(dentry, inode, &res))
 		return 0;
 
 	__u32 event_type = (mask & MAY_WRITE) ? EVENT_WRITE : EVENT_READ;
@@ -2131,7 +2174,7 @@ int guard_inode_getattr(unsigned long long *ctx)
 
 	struct inode *inode = get_inode_from_path((void *)ctx[0]);
 
-	if (!is_guarded_access(dentry, inode, &res))
+	if (off_guarded_fs(dentry, inode) || !is_guarded_access(dentry, inode, &res))
 		return 0;
 
 	// Allow stat of the watch-root DIRECTORY itself: leaks almost nothing (the path is in the

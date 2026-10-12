@@ -2084,6 +2084,7 @@ func (g *Guard) Events() <-chan GuardEvent {
 func (g *Guard) Start() error {
 	// Events arrive from the shared engine's reader, which routes each one by resource id.
 	log.Infof("guard started \u2014 guarding: %s", g.path)
+	g.syncQuietAllow()
 
 	if g.mode == ModeWhitelist && len(g.binaries) > 0 {
 		g.startBinaryHashVerifier()
@@ -2372,9 +2373,23 @@ func (g *Guard) dispatch(ev *GuardEvent) {
 func (g *Guard) SetEventTap(fn func(GuardEvent)) {
 	if fn == nil {
 		g.tap.Store(nil)
-		return
+	} else {
+		g.tap.Store(&fn)
 	}
-	g.tap.Store(&fn)
+	g.syncQuietAllow()
+}
+
+// syncQuietAllow stops the kernel emitting this resource's allowed events while nobody reads them
+// (WithoutAllowedEvents and no tap: FORWARD's idle timer counts the granted binaries' allowed
+// events). Reporting only: a failed write keeps today's behavior or, for a tap, ends a grant early.
+func (g *Guard) syncQuietAllow() {
+	var quiet uint8
+	if g.dropAllowed && g.tap.Load() == nil {
+		quiet = 1
+	}
+	if err := g.objs().GuardQuietAllow.Put(g.resID, quiet); err != nil {
+		log.Warnf("guard %s: setting allowed-event reporting (quiet=%d): %v", g.path, quiet, err)
+	}
 }
 
 // Reports reports whether the guard queues ev for its consumer; a denial always is.

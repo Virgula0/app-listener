@@ -695,6 +695,10 @@ func (e *engine) release(id uint32) {
 			if err := e.objs.GuardResConfig.Put(id, GuardResConfig{}); err != nil {
 				log.Warnf("guard: clearing resource slot %d: %v", id, err)
 			}
+			// A later resource reusing the id must start with its allowed events reported.
+			if err := e.objs.GuardQuietAllow.Put(id, uint8(0)); err != nil {
+				log.Warnf("guard: clearing quiet-allow flag of slot %d: %v", id, err)
+			}
 			e.unlinkReloadTwinLocked(id)
 			// Drop the id from every taint set now: a later resource reusing it must not be
 			// judged as a member of a set it never joined.
