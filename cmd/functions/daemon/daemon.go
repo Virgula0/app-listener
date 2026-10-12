@@ -1239,9 +1239,9 @@ var processStart = time.Now()
 // minutes, for small-RAM hosts.
 func markReady() {
 	notifySystemdReady()
-	hashed, bytes, reused := guard.HashStats()
-	log.Infof("daemon: ready %s after start: hashed %d binaries (%d MiB), reused %d hashes",
-		time.Since(processStart).Round(time.Millisecond), hashed, bytes>>20, reused)
+	hashed, bytes, reused, cached := guard.HashStats()
+	log.Infof("daemon: ready %s after start: hashed %d binaries (%d MiB), reused %d hashes, %d from the hash cache",
+		time.Since(processStart).Round(time.Millisecond), hashed, bytes>>20, reused, cached)
 	guard.WarnInodeOccupancy()
 	go debug.FreeOSMemory()
 }

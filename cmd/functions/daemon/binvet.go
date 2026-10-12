@@ -33,6 +33,8 @@ import (
 type binaryVetter struct {
 	ledger *binledger.Ledger
 	out    io.Writer
+	// cache persists content hashes across runs (guard.SetHashStore); nil in tests.
+	cache *hashCache
 
 	mu        sync.Mutex
 	bootstrap bool
@@ -98,6 +100,7 @@ func (v *binaryVetter) endBootstrap() {
 	was := v.bootstrap
 	v.bootstrap = false
 	v.mu.Unlock()
+	v.cache.flush(true)
 	if err := v.ledger.DropGrants(); err != nil {
 		log.Errorf("daemon: dropping unused install grants from the binary ledger: %v", err)
 	}
@@ -286,10 +289,16 @@ func openBinaryVetter(cfg *daemonconfig.Config) (*binaryVetter, error) {
 		return nil, fmt.Errorf("%w: %w", constants.ErrCriticalStartup, err)
 	}
 	v.begin(cfg)
+	v.cache = newHashCache(l)
+	guard.SetHashStore(v.cache)
 	return v, nil
 }
 
 func (v *binaryVetter) close() {
+	if v.cache != nil {
+		guard.SetHashStore(nil)
+		v.cache.flush(false)
+	}
 	if err := v.ledger.Close(); err != nil {
 		log.Warnf("daemon: closing the binary ledger: %v", err)
 	}

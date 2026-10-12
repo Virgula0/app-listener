@@ -34,7 +34,7 @@ func writeBin(t *testing.T, content string) string {
 
 func hashedReused(t *testing.T) (uint64, uint64) {
 	t.Helper()
-	h, _, r := HashStats()
+	h, _, r, _ := HashStats()
 	return h, r
 }
 
@@ -176,5 +176,131 @@ func TestVerifierHashesAndPinsFromOneFd(t *testing.T) {
 	g.verifyBinaryHashesOnce()
 	if !st.hashed || st.stat.Ino != v.Key.Ino || st.demoted {
 		t.Fatalf("unchanged binary not pinned: %+v", st)
+	}
+}
+
+type fakeHashStore struct {
+	rows    map[ebpf.DurableStat][32]byte
+	lookups int
+}
+
+func (s *fakeHashStore) LookupHash(ds ebpf.DurableStat) ([32]byte, bool) {
+	s.lookups++
+	h, ok := s.rows[ds]
+	return h, ok
+}
+
+func (s *fakeHashStore) StoreHash(ds ebpf.DurableStat, h [32]byte) { s.rows[ds] = h }
+
+// withStore installs a fake persistent store whose files all count as durable (a real durable
+// mount needs root), recording syncFile calls.
+func withStore(t *testing.T, durable bool, syncErr error) (*fakeHashStore, *int) {
+	t.Helper()
+	store := &fakeHashStore{rows: map[ebpf.DurableStat][32]byte{}}
+	syncs := 0
+	prevStat, prevSync := statDurable, syncFile
+	statDurable = func(_ *os.File, fp ebpf.BinaryStat) (ebpf.DurableStat, bool) {
+		return ebpf.DurableStat{BinaryStat: fp, BtimeNs: 7, Fsid: 9}, durable
+	}
+	syncFile = func(*os.File) error { syncs++; return syncErr }
+	SetHashStore(store)
+	t.Cleanup(func() {
+		SetHashStore(nil)
+		statDurable, syncFile = prevStat, prevSync
+	})
+	return store, &syncs
+}
+
+func TestPersistentStoreFilledAfterSyncAndHit(t *testing.T) {
+	resetSharedHashes(t, 0)
+	store, syncs := withStore(t, true, nil)
+	p := writeBin(t, "content-a")
+
+	e1, v1, err := ConfinedEntry(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1.Close()
+	if *syncs != 1 || len(store.rows) != 1 {
+		t.Fatalf("a fresh durable hash must be synced then stored: syncs %d rows %d", *syncs, len(store.rows))
+	}
+
+	// A new run: nothing in memory, the store answers without a read.
+	sharedHashes = map[GuardInodeKey]sharedHashEntry{}
+	h0, _ := hashedReused(t)
+	_, _, _, c0 := HashStats()
+	e2, v2, err := ConfinedEntry(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2.Close()
+	_, _, _, c1 := HashStats()
+	if h, _ := hashedReused(t); h != h0 || c1-c0 != 1 || e2.Hash != e1.Hash {
+		t.Fatalf("store hit re-read the file (hashed +%d, cached +%d)", h-h0, c1-c0)
+	}
+	if *syncs != 1 {
+		t.Fatal("a hit must not sync")
+	}
+	if st := newVerifyState(v2.Key, e2.Hash); !st.hashed {
+		t.Fatal("a store hit must seed the verifier like a fresh hash")
+	}
+}
+
+func TestPersistentStoreMissesOnRewrite(t *testing.T) {
+	resetSharedHashes(t, 0)
+	_, _ = withStore(t, true, nil)
+	p := writeBin(t, "content-a")
+	if _, v, err := ConfinedEntry(p); err == nil {
+		v.Close()
+	}
+	if err := os.WriteFile(p, []byte("content-bb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sharedHashes = map[GuardInodeKey]sharedHashEntry{}
+	e, v, err := ConfinedEntry(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.Close()
+	if e.Hash != sha256.Sum256([]byte("content-bb")) {
+		t.Fatal("a stale persisted hash was used after a rewrite")
+	}
+}
+
+func TestPersistentStoreSkipped(t *testing.T) {
+	for name, tc := range map[string]struct {
+		durable bool
+		syncErr error
+		settle  time.Duration
+		racer   bool
+		lookups int
+	}{
+		"not durable":         {durable: false, lookups: 0},
+		"sync failed":         {durable: true, syncErr: os.ErrInvalid, lookups: 1},
+		"not settled":         {durable: true, settle: time.Hour, lookups: 1},
+		"written during read": {durable: true, racer: true, lookups: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resetSharedHashes(t, tc.settle)
+			store, _ := withStore(t, tc.durable, tc.syncErr)
+			p := writeBin(t, "content-a")
+			if tc.racer {
+				computeEntryFile = func(f *os.File, path string) (BinaryEntry, error) {
+					e, err := ebpf.ComputeBinaryEntryFile(f, path)
+					if werr := os.WriteFile(p, []byte("content-written-during"), 0o755); werr != nil {
+						t.Fatal(werr)
+					}
+					return e, err
+				}
+			}
+			_, v, err := ConfinedEntry(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v.Close()
+			if len(store.rows) != 0 || store.lookups != tc.lookups {
+				t.Fatalf("rows %d lookups %d (want 0, %d)", len(store.rows), store.lookups, tc.lookups)
+			}
+		})
 	}
 }

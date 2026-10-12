@@ -83,6 +83,8 @@ an arm64 host.
   below 1 GiB of RAM. Of that, `guard_inodes` (about 22 MiB) can be shrunk with `max_inodes`
   in `[settings]` ([Daemon configuration](daemon-config.md#daemon-settings-settings)) when the
   guarded trees are small.
-- Startup hashes every whitelisted binary once (a binary several sections list is read once); on
-  SD/eMMC storage and CPUs without SHA-2 instructions (Raspberry Pi 4) that takes longer, and
-  logins wait for it. The unit's start timeout is 15 minutes.
+- The first start hashes every whitelisted binary once (a binary several sections list is read
+  once); on SD/eMMC storage and CPUs without SHA-2 instructions (Raspberry Pi 4) that takes longer,
+  and logins wait for it. The unit's start timeout is 15 minutes. Later starts read only binaries
+  that changed, when they sit on ext4, xfs, btrfs or f2fs
+  ([hash cache](binary-trust.md#hash-cache)).

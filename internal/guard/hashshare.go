@@ -17,7 +17,29 @@ import (
 var (
 	sharedHashMu sync.Mutex
 	sharedHashes = map[GuardInodeKey]sharedHashEntry{}
-	hashStats    struct{ hashed, reused, bytes atomic.Uint64 }
+	hashStore    HashStore // under sharedHashMu
+	hashStats    struct{ hashed, reused, cached, bytes atomic.Uint64 }
+)
+
+// HashStore persists content hashes across daemon runs (the binary ledger's hash cache), keyed by
+// a DurableStat. A hit only replaces reading the file: the ledger still judges the hash. Lookup
+// failures are misses.
+type HashStore interface {
+	LookupHash(ebpf.DurableStat) ([32]byte, bool)
+	StoreHash(ebpf.DurableStat, [32]byte)
+}
+
+// SetHashStore installs the persistent store; nil keeps sharing in-process only.
+func SetHashStore(s HashStore) {
+	sharedHashMu.Lock()
+	hashStore = s
+	sharedHashMu.Unlock()
+}
+
+// statDurable and syncFile are the ebpf calls; tests swap them (a durable mount needs root).
+var (
+	statDurable = ebpf.StatDurable
+	syncFile    = ebpf.SyncFile
 )
 
 type sharedHashEntry struct {
@@ -51,10 +73,25 @@ func hashFileShared(f *os.File, path string) (entry BinaryEntry, fp ebpf.BinaryS
 	key := GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
 	sharedHashMu.Lock()
 	e, ok := sharedHashes[key]
+	store := hashStore
 	sharedHashMu.Unlock()
 	if ok && e.stat == fp {
 		hashStats.reused.Add(1)
 		return ebpf.EntryWithHash(path, e.hash), fp, nil
+	}
+
+	ds, durable := ebpf.DurableStat{}, false
+	if store != nil {
+		ds, durable = statDurable(f, fp)
+	}
+	if durable {
+		if h, hit := store.LookupHash(ds); hit {
+			hashStats.cached.Add(1)
+			publishHash(key, fp, h)
+			return ebpf.EntryWithHash(path, h), fp, nil
+		}
+		// Persisted hashes must outlive this run: clean every page first (SyncFile).
+		durable = syncFile(f) == nil
 	}
 
 	if entry, err = computeEntryFile(f, path); err != nil {
@@ -65,13 +102,20 @@ func hashFileShared(f *os.File, path string) (entry BinaryEntry, fp ebpf.BinaryS
 	if !unchangedSince(f, fp) || !settled(fp) {
 		return entry, fp, nil
 	}
+	publishHash(key, fp, entry.Hash)
+	if durable {
+		store.StoreHash(ds, entry.Hash)
+	}
+	return entry, fp, nil
+}
+
+func publishHash(key GuardInodeKey, fp ebpf.BinaryStat, hash [32]byte) {
 	sharedHashMu.Lock()
 	if len(sharedHashes) >= maxSharedHashes {
 		sharedHashes = map[GuardInodeKey]sharedHashEntry{}
 	}
-	sharedHashes[key] = sharedHashEntry{stat: fp, hash: entry.Hash}
+	sharedHashes[key] = sharedHashEntry{stat: fp, hash: hash}
 	sharedHashMu.Unlock()
-	return entry, fp, nil
 }
 
 func unchangedSince(f *os.File, fp ebpf.BinaryStat) bool {
@@ -104,8 +148,8 @@ func newVerifyState(key GuardInodeKey, hash [32]byte) *binaryVerifyState {
 	return st
 }
 
-// HashStats reports this process's binary content hashing so far: files read, bytes read, and
-// hashes reused instead of read.
-func HashStats() (hashed, bytes, reused uint64) {
-	return hashStats.hashed.Load(), hashStats.bytes.Load(), hashStats.reused.Load()
+// HashStats reports this process's binary content hashing so far: files read, bytes read, hashes
+// reused within the run, and hashes taken from the persistent store.
+func HashStats() (hashed, bytes, reused, cached uint64) {
+	return hashStats.hashed.Load(), hashStats.bytes.Load(), hashStats.reused.Load(), hashStats.cached.Load()
 }
