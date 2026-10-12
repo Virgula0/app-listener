@@ -1,7 +1,6 @@
 package guard
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -200,8 +199,6 @@ type Guard struct {
 	// detector; verifyStop stops it (startBinaryHashVerifier).
 	binaryVerifyStates map[string]*binaryVerifyState
 	verifyStop         chan struct{}
-	// degradeStop shuts the BPF degradation watcher down (startDegradeWatch).
-	degradeStop chan struct{}
 	// deployed: per canonical whitelisted path, the (dev, ino) in the BPF maps. A replaced key stays
 	// in the maps, admitting only processes started before its supersede, until its inode is gone
 	// (supersede.go).
@@ -2049,34 +2046,32 @@ func (g *Guard) ReconcileInodes() error {
 	rootKey := g.rootKey
 	g.mu.Unlock()
 
-	var stale []GuardInodeKey
-	var key GuardInodeKey
-	var val uint32
-	it := g.objs().GuardInodes.Iterate()
-	for it.Next(&key, &val) {
-		// The map is shared by every resource; another resource's rows are not ours to judge.
-		if val != g.resID {
-			continue
-		}
-		if key == rootKey {
-			continue
-		}
-		if _, ok := live[key]; ok {
-			continue
-		}
-		stale = append(stale, key)
-	}
-	if iterErr := it.Err(); iterErr != nil {
-		return fmt.Errorf("iterating guard_inodes for %s: %w", g.path, iterErr)
+	// The map is shared by every resource; another resource's rows are not ours to judge.
+	owned, err := inodeRowsOf(g.objs().GuardInodes, g.resID)
+	if err != nil {
+		return fmt.Errorf("iterating guard_inodes for %s: %w", g.path, err)
 	}
 
-	for _, k := range stale {
+	evicted := 0
+	for _, k := range owned {
+		if k == rootKey {
+			continue
+		}
+		if _, ok := live[k]; ok {
+			continue
+		}
+		// Re-read: a row another resource claimed since the walk is not ours to delete.
+		var cur uint32
+		if g.objs().GuardInodes.Lookup(k, &cur) != nil || cur != g.resID {
+			continue
+		}
 		if delErr := g.objs().GuardInodes.Delete(k); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {
 			return fmt.Errorf("evicting stale inode from guard_inodes for %s: %w", g.path, delErr)
 		}
+		evicted++
 	}
-	if len(stale) > 0 {
-		log.Infof("guard %s: evicted %d stale inode(s) no longer present on disk", g.path, len(stale))
+	if evicted > 0 {
+		log.Infof("guard %s: evicted %d stale inode(s) no longer present on disk", g.path, evicted)
 	}
 	return nil
 }
@@ -2088,8 +2083,6 @@ func (g *Guard) Events() <-chan GuardEvent {
 func (g *Guard) Start() error {
 	// Events arrive from the shared engine's reader, which routes each one by resource id.
 	log.Infof("guard started \u2014 guarding: %s", g.path)
-
-	g.startDegradeWatch()
 
 	if g.mode == ModeWhitelist && len(g.binaries) > 0 {
 		g.startBinaryHashVerifier()
@@ -2105,39 +2098,46 @@ const (
 
 const degradeWatchInterval = 30 * time.Second
 
-// startDegradeWatch logs otherwise-silent BPF-side degradation (kernel map allocation failures
-// reduce inode-discovery coverage or disable ptrace protection). Observability only.
-func (g *Guard) startDegradeWatch() {
-	g.degradeStop = make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(degradeWatchInterval)
-		defer ticker.Stop()
-		seen := map[uint32]uint64{
-			degradeInodesFull: 0,
-			degradeTaintFull:  0,
+var degradeLabels = [...]string{
+	degradeInodesFull: "guard_inodes map full: runtime inode discovery dropped entries, coverage degrades to the ancestor walk",
+	degradeTaintFull:  "tainted-pids map full: ptrace/process_vm_readv protection was not stamped for some processes",
+}
+
+// degradeWatchLoop logs otherwise-silent BPF-side degradation (kernel map allocation failures
+// reduce inode-discovery coverage or disable ptrace protection) while the engine lives. One per
+// engine: guard_degrade is shared by every resource. Observability only.
+func (e *engine) degradeWatchLoop(done <-chan struct{}) {
+	ticker := time.NewTicker(degradeWatchInterval)
+	defer ticker.Stop()
+	var seen [len(degradeLabels)]uint64
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			e.reportDegradation(done, &seen)
 		}
-		labels := map[uint32]string{
-			degradeInodesFull: "guard_inodes map full: runtime inode discovery dropped entries, coverage degrades to the ancestor walk",
-			degradeTaintFull:  "tainted-pids map full: ptrace/process_vm_readv protection was not stamped for some processes",
+	}
+}
+
+func (e *engine) reportDegradation(done <-chan struct{}, seen *[len(degradeLabels)]uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	select {
+	case <-done:
+		return // stopped (under e.mu): e.objs is closed or belongs to a later start
+	default:
+	}
+	for slot, label := range degradeLabels {
+		var count uint64
+		if err := e.objs.GuardDegrade.Lookup(uint32(slot), &count); err != nil { //nolint:gosec // slot < len(degradeLabels)
+			continue
 		}
-		for {
-			select {
-			case <-g.degradeStop:
-				return
-			case <-ticker.C:
-				for slot, label := range labels {
-					var count uint64
-					if err := g.objs().GuardDegrade.Lookup(slot, &count); err != nil {
-						continue
-					}
-					if count > seen[slot] {
-						log.Warnf("guard %s: degraded coverage: %s (%d time(s) so far)", g.path, label, count)
-						seen[slot] = count
-					}
-				}
-			}
+		if count > seen[slot] {
+			log.Warnf("guard: degraded coverage: %s (%d time(s) so far)", label, count)
+			seen[slot] = count
 		}
-	}()
+	}
 }
 
 // binaryVerifyState is the verifier's pinned identity of an admitted binary: inode key, content
@@ -2302,8 +2302,8 @@ func (g *Guard) adoptReplacedIdentity(canonical string, st *binaryVerifyState, f
 // it. The engine calls it once per record and routes the result.
 func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 	var be bpfGuardEvent
-	if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &be); err != nil {
-		log.Errorf("decode guard event: %v", err)
+	if !decodeGuardEvent(raw, &be) {
+		log.Errorf("decode guard event: short record (%d of %d bytes)", len(raw), bpfGuardEventSize)
 		return nil, 0, false
 	}
 
@@ -2462,10 +2462,6 @@ func (g *Guard) Stop() {
 		close(g.verifyStop)
 		g.verifyStop = nil
 	}
-	if g.degradeStop != nil {
-		close(g.degradeStop)
-		g.degradeStop = nil
-	}
 	close(g.done)
 	g.cleanup()
 }
@@ -2575,6 +2571,33 @@ type bpfGuardEvent struct {
 	Comm    [16]byte
 	Path    [256]byte
 	Dest    [256]byte
+}
+
+// bpfGuardEventSize is struct guard_event's wire size (guard.bpf.c): 8 x u32, 2 x u64, comm, path,
+// dest. Keep in sync with the C layout.
+const bpfGuardEventSize = 8*4 + 2*8 + 16 + 256 + 256
+
+// decodeGuardEvent fills e from a ringbuf record at fixed offsets: binary.Read's reflection was the
+// reader's main cost. False for a short record.
+func decodeGuardEvent(raw []byte, e *bpfGuardEvent) bool {
+	if len(raw) < bpfGuardEventSize {
+		return false
+	}
+	le := binary.LittleEndian
+	e.PID = le.Uint32(raw[0:4])
+	e.UID = le.Uint32(raw[4:8])
+	e.GID = le.Uint32(raw[8:12])
+	e.Type = le.Uint32(raw[12:16])
+	e.FD = le.Uint32(raw[16:20])
+	e.Blocked = le.Uint32(raw[20:24])
+	e.Reason = le.Uint32(raw[24:28])
+	e.ResID = le.Uint32(raw[28:32])
+	e.ExeDev = le.Uint64(raw[32:40])
+	e.ExeIno = le.Uint64(raw[40:48])
+	copy(e.Comm[:], raw[48:64])
+	copy(e.Path[:], raw[64:320])
+	copy(e.Dest[:], raw[320:576])
+	return true
 }
 
 func (e *bpfGuardEvent) toFileEvent() ebpf.FileEvent {
