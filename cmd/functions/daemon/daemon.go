@@ -1217,11 +1217,16 @@ func eventFilterOptions() []guard.GuardOption {
 	return opts
 }
 
+var processStart = time.Now()
+
 // markReady tells systemd the guards are up, then returns the startup peak (catalog, ELF closures,
 // populate: well above the steady-state heap) to the OS now rather than over the scavenger's
 // minutes, for small-RAM hosts.
 func markReady() {
 	notifySystemdReady()
+	hashed, bytes, reused := guard.HashStats()
+	log.Infof("daemon: ready %s after start: hashed %d binaries (%d MiB), reused %d hashes",
+		time.Since(processStart).Round(time.Millisecond), hashed, bytes>>20, reused)
 	go debug.FreeOSMemory()
 }
 

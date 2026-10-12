@@ -47,12 +47,18 @@ func entryOf(r io.Reader, path string) (BinaryEntry, error) {
 	if err != nil {
 		return BinaryEntry{}, fmt.Errorf("reading binary %s: %w", path, err)
 	}
-	e := BinaryEntry{Path: path, Comm: filepath.Base(path)}
-	h.Sum(e.Hash[:0])
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	return EntryWithHash(path, sum), nil
+}
+
+// EntryWithHash is the entry for path whose content hash is already known.
+func EntryWithHash(path string, hash [sha256.Size]byte) BinaryEntry {
+	e := BinaryEntry{Path: path, Hash: hash, Comm: filepath.Base(path)}
 	if len(e.Comm) > 15 {
 		e.Comm = e.Comm[:15]
 	}
-	return e, nil
+	return e
 }
 
 // KernelDev encodes major:minor as the kernel's internal dev_t (sb->s_dev), which the BPF programs
@@ -91,17 +97,30 @@ type BinaryStat struct {
 
 // StatBinary returns the fingerprint of path (dev encoded as StatInode does).
 func StatBinary(path string) (BinaryStat, error) {
-	var s syscall.Stat_t
-	if err := syscall.Stat(path, &s); err != nil {
+	var s unix.Stat_t
+	if err := unix.Stat(path, &s); err != nil {
 		return BinaryStat{}, err
 	}
+	return binaryStatOf(&s), nil
+}
+
+// StatBinaryFile is StatBinary for the inode f holds (any fd, O_PATH included).
+func StatBinaryFile(f *os.File) (BinaryStat, error) {
+	var s unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &s); err != nil {
+		return BinaryStat{}, &os.PathError{Op: "fstat", Path: f.Name(), Err: err}
+	}
+	return binaryStatOf(&s), nil
+}
+
+func binaryStatOf(s *unix.Stat_t) BinaryStat {
 	return BinaryStat{
 		Dev:     KernelDev(unix.Major(s.Dev), unix.Minor(s.Dev)),
 		Ino:     s.Ino,
 		Size:    s.Size,
 		MtimeNs: s.Mtim.Sec*1_000_000_000 + s.Mtim.Nsec,
 		CtimeNs: s.Ctim.Sec*1_000_000_000 + s.Ctim.Nsec,
-	}, nil
+	}
 }
 
 // BinariesSummary renders a whitelist as a compact log-friendly list.

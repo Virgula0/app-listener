@@ -1124,9 +1124,9 @@ func confinedEntry(path string) (resolved string, entry BinaryEntry, key GuardIn
 		return "", entry, key, nil, err
 	}
 	if resolved, err = os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); err == nil {
-		if key.Dev, key.Ino, err = ebpf.StatFile(f); err == nil {
-			entry, err = ebpf.ComputeBinaryEntryFile(f, resolved)
-		}
+		var fp ebpf.BinaryStat
+		entry, fp, err = hashFileShared(f, resolved)
+		key = GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
 	}
 	if err != nil {
 		f.Close()
@@ -1142,13 +1142,12 @@ func ConfinedEntry(path string) (entry BinaryEntry, v VettedInode, err error) {
 	if err != nil {
 		return entry, v, err
 	}
-	if v.Key.Dev, v.Key.Ino, err = ebpf.StatFile(f); err == nil {
-		entry, err = ebpf.ComputeBinaryEntryFile(f, path)
-	}
+	entry, fp, err := hashFileShared(f, path)
 	if err != nil {
 		f.Close()
 		return entry, VettedInode{}, err
 	}
+	v.Key = GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
 	v.f = f
 	return entry, v, nil
 }
@@ -1246,7 +1245,7 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 			entry := resolved[i]
 			canonical := canonicalBinaryPath(entry.Path)
 			if key, ok := g.deployed[canonical]; ok {
-				g.binaryVerifyStates[canonical] = &binaryVerifyState{key: key, hash: entry.Hash}
+				g.binaryVerifyStates[canonical] = newVerifyState(key, entry.Hash)
 			}
 		}
 	}
@@ -1429,7 +1428,7 @@ func (g *Guard) admitSystemMatch(path string, events []ebpf.EventType) (bool, er
 	if !replacementAllowed(path, f, GuardInodeKey{}, key) {
 		return false, nil
 	}
-	entry, err := ebpf.ComputeBinaryEntryFile(f, path)
+	entry, _, err := hashFileShared(f, path)
 	if err != nil {
 		return false, nil // unreadable now: next re-sync
 	}
@@ -1451,7 +1450,7 @@ func (g *Guard) admitSystemMatch(path string, events []ebpf.EventType) (bool, er
 	g.deployed[resolved] = key
 	g.keyPaths[key] = path
 	if g.binaryVerifyStates != nil {
-		g.binaryVerifyStates[resolved] = &binaryVerifyState{key: key, hash: entry.Hash}
+		g.binaryVerifyStates[resolved] = newVerifyState(key, entry.Hash)
 	}
 	g.mu.Unlock()
 	log.Infof("guard %s: admitted %s (inode %d): a new system binary at a root-placed name matching a catalog pattern",
@@ -2166,44 +2165,6 @@ type binaryVerifyState struct {
 // (verifyBinaryHashesOnce).
 const binaryHashVerifyInterval = 10 * time.Second
 
-// sharedBinaryHashes dedupes content hashing across all guards in the process (one large app blob
-// is admitted by ~10 guards). Keyed by inode; the stored fingerprint gates reuse.
-var (
-	sharedHashMu sync.Mutex
-	sharedHashes = map[GuardInodeKey]sharedHashEntry{}
-)
-
-type sharedHashEntry struct {
-	stat ebpf.BinaryStat
-	hash [32]byte
-}
-
-// hashBinaryShared returns path's hash, reusing one already computed for the same
-// inode+fingerprint.
-func hashBinaryShared(path string, fp ebpf.BinaryStat) ([32]byte, error) {
-	key := GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
-
-	sharedHashMu.Lock()
-	if e, ok := sharedHashes[key]; ok && e.stat == fp {
-		sharedHashMu.Unlock()
-		return e.hash, nil
-	}
-	sharedHashMu.Unlock()
-
-	entry, err := ComputeBinaryEntry(path)
-	if err != nil {
-		return [32]byte{}, err
-	}
-
-	sharedHashMu.Lock()
-	if len(sharedHashes) > 8192 { // pathological only; keeps the map bounded
-		sharedHashes = map[GuardInodeKey]sharedHashEntry{}
-	}
-	sharedHashes[key] = sharedHashEntry{stat: fp, hash: entry.Hash}
-	sharedHashMu.Unlock()
-	return entry.Hash, nil
-}
-
 // startBinaryHashVerifier pins each admitted binary's content hash and periodically re-verifies it:
 // identity is the exe inode alone, so anyone who can write an admitted binary outside the guarded
 // tree could replace it in place and inherit the allow. A same-inode hash change demotes the entry
@@ -2219,7 +2180,7 @@ func (g *Guard) startBinaryHashVerifier() {
 		if !ok {
 			continue // deferred and not yet resolved: nothing admitted yet
 		}
-		g.binaryVerifyStates[canonical] = &binaryVerifyState{key: key, hash: b.Hash}
+		g.binaryVerifyStates[canonical] = newVerifyState(key, b.Hash)
 	}
 	g.verifyStop = make(chan struct{})
 	go g.verifyBinaryHashLoop()
@@ -2257,25 +2218,25 @@ func (g *Guard) verifyBinaryHashesOnce() {
 		if err != nil {
 			continue // vanished mid-update: ReSyncBinaries handles it
 		}
-		freshKey := GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
-
 		// Same inode and size/mtime/ctime: an in-place overwrite always bumps mtime/ctime, so
 		// unchanged. No read.
-		if st.hashed && freshKey == st.key.Real() && fp == st.stat {
+		if st.hashed && (GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}) == st.key.Real() && fp == st.stat {
 			continue
 		}
 
-		hash, err := hashBinaryShared(canonical, fp)
+		// Inode and fingerprint from the fd hashed, not the stat above: a rename in between can't
+		// pin one inode's content to another's key.
+		entry, fp, err := hashPathShared(canonical)
 		if err != nil {
 			continue // unreadable right now: keep the current decision
 		}
-
-		if freshKey != st.key.Real() {
+		hash := entry.Hash
+		if (GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}) != st.key.Real() {
 			g.adoptReplacedIdentity(canonical, st, fp, hash)
 			continue
 		}
 		st.stat = fp
-		st.hashed = true
+		st.hashed = settled(fp) // a fresh one is re-read next tick
 		if !st.demoted && hash != st.hash {
 			g.demoteInPlace(canonical, st)
 		}
@@ -2309,7 +2270,7 @@ func (g *Guard) adoptReplacedIdentity(canonical string, st *binaryVerifyState, f
 	st.key = deployedKey
 	st.stat = fp
 	st.hash = hash
-	st.hashed = true
+	st.hashed = settled(fp)
 	st.demoted = false
 }
 

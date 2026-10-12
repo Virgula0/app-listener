@@ -1,6 +1,8 @@
 package integrationtests
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -159,6 +161,51 @@ func (s *IntegrationSuite) TestDaemon_Ledger_GlobMatchPlantedWhileStoppedRefused
 	s.trustBinaries(c, "--yes")
 	s.Require().Truef(s.awaitReadAs(c, plant), "confirmed, the match must be admitted; daemon log:\n%s",
 		s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+var readyHashRe = regexp.MustCompile(`hashed (\d+) binaries \(\d+ MiB\), reused (\d+) hashes`)
+
+// One binary whitelisted by two resources is read once per run; the hash both guards share must
+// not blind either verifier: an in-place rewrite still demotes it in both.
+func (s *IntegrationSuite) TestDaemon_SharedHash_InPlaceRewriteDemotesEveryResource() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.copySwapFixtures(c)
+	s.installFakeSystemctl(c)
+
+	const bin = "/opt/shared/reader"
+	secrets := []string{"/p1/secret", "/p2/secret"}
+	// The sleep lets the copy's ctime settle (guard settleAge): a fresher file is never shared.
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /p1 /p2 /opt/shared /etc/app-listener && for f in " +
+		strings.Join(secrets, " ") + "; do printf '" + ledgerMarker + "' > $f; done && cp " + swapReaderPath +
+		" " + bin + " && sleep 2 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	config := "[watch /p1]\nneed_encryption: false\n" + bin + "\n\n[watch /p2]\nneed_encryption: false\n" + bin
+	s.startDaemon(c, config)
+	s.Require().Truef(s.awaitLog(c, "daemon: ready", 30*time.Second), "no ready line; daemon log:\n%s", s.readDaemonLog(c))
+
+	m := readyHashRe.FindStringSubmatch(s.readDaemonLog(c))
+	s.Require().NotNilf(m, "no hash counters on the ready line; daemon log:\n%s", s.readDaemonLog(c))
+	reused, _ := strconv.Atoi(m[2])
+	s.Require().GreaterOrEqualf(reused, 1, "the second resource re-read %s (hashed %s, reused %s)", bin, m[1], m[2])
+	for _, sec := range secrets {
+		_, out := s.exec(c, []string{bin, sec})
+		s.Require().Containsf(out, "STOLEN|"+ledgerMarker, "baseline: %s reads %s: %s", bin, sec, out)
+	}
+
+	// Same inode, new content: the verifier (10s tick) must re-read it in both guards.
+	code, out = s.exec(c, []string{"sh", "-c", "i1=$(stat -c %i " + bin + "); printf x >> " + bin +
+		"; [ \"$i1\" = \"$(stat -c %i " + bin + ")\" ] && echo SAME-INODE"})
+	s.Require().Containsf(out, "SAME-INODE", "fixture: rewrite must keep the inode (%d): %s", code, out)
+	s.Require().Truef(s.awaitLogCount(c, "was modified in place", 2, 40*time.Second),
+		"the rewrite was not demoted in both resources; daemon log:\n%s", s.readDaemonLog(c))
+	for _, sec := range secrets {
+		_, out := s.exec(c, []string{"sh", "-c", "timeout 10 " + bin + " " + sec + " 2>&1"})
+		s.Require().NotContainsf(out, "STOLEN|"+ledgerMarker, "the rewritten binary still reads %s", sec)
+	}
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

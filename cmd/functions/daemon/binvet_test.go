@@ -178,3 +178,46 @@ func TestVetterRecordLiveUnderLinkLines(t *testing.T) {
 		}
 	}
 }
+
+// Shared hashing must keep the in-generation swap check: a same-inode rewrite between two guards'
+// opens is hashed again, so the second judgement sees two contents and is refused.
+func TestVetterSeesInPlaceRewriteThroughSharedHashes(t *testing.T) {
+	v, l, _ := newTestVetter(t)
+	v.endBootstrap()
+	bin := filepath.Join(t.TempDir(), "app")
+	if err := os.WriteFile(bin, []byte("a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rule := daemonconfig.BinaryRule{Path: bin}
+	cfg, res := vetResource(rule)
+	v.begin(cfg)
+
+	e1, k1, err := guard.ConfinedEntry(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k1.Close()
+	if err := l.Record(bin, e1.Hash, binledger.SourceInstall); err != nil {
+		t.Fatal(err)
+	}
+	if !v.judge(res, rule, bin, k1.File(), k1.Key, e1.Hash) {
+		t.Fatal("first judgement refused")
+	}
+	if err := os.WriteFile(bin, []byte("bb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e2, k2, err := guard.ConfinedEntry(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k2.Close()
+	if k2.Key != k1.Key || e2.Hash == e1.Hash {
+		t.Fatalf("rewrite not re-hashed: key %v/%v", k1.Key, k2.Key)
+	}
+	if v.judge(res, rule, bin, k2.File(), k2.Key, e2.Hash) {
+		t.Fatal("a rewritten binary was admitted within the generation")
+	}
+	if _, _, err := v.resolve(bin); err == nil {
+		t.Fatal("rewritten path kept updater rights")
+	}
+}
