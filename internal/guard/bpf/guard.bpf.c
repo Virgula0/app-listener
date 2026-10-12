@@ -5,7 +5,7 @@
 #include "inode_dev.h"
 
 #define MAX_PATH 256
-// VFS access-mask bits for bpf_lsm_inode_permission/file_permission. This kernel (7.0-hardened)
+// VFS access-mask bits for bpf_lsm_file_permission. This kernel (7.0-hardened)
 // differs from mainline: MAY_OPEN is 0x20 (not 0x40), MAY_ACCESS 0x10. Keep in sync with the target
 // kernel's include/linux/fs.h.
 #define MAY_EXEC   0x00000001
@@ -1272,8 +1272,8 @@ static __noinline int check_and_emit_args(struct emit_args *a)
 		}
 	}
 
-	// quiet_allow: allowed accesses aren't reported (inode_permission fires on every guarded access
-	// and would flood the log with allowed STATs). Denials are always reported.
+	// quiet_allow: allowed accesses aren't reported (read-only guards: a config file is read
+	// constantly). Denials are always reported.
 	if (!is_blocked && quiet_allow)
 		return 0;
 	if (!is_blocked) {
@@ -2251,36 +2251,10 @@ int guard_inode_listxattr(unsigned long long *ctx)
 	return 0;
 }
 
-// inode_permission handles pure may-checks (access(2)/faccessat(2), MAY_ACCESS). Its context is
-// only (inode, mask): no dentry, so the watch-root chain can't be walked and a raw map hit can't be
-// confined (it false-denied inode numbers reused in other trees, and the audit denial was a log lie
-// since the syscall was never blocked). access/faccessat leak no content, so it passes everything
-// through; real reads/writes/execs/deletes are enforced in file_open and the path_*/inode_* hooks,
-// which carry a dentry. An X_OK probe (MAY_EXEC without MAY_OPEN) is deliberately not denied. The
-// MAY_ACCESS selection below keeps this hook from intercepting opens, execs, truncates or setxattr.
-SEC("lsm/inode_permission")
-int guard_inode_permission(unsigned long long *ctx)
-{
-	struct inode *inode = (struct inode *)ctx[0];
-	if (!inode)
-		return 0;
-
-	int mask = (int)ctx[1];
-	// Only genuine access(2)/faccessat probes carry MAY_ACCESS.
-	if (!(mask & MAY_ACCESS))
-		return 0;
-	if (!(mask & (MAY_READ | MAY_WRITE)))
-		return 0;
-	if (mask & (MAY_EXEC | MAY_OPEN))
-		return 0;
-
-	umode_t mode;
-	bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode);
-	if ((mode & S_IFMT) == S_IFDIR)
-		return 0;
-
-	return 0;
-}
+// No inode_permission hook: its (inode, mask) context has no dentry, so a map hit can't be confined
+// to the watch root (it false-denied reused inode numbers in other trees), and access(2)/faccessat
+// leak no content. Reads, writes, execs, deletes and stat are enforced in file_open and the
+// path_*/inode_* hooks, which carry a dentry.
 
 SEC("lsm/sb_mount")
 int guard_sb_mount(unsigned long long *ctx)

@@ -296,9 +296,9 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree_Deep() {
 	code, out = s.exec(c, []string{"rm", deep + "/victim.txt"})
 	s.Require().Equalf(0, code, "rm on deep out-of-tree victim must not be denied by its stale map entry: %s", out)
 
-	// A pure access(2)-style probe (inode_permission) on the stale inode
-	// must pass too: that hook has no dentry to confine against, so it no
-	// longer denies — it would only ever produce false positives.
+	// A pure access(2) probe on the stale inode must pass too: access(2) is not
+	// hooked (inode_permission has no dentry to confine against, so it could
+	// only ever produce false positives).
 	s.exec(c, []string{"sh", "-c", "echo 'probe content' > " + deep + "/victim.txt"})
 	code, out = s.exec(c, []string{"sh", "-c", "[ -r " + deep + "/victim.txt ]"})
 	s.Require().Equalf(0, code, "access probe on stale out-of-tree inode must succeed: %s", out)
@@ -2227,7 +2227,7 @@ func (s *IntegrationSuite) TestGuard_RuntimeRenameFile() {
 //   - setxattr(2)                -> inode_setxattr (ATTR)
 //   - mknod(2)                   -> path_mknod (MKNOD)
 //   - rmdir(2)                   -> path_rmdir (DELETE)
-//   - stat/access/readlink       -> inode_getattr / inode_permission / inode_readlink (STAT)
+//   - stat/readlink              -> inode_getattr / inode_readlink (STAT); access(2) is not hooked
 // Each case runs twice in one container: (1) block-all mode: the op must fail with a blocked event
 // for the exploit binary; (2) whitelist mode (exploit binary whitelisted): the SAME op must succeed
 // while a plain cat stays blocked, proving the hook is selective and caller identity is enforced.

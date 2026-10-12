@@ -735,7 +735,6 @@ func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []struct {
 		{o.GuardInodeRemovexattr, "inode_removexattr"},
 		{o.GuardPathMknod, "path_mknod"},
 		{o.GuardPathRmdir, "path_rmdir"},
-		{o.GuardInodePermission, "inode_permission"},
 		{o.GuardInodeGetattr, "inode_getattr"},
 		{o.GuardInodeGetxattr, "inode_getxattr"},
 		{o.GuardInodeListxattr, "inode_listxattr"},
