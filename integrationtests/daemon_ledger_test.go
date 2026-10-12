@@ -235,7 +235,8 @@ func (s *IntegrationSuite) TestDaemon_HashCache_RestartReusesAndStoppedRewriteMi
 	s.installFakeSystemctl(c)
 
 	const bin, overlayBin = "/mnt/img/bin/app", "/opt/overlay/app"
-	// -I 256: ext4 keeps a birth time only in large inodes. The sleep lets the copy's ctime settle.
+	// -I 256: ext4 keeps a birth time only in large inodes. A user-owned dir: a root-placed binary is
+	// admitted without the ledger. The sleep lets the copy's ctime settle.
 	build := `
 set -e
 mkdir -p /protected /etc/app-listener /mnt/img && printf '` + ledgerMarker + `' > /protected/secret
@@ -244,6 +245,7 @@ mkfs.ext4 -q -F -I 256 /tmp/img
 for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
 mount -o loop /tmp/img /mnt/img
 mkdir -p /mnt/img/bin /opt/overlay && cp ` + swapReaderPath + ` ` + bin + ` && cp ` + swapReaderPath + ` ` + overlayBin + `
+chown -R 65534 /mnt/img/bin
 sleep 2
 echo MOUNTED`
 	code, out := s.exec(c, []string{"sh", "-c", build})
@@ -274,8 +276,9 @@ echo MOUNTED`
 		sum = sha256Re.FindString(out) // docker exec frames can prefix the output
 		s.Require().NotEmptyf(sum, "fixture: no sha256 in %q", out)
 	})
+	s.Require().Equalf(0, s.readyCached(c), "the rewritten %s was taken from the hash cache", bin)
 	line := s.unconfirmedLine(c, bin)
-	s.Require().NotEmptyf(line, "a rewrite while stopped was admitted from the hash cache; daemon log:\n%s", s.readDaemonLog(c))
+	s.Require().NotEmptyf(line, "a rewrite while stopped was admitted; daemon log:\n%s", s.readDaemonLog(c))
 	s.Require().Containsf(line, "sha256="+sum, "the refusal must carry the rewritten content's hash: %s", line)
 	s.assertNeverStolen(c, bin, "/protected/secret", ledgerMarker)
 }
