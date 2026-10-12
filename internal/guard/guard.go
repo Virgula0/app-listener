@@ -2121,15 +2121,21 @@ func (e *engine) degradeWatchLoop(done <-chan struct{}) {
 	ticker := time.NewTicker(degradeWatchInterval)
 	defer ticker.Stop()
 	var seen [len(degradeLabels)]uint64
-	for {
+	for tick := 1; ; tick++ {
 		select {
 		case <-done:
 			return
 		case <-ticker.C:
 			e.reportDegradation(done, &seen)
+			if tick%occupancyEveryTicks == 0 {
+				WarnInodeOccupancy() // runtime discovery grows the map between populates
+			}
 		}
 	}
 }
+
+// occupancyEveryTicks: guard_inodes is counted every 10 min (a full-map walk).
+const occupancyEveryTicks = int(10 * time.Minute / degradeWatchInterval)
 
 func (e *engine) reportDegradation(done <-chan struct{}, seen *[len(degradeLabels)]uint64) {
 	e.mu.Lock()

@@ -4,6 +4,9 @@
 // root. Exits 1 when a program of the first object is rejected (over budget included: E2BIG).
 //
 //	sudo ./bpfstats new.o [base.o ...]
+//
+// BPFSTATS_MAX_ENTRIES=guard_inodes=65536[,map=n...] resizes maps before loading (daemon.conf
+// [settings] max_inodes), to check the verifier's verdict doesn't depend on it.
 package main
 
 import (
@@ -58,6 +61,10 @@ func measure(path string) map[string]int {
 		fmt.Fprintf(os.Stderr, "loading %s: %v\n", path, err)
 		os.Exit(1)
 	}
+	if err := resizeMaps(spec, os.Getenv("BPFSTATS_MAX_ENTRIES")); err != nil {
+		fmt.Fprintf(os.Stderr, "BPFSTATS_MAX_ENTRIES: %v\n", err)
+		os.Exit(2)
+	}
 
 	out := make(map[string]int)
 	names := make([]string, 0, len(spec.Programs))
@@ -88,6 +95,22 @@ func measure(path string) map[string]int {
 		}
 	}
 	return out
+}
+
+// resizeMaps applies "map=n,map=n" max_entries overrides; a map the object lacks is skipped.
+func resizeMaps(spec *cilium.CollectionSpec, overrides string) error {
+	for _, kv := range strings.FieldsFunc(overrides, func(r rune) bool { return r == ',' }) {
+		name, val, ok := strings.Cut(kv, "=")
+		n, err := strconv.ParseUint(val, 10, 32)
+		if !ok || err != nil || n == 0 {
+			return fmt.Errorf("%q is not map=entries", kv)
+		}
+		if m, found := spec.Maps[name]; found {
+			m.MaxEntries = uint32(n)
+			fmt.Printf("  (%s max_entries %d)\n", name, n)
+		}
+	}
+	return nil
 }
 
 func loadOne(spec *cilium.CollectionSpec, name string) (int, error) {

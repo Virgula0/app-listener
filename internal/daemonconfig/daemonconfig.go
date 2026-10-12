@@ -36,6 +36,9 @@ type Config struct {
 	// that runs the app its argv names, /usr/lib/electronNN) may be started with. Any other is code
 	// its caller chose; root placement is the daemon's to check.
 	ElectronApps []string
+	// MaxInodes is [settings] max_inodes: the guard_inodes capacity, applied at daemon start. 0 =
+	// the compiled default (1<<18).
+	MaxInodes uint32
 	// Raw is the file's content as parsed: the daemon's catalog refresh writes only over the
 	// version it runs (compare-and-swap).
 	Raw []byte
@@ -165,7 +168,9 @@ type watchGroup struct {
 	inspectorsBlock bool
 	// electronAppsBlock marks an [electron_apps] block: one app path per line.
 	electronAppsBlock bool
-	blockName         string
+	// settingsBlock marks a [settings] block: daemon-wide `key: value` lines.
+	settingsBlock bool
+	blockName     string
 	// skipped marks a section whose root is missing: its directives are warned and ignored, never
 	// fatal (the group is dropped at finalize).
 	skipped bool
@@ -256,6 +261,9 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	if g.electronAppsBlock {
 		return applyElectronApp(cfg, line, lineNo)
 	}
+	if g.settingsBlock {
+		return applySetting(cfg, line, lineNo)
+	}
 	if g.skipped {
 		log.Warnf("daemon config line %d: skipped section: ignoring directive %q", lineNo, line)
 		return nil
@@ -278,8 +286,8 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	return applyDirective(g, line, lineNo)
 }
 
-// openBlock returns the group a [libraries <name>], [inspectors] or [electron_apps] header opens,
-// nil for any other line.
+// openBlock returns the group a [libraries <name>], [inspectors], [electron_apps] or [settings]
+// header opens, nil for any other line.
 func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
 	if name, ok := parseLibrariesSection(line); ok {
 		return &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
@@ -292,6 +300,8 @@ func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
 		return &watchGroup{inspectorsBlock: true, lineNo: lineNo}
 	case "[electron_apps]":
 		return &watchGroup{electronAppsBlock: true, lineNo: lineNo}
+	case "[settings]":
+		return &watchGroup{settingsBlock: true, lineNo: lineNo}
 	}
 	return nil
 }
@@ -310,7 +320,7 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 
 // finalizeGroup materializes a closed group unless it was skipped.
 func finalizeGroup(cfg *Config, group *watchGroup) {
-	if group == nil || group.skipped || group.inspectorsBlock || group.electronAppsBlock {
+	if group == nil || group.skipped || group.inspectorsBlock || group.electronAppsBlock || group.settingsBlock {
 		return
 	}
 	if group.libraryBlock {

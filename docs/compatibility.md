@@ -80,7 +80,9 @@ an arm64 host.
   runs the hooks in the interpreter, several times slower. `check-compatibility` warns.
 - The guard's BPF maps are preallocated kernel memory, about 50 MiB whatever the RAM, on top of
   the daemon's own ~70 MiB. `check-compatibility` reports the running daemon's figure and warns
-  below 1 GiB of RAM.
-- Startup hashes every whitelisted binary; on SD/eMMC storage and CPUs without SHA-2 instructions
-  (Raspberry Pi 4) that takes longer, and logins wait for it. The unit's start timeout is 15
-  minutes.
+  below 1 GiB of RAM. Of that, `guard_inodes` (about 22 MiB) can be shrunk with `max_inodes`
+  in `[settings]` ([Daemon configuration](daemon-config.md#daemon-settings-settings)) when the
+  guarded trees are small.
+- Startup hashes every whitelisted binary once (a binary several sections list is read once); on
+  SD/eMMC storage and CPUs without SHA-2 instructions (Raspberry Pi 4) that takes longer, and
+  logins wait for it. The unit's start timeout is 15 minutes.

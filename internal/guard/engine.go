@@ -87,6 +87,12 @@ type engine struct {
 	pinPrefix   string
 	pinDegraded bool
 	mapsPinned  bool
+
+	// inodeCap is guard_inodes' max_entries for the next load (ConfigureInodeCapacity); 0 = the
+	// object's default, inodeCapDefault. inodeWarned: occupancy is past inodeWarnPercent.
+	inodeCap        uint32
+	inodeCapDefault uint32
+	inodeWarned     bool
 }
 
 var sharedEngine engine
@@ -211,15 +217,19 @@ func (e *engine) unlinkReloadTwinLocked(id uint32) {
 	}
 }
 
-// startLocked loads the objects, attaches every LSM program once and starts the event reader.
-func (e *engine) startLocked() error {
-	shared, mapsErr := supersedeMaps()
-	if mapsErr != nil {
-		return mapsErr
+// loadLocked loads the guard objects, guard_inodes sized by inodeCap.
+func (e *engine) loadLocked() error {
+	shared, err := supersedeMaps()
+	if err != nil {
+		return err
 	}
-	spec, ioctlCompat, specErr := guardSpec()
-	if specErr != nil {
-		return specErr
+	spec, ioctlCompat, err := guardSpec()
+	if err != nil {
+		return err
+	}
+	inodeCapDefault, err := applyInodeCapacity(spec, e.inodeCap)
+	if err != nil {
+		return err
 	}
 	var objs GuardObjects
 	if err := spec.LoadAndAssign(&objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
@@ -227,6 +237,15 @@ func (e *engine) startLocked() error {
 	}
 	e.objs = objs
 	e.ioctlCompat = ioctlCompat
+	e.inodeCapDefault = inodeCapDefault
+	return nil
+}
+
+// startLocked loads the objects, attaches every LSM program once and starts the event reader.
+func (e *engine) startLocked() error {
+	if err := e.loadLocked(); err != nil {
+		return err
+	}
 	e.done = make(chan struct{})
 
 	failedRequired, total := e.attachLocked()
@@ -279,6 +298,7 @@ func (e *engine) startLocked() error {
 	go e.degradeWatchLoop(e.done)
 
 	log.Infof("guard engine — %d/%d LSM hooks attached once for every resource", lsmAttached, total)
+	log.Infof("guard engine: guard_inodes holds up to %d rows", e.objs.GuardInodes.MaxEntries())
 	return nil
 }
 

@@ -296,7 +296,8 @@ else
 	pass "BPF JIT enabled (net.core.bpf_jit_enable=${jit:-n/a})"
 fi
 
-# The guard's BPF maps are preallocated kernel memory, the same size on any host.
+# The guard's BPF maps are preallocated kernel memory, the same size on any host unless
+# daemon.conf [settings] max_inodes resizes guard_inodes.
 mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
 maps_mb=""
 if [ "$(id -u)" -eq 0 ] && command -v bpftool >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
@@ -308,7 +309,7 @@ else
 	maps_note="the daemon's guard maps hold about 50 MiB of kernel memory, whatever the RAM (scripts/kernel-prof.sh measures it)"
 fi
 if [ -n "$mem_kb" ] && [ "$mem_kb" -lt 1048576 ]; then
-	warn "$((mem_kb / 1024)) MiB of RAM — $maps_note, plus the daemon's own ~70 MiB"
+	warn "$((mem_kb / 1024)) MiB of RAM — $maps_note, plus the daemon's own ~70 MiB; with few, small guarded trees, max_inodes in daemon.conf [settings] shrinks guard_inodes (docs/daemon-config.md)"
 elif [ -n "$mem_kb" ]; then
 	pass "$((mem_kb / 1024)) MiB of RAM ($maps_note)"
 fi

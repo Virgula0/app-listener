@@ -128,6 +128,27 @@ memory map, the contents of its *unguarded* open files reachable through `/proc/
 stay denied through `/proc/<pid>/fd`. Never list a shell, an interpreter, `cat`, `ps`, `perf`,
 `gdb` or anything that does what its caller asks.
 
+## Daemon settings: `[settings]`
+
+Daemon-wide `key: value` lines. An unknown or repeated key, or a value out of range, is a config
+error: the daemon refuses to start (a reload keeps the running config).
+
+```ini
+[settings]
+max_inodes: 65536
+```
+
+- **`max_inodes`** sizes `guard_inodes`, the kernel map holding one row per inode of every guarded
+  tree. Default 262144 rows (about 22 MiB of preallocated kernel memory); accepted range 32768 to
+  4194304. Only worth lowering on a small-RAM host with few, small resources: 37 resources
+  (browser profiles, Steam, Discord, AI agents) use about 100,000 rows. `sudo
+  scripts/kernel-prof.sh` prints the running daemon's `guard_inodes_used`.
+- When the map passes 75% the daemon logs `guard_inodes holds N of M rows`, after startup, after
+  each reload and every 10 minutes. Once full, inodes it can't hold are guarded by the ancestor
+  walk alone (`degraded coverage: guard_inodes map full`): raise the value.
+- It is never lowered automatically, and a reload can't resize the live map: a changed value takes
+  effect at the next restart (the reload logs so).
+
 ## Reloading
 
 `sudo systemctl reload app-listener-daemon` re-reads the file. New guards attach before old ones
