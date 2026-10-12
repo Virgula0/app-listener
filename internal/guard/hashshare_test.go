@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -302,5 +303,107 @@ func TestPersistentStoreSkipped(t *testing.T) {
 				t.Fatalf("rows %d lookups %d (want 0, %d)", len(store.rows), store.lookups, tc.lookups)
 			}
 		})
+	}
+}
+
+// Concurrent callers of one inode read it once: the others wait for the published hash. The
+// leader's read is held until every caller has started, so the count doesn't depend on timing.
+func TestConcurrentCallersHashOnce(t *testing.T) {
+	resetSharedHashes(t, 0)
+	p := writeBin(t, "content-a")
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	computeEntryFile = func(f *os.File, path string) (BinaryEntry, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return ebpf.ComputeBinaryEntryFile(f, path)
+	}
+	h0, r0 := hashedReused(t)
+
+	const callers = 8
+	var wg sync.WaitGroup
+	hashes := make([][32]byte, callers)
+	run := func(i int) {
+		defer wg.Done()
+		e, v, err := ConfinedEntry(p)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		v.Close()
+		hashes[i] = e.Hash
+	}
+	wg.Add(1)
+	go run(0)
+	<-started
+	for i := 1; i < callers; i++ {
+		wg.Add(1)
+		go run(i)
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if h, r := hashedReused(t); h-h0 != 1 || r-r0 != callers-1 {
+		t.Fatalf("hashed %d reused %d, want 1 and %d", h-h0, r-r0, callers-1)
+	}
+	for _, h := range hashes {
+		if h != sha256.Sum256([]byte("content-a")) {
+			t.Fatal("a waiter got a wrong hash")
+		}
+	}
+	if len(hashing) != 0 {
+		t.Fatal("an in-flight marker was left behind")
+	}
+}
+
+// A leader whose hash isn't published (here: failed) lets a waiter hash for itself.
+func TestWaiterHashesWhenLeaderFails(t *testing.T) {
+	resetSharedHashes(t, 0)
+	p := writeBin(t, "content-a")
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls sync.Mutex
+	n := 0
+	computeEntryFile = func(f *os.File, path string) (BinaryEntry, error) {
+		calls.Lock()
+		n++
+		first := n == 1
+		calls.Unlock()
+		if first {
+			close(started)
+			<-release
+			return BinaryEntry{}, os.ErrInvalid
+		}
+		return ebpf.ComputeBinaryEntryFile(f, path)
+	}
+	errc := make(chan error, 1)
+	go func() {
+		_, v, err := ConfinedEntry(p)
+		if err == nil {
+			v.Close()
+		}
+		errc <- err
+	}()
+	<-started
+	type result struct {
+		e   BinaryEntry
+		err error
+	}
+	waiter := make(chan result, 1)
+	go func() {
+		e, v, err := ConfinedEntry(p)
+		if err == nil {
+			v.Close()
+		}
+		waiter <- result{e, err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	if err := <-errc; err == nil {
+		t.Fatal("the leader's failure was lost")
+	}
+	r := <-waiter
+	if r.err != nil || r.e.Hash != sha256.Sum256([]byte("content-a")) {
+		t.Fatalf("waiter: %v %x", r.err, r.e.Hash)
 	}
 }

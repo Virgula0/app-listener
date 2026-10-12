@@ -17,8 +17,10 @@ import (
 var (
 	sharedHashMu sync.Mutex
 	sharedHashes = map[GuardInodeKey]sharedHashEntry{}
-	hashStore    HashStore // under sharedHashMu
-	hashStats    struct{ hashed, reused, cached, bytes atomic.Uint64 }
+	// hashing: inodes being hashed now, closed once the hash is published or abandoned (claimHash).
+	hashing   = map[GuardInodeKey]chan struct{}{}
+	hashStore HashStore // under sharedHashMu
+	hashStats struct{ hashed, reused, cached, bytes atomic.Uint64 }
 )
 
 // HashStore persists content hashes across daemon runs (the binary ledger's hash cache), keyed by
@@ -71,14 +73,12 @@ func hashFileShared(f *os.File, path string) (entry BinaryEntry, fp ebpf.BinaryS
 		return entry, fp, err
 	}
 	key := GuardInodeKey{Dev: fp.Dev, Ino: fp.Ino}
-	sharedHashMu.Lock()
-	e, ok := sharedHashes[key]
-	store := hashStore
-	sharedHashMu.Unlock()
-	if ok && e.stat == fp {
+	h, reused, store, done := claimHash(key, fp)
+	if reused {
 		hashStats.reused.Add(1)
-		return ebpf.EntryWithHash(path, e.hash), fp, nil
+		return ebpf.EntryWithHash(path, h), fp, nil
 	}
+	defer done() // after publishHash: a waiter wakes to the published hash
 
 	ds, durable := ebpf.DurableStat{}, false
 	if store != nil {
@@ -107,6 +107,35 @@ func hashFileShared(f *os.File, path string) (entry BinaryEntry, fp ebpf.BinaryS
 		store.StoreHash(ds, entry.Hash)
 	}
 	return entry, fp, nil
+}
+
+// claimHash returns the hash published for key under fp, or makes the caller the only one hashing
+// key (call done when finished): guards built in parallel wait instead of reading one blob several
+// times. A waiter re-checks against its own fp, and hashes itself when nothing matching was
+// published (the file changed, or the hash was unstable or failed).
+func claimHash(key GuardInodeKey, fp ebpf.BinaryStat) (hash [32]byte, reused bool, store HashStore, done func()) {
+	for {
+		sharedHashMu.Lock()
+		if e, ok := sharedHashes[key]; ok && e.stat == fp {
+			sharedHashMu.Unlock()
+			return e.hash, true, nil, nil
+		}
+		if wait, busy := hashing[key]; busy {
+			sharedHashMu.Unlock()
+			<-wait
+			continue
+		}
+		ch := make(chan struct{})
+		hashing[key] = ch
+		store = hashStore
+		sharedHashMu.Unlock()
+		return hash, false, store, func() {
+			sharedHashMu.Lock()
+			delete(hashing, key)
+			sharedHashMu.Unlock()
+			close(ch)
+		}
+	}
 }
 
 func publishHash(key GuardInodeKey, fp ebpf.BinaryStat, hash [32]byte) {
