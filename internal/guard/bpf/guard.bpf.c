@@ -985,9 +985,9 @@ static __always_inline bool sb_unguarded(struct inode *inode)
 	return !bpf_map_lookup_elem(&guard_fs_sbdevs, &dev);
 }
 
-// off_guarded_fs is a fast "not guarded" for the per-read/stat hooks (pipes, sockets, tmpfs...):
-// is_guarded_access answers 0 there anyway, root_in_chain judging file_inode's superblock and the
-// ancestor walk the dentry's. Both must be unguarded: an overlayfs backing file's f_inode and
+// off_guarded_fs is a fast "not guarded" (pipes, sockets, tmpfs...) for hooks whose only decision
+// is is_guarded_access, which answers 0 there anyway: root_in_chain judges file_inode's superblock,
+// the ancestor walk the dentry's. Both must be unguarded: an overlayfs backing file's f_inode and
 // f_path differ. Sound because every root superblock is in guard_fs_sbdevs before its resource
 // owns any guard_inodes row (populateMaps, fail-closed) and is never removed.
 static __always_inline bool off_guarded_fs(struct dentry *dentry, struct inode *file_inode)
@@ -1554,7 +1554,7 @@ int guard_mmap_file(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
-	if (is_guarded_access(dentry, inode, &res)) {
+	if (!off_guarded_fs(dentry, inode) && is_guarded_access(dentry, inode, &res)) {
 		unsigned long prot = (unsigned long)ctx[2];
 		unsigned long flags = (unsigned long)ctx[3];
 		bool is_write_map = (prot & PROT_WRITE) && (flags & MAP_SHARED);
@@ -1623,7 +1623,7 @@ int guard_file_truncate(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
-	if (is_guarded_access(dentry, inode, &res)) {
+	if (!off_guarded_fs(dentry, inode) && is_guarded_access(dentry, inode, &res)) {
 		int ret = check_and_emit(EVENT_WRITE, dentry, NULL, false, NULL, false, false, res);
 		if (ret == 0 && !is_readonly_mode(res))
 			mark_tainted(res);
@@ -2046,7 +2046,7 @@ int guard_inode_setattr(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
-	if (!is_guarded_access(dentry, inode, &res))
+	if (off_guarded_fs(dentry, inode) || !is_guarded_access(dentry, inode, &res))
 		return 0;
 
 	struct iattr *attr = (struct iattr *)ctx[2];
@@ -2203,7 +2203,7 @@ int guard_inode_readlink(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
-	if (is_guarded_access(dentry, inode, &res))
+	if (!off_guarded_fs(dentry, inode) && is_guarded_access(dentry, inode, &res))
 		return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false, res);
 
 	return 0;
@@ -2226,7 +2226,7 @@ int guard_inode_getxattr(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
-	if (is_guarded_access(dentry, inode, &res))
+	if (!off_guarded_fs(dentry, inode) && is_guarded_access(dentry, inode, &res))
 		return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false, res);
 
 	return 0;
@@ -2245,7 +2245,7 @@ int guard_inode_listxattr(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
-	if (is_guarded_access(dentry, inode, &res))
+	if (!off_guarded_fs(dentry, inode) && is_guarded_access(dentry, inode, &res))
 		return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false, res);
 
 	return 0;
