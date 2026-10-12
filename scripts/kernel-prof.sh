@@ -5,7 +5,8 @@
 #
 #   1. per-program BPF run time (kernel.bpf_stats_enabled), which is charged to
 #      EVERY process that hits a guarded LSM hook, not to the daemon;
-#   2. kernel memory held by the BPF maps (bytes_memlock, not in the daemon's RSS);
+#   2. kernel memory held by the BPF maps (bytes_memlock, not in the daemon's RSS) and how full
+#      guard_inodes is;
 #   3. a `perf record` of the daemon with user + kernel stacks (its sys time);
 #   4. the daemon's utime/stime over the window, RSS, threads, open fds.
 #
@@ -76,6 +77,11 @@ perf report -i "$OUT/perf.data" --stdio --no-children --sort sym -g caller,0.5,c
 	grep -E 'VmRSS|VmHWM|RssAnon|RssFile|Threads' /proc/"$PID"/status
 	echo "open_fds=$(find /proc/"$PID"/fd -mindepth 1 -maxdepth 1 | wc -l)"
 	awk 'NR > 1 { s += $5 } END { printf "bpf_maps_memlock_total_bytes=%d\n", s }' "$OUT/bpf-maps.txt"
+	# Occupancy vs max_entries: the only sound basis for ever resizing guard_inodes (a full map
+	# degrades inode discovery to the ancestor walk).
+	used=$(bpftool -j map dump name guard_inodes 2>/dev/null | jq length 2>/dev/null || echo "?")
+	max=$(bpftool -j map show name guard_inodes 2>/dev/null | jq -r '.max_entries // "?"' 2>/dev/null || echo "?")
+	echo "guard_inodes_used=$used guard_inodes_max=$max"
 } > "$OUT/proc.txt"
 
 [[ -n ${SUDO_USER:-} ]] && chown -R "$SUDO_USER": "$OUT"

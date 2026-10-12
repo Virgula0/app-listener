@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -314,7 +315,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			"self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 	}
 
-	notifySystemdReady()
+	markReady()
 
 	if err := writePidFile(); err != nil {
 		return err
@@ -1214,6 +1215,14 @@ func eventFilterOptions() []guard.GuardOption {
 		opts = append(opts, guard.WithoutAllowedEvents())
 	}
 	return opts
+}
+
+// markReady tells systemd the guards are up, then returns the startup peak (catalog, ELF closures,
+// populate: well above the steady-state heap) to the OS now rather than over the scavenger's
+// minutes, for small-RAM hosts.
+func markReady() {
+	notifySystemdReady()
+	go debug.FreeOSMemory()
 }
 
 // notifySystemdReady sends READY=1: the unit is Type=notify, so logins and cron, ordered after it,

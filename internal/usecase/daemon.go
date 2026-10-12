@@ -13,6 +13,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
+	"github.com/Virgula0/app-listener/internal/pulse"
 	"github.com/Virgula0/app-listener/internal/repository"
 )
 
@@ -347,23 +348,32 @@ func (d *daemonUseCase) startGuards() error {
 	return nil
 }
 
+// One process-wide pulse per cadence: dozens of resources wake the daemon once per period, not
+// once each. Each loop still runs its own work (serialized with its events), late rather than lost.
+var (
+	sweepPulse      = pulse.New(resyncSweepEvery)
+	inodeGCPulse    = pulse.New(inodeGCEvery)
+	followRootPulse = pulse.New(fileRootFollowEvery)
+)
+
 func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardRepository, stop <-chan struct{}) {
-	sweep := time.NewTicker(resyncSweepEvery)
-	defer sweep.Stop()
-	inodeGC := time.NewTicker(inodeGCEvery)
-	defer inodeGC.Stop()
+	sweep := sweepPulse.Subscribe()
+	inodeGC := inodeGCPulse.Subscribe()
 	// nil (never fires) unless the resource is a single file; a watch root doesn't change type
 	// while guarded.
-	var followRoot <-chan time.Time
+	var follow *pulse.Sub
 	if info, err := os.Lstat(resource); err == nil && !info.IsDir() {
-		follow := time.NewTicker(fileRootFollowEvery)
-		defer follow.Stop()
-		followRoot = follow.C
+		follow = followRootPulse.Subscribe()
 	}
 	var lastResync time.Time
 	for {
+		var followRoot <-chan struct{}
+		if follow != nil {
+			followRoot = follow.C()
+		}
 		select {
 		case <-followRoot:
+			follow.Ack()
 			// Errors are left to the periodic sweep, which reports them at a sane rate.
 			_ = g.SweepInodes()
 		case ev, ok := <-g.Events():
@@ -373,10 +383,12 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 			if !d.dispatchGuardEvent(resource, g, &ev, stop, &lastResync) {
 				return
 			}
-		case <-sweep.C:
+		case <-sweep.C():
+			sweep.Ack()
 			d.periodicSweep(resource, g)
 			lastResync = time.Now()
-		case <-inodeGC.C:
+		case <-inodeGC.C():
+			inodeGC.Ack()
 			if err := g.ReconcileInodes(); err != nil {
 				log.Warnf("daemon: periodic inode GC for %s: %v", resource, err)
 			}

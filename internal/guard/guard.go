@@ -22,6 +22,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/logging"
+	"github.com/Virgula0/app-listener/internal/pulse"
 )
 
 type Mode int
@@ -2213,14 +2214,17 @@ func (g *Guard) startBinaryHashVerifier() {
 	go g.verifyBinaryHashLoop()
 }
 
+// binaryVerifyPulse: one shared tick for every guard's verifier (see pulse.Sub's delivery rule).
+var binaryVerifyPulse = pulse.New(binaryHashVerifyInterval)
+
 func (g *Guard) verifyBinaryHashLoop() {
-	ticker := time.NewTicker(binaryHashVerifyInterval)
-	defer ticker.Stop()
+	tick := binaryVerifyPulse.Subscribe()
 	for {
 		select {
 		case <-g.verifyStop:
 			return
-		case <-ticker.C:
+		case <-tick.C():
+			tick.Ack()
 			g.verifyBinaryHashesOnce()
 		}
 	}

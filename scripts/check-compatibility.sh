@@ -291,9 +291,26 @@ esac
 
 jit="$(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || true)"
 if [ "$jit" = "0" ]; then
-	warn "net.core.bpf_jit_enable=0 — some programs may fail to load; set it to 1"
+	warn "net.core.bpf_jit_enable=0 — some programs may fail to load, and every guarded read/write/stat would run the hooks in the BPF interpreter, several times slower; set it to 1"
 else
 	pass "BPF JIT enabled (net.core.bpf_jit_enable=${jit:-n/a})"
+fi
+
+# The guard's BPF maps are preallocated kernel memory, the same size on any host.
+mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+maps_mb=""
+if [ "$(id -u)" -eq 0 ] && command -v bpftool >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+	maps_mb="$(bpftool -j map show 2>/dev/null | jq '[.[] | select((.name // "") | test("^(guard_|trust_|exe_)|^rb$")) | .bytes_memlock // 0] | add // 0 | . / 1048576 | floor' 2>/dev/null || true)"
+fi
+if [ -n "$maps_mb" ] && [ "$maps_mb" != "0" ]; then
+	maps_note="the running daemon's guard maps hold ${maps_mb} MiB of kernel memory"
+else
+	maps_note="the daemon's guard maps hold about 50 MiB of kernel memory, whatever the RAM (scripts/kernel-prof.sh measures it)"
+fi
+if [ -n "$mem_kb" ] && [ "$mem_kb" -lt 1048576 ]; then
+	warn "$((mem_kb / 1024)) MiB of RAM — $maps_note, plus the daemon's own ~70 MiB"
+elif [ -n "$mem_kb" ]; then
+	pass "$((mem_kb / 1024)) MiB of RAM ($maps_note)"
 fi
 
 [ "$(id -u)" -ne 0 ] && warn "not running this check as root — 'app-listener install' and every mode need root (sudo)"

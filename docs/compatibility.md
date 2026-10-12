@@ -73,3 +73,14 @@ arm64 BPF trampoline).
 
 Source builds are native only: the eBPF is compiled against the build host's BTF, so build arm64 on
 an arm64 host.
+
+## Low-end hardware
+
+- Keep the BPF JIT on (`net.core.bpf_jit_enable=1`): without it every guarded read, write and stat
+  runs the hooks in the interpreter, several times slower. `check-compatibility` warns.
+- The guard's BPF maps are preallocated kernel memory, about 50 MiB whatever the RAM, on top of
+  the daemon's own ~70 MiB. `check-compatibility` reports the running daemon's figure and warns
+  below 1 GiB of RAM.
+- Startup hashes every whitelisted binary; on SD/eMMC storage and CPUs without SHA-2 instructions
+  (Raspberry Pi 4) that takes longer, and logins wait for it. The unit's start timeout is 15
+  minutes.
