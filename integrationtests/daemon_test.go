@@ -67,10 +67,10 @@ func parseDaemonEvents(logContent string) []daemonEvent {
 
 // startDaemon writes the config, starts the daemon headless and waits for
 // the pid file (written after guards attach and readers run).
-func (s *IntegrationSuite) startDaemon(c testcontainers.Container, config string) {
+func (s *IntegrationSuite) startDaemon(c testcontainers.Container, config string, flags ...string) {
 	writeConfig := fmt.Sprintf("cat > /etc/app-listener/daemon.conf <<'EOF'\n%s\nEOF", config)
 	s.exec(c, []string{"sh", "-c", writeConfig})
-	s.launchDaemon(c)
+	s.launchDaemon(c, flags...)
 	s.awaitDaemonUp(c, config)
 }
 
@@ -94,15 +94,16 @@ func watchPathsInConfig(config string) []string {
 // launchDaemon backgrounds the daemon on the already-written daemon.conf without waiting for it.
 // Split from startDaemon so a caller can start a racer right before this call and stop it once
 // awaitDaemonUp returns (daemon_toctou_test.go).
-func (s *IntegrationSuite) launchDaemon(c testcontainers.Container) {
+func (s *IntegrationSuite) launchDaemon(c testcontainers.Container, flags ...string) {
 	s.confirmConfigBinaries(c)
-	s.launchDaemonUnconfirmed(c)
+	s.launchDaemonUnconfirmed(c, flags...)
 }
 
 // launchDaemonUnconfirmed starts the daemon without confirming daemon.conf's binaries first: what
 // the binary ledger tests (daemon_ledger_test.go) need to see refused.
-func (s *IntegrationSuite) launchDaemonUnconfirmed(c testcontainers.Container) {
-	cmd := "nohup /app-listener daemon --config /etc/app-listener/daemon.conf --headless > /tmp/daemon.log 2>&1 &"
+func (s *IntegrationSuite) launchDaemonUnconfirmed(c testcontainers.Container, flags ...string) {
+	cmd := "nohup /app-listener daemon --config /etc/app-listener/daemon.conf --headless " +
+		strings.Join(flags, " ") + " > /tmp/daemon.log 2>&1 &"
 	code, out := s.exec(c, []string{"sh", "-c", cmd})
 	s.Require().Equalf(0, code, "starting daemon: %s", out)
 }
