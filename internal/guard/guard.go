@@ -1256,7 +1256,14 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 // ReSyncBinaries re-stats whitelisted binaries and admits a replacement inode only when the
 // SetReplacementCheck check approves it. A replaced key stays admitted for processes started
 // before its supersede (supersede.go). Still-deferred rules are retried.
-func (g *Guard) ReSyncBinaries() (int, error) {
+func (g *Guard) ReSyncBinaries() (int, error) { return g.reSyncBinaries(false) }
+
+// SweepReSyncBinaries is ReSyncBinaries for the periodic sweep: a binary that another guard's
+// confined open resolved, moments ago, to the key this guard deploys is skipped (sweepShared).
+// Deferred rules, links and system matches are still re-checked fresh.
+func (g *Guard) SweepReSyncBinaries() (int, error) { return g.reSyncBinaries(true) }
+
+func (g *Guard) reSyncBinaries(shared bool) (int, error) {
 	// Retry deferred rules first; addBinaryActions records newly resolved binaries in deployed, so the pass below skips them.
 	resolved, resolvedEvents, links, stillDeferred := g.resolveDeferred()
 	if err := g.retryDeferredBinaries(resolved, resolvedEvents, links, stillDeferred); err != nil {
@@ -1273,6 +1280,9 @@ func (g *Guard) ReSyncBinaries() (int, error) {
 
 	var changed int
 	for _, b := range binaries {
+		if shared && g.unchangedPerShared(b.Path, time.Now()) {
+			continue
+		}
 		ok, err := g.resyncOne(b.Path, exeEvents)
 		if err != nil {
 			return changed, err
@@ -1309,6 +1319,7 @@ func (g *Guard) resyncOne(binPath string, exeEvents map[string][]ebpf.EventType)
 		return false, nil // unreadable now: keep the deployed key
 	}
 	key := GuardInodeKey{Dev: dev, Ino: ino}
+	sweepShared.record(binPath, path, key, time.Now())
 
 	g.mu.Lock()
 	old, deployed := g.deployed[path]

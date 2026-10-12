@@ -430,7 +430,7 @@ func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRe
 // single-file root, or a directory that gained/lost a top-level entry); an unconditional re-walk
 // per tick was a large share of steady-state CPU.
 func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardRepository) {
-	if _, err := g.ReSyncBinaries(); err != nil {
+	if _, err := g.SweepReSyncBinaries(); err != nil {
 		log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
 	}
 	if err := g.SweepInodes(); err != nil {
