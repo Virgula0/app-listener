@@ -119,7 +119,7 @@ it aborts. Every command it may run is listed in `internal/fscrypt/prereq.go`.
 | `--update-catalog-only` | Re-expands every catalog-matched whitelist and rewrites the config, dropping every line the catalog does not produce. Stops the daemon and unlocks each vault under an ephemeral self-only guard. The running daemon already does this on its own (see [catalog refresh](catalog.md#catalog-refresh)), so you normally never need it. |
 | `--live` | With `--update-catalog-only`: refresh without stopping the daemon (no lock churn), applied via SIGHUP. Requires the daemon to be running. |
 | `--allow-metadata-output` | Installs the daemon unit **without** `--no-log-metadata-blocks`, so denied metadata-only process inspections (`op=PTRACE mode=READ`) are logged. Use it to diagnose an app that breaks with nothing logged; re-run `install` without it to quiet them again. |
-| `--binary-only` | Moves the freshly built binary to the install path and recreates the PATH symlink. No wizard, config, fscrypt or units. If the daemon service is installed, asks whether to restart it now. |
+| `--binary-only` | Moves the freshly built binary to the install path and recreates the PATH symlink. No wizard, config or fscrypt. If the daemon service is installed, diffs its unit against the one the new build ships (replaced only if you accept, as with [`update`](#update)) and asks whether to restart it now; a skipped restart applies the accepted unit on the next one. |
 | `--restore-backups` | Undoes the fscrypt migration: lists the `.app_listener.backup` directories, and after one confirmation deletes the encrypted copies and moves the backups back. Refused while the daemon runs. |
 | `--delete-post-backups` | Deletes the `.app_listener.backup` directories (listed, confirmed once). |
 | `-y, --yes` | Skips confirmation prompts (for `--update-catalog-only` in scripts). |
@@ -139,6 +139,13 @@ Self-updates from the latest signed release of `--channel` (`stable`, the defaul
 `pre-release`), fetching the asset for the running binary's architecture. The Ed25519 signature,
 signed asset name, checksum, GitHub asset digest and ELF machine are all verified before anything
 is written.
+
+When the daemon service is installed, `update` also compares the systemd unit the new release ships
+(`/etc/systemd/system/app-listener-daemon.service`) with the installed one. If they differ, it shows
+the diff and asks whether to replace it; declining keeps the installed unit and still updates the
+binary. The new unit is written while the daemon is stopped, so the restart already runs under it.
+With `--yes` the new unit is accepted and the diff is logged. An installed unit without
+`--no-log-metadata-blocks` (`install --allow-metadata-output`) keeps that choice.
 
 ## Uninstall
 
