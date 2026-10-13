@@ -140,6 +140,11 @@ Self-updates from the latest signed release of `--channel` (`stable`, the defaul
 signed asset name, checksum, GitHub asset digest and ELF machine are all verified before anything
 is written.
 
+The changelog covers every release of the channel between the installed version and the new one,
+newest first, with a link to the full compare. If the installed version is not among the fetched
+releases (a local `dev` build, or older than the 100 newest), it shows every fetched release up to
+the new one and says so.
+
 When the daemon service is installed, `update` also compares the systemd unit the new release ships
 (`/etc/systemd/system/app-listener-daemon.service`) with the installed one. If they differ, it shows
 the diff and asks whether to replace it; declining keeps the installed unit and still updates the

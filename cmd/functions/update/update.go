@@ -91,8 +91,9 @@ newer one exists:
      then the checksum against the downloaded binary, and the
      GitHub-provided asset digest when present — a failed verification
      aborts the update
-  3. shows the release changelog in a TUI viewer and asks for confirmation
-     before anything is changed
+  3. shows the changelog in a TUI viewer, covering every release of the
+     channel between the installed version and the new one, and asks for
+     confirmation before anything is changed
   4. compares the daemon's systemd unit the new release ships with the
      installed one and, when they differ, shows the diff and asks whether
      to replace it (an installed unit without --no-log-metadata-blocks
@@ -209,7 +210,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	proceed, err := confirmUpdate(&latest)
+	proceed, err := confirmUpdate(&latest, cumulativeChangelog(installed, &latest, releases, channelFlag))
 	if err != nil {
 		return err
 	}
@@ -287,16 +288,16 @@ func downloadAndVerify(tmp string, r *githubRelease, assets releaseAssets, binUR
 
 // confirmUpdate: --yes logs the changelog and proceeds; otherwise the notes open in a TUI viewer
 // (non-tty aborts) and the user confirms.
-func confirmUpdate(r *githubRelease) (bool, error) {
+func confirmUpdate(r *githubRelease, notes string) (bool, error) {
 	if yesFlag {
 		log.Infof("--yes given: skipping the changelog viewer and the confirmation prompt")
-		log.Infof("changelog of %s:\n%s", r.TagName, changelogText(r))
+		log.Infof("changelog up to %s:\n%s", r.TagName, notes)
 		return true, nil
 	}
 	if !isTerminal(os.Stdin) {
 		return false, errors.New("stdin is not a terminal: interactive confirmation is impossible; re-run with --yes to update without prompts")
 	}
-	if err := showChangelog(r.TagName, changelogText(r)); err != nil {
+	if err := showChangelog(r.TagName, notes); err != nil {
 		return false, fmt.Errorf("showing the changelog: %w", err)
 	}
 	ok, err := wizard.ConfirmOnce(fmt.Sprintf("Update to %s now?", r.TagName), "Update")
