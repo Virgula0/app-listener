@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
 func TestValidateMaintenanceFlags(t *testing.T) {
@@ -51,7 +52,7 @@ func TestDaemonUnitWithMetadataOutput(t *testing.T) {
 	if !bytes.Contains(unit, []byte("--no-log-metadata-blocks")) {
 		t.Fatal("the bundled unit is expected to quiet metadata denials by default")
 	}
-	got := daemonUnitWithMetadataOutput(unit)
+	got := systemd.DaemonUnitWithMetadataOutput(unit)
 	if bytes.Contains(got, []byte("--no-log-metadata-blocks")) {
 		t.Fatalf("flag still present:\n%s", got)
 	}

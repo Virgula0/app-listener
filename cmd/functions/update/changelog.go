@@ -2,7 +2,9 @@ package update
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
@@ -26,6 +28,82 @@ func changelogText(r *githubRelease) string {
 		return notes
 	}
 	return fmt.Sprintf("No changelog available for this release.\n\nTag: %s\nPublished: %s", r.TagName, r.PublishedAt)
+}
+
+// cumulativeChangelog joins the notes of every channel release after installed up to latest,
+// newest first: each release's notes cover only the step from its predecessor.
+func cumulativeChangelog(installed string, latest *githubRelease, all []githubRelease, channel string) string {
+	span, found := releasesSince(installed, latest, all, channel)
+	if len(span) == 1 && found {
+		return changelogText(&span[0])
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Changes from %s to %s (%d releases)\n", installed, latest.TagName, len(span))
+	if found {
+		fmt.Fprintf(&b, "Full diff: https://github.com/%s/compare/%s...%s\n", defaultRepo, installed, latest.TagName)
+	} else {
+		fmt.Fprintf(&b, "The installed version %s is not among the fetched releases: showing every fetched %s release up to %s.\n",
+			installed, channel, latest.TagName)
+	}
+	for i := range span {
+		fmt.Fprintf(&b, "\n# %s (published %s)\n\n%s\n", span[i].TagName, span[i].PublishedAt, changelogText(&span[i]))
+	}
+	return b.String()
+}
+
+// releasesSince returns the channel releases newer than installed and not newer than latest, newest
+// first; latest is always included. found is false when installed's own release is unknown, so the
+// lower bound is missing and every fetched release up to latest is returned. Stable tags compare by
+// semver; anything else by published_at, located in all (any channel) so a channel switch works.
+func releasesSince(installed string, latest *githubRelease, all []githubRelease, channel string) (span []githubRelease, found bool) {
+	w := newReleaseWindow(installed, latest, all, channel)
+	for _, r := range filterChannel(all, channel) {
+		if r.TagName != latest.TagName && w.contains(&r) {
+			span = append(span, r)
+		}
+	}
+	span = append(span, *latest)
+	slices.SortStableFunc(span, func(a, b githubRelease) int { return w.newestFirst(&a, &b) })
+	return span, w.found
+}
+
+// releaseWindow is the (installed, latest] interval releasesSince selects.
+type releaseWindow struct {
+	installedVer, latestVer stableVersion
+	bySemver, found         bool
+	installedAt, latestAt   time.Time
+}
+
+func newReleaseWindow(installed string, latest *githubRelease, all []githubRelease, channel string) releaseWindow {
+	w := releaseWindow{latestAt: latestTime(latest)}
+	var installedOK, latestOK bool
+	w.installedVer, installedOK = parseStableVersion(installed)
+	w.latestVer, latestOK = parseStableVersion(latest.TagName)
+	w.bySemver = channel == channelStable && installedOK && latestOK
+	for i := range all {
+		if all[i].TagName == installed {
+			w.installedAt, w.found = latestTime(&all[i]), true
+		}
+	}
+	w.found = w.found || w.bySemver
+	return w
+}
+
+func (w *releaseWindow) contains(r *githubRelease) bool {
+	if v, ok := parseStableVersion(r.TagName); w.bySemver && ok {
+		return compareStableVersions(v, w.installedVer) > 0 && compareStableVersions(v, w.latestVer) <= 0
+	}
+	at := latestTime(r)
+	return !at.IsZero() && !at.After(w.latestAt) && (!w.found || at.After(w.installedAt))
+}
+
+func (w *releaseWindow) newestFirst(a, b *githubRelease) int {
+	va, oka := parseStableVersion(a.TagName)
+	vb, okb := parseStableVersion(b.TagName)
+	if w.bySemver && oka && okb {
+		return compareStableVersions(vb, va)
+	}
+	return latestTime(b).Compare(latestTime(a))
 }
 
 // showChangelog displays release notes in a full-screen read-only TUI

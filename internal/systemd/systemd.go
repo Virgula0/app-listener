@@ -342,9 +342,10 @@ func DaemonUnitInstalled() bool {
 }
 
 // DeployInstalledBinary installs srcPath as the service binary: stops the daemon (outside-systemd
-// is fatal), replaces it atomically, recreates the PATH symlink, restores enabled-and-running.
-// Shared by update/install. If the unit isn't installed it stops after the replace and symlink.
-func DeployInstalledBinary(srcPath string) error {
+// is fatal), replaces it atomically, recreates the PATH symlink, writes unit (nil keeps the
+// installed daemon unit) and restores enabled-and-running. Shared by update/install. If the unit
+// isn't installed it stops after the replace and symlink.
+func DeployInstalledBinary(srcPath string, unit []byte) error {
 	if err := StopDaemonIfRunning(); err != nil {
 		return err
 	}
@@ -363,17 +364,35 @@ func DeployInstalledBinary(srcPath string) error {
 		return nil
 	}
 
+	// Written while stopped, so the next start is the first to run under the new unit. A failure
+	// leaves the daemon stopped: its vaults were verified locked by StopDaemonIfRunning.
+	if unit != nil {
+		if err := WriteDaemonUnit(unit); err != nil {
+			return fmt.Errorf("%w — the new binary is installed but the daemon is left stopped (vaults locked): fix the unit, then systemctl daemon-reload && systemctl start %s", err, DaemonServiceName)
+		}
+	}
+
 	return EnableAndVerify(false)
 }
 
 // DeployInstalledBinaryNoRestart installs the service binary WITHOUT stopping a running daemon: the
 // atomic rename-over means it keeps executing its old unlinked inode, so guards stay attached and
-// unlocked vaults are untouched. For `install --binary-only` when the admin skips the restart; the
-// caller must tell them to restart manually.
-func DeployInstalledBinaryNoRestart(srcPath string) error {
+// unlocked vaults are untouched. A non-nil unit is written and daemon-reloaded, taking effect on the
+// next restart. For `install --binary-only` when the admin skips the restart; the caller must tell
+// them to restart manually.
+func DeployInstalledBinaryNoRestart(srcPath string, unit []byte) error {
 	if err := ReplaceInstalledBinary(srcPath, InstallBinaryPath); err != nil {
 		return err
 	}
 	log.Infof("installed binary at %s (daemon restart skipped)", InstallBinaryPath)
-	return EnsureBinSymlink()
+	if err := EnsureBinSymlink(); err != nil {
+		return err
+	}
+	if unit == nil {
+		return nil
+	}
+	if err := WriteDaemonUnit(unit); err != nil {
+		return err
+	}
+	return RunCmd("systemctl", "daemon-reload")
 }

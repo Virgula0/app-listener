@@ -32,6 +32,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Virgula0/app-listener/certificates"
+	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
@@ -60,7 +61,7 @@ var preVersionRe = regexp.MustCompile(preVersionPattern)
 
 var stableVersionRe = regexp.MustCompile(stableVersionPattern)
 
-// yesFlag skips the changelog viewer and the confirmation prompt.
+// yesFlag skips the changelog viewer and the confirmation prompts (a changed unit is accepted).
 var yesFlag bool
 
 // channelFlag selects the tracked release channel (default channelStable).
@@ -68,7 +69,7 @@ var channelFlag string
 
 func init() {
 	UpdateCmd.Flags().BoolVar(&yesFlag, "yes", false,
-		"update without the changelog viewer and confirmation prompt")
+		"update without the changelog viewer and confirmation prompts (a changed daemon unit is accepted, its diff logged)")
 	UpdateCmd.Flags().StringVar(&channelFlag, "channel", channelStable,
 		"release channel to track: stable or pre-release")
 }
@@ -90,10 +91,15 @@ newer one exists:
      then the checksum against the downloaded binary, and the
      GitHub-provided asset digest when present — a failed verification
      aborts the update
-  3. shows the release changelog in a TUI viewer and asks for confirmation
-     before anything is changed
-  4. replaces the installed binary atomically
-  5. restarts the systemd daemon (it is stopped first so the watch
+  3. shows the changelog in a TUI viewer, covering every release of the
+     channel between the installed version and the new one, and asks for
+     confirmation before anything is changed
+  4. compares the daemon's systemd unit the new release ships with the
+     installed one and, when they differ, shows the diff and asks whether
+     to replace it (an installed unit without --no-log-metadata-blocks
+     keeps that choice)
+  5. replaces the installed binary atomically (and the unit, if accepted)
+  6. restarts the systemd daemon (it is stopped first so the watch
      directories are verified locked again before the new binary starts)
 
 The stable channel tracks non-pre-release releases (vX.Y.Z tags); the
@@ -101,8 +107,9 @@ pre-release channel tracks the pre-YYYYMMDD-<sha> builds produced by the
 release workflow.
 
 When stdin is not a terminal the command aborts without updating; use
---yes to update without the viewer and the prompt (for scripts and
-cron jobs). The repository is fixed: only releases of the signing
+--yes to update without the viewer and the prompts (for scripts and
+cron jobs; a changed daemon unit is then accepted and its diff logged).
+The repository is fixed: only releases of the signing
 repository are accepted.`,
 	Args: cobra.NoArgs,
 	RunE: runUpdate,
@@ -203,7 +210,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	proceed, err := confirmUpdate(&latest)
+	proceed, err := confirmUpdate(&latest, cumulativeChangelog(installed, &latest, releases, channelFlag))
 	if err != nil {
 		return err
 	}
@@ -212,7 +219,24 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	return applyUpdate(binPath)
+	// Asked before anything changes: the new release's unit is read from the verified download.
+	unit, err := systemd.PlanDaemonUnitUpdate(binPath, confirmUnit(yesFlag))
+	if err != nil {
+		return err
+	}
+
+	return applyUpdate(binPath, unit)
+}
+
+// confirmUnit shows the daemon unit diff and asks; autoConfirm logs the diff and accepts it.
+func confirmUnit(autoConfirm bool) systemd.ConfirmUnitFunc {
+	if !autoConfirm {
+		return inst.ConfirmOverwrite
+	}
+	return func(path string, installed, desired []byte) (bool, error) {
+		log.Infof("--yes given: updating %s to the new release's unit:\n%s", path, inst.UnifiedDiff(string(installed), string(desired)))
+		return true, nil
+	}
 }
 
 // checkUpdatePreconditions refuses non-root, a bad --channel, an arch with no release, or a
@@ -264,16 +288,16 @@ func downloadAndVerify(tmp string, r *githubRelease, assets releaseAssets, binUR
 
 // confirmUpdate: --yes logs the changelog and proceeds; otherwise the notes open in a TUI viewer
 // (non-tty aborts) and the user confirms.
-func confirmUpdate(r *githubRelease) (bool, error) {
+func confirmUpdate(r *githubRelease, notes string) (bool, error) {
 	if yesFlag {
 		log.Infof("--yes given: skipping the changelog viewer and the confirmation prompt")
-		log.Infof("changelog of %s:\n%s", r.TagName, changelogText(r))
+		log.Infof("changelog up to %s:\n%s", r.TagName, notes)
 		return true, nil
 	}
 	if !isTerminal(os.Stdin) {
 		return false, errors.New("stdin is not a terminal: interactive confirmation is impossible; re-run with --yes to update without prompts")
 	}
-	if err := showChangelog(r.TagName, changelogText(r)); err != nil {
+	if err := showChangelog(r.TagName, notes); err != nil {
 		return false, fmt.Errorf("showing the changelog: %w", err)
 	}
 	ok, err := wizard.ConfirmOnce(fmt.Sprintf("Update to %s now?", r.TagName), "Update")
@@ -679,10 +703,10 @@ func sanityCheckBinary(path, wantVersion string, machine elf.Machine) error {
 	return nil
 }
 
-// applyUpdate stops the daemon (verifying lock state), atomically replaces the binary and brings
-// the unit back to enabled-and-running.
-func applyUpdate(binPath string) error {
-	if err := systemd.DeployInstalledBinary(binPath); err != nil {
+// applyUpdate stops the daemon (verifying lock state), atomically replaces the binary, writes unit
+// when non-nil and brings the daemon back to enabled-and-running.
+func applyUpdate(binPath string, unit []byte) error {
+	if err := systemd.DeployInstalledBinary(binPath, unit); err != nil {
 		return err
 	}
 	log.Info("update complete: the daemon is running the new binary")

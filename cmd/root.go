@@ -117,6 +117,7 @@ func init() {
 	rootCmd.AddCommand(install.InstallCmd)
 	rootCmd.AddCommand(uninstall.UninstallCmd)
 	rootCmd.AddCommand(update.UpdateCmd)
+	rootCmd.AddCommand(update.DaemonUnitCmd)
 	rootCmd.AddCommand(editprotected.EditProtectedCmd)
 	rootCmd.AddCommand(trustbinaries.TrustBinariesCmd)
 }

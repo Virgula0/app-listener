@@ -36,11 +36,6 @@ func mustCwd() string {
 // allowMetadataOutput is install --allow-metadata-output.
 var allowMetadataOutput bool
 
-// daemonUnitWithMetadataOutput drops --no-log-metadata-blocks from the daemon unit's ExecStart.
-func daemonUnitWithMetadataOutput(unit []byte) []byte {
-	return bytes.ReplaceAll(unit, []byte(" --no-log-metadata-blocks"), nil)
-}
-
 func installUnit(name string) error {
 	dest := filepath.Join(systemd.SystemdDir, name)
 	if name != systemd.DaemonServiceName+".service" || !allowMetadataOutput {
@@ -50,7 +45,7 @@ func installUnit(name string) error {
 	if err != nil {
 		return err
 	}
-	return upsertFile(dest, dest, daemonUnitWithMetadataOutput(data), 0o644, -1)
+	return upsertFile(dest, dest, systemd.DaemonUnitWithMetadataOutput(data), 0o644, -1)
 }
 
 // installServices copies the embedded unit files from daemon-samples into place (skipping
