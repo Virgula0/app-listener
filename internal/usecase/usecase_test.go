@@ -86,6 +86,8 @@ func (f *fakeGuardRepo) ResolvePendingBinaries() error {
 	return nil
 }
 
+func (f *fakeGuardRepo) SweepReSyncBinaries() (int, error) { return f.ReSyncBinaries() }
+
 func (f *fakeGuardRepo) ReSyncBinaries() (int, error) {
 	if f.resyncErr != nil {
 		return 0, f.resyncErr

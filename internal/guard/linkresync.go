@@ -86,7 +86,7 @@ func (g *Guard) resyncLink(link, target string, exeEvents map[string][]ebpf.Even
 		}
 		return false, nil
 	}
-	entry, err := ebpf.ComputeBinaryEntryFile(f, resolved)
+	entry, _, err := hashFileShared(f, resolved)
 	if err != nil {
 		return false, nil
 	}
@@ -136,7 +136,7 @@ func (g *Guard) retargetLink(link, target string, entry BinaryEntry, key, old Gu
 	delete(g.retired, resolved)
 	g.keyPaths[key] = resolved
 	if g.binaryVerifyStates != nil {
-		g.binaryVerifyStates[resolved] = &binaryVerifyState{key: key, hash: entry.Hash}
+		g.binaryVerifyStates[resolved] = newVerifyState(key, entry.Hash)
 	}
 	if named {
 		return

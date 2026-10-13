@@ -50,6 +50,22 @@ The first start after upgrading from a version without the ledger records what i
 (with a warning). Lines the install wizard just added are recorded at the next start. The ledger
 is self-guarded with the rest of `/etc/app-listener` and removed by `uninstall`.
 
+### Hash cache
+
+To spare reading every binary at each start (gigabytes for Steam or Electron apps), the ledger
+also remembers each binary's hash under its file identity: device, inode, size, modification,
+change and birth times, and filesystem id. A start whose binary still shows exactly that identity
+reuses the hash instead of reading the file; the ledger check above still decides admission. Any
+change to the content moves the change time, which no user can set back, so a changed binary is
+always read again.
+
+Only files on ext4, xfs, btrfs or f2fs, on a mount without `nosuid`, are cached: FUSE, network
+and overlay filesystems, and images a user mounted, report whatever timestamps their author
+chose. Before a hash is cached the file is flushed to disk, so a process writing it through a
+shared memory mapping can't change it later without moving its change time. A file changed less
+than a second before it is read is never cached. Rows unused by a start are dropped. The ready
+line in the journal says how many hashes came from the cache.
+
 ## trust-binaries
 
 ```bash

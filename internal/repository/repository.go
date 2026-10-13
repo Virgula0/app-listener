@@ -31,6 +31,10 @@ type GuardRepository interface {
 	// the replacement until its inode is gone. Safe to repeat; also retries still-deferred
 	// binaries. Returns how many entries changed.
 	ReSyncBinaries() (int, error)
+	// SweepReSyncBinaries is ReSyncBinaries for the periodic sweep only: it may skip a binary
+	// another guard resolved moments ago to the key this one deploys. Never admits from that;
+	// denial-triggered and reload re-syncs use ReSyncBinaries.
+	SweepReSyncBinaries() (int, error)
 	// SweepInodes is the cheap periodic guard_inodes refresh: re-scans only when the watch root's
 	// fingerprint moved (recreated single-file root, or a directory that gained/lost a top-level
 	// entry). Deeper changes are covered by BPF runtime discovery and the ancestor walk.

@@ -1,6 +1,8 @@
 package integrationtests
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -161,4 +163,122 @@ func (s *IntegrationSuite) TestDaemon_Ledger_GlobMatchPlantedWhileStoppedRefused
 		s.readDaemonLog(c))
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+var readyHashRe = regexp.MustCompile(`hashed (\d+) binaries \(\d+ MiB\), reused (\d+) hashes`)
+
+// One binary whitelisted by two resources is read once per run; the hash both guards share must
+// not blind either verifier: an in-place rewrite still demotes it in both.
+func (s *IntegrationSuite) TestDaemon_SharedHash_InPlaceRewriteDemotesEveryResource() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.copySwapFixtures(c)
+	s.installFakeSystemctl(c)
+
+	const bin = "/opt/shared/reader"
+	secrets := []string{"/p1/secret", "/p2/secret"}
+	// The sleep lets the copy's ctime settle (guard settleAge): a fresher file is never shared.
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /p1 /p2 /opt/shared /etc/app-listener && for f in " +
+		strings.Join(secrets, " ") + "; do printf '" + ledgerMarker + "' > $f; done && cp " + swapReaderPath +
+		" " + bin + " && sleep 2 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	config := "[watch /p1]\nneed_encryption: false\n" + bin + "\n\n[watch /p2]\nneed_encryption: false\n" + bin
+	s.startDaemon(c, config)
+	s.Require().Truef(s.awaitLog(c, "daemon: ready", 30*time.Second), "no ready line; daemon log:\n%s", s.readDaemonLog(c))
+
+	m := readyHashRe.FindStringSubmatch(s.readDaemonLog(c))
+	s.Require().NotNilf(m, "no hash counters on the ready line; daemon log:\n%s", s.readDaemonLog(c))
+	reused, _ := strconv.Atoi(m[2])
+	s.Require().GreaterOrEqualf(reused, 1, "the second resource re-read %s (hashed %s, reused %s)", bin, m[1], m[2])
+	for _, sec := range secrets {
+		_, out := s.exec(c, []string{bin, sec})
+		s.Require().Containsf(out, "STOLEN|"+ledgerMarker, "baseline: %s reads %s: %s", bin, sec, out)
+	}
+
+	// Same inode, new content: the verifier (10s tick) must re-read it in both guards.
+	code, out = s.exec(c, []string{"sh", "-c", "i1=$(stat -c %i " + bin + "); printf x >> " + bin +
+		"; [ \"$i1\" = \"$(stat -c %i " + bin + ")\" ] && echo SAME-INODE"})
+	s.Require().Containsf(out, "SAME-INODE", "fixture: rewrite must keep the inode (%d): %s", code, out)
+	s.Require().Truef(s.awaitLogCount(c, "was modified in place", 2, 40*time.Second),
+		"the rewrite was not demoted in both resources; daemon log:\n%s", s.readDaemonLog(c))
+	for _, sec := range secrets {
+		_, out := s.exec(c, []string{"sh", "-c", "timeout 10 " + bin + " " + sec + " 2>&1"})
+		s.Require().NotContainsf(out, "STOLEN|"+ledgerMarker, "the rewritten binary still reads %s", sec)
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+var (
+	cachedRe = regexp.MustCompile(`reused \d+ hashes, (\d+) from the hash cache`)
+	sha256Re = regexp.MustCompile(`[0-9a-f]{64}`)
+)
+
+// readyCached waits for this start's ready line and returns its hash-cache hit count.
+func (s *IntegrationSuite) readyCached(c testcontainers.Container) int {
+	s.Require().Truef(s.awaitLog(c, "daemon: ready", 60*time.Second), "no ready line; daemon log:\n%s", s.readDaemonLog(c))
+	m := cachedRe.FindStringSubmatch(s.readDaemonLog(c))
+	s.Require().NotNilf(m, "no hash-cache counter on the ready line; daemon log:\n%s", s.readDaemonLog(c))
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// A binary on a local filesystem is read once across restarts (the hash cache in binaries.db),
+// but a rewrite while the daemon is stopped, size and mtime restored, is hashed again: the ledger
+// sees the new content and refuses it.
+func (s *IntegrationSuite) TestDaemon_HashCache_RestartReusesAndStoppedRewriteMisses() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.copySwapFixtures(c)
+	s.installFakeSystemctl(c)
+
+	const bin, overlayBin = "/mnt/img/bin/app", "/opt/overlay/app"
+	// -I 256: ext4 keeps a birth time only in large inodes. A user-owned dir: a root-placed binary is
+	// admitted without the ledger. The sleep lets the copy's ctime settle.
+	build := `
+set -e
+mkdir -p /protected /etc/app-listener /mnt/img && printf '` + ledgerMarker + `' > /protected/secret
+dd if=/dev/zero of=/tmp/img bs=1M count=64 status=none
+mkfs.ext4 -q -F -I 256 /tmp/img
+for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+mount -o loop /tmp/img /mnt/img
+mkdir -p /mnt/img/bin /opt/overlay && cp ` + swapReaderPath + ` ` + bin + ` && cp ` + swapReaderPath + ` ` + overlayBin + `
+chown -R 65534 /mnt/img/bin
+sleep 2
+echo MOUNTED`
+	code, out := s.exec(c, []string{"sh", "-c", build})
+	if code != 0 || !strings.Contains(out, "MOUNTED") {
+		s.T().Skipf("ext4 loop mount unavailable here (exit %d): %s", code, out)
+	}
+	defer s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon'; sleep 1; umount /mnt/img 2>/dev/null; losetup -D 2>/dev/null; true"})
+
+	config := "[watch /protected]\nneed_encryption: false\n" + bin + "\n" + overlayBin
+	s.startDaemon(c, config)
+	s.readyCached(c)
+	_, out = s.exec(c, []string{bin, "/protected/secret"})
+	s.Require().Containsf(out, "STOLEN|"+ledgerMarker, "baseline: %s reads: %s", bin, out)
+
+	s.restartUnconfirmed(c, config, nil)
+	// The container root is overlayfs: its binary is never vouched for across restarts.
+	s.Require().Equalf(1, s.readyCached(c), "want %s from the hash cache and %s hashed again", bin, overlayBin)
+	_, out = s.exec(c, []string{bin, "/protected/secret"})
+	s.Require().Containsf(out, "STOLEN|"+ledgerMarker, "after a cached restart %s must still read: %s", bin, out)
+
+	// Same inode, size and mtime; only ctime moves.
+	var sum string
+	s.restartUnconfirmed(c, config, func() {
+		code, out := s.exec(c, []string{"sh", "-c", "set -e; B=" + bin + "; i1=$(stat -c %i $B); m=$(stat -c %y $B); " +
+			"printf X | dd of=$B bs=1 seek=$(($(stat -c %s $B)-1)) conv=notrunc status=none; touch -d \"$m\" $B; " +
+			"[ \"$i1\" = \"$(stat -c %i $B)\" ] && sha256sum $B"})
+		s.Require().Equalf(0, code, "fixture: in-place rewrite while stopped: %s", out)
+		sum = sha256Re.FindString(out) // docker exec frames can prefix the output
+		s.Require().NotEmptyf(sum, "fixture: no sha256 in %q", out)
+	})
+	s.Require().Equalf(0, s.readyCached(c), "the rewritten %s was taken from the hash cache", bin)
+	line := s.unconfirmedLine(c, bin)
+	s.Require().NotEmptyf(line, "a rewrite while stopped was admitted; daemon log:\n%s", s.readDaemonLog(c))
+	s.Require().Containsf(line, "sha256="+sum, "the refusal must carry the rewritten content's hash: %s", line)
+	s.assertNeverStolen(c, bin, "/protected/secret", ledgerMarker)
 }

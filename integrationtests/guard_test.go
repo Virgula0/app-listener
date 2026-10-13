@@ -296,9 +296,9 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleEntryOutsideTree_Deep() {
 	code, out = s.exec(c, []string{"rm", deep + "/victim.txt"})
 	s.Require().Equalf(0, code, "rm on deep out-of-tree victim must not be denied by its stale map entry: %s", out)
 
-	// A pure access(2)-style probe (inode_permission) on the stale inode
-	// must pass too: that hook has no dentry to confine against, so it no
-	// longer denies — it would only ever produce false positives.
+	// A pure access(2) probe on the stale inode must pass too: access(2) is not
+	// hooked (inode_permission has no dentry to confine against, so it could
+	// only ever produce false positives).
 	s.exec(c, []string{"sh", "-c", "echo 'probe content' > " + deep + "/victim.txt"})
 	code, out = s.exec(c, []string{"sh", "-c", "[ -r " + deep + "/victim.txt ]"})
 	s.Require().Equalf(0, code, "access probe on stale out-of-tree inode must succeed: %s", out)
@@ -2227,7 +2227,7 @@ func (s *IntegrationSuite) TestGuard_RuntimeRenameFile() {
 //   - setxattr(2)                -> inode_setxattr (ATTR)
 //   - mknod(2)                   -> path_mknod (MKNOD)
 //   - rmdir(2)                   -> path_rmdir (DELETE)
-//   - stat/access/readlink       -> inode_getattr / inode_permission / inode_readlink (STAT)
+//   - stat/readlink              -> inode_getattr / inode_readlink (STAT); access(2) is not hooked
 // Each case runs twice in one container: (1) block-all mode: the op must fail with a blocked event
 // for the exploit binary; (2) whitelist mode (exploit binary whitelisted): the SAME op must succeed
 // while a plain cat stays blocked, proving the hook is selective and caller identity is enforced.
@@ -2627,3 +2627,81 @@ func (s *IntegrationSuite) TestGuard_InodeFreeEvictsOnlyDeletedFiles() {
 
 	s.stopGuard(c)
 }
+
+// fdGateOps are fdgate's operations, one per hook that judges an fd opened before the guard (or a
+// dentry with no open): the hooks behind off_guarded_fs.
+var fdGateOps = []string{"pread", "mmap", "ftruncate", "fchmod", "fstat", "fgetxattr", "flistxattr", "readlink"}
+
+// runFdGateHeld backgrounds fdgate on file/link (released by /ctl/go) and waits until it holds the fd.
+func (s *IntegrationSuite) runFdGateHeld(c testcontainers.Container, file, link, out string) {
+	s.exec(c, []string{"sh", "-c", "nohup /exploits/fdgate " + file + " " + link + " /ctl/go > " + out + " 2>&1 &"})
+	s.Require().Eventuallyf(func() bool {
+		_, o := s.exec(c, []string{"cat", out})
+		return strings.Contains(o, "READY")
+	}, 10*time.Second, 100*time.Millisecond, "fdgate on %s never held its fd", file)
+}
+
+func (s *IntegrationSuite) fdGateResult(c testcontainers.Container, out string) string {
+	var o string
+	s.Require().Eventuallyf(func() bool {
+		_, o = s.exec(c, []string{"cat", out})
+		return strings.Contains(o, "op=readlink")
+	}, 15*time.Second, 100*time.Millisecond, "fdgate never finished: %s", out)
+	return o
+}
+
+func (s *IntegrationSuite) requireFdGate(out, want, why string) {
+	for _, op := range fdGateOps {
+		s.Require().Containsf(out, "op="+op+" "+want, "%s: %s not %s:\n%s", why, op, want, out)
+	}
+}
+
+// The superblock fast path (off_guarded_fs) must not change a decision: through fds opened before
+// the guard attached (file_open never sees them), every gated hook still denies on the guarded
+// tree, while an unguarded tmpfs, whose superblock no resource uses, takes the fast path and
+// passes. The pre-guard run proves each operation can succeed on the guarded file's filesystem,
+// so a "denied" is the guard's.
+func (s *IntegrationSuite) testFdGateHooks(rootOnTmpfs bool) {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/watch", "/exploits", "/ctl", "/fastpath"})
+	if rootOnTmpfs {
+		code, out := s.exec(c, []string{"mount", "-t", "tmpfs", "tmpfs", "/watch"})
+		s.Require().Equalf(0, code, "mounting tmpfs on /watch: %s", out)
+		defer s.exec(c, []string{"umount", "/watch"})
+	}
+	code, out := s.exec(c, []string{"mount", "-t", "tmpfs", "tmpfs", "/fastpath"})
+	s.Require().Equalf(0, code, "mounting tmpfs on /fastpath: %s", out)
+	defer s.exec(c, []string{"umount", "/fastpath"})
+
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/fdgate"), "/exploits/fdgate", 0o755),
+		"copy fdgate")
+	s.exec(c, []string{"sh", "-c", "echo SECRET-FDGATE > /watch/secret.txt && ln -s secret.txt /watch/link && " +
+		"echo FREE-FDGATE > /fastpath/free.txt && ln -s free.txt /fastpath/link && rm -f /ctl/go"})
+
+	// Positive control, before the guard: every operation succeeds on this filesystem.
+	s.exec(c, []string{"touch", "/ctl/go"})
+	_, pre := s.exec(c, []string{"/exploits/fdgate", "/watch/secret.txt", "/watch/link", "/ctl/go"})
+	s.requireFdGate(pre, "ok", "before the guard")
+	s.exec(c, []string{"rm", "-f", "/ctl/go"})
+
+	s.runFdGateHeld(c, "/watch/secret.txt", "/watch/link", "/ctl/guarded.out")
+	s.runFdGateHeld(c, "/fastpath/free.txt", "/fastpath/link", "/ctl/free.out")
+	s.startGuardStd(c, "/watch")
+	s.exec(c, []string{"touch", "/ctl/go"})
+
+	guarded := s.fdGateResult(c, "/ctl/guarded.out")
+	s.requireFdGate(guarded, "denied", "fd held across guard start, guarded tree")
+	s.Require().NotContainsf(guarded, "SECRET-FDGATE", "the held fd leaked the guarded file:\n%s", guarded)
+
+	free := s.fdGateResult(c, "/ctl/free.out")
+	s.requireFdGate(free, "ok", "unguarded tmpfs (fast path)")
+	s.Require().Containsf(free, "FREE-FDGATE", "the fast path must not deny unguarded files:\n%s", free)
+
+	s.stopGuard(c)
+}
+
+func (s *IntegrationSuite) TestGuard_FdOps_GatedHooksDeny_OverlayRoot() { s.testFdGateHooks(false) }
+
+func (s *IntegrationSuite) TestGuard_FdOps_GatedHooksDeny_TmpfsRoot() { s.testFdGateHooks(true) }

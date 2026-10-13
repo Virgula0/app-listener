@@ -23,9 +23,9 @@ const (
 	unlistedRead = "sed -n p /protected/secret"
 )
 
-// forwardSetup starts a daemon guarding /protected (whitelist: fwdListed) with an edit-protected
-// password, and waits for its control socket.
-func (s *IntegrationSuite) forwardSetup() testcontainers.Container {
+// forwardSetup starts a daemon (extra daemon flags appended) guarding /protected (whitelist:
+// fwdListed) with an edit-protected password, and waits for its control socket.
+func (s *IntegrationSuite) forwardSetup(daemonFlags ...string) testcontainers.Container {
 	hash, err := editprotected.Hash(forwardPassword, editprotected.OriginInstall)
 	s.Require().NoError(err)
 
@@ -34,7 +34,7 @@ func (s *IntegrationSuite) forwardSetup() testcontainers.Container {
 	s.exec(c, []string{"sh", "-c",
 		"mkdir -p /protected /etc/app-listener && echo SECRET > /protected/secret && chmod 644 /protected/secret && " +
 			"printf '%s\\n' " + shQuote(hash) + " > /etc/app-listener/edit-auth.hash && chmod 600 /etc/app-listener/edit-auth.hash"})
-	s.startDaemon(c, fwdConf)
+	s.startDaemon(c, fwdConf, daemonFlags...)
 	s.Require().Truef(s.awaitLog(c, "edit-protected control socket ready", 20*time.Second),
 		"control socket never came up, log:\n%s", s.readDaemonLog(c))
 	return c
@@ -330,6 +330,48 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_RuntimeLaunchJudged(
 	s.stopForward(c, "TERM", 1)
 	s.Require().NotContains(read("", ""), "STOLEN|", "launch_probe after the client exited")
 	s.Require().NotContains(s.readDaemonLog(c), "restoring the trust row", "the revoke left a trust row behind")
+
+	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
+}
+
+// --blocked-only stops the kernel emitting allowed events (guard_quiet_allow) while nobody reads
+// them, yet denials are still logged, and a FORWARD session, whose idle timer counts its granted
+// binaries' allowed events, still receives them: the flag must lift for each session and come
+// back after it.
+func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_BlockedOnlyStreamsGrantedEvents() {
+	c := s.forwardSetup("--blocked-only")
+	defer c.Terminate(s.ctx)
+
+	s.requireRead(c, listedRead, true, "baseline: grep is whitelisted")
+	s.requireRead(c, unlistedRead, false, "baseline: sed is not whitelisted")
+	s.Require().Eventuallyf(func() bool {
+		for _, ev := range parseDaemonEvents(s.readDaemonLog(c)) {
+			if ev.Denied && ev.Comm == "sed" {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 200*time.Millisecond, "--blocked-only must still log denials:\n%s", s.readDaemonLog(c))
+
+	for session := 1; session <= 2; session++ {
+		s.startForward(c, "-w "+fwdUnlisted+" --timeout-session 4s", session)
+		for range 6 { // ~6s of reads: past the 4s idle timeout only if the session saw no events
+			s.requireRead(c, unlistedRead, true, "sed while the session is active")
+			time.Sleep(time.Second)
+		}
+		s.Require().Equalf(session-1, strings.Count(s.readDaemonLog(c), "temporary access REVOKED"),
+			"session %d hit the idle timeout while sed was reading: its allowed events never reached it:\n%s",
+			session, s.readDaemonLog(c))
+		s.Require().Containsf(s.forwardLog(c), "|sed|/protected/secret|",
+			"session %d: the granted binary's events never reached the client:\n%s", session, s.forwardLog(c))
+		s.stopForward(c, "TERM", session)
+	}
+
+	s.requireRead(c, unlistedRead, false, "sed after the sessions")
+	s.requireRead(c, listedRead, true, "grep after the sessions")
+	for _, ev := range parseDaemonEvents(s.readDaemonLog(c)) {
+		s.Require().Truef(ev.Denied, "--blocked-only logged an allowed event: %+v", ev)
+	}
 
 	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
 }

@@ -315,9 +315,13 @@ edit-auth hash. When `edit-protected` has a password configured, `control.go` op
 live-edit control socket and `DaemonUseCase.GrantEditAccess` / the guard's
 `GrantSelfEditAccess`+`RevokeSelfEditAccess` implement the transient per-resource write
 grant. The `GuardRepository` port has daemon-specific methods (`PopulateInodes`,
-`ResolvePendingBinaries`, `ReSyncBinaries`, `SweepInodes`, `GrantSelfEditAccess`,
-`RevokeSelfEditAccess`) — read their doc comments in
-`internal/repository/repository.go` before changing reload/resync behaviour.
+`ResolvePendingBinaries`, `ReSyncBinaries`, `SweepReSyncBinaries`, `SweepInodes`,
+`GrantSelfEditAccess`, `RevokeSelfEditAccess`) — read their doc comments in
+`internal/repository/repository.go` before changing reload/resync behaviour. Periodic loops
+(sweep, inode GC, single-file follow, hash verify) share one ticker per cadence
+(`internal/pulse`): a busy loop gets its tick late, never loses it. Only the periodic sweep may
+reuse another guard's fresh binary resolution (`internal/guard/sweepshare.go`), and only to skip
+an unchanged binary, never to admit one; every other re-sync opens fresh.
 
 ### Install / lifecycle packages
 

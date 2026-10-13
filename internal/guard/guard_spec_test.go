@@ -93,3 +93,30 @@ func TestParseGuardEventFsGateLabels(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeGuardEventMatchesBinaryRead(t *testing.T) {
+	if got := binary.Size(bpfGuardEvent{}); got != bpfGuardEventSize {
+		t.Fatalf("bpfGuardEventSize = %d, binary.Size = %d", bpfGuardEventSize, got)
+	}
+	raw := make([]byte, bpfGuardEventSize+8) // trailing bytes past the struct are ignored
+	for i := range raw {
+		raw[i] = byte((i*131 + 7) % 251)
+	}
+	var want bpfGuardEvent
+	if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &want); err != nil {
+		t.Fatal(err)
+	}
+	var got bpfGuardEvent
+	if !decodeGuardEvent(raw, &got) {
+		t.Fatal("decode failed")
+	}
+	if got != want {
+		t.Fatalf("decoded %+v, binary.Read %+v", got, want)
+	}
+	if decodeGuardEvent(raw[:bpfGuardEventSize-1], &got) {
+		t.Fatal("short record decoded")
+	}
+	if _, _, ok := parseGuardEvent(raw[:bpfGuardEventSize-1]); ok {
+		t.Fatal("parseGuardEvent accepted a short record")
+	}
+}

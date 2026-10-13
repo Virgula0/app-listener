@@ -320,3 +320,50 @@ func (s *IntegrationSuite) TestDaemon_LiveAdmission_UpdaterRepointsLink() {
 
 	s.exec(c, []string{"sh", "-c", "pkill -f hold.pl; pkill -f 'app-listener daemon' || true"})
 }
+
+// The periodic sweep shares one guard's confined resolution of a binary with the other guards that
+// whitelist it (sweepShared), but only to skip an unchanged one: after a replacement every
+// resource must still re-admit the new inode on its own. unlink + link() leaves no IN_CLOSE_WRITE,
+// IN_MOVED_TO or symlink IN_CREATE for the catalog watch, so only the 30s sweep can admit it, and
+// nothing touches the resources before it does (a denial would re-sync without the share).
+func (s *IntegrationSuite) TestDaemon_SharedSweep_ReplacedBinaryReadmittedByEveryResource() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.copySwapFixtures(c)
+
+	const (
+		app    = "/usr/local/bin/app"
+		marker = "TOP-SECRET-SHARED-SWEEP-4C19"
+	)
+	s.exec(c, []string{"sh", "-c", "mkdir -p /res1 /res2 /etc/app-listener && printf '" + marker +
+		"' > /res1/secret && printf '" + marker + "' > /res2/secret && cp " + swapReaderPath + " " + app})
+	s.startDaemon(c, "[watch /res1]\nneed_encryption: false\n"+app+"\n\n[watch /res2]\nneed_encryption: false\n"+app)
+	for _, res := range []string{"/res1", "/res2"} {
+		_, out := s.exec(c, []string{app, res + "/secret"})
+		s.Require().Containsf(out, "STOLEN|"+marker, "baseline: %s reads %s: %s", app, res, out)
+	}
+
+	old := s.inodeOf(c, app)
+	code, out := s.exec(c, []string{"sh", "-c", "cp " + swapReaderPath + " /usr/local/bin/.app.new && " +
+		"printf x >> /usr/local/bin/.app.new && " +
+		`perl -e 'unlink "` + app + `"; link "/usr/local/bin/.app.new", "` + app + `" or die "link: $!\n"' && ` +
+		"rm /usr/local/bin/.app.new 2>&1"})
+	s.Require().Equalf(0, code, "the hard-link replacement: %s", out)
+	s.Require().NotEqual(old, s.inodeOf(c, app), "fixture: the replacement must be a new inode")
+
+	resynced := func(res string) bool {
+		return strings.Contains(s.readDaemonLog(c), "guard "+res+": re-synced 1 binary inode(s)")
+	}
+	s.Require().Eventuallyf(func() bool { return resynced("/res1") && resynced("/res2") },
+		staleRootSweepPollTimeout, time.Second,
+		"the periodic sweep did not re-admit the replacement in every resource; daemon log:\n%s", s.readDaemonLog(c))
+
+	for _, res := range []string{"/res1", "/res2"} {
+		_, out := s.exec(c, []string{app, res + "/secret"})
+		s.Require().Containsf(out, "STOLEN|"+marker, "after the sweep, %s must read %s: %s", app, res, out)
+	}
+	s.Require().NotContains(s.readDaemonLog(c), "configuration reloaded", "admission must need no reload")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

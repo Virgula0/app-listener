@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -314,7 +315,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			"self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 	}
 
-	notifySystemdReady()
+	markReady()
 
 	if err := writePidFile(); err != nil {
 		return err
@@ -495,7 +496,21 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("%w: config %s contains no [watch] sections", constants.ErrCriticalStartup, configPath)
 	}
+	// Before the first guard loads the engine: the map is sized once per process.
+	if _, err := guard.ConfigureInodeCapacity(cfg.MaxInodes); err != nil {
+		return "", nil, fmt.Errorf("%w: config %s: %w", constants.ErrCriticalStartup, configPath, err)
+	}
 	return configPath, cfg, nil
+}
+
+// noteReloadedSettings warns that a changed max_inodes waits for a restart (a loaded map can't be
+// resized) and re-checks guard_inodes occupancy after the reload's populate.
+func noteReloadedSettings(cfg *daemonconfig.Config) {
+	if applied, err := guard.ConfigureInodeCapacity(cfg.MaxInodes); err != nil || !applied {
+		log.Warnf("daemon: max_inodes %d takes effect at the next restart (guard_inodes can't be resized live)",
+			cfg.MaxInodes)
+	}
+	guard.WarnInodeOccupancy()
 }
 
 // makeReloadHandler returns the reload: re-parse the config, rebuild every guard (re-statting
@@ -538,6 +553,7 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 				"able to widen self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 		}
 		reloaded(cfg)
+		noteReloadedSettings(cfg)
 		log.Infof("daemon: configuration reloaded from %s", configPath)
 		return cfg, nil
 	}
@@ -1214,6 +1230,20 @@ func eventFilterOptions() []guard.GuardOption {
 		opts = append(opts, guard.WithoutAllowedEvents())
 	}
 	return opts
+}
+
+var processStart = time.Now()
+
+// markReady tells systemd the guards are up, then returns the startup peak (catalog, ELF closures,
+// populate: well above the steady-state heap) to the OS now rather than over the scavenger's
+// minutes, for small-RAM hosts.
+func markReady() {
+	notifySystemdReady()
+	hashed, bytes, reused, cached := guard.HashStats()
+	log.Infof("daemon: ready %s after start: hashed %d binaries (%d MiB), reused %d hashes, %d from the hash cache",
+		time.Since(processStart).Round(time.Millisecond), hashed, bytes>>20, reused, cached)
+	guard.WarnInodeOccupancy()
+	go debug.FreeOSMemory()
 }
 
 // notifySystemdReady sends READY=1: the unit is Type=notify, so logins and cron, ordered after it,

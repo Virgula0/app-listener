@@ -87,6 +87,12 @@ type engine struct {
 	pinPrefix   string
 	pinDegraded bool
 	mapsPinned  bool
+
+	// inodeCap is guard_inodes' max_entries for the next load (ConfigureInodeCapacity); 0 = the
+	// object's default, inodeCapDefault. inodeWarned: occupancy is past inodeWarnPercent.
+	inodeCap        uint32
+	inodeCapDefault uint32
+	inodeWarned     bool
 }
 
 var sharedEngine engine
@@ -211,15 +217,19 @@ func (e *engine) unlinkReloadTwinLocked(id uint32) {
 	}
 }
 
-// startLocked loads the objects, attaches every LSM program once and starts the event reader.
-func (e *engine) startLocked() error {
-	shared, mapsErr := supersedeMaps()
-	if mapsErr != nil {
-		return mapsErr
+// loadLocked loads the guard objects, guard_inodes sized by inodeCap.
+func (e *engine) loadLocked() error {
+	shared, err := supersedeMaps()
+	if err != nil {
+		return err
 	}
-	spec, ioctlCompat, specErr := guardSpec()
-	if specErr != nil {
-		return specErr
+	spec, ioctlCompat, err := guardSpec()
+	if err != nil {
+		return err
+	}
+	inodeCapDefault, err := applyInodeCapacity(spec, e.inodeCap)
+	if err != nil {
+		return err
 	}
 	var objs GuardObjects
 	if err := spec.LoadAndAssign(&objs, &cilium.CollectionOptions{MapReplacements: shared}); err != nil {
@@ -227,6 +237,15 @@ func (e *engine) startLocked() error {
 	}
 	e.objs = objs
 	e.ioctlCompat = ioctlCompat
+	e.inodeCapDefault = inodeCapDefault
+	return nil
+}
+
+// startLocked loads the objects, attaches every LSM program once and starts the event reader.
+func (e *engine) startLocked() error {
+	if err := e.loadLocked(); err != nil {
+		return err
+	}
 	e.done = make(chan struct{})
 
 	failedRequired, total := e.attachLocked()
@@ -276,8 +295,10 @@ func (e *engine) startLocked() error {
 	e.started = true
 	go e.readLoop(rd)
 	go supersedePruneLoop(e.done)
+	go e.degradeWatchLoop(e.done)
 
 	log.Infof("guard engine — %d/%d LSM hooks attached once for every resource", lsmAttached, total)
+	log.Infof("guard engine: guard_inodes holds up to %d rows", e.objs.GuardInodes.MaxEntries())
 	return nil
 }
 
@@ -568,16 +589,8 @@ func (e *engine) releaseInodes(resID uint32) error {
 		return nil // engine already torn down
 	}
 
-	var owned []GuardInodeKey
-	var key GuardInodeKey
-	var val uint32
-	it := e.objs.GuardInodes.Iterate()
-	for it.Next(&key, &val) {
-		if val == resID {
-			owned = append(owned, key)
-		}
-	}
-	if err := it.Err(); err != nil {
+	owned, err := inodeRowsOf(e.objs.GuardInodes, resID)
+	if err != nil {
 		return err
 	}
 
@@ -602,6 +615,69 @@ func (e *engine) releaseInodes(resID uint32) error {
 	return nil
 }
 
+// inodeBatchRows is guard_inodes rows per BPF_MAP_LOOKUP_BATCH call.
+const inodeBatchRows = 4096
+
+type inodeBatchFn func(c *cilium.MapBatchCursor, keys []GuardInodeKey, vals []uint32) (int, error)
+
+// inodeRowsOf returns resID's guard_inodes keys, each once. Batched: the per-row iterator costs
+// two syscalls per row of a 2^18-row map that every guard walks. Falls back to the iterator when
+// batching fails (ENOSPC on an oversized bucket, a kernel without it).
+func inodeRowsOf(m *cilium.Map, resID uint32) ([]GuardInodeKey, error) {
+	rows, err := batchInodeRows(func(c *cilium.MapBatchCursor, keys []GuardInodeKey, vals []uint32) (int, error) {
+		return m.BatchLookup(c, keys, vals, nil)
+	}, resID)
+	if err == nil {
+		return rows, nil
+	}
+	log.Debugf("guard: batched guard_inodes walk failed (%v), iterating", err)
+
+	seen := map[GuardInodeKey]struct{}{}
+	rows = rows[:0]
+	var key GuardInodeKey
+	var val uint32
+	it := m.Iterate()
+	for it.Next(&key, &val) {
+		rows = appendInodeRow(rows, seen, key, val, resID)
+	}
+	return rows, it.Err()
+}
+
+// batchInodeRows dedupes: a batch walk racing concurrent updates may return a key twice, and
+// releaseInodes would then delete the row it just handed back.
+func batchInodeRows(lookup inodeBatchFn, resID uint32) ([]GuardInodeKey, error) {
+	keys := make([]GuardInodeKey, inodeBatchRows)
+	vals := make([]uint32, inodeBatchRows)
+	seen := map[GuardInodeKey]struct{}{}
+	var rows []GuardInodeKey
+	var cursor cilium.MapBatchCursor
+	for {
+		n, err := lookup(&cursor, keys, vals)
+		for i := 0; i < n && i < len(keys); i++ {
+			rows = appendInodeRow(rows, seen, keys[i], vals[i], resID)
+		}
+		switch {
+		case errors.Is(err, cilium.ErrKeyNotExist):
+			return rows, nil // end of map; n still counts this call's rows
+		case err != nil:
+			return rows, err
+		case n == 0:
+			return rows, errors.New("batch lookup returned no rows before the end of the map")
+		}
+	}
+}
+
+func appendInodeRow(rows []GuardInodeKey, seen map[GuardInodeKey]struct{}, key GuardInodeKey, val, resID uint32) []GuardInodeKey {
+	if val != resID {
+		return rows
+	}
+	if _, dup := seen[key]; dup {
+		return rows
+	}
+	seen[key] = struct{}{}
+	return append(rows, key)
+}
+
 // innerResourceOwnsLocked: a replacement guard over the same root (reload) is not "inner".
 func (e *engine) innerResourceOwnsLocked(g *Guard, path string) bool {
 	outer := filepath.Clean(g.path)
@@ -617,8 +693,13 @@ func (e *engine) innerResourceOwnsLocked(g *Guard, path string) bool {
 	return false
 }
 
+// pathWithin is path == root || HasPrefix(path, root+"/") without building root+"/": claimInode
+// runs it per slot for every scanned inode.
 func pathWithin(path, root string) bool {
-	return path == root || strings.HasPrefix(path, root+"/")
+	if len(path) == len(root) {
+		return path == root
+	}
+	return len(path) > len(root) && path[len(root)] == '/' && path[:len(root)] == root
 }
 
 // release retires g's slot and, once the last Guard is gone, detaches the shared programs.
@@ -633,6 +714,10 @@ func (e *engine) release(id uint32) {
 		if e.started {
 			if err := e.objs.GuardResConfig.Put(id, GuardResConfig{}); err != nil {
 				log.Warnf("guard: clearing resource slot %d: %v", id, err)
+			}
+			// A later resource reusing the id must start with its allowed events reported.
+			if err := e.objs.GuardQuietAllow.Put(id, uint8(0)); err != nil {
+				log.Warnf("guard: clearing quiet-allow flag of slot %d: %v", id, err)
 			}
 			e.unlinkReloadTwinLocked(id)
 			// Drop the id from every taint set now: a later resource reusing it must not be
@@ -684,8 +769,10 @@ func (e *engine) stopLocked() {
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.
 // Takes the reader as an argument: stopLocked clears e.rd, which this goroutine outlives.
 func (e *engine) readLoop(rd *ringbuf.Reader) {
+	// One reused record buffer: parseGuardEvent copies everything it keeps out of RawSample.
+	var rec ringbuf.Record
 	for {
-		rec, err := rd.Read()
+		err := rd.ReadInto(&rec)
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return

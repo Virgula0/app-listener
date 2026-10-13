@@ -17,10 +17,21 @@ Contributor-oriented notes (architecture, the BPF verifier budget, test conventi
 | `make test-integration` | Docker integration and bypass suite (rootful Docker) |
 | `make lint` | golangci-lint |
 | `make vuln` | govulncheck over the module (`GUI=1` scans the GUI build; run `make generate` first) |
+| `make pprof` | Save CPU, heap, allocation and goroutine profiles of a daemon started with `--pprof` |
 | `make clean` | Remove build artifacts |
 
 The eBPF is compiled against the build host's BTF, so builds are native only: build arm64 on an
 arm64 host.
+
+## Profiling
+
+`make pprof` sees only the daemon's Go side. The guard hooks run inside every process that reads,
+writes or stats a file, and the BPF maps are kernel memory, so neither shows up there.
+`sudo bash scripts/kernel-prof.sh [seconds]` records that part while you keep using the machine:
+per-program BPF run time, map memory and `guard_inodes` occupancy, and a `perf` profile of the
+daemon with kernel stacks. Output goes to `build/pprof/kernel-<timestamp>/`. Profile on the
+weakest hardware you target: hook cost per call grows on slow CPUs, map memory does not shrink
+with RAM.
 
 ## Tests
 

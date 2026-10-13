@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS pending (
 	sha256 BLOB NOT NULL,
 	resources TEXT NOT NULL,
 	seen_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hash_cache (
+	dev INTEGER NOT NULL,
+	ino INTEGER NOT NULL,
+	fsid INTEGER NOT NULL,
+	size INTEGER NOT NULL,
+	mtime_ns INTEGER NOT NULL,
+	ctime_ns INTEGER NOT NULL,
+	btime_ns INTEGER NOT NULL,
+	sha256 BLOB NOT NULL,
+	PRIMARY KEY (dev, ino)
 );`
 
 // Line is the whitelist line the ledger keys r on: the link when r is a symlink line, so a link
