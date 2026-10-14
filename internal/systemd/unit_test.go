@@ -56,17 +56,6 @@ func TestShippedDaemonUnit(t *testing.T) {
 	}
 }
 
-func TestDesiredDaemonUnitKeepsMetadataChoice(t *testing.T) {
-	if got := DesiredDaemonUnit([]byte(testUnit), []byte(testUnit)); string(got) != testUnit {
-		t.Fatalf("default install: got %q", got)
-	}
-	allowed := DaemonUnitWithMetadataOutput([]byte(testUnit))
-	got := DesiredDaemonUnit(allowed, []byte(testUnit))
-	if strings.Contains(string(got), "--no-log-metadata-blocks") {
-		t.Fatalf("--allow-metadata-output install lost its choice: %q", got)
-	}
-}
-
 func TestPlanDaemonUnitUpdate(t *testing.T) {
 	newUnit := strings.Replace(testUnit, "Description=x", "Description=y", 1)
 	bin := fakeBinary(t, newUnit, 0)
@@ -100,6 +89,20 @@ func TestPlanDaemonUnitUpdate(t *testing.T) {
 	}
 	if got, err := PlanDaemonUnitUpdate(fakeBinary(t, "", 1), mustNotAsk); got != nil || err != nil {
 		t.Fatalf("binary without the command: %q, %v", got, err)
+	}
+}
+
+func TestPlanDaemonUnitUpdateDropsLocalEdits(t *testing.T) {
+	bin := fakeBinary(t, testUnit, 0)
+	accept := func(_ string, _, _ []byte) (bool, error) { return true, nil }
+	for name, installed := range map[string]string{
+		"pre-flag or --allow-metadata-output": string(DaemonUnitWithMetadataOutput([]byte(testUnit))),
+		"--pprof added":                       strings.Replace(testUnit, "--headless", "--headless --pprof 127.0.0.1:6060", 1),
+	} {
+		withUnitFile(t, installed)
+		if got, err := PlanDaemonUnitUpdate(bin, accept); err != nil || string(got) != testUnit {
+			t.Errorf("%s: got %q, %v; want the shipped unit", name, got, err)
+		}
 	}
 }
 

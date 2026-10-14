@@ -1,9 +1,13 @@
 package integrationtests
 
 import (
+	"regexp"
 	"strings"
 	"time"
 )
+
+// selfDirGuarded matches the read-only directory self guard, the last one attached.
+var selfDirGuarded = regexp.MustCompile(`self-protection: guarding /etc/app-listener([^/]|$)`)
 
 // fscrypt.key and edit-auth.hash are sealed guards nested in the read-only /etc/app-listener guard.
 // That guard's first sweep (selfSweepEvery, 30s after attach) rescans the directory; the rescan must
@@ -23,7 +27,7 @@ need_encryption: false
 
 	selfReady := false
 	for dl := time.Now().Add(45 * time.Second); time.Now().Before(dl); {
-		if strings.Contains(s.readDaemonLog(c), "self-protection: guarding /etc/app-listener/edit-auth.hash") {
+		if selfDirGuarded.MatchString(s.readDaemonLog(c)) {
 			selfReady = true
 			break
 		}
@@ -39,6 +43,49 @@ need_encryption: false
 		s.Require().NotEqualf(0, code, "edit-auth.hash became readable by a non-daemon process: %s", out)
 		time.Sleep(3 * time.Second)
 	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// systemd's ReadWritePaths=/etc/app-listener (units installed before it was dropped) bind-mounts the
+// directory onto itself, so a sealed file's physical chain can't be verified past that mount root.
+// The sealed guards must still own their files rather than leave them to the read-only resource.
+func (s *IntegrationSuite) TestDaemon_SelfProtection_KeySealedUnderBindMount() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "SELF-KEY-BINDMNT-MARKER-01234567"
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /exploits /etc/app-listener && echo s > /protected/secret && printf '" +
+			marker + "' > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key"})
+	code, out := s.exec(c, []string{"sh", "-c", "mount --bind /etc/app-listener /etc/app-listener 2>&1 && " +
+		"grep -q ' /etc/app-listener /etc/app-listener ' /proc/self/mountinfo && echo bound"})
+	s.Require().Truef(code == 0 && strings.Contains(out, "bound"), "bind mount failed: %s", out)
+	s.copySwapFixtures(c)
+	s.startDaemon(c, `[watch /protected]
+need_encryption: false
+/usr/bin/sleep`)
+
+	selfReady := false
+	for dl := time.Now().Add(45 * time.Second); time.Now().Before(dl); {
+		if selfDirGuarded.MatchString(s.readDaemonLog(c)) {
+			selfReady = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	log := s.readDaemonLog(c)
+	s.Require().Truef(selfReady, "self-protection guards did not attach, log:\n%s", log)
+	s.Require().NotContainsf(log, "physical location could not be verified", "a sealed file was left to the "+
+		"read-only resource, log:\n%s", log)
+
+	_, out = s.exec(c, []string{"sh", "-c", swapReaderPath + " /etc/app-listener/fscrypt.key 2>&1"})
+	s.Require().NotContainsf(out, "STOLEN|", "fscrypt.key is readable by a non-daemon process")
+	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/fscrypt.key 2>&1"})
+	s.Require().NotEqualf(0, code, "reading fscrypt.key must be denied: %s", out)
+	s.Require().NotContainsf(out, marker, "fscrypt.key is readable by a non-daemon process")
+	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/edit-auth.hash >/dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "edit-auth.hash is readable by a non-daemon process: %s", out)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
@@ -85,7 +132,7 @@ need_encryption: false
 
 	selfReady := false
 	for dl := time.Now().Add(45 * time.Second); time.Now().Before(dl); {
-		if strings.Contains(s.readDaemonLog(c), "self-protection: guarding /etc/app-listener/fscrypt.key") {
+		if selfDirGuarded.MatchString(s.readDaemonLog(c)) {
 			selfReady = true
 			break
 		}

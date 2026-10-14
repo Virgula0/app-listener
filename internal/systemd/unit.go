@@ -62,21 +62,13 @@ func ShippedDaemonUnit(binPath string) ([]byte, error) {
 	return unit, nil
 }
 
-// DesiredDaemonUnit adapts the shipped unit to the installed one: an installed ExecStart without
-// --no-log-metadata-blocks (install --allow-metadata-output) keeps that choice.
-func DesiredDaemonUnit(installed, shipped []byte) []byte {
-	if !bytes.Contains(installed, []byte(noMetadataFlag)) {
-		return DaemonUnitWithMetadataOutput(shipped)
-	}
-	return shipped
-}
-
 // ConfirmUnitFunc decides whether the installed unit at path is replaced by desired.
 type ConfirmUnitFunc func(path string, installed, desired []byte) (bool, error)
 
 // PlanDaemonUnitUpdate diffs the daemon unit binPath ships against the installed one and returns
 // the unit to write, or nil to keep the installed one (not installed, identical, unreadable from
-// binPath, or declined by confirm).
+// binPath, or declined by confirm). The shipped unit is written as is: local edits (an
+// install --allow-metadata-output ExecStart, a --pprof) are not carried over.
 func PlanDaemonUnitUpdate(binPath string, confirm ConfirmUnitFunc) ([]byte, error) {
 	installed, present, err := InstalledDaemonUnit()
 	if err != nil || !present {
@@ -87,12 +79,11 @@ func PlanDaemonUnitUpdate(binPath string, confirm ConfirmUnitFunc) ([]byte, erro
 		log.Warnf("cannot read the daemon unit the new binary ships (%v): keeping the installed %s", err, daemonUnitFile)
 		return nil, nil
 	}
-	desired := DesiredDaemonUnit(installed, shipped)
-	if bytes.Equal(installed, desired) {
+	if bytes.Equal(installed, shipped) {
 		log.Infof("%s already matches the new binary's unit", daemonUnitFile)
 		return nil, nil
 	}
-	overwrite, err := confirm(daemonUnitFile, installed, desired)
+	overwrite, err := confirm(daemonUnitFile, installed, shipped)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +91,7 @@ func PlanDaemonUnitUpdate(binPath string, confirm ConfirmUnitFunc) ([]byte, erro
 		log.Warnf("keeping the installed %s", daemonUnitFile)
 		return nil, nil
 	}
-	return desired, nil
+	return shipped, nil
 }
 
 // WriteDaemonUnit atomically replaces the daemon unit (mode 0644); the caller runs daemon-reload.

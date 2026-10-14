@@ -149,8 +149,10 @@ When the daemon service is installed, `update` also compares the systemd unit th
 (`/etc/systemd/system/app-listener-daemon.service`) with the installed one. If they differ, it shows
 the diff and asks whether to replace it; declining keeps the installed unit and still updates the
 binary. The new unit is written while the daemon is stopped, so the restart already runs under it.
-With `--yes` the new unit is accepted and the diff is logged. An installed unit without
-`--no-log-metadata-blocks` (`install --allow-metadata-output`) keeps that choice.
+With `--yes` the new unit is accepted and the diff is logged. The shipped unit is written as is:
+local edits to the installed one (an `install --allow-metadata-output` unit, an added `--pprof`)
+are not carried over, so re-run `install --allow-metadata-output` after updating to keep metadata
+denials logged.
 
 ## Uninstall
 

@@ -96,8 +96,8 @@ newer one exists:
      confirmation before anything is changed
   4. compares the daemon's systemd unit the new release ships with the
      installed one and, when they differ, shows the diff and asks whether
-     to replace it (an installed unit without --no-log-metadata-blocks
-     keeps that choice)
+     to replace it with the shipped unit as is (local edits, e.g.
+     install --allow-metadata-output or --pprof, are not carried over)
   5. replaces the installed binary atomically (and the unit, if accepted)
   6. restarts the systemd daemon (it is stopped first so the watch
      directories are verified locked again before the new binary starts)

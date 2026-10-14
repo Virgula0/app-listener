@@ -350,6 +350,9 @@ func (s *IntegrationSuite) TestDaemon_Bypass_LdPreloadWhitelistedBinary() {
 	s.exec(c, []string{"sh", "-c",
 		"mkdir -p /protected /etc/app-listener && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_leak.so"), "/tmp/leak.so", 0755), "copy preload_leak.so")
+	// Positive control: with no daemon running the payload does leak, so the refusal below is real.
+	_, out := s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/tmp/leak.so LEAK_FILE=/protected/secret /usr/bin/true 2>&1"})
+	s.Require().Containsf(out, marker, "preload_leak.so did not leak without a daemon: %s", out)
 
 	s.startDaemon(c, `[watch /protected]
 need_encryption: false
@@ -451,6 +454,9 @@ func (s *IntegrationSuite) TestDaemon_Bypass_LdPreloadBinaryWhitelistedByReload(
 	s.exec(c, []string{"sh", "-c",
 		"mkdir -p /protected && printf '" + marker + "' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/preload_leak.so"), "/tmp/leak.so", 0755), "copy preload_leak.so")
+	// Positive control: with no daemon running the payload does leak, so the refusal below is real.
+	_, out := s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/tmp/leak.so LEAK_FILE=/protected/secret /usr/bin/true 2>&1"})
+	s.Require().Containsf(out, marker, "preload_leak.so did not leak without a daemon: %s", out)
 
 	// The config lives OUTSIDE /etc/app-listener so this test can rewrite it: once the daemon runs,
 	// /etc/app-listener is self-guarded read-only and only the app-listener binary may write it (the
@@ -834,11 +840,9 @@ need_encryption: false
 need_encryption: false
 /usr/bin/sleep`)
 
-	// Self guards attach after the daemon signals ready (best-effort
-	// hardening, slow LSM attach on hardened kernels) — wait for both.
 	selfReady := false
 	for dl := time.Now().Add(45 * time.Second); time.Now().Before(dl); {
-		if strings.Contains(s.readDaemonLog(c), "self-protection: guarding /etc/app-listener/fscrypt.key") {
+		if selfDirGuarded.MatchString(s.readDaemonLog(c)) {
 			selfReady = true
 			break
 		}
