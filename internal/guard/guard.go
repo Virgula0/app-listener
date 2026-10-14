@@ -1793,6 +1793,23 @@ func (g *Guard) RootAnchor() (GuardInodeKey, bool, error) {
 	return key, alive, err
 }
 
+// OwnsRootInode reports whether guard_inodes maps this guard's root inode to its own resource. A
+// root claimed first by an enclosing resource (claimInode keeps it when the chain can't be verified)
+// is judged by that resource's mode, not this guard's.
+func (g *Guard) OwnsRootInode() (bool, error) {
+	g.mu.Lock()
+	key := g.rootKey
+	g.mu.Unlock()
+	var owner uint32
+	if err := g.objs().GuardInodes.Lookup(key, &owner); err != nil {
+		if errors.Is(err, cilium.ErrKeyNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("looking up root inode of %s: %w", g.path, err)
+	}
+	return owner == g.resID, nil
+}
+
 // sweepRoot re-anchors a root whose inode changed. handled: the sweep must not re-scan by mtime
 // this tick (re-anchored, or refused: a refused root's path names a tree that is not ours).
 func (g *Guard) sweepRoot(root *rootHandle) (handled bool, err error) {

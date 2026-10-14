@@ -834,11 +834,9 @@ need_encryption: false
 need_encryption: false
 /usr/bin/sleep`)
 
-	// Self guards attach after the daemon signals ready (best-effort
-	// hardening, slow LSM attach on hardened kernels) — wait for both.
 	selfReady := false
 	for dl := time.Now().Add(45 * time.Second); time.Now().Before(dl); {
-		if strings.Contains(s.readDaemonLog(c), "self-protection: guarding /etc/app-listener/fscrypt.key") {
+		if selfDirGuarded.MatchString(s.readDaemonLog(c)) {
 			selfReady = true
 			break
 		}

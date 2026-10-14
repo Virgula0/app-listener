@@ -187,6 +187,9 @@ func init() {
 // startPprof serves the Go profiler on loopback only (opt-in --pprof), e.g. `go tool pprof
 // http://127.0.0.1:6060/debug/pprof/heap`.
 func startPprof(addr string) {
+	if addr == "" {
+		return
+	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		log.Errorf("pprof: ignoring --pprof %q: %v", addr, err)
@@ -258,9 +261,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if handled, modeErr := runOneShotMode(); handled {
 		return modeErr
 	}
-	if pprofAddr != "" {
-		startPprof(pprofAddr)
-	}
+	startPprof(pprofAddr)
 
 	configPath, cfg, pin, err := prepareDaemonStart()
 	if err != nil {
@@ -277,9 +278,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// a killed predecessor's self-guard pins (swept by CleanupStalePins, same pin.base) would leave
 	// a window with no replacements. pinstate.go's ensurePinStateFilePlaceholder keeps
 	// writePinState working under the live RO self-guard. They stay attached across every reload.
-	// A failed self guard is logged CRITICAL but never aborts startup.
-	sg := newSelfGuards()
-	sg.attach(pin)
+	// Nothing is unlocked yet, so refusing here leaves every vault and fscrypt.key's secret locked.
+	sg, err := startSelfGuards(pin)
+	if err != nil {
+		return err
+	}
 	defer sg.detach()
 
 	// Attached before anything is unlocked; startTrustGuard explains why the daemon can't run
