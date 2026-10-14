@@ -1,6 +1,6 @@
 # app-listener
 
-**Your secrets, readable only by the apps they belong to.**
+**Secrets, readable only by the apps they actually belong to.**
 
 On a Linux desktop, every program you run can read every file you own. Your SSH keys, browser
 cookies, cloud credentials and AI tokens are open to any info-stealer that runs as you, and to
