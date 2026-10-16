@@ -30,6 +30,12 @@ struct event {
 	char comm[16];
 	char path[MAX_PATH];
 	char dest[MAX_PATH];
+	// Identity of the dentry the kernel paths were walked from; dev == 0 means path/dest are
+	// user strings. read_path stops at the superblock root, so userspace maps (dev, path) to
+	// the mount through /proc/self/mountinfo, whose major:minor is this same kernel s_dev.
+	__u32 dev;
+	__u32 mode;
+	__u64 ino;
 };
 
 struct {
@@ -44,6 +50,21 @@ struct {
 	__type(value, char[MAX_PATH]);
 } tmp_buf SEC(".maps");
 
+static __always_inline void fill_identity(struct event *e, struct dentry *dentry)
+{
+	e->dev = 0;
+	e->mode = 0;
+	e->ino = 0;
+	if (!dentry)
+		return;
+	e->dev = BPF_CORE_READ(dentry, d_sb, s_dev);
+	struct inode *inode = BPF_CORE_READ(dentry, d_inode);
+	if (!inode)
+		return;
+	e->ino = BPF_CORE_READ(inode, i_ino);
+	e->mode = BPF_CORE_READ(inode, i_mode);
+}
+
 static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, const char *dest)
 {
 	struct event *e;
@@ -51,6 +72,8 @@ static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, co
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
 	if (!e)
 		return 0;
+
+	fill_identity(e, NULL);
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
 	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
@@ -74,13 +97,16 @@ static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, co
 	return 0;
 }
 
-static __always_inline int emit_event_kern(__u32 type, __u32 fd, const char *path, const char *dest)
+static __always_inline int emit_event_kern(__u32 type, __u32 fd, const char *path, const char *dest,
+					   struct dentry *dentry)
 {
 	struct event *e;
 
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
 	if (!e)
 		return 0;
+
+	fill_identity(e, dentry);
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
 	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
@@ -118,6 +144,21 @@ static __always_inline long read_path(struct dentry *dentry, char *buf, int buf_
 	char tmp[64];
 	int pos = buf_size - 1;
 	buf[pos & (MAX_PATH - 1)] = '\0';
+
+	// A superblock root (e.g. a tmpfs mountpoint) is named "/": emit it. Pipe, socket and
+	// anon-inode dentries are parentless too but named otherwise; they stay dropped.
+	struct dentry *root_parent;
+	struct qstr root_q;
+	if (dentry && !bpf_probe_read_kernel(&root_parent, sizeof(root_parent), &dentry->d_parent) &&
+	    root_parent == dentry &&
+	    !bpf_probe_read_kernel(&root_q, sizeof(root_q), &dentry->d_name) && root_q.len == 1) {
+		char root_name = 0;
+		bpf_probe_read_kernel(&root_name, 1, root_q.name);
+		if (root_name == '/') {
+			buf[(pos - 1) & (MAX_PATH - 1)] = '/';
+			return pos - 1;
+		}
+	}
 
 	#pragma unroll
 	for (int i = 0; i < 48; i++) {
@@ -207,7 +248,7 @@ int trace_vfs_open(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_OPEN, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_OPEN, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_read")
@@ -228,7 +269,7 @@ int trace_vfs_read(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_write")
@@ -249,7 +290,7 @@ int trace_vfs_write(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_WRITE, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_WRITE, 0, buf + off, NULL, dentry);
 }
 
 // Additional VFS kprobes for syscalls that bypass vfs_read/vfs_write:
@@ -277,7 +318,7 @@ int trace_vfs_readv(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_copy_file_range")
@@ -298,7 +339,7 @@ int trace_vfs_copy_file_range(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/do_splice")
@@ -319,7 +360,7 @@ int trace_do_splice(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/do_splice_direct")
@@ -340,7 +381,7 @@ int trace_do_splice_direct(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/splice_file_range")
@@ -361,7 +402,7 @@ int trace_splice_file_range(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 // do_sendfile catches sendfile on kernels where it no longer calls
@@ -417,7 +458,7 @@ int trace_do_sendfile(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 // vfs_iter_read: catch-all for read-like operations on newer kernels.
@@ -439,7 +480,7 @@ int trace_vfs_iter_read(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 // io_uring read/write. io_uring does NOT go through vfs_read/vfs_readv/vfs_iter_read (its path is
@@ -472,7 +513,7 @@ int trace_io_read(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_READ, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_READ, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/io_write")
@@ -499,7 +540,7 @@ int trace_io_write(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_WRITE, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_WRITE, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/security_mmap_file")
@@ -520,7 +561,7 @@ int trace_security_mmap_file(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_MMAP, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_MMAP, 0, buf + off, NULL, dentry);
 }
 
 // VFS kprobes for metadata operations. They replace tracepoint/syscalls/sys_enter_* because
@@ -547,7 +588,7 @@ int trace_vfs_mkdir(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_MKDIR, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_MKDIR, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_rmdir")
@@ -562,7 +603,7 @@ int trace_vfs_rmdir(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_DELETE, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_DELETE, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_unlink")
@@ -577,7 +618,7 @@ int trace_vfs_unlink(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_DELETE, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_DELETE, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_rename")
@@ -609,6 +650,7 @@ int trace_vfs_rename(struct pt_regs *ctx)
 
 	fill_path(old_dentry, e->path);
 	fill_path(new_dentry, e->dest);
+	fill_identity(e, old_dentry);
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -628,7 +670,7 @@ int trace_vfs_symlink(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_SYMLINK, 0, buf + off, symname);
+	return emit_event_kern(EVENT_SYMLINK, 0, buf + off, symname, dentry);
 }
 
 SEC("kprobe/vfs_link")
@@ -653,6 +695,7 @@ int trace_vfs_link(struct pt_regs *ctx)
 
 	fill_path(old_dentry, e->path);
 	fill_path(new_dentry, e->dest);
+	fill_identity(e, old_dentry);
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -680,7 +723,7 @@ int trace_notify_change(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_setxattr")
@@ -695,7 +738,7 @@ int trace_vfs_setxattr(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_removexattr")
@@ -710,7 +753,7 @@ int trace_vfs_removexattr(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_ATTR, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_mknod")
@@ -725,7 +768,7 @@ int trace_vfs_mknod(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_MKNOD, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_MKNOD, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_getattr")
@@ -746,7 +789,7 @@ int trace_vfs_getattr(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_STAT, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_STAT, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/vfs_readlink")
@@ -761,7 +804,7 @@ int trace_vfs_readlink(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_STAT, 0, buf + off, NULL);
+	return emit_event_kern(EVENT_STAT, 0, buf + off, NULL, dentry);
 }
 
 SEC("kprobe/do_faccessat")

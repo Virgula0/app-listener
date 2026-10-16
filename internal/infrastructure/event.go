@@ -78,11 +78,16 @@ type BpfEvent struct {
 	Comm [16]byte
 	Path [256]byte
 	Dest [256]byte
+	// Dev is the walked dentry's kernel s_dev (MAJOR<<20|MINOR, as mountinfo prints it); 0 when
+	// Path/Dest are user strings. Kernel paths are relative to that superblock's root.
+	Dev  uint32
+	Mode uint32
+	Ino  uint64
 }
 
-// BpfEventSize is BpfEvent's wire size as laid out by the BPF side: 6 x u32 header, then the three
-// fixed byte arrays. Keep in sync with C struct event {} in monitor.bpf.c.
-const BpfEventSize = 6*4 + 16 + 256 + 256
+// BpfEventSize is BpfEvent's wire size as laid out by the BPF side: 6 x u32 header, the three
+// fixed byte arrays, then dev/mode/ino. Keep in sync with C struct event {} in monitor.bpf.c.
+const BpfEventSize = 6*4 + 16 + 256 + 256 + 4 + 4 + 8
 
 // DecodeBpfEvent fills e from a raw ring-buffer record without reflection or a per-record
 // bytes.Reader (binary.Read does both, which adds up on the monitor's unfiltered VFS firehose).
@@ -100,6 +105,9 @@ func DecodeBpfEvent(raw []byte, e *BpfEvent) bool {
 	copy(e.Comm[:], raw[24:40])
 	copy(e.Path[:], raw[40:296])
 	copy(e.Dest[:], raw[296:552])
+	e.Dev = binary.LittleEndian.Uint32(raw[552:556])
+	e.Mode = binary.LittleEndian.Uint32(raw[556:560])
+	e.Ino = binary.LittleEndian.Uint64(raw[560:568])
 	return true
 }
 

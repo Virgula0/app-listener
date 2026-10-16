@@ -22,6 +22,10 @@ sudo app-listener monitor -w /path/to/file.txt -e OPEN,READ
 | `STAT` | stat, access, readlink |
 | `MKNOD` | Device node creation |
 
+A watched path on its own mount (a tmpfs `/tmp`, a bind mount, a btrfs subvolume) is reported
+under the watched path. The monitor never stats files outside the watch, so running it while the
+daemon is active does not trip the daemon's guards on their protected files.
+
 ## Flags
 
 | Flag | Default | Description |
