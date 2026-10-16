@@ -22,6 +22,7 @@ type rootHandle struct {
 	resolved string // the kernel's d_path for fd: where the configured path resolved
 	dir      bool
 	proc     string
+	mnt      uint64 // mount id the root was reached through
 }
 
 // openRoot resolves path once, following symlinks like StatInode (the anchor's historical flavor).
@@ -46,7 +47,7 @@ func openRoot(path string) (*rootHandle, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("resolving guard root %s: %w", path, err)
 	}
-	return &rootHandle{fd: fd, key: st.key, sbdev: sbdev, resolved: resolved, dir: st.dir, proc: proc}, nil
+	return &rootHandle{fd: fd, key: st.key, sbdev: sbdev, resolved: resolved, dir: st.dir, proc: proc, mnt: st.mnt}, nil
 }
 
 const procFDDir = "/proc/self/fd/"

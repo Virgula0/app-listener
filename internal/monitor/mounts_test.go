@@ -39,7 +39,7 @@ func (s *mountsUnitTest) fixtureTable() *mountTable {
 
 func (s *mountsUnitTest) TestResolve() {
 	t := s.fixtureTable()
-	underTmp := func(p string) bool { _, ok := underRoot(p, "/tmp"); return ok }
+	underTmp := func(p string) bool { _, ok := ebpf.PathUnder(p, "/tmp"); return ok }
 
 	tests := []struct {
 		name   string
@@ -77,11 +77,6 @@ func (s *mountsUnitTest) TestDevOf() {
 	s.Require().Equal(rootDev, t.devOf("/tmpx"))
 	s.Require().Equal(tmpfsDev, t.devOf("/mnt/bind dir/q"))
 	s.Require().Equal(btrfsDev, t.devOf("/home/u"))
-}
-
-func (s *mountsUnitTest) TestUnescapeMountinfo() {
-	s.Require().Equal("/a b\tc\\d", unescapeMountinfo(`/a\040b\011c\134d`))
-	s.Require().Equal(`/trailing\04`, unescapeMountinfo(`/trailing\04`))
 }
 
 func (s *mountsUnitTest) newMonitor() *Monitor {

@@ -795,6 +795,7 @@ func (e *engine) readLoop(rd *ringbuf.Reader) {
 func (e *engine) deliver(resID uint32, ev *GuardEvent) {
 	e.mu.Lock()
 	var target *Guard
+	ownFile := false // a file event of the slot's own resource, on its root's filesystem
 	switch {
 	case resID == resGlobal:
 		target = e.globalOwnerLocked()
@@ -808,12 +809,17 @@ func (e *engine) deliver(resID uint32, ev *GuardEvent) {
 		}
 	case resID < GuardMaxRes:
 		target = e.slots[resID]
+		ownFile = ev.FsGate == "" && ev.Process == ""
 	}
 	e.mu.Unlock()
 
-	if target != nil {
-		target.dispatch(ev)
+	if target == nil {
+		return
 	}
+	if ownFile {
+		target.localizePaths(ev)
+	}
+	target.dispatch(ev)
 }
 
 // globalOwnerLocked is the guard that reports reserved-slot events: the raw-device owner while it

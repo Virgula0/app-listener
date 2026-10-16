@@ -264,6 +264,9 @@ type Guard struct {
 	admit AdmissionCheck
 	// tap: SetEventTap.
 	tap atomic.Pointer[func(GuardEvent)]
+	// rootMount is the mount the root was last reached through (noteRootMount): localizePaths maps
+	// the kernel's superblock-relative event paths through it. Nil when unknown.
+	rootMount atomic.Pointer[ebpf.MountInfo]
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -1501,6 +1504,7 @@ func (g *Guard) populateMaps() error {
 	if rootErr != nil {
 		return fmt.Errorf("stating guard root %s: %w", g.path, rootErr)
 	}
+	g.noteRootMount(root)
 	root.close()
 	if keyErr := g.updateRootKey(root.key, root.sbdev); keyErr != nil {
 		return keyErr
@@ -1847,6 +1851,7 @@ func (g *Guard) SweepInodes() error {
 		return fmt.Errorf("stating guarded path %s: %w", g.path, err)
 	}
 	defer root.close()
+	g.noteRootMount(root)
 
 	if handled, anchorErr := g.sweepRoot(root); anchorErr != nil || handled || !root.dir {
 		if handled && anchorErr == nil && root.dir {
@@ -2327,6 +2332,41 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 		}
 	}
 	return ge, be.ResID, true
+}
+
+// noteRootMount records the mount root was reached through; mountinfo is re-read only when the
+// mount id changed (a remount, a vault mounted after unlock).
+func (g *Guard) noteRootMount(root *rootHandle) {
+	if m := g.rootMount.Load(); m != nil && m.ID == root.mnt {
+		return
+	}
+	m, err := ebpf.MountByID(root.mnt)
+	if err != nil {
+		log.Debugf("guard %s: event paths stay filesystem-relative: %v", g.path, err)
+		g.rootMount.Store(nil)
+		return
+	}
+	g.rootMount.Store(&m)
+}
+
+// localizePaths rewrites a file event's paths, which the BPF dentry walk yields relative to the
+// superblock root, to absolute ones through the root's mount. Root confinement means every file
+// event of this slot walked through the root's dentry, so it is on the root's filesystem. Display
+// only: no decision reads these paths.
+func (g *Guard) localizePaths(ev *GuardEvent) {
+	m := g.rootMount.Load()
+	if m == nil || (m.Root == "/" && m.Mountpoint == "/") {
+		return
+	}
+	if p, ok := m.MountPath(ev.Path); ok {
+		ev.Path = p
+	}
+	// Only RENAME and HARDLINK walk dest from a dentry; SYMLINK's is the link body.
+	if ev.Type == ebpf.EventRename || ev.Type == ebpf.EventHardlink {
+		if p, ok := m.MountPath(ev.Dest); ok {
+			ev.Dest = p
+		}
+	}
 }
 
 // dispatch delivers one decoded event to this guard's consumer.
