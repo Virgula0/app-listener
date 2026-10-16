@@ -73,7 +73,7 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 	// eBPF setup, when this binary was built without GUI support.
 	if launchGUI, _ := cmd.Flags().GetBool("gui"); launchGUI && !gui.Available {
 		return errors.New("--gui: this app-listener binary was built without GUI support — " +
-			"rebuild with `make build-linux GUI=1` (or `go build -tags gui`), or drop --gui for the terminal UI")
+			"rebuild with `make build GUI=1` (or `go build -tags gui`), or drop --gui for the terminal UI")
 	}
 
 	rawTargets, ebpfTargets, err := prepareMonitorTargets()
@@ -116,7 +116,7 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 		runHeadless(ucase)
 	case launchGUI:
 		// Availability was checked up front (before eBPF setup).
-		gui.Run(ucase.Events(), displayPaths, recursive, depth)
+		return gui.Run(ucase.Events(), displayPaths, recursive, depth)
 	case serve.Enabled:
 		fan := tui.NewEventFanout(ucase.Events())
 		defer fan.Stop()

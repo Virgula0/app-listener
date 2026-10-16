@@ -2,7 +2,7 @@
 
 // Package gui is the optional fyne desktop window for `monitor --gui`, behind the `gui` build tag:
 // fyne adds X11/OpenGL/font/image dependencies (~15 MiB) and package-init goroutines that don't
-// belong in the daemon sharing this binary. Build with `-tags gui` (or `make build-linux GUI=1`).
+// belong in the daemon sharing this binary. Build with `-tags gui` (or `make build GUI=1`).
 package gui
 
 import (
@@ -304,7 +304,16 @@ func (hr *headerRenderer) Destroy() {}
 
 // ── Run ────────────────────────────────────────────────────────────────────
 
-func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) {
+func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) (err error) {
+	restoreSessionEnv()
+	defer cleanupSessionEnv()
+	// fyne logs a failed GLFW init and then panics on the first window call.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("--gui: no display reachable (%v): run it from a graphical session "+
+				"(under sudo it needs the invoking user's WAYLAND_DISPLAY or DISPLAY)", r)
+		}
+	}()
 	m := &guiModel{
 		events:    events,
 		allEvents: make([]ebpf.FileEvent, 0, 500),
@@ -372,9 +381,13 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 	startTime := time.Now()
 	go m.listenEvents(infoLabel, list, startTime, recursiveStr)
 	go m.uptimeTicker(infoLabel, resLabel, startTime, recursiveStr)
-	floatWindow()
+	// The float hint is an X11 property; a Wayland window has no X id to set it on.
+	if os.Getenv("WAYLAND_DISPLAY") == "" {
+		floatWindow()
+	}
 
 	win.ShowAndRun()
+	return nil
 }
 
 func (m *guiModel) listenEvents(
