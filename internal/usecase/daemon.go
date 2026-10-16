@@ -441,7 +441,8 @@ func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardReposit
 // Reload atomically applies a new configuration: old and new LSM programs run concurrently and ANY
 // deny wins, so protection is never weaker than either; on error the old config keeps running and
 // new guards are detached. Removing a resource is refused (it would be left unlocked and
-// unguarded); dropping protection requires stop/edit/start.
+// unguarded) unless it is a released lib_dir (libDirReleased); dropping protection requires
+// stop/edit/start.
 func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repository.GuardRepository) error {
 	if len(resources) != len(guards) {
 		return fmt.Errorf("daemon: %d resources but %d guard engines", len(resources), len(guards))
@@ -461,19 +462,9 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 
 	// Phase 0: refuse to drop any protected resource (see Reload). Nothing is committed: new guards
 	// detach, old config keeps running.
-	newByPath := make(map[string]bool, len(resources))
-	for i := range resources {
-		newByPath[resources[i].Path] = true
-	}
-	var removed []string
-	for i := range d.resources {
-		if !newByPath[d.resources[i].Path] {
-			removed = append(removed, d.resources[i].Path)
-		}
-	}
-	if len(removed) > 0 {
+	if err := d.refuseRemovedResources(resources); err != nil {
 		d.rollbackReload(resources, guards, nil)
-		return fmt.Errorf("reload refused: %v would be left unlocked and unprotected — stop the daemon, edit the config, and start it again to drop them", removed)
+		return err
 	}
 
 	oldByPath := make(map[string]int, len(d.resources))
@@ -511,6 +502,44 @@ func (d *daemonUseCase) Reload(resources []daemonconfig.Resource, guards []repos
 	d.commitReload(resources, guards)
 	log.Info("daemon: configuration reloaded without dropping protection")
 	return nil
+}
+
+func (d *daemonUseCase) refuseRemovedResources(resources []daemonconfig.Resource) error {
+	newByPath := make(map[string]bool, len(resources))
+	for i := range resources {
+		newByPath[resources[i].Path] = true
+	}
+	var removed []string
+	for i := range d.resources {
+		if newByPath[d.resources[i].Path] {
+			continue
+		}
+		released, err := d.libDirReleased(i)
+		if err != nil {
+			return fmt.Errorf("reload refused: %w", err)
+		}
+		if !released {
+			removed = append(removed, d.resources[i].Path)
+		}
+	}
+	if len(removed) > 0 {
+		return fmt.Errorf("reload refused: %v would be left unlocked and unprotected — stop the daemon, edit the config, and start it again to drop them", removed)
+	}
+	return nil
+}
+
+// libDirReleased reports whether the running resource i is a lib_dir whose root the kernel saw
+// deleted or moved by an allowed operation (only its writers): it holds no secret, so a reload may
+// drop it as a restart's parse does. A root still anchored, or any whitelist resource, stays.
+func (d *daemonUseCase) libDirReleased(i int) (bool, error) {
+	if !d.resources[i].ReadOnly {
+		return false, nil
+	}
+	_, alive, err := d.guards[i].RootAnchor()
+	if err != nil {
+		return false, fmt.Errorf("reading the root of %s: %w", d.resources[i].Path, err)
+	}
+	return !alive, nil
 }
 
 // refuseMovedRoots refuses a reload whose guard for a kept resource anchored on a different root

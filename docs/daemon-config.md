@@ -152,6 +152,8 @@ max_inodes: 65536
 ## Reloading
 
 `sudo systemctl reload app-listener-daemon` re-reads the file. New guards attach before old ones
-detach, and a malformed config keeps the previous one running. Binaries added by hand are vetted
+detach, and a malformed config keeps the previous one running. A reload never drops a guarded
+resource (stop, edit and start for that), except a `lib_dir` whose directory its writer deleted
+(an app's old version dir after an update), which it drops as a restart would. Binaries added by hand are vetted
 like any other: one that isn't root-placed needs `sudo app-listener trust-binaries`
 ([Binary trust](binary-trust.md#trust-binaries)).

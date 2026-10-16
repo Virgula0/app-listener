@@ -1556,6 +1556,74 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_GroupedResou
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("umount %s 2>/dev/null; losetup -D 2>/dev/null; true", mnt)})
 }
 
+// A reload re-defers a stale lib_dir of an unlocked grouped vault and "unlocks" that vault again
+// under an ephemeral guard. When the reload is then refused, the lock-back must not pull the key
+// the running config still holds: with apps' files open the key is left incompletely removed,
+// cached inodes keep working and every new one (an updater's fresh files) stays ciphertext.
+func (s *IntegrationSuite) TestDaemon_RefusedReload_KeepsRunningVaultUnlocked() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.copyFscryptHarness(c)
+
+	const marker = "REFUSED-RELOAD-VAULT-SECRET-4D2A"
+	const mnt = "/mnt/fscrypt-reload"
+	s.setupFscryptDirFilesystem(c, mnt)
+
+	root := mnt + "/profile"
+	sub := root + "/sentry"
+	secret := sub + "/secret.txt"
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"mkdir -p %s /dropB /etc/app-listener && printf '%s' > %s && echo x > /dropB/f && "+
+			"chmod 755 %s %s && chmod 644 %s && "+
+			"head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key",
+		sub, marker, secret, root, sub, secret)})
+	s.harnessMigrate(c, root)
+	s.Require().True(s.harnessIsEncrypted(c, root), "setup: the vault root must be encrypted before the daemon starts")
+
+	const cfgPath = "/tmp/reload-vault.conf"
+	writeCfg := func(body string) {
+		code, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF", cfgPath, body)})
+		s.Require().Equalf(0, code, "writing %s: %s", cfgPath, out)
+	}
+	group := fmt.Sprintf("[watch %s]\nwatch: %s\nlib_dir %s/app-gone\nneed_encryption: true\n/usr/bin/grep", root, sub, root)
+	writeCfg(group + "\n\n[watch /dropB]\nneed_encryption: false\n/usr/bin/true")
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"nohup /app-listener daemon --config " + cfgPath + " --headless > /tmp/daemon.log 2>&1 &"})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, "")
+	_, out = s.exec(c, []string{"grep", "-c", marker, secret})
+	s.Require().Containsf(out, "1", "baseline: the whitelisted reader must see the unlocked vault: %s", out)
+	const deferred = "lib_dir not resolvable yet"
+	deferredAtStart := strings.Count(s.readDaemonLog(c), deferred)
+
+	// Dropping /dropB makes Phase 0 refuse after the ephemeral unlock already ran.
+	writeCfg(group)
+	s.sigDaemon(c, "HUP")
+	refused := false
+	for dl := time.Now().Add(daemonShutdownTimeout); time.Now().Before(dl); {
+		if strings.Contains(s.readDaemonLog(c), "reload failed, keeping previous configuration") {
+			refused = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	daemonLog := s.readDaemonLog(c)
+	s.Require().Truef(refused, "the reload dropping /dropB must be refused, daemon log:\n%s", daemonLog)
+	s.Require().Greaterf(strings.Count(daemonLog, deferred), deferredAtStart,
+		"the reload must re-defer the stale lib_dir (the ephemeral-unlock path), daemon log:\n%s", daemonLog)
+
+	_, out = s.exec(c, []string{"grep", "-c", marker, secret})
+	s.Require().Containsf(out, "1", "the refused reload locked the running config's vault: %s\ndaemon log:\n%s",
+		out, s.readDaemonLog(c))
+
+	s.sigDaemon(c, "TERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
+	s.Require().Truef(s.harnessIsEncrypted(c, root), "a graceful stop must still re-lock the vault")
+
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf("umount %s 2>/dev/null; losetup -D 2>/dev/null; true", mnt)})
+}
+
 // C. SIGKILL inside startup's unlock/populate window at several delays, for the file-vault
 // resource: the newest, most crash-sensitive path (in-place AEAD transform + recovery sidecar).
 
