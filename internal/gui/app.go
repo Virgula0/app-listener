@@ -349,12 +349,6 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 
 	filterEntry := widget.NewEntry()
 	filterEntry.SetPlaceHolder("Filter by path, process, or event type...")
-	filterEntry.OnChanged = func(s string) {
-		m.mu.Lock()
-		m.filter = strings.ToLower(s)
-		m.applyFilter()
-		m.mu.Unlock()
-	}
 
 	header := newHeaderWidget(m.cols, func() {
 		// called after columns are resized
@@ -373,6 +367,14 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 	)
 
 	header.onResize = func() {
+		list.Refresh()
+	}
+	// Redraw now: otherwise the list only re-reads m.filtered on the next event.
+	filterEntry.OnChanged = func(s string) {
+		m.mu.Lock()
+		m.filter = strings.ToLower(s)
+		m.applyFilter()
+		m.mu.Unlock()
 		list.Refresh()
 	}
 
