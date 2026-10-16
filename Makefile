@@ -95,6 +95,7 @@ build:
 		-e GOMODCACHE=/cache/gomod \
 		-e GOFLAGS=-modcacherw \
 		-e VERSION="$(VERSION)" \
+		-e GUI="$(GUI)" \
 		-w /app/app-listener \
 		$(BUILD_IMAGE) \
 		make bpftool-headers generate build-linux

@@ -73,7 +73,7 @@ Every mode has three presentations:
 - **`--headless`**: no TUI, one line per event on stderr, with a stable prefix per mode that
   scripts and the integration tests parse: `EVENT|` (monitor), `GUARD|` (guard), `NETEVENT|`
   (network-monitor), `NETGUARD|` (network-guard), `DAEMON ...` (daemon; journald under systemd).
-- **`--gui`** (monitor only): a desktop window, available in builds made with `make build-linux GUI=1`.
+- **`--gui`** (monitor only): a desktop window, available in builds made with `make build GUI=1`.
 
 ### Global flags
 

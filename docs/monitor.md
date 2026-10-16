@@ -31,5 +31,5 @@ sudo app-listener monitor -w /path/to/file.txt -e OPEN,READ
 | `-d, --depth <n>` | `0` | Max depth (needs `--recursive`; `0` = unlimited) |
 | `-e, --events <list>` | all | Comma-separated subset of the events above |
 | `--headless` | `false` | No TUI; log `EVENT\|` lines to stderr |
-| `--gui` | `false` | Desktop GUI (needs a `make build-linux GUI=1` build) |
+| `--gui` | `false` | Desktop GUI (needs a `make build GUI=1` build) |
 | `--serve[=host:port]` | off | Mirror the TUI to a browser, see [How it works](how-it-works.md#watching-from-a-browser---serve) |
