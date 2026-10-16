@@ -325,6 +325,9 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 	}
 
 	os.Setenv("FYNE_THEME", "dark")
+	// Opts out of fyne's off-main-goroutine marshalling: every widget call from a goroutine here
+	// goes through fyne.Do. Set before the app exists: fyne reads it once, on first use.
+	app.SetMetadata(fyne.AppMetadata{Migrations: map[string]bool{"fyneDo": true}})
 	fyneApp := app.NewWithID("com.virgula0.app-listener")
 	win := fyneApp.NewWindow("app-listener — File System Monitor (eBPF)")
 
