@@ -64,6 +64,7 @@ folder picker picks the folder shown. The path field above takes a typed absolut
 |---|---|
 | Files | `monitor` and `guard`, on several folders or files side by side. |
 | Network | `network-monitor` and `network-guard`. |
+| Update | `update`, from the stable or the pre-release channel. |
 | Install | `install`: the wizard and its maintenance flags. |
 
 ## Files
@@ -151,6 +152,29 @@ the window still stops responding, Ctrl+C in the terminal that started it stops 
 
 Closing the window stops the guard, then the monitor.
 
+## Update
+
+The Update workspace runs `update` in the window with every prompt as a dialog. The page shows the
+installed version, whether the daemon runs, and the newest release of the selected **Channel**
+(looked up on GitHub when the page opens, on a channel change and on **Check**), with whether
+`update` would install it.
+
+| Channel | CLI equivalent |
+|---|---|
+| Latest stable release (default) | `update` |
+| Latest pre-release | `update --channel pre-release` |
+
+There is no local-file source and no `--yes`. **Update** runs the same steps as the terminal: the
+release's headless asset is downloaded and verified (Ed25519 signature, checksum, GitHub digest,
+ELF architecture, `--version`, no `gui` build tag); the changelog since the installed version opens
+in a dialog and you confirm; a changed daemon unit shows its diff and asks; then the daemon is
+stopped, its folders verified locked, the binary replaced atomically and the daemon started again.
+Nothing changes before that last step, and the window's own build is never installed. An installed
+version that is already the newest finishes with "up to date" in the log and changes nothing.
+
+The run view, the close confirmation and the guard rule are the Install workspace's (below): no
+update starts while a guard runs in this window, nor while an installer run is in progress.
+
 ## Install
 
 The Install workspace runs `install` with every prompt as a dialog. The page shows the installed
@@ -195,8 +219,8 @@ load it.
 confirmation is asked.
 
 The wizard needs the installed binary to be identical to the staged build, as the terminal
-wizard needs it to be the one running: if they differ, update it from a terminal first
-(`app-listener update`, or `install --binary-only`). The GUI has no binary-only action.
+wizard needs it to be the one running: if they differ, update it first (the Update workspace, or
+`install --binary-only` from a terminal). The GUI has no binary-only action.
 
 Starting an action switches to its run view: the steps reached so far, a progress bar for long
 copies (migration, backups, the download), and the log. A canceled prompt stops the run where it

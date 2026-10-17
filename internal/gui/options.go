@@ -9,6 +9,7 @@ type Options struct {
 	// tag's headless asset. A local build has no release to fetch and asks for a local file.
 	Release bool
 	Install InstallHooks
+	Update  UpdateHooks
 }
 
 // InstallMode is an installer entry point (the wizard or one maintenance flag of `install`).
@@ -41,4 +42,13 @@ type InstallHooks struct {
 	FetchLatest func(preRelease bool, dir string) (path, tag string, err error)
 	// InstalledVersion is the version the installed binary reports.
 	InstalledVersion func() string
+}
+
+// UpdateHooks are the updater functions the Update page drives (cmd/functions/update).
+type UpdateHooks struct {
+	// Run updates to the latest stable (or pre-) release with every prompt on ui.
+	Run func(ui wizard.UI, preRelease bool) error
+	// Latest returns the newest stable (or pre-) release's tag without downloading it, and whether
+	// Run would install it over installed.
+	Latest func(preRelease bool, installed string) (tag string, newer bool, err error)
 }

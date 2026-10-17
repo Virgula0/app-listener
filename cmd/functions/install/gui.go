@@ -43,6 +43,7 @@ var deploySource string
 var runMu sync.Mutex
 
 // RunWith runs req with every prompt on ui. One run at a time: the installer keeps package state.
+// TODO(self-binary-guard): runs in the GUI process, see update.RunWith.
 func RunWith(ui wizard.UI, req Request) error {
 	if !runMu.TryLock() {
 		return errors.New("an installer run is already in progress")

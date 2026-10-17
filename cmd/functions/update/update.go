@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -162,37 +163,68 @@ func validateChannel(ch string) error {
 // runUpdate drives the update flow: every check runs first; changelog and
 // confirmation come last unless --yes skips them.
 func runUpdate(cmd *cobra.Command, args []string) error {
-	assets, err := checkUpdatePreconditions()
+	return run(channelFlag, yesFlag)
+}
+
+// RunWith updates to the latest release of the stable (or pre-release) channel with every prompt on
+// ui: the desktop GUI's updater. Like the CLI it deploys the release's headless asset, never the
+// running executable. One run at a time: wizard.Use is process-wide.
+//
+// TODO(self-binary-guard): runs in the GUI process (not the daemon's exe inode), safe only because
+// nothing it touches is daemon-guarded: with the daemon up it just execs and hashes
+// systemd.InstallBinaryPath (so do install.RunWith and gui readInstalled); the swap follows
+// systemctl stop. When the daemon guards its own binary, keep those reads open to root (ModeReadOnly)
+// or move them after the stop; a guard outliving the stop leaves the daemon stopped on a failed
+// swap, so then hand the swap to the installed binary (fixed argv, no shell) or to the daemon.
+func RunWith(ui wizard.UI, preRelease bool) error {
+	if !runMu.TryLock() {
+		return errors.New("an update is already in progress")
+	}
+	defer runMu.Unlock()
+	defer wizard.Use(ui)()
+	return run(channelOf(preRelease), false)
+}
+
+var runMu sync.Mutex
+
+func channelOf(preRelease bool) string {
+	if preRelease {
+		return channelPreRelease
+	}
+	return channelStable
+}
+
+// run is the update of channel; auto is --yes (no changelog viewer or prompts).
+func run(channel string, auto bool) error {
+	assets, err := checkUpdatePreconditions(channel)
 	if err != nil {
 		return err
 	}
 
+	wizard.Stage("Checking the installed version")
 	installed := readInstalledVersion(systemd.InstallBinaryPath)
 	log.Infof("installed version: %s", installed)
 
-	releases, err := fetchReleases(githubAPIBase, defaultRepo, updateHTTPClient())
+	wizard.Stage("Looking up the latest " + channel + " release")
+	c, err := findUpdate(channel, installed)
 	if err != nil {
 		return err
 	}
-	channel := filterChannel(releases, channelFlag)
-	latest, ok := pickLatestRelease(channel)
-	if !ok {
-		log.Infof("no %s releases found: nothing to update", channelFlag)
+	if c == nil {
+		log.Infof("no %s releases found: nothing to update", channel)
 		return nil
 	}
-	log.Infof("latest %s release: %s (published %s)", channelFlag, latest.TagName, latest.PublishedAt)
-
-	var newer bool
-	if channelFlag == channelStable {
-		newer = newerThanStable(installed, &latest)
-	} else {
-		newer = newerThanInstalled(installed, &latest, channel)
-	}
-	if !newer {
+	log.Infof("latest %s release: %s (published %s)", channel, c.latest.TagName, c.latest.PublishedAt)
+	if !c.newer {
 		log.Infof("installed version %s is up to date", installed)
 		return nil
 	}
+	return deploy(c, assets, installed, channel, auto)
+}
 
+// deploy downloads and verifies c's release, asks (changelog, unit diff) and swaps it in.
+func deploy(c *candidate, assets releaseAssets, installed, channel string, auto bool) error {
+	latest, releases := c.latest, c.all
 	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&latest, assets)
 	if err != nil {
 		return err
@@ -206,12 +238,14 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 	defer os.RemoveAll(tmp)
 
+	wizard.Stage("Downloading and verifying " + latest.TagName)
 	binPath, err := downloadAndVerify(tmp, &latest, assets, binURL, binDigest, checksumURL, sigURL)
 	if err != nil {
 		return err
 	}
 
-	proceed, err := confirmUpdate(&latest, cumulativeChangelog(installed, &latest, releases, channelFlag))
+	wizard.Stage("Reviewing the changelog")
+	proceed, err := confirmUpdate(&latest, cumulativeChangelog(installed, &latest, releases, channel), auto)
 	if err != nil {
 		return err
 	}
@@ -221,11 +255,13 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Asked before anything changes: the new release's unit is read from the verified download.
-	unit, err := systemd.PlanDaemonUnitUpdate(binPath, confirmUnit(yesFlag))
+	wizard.Stage("Checking the daemon unit")
+	unit, err := systemd.PlanDaemonUnitUpdate(binPath, confirmUnit(auto))
 	if err != nil {
 		return err
 	}
 
+	wizard.Stage("Installing " + latest.TagName + " and restarting the daemon")
 	return applyUpdate(binPath, unit)
 }
 
@@ -242,11 +278,11 @@ func confirmUnit(autoConfirm bool) systemd.ConfirmUnitFunc {
 
 // checkUpdatePreconditions refuses non-root, a bad --channel, an arch with no release, or a
 // missing install; it returns this arch's release assets.
-func checkUpdatePreconditions() (releaseAssets, error) {
+func checkUpdatePreconditions(channel string) (releaseAssets, error) {
 	if os.Geteuid() != 0 {
 		return releaseAssets{}, errors.New("update must be run as root: sudo app-listener update")
 	}
-	if err := validateChannel(channelFlag); err != nil {
+	if err := validateChannel(channel); err != nil {
 		return releaseAssets{}, err
 	}
 	assets, err := assetsFor(runtime.GOARCH)
@@ -287,15 +323,15 @@ func downloadAndVerify(tmp string, r *githubRelease, assets releaseAssets, binUR
 	return binPath, nil
 }
 
-// confirmUpdate: --yes logs the changelog and proceeds; otherwise the notes open in a TUI viewer
-// (non-tty aborts) and the user confirms.
-func confirmUpdate(r *githubRelease, notes string) (bool, error) {
-	if yesFlag {
+// confirmUpdate: auto (--yes) logs the changelog and proceeds; otherwise the notes open in a viewer
+// (a terminal one needs a tty) and the user confirms.
+func confirmUpdate(r *githubRelease, notes string, auto bool) (bool, error) {
+	if auto {
 		log.Infof("--yes given: skipping the changelog viewer and the confirmation prompt")
 		log.Infof("changelog up to %s:\n%s", r.TagName, notes)
 		return true, nil
 	}
-	if !isTerminal(os.Stdin) {
+	if wizard.Active() == nil && !isTerminal(os.Stdin) {
 		return false, errors.New("stdin is not a terminal: interactive confirmation is impossible; re-run with --yes to update without prompts")
 	}
 	if err := showChangelog(r.TagName, notes); err != nil {
@@ -616,13 +652,52 @@ func FetchVerified(tag, dir string) (string, error) {
 	return downloadAndVerify(dir, &r, assets, binURL, binDigest, checksumURL, sigURL)
 }
 
+// candidate is a channel's newest release, every release (the changelog spans them) and whether
+// it beats the installed version.
+type candidate struct {
+	latest githubRelease
+	all    []githubRelease
+	newer  bool
+}
+
+// findUpdate picks channel's newest release for installed; nil when the channel has none.
+func findUpdate(channel, installed string) (*candidate, error) {
+	releases, err := fetchReleases(githubAPIBase, defaultRepo, updateHTTPClient())
+	if err != nil {
+		return nil, err
+	}
+	inChannel := filterChannel(releases, channel)
+	latest, ok := pickLatestRelease(inChannel)
+	if !ok {
+		return nil, nil
+	}
+	c := &candidate{latest: latest, all: releases}
+	if channel == channelStable {
+		c.newer = newerThanStable(installed, &latest)
+	} else {
+		c.newer = newerThanInstalled(installed, &latest, inChannel)
+	}
+	return c, nil
+}
+
+// Latest returns the newest release of the stable (or pre-release) channel without downloading it,
+// and whether update would install it over the installed version.
+func Latest(preRelease bool, installed string) (tag string, newer bool, err error) {
+	channel := channelOf(preRelease)
+	c, err := findUpdate(channel, installed)
+	if err != nil {
+		return "", false, err
+	}
+	if c == nil {
+		return "", false, fmt.Errorf("no %s release is published", channel)
+	}
+	return c.latest.TagName, c.newer, nil
+}
+
 // FetchLatest is FetchVerified for the newest release of a channel (preRelease: the pre-YYYYMMDD
 // builds, else stable vX.Y.Z), picked as `update --channel` picks it; it returns that release's tag.
 func FetchLatest(preRelease bool, dir string) (path, tag string, err error) {
-	channel := channelStable
-	if preRelease {
-		channel = channelPreRelease
-	}
+	channel := channelOf(preRelease)
 	assets, err := assetsFor(runtime.GOARCH)
 	if err != nil {
 		return "", "", err

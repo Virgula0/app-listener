@@ -116,6 +116,7 @@ func TestSnapshots(t *testing.T) {
 		s.picker.close()
 
 		snapInstall(t, s, filepath.Join(dir, v.name+"-Install-"))
+		snapUpdate(t, s, filepath.Join(dir, v.name+"-Update-"))
 		w.Close()
 	}
 }
@@ -359,5 +360,34 @@ func snapInstall(t *testing.T, s *shell, prefix string) {
 		[]wizard.Choice{{Label: "alice (/home/alice)", Selected: true}, {Label: "bob (/home/bob)"}},
 		func(multiAnswer) {})
 	save(t, prefix+"Prompt.png", s.win)
+	s.win.Canvas().Overlays().Top().Hide()
+}
+
+// snapUpdate renders the Update page with a newer release, a run and the changelog prompt.
+func snapUpdate(t *testing.T, s *shell, prefix string) {
+	t.Helper()
+	up := newUpdatePage(s)
+	s.update = up
+	s.views[pageUpdate] = up.view()
+	s.show(pageUpdate)
+	up.present = installedBinary{present: true, version: "v0.3.0"}
+	up.daemonUp, up.loaded = true, true
+	up.latest[false] = &latestRelease{tag: "v0.4.0", newer: true}
+	up.renderStatus()
+	save(t, prefix+"Overview.png", s.win)
+
+	up.run.start("Update: Latest stable release", "arrow-clockwise")
+	up.show(up.run.root)
+	for _, st := range []string{"Checking the installed version", "Looking up the latest stable release",
+		"Downloading and verifying v0.4.0"} {
+		up.run.stage(st)
+	}
+	up.run.appendLog(logLine{level: log.InfoLevel, at: time.Now(), text: "latest stable release: v0.4.0"})
+	up.run.progress("Downloading app-listener", 0.63)
+	save(t, prefix+"Run.png", s.win)
+
+	ui := &installUI{s: s, run: up.run}
+	ui.showText("Changelog up to v0.4.0", "## v0.4.0\n\n- gui: updater page\n- guard: fixes", func() {})
+	save(t, prefix+"Changelog.png", s.win)
 	s.win.Canvas().Overlays().Top().Hide()
 }

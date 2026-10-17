@@ -62,7 +62,8 @@ func Run(ignored []string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("--gui needs root to load eBPF programs: run `sudo %s --gui`", os.Args[0])
 	}
-	return gui.Run(gui.Options{Version: constants.Version, Release: releaseBuild(), Install: installHooks()})
+	return gui.Run(gui.Options{Version: constants.Version, Release: releaseBuild(), Install: installHooks(),
+		Update: gui.UpdateHooks{Run: update.RunWith, Latest: update.Latest}})
 }
 
 // releaseBuild reports whether -ldflags stamped constants.Version, as the release pipeline does: the

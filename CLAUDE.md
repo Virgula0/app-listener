@@ -352,6 +352,8 @@ normalized to explicit commands: oksvg drops implicit repeated arcs and ignores 
 The GUI installer (`install.RunWith`, prompts routed via `wizard.Use`) must never deploy the fyne
 build as the daemon: it deploys a staged headless build (`update.FetchVerified`/`FetchLatest` or a
 local file), which `RunWith` itself re-checks with `headless.Check`; never `os.Executable()`.
+The GUI updater (`update.RunWith`) runs `update` in the fyne process too: it only works because
+nothing it touches is daemon-guarded while the daemon runs (see its `TODO(self-binary-guard)`).
 Verbosity ladder lives in `internal/constants`; `--verbose` requires `--headless`.
 
 ## Comment style

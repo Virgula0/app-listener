@@ -18,7 +18,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// installUI is the wizard.UI of one run: every prompt is a dialog over the window, asked from the
+// installUI is the wizard.UI of one installer or updater run: every prompt is a dialog over the window, asked from the
 // run's goroutine; stages and progress go to the run view.
 type installUI struct {
 	s   *shell
@@ -181,6 +181,22 @@ func (u *installUI) ShowDiff(title, diff string) error {
 		u.s.showSized(d, fyne.NewSize(1040, 720))
 	})
 	return nil
+}
+
+// ShowText shows text verbatim: rendering it as markdown would make this root process fetch the
+// image URIs the text names.
+func (u *installUI) ShowText(title, text string) error {
+	ask(func(reply func(struct{})) { u.showText(title, text, func() { reply(struct{}{}) }) })
+	return nil
+}
+
+func (u *installUI) showText(title, text string, closed func()) {
+	body := selectable(text)
+	body.Wrapping = fyne.TextWrapWord
+	d := dialog.NewCustom(u.run.name, "Close", container.NewBorder(promptBody(title, ""), nil, nil, nil,
+		container.NewScroll(body)), u.s.win)
+	d.SetOnClosed(closed)
+	u.s.showSized(d, fyne.NewSize(1040, 720))
 }
 
 // diffText colors a unified diff's added and removed lines.

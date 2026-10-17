@@ -140,6 +140,9 @@ Self-updates from the latest signed release of `--channel` (`stable`, the defaul
 signed asset name, checksum, GitHub asset digest and ELF machine are all verified before anything
 is written.
 
+The desktop window (`--gui`) runs the same update from its Update workspace, with the changelog and
+the confirmations as dialogs (see [Desktop GUI](gui.md#update)).
+
 The changelog covers every release of the channel between the installed version and the new one,
 newest first, with a link to the full compare. If the installed version is not among the fetched
 releases (a local `dev` build, or older than the 100 newest), it shows every fetched release up to

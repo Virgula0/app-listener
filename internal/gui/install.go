@@ -21,11 +21,9 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/Virgula0/app-listener/internal/headless"
-	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/protected"
 	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/wizard"
-	"github.com/Virgula0/app-listener/internal/workbench"
 )
 
 // stagedBinary is the headless build the installer deploys, copied or downloaded into the page's
@@ -92,13 +90,9 @@ var installActions = []installAction{
 // installPage is the Install workspace: the headless build the daemon will run, the installer's
 // options and entry points, and the run view each of them switches to.
 type installPage struct {
-	s     *shell
+	runHost
 	hooks InstallHooks
-	stack *fyne.Container
-	over  fyne.CanvasObject
-	run   *runView
 
-	running  bool
 	staging  string
 	bin      *stagedBinary
 	present  installedBinary
@@ -116,7 +110,9 @@ type installPage struct {
 }
 
 func newInstallPage(s *shell) *installPage {
-	return &installPage{s: s, hooks: s.opts.Install}
+	p := &installPage{runHost: runHost{s: s}, hooks: s.opts.Install}
+	p.settled = p.refreshStatus
+	return p
 }
 
 func (p *installPage) view() fyne.CanvasObject {
@@ -129,7 +125,7 @@ func (p *installPage) view() fyne.CanvasObject {
 	p.meta = widget.NewCheck("Log denied metadata inspections", nil)
 	p.live = widget.NewCheck("Live: keep the daemon running", nil)
 
-	p.over = container.NewVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), container.NewVBox(
+	over := container.NewVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), container.NewVBox(
 		container.NewGridWithColumns(3, p.installedT.card, p.daemonT.card, p.windowT.card),
 		sectionTitle("DAEMON BINARY"),
 		p.binaryCard(),
@@ -140,16 +136,10 @@ func (p *installPage) view() fyne.CanvasObject {
 		sectionTitle("ACTIONS"),
 		p.actionGrid(),
 	)))
-	p.run = newRunView(p.s, func() { p.show(p.over) })
-	p.stack = container.NewStack(p.over)
+	root := p.mount(over, "Back to Install")
 	p.renderBinary()
 	p.refreshStatus()
-	return p.stack
-}
-
-func (p *installPage) show(o fyne.CanvasObject) {
-	p.stack.Objects = []fyne.CanvasObject{o}
-	p.stack.Refresh()
+	return root
 }
 
 func (p *installPage) binaryCard() fyne.CanvasObject {
@@ -318,7 +308,7 @@ func (p *installPage) renderInstalled() {
 		p.installedT.set(true, ib.version, "Identical to the staged headless build.", theme.ColorNameSuccess)
 	default:
 		p.installedT.set(true, ib.version, "Differs from the staged build, and the wizard needs them identical: "+
-			"update it from a terminal (app-listener update, or install --binary-only) first.", theme.ColorNameWarning)
+			"update it first (the Update workspace, or install --binary-only from a terminal).", theme.ColorNameWarning)
 	}
 	if p.daemonUp {
 		p.daemonT.set(true, "running", "The installer stops it where a step needs that and starts it again.",
@@ -342,6 +332,8 @@ func (p *installPage) refreshStatus() {
 	})
 }
 
+// readInstalled execs and hashes the installed binary from this (non-daemon) process.
+// TODO(self-binary-guard): see update.RunWith.
 func readInstalled(versionOf func() string) installedBinary {
 	if _, err := os.Stat(systemd.InstallBinaryPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -369,59 +361,6 @@ func hashReader(r io.Reader) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// blocked names why no installer run may start now: a guard this window runs would deny the
-// installer (it moves and encrypts guarded folders, restarts the daemon, downloads from GitHub)
-// since none of them admits this window.
-func (p *installPage) blocked() string {
-	var active []string
-	for _, t := range p.s.files.Targets() {
-		if t.Policy().Mode != workbench.GuardOff {
-			active = append(active, "the guard on "+t.Spec.Path)
-		}
-	}
-	if p.s.network.Policy().Mode != workbench.GuardOff {
-		active = append(active, "the network guard")
-	}
-	if len(active) == 0 {
-		return ""
-	}
-	return "Turn off " + strings.Join(active, ", ") + " first (Files and Network workspaces).\n\n" +
-		"The installer moves and encrypts protected folders, restarts the daemon and downloads from " +
-		"GitHub. A guard running in this window doesn't admit the installer, so it would deny those steps."
-}
-
-// begin switches to the run view and runs work off the UI goroutine with its prompts, stages and
-// logs on that view; after runs on success.
-func (p *installPage) begin(name, iconName string, work func(ui wizard.UI) error, after func()) bool {
-	if p.running {
-		return false
-	}
-	if why := p.blocked(); why != "" {
-		dialog.ShowInformation("Guards are running", why, p.s.win)
-		return false
-	}
-	p.running = true
-	p.run.start(name, iconName)
-	p.show(p.run.root)
-	ui := &installUI{s: p.s, run: p.run}
-	restoreLogs := captureLogs(p.run)
-	go func() {
-		err := work(ui)
-		restoreLogs()
-		fyne.Do(func() {
-			p.running = false
-			canceled := errors.Is(err, wizard.ErrCanceled) || errors.Is(err, inst.ErrEditCanceled)
-			p.run.finish(err, canceled)
-			if err == nil && after != nil {
-				after()
-			}
-			p.refreshStatus()
-			p.s.reprobe()
-		})
-	}()
-	return true
 }
 
 func (p *installPage) startAction(a *installAction) {

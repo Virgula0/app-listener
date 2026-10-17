@@ -35,7 +35,7 @@ type stageItem struct {
 	state stageState
 }
 
-// runView is the panel of one installer run: its stages as a stepper, the current progress bar and
+// runView is the panel of one installer or updater run: its stages as a stepper, the current progress bar and
 // the run's log. Every method runs on the UI goroutine.
 type runView struct {
 	name   string
@@ -58,7 +58,7 @@ type runView struct {
 	lines  []logLine
 }
 
-func newRunView(s *shell, onBack func()) *runView {
+func newRunView(s *shell, back string, onBack func()) *runView {
 	r := &runView{
 		tile:   newIconTile("terminal-window", theme.ColorNamePrimary, 44),
 		title:  boldLabel(""),
@@ -94,7 +94,7 @@ func newRunView(s *shell, onBack func()) *runView {
 		}
 	}
 
-	r.back = newTextButton("Back to Install", onBack)
+	r.back = newTextButton(back, onBack)
 	copyLog := newButton("Copy log", icon("copy"), func() {
 		s.app.Clipboard().SetContent(r.logText())
 	})

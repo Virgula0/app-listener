@@ -562,3 +562,60 @@ func TestFetchReleaseByTag(t *testing.T) {
 	}
 }
 
+
+// recordUI is a wizard.UI that records the changelog it was shown and answers Confirm with answer.
+type recordUI struct {
+	wizard.UI
+	answer       bool
+	title, shown string
+	asked        string
+}
+
+func (u *recordUI) ShowText(title, text string) error {
+	u.title, u.shown = title, text
+	return nil
+}
+
+func (u *recordUI) Confirm(q wizard.Question) (bool, error) {
+	u.asked = q.Title
+	return u.answer, nil
+}
+
+func TestConfirmUpdateRoutesToActiveUI(t *testing.T) {
+	for _, answer := range []bool{true, false} {
+		ui := &recordUI{answer: answer}
+		restore := wizard.Use(ui)
+		// stdin is no terminal under go test: the GUI path must not need one.
+		ok, err := confirmUpdate(&githubRelease{TagName: "v9.9.9"}, "## v9.9.9\n- notes", false)
+		restore()
+		if err != nil {
+			t.Fatalf("confirmUpdate: %v", err)
+		}
+		if ok != answer {
+			t.Errorf("confirmUpdate = %v, want the UI's answer %v", ok, answer)
+		}
+		if ui.shown != "## v9.9.9\n- notes" || !strings.Contains(ui.title, "v9.9.9") {
+			t.Errorf("changelog shown = %q (title %q)", ui.shown, ui.title)
+		}
+		if !strings.Contains(ui.asked, "v9.9.9") {
+			t.Errorf("confirmation asked %q", ui.asked)
+		}
+	}
+}
+
+func TestConfirmUpdateWithoutTerminalOrUIRefuses(t *testing.T) {
+	if isTerminal(os.Stdin) {
+		t.Skip("stdin is a terminal")
+	}
+	if _, err := confirmUpdate(&githubRelease{TagName: "v9.9.9"}, "notes", false); err == nil {
+		t.Fatal("confirmUpdate without a terminal or a UI must refuse")
+	}
+}
+
+func TestRunWithRefusesConcurrentRun(t *testing.T) {
+	runMu.Lock()
+	defer runMu.Unlock()
+	if err := RunWith(&recordUI{}, false); err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("RunWith during a run = %v, want an in-progress refusal", err)
+	}
+}

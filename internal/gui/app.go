@@ -37,6 +37,7 @@ const (
 	pageHome pageID = iota
 	pageFiles
 	pageNetwork
+	pageUpdate
 	pageInstall
 )
 
@@ -51,6 +52,7 @@ var pageDefs = []pageDef{
 	{pageHome, "house", "Home", "System checks and workspaces"},
 	{pageFiles, "folders", "Files", "Monitor folders and files, then guard them with a whitelist or blacklist"},
 	{pageNetwork, "globe-hemisphere-west", "Network", "Watch binaries' network activity and enforce a network guard"},
+	{pageUpdate, "arrow-clockwise", "Update", "Update the installed daemon to the latest signed release"},
 	{pageInstall, "download-simple", "Install", "Set up the protection daemon"},
 }
 
@@ -73,6 +75,7 @@ type shell struct {
 	files    *workbench.Files
 	network  *workbench.Network
 	install  *installPage
+	update   *updatePage
 
 	wm        wm.Session
 	collapsed bool
@@ -149,14 +152,14 @@ func Run(opts Options) (err error) {
 	return nil
 }
 
-// confirmClose asks before quitting mid-install: the installer would stop between two steps.
+// confirmClose asks before quitting mid-run: the installer or updater would stop between two steps.
 func (s *shell) confirmClose() {
-	if s.install == nil || !s.install.running {
+	if !s.running() {
 		s.win.Close()
 		return
 	}
-	dialog.ShowConfirm("Quit during an installer run?", "Closing the window stops the installer midway. "+
-		"Steps already completed stay applied; re-run the wizard afterwards to resume.", func(ok bool) {
+	dialog.ShowConfirm("Quit during a run?", "Closing the window stops the installer or updater midway. "+
+		"Steps already completed stay applied; re-run it afterwards to resume.", func(ok bool) {
 		if ok {
 			s.win.Close()
 		}
@@ -345,6 +348,9 @@ func (s *shell) build(id pageID) fyne.CanvasObject {
 	case pageNetwork:
 		s.netPg = newNetworkPage(s, s.network)
 		return s.netPg.view()
+	case pageUpdate:
+		s.update = newUpdatePage(s)
+		return s.update.view()
 	default:
 		s.install = newInstallPage(s)
 		return s.install.view()

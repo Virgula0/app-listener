@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Virgula0/app-listener/internal/codeedit"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 const (
@@ -107,8 +108,11 @@ func (w *releaseWindow) newestFirst(a, b *githubRelease) int {
 }
 
 // showChangelog displays release notes in a full-screen read-only TUI
-// viewer. Close it with q, Esc or Enter.
+// viewer (or the active wizard UI's). Close it with q, Esc or Enter.
 func showChangelog(title, notes string) error {
+	if ui := wizard.Active(); ui != nil {
+		return ui.ShowText("Changelog up to "+title, notes)
+	}
 	m := newChangelogModel(title, notes)
 	p := tea.NewProgram(&m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()

@@ -36,6 +36,8 @@ type UI interface {
 	Input(f Field) (string, error)
 	EditText(title, name, text string) (string, error)
 	ShowDiff(title, diff string) error
+	// ShowText shows read-only plain text (a changelog) until the user closes it.
+	ShowText(title, text string) error
 	// Progress runs run with set reporting its progress (fraction in [0, 1]).
 	Progress(run func(set func(label string, fraction float64)) error) error
 	// Stage names the step the command is at.
