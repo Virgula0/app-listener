@@ -73,8 +73,9 @@ Every mode has three presentations:
 - **`--headless`**: no TUI, one line per event on stderr, with a stable prefix per mode that
   scripts and the integration tests parse: `EVENT|` (monitor), `GUARD|` (guard), `NETEVENT|`
   (network-monitor), `NETGUARD|` (network-guard), `DAEMON ...` (daemon; journald under systemd).
-- **`--gui`**: the desktop window, in builds made with `make build GUI=1`. It replaces the
-  subcommand and its flags; see [Desktop GUI](gui.md).
+- **`--gui`**: the desktop window, in builds made with `make build GUI=1`, opened by
+  `app-listener --gui` without a subcommand (with one, the subcommand runs and `--gui` is
+  ignored); see [Desktop GUI](gui.md).
 
 ### Global flags
 
@@ -82,7 +83,7 @@ Every mode has three presentations:
 |---|---|
 | `-v, --verbose <0..4>` | Verbosity of the headless stream and `--dump-log`: `0` errors only, `1` essential, `2` current display, `3` plus internal details, `4` everything. Requires `--headless`. |
 | `--dump-log <file>` | Mirror every log line into this file as plain text (asks before overwriting). |
-| `--gui` | Open the [desktop GUI](gui.md); every other subcommand and flag is ignored (`-tags gui` build). |
+| `--gui` | Open the [desktop GUI](gui.md) when given without a subcommand; every other flag is ignored (`-tags gui` build). With a subcommand, `--gui` is ignored. |
 
 ## Watching from a browser: `--serve`
 

@@ -27,8 +27,7 @@ func (p *filesPage) addTarget() {
 				path.SetText(u.Path())
 			}
 		}, win)
-		p.shell.startAt(d, "")
-		d.Show()
+		p.shell.showFile(d, "")
 	})
 	browseFile := widget.NewButtonWithIcon("File…", icon("file"), func() {
 		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
@@ -37,8 +36,7 @@ func (p *filesPage) addTarget() {
 				_ = r.Close()
 			}
 		}, win)
-		p.shell.startAt(d, "")
-		d.Show()
+		p.shell.showFile(d, "")
 	})
 
 	depth := widget.NewEntry()
@@ -71,7 +69,7 @@ func (p *filesPage) addTarget() {
 		"or whitelist and blacklist processes from the activity you observe.")
 
 	d := dialog.NewCustomConfirm("Watch a folder or file", "Start watching", "Cancel",
-		container.NewVBox(form, note), func(ok bool) {
+		scrollable(container.NewVBox(form, note)), func(ok bool) {
 			if !ok {
 				return
 			}
@@ -87,8 +85,7 @@ func (p *filesPage) addTarget() {
 				return addErr
 			}, func() { p.reloadTargets(t) })
 		}, win)
-	d.Resize(fyne.NewSize(760, 420))
-	d.Show()
+	p.shell.showSized(d, fyne.NewSize(760, 440))
 }
 
 func specFromForm(path string, recursive bool, depthText string, selected []string) (workbench.FileSpec, error) {

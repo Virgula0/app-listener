@@ -51,8 +51,19 @@ func newTargetView(p *filesPage, t *workbench.FileTarget) *targetView {
 		container.NewTabItemWithIcon("Guard", icon("shield-check"), v.policy.root),
 	)
 	v.counters = newCounterStrip("Denied")
-	v.root = container.NewBorder(container.NewVBox(v.header(), v.counters.root, v.errLabel), nil, nil, nil, v.tabs)
+	v.root = container.NewBorder(newGapVBox(v.header(), v.counters.root, v.errLabel), nil, nil, nil, v.tabs)
 	return v
+}
+
+// searchEntry is the filter of the visible table tab, nil on the others.
+func (v *targetView) searchEntry() *widget.Entry {
+	switch v.tabs.SelectedIndex() {
+	case 0:
+		return v.activity.search
+	case 1:
+		return v.procs.search
+	}
+	return nil
 }
 
 func (v *targetView) header() fyne.CanvasObject {
@@ -120,11 +131,12 @@ func newCounterStrip(deniedCaption string) *counterStrip {
 		cs.labels[i] = widget.NewLabelWithStyle("0", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 		cs.labels[i].SizeName = theme.SizeNameSubHeadingText
 		caption := mutedText(sp.caption)
+		caption.Wrapping = fyne.TextWrapOff
 		caption.SizeName = theme.SizeNameCaptionText
 		cards[i] = newPanel(container.NewBorder(nil, nil, container.NewCenter(newIconTile(sp.icon, sp.c, 34)), nil,
 			container.NewVBox(cs.labels[i], caption)))
 	}
-	cs.root = container.NewGridWithColumns(len(cards), cards...)
+	cs.root = newAdaptiveGrid(len(cards), cards...)
 	return cs
 }
 

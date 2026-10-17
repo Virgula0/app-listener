@@ -61,7 +61,7 @@ func TestSnapshots(t *testing.T) {
 		s.setStatus(sysStatus{root: true})
 		fillFiles(t, s, fe)
 		fp := newFilesPage(s, s.files)
-		s.views[pageFiles] = fp.view()
+		s.views[pageFiles] = container.NewScroll(fp.view())
 		s.show(pageFiles)
 		fp.reloadTargets(s.files.Targets()[0])
 		for i, tab := range []string{"Activity", "Processes", "Guard"} {
@@ -69,16 +69,37 @@ func TestSnapshots(t *testing.T) {
 			fp.current.refresh(true)
 			save(t, filepath.Join(dir, v.name+"-Files-"+tab+".png"), w)
 		}
+		fp.current.tabs.SelectIndex(0)
+		fp.current.activity.table.Select(widget.TableCellID{Row: 1, Col: 2})
+		save(t, filepath.Join(dir, v.name+"-Files-RowSelected.png"), w)
 
 		fillNetwork(t, s, ne)
 		np := newNetworkPage(s, s.network)
-		s.views[pageNetwork] = np.view()
+		s.views[pageNetwork] = container.NewScroll(np.view())
 		s.show(pageNetwork)
-		for i, tab := range []string{"Activity", "Processes", "Watched", "Guard"} {
+		for i, tab := range []string{"Watched", "Activity", "Processes", "Guard"} {
 			np.tabs.SelectIndex(i)
 			np.refresh(true)
 			save(t, filepath.Join(dir, v.name+"-Network-"+tab+".png"), w)
 		}
+
+		s.toggleSidebar()
+		save(t, filepath.Join(dir, v.name+"-Collapsed.png"), w)
+		s.toggleSidebar()
+
+		w.Resize(fyne.NewSize(860, 600))
+		s.show(pageHome)
+		save(t, filepath.Join(dir, v.name+"-Narrow-Home.png"), w)
+		s.show(pageNetwork)
+		np.tabs.SelectIndex(1)
+		s.exportTable("network-events", np.feed.table)
+		save(t, filepath.Join(dir, v.name+"-Narrow-Export.png"), w)
+		w.Canvas().Overlays().Top().Hide()
+		np.tabs.SelectIndex(0)
+		np.watch.bins.pick()
+		save(t, filepath.Join(dir, v.name+"-Narrow-AddExecutable.png"), w)
+		w.Canvas().Overlays().Top().Hide()
+		w.Resize(fyne.NewSize(1280, 820))
 
 		snapInstall(t, s, filepath.Join(dir, v.name+"-Install-"))
 		w.Close()

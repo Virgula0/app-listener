@@ -14,11 +14,13 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/Virgula0/app-listener/internal/wm"
 	"github.com/Virgula0/app-listener/internal/workbench"
 )
 
@@ -64,9 +66,22 @@ type shell struct {
 	subtitle *widget.Label
 	body     *fyne.Container
 	home     *homePage
+	current  pageID
+	filesPg  *filesPage
+	netPg    *networkPage
 	files    *workbench.Files
 	network  *workbench.Network
 	install  *installPage
+
+	wm        wm.Session
+	collapsed bool
+	sidebar   *fyne.Container
+	navBox    *fyne.Container
+	frame     *fyne.Container
+	stats     procStats
+	statLines [3]*widget.Label
+	// dialogs are the open sized dialogs and the size each asked for (refitDialogs).
+	dialogs map[sizedDialog]fyne.Size
 	// syncBackground makes background synchronous and every a no-op: fyne's test driver runs fyne.Do
 	// inline on the calling goroutine, so a real goroutine would race the test's own rendering.
 	syncBackground bool
@@ -74,8 +89,9 @@ type shell struct {
 
 // Run opens the window and blocks until it is closed.
 func Run(opts Options) (err error) {
-	restoreSessionEnv()
+	wmEnv := restoreSessionEnv()
 	defer cleanupSessionEnv()
+	defer filterFyneLogs()()
 	// fyne logs a failed GLFW init and then panics on the first window call.
 	defer func() {
 		if r := recover(); r != nil {
@@ -96,13 +112,23 @@ func Run(opts Options) (err error) {
 
 	w := a.NewWindow("app-listener")
 	s := newShell(a, w, opts)
+	s.wm = detectWM(wmEnv)
 	w.SetContent(s.view())
-	w.Resize(fyne.NewSize(1280, 820))
+	w.Resize(preferredSize)
 	w.CenterOnScreen()
 	w.SetMaster()
 	w.SetCloseIntercept(s.confirmClose)
+	a.Lifecycle().SetOnStarted(func() {
+		if s.floatPref() {
+			s.setFloating(true)
+		}
+	})
+
+	w.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierShortcutDefault},
+		func(fyne.Shortcut) { s.focusSearch() })
 
 	s.reprobe()
+	s.every(time.Second, s.updateStats)
 	w.ShowAndRun()
 	s.network.Close()
 	s.files.Close()
@@ -174,11 +200,14 @@ func newShell(a fyne.App, w fyne.Window, opts Options) *shell {
 		opts:     opts,
 		nav:      map[pageID]*navItem{},
 		views:    map[pageID]fyne.CanvasObject{},
+		dialogs:  map[sizedDialog]fyne.Size{},
 		title:    widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		subtitle: mutedText(""),
 		body:     container.NewStack(),
 	}
 	s.title.SizeName = theme.SizeNameHeadingText
+	s.subtitle.Wrapping = fyne.TextWrapOff
+	s.subtitle.Truncation = fyne.TextTruncateEllipsis
 	s.home = newHomePage(s)
 	s.files = workbench.NewFiles(workbench.RealFileEngines())
 	s.network = workbench.NewNetwork(workbench.RealNetEngines())
@@ -186,18 +215,49 @@ func newShell(a fyne.App, w fyne.Window, opts Options) *shell {
 }
 
 func (s *shell) view() fyne.CanvasObject {
-	items := container.NewVBox()
+	s.navBox = container.NewVBox()
 	for _, d := range pageDefs {
 		n := newNavItem(d.icon, d.title, func() { s.show(d.id) })
 		s.nav[d.id] = n
-		items.Add(n)
+		s.navBox.Add(n)
 	}
+	for i := range s.statLines {
+		s.statLines[i] = mutedText("")
+		s.statLines[i].Wrapping = fyne.TextWrapOff
+		s.statLines[i].SizeName = theme.SizeNameCaptionText
+	}
+	s.updateStats()
 
-	brand := container.NewHBox(newLogo(34), container.NewVBox(
-		widget.NewLabelWithStyle("app-listener", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-	))
-	version := mutedText(s.opts.Version)
-	version.SizeName = theme.SizeNameCaptionText
+	s.sidebar = container.NewStack()
+	s.collapsed = s.app.Preferences().Bool(prefSidebarCollapsed)
+	s.layoutSidebar()
+	sidebarBox := newPanel(s.sidebar)
+	sidebarBox.fill = colorSidebar
+	sidebarBox.inset = theme.Padding() * 2
+
+	header := container.New(layout.NewCustomPaddedVBoxLayout(-10), s.title, s.subtitle)
+	main := container.NewBorder(container.New(layout.NewCustomPaddedLayout(4, 12, 0, 0), header), nil, nil, nil, s.body)
+
+	s.show(pageHome)
+	s.frame = container.NewBorder(nil, nil, container.NewPadded(sidebarBox), nil,
+		container.New(layout.NewCustomPaddedLayout(12, 16, 8, 24), main))
+	return container.New(&resizeWatch{onResize: s.refitDialogs}, s.frame)
+}
+
+const prefSidebarCollapsed = "sidebarCollapsed"
+
+// layoutSidebar fills the sidebar for the current collapsed state: brand, navigation, process stats,
+// version and theme toggle, or only the icons.
+func (s *shell) layoutSidebar() {
+	for _, n := range s.nav {
+		n.setCompact(s.collapsed)
+	}
+	collapseIcon := "sidebar-simple"
+	if s.collapsed {
+		collapseIcon = "caret-right"
+	}
+	toggle := widget.NewButtonWithIcon("", icon(collapseIcon), s.toggleSidebar)
+	toggle.Importance = widget.LowImportance
 
 	themeBtn := widget.NewButtonWithIcon("", s.themeIcon(), nil)
 	themeBtn.Importance = widget.LowImportance
@@ -206,24 +266,44 @@ func (s *shell) view() fyne.CanvasObject {
 		themeBtn.SetIcon(s.themeIcon())
 	}
 
-	sidebar := container.NewBorder(
-		container.NewVBox(container.NewPadded(brand), widget.NewSeparator(), items),
-		container.NewVBox(widget.NewSeparator(), hfill(version, themeBtn)),
-		nil, nil,
-	)
-	sidebarBox := newPanel(sidebar)
-	sidebarBox.fill = colorSidebar
-	sidebarBox.inset = theme.Padding() * 2
+	var top, bottom fyne.CanvasObject
+	if s.collapsed {
+		top = container.NewVBox(container.NewCenter(newLogo(30)), container.NewCenter(toggle), widget.NewSeparator(), s.navBox)
+		bottom = container.NewVBox(widget.NewSeparator(), container.NewCenter(themeBtn))
+	} else {
+		brand := container.NewHBox(newLogo(34), container.NewCenter(
+			widget.NewLabelWithStyle("app-listener", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})))
+		version := mutedText(s.opts.Version)
+		version.SizeName = theme.SizeNameCaptionText
+		stats := container.New(layout.NewCustomPaddedVBoxLayout(-12), s.statLines[0], s.statLines[1], s.statLines[2])
+		top = container.NewVBox(hfill(container.NewPadded(brand), container.NewCenter(toggle)), widget.NewSeparator(), s.navBox)
+		bottom = container.NewVBox(widget.NewSeparator(), sectionTitle("USAGE"), stats, widget.NewSeparator(),
+			hfill(version, themeBtn))
+	}
+	s.sidebar.Objects = []fyne.CanvasObject{container.NewBorder(top, bottom, nil, nil)}
+	s.sidebar.Refresh()
+	if s.frame != nil {
+		s.frame.Refresh() // the sidebar's width changed: lay the page out again
+	}
+}
 
-	header := container.New(layout.NewCustomPaddedVBoxLayout(-10), s.title, s.subtitle)
-	main := container.NewBorder(container.New(layout.NewCustomPaddedLayout(4, 12, 0, 0), header), nil, nil, nil, s.body)
+func (s *shell) toggleSidebar() {
+	s.collapsed = !s.collapsed
+	s.app.Preferences().SetBool(prefSidebarCollapsed, s.collapsed)
+	s.layoutSidebar()
+}
 
-	s.show(pageHome)
-	return container.NewBorder(nil, nil, container.NewPadded(sidebarBox), nil,
-		container.New(layout.NewCustomPaddedLayout(12, 16, 8, 24), main))
+func (s *shell) updateStats() {
+	cpu, mem, rate := s.stats.sample().lines()
+	for i, text := range []string{cpu, mem, rate} {
+		if s.statLines[i] != nil && s.statLines[i].Text != text {
+			s.statLines[i].SetText(text)
+		}
+	}
 }
 
 func (s *shell) show(id pageID) {
+	s.current = id
 	for pid, n := range s.nav {
 		n.setSelected(pid == id)
 	}
@@ -235,7 +315,9 @@ func (s *shell) show(id pageID) {
 	}
 	v, ok := s.views[id]
 	if !ok {
-		v = s.build(id)
+		// The page fills the window when it fits and scrolls when the window is smaller than it
+		// (fyne grows scroll content to the viewport): a tiling WM may impose any size.
+		v = container.NewScroll(s.build(id))
 		s.views[id] = v
 	}
 	s.body.Objects = []fyne.CanvasObject{v}
@@ -247,12 +329,100 @@ func (s *shell) build(id pageID) fyne.CanvasObject {
 	case pageHome:
 		return s.home.view()
 	case pageFiles:
-		return newFilesPage(s, s.files).view()
+		s.filesPg = newFilesPage(s, s.files)
+		return s.filesPg.view()
 	case pageNetwork:
-		return newNetworkPage(s, s.network).view()
+		s.netPg = newNetworkPage(s, s.network)
+		return s.netPg.view()
 	default:
 		s.install = newInstallPage(s)
 		return s.install.view()
+	}
+}
+
+// preferredSize is the window's size when nothing smaller is imposed (fyne units).
+var preferredSize = fyne.NewSize(1280, 820)
+
+// sizedDialog is a dialog showSized can resize (dialog.Dialog and *dialog.FileDialog).
+type sizedDialog interface {
+	Show()
+	Resize(fyne.Size)
+	SetOnClosed(func())
+}
+
+const dialogMargin = 24
+
+// showSized shows d at want, capped to the window less a margin; refitDialogs keeps it capped as the
+// window is resized (a tiling WM can shrink the window under an open dialog). Content larger than
+// the cap must scroll: see scrollable.
+func (s *shell) showSized(d sizedDialog, want fyne.Size) {
+	s.dialogs[d] = want
+	d.SetOnClosed(func() { delete(s.dialogs, d) })
+	s.fitDialog(d, want)
+	d.Show()
+	s.fitDialog(d, want)
+}
+
+func (s *shell) fitDialog(d sizedDialog, want fyne.Size) {
+	c := s.win.Canvas().Size()
+	if c.Width <= 0 || c.Height <= 0 {
+		d.Resize(want)
+		return
+	}
+	d.Resize(fyne.NewSize(
+		fyne.Max(1, fyne.Min(want.Width, c.Width-2*dialogMargin)),
+		fyne.Max(1, fyne.Min(want.Height, c.Height-2*dialogMargin))))
+}
+
+func (s *shell) refitDialogs(fyne.Size) {
+	for d, want := range s.dialogs {
+		s.fitDialog(d, want)
+	}
+}
+
+// scrollable lets a dialog's content shrink below its natural size and scroll instead.
+func scrollable(content fyne.CanvasObject) fyne.CanvasObject {
+	return container.NewVScroll(content)
+}
+
+// resizeWatch is a stack layout that reports size changes of the window content.
+type resizeWatch struct {
+	last     fyne.Size
+	onResize func(fyne.Size)
+}
+
+func (r *resizeWatch) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range objs {
+		o.Move(fyne.NewPos(0, 0))
+		o.Resize(size)
+	}
+	if size != r.last {
+		r.last = size
+		if r.onResize != nil {
+			r.onResize(size)
+		}
+	}
+}
+
+func (r *resizeWatch) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	var m fyne.Size
+	for _, o := range objs {
+		m = m.Max(o.MinSize())
+	}
+	return m
+}
+
+// focusSearch focuses the filter of the table on screen (Ctrl+F).
+func (s *shell) focusSearch() {
+	var e *widget.Entry
+	switch {
+	case s.current == pageFiles && s.filesPg != nil && s.filesPg.current != nil:
+		e = s.filesPg.current.searchEntry()
+	case s.current == pageNetwork && s.netPg != nil:
+		e = s.netPg.searchEntry()
+	}
+	if e != nil {
+		s.win.Canvas().Focus(e)
 	}
 }
 
@@ -297,6 +467,12 @@ func (s *shell) busy(title string, work func() error, done func()) {
 			}
 		})
 	}()
+}
+
+// showFile shows a file or folder picker sized to the window.
+func (s *shell) showFile(d *dialog.FileDialog, dir string) {
+	s.startAt(d, dir)
+	s.showSized(d, fyne.NewSize(900, 620))
 }
 
 // startAt opens d in dir, or the invoking user's home when empty: the GUI runs as root under sudo,

@@ -5,6 +5,7 @@ package gui
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -88,12 +89,15 @@ type feedSpec struct {
 	placeholder string
 	hint        string
 	actions     []feedAction
+	// exportName names exported files ("files-events").
+	exportName string
 }
 
 // eventFeed is a filterable, pausable event table with actions on the selected event's executable.
 type eventFeed struct {
 	spec    feedSpec
 	root    fyne.CanvasObject
+	search  *widget.Entry
 	table   *dataTable
 	bar     *actionBar
 	rows    []workbench.Row
@@ -115,10 +119,7 @@ func newEventFeed(s *shell, spec *feedSpec) *eventFeed {
 	f.table = newDataTable(spec.cols, func() int { return len(f.rows) },
 		func(row, col int) cell { return spec.cell(&f.rows[row], col) }, f.onSelect)
 
-	search := widget.NewEntry()
-	search.SetPlaceHolder(spec.placeholder)
-	search.ActionItem = widget.NewIcon(icon("magnifying-glass"))
-	search.OnChanged = func(s string) { f.filter.Text = s; f.refresh(true) }
+	f.search = newSearchEntry(spec.placeholder, func(s string) { f.filter.Text = s; f.refresh(true) })
 
 	verdict := widget.NewSelect([]string{"All verdicts", "Denied", "Allowed", "Observed"}, func(s string) {
 		f.filter.Verdicts = verdictFilters[s]
@@ -140,7 +141,8 @@ func newEventFeed(s *shell, spec *feedSpec) *eventFeed {
 		f.refresh(true)
 	})
 	clearBtn := widget.NewButtonWithIcon("Clear", icon("broom"), func() { spec.clear(); f.refresh(true) })
-	toolbar := container.NewBorder(nil, nil, nil, container.NewHBox(verdict, pause, clearBtn), search)
+	export := widget.NewButtonWithIcon("Export", icon("export"), func() { s.exportTable(spec.exportName, f.table) })
+	toolbar := container.NewBorder(nil, nil, nil, container.NewHBox(verdict, pause, clearBtn, export), f.search)
 
 	f.bar = newActionBar(s, spec.hint, spec.actions)
 	f.root = container.NewBorder(container.NewPadded(toolbar), f.bar.root, nil, nil, f.table)
@@ -176,22 +178,34 @@ func (f *eventFeed) onSelect(row int) {
 		r.Time.Format(time.TimeOnly)))
 }
 
+// newSearchEntry is a filter field; Ctrl+F focuses the visible one (shell.focusSearch).
+func newSearchEntry(placeholder string, onChanged func(string)) *widget.Entry {
+	e := widget.NewEntry()
+	e.SetPlaceHolder(placeholder)
+	e.ActionItem = widget.NewIcon(icon("magnifying-glass"))
+	e.OnChanged = onChanged
+	return e
+}
+
 // procSpec configures a processView.
 type procSpec struct {
-	cols    []column
-	cell    func(p *workbench.Process, col int) cell
-	source  func() []workbench.Process
-	hint    string
-	actions []feedAction
+	cols       []column
+	cell       func(p *workbench.Process, col int) cell
+	source     func() []workbench.Process
+	hint       string
+	actions    []feedAction
+	exportName string
 }
 
 // processView lists the executables seen, one row per inode, with actions on the selected one.
 type processView struct {
-	spec  procSpec
-	root  fyne.CanvasObject
-	table *dataTable
-	bar   *actionBar
-	procs []workbench.Process
+	spec   procSpec
+	root   fyne.CanvasObject
+	search *widget.Entry
+	table  *dataTable
+	bar    *actionBar
+	procs  []workbench.Process
+	filter string
 }
 
 func newProcessView(s *shell, spec *procSpec) *processView {
@@ -205,12 +219,29 @@ func newProcessView(s *shell, spec *procSpec) *processView {
 			}
 		})
 	p.bar = newActionBar(s, spec.hint, spec.actions)
-	p.root = container.NewBorder(nil, p.bar.root, nil, nil, p.table)
+	p.search = newSearchEntry("Search processes", func(text string) {
+		p.filter = strings.ToLower(text)
+		p.refresh()
+	})
+	export := widget.NewButtonWithIcon("Export", icon("export"), func() { s.exportTable(spec.exportName, p.table) })
+	toolbar := container.NewBorder(nil, nil, nil, export, p.search)
+	p.root = container.NewBorder(container.NewPadded(toolbar), p.bar.root, nil, nil, p.table)
 	return p
 }
 
 func (p *processView) refresh() {
-	p.procs = p.spec.source()
+	all := p.spec.source()
+	if p.filter == "" {
+		p.procs = all
+	} else {
+		p.procs = nil
+		for _, pr := range all {
+			if strings.Contains(strings.ToLower(pr.Comm), p.filter) ||
+				strings.Contains(strings.ToLower(exeText(pr.Exe)), p.filter) {
+				p.procs = append(p.procs, pr)
+			}
+		}
+	}
 	p.table.Refresh()
 }
 

@@ -51,16 +51,27 @@ func (p *networkPage) view() fyne.CanvasObject {
 	p.feed = p.newFeed()
 	p.procs = p.newProcesses()
 	p.tabs = container.NewAppTabs(
+		container.NewTabItemWithIcon("Watched", icon("eye"), p.watch.root),
 		container.NewTabItemWithIcon("Activity", icon("pulse"), p.feed.root),
 		container.NewTabItemWithIcon("Processes", icon("cpu"), p.procs.root),
-		container.NewTabItemWithIcon("Watched", icon("eye"), p.watch.root),
 		container.NewTabItemWithIcon("Guard", icon("shield-check"), p.guard.root),
 	)
 	p.pills = container.NewHBox(p.monPill, p.guardPill)
-	top := container.NewVBox(p.counters.root, p.pills, p.errLabel)
+	top := newGapVBox(p.counters.root, p.pills, p.errLabel)
 	p.refresh(true)
 	p.shell.every(pollInterval, func() { p.refresh(false) })
 	return container.NewBorder(top, nil, nil, nil, p.tabs)
+}
+
+// searchEntry is the filter of the visible table tab, nil on the others.
+func (p *networkPage) searchEntry() *widget.Entry {
+	switch p.tabs.SelectedIndex() {
+	case 1:
+		return p.feed.search
+	case 2:
+		return p.procs.search
+	}
+	return nil
 }
 
 func (p *networkPage) refresh(force bool) {
@@ -124,9 +135,10 @@ func (p *networkPage) newFeed() *eventFeed {
 		cell:        netCell,
 		source:      p.n.Rows,
 		clear:       p.n.Clear,
-		placeholder: "Filter by process, address, protocol, event or executable",
+		placeholder: "Search events",
 		hint:        "Select an event to watch, whitelist or blacklist the executable behind it.",
 		actions:     p.actions(),
+		exportName:  "network-events",
 	})
 }
 
@@ -189,7 +201,8 @@ func (p *networkPage) newProcesses() *processView {
 		source: p.n.Processes,
 		hint: "Every program seen on the network, identified by its inode. Watch one to trace all of its " +
 			"connections, or put it in the network guard's policy.",
-		actions: p.actions(),
+		actions:    p.actions(),
+		exportName: "network-processes",
 	})
 }
 

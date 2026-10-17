@@ -1,6 +1,6 @@
-// Package desktop is the `--gui` entry: it opens the desktop window in place of any subcommand.
-// The window configures every operation itself, so every other argument is ignored (and named
-// in a warning).
+// Package desktop is the `--gui` entry: it opens the desktop window when no subcommand is given
+// (cmd.Execute lets a subcommand win). The window configures every operation itself, so every
+// other argument is ignored (and named in a warning).
 package desktop
 
 import (

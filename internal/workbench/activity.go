@@ -3,7 +3,15 @@ package workbench
 import (
 	"slices"
 	"sync"
+	"sync/atomic"
 )
+
+// ingested counts every event any workspace recorded since the process started.
+var ingested atomic.Uint64
+
+// Ingested is the number of events all workspaces have recorded so far (monotonic; Clear and
+// target removal don't lower it).
+func Ingested() uint64 { return ingested.Load() }
 
 // activity buffers a workspace's events and aggregates them per executable.
 type activity struct {
@@ -24,6 +32,7 @@ func (a *activity) ingest(r *Row) {
 		return
 	}
 	a.rows.add(r)
+	ingested.Add(1)
 	key := processKey(r.Exe, r.Comm)
 	a.mu.Lock()
 	p := a.procs[key]

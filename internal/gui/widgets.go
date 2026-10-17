@@ -44,11 +44,14 @@ type panelRenderer struct {
 }
 
 func (r *panelRenderer) Layout(size fyne.Size) {
+	// A tiling WM can impose a window smaller than the content's MinSize: never lay out a negative
+	// size (the software painter panics on one).
+	size = size.Max(fyne.Size{})
 	r.bg.Resize(size)
 	r.hover.Resize(size)
 	in := r.p.inset
 	r.p.content.Move(fyne.NewPos(in, in))
-	r.p.content.Resize(size.SubtractWidthHeight(2*in, 2*in))
+	r.p.content.Resize(size.SubtractWidthHeight(2*in, 2*in).Max(fyne.Size{}))
 }
 
 func (r *panelRenderer) MinSize() fyne.Size {

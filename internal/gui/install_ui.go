@@ -60,9 +60,8 @@ func orDefault(s, def string) string {
 func (u *installUI) Confirm(q wizard.Question) (bool, error) {
 	return ask(func(reply func(bool)) {
 		d := dialog.NewCustomConfirm(u.run.name, orDefault(q.Affirmative, "Yes"), orDefault(q.Negative, "No"),
-			promptBody(q.Title, q.Description), reply, u.s.win)
-		d.Resize(fyne.NewSize(640, 280))
-		d.Show()
+			scrollable(promptBody(q.Title, q.Description)), reply, u.s.win)
+		u.s.showSized(d, fyne.NewSize(640, 280))
 	}), nil
 }
 
@@ -116,8 +115,7 @@ func (u *installUI) showMultiSelect(title, description string, choices []wizard.
 		}
 		reply(multiAnswer{picked: picked, ok: ok})
 	}, u.s.win)
-	d.Resize(fyne.NewSize(760, 600))
-	d.Show()
+	u.s.showSized(d, fyne.NewSize(760, 600))
 }
 
 type textAnswer struct {
@@ -136,11 +134,10 @@ func (u *installUI) Input(f wizard.Field) (string, error) {
 		if f.Path {
 			field = container.NewBorder(nil, nil, nil, u.pathButtons(entry), entry)
 		}
-		d := dialog.NewCustomConfirm(u.run.name, "OK", "Cancel", promptBody(f.Title, f.Description, field),
+		d := dialog.NewCustomConfirm(u.run.name, "OK", "Cancel", scrollable(promptBody(f.Title, f.Description, field)),
 			func(ok bool) { reply(textAnswer{text: entry.Text, ok: ok}) }, u.s.win)
 		entry.OnSubmitted = func(string) { d.Confirm() }
-		d.Resize(fyne.NewSize(680, 260))
-		d.Show()
+		u.s.showSized(d, fyne.NewSize(680, 260))
 		u.s.win.Canvas().Focus(entry)
 	})
 	if !a.ok {
@@ -157,8 +154,7 @@ func (u *installUI) pathButtons(entry *widget.Entry) fyne.CanvasObject {
 				entry.SetText(l.Path())
 			}
 		}, u.s.win)
-		u.s.startAt(d, "")
-		d.Show()
+		u.s.showFile(d, "")
 	})
 	file := widget.NewButtonWithIcon("File…", icon("file"), func() {
 		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
@@ -167,8 +163,7 @@ func (u *installUI) pathButtons(entry *widget.Entry) fyne.CanvasObject {
 				_ = r.Close()
 			}
 		}, u.s.win)
-		u.s.startAt(d, "")
-		d.Show()
+		u.s.showFile(d, "")
 	})
 	return container.NewHBox(folder, file)
 }
@@ -181,8 +176,7 @@ func (u *installUI) EditText(title, name, text string) (string, error) {
 		top := promptBody(title, "Editing "+name+". Save to continue the installer with this text.")
 		d := dialog.NewCustomConfirm(u.run.name, "Save", "Cancel", container.NewBorder(top, nil, nil, nil, ed),
 			func(ok bool) { reply(textAnswer{text: ed.Text, ok: ok}) }, u.s.win)
-		d.Resize(fyne.NewSize(1040, 720))
-		d.Show()
+		u.s.showSized(d, fyne.NewSize(1040, 720))
 	})
 	if !a.ok {
 		return "", wizard.ErrCanceled
@@ -195,8 +189,7 @@ func (u *installUI) ShowDiff(title, diff string) error {
 		d := dialog.NewCustom(u.run.name, "Close", container.NewBorder(promptBody(title, ""), nil, nil, nil,
 			container.NewScroll(diffText(diff))), u.s.win)
 		d.SetOnClosed(func() { reply(struct{}{}) })
-		d.Resize(fyne.NewSize(1040, 720))
-		d.Show()
+		u.s.showSized(d, fyne.NewSize(1040, 720))
 	})
 	return nil
 }

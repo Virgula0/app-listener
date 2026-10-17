@@ -343,8 +343,10 @@ with a stable `EVENT|` / `GUARD|` / `DAEMON …` / `NETEVENT|` line format that 
 integration tests parse, and `--serve[=host:port]` which mirrors the event stream
 read-only over WebSockets (`internal/tui/serve.go`). `--gui` (build-tag `gui`) is one fyne
 window for every interactive mode, intercepted in `cmd.Execute` before cobra
-(`cmd/functions/desktop`), so it ignores the subcommand and all other flags;
-`internal/gui/stub.go` is the no-op for non-gui builds. Icons are Phosphor SVGs whose path data is
+(`cmd/functions/desktop`) only when no subcommand is given (a subcommand wins and runs in the
+terminal), so it ignores all other flags; `internal/gui/stub.go` is the no-op for non-gui builds.
+`internal/wm` floats the window on Hyprland/sway/i3 over the WM's IPC socket (owner-checked: root
+talks to the user's socket). Exports go through `safeio` (fyne's save dialog `os.Create`s as root). Icons are Phosphor SVGs whose path data is
 normalized to explicit commands: oksvg drops implicit repeated arcs and ignores `<g transform>`.
 `APPLISTENER_GUI_SNAPSHOTS=<dir> go test -tags gui ./internal/gui/` renders every page headlessly.
 The GUI installer (`install.RunWith`, prompts routed via `wizard.Use`) must never deploy the fyne

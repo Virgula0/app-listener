@@ -51,9 +51,10 @@ func newFileFeed(v *targetView) *eventFeed {
 		},
 		source:      v.t.Rows,
 		clear:       v.t.Clear,
-		placeholder: "Filter by process, path, operation or executable",
+		placeholder: "Search events",
 		hint:        "Select an event to whitelist or blacklist the executable behind it.",
 		actions:     v.promoteActions(),
+		exportName:  "files-events",
 	})
 }
 
@@ -82,7 +83,8 @@ func newFileProcesses(v *targetView) *processView {
 		source: v.t.Processes,
 		hint: "Every executable that touched this target, identified by its inode. " +
 			"Whitelist or blacklist one to put it in the guard policy.",
-		actions: v.promoteActions(),
+		actions:    v.promoteActions(),
+		exportName: "files-processes",
 	})
 }
 

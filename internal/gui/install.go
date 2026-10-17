@@ -540,8 +540,7 @@ func (p *installPage) chooseLocal() {
 		})
 	}, p.s.win)
 	start, _ := os.Getwd()
-	p.s.startAt(d, start)
-	d.Show()
+	p.s.showFile(d, start)
 }
 
 // stageLocal copies src into dir (a fresh 0700 file) and refuses it unless it is the headless build.

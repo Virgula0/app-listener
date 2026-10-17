@@ -3,7 +3,12 @@
 package gui
 
 import (
+	"image/color"
+
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -20,7 +25,8 @@ type cell struct {
 	bold       bool
 }
 
-// dataTable is a header-row table over a row count and a cell function, with single-row selection.
+// dataTable is a header-row table over a row count and a cell function, with whole-row selection:
+// fyne selects a single cell, so the selection is kept here and painted behind every cell of the row.
 type dataTable struct {
 	*widget.Table
 	cols     []column
@@ -37,10 +43,19 @@ func newDataTable(cols []column, rows func() int, cellFn func(row, col int) cell
 		func() fyne.CanvasObject {
 			l := widget.NewLabel("")
 			l.Truncation = fyne.TextTruncateEllipsis
-			return l
+			return container.NewStack(canvas.NewRectangle(color.Transparent), l)
 		},
 		func(id widget.TableCellID, o fyne.CanvasObject) {
-			l := o.(*widget.Label)
+			box := o.(*fyne.Container)
+			bg, l := box.Objects[0].(*canvas.Rectangle), box.Objects[1].(*widget.Label)
+			fill := color.Color(color.Transparent)
+			if id.Row == d.selected {
+				fill = themeColor(theme.ColorNameSelection)
+			}
+			if bg.FillColor != fill {
+				bg.FillColor = fill
+				bg.Refresh()
+			}
 			if id.Row >= d.rows() {
 				l.SetText("")
 				return
@@ -66,6 +81,9 @@ func newDataTable(cols []column, rows func() int, cellFn func(row, col int) cell
 	}
 	d.OnSelected = func(id widget.TableCellID) {
 		d.selected = id.Row
+		// Drop fyne's single-cell highlight: the row background marks the selection.
+		d.UnselectAll()
+		d.Refresh()
 		if d.onSelect != nil {
 			d.onSelect(id.Row)
 		}
@@ -78,4 +96,20 @@ func (d *dataTable) reset() {
 	d.selected = -1
 	d.UnselectAll()
 	d.Refresh()
+}
+
+// texts is the table as header titles and cell texts, for export.
+func (d *dataTable) texts() (headers []string, rows [][]string) {
+	for _, c := range d.cols {
+		headers = append(headers, c.title)
+	}
+	n := d.rows()
+	rows = make([][]string, n)
+	for r := range n {
+		rows[r] = make([]string, len(d.cols))
+		for c := range d.cols {
+			rows[r][c] = d.cell(r, c).text
+		}
+	}
+	return headers, rows
 }

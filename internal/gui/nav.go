@@ -12,13 +12,15 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// navItem is one sidebar entry: icon + label, a tinted pill and accent bar when selected.
+// navItem is one sidebar entry: icon + label (icon only when compact), a tinted pill and accent bar
+// when selected.
 type navItem struct {
 	widget.BaseWidget
 	iconName string
 	label    string
 	selected bool
 	hovered  bool
+	compact  bool
 	onTap    func()
 }
 
@@ -31,6 +33,13 @@ func newNavItem(iconName, label string, onTap func()) *navItem {
 func (n *navItem) setSelected(on bool) {
 	if n.selected != on {
 		n.selected = on
+		n.Refresh()
+	}
+}
+
+func (n *navItem) setCompact(on bool) {
+	if n.compact != on {
+		n.compact = on
 		n.Refresh()
 	}
 }
@@ -73,6 +82,11 @@ func (r *navItemRenderer) Layout(size fyne.Size) {
 	r.bar.Move(fyne.NewPos(0, size.Height*0.25))
 	r.bar.Resize(fyne.NewSize(3, size.Height*0.5))
 	pad := theme.Padding() * 2
+	if r.n.compact {
+		r.img.Move(fyne.NewPos((size.Width-navIconSize)/2, (size.Height-navIconSize)/2))
+		r.img.Resize(fyne.NewSquareSize(navIconSize))
+		return
+	}
 	r.img.Move(fyne.NewPos(pad+4, (size.Height-navIconSize)/2))
 	r.img.Resize(fyne.NewSquareSize(navIconSize))
 	ts := r.txt.MinSize()
@@ -82,6 +96,9 @@ func (r *navItemRenderer) Layout(size fyne.Size) {
 
 func (r *navItemRenderer) MinSize() fyne.Size {
 	pad := theme.Padding() * 2
+	if r.n.compact {
+		return fyne.NewSize(2*pad+8+navIconSize, navHeight)
+	}
 	return fyne.NewSize(pad+4+navIconSize+pad+r.txt.MinSize().Width+pad, navHeight)
 }
 
@@ -107,6 +124,7 @@ func (r *navItemRenderer) Refresh() {
 		r.img.Resource = coloredIcon(r.n.iconName, colorMuted)
 	}
 	r.txt.TextStyle = fyne.TextStyle{Bold: r.n.selected}
+	r.txt.Hidden = r.n.compact
 	r.bg.Refresh()
 	r.bar.Refresh()
 	r.img.Refresh()

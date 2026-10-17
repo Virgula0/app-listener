@@ -5,6 +5,7 @@ package gui
 import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -62,9 +63,9 @@ func (h *homePage) view() fyne.CanvasObject {
 			"operation; the LSM guard denies the ones you don't allow, keyed on the executable's inode."),
 	))
 
-	checks := container.NewGridWithColumns(4, h.privs.card, h.ebpfT.card, h.lsm.card, h.daemon.card)
+	checks := newAdaptiveGrid(4, h.privs.card, h.ebpfT.card, h.lsm.card, h.daemon.card)
 
-	cards := container.NewGridWithColumns(3,
+	cards := newAdaptiveGrid(3,
 		h.workspaceCard("folders", theme.ColorNamePrimary, "Files",
 			"Monitor folders and files, then guard them: whitelist or blacklist the processes you see, or any binary.",
 			pageFiles),
@@ -76,13 +77,29 @@ func (h *homePage) view() fyne.CanvasObject {
 			pageInstall),
 	)
 
-	return container.NewVScroll(container.NewVBox(
+	// The right inset keeps the cards clear of the scroll bar.
+	return container.NewVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), newGapVBox(
 		newPanel(hero),
-		sectionTitle("SYSTEM"),
-		checks,
-		sectionTitle("WORKSPACES"),
-		cards,
-	))
+		container.NewVBox(sectionTitle("SYSTEM"), checks),
+		container.NewVBox(sectionTitle("WORKSPACES"), cards),
+		container.NewVBox(sectionTitle("WINDOW"), h.windowCard()),
+	)))
+}
+
+// windowCard holds the window settings: floating on tiling window managers.
+func (h *homePage) windowCard() fyne.CanvasObject {
+	s := h.shell
+	detail := "No tiling window manager detected (Hyprland, sway and i3 are supported): the setting " +
+		"applies when the window opens on one."
+	if s.wm.Tiling() {
+		detail = "Detected " + s.wm.Kind.String() + ". Unchecking it tiles the window again."
+	}
+	float := widget.NewCheck("Open as a floating window on tiling window managers", func(on bool) {
+		s.app.Preferences().SetBool(prefFloatTiling, on)
+		s.setFloating(on)
+	})
+	float.Checked = s.floatPref()
+	return newPanel(container.NewVBox(float, mutedText(detail)))
 }
 
 func (h *homePage) workspaceCard(iconName string, c fyne.ThemeColorName, title, desc string, target pageID) fyne.CanvasObject {

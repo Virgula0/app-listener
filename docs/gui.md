@@ -8,13 +8,22 @@ systemd service, and `uninstall` and `edit-protected` stay terminal-only.
 sudo app-listener-gui --gui
 ```
 
-- `--gui` replaces the subcommand: any other subcommand or flag on the command line is ignored,
-  and a warning names each one. Everything a flag would set is a control in the window.
+- `--gui` opens the window only without a subcommand. Any other flag is then ignored, and a
+  warning names each one: everything a flag would set is a control in the window. With a
+  subcommand (`sudo app-listener-gui monitor --gui`), the subcommand runs in the terminal and
+  `--gui` is ignored with a warning.
 - It needs root, like every mode it drives (each one loads eBPF programs).
 - X11 or Wayland. Under `sudo` or `pkexec` it reuses the invoking user's display session
   (`DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`), taken only from that user's own processes and
   files.
 - The default build answers `--gui` with an error naming the GUI build.
+- On a tiling window manager (Hyprland, sway, i3) the window opens floating, sized to fit its
+  content and the output (1280x820 when it fits, at most 90% of the output) and centered. The
+  WINDOW card on Home turns this off; unchecking it tiles the window again. The WM is reached
+  over its own IPC socket (`HYPRLAND_INSTANCE_SIGNATURE`, `SWAYSOCK`, `I3SOCK`, or i3's socket
+  under `XDG_RUNTIME_DIR`), taken like the display variables and only if the invoking user owns it.
+- Pages and dialogs shrink to the window: a page smaller than its content scrolls, and a dialog
+  never grows past the window.
 
 ## Home
 
@@ -27,8 +36,17 @@ The landing page checks the host and links the workspaces:
 | BPF LSM | `bpf` is in the active LSM list: guards can deny. Without it, guards are disabled and monitors still work. |
 | Daemon | Whether the protection daemon is running. |
 
-The sun/moon button at the bottom of the sidebar switches between the dark and light themes; the
-choice is remembered.
+The sun/moon button at the bottom of the sidebar switches between the dark and light themes, and
+the button next to the logo collapses the sidebar to its icons. Both choices are remembered. The
+USAGE lines at the bottom of the sidebar show the whole process's CPU (share of one core),
+resident memory and events per second across workspaces, refreshed every second.
+
+### Tables
+
+Every event and process table has a search field (Ctrl+F focuses the one on screen) and an
+**Export** button that writes the rows as currently filtered to a CSV or JSON file. The file is
+written without following symlinks in its path and is owned by the user who ran `sudo`. Clicking
+a cell selects its whole row.
 
 ## Workspaces
 
@@ -63,7 +81,7 @@ A target has three tabs:
 - **Processes**: one row per executable that touched the target, keyed by its inode, with event
   and denial counts and its place in the policy.
 - **Guard**: the policy. Pick Off, Whitelist (`-w`) or Blacklist (`-b`), add executables by
-  path, then Apply. Nothing is enforced until Apply.
+  full path (typed, or picked with Browse...), then Apply. Nothing is enforced until Apply.
 
 Whitelisting or blacklisting a process resolves `/proc/<pid>/exe` and admits that file only if
 it is still the same inode the process ran; if the path now names another file, the action is
@@ -90,9 +108,9 @@ one monitor and one guard: the network guard applies to the whole host.
 
 | Tab | Covers |
 |---|---|
+| Watched | The programs `network-monitor` traces (its positional binaries, added by typed full path or Browse...) and the events shown (`-e`). Changes apply at once. |
 | Activity | Monitor events and guard verdicts in one table (event, process, protocol, local and remote address, size). Selecting an event offers to watch, whitelist or blacklist its executable. |
 | Processes | One row per executable seen on the network, keyed by its inode, with whether it is watched and its place in the guard policy. |
-| Watched | The programs `network-monitor` traces (its positional binaries) and the events shown (`-e`). Changes apply at once. |
 | Guard | The `network-guard` policy, applied with Apply. |
 
 Guard controls and their CLI equivalents:

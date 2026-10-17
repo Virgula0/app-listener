@@ -5,7 +5,9 @@ package gui
 import (
 	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"slices"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -93,22 +95,43 @@ func (b *binaryList) changed() {
 	}
 }
 
+// pick asks for an executable: a typed full path or one chosen in the file picker.
 func (b *binaryList) pick() {
-	d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-		if err != nil || r == nil {
-			return
+	path := widget.NewEntry()
+	path.SetPlaceHolder("/usr/bin/curl")
+	browse := widget.NewButtonWithIcon("Browse…", icon("folder"), func() {
+		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err == nil && r != nil {
+				path.SetText(r.URI().Path())
+				_ = r.Close()
+			}
+		}, b.shell.win)
+		b.shell.showFile(d, "/usr/bin")
+	})
+	body := container.NewVBox(
+		widget.NewForm(widget.NewFormItem("Full path", container.NewBorder(nil, nil, nil, browse, path))),
+		mutedText("Type the executable's absolute path or browse for it. It is hashed and identified by its inode."))
+	d := dialog.NewCustomConfirm("Add executable", "Add", "Cancel", scrollable(body), func(ok bool) {
+		if ok {
+			b.addPath(strings.TrimSpace(path.Text))
 		}
-		path := r.URI().Path()
-		_ = r.Close()
-		var entry ebpf.BinaryEntry
-		b.shell.busy("Hashing "+path+"…", func() error {
-			var hashErr error
-			entry, hashErr = ebpf.ComputeBinaryEntry(path)
-			return hashErr
-		}, func() { b.put(entry) })
 	}, b.shell.win)
-	b.shell.startAt(d, "/usr/bin")
-	d.Show()
+	path.OnSubmitted = func(string) { d.Confirm() }
+	b.shell.showSized(d, fyne.NewSize(640, 240))
+	b.shell.win.Canvas().Focus(path)
+}
+
+func (b *binaryList) addPath(path string) {
+	if !filepath.IsAbs(path) {
+		dialog.ShowError(fmt.Errorf("%q is not an absolute path", path), b.shell.win)
+		return
+	}
+	var entry ebpf.BinaryEntry
+	b.shell.busy("Hashing "+path+"…", func() error {
+		var hashErr error
+		entry, hashErr = ebpf.ComputeBinaryEntry(path)
+		return hashErr
+	}, func() { b.put(entry) })
 }
 
 // binaryRow is one executable of a list; a caption replaces the remove button on read-only rows.
@@ -175,11 +198,13 @@ func (s *shell) confirmExecutable(verb string, entry ebpf.BinaryEntry, exe workb
 		widget.NewFormItem("SHA-256", selectable(hex.EncodeToString(entry.Hash[:]))),
 	)
 	body := mutedText(note)
-	dialog.ShowCustomConfirm(verb+" executable", verb, "Cancel", container.NewVBox(form, body), func(yes bool) {
-		if yes {
-			ok()
-		}
-	}, s.win)
+	d := dialog.NewCustomConfirm(verb+" executable", verb, "Cancel", scrollable(container.NewVBox(form, body)),
+		func(yes bool) {
+			if yes {
+				ok()
+			}
+		}, s.win)
+	s.showSized(d, fyne.NewSize(640, 400))
 }
 
 func selectable(s string) *widget.Label {

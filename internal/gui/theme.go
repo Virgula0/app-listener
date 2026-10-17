@@ -101,6 +101,8 @@ func (t *appTheme) Size(name fyne.ThemeSizeName) float32 {
 		return 1
 	case theme.SizeNameInputBorder:
 		return 1
+	case theme.SizeNamePadding:
+		return 6
 	}
 	return theme.DefaultTheme().Size(name)
 }
