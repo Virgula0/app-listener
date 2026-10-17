@@ -185,7 +185,9 @@ var multiLinkWarned struct {
 
 // warnMultiLinked flags a whitelisted single binary with several hard links: every name shares its
 // identity. Harmless for one program under several names (perl, e2fsck); a multicall that prints
-// no marker the classifier knows would admit all its programs. A warning, never a refusal.
+// no marker the classifier knows would admit all its programs. A warning, never a refusal; links
+// only in other directories (pressure-vessel's per-container copies) log at debug: a multicall's
+// applet links sit side by side.
 func warnMultiLinked(path string, f *os.File, file GuardInodeKey) {
 	var st unix.Stat_t
 	if unix.Fstat(int(f.Fd()), &st) != nil || st.Nlink < 2 {
@@ -201,14 +203,15 @@ func warnMultiLinked(path string, f *os.File, file GuardInodeKey) {
 	if !first {
 		return
 	}
-	also := ""
-	if sib := siblingNames(f); len(sib) > 0 {
-		also = " (also: " + strings.Join(sib, ", ") + ")"
+	sib := siblingNames(f)
+	if len(sib) == 0 {
+		log.Debugf("%s has %d hard links, none in its directory", logging.SanitizeText(path), st.Nlink)
+		return
 	}
-	log.Warnf("%s has %d hard links%s: every name is the same whitelist identity — expected for one "+
-		"program under several names, but if it picks what it runs by its name it is a multicall "+
-		"this build doesn't recognize, and whitelisting it admits all of them",
-		logging.SanitizeText(path), st.Nlink, logging.SanitizeText(also))
+	log.Warnf("%s has %d hard links (also: %s): every name is the same whitelist identity — expected "+
+		"for one program under several names, but if it picks what it runs by its name it is a "+
+		"multicall this build doesn't recognize, and whitelisting it admits all of them",
+		logging.SanitizeText(path), st.Nlink, logging.SanitizeText(strings.Join(sib, ", ")))
 }
 
 // Tagged reports whether k carries an applet tag (a uutils multicall identity).

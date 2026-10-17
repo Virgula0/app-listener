@@ -156,7 +156,9 @@ its file, with a warning.
 
 Whitelisting a single binary with several hard links logs a warning: all its names share one
 identity. That is fine for one program under several names (`perl`, `e2fsck`), but not for a
-multicall the classifier doesn't recognize.
+multicall the classifier doesn't recognize. The warning needs another name for it in the same
+directory, where a multicall's applet links sit; links only in other directories (Steam's
+pressure-vessel hard-links its tools into each container it builds) are logged at debug level.
 
 **Processes started before the guard.** The applet is attested at exec, so a multicall process
 already running when a guard starts (or the daemon restarts; a `systemctl reload` keeps them) has

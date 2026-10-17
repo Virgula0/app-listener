@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
@@ -223,5 +224,36 @@ func TestWarnMultiLinkedOncePerInode(t *testing.T) {
 	}
 	if len(warned) != 1 || !strings.Contains(warned[0], "also: perl5.40") {
 		t.Fatalf("want one warning naming perl5.40, got %q", warned)
+	}
+}
+
+func TestWarnMultiLinkedSkipsLinksInOtherDirs(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "bin", "pv-wrap")
+	copyDir := filepath.Join(root, "var", "tmp-X", "bin")
+	for _, d := range []string{filepath.Dir(p), copyDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(p, []byte("\x7fELF plain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(p, filepath.Join(copyDir, "pv-wrap")); err != nil {
+		t.Fatal(err)
+	}
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	dev, ino, err := ebpf.StatInode(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExeKey(p, nil, GuardInodeKey{Dev: dev, Ino: ino}); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range hook.AllEntries() {
+		if e.Level <= log.WarnLevel && strings.Contains(e.Message, "hard links") {
+			t.Fatalf("a link only in another directory must not warn: %q", e.Message)
+		}
 	}
 }
