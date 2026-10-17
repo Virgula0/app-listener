@@ -1840,9 +1840,9 @@ decided:
 //
 // A root P matches when the target is P itself or lies below it (P followed by '/'): path_key_buf
 // holds target[0..i) zero-padded, so at every '/' or end it is an exact guard_path key, and a
-// similarly named sibling (/bypasses_fake for /bypasses) never forms it. Roots nest, and the
-// innermost (deepest) match wins — the same nearest-guarded-ancestor rule every other hook applies
-// via guarded_ancestor_within_limit, and guard_inodes likewise records one owning res_id per inode.
+// similarly named sibling (/bypasses_fake for /bypasses) never forms it. If roots nest (config load
+// refuses it), the innermost (deepest) match wins, as guard_inodes records one owning res_id per
+// inode; guarded_ancestor_within_limit instead returns the farthest guarded ancestor.
 // Exactly one decision may be emitted here: two sequential check_and_emit calls cost >1M insns
 // because the second re-explores the shared body from every state the first one forked (a single
 // call is ~105k). Read-only roots are skipped: the check stops an alias reaching content the
