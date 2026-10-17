@@ -68,8 +68,8 @@ A TUI wizard that runs in a safe order:
 7. Runs `daemon --check` on the deployed binary before enabling the service: if this kernel's
    verifier rejects the guard eBPF, the service is not enabled.
 
-Earlier versions installed pacman/apt hooks and a boot unit to refresh the catalog; the wizard
-removes them, since the daemon now refreshes the catalog itself.
+Earlier versions installed pacman/apt hooks and a boot unit to refresh the catalog; the wizard,
+`install --binary-only` and `update` remove them, since the daemon now refreshes the catalog itself.
 
 ### SSH agent
 

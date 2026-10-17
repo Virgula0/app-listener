@@ -34,7 +34,7 @@ const (
 	DaemonServiceName = "app-listener-daemon"
 
 	// Legacy catalog-refresh triggers, superseded by the daemon's own catalog watch: earlier
-	// installers deployed them, install and uninstall remove them (RemoveLegacyCatalogRefresh).
+	// installers deployed them; install, update and uninstall remove them (RemoveLegacyCatalogRefresh).
 	PacmanHooksDir            = "/etc/pacman.d/hooks"
 	PacmanHookName            = "50-app-listener-reload.hook"
 	AptHooksDir               = "/etc/apt/apt.conf.d"
@@ -63,6 +63,14 @@ func RemoveLegacyCatalogRefresh() error {
 		}
 	}
 	return removeLegacy(LegacyCatalogRefreshFiles())
+}
+
+// dropLegacyCatalogRefresh is RemoveLegacyCatalogRefresh for a binary deploy: only logged on
+// failure, since the new binary is already in place and the daemon must still come back up.
+func dropLegacyCatalogRefresh() {
+	if err := RemoveLegacyCatalogRefresh(); err != nil {
+		log.Warnf("%v — remove it by hand", err)
+	}
 }
 
 func removeLegacy(paths []string) error {
@@ -358,6 +366,7 @@ func DeployInstalledBinary(srcPath string, unit []byte) error {
 	if err := EnsureBinSymlink(); err != nil {
 		return err
 	}
+	dropLegacyCatalogRefresh()
 
 	if !DaemonUnitInstalled() {
 		log.Infof("daemon service is not installed: binary deployed at %s — run `sudo app-listener install` to set up the protective daemon", InstallBinaryPath)
@@ -388,11 +397,11 @@ func DeployInstalledBinaryNoRestart(srcPath string, unit []byte) error {
 	if err := EnsureBinSymlink(); err != nil {
 		return err
 	}
-	if unit == nil {
-		return nil
-	}
-	if err := WriteDaemonUnit(unit); err != nil {
-		return err
+	dropLegacyCatalogRefresh()
+	if unit != nil {
+		if err := WriteDaemonUnit(unit); err != nil {
+			return err
+		}
 	}
 	return RunCmd("systemctl", "daemon-reload")
 }
