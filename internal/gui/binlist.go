@@ -100,13 +100,7 @@ func (b *binaryList) pick() {
 	path := widget.NewEntry()
 	path.SetPlaceHolder("/usr/bin/curl")
 	browse := newButton("Browse…", icon("folder"), func() {
-		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err == nil && r != nil {
-				path.SetText(r.URI().Path())
-				_ = r.Close()
-			}
-		}, b.shell.win)
-		b.shell.showFile(d, "/usr/bin")
+		b.shell.pickPath(pickFile, "Choose an executable", "/usr/bin", path.SetText)
 	})
 	body := container.NewVBox(
 		widget.NewForm(widget.NewFormItem("Full path", container.NewBorder(nil, nil, nil, browse, path))),

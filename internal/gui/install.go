@@ -516,13 +516,10 @@ func (p *installPage) download(src binSource) {
 }
 
 func (p *installPage) chooseLocal() {
-	d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-		if err != nil || r == nil {
-			return
-		}
+	start, _ := os.Getwd()
+	p.s.pickPath(pickFile, "Choose a headless app-listener binary", start, func(path string) {
 		dir, err := p.ensureStaging()
 		if err != nil {
-			_ = r.Close()
 			dialog.ShowError(err, p.s.win)
 			return
 		}
@@ -530,17 +527,18 @@ func (p *installPage) chooseLocal() {
 		p.renderBinary()
 		var staged *stagedBinary
 		p.s.busy("Checking the binary…", func() error {
+			r, err := os.Open(path)
+			if err != nil {
+				return err
+			}
 			defer r.Close()
-			var stageErr error
-			staged, stageErr = stageLocal(r, dir, headless.Check)
-			return stageErr
+			staged, err = stageLocal(r, dir, headless.Check)
+			return err
 		}, func() {
 			p.bin = staged
 			p.renderBinary()
 		})
-	}, p.s.win)
-	start, _ := os.Getwd()
-	p.s.showFile(d, start)
+	})
 }
 
 // stageLocal copies src into dir (a fresh 0700 file) and refuses it unless it is the headless build.

@@ -22,21 +22,10 @@ func (p *filesPage) addTarget() {
 	path := widget.NewEntry()
 	path.SetPlaceHolder("/home/user/.ssh")
 	browseDir := newButton("Folder…", icon("folder"), func() {
-		d := dialog.NewFolderOpen(func(u fyne.ListableURI, err error) {
-			if err == nil && u != nil {
-				path.SetText(u.Path())
-			}
-		}, win)
-		p.shell.showFile(d, "")
+		p.shell.pickPath(pickFolder, "Folder to monitor", "", path.SetText)
 	})
 	browseFile := newButton("File…", icon("file"), func() {
-		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err == nil && r != nil {
-				path.SetText(r.URI().Path())
-				_ = r.Close()
-			}
-		}, win)
-		p.shell.showFile(d, "")
+		p.shell.pickPath(pickFile, "File to monitor", "", path.SetText)
 	})
 
 	depth := widget.NewEntry()

@@ -149,21 +149,10 @@ func (u *installUI) Input(f wizard.Field) (string, error) {
 // pathButtons fill entry from a folder or file picker opened in the invoking user's home.
 func (u *installUI) pathButtons(entry *widget.Entry) fyne.CanvasObject {
 	folder := newButton("Folder…", icon("folder"), func() {
-		d := dialog.NewFolderOpen(func(l fyne.ListableURI, err error) {
-			if err == nil && l != nil {
-				entry.SetText(l.Path())
-			}
-		}, u.s.win)
-		u.s.showFile(d, "")
+		u.s.pickPath(pickFolder, "Choose a folder", "", entry.SetText)
 	})
 	file := newButton("File…", icon("file"), func() {
-		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err == nil && r != nil {
-				entry.SetText(r.URI().Path())
-				_ = r.Close()
-			}
-		}, u.s.win)
-		u.s.showFile(d, "")
+		u.s.pickPath(pickFile, "Choose a file", "", entry.SetText)
 	})
 	return container.NewHBox(folder, file)
 }

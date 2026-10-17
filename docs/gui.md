@@ -48,6 +48,16 @@ Every event and process table has a search field (Ctrl+F focuses the one on scre
 written without following symlinks in its path and is owned by the user who ran `sudo`. Clicking
 a cell selects its whole row.
 
+### File and folder pickers
+
+Every Browse, File... and Folder... button opens the same picker, starting in the home of the user
+who ran `sudo`. Its search field has the focus when it opens (Ctrl+F returns to it) and filters the
+folder shown as you type; several words must all appear in the name. **Subfolders** searches the
+whole tree below the folder instead (symlinks are not followed, `/proc`, `/sys` and `/dev` are
+skipped, and the search stops at 1000 matches). Up/Down move through the results, Enter opens the
+highlighted folder or picks the highlighted file, Escape cancels. Clicking a folder opens it; a
+folder picker picks the folder shown. The path field above takes a typed absolute path.
+
 ## Workspaces
 
 | Workspace | Covers |

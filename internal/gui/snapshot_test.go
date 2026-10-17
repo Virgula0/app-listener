@@ -108,6 +108,13 @@ func TestSnapshots(t *testing.T) {
 		w.Canvas().Overlays().Top().Hide()
 		w.Resize(fyne.NewSize(1280, 820))
 
+		s.pickPath(pickFile, "File to monitor", pickerTree(t), func(string) {})
+		s.picker.deep = true
+		test.Type(s.picker.search, "alpha")
+		s.picker.search.TypedKey(&fyne.KeyEvent{Name: fyne.KeyDown})
+		save(t, filepath.Join(dir, v.name+"-Picker.png"), w)
+		s.picker.close()
+
 		snapInstall(t, s, filepath.Join(dir, v.name+"-Install-"))
 		w.Close()
 	}

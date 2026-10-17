@@ -120,12 +120,7 @@ func (s *shell) exportTable(baseName string, t *dataTable) {
 		name.SetText(base + ext)
 	}
 	browse := newButton("Folder…", icon("folder"), func() {
-		d := dialog.NewFolderOpen(func(l fyne.ListableURI, err error) {
-			if err == nil && l != nil {
-				folder.SetText(l.Path())
-			}
-		}, s.win)
-		s.showFile(d, folder.Text)
+		s.pickPath(pickFolder, "Export folder", folder.Text, folder.SetText)
 	})
 	form := widget.NewForm(
 		widget.NewFormItem("Format", format),

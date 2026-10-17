@@ -18,7 +18,6 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -82,6 +81,8 @@ type shell struct {
 	frame     *fyne.Container
 	stats     procStats
 	statLines [3]*widget.Label
+	// picker is the open file or folder picker, which Ctrl+F searches.
+	picker *picker
 	// dialogs are the open sized dialogs and the size each asked for (refitDialogs).
 	dialogs map[sizedDialog]fyne.Size
 	// syncBackground makes background synchronous and every a no-op: fyne's test driver runs fyne.Do
@@ -353,7 +354,7 @@ func (s *shell) build(id pageID) fyne.CanvasObject {
 // preferredSize is the window's size when nothing smaller is imposed (fyne units).
 var preferredSize = fyne.NewSize(1280, 820)
 
-// sizedDialog is a dialog showSized can resize (dialog.Dialog and *dialog.FileDialog).
+// sizedDialog is a dialog showSized can resize.
 type sizedDialog interface {
 	Show()
 	Resize(fyne.Size)
@@ -368,7 +369,6 @@ const dialogMargin = 24
 func (s *shell) showSized(d sizedDialog, want fyne.Size) {
 	s.dialogs[d] = want
 	d.SetOnClosed(func() { delete(s.dialogs, d) })
-	// Show first: a FileDialog's Resize dereferences the dialog Show creates.
 	d.Show()
 	s.fitDialog(d, want)
 }
@@ -426,10 +426,13 @@ func (r *resizeWatch) MinSize(objs []fyne.CanvasObject) fyne.Size {
 	return m
 }
 
-// focusSearch focuses the filter of the table on screen (Ctrl+F).
+// focusSearch focuses the open picker's search, else the filter of the table on screen (Ctrl+F).
 func (s *shell) focusSearch() {
 	var e *widget.Entry
 	switch {
+	case s.picker != nil:
+		s.picker.focusSearch()
+		return
 	case s.current == pageFiles && s.filesPg != nil && s.filesPg.current != nil:
 		e = s.filesPg.current.searchEntry()
 	case s.current == pageNetwork && s.netPg != nil:
@@ -481,26 +484,6 @@ func (s *shell) busy(title string, work func() error, done func()) {
 			}
 		})
 	}()
-}
-
-// showFile shows a file or folder picker sized to the window.
-func (s *shell) showFile(d *dialog.FileDialog, dir string) {
-	s.startAt(d, dir)
-	s.showSized(d, fyne.NewSize(900, 620))
-}
-
-// startAt opens d in dir, or the invoking user's home when empty: the GUI runs as root under sudo,
-// and the secrets worth watching live in that user's home.
-func (s *shell) startAt(d *dialog.FileDialog, dir string) {
-	if dir == "" {
-		dir = invokingHome()
-	}
-	if dir == "" {
-		return
-	}
-	if l, err := storage.ListerForURI(storage.NewFileURI(dir)); err == nil {
-		d.SetLocation(l)
-	}
 }
 
 func newLogo(side float32) fyne.CanvasObject {
