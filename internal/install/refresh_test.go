@@ -218,3 +218,100 @@ func TestRefreshCatalogAdmitVetsOnlyNewLines(t *testing.T) {
 		t.Errorf("changes = %+v, want none", changes)
 	}
 }
+
+// staleDiscordLibConf is a Discord config whose [libraries] block still names app-1, removed by the
+// updater, beside the installed app-2 and a hand-written writer that never existed.
+func staleDiscordLibConf(t *testing.T, home string, encrypt bool) (conf string, cfg *daemonconfig.Config) {
+	t.Helper()
+	root := filepath.Join(home, ".config", "discord")
+	lsDir := filepath.Join(root, "Local Storage")
+	for _, d := range []string{lsDir, filepath.Join(root, "app-2")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "app-2", "Discord"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conf = GenerateConf([]Section{{
+		Path: root, Allow: []BinaryRule{{Path: filepath.Join(root, "app-2", "Discord")}}, Encrypt: encrypt,
+		ExtraWatchPaths: []string{lsDir},
+	}}, []LibraryBlock{{
+		Name:    "Discord (u)",
+		LibDirs: []string{filepath.Join(root, "app-1"), filepath.Join(root, "app-2")},
+		LibWriters: []string{filepath.Join(root, "app-1", "Discord"), filepath.Join(root, "app-2", "Discord"),
+			filepath.Join(home, "opt", "hand-written")},
+	}})
+	confPath := filepath.Join(t.TempDir(), "daemon.conf")
+	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := daemonconfig.Load(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conf, cfg
+}
+
+func TestRefreshCatalogPrunesVanishedAppVersionLibLines(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".config", "discord")
+	conf, cfg := staleDiscordLibConf(t, home, false)
+	plain := func(_ *daemonconfig.Resource, expand func() []BinaryRule) ([]BinaryRule, bool, error) {
+		return expand(), false, nil
+	}
+	text, changes, err := RefreshCatalog(conf, cfg, []User{{Name: "u", Home: home}},
+		RefreshOptions{Live: true, KeepExisting: true, Scan: plain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := []string{filepath.Join(root, "app-1"), filepath.Join(root, "app-1", "Discord")}
+	for _, p := range gone {
+		if strings.Contains(text, `"`+p+`"`) {
+			t.Errorf("vanished %s survived the refresh:\n%s", p, text)
+		}
+	}
+	for _, p := range []string{filepath.Join(root, "app-2"), filepath.Join(root, "app-2", "Discord"),
+		filepath.Join(home, "opt", "hand-written")} {
+		if !strings.Contains(text, `"`+p+`"`) {
+			t.Errorf("%s was dropped:\n%s", p, text)
+		}
+	}
+	if len(changes) != 1 || !reflect.DeepEqual(changes[0].Dropped, gone) {
+		t.Errorf("changes = %+v, want the app-1 lines dropped", changes)
+	}
+
+	// The install CLI rebuilds from the catalog and may scan a vault it relocks: it never prunes.
+	text, _, err = RefreshCatalog(conf, cfg, []User{{Name: "u", Home: home}},
+		RefreshOptions{Live: true, Scan: plain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, `lib_dir "`+filepath.Join(root, "app-1")+`"`) {
+		t.Errorf("a non-daemon refresh pruned a lib line:\n%s", text)
+	}
+}
+
+// An encrypted section showing no app-* dir looks locked: every lib line stays.
+func TestRefreshCatalogKeepsLibLinesOfLockedLookingVault(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".config", "discord")
+	conf, cfg := staleDiscordLibConf(t, home, true)
+	if err := os.RemoveAll(filepath.Join(root, "app-2")); err != nil {
+		t.Fatal(err)
+	}
+	locked := func(_ *daemonconfig.Resource, _ func() []BinaryRule) ([]BinaryRule, bool, error) {
+		return []BinaryRule{{Path: "/bin/sh"}}, true, nil
+	}
+	text, _, err := RefreshCatalog(conf, cfg, []User{{Name: "u", Home: home}},
+		RefreshOptions{Live: true, KeepExisting: true, Scan: locked})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"app-1", "app-2"} {
+		if !strings.Contains(text, `lib_dir "`+filepath.Join(root, v)+`"`) ||
+			!strings.Contains(text, `lib_binary "`+filepath.Join(root, v, "Discord")+`"`) {
+			t.Errorf("%s lib lines pruned from a locked-looking vault:\n%s", v, text)
+		}
+	}
+}

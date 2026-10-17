@@ -3,7 +3,9 @@ package install
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -34,7 +36,8 @@ type RefreshOptions struct {
 	Live bool
 	// KeepExisting keeps a section's whitelist lines whose file still exists, dropping only
 	// vanished ones (the daemon's own refresh). Off, the section is rebuilt from the catalog alone,
-	// so a line the catalog doesn't produce is dropped (`install --update-catalog-only`).
+	// so a line the catalog doesn't produce is dropped (`install --update-catalog-only`). On, the
+	// app's [libraries] block also loses catalog-pattern lib_dir / lib_binary lines whose path is gone.
 	KeepExisting bool
 	Scan         SectionScan
 	// Admit, when set, vets each line the refresh would add to a section (one it doesn't list yet).
@@ -43,7 +46,7 @@ type RefreshOptions struct {
 
 // RefreshCatalog re-expands the whitelist of every catalog section of confText (the text cfg was
 // parsed from). What it admits is what `install --update-catalog-only` admits: catalog globs,
-// confSafeMatch, homeMatchConfined, and library directives only ever added. User sections are
+// confSafeMatch, homeMatchConfined, and library directives added (see KeepExisting). User sections are
 // kept verbatim.
 func RefreshCatalog(confText string, cfg *daemonconfig.Config, users []User, opts RefreshOptions) (string, []SectionChange, error) {
 	patched := 0
@@ -108,7 +111,7 @@ func RefreshSection(confText string, r *daemonconfig.Resource, users []User,
 	if err != nil {
 		return "", change, false, fmt.Errorf("patching section %s: %w", sectionPath, err)
 	}
-	// Library directives are only ever ADDED, in the app's own [libraries] block. Catalog-generated
+	// Library directives are ADDED in the app's own [libraries] block (pruned below). Catalog-generated
 	// ones an older installer nested under this section move there first (hand-written ones stay).
 	// When the catalog moves a binary from the whitelist to the lib writers, only this re-adds it.
 	block := entry.LibraryBlockFor(user.Name, user.Home)
@@ -122,7 +125,44 @@ func RefreshSection(confText string, r *daemonconfig.Resource, users []User,
 	}
 	change.Admitted = missingFrom(freshPaths, old)
 	change.Dropped = missingFrom(old, freshPaths)
-	return EnsureLibraryBlock(migrated, &block), change, true, nil
+	text = EnsureLibraryBlock(migrated, &block)
+	// Live view only: a locked vault hides every lib_dir inside it, and dropping a live one would
+	// leave that code tree writable. No lib_dir found in an encrypted section looks locked.
+	if opts.KeepExisting && (!encrypted || len(block.LibDirs) > 0) {
+		var gone []string
+		text, gone = PruneLibraryBlock(text, block.Name, vanishedLibLine(entry, *user))
+		change.Dropped = append(change.Dropped, gone...)
+	}
+	return text, change, true, nil
+}
+
+// vanishedLibLine reports a lib_dir / lib_binary line that entry's own patterns produce and whose
+// path is gone (an app version its updater removed); the refresh re-adds it if it returns. A
+// hand-written line, or any error but ENOENT, keeps it.
+func vanishedLibLine(entry *CandidateDir, u User) func(keyword, path string) bool {
+	return func(keyword, path string) bool {
+		var patterns []string
+		stat := os.Stat // a symlinked writer resolves like ExpandLibDirWriters
+		switch keyword {
+		case "lib_dir":
+			for _, rel := range entry.LibDirRelPaths {
+				patterns = append(patterns, filepath.Join(u.Home, expandPlaceholders(rel, u.Name, u.Home)))
+			}
+			stat = os.Lstat
+		case "lib_binary":
+			for _, bin := range entry.LibDirWriters {
+				patterns = append(patterns, expandPlaceholders(bin, u.Name, u.Home))
+			}
+		}
+		if !slices.ContainsFunc(patterns, func(p string) bool {
+			ok, err := filepath.Match(p, path)
+			return err == nil && ok
+		}) {
+			return false
+		}
+		_, err := stat(path)
+		return errors.Is(err, fs.ErrNotExist)
+	}
 }
 
 // keepExisting adds to fresh every whitelist line of r whose file still exists, events kept. A
