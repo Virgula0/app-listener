@@ -598,7 +598,7 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 	pin := pinCfg{base: pinBase, gen: newPinGeneration()}
 	guard.ConfigureSharedPinning(guard.SharedPinPrefix(pin.base, pin.gen))
 
-	pending, err := unlockPendingGroupRoots(cfg, vault, pin)
+	pending, err := unlockPendingGroupRoots(cfg, vault, pin, true)
 	if err != nil {
 		return "", nil, err
 	}
@@ -642,7 +642,7 @@ func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinC
 		log.Warnf("daemon: could not sweep stale guard pins: %v", cleanErr)
 	}
 
-	pending, err := unlockPendingGroupRoots(cfg, vault, pin)
+	pending, err := unlockPendingGroupRoots(cfg, vault, pin, false)
 	if err != nil {
 		return nil, err
 	}
@@ -736,8 +736,9 @@ func (p *pendingGroupUnlock) lockRoots(vault *fscrypt.Vault) {
 // unlockPendingGroupRoots unlocks the vault of every PathPending grouped resource so buildGuards
 // can resolve real sub-path inodes. Each root is unlocked UNDER an ephemeral recursive self-only
 // guard attached first (denies every reader but the root daemon; same discipline as the running
-// daemon and --update-catalog-only). Returns an empty tracker when nothing is pending.
-func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg) (*pendingGroupUnlock, error) {
+// daemon and --update-catalog-only). Returns an empty tracker when nothing is pending. reloading:
+// a root already unlocked belongs to the running config and is never recorded for lock-back.
+func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg, reloading bool) (*pendingGroupUnlock, error) {
 	seen := make(map[string]bool)
 	var roots []string
 	for i := range cfg.Resources {
@@ -777,6 +778,19 @@ func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin
 		}
 		p.guards = append(p.guards, g)
 		go drainEphemeral(root, g, p.drained)
+		// An aborted reload's lockRoots would pull the live vault's key out from under its open
+		// files (left incompletely removed: new inodes undecryptable).
+		if reloading {
+			provisioned, provErr := vault.IsProvisioned(root)
+			if provErr != nil {
+				p.lockRoots(vault)
+				p.stop()
+				return nil, fmt.Errorf("checking lock state of vault %s for grouped watch paths: %w", root, provErr)
+			}
+			if provisioned {
+				continue
+			}
+		}
 		if unlockErr := vault.Unlock(root); unlockErr != nil {
 			p.lockRoots(vault)
 			p.stop()
@@ -1076,7 +1090,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	}
 	opts = append(opts, eventFilterOptions()...)
 	if r.ReadOnly {
-		opts = append(opts, guard.WithChmodDropWrite())
+		opts = append(opts, guard.WithChmodDropWrite(), guard.WithMovePeer(r.MovePeer()))
 	}
 	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0, opts...)
 	if err != nil {

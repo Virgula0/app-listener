@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -281,36 +282,30 @@ func (s *monitorUnitTest) TestCheckHardlinkByInode() {
 
 	m := &Monitor{
 		targets:     dirTarget(watchedDir),
-		watchInodes: make(map[string]string),
+		watchInodes: make(map[uint64][]watchedInode),
+		mounts:      newMountTable(),
 	}
 	m.addInode(watchedFile)
+	dev, ino := s.kernelIdentity(m, watchedFile)
 
 	tests := []struct {
 		name     string
+		dev      uint32
+		ino      uint64
 		path     string
 		expected string
 	}{
-		{
-			name:     "original file matches",
-			path:     watchedFile,
-			expected: watchedFile,
-		},
-		{
-			name:     "hardlink resolves to watched file path",
-			path:     hardlinkPath,
-			expected: watchedFile,
-		},
-		{
-			name:     "non-existent path",
-			path:     filepath.Join(dir, "nonexistent"),
-			expected: "",
-		},
+		{name: "original file matches", dev: dev, ino: ino, path: watchedFile, expected: watchedFile},
+		{name: "hardlink resolves to watched file path", dev: dev, ino: ino, path: hardlinkPath, expected: watchedFile},
+		{name: "other superblock", dev: dev + 1, ino: ino, path: hardlinkPath, expected: ""},
+		{name: "inode not watched", dev: dev, ino: ino + 1, path: hardlinkPath, expected: ""},
+		{name: "user-string event has no inode", dev: 0, ino: 0, path: hardlinkPath, expected: ""},
+		{name: "path no longer that inode", dev: dev, ino: ino, path: filepath.Join(dir, "nonexistent"), expected: ""},
 	}
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			result := m.checkHardlinkByInode(tt.path)
-			s.Require().Equal(tt.expected, result)
+			s.Require().Equal(tt.expected, m.hardlinkByInode(tt.dev, tt.ino, tt.path))
 		})
 	}
 }
@@ -320,8 +315,18 @@ func (s *monitorUnitTest) TestCheckHardlinkByInodeNoInodes() {
 		targets:     dirTarget("/tmp/watch"),
 		watchInodes: nil,
 	}
-	result := m.checkHardlinkByInode("/some/path")
-	s.Require().Equal("", result)
+	s.Require().Equal("", m.hardlinkByInode(1, 42, "/some/path"))
+}
+
+// kernelIdentity returns path's (sb->s_dev, ino) as the BPF event carries them.
+func (s *monitorUnitTest) kernelIdentity(m *Monitor, path string) (uint32, uint64) {
+	real, err := filepath.EvalSymlinks(path)
+	s.Require().NoError(err)
+	var st syscall.Stat_t
+	s.Require().NoError(syscall.Lstat(real, &st))
+	dev := m.mounts.devOf(real)
+	s.Require().NotZero(dev)
+	return dev, st.Ino
 }
 
 func (s *monitorUnitTest) TestPopulateWatchInodes_SingleFile() {
@@ -333,14 +338,15 @@ func (s *monitorUnitTest) TestPopulateWatchInodes_SingleFile() {
 		targets: []ebpf.Target{
 			{Dir: dir, File: "target.txt", IsDir: false, Path: targetFile},
 		},
-		watchInodes: make(map[string]string),
+		watchInodes: make(map[uint64][]watchedInode),
 	}
 	m.populateWatchInodes()
 
 	s.Require().Len(m.watchInodes, 1)
-	for key, val := range m.watchInodes {
-		s.True(len(key) > 0, "key should be dev:ino")
-		s.Equal(targetFile, val)
+	for ino, ws := range m.watchInodes {
+		s.NotZero(ino)
+		s.Require().Len(ws, 1)
+		s.Equal(targetFile, ws[0].path)
 	}
 }
 
@@ -357,13 +363,13 @@ func (s *monitorUnitTest) TestPopulateWatchInodes_Directory() {
 		targets:     dirTarget(dir),
 		recursive:   true,
 		depth:       0,
-		watchInodes: make(map[string]string),
+		watchInodes: make(map[uint64][]watchedInode),
 	}
 	m.populateWatchInodes()
 
 	s.Require().Len(m.watchInodes, 3)
-	for _, val := range m.watchInodes {
-		s.Contains(val, dir)
+	for _, ws := range m.watchInodes {
+		s.Contains(ws[0].path, dir)
 	}
 }
 
@@ -508,12 +514,13 @@ func (s *monitorUnitTest) TestCheckHardlinkByInode_Preexisting() {
 
 	m := &Monitor{
 		targets:     dirTarget(watchedDir),
-		watchInodes: make(map[string]string),
+		watchInodes: make(map[uint64][]watchedInode),
+		mounts:      newMountTable(),
 	}
 	m.populateWatchInodes()
 
-	result := m.checkHardlinkByInode(hardlinkPath)
-	s.Require().Equal(watchedFile, result)
+	dev, ino := s.kernelIdentity(m, hardlinkPath)
+	s.Require().Equal(watchedFile, m.hardlinkByInode(dev, ino, hardlinkPath))
 }
 
 func TestSetEventTypesRace(t *testing.T) {

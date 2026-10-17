@@ -2,7 +2,7 @@
 
 // Package gui is the optional fyne desktop window for `monitor --gui`, behind the `gui` build tag:
 // fyne adds X11/OpenGL/font/image dependencies (~15 MiB) and package-init goroutines that don't
-// belong in the daemon sharing this binary. Build with `-tags gui` (or `make build-linux GUI=1`).
+// belong in the daemon sharing this binary. Build with `-tags gui` (or `make build GUI=1`).
 package gui
 
 import (
@@ -304,7 +304,16 @@ func (hr *headerRenderer) Destroy() {}
 
 // ── Run ────────────────────────────────────────────────────────────────────
 
-func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) {
+func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) (err error) {
+	restoreSessionEnv()
+	defer cleanupSessionEnv()
+	// fyne logs a failed GLFW init and then panics on the first window call.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("--gui: no display reachable (%v): run it from a graphical session "+
+				"(under sudo it needs the invoking user's WAYLAND_DISPLAY or DISPLAY)", r)
+		}
+	}()
 	m := &guiModel{
 		events:    events,
 		allEvents: make([]ebpf.FileEvent, 0, 500),
@@ -316,6 +325,9 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 	}
 
 	os.Setenv("FYNE_THEME", "dark")
+	// Opts out of fyne's off-main-goroutine marshalling: every widget call from a goroutine here
+	// goes through fyne.Do. Set before the app exists: fyne reads it once, on first use.
+	app.SetMetadata(fyne.AppMetadata{Migrations: map[string]bool{"fyneDo": true}})
 	fyneApp := app.NewWithID("com.virgula0.app-listener")
 	win := fyneApp.NewWindow("app-listener — File System Monitor (eBPF)")
 
@@ -337,12 +349,6 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 
 	filterEntry := widget.NewEntry()
 	filterEntry.SetPlaceHolder("Filter by path, process, or event type...")
-	filterEntry.OnChanged = func(s string) {
-		m.mu.Lock()
-		m.filter = strings.ToLower(s)
-		m.applyFilter()
-		m.mu.Unlock()
-	}
 
 	header := newHeaderWidget(m.cols, func() {
 		// called after columns are resized
@@ -363,6 +369,14 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 	header.onResize = func() {
 		list.Refresh()
 	}
+	// Redraw now: otherwise the list only re-reads m.filtered on the next event.
+	filterEntry.OnChanged = func(s string) {
+		m.mu.Lock()
+		m.filter = strings.ToLower(s)
+		m.applyFilter()
+		m.mu.Unlock()
+		list.Refresh()
+	}
 
 	infoBox := container.NewVBox(infoLabel, filterEntry, header)
 	content := container.NewBorder(infoBox, resLabel, nil, nil, list)
@@ -372,9 +386,13 @@ func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int
 	startTime := time.Now()
 	go m.listenEvents(infoLabel, list, startTime, recursiveStr)
 	go m.uptimeTicker(infoLabel, resLabel, startTime, recursiveStr)
-	floatWindow()
+	// The float hint is an X11 property; a Wayland window has no X id to set it on.
+	if os.Getenv("WAYLAND_DISPLAY") == "" {
+		floatWindow()
+	}
 
 	win.ShowAndRun()
+	return nil
 }
 
 func (m *guiModel) listenEvents(

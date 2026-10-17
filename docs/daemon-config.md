@@ -55,7 +55,8 @@ A whitelisted binary may only map libraries the daemon trusts, which is what def
 
 1. **Root-owned system libraries**: any `.so` owned by root, not world-writable, in a root-owned
    directory (covers `/usr/lib`, `/opt`, ... and survives package upgrades).
-2. **Anything inside a guarded tree**: only whitelisted binaries can write there.
+2. **Anything inside a guarded tree**: only whitelisted binaries can write there. A tree its own
+   writer moved aside stops counting as soon as its guard lets go of it.
 3. **Code a whitelisted process generated itself**, such as a GPU driver's JIT output.
 
 Anything else goes in a `[libraries]` block, one per application, after the watch sections:
@@ -75,6 +76,13 @@ lib_binary /home/alice/.local/share/Steam/ubuntu12_32/steam
 
 The block name is a label the installer uses to find the block again. Older configs that nest
 these directives inside a `[watch]` section are still accepted.
+
+Moving a file from one guarded tree into another is refused to every process but the daemon,
+with one exception: two `lib_dir` trees with exactly the same writers, where those writers may
+rename a file (not a directory) from one into the other. That is how Steam installs an update from
+its staging dir `package/` into `linux32/`, `ubuntu12_32/` and the other runtime dirs. The moved
+file stays protected by the tree it lands in. A refused move is logged with
+`resource=cross-resource`.
 
 ## Generic Electron apps: `[electron_apps]`
 
@@ -152,6 +160,8 @@ max_inodes: 65536
 ## Reloading
 
 `sudo systemctl reload app-listener-daemon` re-reads the file. New guards attach before old ones
-detach, and a malformed config keeps the previous one running. Binaries added by hand are vetted
+detach, and a malformed config keeps the previous one running. A reload never drops a guarded
+resource (stop, edit and start for that), except a `lib_dir` whose directory its writer deleted
+(an app's old version dir after an update), which it drops as a restart would. Binaries added by hand are vetted
 like any other: one that isn't root-placed needs `sudo app-listener trust-binaries`
 ([Binary trust](binary-trust.md#trust-binaries)).

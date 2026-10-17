@@ -142,6 +142,53 @@ func EnsureLibraryBlock(confText string, block *LibraryBlock) string {
 	return strings.Join(result, "\n")
 }
 
+// PruneLibraryBlock deletes from the `[libraries <name>]` block each lib_dir / lib_binary line whose
+// path stale reports, returning those paths. allow_lib lines and other blocks are untouched.
+func PruneLibraryBlock(confText, name string, stale func(keyword, path string) bool) (text string, dropped []string) {
+	lines := strings.Split(confText, "\n")
+	start := -1
+	for i, l := range lines {
+		if n, ok := parseLibrariesHeaderName(l); ok && n == name {
+			start = i
+			break
+		}
+	}
+	if start == -1 {
+		return confText, nil
+	}
+	end := findSectionEnd(lines, start)
+	result := make([]string, 0, len(lines))
+	for i, l := range lines {
+		if i > start && i < end {
+			if keyword, path, ok := parseLibDirLine(strings.TrimSpace(l)); ok && stale(keyword, path) {
+				dropped = append(dropped, path)
+				continue
+			}
+		}
+		result = append(result, l)
+	}
+	if len(dropped) == 0 {
+		return confText, nil
+	}
+	return strings.Join(result, "\n"), dropped
+}
+
+// parseLibDirLine splits a trimmed lib_dir / lib_binary line as the daemon parser reads it.
+func parseLibDirLine(t string) (keyword, path string, ok bool) {
+	for _, d := range [...]string{"lib_dir", "lib_binary"} {
+		rest, found := strings.CutPrefix(t, d)
+		if !found || rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
+			continue
+		}
+		path = unquotePath(strings.TrimSpace(strings.TrimPrefix(rest, ":")))
+		if path == "" || strings.Contains(path, `"`) {
+			return "", "", false
+		}
+		return d, path, true
+	}
+	return "", "", false
+}
+
 // RemoveSectionLibDirectives deletes the library directive lines in drop (trimmed comparison) from
 // the [watch path] section body, migrating legacy configs (directives nested under a watch section)
 // to the [libraries] layout: the installer drops the catalog-generated lines and EnsureLibraryBlock

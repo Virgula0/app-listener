@@ -443,6 +443,34 @@ func (s *IntegrationSuite) TestMonitor_Recursive() {
 	s.stopMonitor(c)
 }
 
+// The BPF dentry walk stops at a superblock root: a watch on its own mount (tmpfs, a bind mount)
+// must still see events, reported under the watched path rather than the mount-relative one.
+func (s *IntegrationSuite) TestMonitor_SeparateMounts() {
+	c := s.monitorContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"sh", "-c", "mkdir -p /tmpfswatch /bindsrc /bindwatch && " +
+		"mount -t tmpfs tmpfs /tmpfswatch && mount --bind /bindsrc /bindwatch"})
+	defer s.exec(c, []string{"sh", "-c", "umount /tmpfswatch /bindwatch; rm -rf /tmpfswatch /bindsrc /bindwatch"})
+	s.exec(c, []string{"sh", "-c", "echo bound > /bindsrc/b.txt"})
+
+	for _, tc := range []struct{ watch, file, cmd string }{
+		{watch: "/tmpfswatch", file: "/tmpfswatch/data.txt",
+			cmd: "echo x > /tmpfswatch/data.txt && cat /tmpfswatch/data.txt > /dev/null"},
+		{watch: "/bindwatch", file: "/bindwatch/b.txt", cmd: "cat /bindwatch/b.txt > /dev/null"},
+	} {
+		s.startMonitorStd(c, tc.watch)
+		logBefore := s.readMonitorLog(c)
+		s.exec(c, []string{"sh", "-c", tc.cmd})
+		logAfter := s.waitForEventType(c, logBefore, "OPEN", 5*time.Second)
+		if !slices.Contains(newEventTypes(logBefore, logAfter), "READ") {
+			logAfter = s.waitForEventType(c, logAfter, "READ", 5*time.Second)
+		}
+		s.Require().Containsf(logAfter, "|"+tc.file+"|", "events must carry the watched path %s", tc.file)
+		s.stopMonitor(c)
+	}
+}
+
 // ---------------------------------------------------------------
 // Monitor helpers (used by both event tests and exploit tests)
 // ---------------------------------------------------------------

@@ -11,4 +11,4 @@ const Available = false
 
 // Run is unreachable in the default build (monitor checks Available and
 // errors out); it exists only so the package compiles without the `gui` tag.
-func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) {}
+func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) error { return nil }

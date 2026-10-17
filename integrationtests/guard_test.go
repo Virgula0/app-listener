@@ -1315,7 +1315,7 @@ func (s *IntegrationSuite) TestGuard_Bypass_OpenByHandleAt() {
 	code, out := s.exec(c, []string{"mount", "-t", "tmpfs", "tmpfs", "/watch"})
 	s.Require().Equalf(0, code, "mounting tmpfs on /watch: %s", out)
 	// Unmount before returning: a leftover mount in the pooled container
-	// shifts every later /watch path onto the tmpfs (see the _Tmpfs test).
+	// puts every later /watch file on the tmpfs.
 	defer s.exec(c, []string{"umount", "/watch"})
 
 	s.exec(c, []string{"sh", "-c", "echo 'handle bypass target' > /watch/target.txt"})
@@ -2136,12 +2136,13 @@ func (s *IntegrationSuite) TestGuard_DeepRuntimeTree_AncestorWalk_Tmpfs() {
 	s.requireCatBlocked(deltaEvents)
 	s.requireBlockedEvent(deltaEvents, "DELETE", "rm")
 	s.requireBlockedEvent(deltaEvents, "MKDIR", "mkdir")
+	// The kernel walks paths only up to the tmpfs root; userspace maps them through the mount.
+	s.Require().NotEmptyf(eventsForPath(deltaEvents, deep+"/data.txt"),
+		"events must carry the absolute path, got %v", deltaEvents)
 
 	s.stopGuard(c)
 
-	// Test hygiene: unmount the tmpfs. A leftover mount in the pooled container puts later /watch
-	// files on the tmpfs, whose root dentry ends the d_parent walk at the mount boundary, so later
-	// tests would report mount-relative paths (/bin/mycat, not /watch/bin/mycat).
+	// Test hygiene: a leftover mount in the pooled container would put later /watch files on it.
 	s.exec(c, []string{"umount", "/watch"})
 }
 

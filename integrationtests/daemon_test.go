@@ -690,6 +690,61 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Two lib_dirs with identical writers are move peers: a writer may rename a FILE from one into the
+// other (Steam unpacks its package/ staging dir into linux32/, ubuntu12_32/, ...). The moved file
+// must stay write-protected under the destination: it kept the source's guard_inodes row, which
+// names the source root, so the move must evict it. Directories, RENAME_EXCHANGE and lib_dirs with
+// different writers stay daemon-only, and that denial is labelled cross-resource.
+func (s *IntegrationSuite) TestDaemon_PeerLibDirsAllowFileMoves() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/xres_move"), "/tmp/mover", 0o755),
+		"copy xres_move")
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /stage/dir /rt /other /etc/app-listener && cp /tmp/mover /tmp/mover2 && " +
+			"for f in a b c; do printf \"LIB-$f\" > /stage/$f.so; done && printf 'LIB-x' > /stage/dir/x.so && " +
+			"printf 'LIB-victim' > /rt/victim.so && chmod -R a+rX /stage /rt /other"})
+	s.startDaemon(c, `[libraries "Peers"]
+lib_dir /stage
+lib_dir /rt
+lib_binary /tmp/mover
+
+[libraries "Other"]
+lib_dir /other
+lib_binary /tmp/mover
+lib_binary /tmp/mover2`)
+
+	code, out := s.exec(c, []string{"/tmp/mover", "rename", "/stage/a.so", "/rt/a.so"})
+	s.Require().Equalf(0, code, "a writer must move a file between peer lib_dirs: %s", out)
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cat /rt/a.so"})
+	s.Require().Containsf(out, "LIB-a", "the moved library must stay world-readable")
+
+	// Worst impact: the moved library writable by a non-writer, under a tree the trust guard loads from.
+	code, out = s.exec(c, []string{"sh", "-c", "printf EVIL >> /rt/a.so"})
+	s.Require().NotEqualf(0, code, "a non-writer must not modify a library moved into a peer lib_dir: %s", out)
+	_, out = s.exec(c, []string{"sh", "-c", "cat /rt/a.so"})
+	s.Require().NotContainsf(out, "EVIL", "the moved library was modified by a non-writer")
+
+	code, out = s.exec(c, []string{"/tmp/mover", "rename", "/stage/dir", "/rt/dir"})
+	s.Require().NotEqualf(0, code, "a directory move between peers must stay daemon-only: %s", out)
+	code, out = s.exec(c, []string{"/tmp/mover", "exchange", "/stage/b.so", "/rt/victim.so"})
+	s.Require().NotEqualf(0, code, "RENAME_EXCHANGE between peers must stay daemon-only: %s", out)
+	code, out = s.exec(c, []string{"/tmp/mover", "rename", "/stage/c.so", "/other/c.so"})
+	s.Require().NotEqualf(0, code, "lib_dirs with different writers are not peers: %s", out)
+
+	s.Require().Truef(s.awaitLog(c, "resource="+guard.CrossResourceLabel, 5*time.Second),
+		"a cross-resource denial must be labelled %q, not with an unrelated resource:\n%s",
+		guard.CrossResourceLabel, tailLast(s.readDaemonLog(c), 30))
+	for _, ev := range parseDaemonEvents(s.readDaemonLog(c)) {
+		if ev.Denied && ev.Op == "RENAME" && ev.Resource != guard.CrossResourceLabel {
+			s.Failf("mislabelled cross-resource denial", "%+v", ev)
+		}
+	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Bypass: path_rename/path_link take dst_guarded only from a watch-root victim or a destination
 // dir with its own guard_inodes row, and a guarded source returns before the destination ancestor
 // walk. A dir moved into B maps only its top level, so /resourceB/d/sub has no row: an A-only
@@ -1552,6 +1607,74 @@ func (s *IntegrationSuite) TestDaemon_StartupRace_NoPlaintextWindow_GroupedResou
 	s.sigDaemon(c, "TERM")
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 	s.Require().Truef(s.harnessIsEncrypted(c, root), "a graceful stop must re-lock the shared vault root")
+
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf("umount %s 2>/dev/null; losetup -D 2>/dev/null; true", mnt)})
+}
+
+// A reload re-defers a stale lib_dir of an unlocked grouped vault and "unlocks" that vault again
+// under an ephemeral guard. When the reload is then refused, the lock-back must not pull the key
+// the running config still holds: with apps' files open the key is left incompletely removed,
+// cached inodes keep working and every new one (an updater's fresh files) stays ciphertext.
+func (s *IntegrationSuite) TestDaemon_RefusedReload_KeepsRunningVaultUnlocked() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.copyFscryptHarness(c)
+
+	const marker = "REFUSED-RELOAD-VAULT-SECRET-4D2A"
+	const mnt = "/mnt/fscrypt-reload"
+	s.setupFscryptDirFilesystem(c, mnt)
+
+	root := mnt + "/profile"
+	sub := root + "/sentry"
+	secret := sub + "/secret.txt"
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf(
+		"mkdir -p %s /dropB /etc/app-listener && printf '%s' > %s && echo x > /dropB/f && "+
+			"chmod 755 %s %s && chmod 644 %s && "+
+			"head -c 32 /dev/zero > /etc/app-listener/fscrypt.key && chmod 600 /etc/app-listener/fscrypt.key",
+		sub, marker, secret, root, sub, secret)})
+	s.harnessMigrate(c, root)
+	s.Require().True(s.harnessIsEncrypted(c, root), "setup: the vault root must be encrypted before the daemon starts")
+
+	const cfgPath = "/tmp/reload-vault.conf"
+	writeCfg := func(body string) {
+		code, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf("cat > %s <<'EOF'\n%s\nEOF", cfgPath, body)})
+		s.Require().Equalf(0, code, "writing %s: %s", cfgPath, out)
+	}
+	group := fmt.Sprintf("[watch %s]\nwatch: %s\nlib_dir %s/app-gone\nneed_encryption: true\n/usr/bin/grep", root, sub, root)
+	writeCfg(group + "\n\n[watch /dropB]\nneed_encryption: false\n/usr/bin/true")
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"nohup /app-listener daemon --config " + cfgPath + " --headless > /tmp/daemon.log 2>&1 &"})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, "")
+	_, out = s.exec(c, []string{"grep", "-c", marker, secret})
+	s.Require().Containsf(out, "1", "baseline: the whitelisted reader must see the unlocked vault: %s", out)
+	const deferred = "lib_dir not resolvable yet"
+	deferredAtStart := strings.Count(s.readDaemonLog(c), deferred)
+
+	// Dropping /dropB makes Phase 0 refuse after the ephemeral unlock already ran.
+	writeCfg(group)
+	s.sigDaemon(c, "HUP")
+	refused := false
+	for dl := time.Now().Add(daemonShutdownTimeout); time.Now().Before(dl); {
+		if strings.Contains(s.readDaemonLog(c), "reload failed, keeping previous configuration") {
+			refused = true
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	daemonLog := s.readDaemonLog(c)
+	s.Require().Truef(refused, "the reload dropping /dropB must be refused, daemon log:\n%s", daemonLog)
+	s.Require().Greaterf(strings.Count(daemonLog, deferred), deferredAtStart,
+		"the reload must re-defer the stale lib_dir (the ephemeral-unlock path), daemon log:\n%s", daemonLog)
+
+	_, out = s.exec(c, []string{"grep", "-c", marker, secret})
+	s.Require().Containsf(out, "1", "the refused reload locked the running config's vault: %s\ndaemon log:\n%s",
+		out, s.readDaemonLog(c))
+
+	s.sigDaemon(c, "TERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
+	s.Require().Truef(s.harnessIsEncrypted(c, root), "a graceful stop must still re-lock the vault")
 
 	s.exec(c, []string{"sh", "-c", fmt.Sprintf("umount %s 2>/dev/null; losetup -D 2>/dev/null; true", mnt)})
 }

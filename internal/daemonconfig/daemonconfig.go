@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -96,6 +97,37 @@ type Resource struct {
 	// addResource), which clears this flag. Still missing afterwards = hard error, never silently
 	// dropped.
 	PathPending bool
+}
+
+// MovePeer is a lib_dir's move-peer class: lib_dirs with the same configured writers (paths, links,
+// event masks; order and repeats ignored) share it, so the guard lets those writers rename a file
+// from one into another (an updater unpacking its staging dir). Judging such a move by either
+// side's whitelist is the same decision only because the lists are equal. 0 for every other
+// resource, and for a lib_dir without writers.
+func (r *Resource) MovePeer() uint64 {
+	if !r.ReadOnly {
+		return 0
+	}
+	lines := make([]string, 0, len(r.Binaries)+len(r.PendingBinaries))
+	for _, b := range slices.Concat(r.Binaries, r.PendingBinaries) {
+		events := make([]string, len(b.Events))
+		for i, e := range b.Events {
+			events[i] = e.String()
+		}
+		slices.Sort(events)
+		lines = append(lines, b.Path+"\x00"+b.Link+"\x00"+strings.Join(events, ","))
+	}
+	if len(lines) == 0 {
+		return 0
+	}
+	slices.Sort(lines)
+	lines = slices.Compact(lines)
+	h := fnv.New64a()
+	for _, l := range lines {
+		h.Write([]byte(l))
+		h.Write([]byte{'\n'})
+	}
+	return h.Sum64() | 1
 }
 
 // EncryptionRootOrPath returns the vault root governing this resource: the `watch:` group's section

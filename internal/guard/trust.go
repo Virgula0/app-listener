@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -323,6 +324,27 @@ func (t *TrustGuard) SetGuardedDirs(dirs []TrustedDir) error {
 	return nil
 }
 
+// guardedRoots is the started trust guard whose guard_trusted_dirs releaseRootTrust edits. Atomic
+// rather than supersede.mu: Guard.Stop calls it under g.mu (lock order is supersede.mu, then g.mu).
+var guardedRoots atomic.Pointer[TrustGuard]
+
+// releaseRootTrust drops key from guard_trusted_dirs unless another live resource anchors it (a
+// reload's replacement guard). Called BEFORE a guard stops write-protecting key's tree (Stop, a
+// sweep re-anchor): a tree anyone may write must not keep its libraries trusted until the next
+// trust apply (under_guarded_tree reads only this map). The new root is never added here: a
+// re-anchored path's tree is trusted only once SetGuardedDirs re-resolves it.
+func releaseRootTrust(self uint32, key GuardInodeKey) error {
+	t := guardedRoots.Load()
+	if t == nil || key == (GuardInodeKey{}) || sharedEngine.objs.GuardInodes == nil ||
+		sharedEngine.liveOwner(self, key) != 0 {
+		return nil
+	}
+	if err := t.objs.GuardTrustedDirs.Delete(key); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+		return err
+	}
+	return nil
+}
+
 // trustHook pairs an LSM program with a human name for logging; required marks a hook whose attach
 // failure must fail the whole trust guard.
 type trustHook struct {
@@ -405,6 +427,7 @@ func (t *TrustGuard) Start() error {
 	t.rd = rd
 	go t.readLoop()
 	setSupersedeTrust(t)
+	guardedRoots.Store(t)
 	return nil
 }
 
@@ -508,6 +531,7 @@ func (t *TrustGuard) Stop() {
 		supersede.trust = nil
 	}
 	supersede.mu.Unlock()
+	guardedRoots.CompareAndSwap(t, nil)
 	if t.rd != nil {
 		_ = t.rd.Close()
 	}

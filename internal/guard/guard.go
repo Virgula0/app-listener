@@ -86,6 +86,10 @@ func (ev *GuardEvent) Op() string {
 // resources no taint set covers, and which ones is not recorded.
 const MultipleResourceLabel = "multiple"
 
+// CrossResourceLabel is GuardEvent.Scope for a rename or link between two resources, judged by the
+// GLOBAL slot (xres_judge in guard.bpf.c): it belongs to neither resource's guard.
+const CrossResourceLabel = "cross-resource"
+
 // ResourceLabel is what ev is logged under when delivered to the guard of resource.
 func (ev *GuardEvent) ResourceLabel(resource string) string {
 	switch {
@@ -253,6 +257,8 @@ type Guard struct {
 	quietPID uint32
 	// chmodDropWrite: WithChmodDropWrite.
 	chmodDropWrite bool
+	// movePeer: WithMovePeer.
+	movePeer uint64
 	// systemPatterns: WithSystemPatterns.
 	systemPatterns []daemonconfig.BinaryRule
 	// vetted: whitelist path -> the inode it was hashed from (binaryKey). Guarded by mu.
@@ -264,6 +270,9 @@ type Guard struct {
 	admit AdmissionCheck
 	// tap: SetEventTap.
 	tap atomic.Pointer[func(GuardEvent)]
+	// rootMount is the mount the root was last reached through (noteRootMount): localizePaths maps
+	// the kernel's superblock-relative event paths through it. Nil when unknown.
+	rootMount atomic.Pointer[ebpf.MountInfo]
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -334,6 +343,15 @@ func WithoutAllowedEvents() GuardOption {
 func WithoutOwnAllowedEvents() GuardOption {
 	return func(g *Guard) {
 		g.quietPID = uint32(os.Getpid()) //nolint:gosec // pids fit in 32 bits (PID_MAX_LIMIT 2^22)
+	}
+}
+
+// WithMovePeer sets a lib_dir's move-peer class (daemonconfig.Resource.MovePeer): a file may be
+// renamed between two lib_dirs of one nonzero class by their (identical) writers; see
+// xres_judge_move in guard.bpf.c.
+func WithMovePeer(peer uint64) GuardOption {
+	return func(g *Guard) {
+		g.movePeer = peer
 	}
 }
 
@@ -1476,6 +1494,9 @@ func (g *Guard) writeGuardConfig(modeKey uint64) error {
 	if g.chmodDropWrite {
 		cfg.ChmodDropWrite = 1
 	}
+	if g.mode == ModeReadOnly {
+		cfg.MovePeer = g.movePeer
+	}
 	if putErr := g.objs().GuardResConfig.Put(g.resID, cfg); putErr != nil {
 		return fmt.Errorf("writing resource slot %d: %w", g.resID, putErr)
 	}
@@ -1501,6 +1522,7 @@ func (g *Guard) populateMaps() error {
 	if rootErr != nil {
 		return fmt.Errorf("stating guard root %s: %w", g.path, rootErr)
 	}
+	g.noteRootMount(root)
 	root.close()
 	if keyErr := g.updateRootKey(root.key, root.sbdev); keyErr != nil {
 		return keyErr
@@ -1727,6 +1749,10 @@ func (g *Guard) reanchorRoot(oldKey GuardInodeKey, root *rootHandle) error {
 	if err := g.scanRoot(root); err != nil {
 		return err
 	}
+	// Before the anchor moves: from then on the old tree is unguarded (see releaseRootTrust).
+	if err := releaseRootTrust(g.resID, oldKey); err != nil {
+		return fmt.Errorf("untrusting libraries under the old root of %s: %w", g.path, err)
+	}
 	if err := g.updateRootKey(root.key, root.sbdev); err != nil {
 		return err
 	}
@@ -1847,6 +1873,7 @@ func (g *Guard) SweepInodes() error {
 		return fmt.Errorf("stating guarded path %s: %w", g.path, err)
 	}
 	defer root.close()
+	g.noteRootMount(root)
 
 	if handled, anchorErr := g.sweepRoot(root); anchorErr != nil || handled || !root.dir {
 		if handled && anchorErr == nil && root.dir {
@@ -2329,6 +2356,41 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 	return ge, be.ResID, true
 }
 
+// noteRootMount records the mount root was reached through; mountinfo is re-read only when the
+// mount id changed (a remount, a vault mounted after unlock).
+func (g *Guard) noteRootMount(root *rootHandle) {
+	if m := g.rootMount.Load(); m != nil && m.ID == root.mnt {
+		return
+	}
+	m, err := ebpf.MountByID(root.mnt)
+	if err != nil {
+		log.Debugf("guard %s: event paths stay filesystem-relative: %v", g.path, err)
+		g.rootMount.Store(nil)
+		return
+	}
+	g.rootMount.Store(&m)
+}
+
+// localizePaths rewrites a file event's paths, which the BPF dentry walk yields relative to the
+// superblock root, to absolute ones through the root's mount. Root confinement means every file
+// event of this slot walked through the root's dentry, so it is on the root's filesystem. Display
+// only: no decision reads these paths.
+func (g *Guard) localizePaths(ev *GuardEvent) {
+	m := g.rootMount.Load()
+	if m == nil || (m.Root == "/" && m.Mountpoint == "/") {
+		return
+	}
+	if p, ok := m.MountPath(ev.Path); ok {
+		ev.Path = p
+	}
+	// Only RENAME and HARDLINK walk dest from a dentry; SYMLINK's is the link body.
+	if ev.Type == ebpf.EventRename || ev.Type == ebpf.EventHardlink {
+		if p, ok := m.MountPath(ev.Dest); ok {
+			ev.Dest = p
+		}
+	}
+}
+
 // dispatch delivers one decoded event to this guard's consumer.
 //
 // Never blocks: one reader now serves every resource, so waiting on a slow or absent consumer
@@ -2482,6 +2544,11 @@ func (g *Guard) Stop() {
 // cleanup retires this resource. The shared LSM links stay attached while any other guard holds
 // the engine, so a reload that swaps resources never drops enforcement.
 func (g *Guard) cleanup() {
+	// Before the rows go (see releaseRootTrust); Stop can't refuse, so a failure is only logged.
+	if err := releaseRootTrust(g.resID, g.rootKey); err != nil {
+		log.Errorf("guard %s: CRITICAL: could not untrust libraries under the released root (%v) — "+
+			"they stay loadable by its writers until the next reload", g.path, err)
+	}
 	sharedEngine.forgetResource(g.resID)
 	g.dropResourceState()
 	g.unpinSelfMaps()

@@ -8,8 +8,8 @@ Contributor-oriented notes (architecture, the BPF verifier budget, test conventi
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Dockerized build (rootful Docker): dump `vmlinux.h` from the host BTF, regenerate BPF bindings, build `build/linux/app-listener` |
-| `make build-host` | Same on the host; needs a recent clang/LLVM, `bpftool`, Go 1.26+, GCC |
+| `make build` | Dockerized build (rootful Docker): dump `vmlinux.h` from the host BTF, regenerate BPF bindings, build `build/linux/app-listener`. `GUI=1` links the desktop GUI |
+| `make build-host` | Same on the host; needs a recent clang/LLVM, `bpftool`, Go 1.26+, GCC. Also takes `GUI=1` |
 | `make build-linux` | Go compile only, assuming generated files exist. `GUI=1` links the desktop GUI |
 | `make generate` | Regenerate BPF bindings (needs `bpftool` and a readable `/sys/kernel/btf/vmlinux`) |
 | `make check-compatibility` | Static host check: can it run app-listener? |

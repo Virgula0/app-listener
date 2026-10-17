@@ -34,13 +34,18 @@ type Monitor struct {
 	ownPID     int
 	eventTypes atomic.Value // stores []ebpf.EventType
 
-	watchInodes map[string]string // "dev:ino" → watched path for hardlink detection
+	watchInodes map[uint64][]watchedInode // by inode number, for hardlink detection
 
-	// paths memoizes the two per-event lookups readEvent does for an event path NOT lexically
-	// inside a watched target: its EvalSymlinks resolution and hardlink-inode check. On the
-	// unfiltered VFS firehose the same non-watched paths recur constantly, so this turns a
-	// per-event EvalSymlinks + stat into a map lookup without changing the filtering decision.
-	paths *pathCache
+	// paths memoizes EvalSymlinks for event paths not lexically inside a watched target: on the
+	// unfiltered VFS firehose the same paths recur constantly.
+	paths  *pathCache
+	mounts *mountTable
+}
+
+type watchedInode struct {
+	path  string
+	sdev  uint32 // kernel s_dev of its mount (what BPF reports); 0 when unknown
+	stDev uint64
 }
 
 const (
@@ -50,7 +55,6 @@ const (
 
 type pathCacheEntry struct {
 	resolved string // filepath.EvalSymlinks(path); "" when it errored
-	hardlink string // checkHardlinkByInode(path) verdict
 	at       time.Time
 }
 
@@ -95,6 +99,7 @@ func NewMonitor(targets []ebpf.Target, recursive bool, depth int) (*Monitor, err
 		depth:     depth,
 		ownPID:    os.Getpid(),
 		paths:     newPathCache(),
+		mounts:    newMountTable(),
 	}
 	m.eventTypes.Store(ebpf.EventTypes())
 
@@ -160,7 +165,7 @@ func NewMonitor(targets []ebpf.Target, recursive bool, depth int) (*Monitor, err
 		m.links = append(m.links, l)
 	}
 
-	m.watchInodes = make(map[string]string)
+	m.watchInodes = make(map[uint64][]watchedInode)
 	m.populateWatchInodes()
 
 	paths := make([]string, len(targets))
@@ -237,53 +242,76 @@ func (m *Monitor) readEvent(rd *ringbuf.Reader) (*ebpf.FileEvent, bool) {
 	ev := be.ToFileEvent()
 	ev.Timestamp = time.Now().UnixNano()
 
-	if int(ev.PID) == m.ownPID {
+	if int(ev.PID) == m.ownPID || !m.eventTypeAllowed(ev.Type) {
 		return nil, true
 	}
-
-	ev.Path = m.resolveRelativePath(ev.PID, ev.Path)
-	ev.Dest = m.resolveRelativePath(ev.PID, ev.Dest)
-
-	m.resolveFDPath(&ev)
-
-	if !m.eventTypeAllowed(ev.Type) {
+	if !m.filterEvent(&ev, &be) {
 		return nil, true
 	}
-
-	ev.Path = m.resolveSymlinkToTarget(ev.Path)
-
-	if m.inWatchPath(ev.Path, ev.Dest) {
-		if m.matchesFilter(&ev) {
-			return &ev, true
-		}
-		return nil, true
-	}
-
-	hardlinkPath := m.checkHardlinkByInode(ev.Path)
-	if hardlinkPath == "" {
-		return nil, true
-	}
-	ev.Path = hardlinkPath
-
-	if m.matchesFilter(&ev) {
-		return &ev, true
-	}
-	return nil, true
+	return &ev, true
 }
 
-// pathInfo returns the cached EvalSymlinks resolution and hardlink verdict for path (both computed
-// on a miss). Nil-safe: a Monitor without a cache computes each time.
+// filterEvent completes ev's paths and reports whether it concerns a watch target. Every event on
+// the system reaches it, so it must not touch the event's file: stat-ing other programs' files
+// both costs a syscall per event and trips the daemon's guards on their protected ones.
+func (m *Monitor) filterEvent(ev *ebpf.FileEvent, be *ebpf.BpfEvent) bool {
+	kernelPath := be.Dev != 0
+	if kernelPath {
+		m.mapKernelPaths(ev, be.Dev)
+	} else {
+		ev.Path = m.resolveRelativePath(ev.PID, ev.Path)
+		ev.Dest = m.resolveRelativePath(ev.PID, ev.Dest)
+		m.resolveFDPath(ev)
+	}
+
+	// A kernel path names the object itself: only a symlink can lead into a target.
+	if !kernelPath || be.Mode&syscall.S_IFMT == syscall.S_IFLNK {
+		ev.Path = m.resolveSymlinkToTarget(ev.Path)
+	}
+
+	if m.inWatchPath(ev.Path, ev.Dest) {
+		return m.matchesFilter(ev)
+	}
+
+	hardlinkPath := m.hardlinkByInode(be.Dev, be.Ino, ev.Path)
+	if hardlinkPath == "" {
+		return false
+	}
+	ev.Path = hardlinkPath
+	return m.matchesFilter(ev)
+}
+
+// mapKernelPaths rewrites the superblock-relative paths the BPF walk yields to absolute ones.
+// Unmapped paths (a mount outside this namespace) are left as they are.
+func (m *Monitor) mapKernelPaths(ev *ebpf.FileEvent, dev uint32) {
+	if m.mounts == nil {
+		return
+	}
+	if p, ok := m.mounts.resolve(dev, ev.Path, m.matchesAnyTarget); ok {
+		ev.Path = p
+	}
+	switch ev.Type {
+	case ebpf.EventRename, ebpf.EventHardlink:
+		if p, ok := m.mounts.resolve(dev, ev.Dest, m.matchesAnyTarget); ok {
+			ev.Dest = p
+		}
+	case ebpf.EventSymlink:
+		// Dest is the link body; a relative one is relative to the link's directory.
+		if ev.Dest != "" && !filepath.IsAbs(ev.Dest) {
+			ev.Dest = filepath.Join(filepath.Dir(ev.Path), ev.Dest)
+		}
+	}
+}
+
+// pathInfo returns the cached EvalSymlinks resolution for path. Nil-safe: a Monitor without a
+// cache computes each time.
 func (m *Monitor) pathInfo(path string) pathCacheEntry {
 	if m.paths != nil {
 		if e, ok := m.paths.lookup(path); ok {
 			return e
 		}
 	}
-	e := pathCacheEntry{
-		resolved: evalSymlinksOrEmpty(path),
-		hardlink: m.hardlinkTarget(path),
-		at:       time.Now(),
-	}
+	e := pathCacheEntry{resolved: evalSymlinksOrEmpty(path), at: time.Now()}
 	if m.paths != nil {
 		m.paths.store(path, e)
 	}
@@ -298,16 +326,23 @@ func evalSymlinksOrEmpty(path string) string {
 	return resolved
 }
 
-// hardlinkTarget returns the watched path whose inode this path shares, or "".
-func (m *Monitor) hardlinkTarget(path string) string {
-	if path == "" || len(m.watchInodes) == 0 {
+// hardlinkByInode returns the watched path sharing the event's inode, or "". Only an inode the
+// kernel reported as a watched one is lstat'd, to confirm it: inode numbers repeat across
+// filesystems, and across btrfs subvolumes of one superblock.
+func (m *Monitor) hardlinkByInode(dev uint32, ino uint64, path string) string {
+	if ino == 0 || path == "" {
 		return ""
 	}
-	var s syscall.Stat_t
-	if err := syscall.Stat(path, &s); err != nil {
-		return ""
+	for _, w := range m.watchInodes[ino] {
+		if w.sdev != 0 && w.sdev != dev {
+			continue
+		}
+		var s syscall.Stat_t
+		if syscall.Lstat(path, &s) == nil && s.Ino == ino && s.Dev == w.stDev {
+			return w.path
+		}
 	}
-	return m.watchInodes[fmt.Sprintf("%d:%d", s.Dev, s.Ino)]
+	return ""
 }
 
 func (m *Monitor) resolveRelativePath(pid uint32, path string) string {
@@ -437,8 +472,13 @@ func (m *Monitor) addInode(path string) {
 	if err := syscall.Stat(path, &s); err != nil {
 		return
 	}
-	key := fmt.Sprintf("%d:%d", s.Dev, s.Ino)
-	m.watchInodes[key] = path
+	w := watchedInode{path: path, stDev: s.Dev}
+	if m.mounts != nil {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			w.sdev = m.mounts.devOf(resolved)
+		}
+	}
+	m.watchInodes[s.Ino] = append(m.watchInodes[s.Ino], w)
 }
 
 func (m *Monitor) scanDirInodes(dir string, currentDepth int) {
@@ -472,12 +512,6 @@ func (m *Monitor) resolveSymlinkToTarget(path string) string {
 		return resolved
 	}
 	return path
-}
-
-// checkHardlinkByInode returns the watched path this path is a hard link of,
-// or "". The stat is cached (see pathInfo).
-func (m *Monitor) checkHardlinkByInode(path string) string {
-	return m.pathInfo(path).hardlink
 }
 
 func (m *Monitor) Stop() {

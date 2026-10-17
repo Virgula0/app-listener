@@ -131,6 +131,7 @@ struct res_config {
 	__u64 taint_set; // nonzero: a taint-set slot (no tree; only judges tainted processes)
 	__u64 chmod_drop_write; // lib_dir only: see chmod_only_drops_write
 	__u64 root_sbdev;       // the watch root's superblock (sb_dev): root_in_chain's same-fs test
+	__u64 move_peer;        // lib_dir only: nonzero class shared by lib_dirs with identical writers
 };
 
 struct {
@@ -1692,6 +1693,39 @@ static __always_inline __u32 xres_judge(__u32 src_res, bool dst_guarded, __u32 d
 	return (dst_guarded && dst_res != src_res) ? GUARD_RES_GLOBAL : src_res;
 }
 
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
+
+// move_peers: src and dst are lib_dirs with the same writers (res_config.move_peer, set by
+// userspace from identical configured writer lists). Out of line: only a cross-resource rename
+// pays for it.
+static __noinline int move_peers(__u32 src_res, __u32 dst_res)
+{
+	struct res_config *src = res_cfg(src_res);
+	struct res_config *dst = res_cfg(dst_res);
+	return src && dst && src->move_peer && src->move_peer == dst->move_peer;
+}
+
+// xres_judge_move is xres_judge for path_rename. A non-directory moving between peer lib_dirs (an
+// updater unpacking its staging dir into the runtime dirs) is judged by src's whitelist, which is
+// dst's, and *evict asks the caller to drop its row once allowed: the row would name src's root,
+// which is_guarded_access reads as "not guarded" under dst. Without its row the file is guarded by
+// dst's parent row or ancestor walk. A directory stays daemon-only (its children's rows would stay
+// behind), as do RENAME_EXCHANGE (the victim moves the other way, keeping its row) and a victim
+// that is a watch root (peer_ok false for all three).
+static __always_inline __u32 xres_judge_move(__u32 src_res, bool dst_guarded, __u32 dst_res,
+					     bool peer_ok, bool *evict)
+{
+	if (!dst_guarded || dst_res == src_res)
+		return src_res;
+	if (peer_ok && move_peers(src_res, dst_res)) {
+		*evict = true;
+		return src_res;
+	}
+	return GUARD_RES_GLOBAL;
+}
+
 SEC("lsm/path_rename")
 int guard_path_rename(unsigned long long *ctx)
 {
@@ -1728,6 +1762,12 @@ int guard_path_rename(unsigned long long *ctx)
 	    guarded_map_hit(new_parent, new_parent_inode, 12, &dst_res))
 		dst_parent_guarded = true;
 	bool dst_guarded = dst_victim_root || dst_parent_guarded;
+	umode_t src_mode = 0;
+	if (inode)
+		bpf_probe_read_kernel(&src_mode, sizeof(src_mode), &inode->i_mode);
+	bool peer_ok = !dst_victim_root && !((unsigned int)ctx[4] & RENAME_EXCHANGE) &&
+		       (src_mode & S_IFMT) != S_IFDIR;
+	bool evict = false;
 	// Walked here, not after the source side: a guarded source returns early, and a destination
 	// dir with no row of its own (moved in, runtime-created, full map) must still make the move
 	// cross-resource.
@@ -1747,7 +1787,7 @@ int guard_path_rename(unsigned long long *ctx)
 	if (own_guarded || parent_guarded) {
 		res = own_guarded ? own_res : parent_res;
 		if (root_in_chain(old_dentry, inode, 16, res)) {
-			res = xres_judge(res, dst_guarded, dst_res);
+			res = xres_judge_move(res, dst_guarded, dst_res, peer_ok, &evict);
 			ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
 			goto decided;
 		}
@@ -1755,7 +1795,7 @@ int guard_path_rename(unsigned long long *ctx)
 
 	// Deep-file coverage, source side.
 	if (old_parent && guarded_ancestor_within_limit(old_parent, &res, ANCESTOR_WALK)) {
-		res = xres_judge(res, dst_guarded, dst_res);
+		res = xres_judge_move(res, dst_guarded, dst_res, peer_ok, &evict);
 		ret = check_and_emit(EVENT_RENAME, old_dentry, NULL, false, new_dentry, false, false, res);
 		goto decided;
 	}
@@ -1786,8 +1826,12 @@ int guard_path_rename(unsigned long long *ctx)
 
 decided:
 	// A root can only move past the checks above, so every root move lands here.
-	if (ret == 0)
+	if (ret == 0) {
 		note_root_moved(inode, victim);
+		struct inode_key ikey = {};
+		if (evict && inode_key_of(inode, &ikey))
+			bpf_map_delete_elem(&guard_inodes, &ikey);
+	}
 	return ret;
 }
 
@@ -1796,9 +1840,9 @@ decided:
 //
 // A root P matches when the target is P itself or lies below it (P followed by '/'): path_key_buf
 // holds target[0..i) zero-padded, so at every '/' or end it is an exact guard_path key, and a
-// similarly named sibling (/bypasses_fake for /bypasses) never forms it. Roots nest, and the
-// innermost (deepest) match wins — the same nearest-guarded-ancestor rule every other hook applies
-// via guarded_ancestor_within_limit, and guard_inodes likewise records one owning res_id per inode.
+// similarly named sibling (/bypasses_fake for /bypasses) never forms it. If roots nest (config load
+// refuses it), the innermost (deepest) match wins, as guard_inodes records one owning res_id per
+// inode; guarded_ancestor_within_limit instead returns the farthest guarded ancestor.
 // Exactly one decision may be emitted here: two sequential check_and_emit calls cost >1M insns
 // because the second re-explores the shared body from every state the first one forked (a single
 // call is ~105k). Read-only roots are skipped: the check stops an alias reaching content the

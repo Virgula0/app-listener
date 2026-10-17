@@ -1642,3 +1642,33 @@ lib_binary `+bin+`
 		t.Errorf("lib_dir writers = %+v, want the block's lib_binary", lib.Binaries)
 	}
 }
+
+func TestMovePeer(t *testing.T) {
+	steam := BinaryRule{Path: "/h/.local/share/Steam/ubuntu12_32/steam"}
+	helper := BinaryRule{Path: "/h/.local/share/Steam/ubuntu12_64/steamwebhelper", Events: []ebpf.EventType{ebpf.EventWrite, ebpf.EventOpen}}
+	lib := func(bins, pending []BinaryRule) *Resource {
+		return &Resource{ReadOnly: true, Binaries: bins, PendingBinaries: pending}
+	}
+
+	a := lib([]BinaryRule{steam, helper}, nil)
+	if a.MovePeer() == 0 {
+		t.Fatal("a lib_dir with writers must have a move-peer class")
+	}
+	reordered := BinaryRule{Path: helper.Path, Events: []ebpf.EventType{ebpf.EventOpen, ebpf.EventWrite}}
+	if b := lib([]BinaryRule{reordered}, []BinaryRule{steam, steam}); b.MovePeer() != a.MovePeer() {
+		t.Fatal("order, repeats and pending-vs-resolved must not change the class")
+	}
+	narrower := BinaryRule{Path: helper.Path, Events: []ebpf.EventType{ebpf.EventOpen}}
+	if c := lib([]BinaryRule{steam, narrower}, nil); c.MovePeer() == a.MovePeer() {
+		t.Fatal("a different event mask is a different writer set")
+	}
+	if d := lib([]BinaryRule{steam}, nil); d.MovePeer() == a.MovePeer() {
+		t.Fatal("a missing writer is a different writer set")
+	}
+	if e := (&Resource{Binaries: []BinaryRule{steam, helper}}); e.MovePeer() != 0 {
+		t.Fatal("a whitelist (secret) resource never has a move-peer class")
+	}
+	if f := lib(nil, nil); f.MovePeer() != 0 {
+		t.Fatal("a lib_dir without writers has no move-peer class")
+	}
+}

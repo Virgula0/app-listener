@@ -1000,6 +1000,41 @@ func TestDaemonUseCaseReloadRemovedResourceRefused(t *testing.T) {
 	}
 }
 
+func TestDaemonUseCaseReloadDropsReleasedLibDir(t *testing.T) {
+	lib := daemonconfig.Resource{Path: "/a/app-1", ReadOnly: true}
+	oldA, oldLib := newFakeGuardRepo(), newFakeGuardRepo()
+	oldLib.anchor = guard.GuardInodeKey{Dev: 1, Ino: 10} // alive=false: its writer deleted it
+	d := startDaemon(t, newFakeVault("/a"), []daemonconfig.Resource{resource("/a"), lib},
+		[]repository.GuardRepository{oldA, oldLib})
+
+	newA := newFakeGuardRepo()
+	if err := d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{newA}); err != nil {
+		t.Fatalf("a reload dropping a deleted lib_dir must commit: %v", err)
+	}
+	if !oldLib.isStopped() {
+		t.Error("the dropped lib_dir's guard must detach")
+	}
+	if got := d.Resources(); len(got) != 1 {
+		t.Errorf("Resources() = %v, want only /a", got)
+	}
+}
+
+func TestDaemonUseCaseReloadRefusesDroppingLiveLibDir(t *testing.T) {
+	lib := daemonconfig.Resource{Path: "/a/app-1", ReadOnly: true}
+	oldA, oldLib := newFakeGuardRepo(), newFakeGuardRepo()
+	oldLib.anchor, oldLib.anchorAlive = guard.GuardInodeKey{Dev: 1, Ino: 10}, true
+	d := startDaemon(t, newFakeVault("/a"), []daemonconfig.Resource{resource("/a"), lib},
+		[]repository.GuardRepository{oldA, oldLib})
+
+	newA := newFakeGuardRepo()
+	if err := d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{newA}); err == nil {
+		t.Fatal("a lib_dir whose root still exists must not be dropped by a reload")
+	}
+	if oldLib.isStopped() {
+		t.Error("the running lib_dir guard must be kept after a refused reload")
+	}
+}
+
 func TestDaemonUseCaseReloadThenStop(t *testing.T) {
 	vault := newFakeVault("/a", "/b")
 	old := newFakeGuardRepo()
