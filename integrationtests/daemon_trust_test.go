@@ -437,6 +437,51 @@ func (s *IntegrationSuite) TestDaemon_Bypass_ReloadTrustsSwappedRootLibraries() 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// Bypass: a lib_dir root its writer moved aside loses its guard once the sweep re-anchors onto the
+// recreated path, but guard_trusted_dirs kept the old root's inode until the next reload, so a
+// library anyone planted in the moved-aside tree preloaded into the lib_dir's writers.
+func (s *IntegrationSuite) TestDaemon_Bypass_MovedAsideLibDirStaysTrusted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	// Owned by nobody so neither library is an auto-trusted system file (see
+	// TestDaemon_LibDir_TrustedOnlyForItsWriters); perl renames the root (uutils mv is a multicall).
+	s.exec(c, []string{"sh", "-c",
+		"mkdir -p /protected /rt /tmp/rtw /exploits /etc/app-listener && echo s > /protected/secret" +
+			" && cp /usr/bin/dash /tmp/rtw/dash && cp /usr/bin/perl /tmp/rtw/perl"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), "/rt/lib_probe.so", 0o755),
+		"copy lib_probe.so")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/lib_probe.so"), "/exploits/lib_probe.so", 0o755),
+		"copy lib_probe.so")
+	s.exec(c, []string{"sh", "-c", "chown -R 65534 /rt /exploits"})
+	s.startDaemon(c, `[libraries "Runtime"]
+lib_dir /rt
+lib_binary /tmp/rtw/dash
+lib_binary /tmp/rtw/perl
+
+[watch /protected]
+need_encryption: false
+/usr/bin/bash`)
+
+	loaded, out := s.preload(c, "/tmp/rtw/dash", "/rt/lib_probe.so")
+	s.Require().Truef(loaded, "control: the lib_dir's writer must load its library: %s", out)
+
+	code, out := s.exec(c, []string{"/tmp/rtw/perl", "-e", "rename('/rt', '/rt.old') or die $!"})
+	s.Require().Equalf(0, code, "the lib_dir's writer must move its root aside: %s", out)
+	s.exec(c, []string{"mkdir", "/rt"})
+	s.Require().Truef(s.awaitDenied(c, []string{"sh", "-c", "touch /rt/probe"}, staleRootSweepPollTimeout),
+		"the sweep must re-anchor onto the recreated /rt — daemon log:\n%s", s.readDaemonLog(c))
+
+	code, out = s.exec(c, []string{"sh", "-c", nobodyRun + "cp /exploits/lib_probe.so /rt.old/evil.so 2>&1"})
+	s.Require().Equalf(0, code, "control: the moved-aside tree is no longer guarded: %s", out)
+	loaded, out = s.preload(c, "/tmp/rtw/dash", "/rt.old/evil.so")
+	s.Require().Falsef(loaded,
+		"a library the user planted under the moved-aside lib_dir root loaded into its writer: %s\ndaemon log:\n%s",
+		out, s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // Bypass: validateResources rejects nesting at config load, but NewGuard re-opens the root by path
 // later. A read-only lib_dir re-pointed into another resource between the two becomes that
 // subtree's innermost root and takes its guard_inodes rows, which read-only mode lets anyone read.

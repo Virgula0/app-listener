@@ -1749,6 +1749,10 @@ func (g *Guard) reanchorRoot(oldKey GuardInodeKey, root *rootHandle) error {
 	if err := g.scanRoot(root); err != nil {
 		return err
 	}
+	// Before the anchor moves: from then on the old tree is unguarded (see releaseRootTrust).
+	if err := releaseRootTrust(g.resID, oldKey); err != nil {
+		return fmt.Errorf("untrusting libraries under the old root of %s: %w", g.path, err)
+	}
 	if err := g.updateRootKey(root.key, root.sbdev); err != nil {
 		return err
 	}
@@ -2540,6 +2544,11 @@ func (g *Guard) Stop() {
 // cleanup retires this resource. The shared LSM links stay attached while any other guard holds
 // the engine, so a reload that swaps resources never drops enforcement.
 func (g *Guard) cleanup() {
+	// Before the rows go (see releaseRootTrust); Stop can't refuse, so a failure is only logged.
+	if err := releaseRootTrust(g.resID, g.rootKey); err != nil {
+		log.Errorf("guard %s: CRITICAL: could not untrust libraries under the released root (%v) — "+
+			"they stay loadable by its writers until the next reload", g.path, err)
+	}
 	sharedEngine.forgetResource(g.resID)
 	g.dropResourceState()
 	g.unpinSelfMaps()

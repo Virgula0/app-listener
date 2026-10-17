@@ -55,7 +55,8 @@ A whitelisted binary may only map libraries the daemon trusts, which is what def
 
 1. **Root-owned system libraries**: any `.so` owned by root, not world-writable, in a root-owned
    directory (covers `/usr/lib`, `/opt`, ... and survives package upgrades).
-2. **Anything inside a guarded tree**: only whitelisted binaries can write there.
+2. **Anything inside a guarded tree**: only whitelisted binaries can write there. A tree its own
+   writer moved aside stops counting as soon as its guard lets go of it.
 3. **Code a whitelisted process generated itself**, such as a GPU driver's JIT output.
 
 Anything else goes in a `[libraries]` block, one per application, after the watch sections:
