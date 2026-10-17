@@ -5,11 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -19,14 +16,10 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/codeedit"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/vaultfs"
 )
 
-// Limits for the embedded editor: binary content is never edited; files past the edit limit are
-// read-only.
 const (
-	maxEditableBytes = 2 << 20 // 2 MiB
-	binaryScanBytes  = 8 << 10 // 8 KiB of a file are scanned for NUL bytes
-
 	keyEnter = "enter"
 	keyEsc   = "esc"
 )
@@ -97,14 +90,14 @@ type fileNode struct {
 // re-locked when RunFileEditor returns.
 type fileEditModel struct {
 	root  *fileNode
-	vault *vaultFS
+	vault *vaultfs.Vault
 	rows  []*fileNode
 	cur   int
 	top   int // tree scroll offset
 
 	// singleFile: root itself is a guarded regular file (file-vault resource), not a directory: the
 	// tree is one childless row and save() writes in place, not temp-file+rename
-	// (writeFileInPlace).
+	// (vaultfs.WriteFileInPlace).
 	singleFile bool
 
 	mode fileEditMode
@@ -152,7 +145,7 @@ type fileEditModel struct {
 // straight on it. Returns when closed; fscrypt state is untouched, so the caller must re-lock.
 func RunFileEditor(root string) error {
 	m := newFileEditModel(root)
-	defer m.vault.close()
+	defer m.vault.Close()
 	// Mouse capture keeps a drag inside the editor (the terminal's own selection spans both
 	// panes); RunFileEditorSession captures it too.
 	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -176,12 +169,12 @@ func newFileEditModel(root string) *fileEditModel {
 	m.editor.Blur()
 	m.find = codeedit.NewFinder(true)
 
-	vault, vaultErr := openVault(root)
+	vault, vaultErr := vaultfs.Open(root)
 	if vaultErr != nil {
-		vault = &vaultFS{base: root}
+		vault = vaultfs.Unopened(root)
 	}
 	m.vault = vault
-	if vault.file != nil {
+	if vault.SingleFile() {
 		m.singleFile = true
 		m.root = &fileNode{path: root, name: name, loaded: true}
 	} else {
@@ -596,7 +589,7 @@ func (m *fileEditModel) loadChildren(n *fileNode) error {
 	if !n.isDir || n.loaded {
 		return nil
 	}
-	entries, err := m.vault.readDir(n.path)
+	entries, err := m.vault.ReadDir(n.path)
 	if err != nil {
 		return err
 	}
@@ -721,7 +714,7 @@ func (m *fileEditModel) enterEditor() error {
 	if n == nil || n.isDir {
 		return nil
 	}
-	info, err := m.vault.lstat(n.path)
+	info, err := m.vault.Lstat(n.path)
 	if err != nil {
 		return err
 	}
@@ -755,24 +748,24 @@ func (m *fileEditModel) enterEditor() error {
 	return nil
 }
 
-// previewFile loads path into the (blurred) editor; binary files and files over maxEditableBytes
+// previewFile loads path into the (blurred) editor; binary files and files over MaxEditableBytes
 // reset the preview and report a status.
 func (m *fileEditModel) previewFile(path string) error {
-	info, err := m.vault.lstat(path)
+	info, err := m.vault.Lstat(path)
 	if err != nil {
 		return err
 	}
-	if info.Size() > maxEditableBytes {
+	if info.Size() > vaultfs.MaxEditableBytes {
 		m.previewOK = false
 		m.editor.SetValue("")
 		m.status = fmt.Sprintf("%s is %.1f MiB — only files up to 2 MiB can be edited", path, float64(info.Size())/(1<<20))
 		return nil
 	}
-	data, err := m.vault.readFile(path)
+	data, err := m.vault.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	if isBinaryContent(data) {
+	if vaultfs.IsBinaryContent(data) {
 		m.previewOK = false
 		m.editor.SetValue("")
 		m.status = path + " looks like a binary file — it cannot be edited"
@@ -796,7 +789,7 @@ func (m *fileEditModel) save() error {
 	if m.editPath == "" {
 		return nil
 	}
-	if err := m.vault.write(m.editPath, []byte(m.editor.Value())); err != nil {
+	if err := m.vault.Write(m.editPath, []byte(m.editor.Value())); err != nil {
 		return err
 	}
 	m.original = m.editor.Value()
@@ -841,33 +834,15 @@ func (m *fileEditModel) beginCreate(kind fileKind) {
 }
 
 func (m *fileEditModel) createEntry() {
-	name := strings.TrimSpace(m.input.Value())
 	m.input.Blur()
 	m.mode = modeNav
-	if name == "" || strings.Contains(name, "/") {
-		m.status = "invalid name: must be non-empty and contain no '/'"
-		return
-	}
-	target := filepath.Join(m.inputDir, name)
-	var err error
-	switch m.inputKind {
-	case createFile:
-		// O_EXCL|O_NOFOLLOW: an existing symlink at target is refused, never followed.
-		err = m.vault.dirOp(target, func(r *os.Root, name string) error {
-			f, openErr := r.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
-			if openErr != nil {
-				return openErr
-			}
-			return f.Close()
-		})
-	case createDir:
-		err = m.vault.dirOp(target, func(r *os.Root, name string) error { return r.Mkdir(name, 0o750) })
-	}
+	isDir := m.inputKind == createDir
+	target, err := m.vault.Create(m.inputDir, m.input.Value(), isDir)
 	if err != nil {
 		m.status = err.Error()
 		return
 	}
-	if err := applyNewFileMeta(m.vault, target, m.inputKind == createDir); err != nil {
+	if err := m.vault.ApplyNewMeta(target, isDir); err != nil {
 		m.status = err.Error()
 	}
 	if parent := m.findDir(m.inputDir); parent != nil {
@@ -877,7 +852,7 @@ func (m *fileEditModel) createEntry() {
 			m.status = err.Error()
 		}
 		m.rebuild()
-		if n := m.nodeByName(m.inputDir, name); n != nil {
+		if n := m.nodeByName(m.inputDir, filepath.Base(target)); n != nil {
 			m.cur = m.indexOf(n)
 			m.ensureCursorVisible()
 		}
@@ -910,7 +885,7 @@ func (m *fileEditModel) beginChmod() {
 	if n == nil {
 		return
 	}
-	info, err := m.vault.lstat(n.path)
+	info, err := m.vault.Lstat(n.path)
 	if err != nil {
 		m.status = err.Error()
 		return
@@ -927,7 +902,7 @@ func (m *fileEditModel) beginChmod() {
 	m.chmodInput.Placeholder = "0644"
 	// Prefill the full mode incl. setuid/setgid/sticky so confirming untouched input can't strip
 	// them.
-	m.chmodInput.SetValue(fmt.Sprintf("%04o", fileModeToUnixMode(info.Mode())))
+	m.chmodInput.SetValue(fmt.Sprintf("%04o", vaultfs.FileModeToUnixMode(info.Mode())))
 	m.chmodInput.Focus()
 	m.mode = modeChmod
 	m.status = ""
@@ -937,27 +912,11 @@ func (m *fileEditModel) applyChmod() {
 	v := strings.TrimSpace(m.chmodInput.Value())
 	m.chmodInput.Blur()
 	m.mode = modeNav
-	if !isOctalMode(v) {
-		m.status = "invalid mode: 1-4 octal digits (e.g. 0644)"
-		return
+	// beginChmod's Lstat check is seconds stale: Chmod re-validates on the pinned descriptor.
+	mode, err := vaultfs.ParseMode(v)
+	if err == nil {
+		err = m.vault.Chmod(m.chmodPath, mode)
 	}
-	perm, _ := strconv.ParseUint(v, 8, 16)
-	if perm > 0o7777 {
-		m.status = "invalid mode: must not exceed 07777"
-		return
-	}
-	// Re-validate at apply time on an O_PATH|O_NOFOLLOW descriptor: beginChmod's Lstat check is
-	// seconds stale. The value is a unix mode: convert via the converter, or setuid/setgid/sticky
-	// are lost (a raw os.FileMode cast maps them onto bits chmod ignores).
-	mode := unixModeToFileMode(uint32(perm))
-	err := m.vault.withFile(m.chmodPath, unix.O_PATH, func(f *os.File) error {
-		if info, statErr := f.Stat(); statErr != nil || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s is a symlink — chmod is refused", m.chmodPath)
-		}
-		// O_PATH descriptors can't fchmod directly; chmod via /proc/self/fd resolves the pinned
-		// inode without re-walking the (swappable) path.
-		return os.Chmod(fmt.Sprintf("/proc/self/fd/%d", f.Fd()), mode)
-	})
 	if err != nil {
 		m.status = err.Error()
 		return
@@ -971,7 +930,7 @@ func (m *fileEditModel) beginChown() {
 	if n == nil {
 		return
 	}
-	info, err := m.vault.lstat(n.path)
+	info, err := m.vault.Lstat(n.path)
 	if err != nil {
 		m.status = err.Error()
 		return
@@ -1016,13 +975,7 @@ func (m *fileEditModel) applyChown() {
 		m.mode = modeNav
 		return
 	}
-	err := m.vault.withFile(m.chownPath, unix.O_PATH, func(f *os.File) error {
-		if info, statErr := f.Stat(); statErr != nil || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s is a symlink — chown is refused", m.chownPath)
-		}
-		return unix.Fchownat(int(f.Fd()), "", u.uid, u.gid, unix.AT_EMPTY_PATH)
-	})
-	if err != nil {
+	if err := m.vault.Chown(m.chownPath, u.uid, u.gid); err != nil {
 		m.status = err.Error()
 		m.mode = modeNav
 		return
@@ -1059,7 +1012,7 @@ func (m *fileEditModel) confirmDelete() {
 	path := m.pendingDelete
 	m.pendingDelete = ""
 	m.mode = modeNav
-	if err := m.vault.dirOp(path, (*os.Root).RemoveAll); err != nil {
+	if err := m.vault.Remove(path); err != nil {
 		m.status = err.Error()
 		return
 	}
@@ -1257,7 +1210,7 @@ func (m *fileEditModel) renderEntryInfo(width, height int) string {
 		}
 		return b.String()
 	}
-	info, err := m.vault.lstat(n.path)
+	info, err := m.vault.Lstat(n.path)
 	if err != nil {
 		b.WriteString(err.Error())
 		return b.String()

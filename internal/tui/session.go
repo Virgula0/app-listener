@@ -51,6 +51,6 @@ func RunSession(
 // RunFileEditorSession is RunFileEditor under RunSession.
 func RunFileEditorSession(root string, onActivity func(), ended <-chan struct{}) (endedByPeer bool, err error) {
 	m := newFileEditModel(root)
-	defer m.vault.close()
+	defer m.vault.Close()
 	return RunSession(m, onActivity, ended, tea.WithMouseCellMotion())
 }

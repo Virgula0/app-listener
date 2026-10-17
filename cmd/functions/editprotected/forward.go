@@ -142,19 +142,18 @@ func eventsLabel() string {
 func confirmUserPlaced(bins []string) error {
 	var risky []string
 	for _, p := range bins {
-		b, err := guard.ResolveTempBinary(p)
+		systemPlaced, runtimes, err := forwardCheck(p)
 		if err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
-		if !b.SystemPlaced {
+		if !systemPlaced {
 			risky = append(risky, p)
 		}
-		if names := b.RuntimeNames(); len(names) > 0 {
+		if len(runtimes) > 0 {
 			log.Infof("%s is a %s runtime: started with code-loading env or flags (NODE_OPTIONS, "+
 				"ELECTRON_RUN_AS_NODE, --inspect, JAVA_TOOL_OPTIONS, …) it is refused the directories", p,
-				strings.Join(names, "/"))
+				strings.Join(runtimes, "/"))
 		}
-		b.Close()
 	}
 	if len(risky) == 0 || yesFlag {
 		return nil
@@ -176,6 +175,17 @@ func confirmUserPlaced(bins []string) error {
 		return errors.New("aborted")
 	}
 	return nil
+}
+
+// forwardCheck is what a -w grant confirms about a binary: whether only root could have placed it,
+// and the launch-injectable runtimes it embeds.
+func forwardCheck(path string) (systemPlaced bool, runtimes []string, err error) {
+	b, err := guard.ResolveTempBinary(path)
+	if err != nil {
+		return false, nil, err
+	}
+	defer b.Close()
+	return b.SystemPlaced, b.RuntimeNames(), nil
 }
 
 // chooseResources honors --resource (each must be in the daemon's list), otherwise asks.
@@ -229,7 +239,7 @@ func holdForward(session *liveSession, resources, bins []string, allow bool) err
 			mode = guard.ModeWhitelist
 		}
 		model := tui.NewGuardModel(events, strings.Join(resources, ", "), mode, displayEntries(bins))
-		byDaemon, err := tui.RunSession(model, session.Pinger(pingInterval()), ended)
+		byDaemon, err := tui.RunSession(model, session.Pinger(pingInterval(timeoutSession)), ended)
 		if err != nil {
 			return err
 		}
@@ -276,6 +286,6 @@ func displayEntries(bins []string) []guard.BinaryEntry {
 }
 
 // pingInterval throttles activity PINGs well inside the idle timeout.
-func pingInterval() time.Duration {
-	return min(5*time.Second, timeoutSession/4)
+func pingInterval(timeout time.Duration) time.Duration {
+	return min(5*time.Second, timeout/4)
 }

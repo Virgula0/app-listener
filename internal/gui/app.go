@@ -37,6 +37,7 @@ const (
 	pageHome pageID = iota
 	pageFiles
 	pageNetwork
+	pageProtected
 	pageUpdate
 	pageInstall
 )
@@ -52,6 +53,7 @@ var pageDefs = []pageDef{
 	{pageHome, "house", "Home", "System checks and workspaces"},
 	{pageFiles, "folders", "Files", "Monitor folders and files, then guard them with a whitelist or blacklist"},
 	{pageNetwork, "globe-hemisphere-west", "Network", "Watch binaries' network activity and enforce a network guard"},
+	{pageProtected, "lock-simple", "Protected", "Edit protected directories, grant temporary access, edit the daemon's configuration"},
 	{pageUpdate, "arrow-clockwise", "Update", "Update the installed daemon to the latest signed release"},
 	{pageInstall, "download-simple", "Install", "Set up the protection daemon"},
 }
@@ -76,6 +78,9 @@ type shell struct {
 	network  *workbench.Network
 	install  *installPage
 	update   *updatePage
+	protect  *protectedPage
+	// startBackend runs the installed binary's edit-protected backend (a fake in tests).
+	startBackend func() (backendLink, error)
 
 	wm        wm.Session
 	collapsed bool
@@ -144,6 +149,9 @@ func Run(opts Options) (err error) {
 	s.reprobe()
 	s.every(time.Second, s.updateStats)
 	w.ShowAndRun()
+	if s.protect != nil && s.protect.link != nil {
+		s.protect.link.Close() // narrows a live grant, re-locks an offline vault
+	}
 	s.network.Close()
 	s.files.Close()
 	if s.install != nil {
@@ -152,8 +160,19 @@ func Run(opts Options) (err error) {
 	return nil
 }
 
-// confirmClose asks before quitting mid-run: the installer or updater would stop between two steps.
+// confirmClose asks before quitting mid-run: the installer or updater would stop between two steps,
+// and an open edit-protected session ends (unsaved edits are lost).
 func (s *shell) confirmClose() {
+	if s.protect != nil && s.protect.link != nil {
+		dialog.ShowConfirm("End the edit-protected session?", "Closing the window ends the open session: a "+
+			"live grant is revoked, an offline directory is locked again, and unsaved edits are lost.",
+			func(ok bool) {
+				if ok {
+					s.win.Close()
+				}
+			}, s.win)
+		return
+	}
 	if !s.running() {
 		s.win.Close()
 		return
@@ -223,6 +242,7 @@ func newShell(a fyne.App, w fyne.Window, opts Options) *shell {
 	s.subtitle.Wrapping = fyne.TextWrapOff
 	s.subtitle.Truncation = fyne.TextTruncateEllipsis
 	s.home = newHomePage(s)
+	s.startBackend = startBackend
 	s.files = workbench.NewFiles(workbench.RealFileEngines())
 	s.network = workbench.NewNetwork(workbench.RealNetEngines())
 	return s
@@ -348,6 +368,9 @@ func (s *shell) build(id pageID) fyne.CanvasObject {
 	case pageNetwork:
 		s.netPg = newNetworkPage(s, s.network)
 		return s.netPg.view()
+	case pageProtected:
+		s.protect = newProtectedPage(s)
+		return s.protect.view()
 	case pageUpdate:
 		s.update = newUpdatePage(s)
 		return s.update.view()

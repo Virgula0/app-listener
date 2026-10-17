@@ -71,6 +71,14 @@ every change to enforcement paths as security-sensitive:
   Don't loosen any of: the peer-exe check, AUTH-before-disclosure, the single-session lock,
   the auth lockout, the `origin=install` guard on `--set-password`, the mask being restored
   in `RevokeSelfEditAccess`, or the journal-before-write and CAS-restore rules above.
+- **The GUI drives edit-protected through `edit-protected --backend`** (`cmd/functions/editprotected/
+  backend.go`, client `internal/editbackend`): the window runs the installed headless binary
+  (root-placed, same inode as the running daemon, re-checked on the started pid, allowlisted env,
+  Pdeathsig) and only renders. Keep: per-op state gating (nothing that opens a caller-named path
+  before AUTH: this binary has a root READ baseline on guarded trees), password only over the pipe
+  (never argv/env, no line breaks), file ops only through `internal/vaultfs` (shared with the TUI),
+  EOF = end (revoke / re-lock). The GUI process never opens a protected path or the control socket
+  and never gets a guard row; it refuses to `--forward -w` its own exe.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
   key + edit-auth hash (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.

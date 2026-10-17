@@ -55,7 +55,7 @@ func runLiveEdit() error {
 	log.Infof("editing %s LIVE — the daemon keeps guarding it; write access is granted only for this session "+
 		"and revoked after %s without input", chosen, timeoutSession)
 	_, ended := session.Watch()
-	byDaemon, err := tui.RunFileEditorSession(chosen, session.Pinger(pingInterval()), ended)
+	byDaemon, err := tui.RunFileEditorSession(chosen, session.Pinger(pingInterval(timeoutSession)), ended)
 	if err != nil {
 		return fmt.Errorf("edit %s: %w", chosen, err)
 	}

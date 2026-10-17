@@ -34,6 +34,7 @@ var (
 	yesFlag           bool
 	timeoutSession    time.Duration
 	editConfigFlag    bool
+	backendFlag       bool
 )
 
 // editPasswordEnv carries the password for the non-interactive live apply
@@ -121,6 +122,9 @@ func init() {
 			"reload is not kept (with --content-file: replace it non-interactively)")
 	EditProtectedCmd.Flags().BoolVar(&yesFlag, "yes", false,
 		"With --forward: don't ask before admitting a binary that isn't root-placed (required without a terminal)")
+	EditProtectedCmd.Flags().BoolVar(&backendFlag, "backend", false,
+		"The desktop window's channel to the installed binary (JSON lines on stdin/stdout)")
+	_ = EditProtectedCmd.Flags().MarkHidden("backend")
 }
 
 func validateFlags() error {
@@ -146,6 +150,12 @@ func runEditProtected(cmd *cobra.Command, args []string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("edit-protected must be run as root: sudo app-listener edit-protected")
 	}
+	if backendFlag {
+		if cmd.Flags().NFlag() != 1 {
+			return errors.New("--backend takes no other flag")
+		}
+		return runBackend()
+	}
 
 	if err := validateFlags(); err != nil {
 		return err
@@ -165,27 +175,23 @@ func runEditProtected(cmd *cobra.Command, args []string) error {
 	// precondition for live mode, independent of whether systemd supervises the daemon.
 	liveReady := LiveModeAvailable()
 
-	if editConfigFlag {
-		if !liveReady {
-			return errors.New("--edit-config needs the daemon running with an edit-protected password configured " +
-				"(the control socket " + ControlSocket + " is not present); with the daemon stopped, edit " +
-				"/etc/app-listener/daemon.conf directly")
+	for _, m := range []struct {
+		on        bool
+		flag, alt string
+		run       func() error
+	}{
+		{editConfigFlag, "--edit-config", "; with the daemon stopped, edit /etc/app-listener/daemon.conf directly", runEditConfig},
+		{forwardFlag, "--forward", "", runForward},
+		{putFlag != "", "--put", "", runNonInteractiveLivePut},
+	} {
+		if !m.on {
+			continue
 		}
-		return runEditConfig()
-	}
-	if forwardFlag {
 		if !liveReady {
-			return errors.New("--forward needs the daemon running with an edit-protected password configured " +
-				"(the control socket " + ControlSocket + " is not present)")
+			return errors.New(m.flag + " needs the daemon running with an edit-protected password configured " +
+				"(the control socket " + ControlSocket + " is not present)" + m.alt)
 		}
-		return runForward()
-	}
-	if putFlag != "" {
-		if !liveReady {
-			return errors.New("--put needs the daemon running with an edit-protected password configured " +
-				"(the control socket " + ControlSocket + " is not present)")
-		}
-		return runNonInteractiveLivePut()
+		return m.run()
 	}
 
 	if liveReady {

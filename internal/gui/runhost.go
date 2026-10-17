@@ -49,6 +49,10 @@ func (h *runHost) begin(name, iconName string, work func(ui wizard.UI) error, af
 		dialog.ShowInformation("A run is in progress", "Wait for the installer or updater run to finish.", h.s.win)
 		return false
 	}
+	if h.s.sessionOpen() {
+		dialog.ShowInformation("An edit-protected session is open", "End it first (Protected workspace).", h.s.win)
+		return false
+	}
 	if why := h.s.guardsBlocking(); why != "" {
 		dialog.ShowInformation("Guards are running", why, h.s.win)
 		return false
@@ -82,10 +86,25 @@ func (s *shell) running() bool {
 	return (s.install != nil && s.install.running) || (s.update != nil && s.update.running)
 }
 
+// sessionOpen reports an open edit-protected session: an install or update would restart the
+// daemon and swap the binary under it.
+func (s *shell) sessionOpen() bool { return s.protect != nil && s.protect.link != nil }
+
 // guardsBlocking names why no installer or updater run may start now: a guard this window runs
 // would deny it (they move and encrypt guarded folders, restart the daemon, download from GitHub)
 // since none of them admits this window.
 func (s *shell) guardsBlocking() string {
+	active := s.activeGuards()
+	if len(active) == 0 {
+		return ""
+	}
+	return "Turn off " + strings.Join(active, ", ") + " first (Files and Network workspaces).\n\n" +
+		"The installer and the updater move and encrypt protected folders, restart the daemon and " +
+		"download from GitHub. A guard running in this window doesn't admit them, so it would deny those steps."
+}
+
+// activeGuards names the guards this window runs.
+func (s *shell) activeGuards() []string {
 	var active []string
 	for _, t := range s.files.Targets() {
 		if t.Policy().Mode != workbench.GuardOff {
@@ -95,10 +114,5 @@ func (s *shell) guardsBlocking() string {
 	if s.network.Policy().Mode != workbench.GuardOff {
 		active = append(active, "the network guard")
 	}
-	if len(active) == 0 {
-		return ""
-	}
-	return "Turn off " + strings.Join(active, ", ") + " first (Files and Network workspaces).\n\n" +
-		"The installer and the updater move and encrypt protected folders, restart the daemon and " +
-		"download from GitHub. A guard running in this window doesn't admit them, so it would deny those steps."
+	return active
 }

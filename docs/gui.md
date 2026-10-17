@@ -2,7 +2,7 @@
 
 The `app-listener-gui` release asset (or a `make build GUI=1` build) adds a desktop window to the
 same binary. It covers the interactive modes in one place; the daemon has no GUI and stays a
-systemd service, and `uninstall` and `edit-protected` stay terminal-only.
+systemd service, and `uninstall` stays terminal-only.
 
 ```bash
 sudo app-listener-gui --gui
@@ -64,6 +64,7 @@ folder picker picks the folder shown. The path field above takes a typed absolut
 |---|---|
 | Files | `monitor` and `guard`, on several folders or files side by side. |
 | Network | `network-monitor` and `network-guard`. |
+| Protected | `edit-protected`: edit, temporary access, daemon config, password. |
 | Update | `update`, from the stable or the pre-release channel. |
 | Install | `install`: the wizard and its maintenance flags. |
 
@@ -151,6 +152,59 @@ With **Block local sockets too**, the GUI's own executable is added to the white
 the window still stops responding, Ctrl+C in the terminal that started it stops the guard with it.
 
 Closing the window stops the guard, then the monitor.
+
+## Protected
+
+The Protected workspace is `edit-protected`. The window never touches a protected file or the
+daemon's control socket itself: each action runs the installed headless binary
+(`/usr/local/sbin/app-listener edit-protected --backend`) and drives it over a private pipe. That
+process is the one the daemon admits: it authenticates, holds the grant, and reads and writes the
+files; the window only shows them. Before the password is sent, the window checks that the binary
+is root-placed, that it is the binary the running daemon executes (after an `update` without a
+daemon restart they differ, and the page says to restart it), and that the started process runs
+that same file. The backend gets a fixed environment, not the window's. It never runs the GUI build,
+which is never given access to a guarded directory either (**Temporary access** refuses to admit it).
+
+The page shows the edit mode (live or offline, chosen like the terminal), whether the daemon runs,
+and the password's state.
+
+| Action | CLI equivalent |
+|---|---|
+| Edit protected files | `edit-protected` |
+| Temporary access | `edit-protected --forward -w/-b [-e]` |
+| Daemon configuration | `edit-protected --edit-config` |
+| Set, change or remove the password | `--set-password`, `--clear-password` |
+| Live session idle timeout | `--timeout-session` (5 minutes to 4 hours) |
+
+Every live action asks for the password first; only then does the daemon list the guarded
+directories. A wrong password can be retried (the daemon's lockout applies).
+
+**Edit protected files** opens one directory in a tree and an editor, live (the daemon grants write
+access to it for the session) or offline (the daemon must be stopped; the directory is unlocked
+with the master key and locked again when the session ends). Ctrl+S saves. Binaries, symlinks and
+files over 2 MiB are refused; **New file**, **New folder**, **Permissions**, **Owner** (a login
+user) and **Delete** work as in the terminal editor. Typing and using the session's controls is
+activity for the idle timeout. If the daemon ends the session (idle timeout, reload), the page
+says so and nothing more is written. **End session** narrows the grant (or locks the directory) and
+shows the post-edit audit.
+
+**Temporary access** takes the binaries (absolute paths), admit or deny, and the event types; then
+the password, then the directories. Admitting a binary that isn't root-placed asks first, as the
+terminal does. The active grant shows the granted binaries' accesses until **Stop and revoke**, the
+idle timeout, or a reload.
+
+**Daemon configuration** fetches `daemon.conf` into an editor; **Review and apply** (or Ctrl+S)
+shows the diff and, once confirmed, the daemon writes and reloads it. If the file changed
+meanwhile, nothing is written and the next review diffs against the current file. A configuration
+that fails to reload is not kept.
+
+One session runs at a time, and none while an installer or updater run is in progress or a guard
+runs in this window (it would deny the backend's reads and writes). Closing the window during a
+session asks first, then ends it: the grant is revoked, an offline directory is locked again. If
+the window dies, the backend sees its pipe close and does the same.
+
+The window shows the files it edits: on X11 any program in your session can read the window or
+type into it. Prefer a Wayland session when editing secrets.
 
 ## Update
 

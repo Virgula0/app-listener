@@ -4,6 +4,7 @@ package gui
 
 import (
 	"errors"
+	"github.com/Virgula0/app-listener/internal/editbackend"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -50,6 +51,8 @@ func TestSnapshots(t *testing.T) {
 		s.files = workbench.NewFiles(fe.engines())
 		ne := &snapNet{}
 		s.network = workbench.NewNetwork(ne.engines())
+		snapLink := newFakeLink(true)
+		s.startBackend = func() (backendLink, error) { return snapLink, nil }
 		w.SetContent(s.view())
 		w.Resize(fyne.NewSize(1280, 820))
 		s.setStatus(sysStatus{root: true, lsmErr: errors.New("bpf not in /sys/kernel/security/lsm")})
@@ -117,6 +120,7 @@ func TestSnapshots(t *testing.T) {
 
 		snapInstall(t, s, filepath.Join(dir, v.name+"-Install-"))
 		snapUpdate(t, s, filepath.Join(dir, v.name+"-Update-"))
+		snapProtected(t, s, snapLink, filepath.Join(dir, v.name+"-Protected-"))
 		w.Close()
 	}
 }
@@ -390,4 +394,48 @@ func snapUpdate(t *testing.T, s *shell, prefix string) {
 	ui.showText("Changelog up to v0.4.0", "## v0.4.0\n\n- gui: updater page\n- guard: fixes", func() {})
 	save(t, prefix+"Changelog.png", s.win)
 	s.win.Canvas().Overlays().Top().Hide()
+}
+
+func snapProtected(t *testing.T, s *shell, link *fakeLink, prefix string) {
+	t.Helper()
+	s.show(pageProtected)
+	p := s.protect
+	save(t, prefix+"Overview.png", s.win)
+
+	p.link = link
+	p.authenticate(link, "Edit protected files", func([]string) {})
+	save(t, prefix+"Password.png", s.win)
+	s.win.Canvas().Overlays().Top().Hide()
+
+	v := newEditView(p, link, "/home/alice/.ssh", true, false)
+	p.show(v.root)
+	v.start()
+	v.tree.Select("config")
+	test.Type(v.editor, "# edited\n")
+	save(t, prefix+"Edit.png", s.win)
+	v.onEnded("the daemon ended the live session (idle timeout or reload) — saves made before it are kept, " +
+		"later ones were not written")
+	save(t, prefix+"Edit-Ended.png", s.win)
+
+	off := newEditView(p, link, "/home/alice/.gnupg", false, false)
+	p.show(off.root)
+	off.start()
+	save(t, prefix+"Edit-Offline.png", s.win)
+
+	p.show(p.over)
+	p.link = nil
+	p.startForward()
+	save(t, prefix+"Forward-Form.png", s.win)
+	fv := newForwardView(p, link, []string{"/home/alice/.ssh"}, []string{"/usr/bin/vim"}, true, []string{"OPEN", "READ"})
+	p.show(fv.root)
+	for i, op := range []string{"OPEN", "READ", "STAT", "WRITE"} {
+		fv.add(&editbackend.Event{Time: time.Date(2026, 10, 17, 9, 30, i, 0, time.UTC), PID: 4242, UID: 1000,
+			Comm: "vim", Op: op, Path: "/home/alice/.ssh/config", Allowed: op != "WRITE"})
+	}
+	save(t, prefix+"Forward-Active.png", s.win)
+
+	cv := newConfigView(p, link, []byte("[/home/alice/.ssh]\nmode = whitelist\nbinaries = /usr/bin/ssh\n"))
+	p.show(cv.root)
+	save(t, prefix+"Config.png", s.win)
+	p.show(p.over)
 }

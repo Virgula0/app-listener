@@ -21,6 +21,11 @@ underlined. The open file stays in the editor while you browse the tree, and `Es
 `Ctrl+B` hides the tree and shows it again (`Alt+←` shows it too). Opening another file over unsaved changes asks first.
 A click selects a tree row and a second click opens it; a click in the editor places the cursor.
 
+The desktop window's Protected workspace offers the same actions; see [gui.md](gui.md#protected).
+It drives this binary through `edit-protected --backend`, a hidden mode that speaks JSON lines on
+stdin/stdout. That mode is the window's channel, not for direct use: it refuses a terminal and any
+other flag, and asks the daemon for nothing the modes above can't.
+
 ## Offline and live mode
 
 The mode is chosen automatically.
