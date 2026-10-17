@@ -72,6 +72,9 @@ func TestSnapshots(t *testing.T) {
 		fp.current.tabs.SelectIndex(0)
 		fp.current.activity.table.Select(widget.TableCellID{Row: 1, Col: 2})
 		save(t, filepath.Join(dir, v.name+"-Files-RowSelected.png"), w)
+		fp.toggleTargets()
+		save(t, filepath.Join(dir, v.name+"-Files-TargetsCollapsed.png"), w)
+		fp.toggleTargets()
 
 		fillNetwork(t, s, ne)
 		np := newNetworkPage(s, s.network)
@@ -98,6 +101,10 @@ func TestSnapshots(t *testing.T) {
 		np.tabs.SelectIndex(0)
 		np.watch.bins.pick()
 		save(t, filepath.Join(dir, v.name+"-Narrow-AddExecutable.png"), w)
+		w.Canvas().Overlays().Top().Hide()
+		s.show(pageFiles)
+		fp.addTarget()
+		save(t, filepath.Join(dir, v.name+"-Narrow-AddTarget.png"), w)
 		w.Canvas().Overlays().Top().Hide()
 		w.Resize(fyne.NewSize(1280, 820))
 

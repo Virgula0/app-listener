@@ -3,8 +3,6 @@
 package gui
 
 import (
-	"strings"
-
 	"fyne.io/fyne/v2/widget"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -22,7 +20,6 @@ func (v *targetView) promoteActions() []feedAction {
 
 // newFileFeed is the merged monitor + guard event table of a target.
 func newFileFeed(v *targetView) *eventFeed {
-	root := v.t.Spec.Path
 	return newEventFeed(v.page.shell, &feedSpec{
 		cols: []column{
 			{"Time", 104}, {"Verdict", 86}, {"Operation", 104}, {"Process", 130}, {"PID", 72},
@@ -42,9 +39,9 @@ func newFileFeed(v *targetView) *eventFeed {
 				return pidCell(r)
 			case 5:
 				if r.Dest != "" {
-					return cell{text: relTo(root, r.Path) + " → " + relTo(root, r.Dest)}
+					return cell{text: r.Path + " → " + r.Dest}
 				}
-				return cell{text: relTo(root, r.Path)}
+				return cell{text: r.Path}
 			default:
 				return cell{text: exeText(r.Exe), importance: widget.LowImportance}
 			}
@@ -56,17 +53,6 @@ func newFileFeed(v *targetView) *eventFeed {
 		actions:     v.promoteActions(),
 		exportName:  "files-events",
 	})
-}
-
-// relTo shows p relative to the target root ("./id_ed25519"); anything outside stays absolute.
-func relTo(root, p string) string {
-	if p == root {
-		return "."
-	}
-	if rest, ok := strings.CutPrefix(p, root+"/"); ok {
-		return "./" + rest
-	}
-	return p
 }
 
 // newFileProcesses lists the executables seen on a target.

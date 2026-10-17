@@ -24,8 +24,8 @@ type feedAction struct {
 	run   func(exe workbench.Exe, comm string)
 }
 
-func (a *feedAction) button() *widget.Button {
-	b := widget.NewButtonWithIcon(a.label, icon(a.icon), nil)
+func (a *feedAction) button() *handButton {
+	b := newButton(a.label, icon(a.icon), nil)
 	b.Importance = a.importance
 	b.Disable()
 	return b
@@ -45,7 +45,7 @@ type actionBar struct {
 	info    *widget.Label
 	hint    string
 	actions []feedAction
-	buttons []*widget.Button
+	buttons []*handButton
 }
 
 func newActionBar(s *shell, hint string, actions []feedAction) *actionBar {
@@ -128,8 +128,8 @@ func newEventFeed(s *shell, spec *feedSpec) *eventFeed {
 	// Assigned, not SetSelected: the callback would fire before the feed is built.
 	verdict.Selected = "All verdicts"
 
-	var pause *widget.Button
-	pause = widget.NewButtonWithIcon("Pause", icon("pause"), func() {
+	var pause *handButton
+	pause = newButton("Pause", icon("pause"), func() {
 		f.paused = !f.paused
 		if f.paused {
 			pause.SetText("Resume")
@@ -140,8 +140,8 @@ func newEventFeed(s *shell, spec *feedSpec) *eventFeed {
 		pause.SetIcon(icon("pause"))
 		f.refresh(true)
 	})
-	clearBtn := widget.NewButtonWithIcon("Clear", icon("broom"), func() { spec.clear(); f.refresh(true) })
-	export := widget.NewButtonWithIcon("Export", icon("export"), func() { s.exportTable(spec.exportName, f.table) })
+	clearBtn := newButton("Clear", icon("broom"), func() { spec.clear(); f.refresh(true) })
+	export := newButton("Export", icon("export"), func() { s.exportTable(spec.exportName, f.table) })
 	toolbar := container.NewBorder(nil, nil, nil, container.NewHBox(verdict, pause, clearBtn, export), f.search)
 
 	f.bar = newActionBar(s, spec.hint, spec.actions)
@@ -223,7 +223,7 @@ func newProcessView(s *shell, spec *procSpec) *processView {
 		p.filter = strings.ToLower(text)
 		p.refresh()
 	})
-	export := widget.NewButtonWithIcon("Export", icon("export"), func() { s.exportTable(spec.exportName, p.table) })
+	export := newButton("Export", icon("export"), func() { s.exportTable(spec.exportName, p.table) })
 	toolbar := container.NewBorder(nil, nil, nil, export, p.search)
 	p.root = container.NewBorder(container.NewPadded(toolbar), p.bar.root, nil, nil, p.table)
 	return p

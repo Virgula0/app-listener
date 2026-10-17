@@ -59,7 +59,8 @@ a cell selects its whole row.
 ## Files
 
 The Files workspace runs `monitor` and `guard` together on each folder or file you add. Targets
-are listed on the left; each has its own monitor, its own guard and its own policy.
+are listed on the left (the button beside Add collapses the list to a narrow rail); each has its
+own monitor, its own guard and its own policy.
 
 **Add** asks for what `monitor` takes on the command line:
 
@@ -75,8 +76,8 @@ right away and the guard starts off.
 
 A target has three tabs:
 
-- **Activity**: every monitor event and guard verdict on the target, newest first, with paths
-  shown relative to it. Filter by text or verdict, pause the stream, or clear it. Selecting an
+- **Activity**: every monitor event and guard verdict on the target, newest first, with absolute
+  paths. Filter by text or verdict, pause the stream, or clear it. Selecting an
   event offers to whitelist or blacklist the executable that produced it.
 - **Processes**: one row per executable that touched the target, keyed by its inode, with event
   and denial counts and its place in the policy.

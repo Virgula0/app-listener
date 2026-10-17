@@ -119,7 +119,7 @@ func (s *shell) exportTable(baseName string, t *dataTable) {
 		base := strings.TrimSuffix(strings.TrimSuffix(name.Text, ".csv"), ".json")
 		name.SetText(base + ext)
 	}
-	browse := widget.NewButtonWithIcon("Folder…", icon("folder"), func() {
+	browse := newButton("Folder…", icon("folder"), func() {
 		d := dialog.NewFolderOpen(func(l fyne.ListableURI, err error) {
 			if err == nil && l != nil {
 				folder.SetText(l.Path())

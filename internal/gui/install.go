@@ -109,10 +109,10 @@ type installPage struct {
 	binState                     *pill
 	binHead, binCard             *fyne.Container
 	binInfo, binIntro, binNote   *widget.Label
-	binBtn                       *widget.Button
+	binBtn                       *handButton
 	source                       binSource
 	meta, live                   *widget.Check
-	binButtons                   []*widget.Button
+	binButtons                   []*handButton
 }
 
 func newInstallPage(s *shell) *installPage {
@@ -161,7 +161,7 @@ func (p *installPage) binaryCard() fyne.CanvasObject {
 	p.binNote = widget.NewLabel("")
 	p.binNote.Wrapping = fyne.TextWrapWord
 	p.binNote.Importance = widget.WarningImportance
-	p.binBtn = widget.NewButton("", p.acquire)
+	p.binBtn = newTextButton("", p.acquire)
 	p.binBtn.Importance = widget.HighImportance
 
 	sources := []binSource{srcStable, srcPreRelease, srcLocal}
@@ -227,7 +227,7 @@ func (p *installPage) actionGrid() fyne.CanvasObject {
 	grid := container.NewGridWithColumns(3)
 	for i := range installActions {
 		a := &installActions[i]
-		btn := widget.NewButtonWithIcon("Start", icon("play"), func() { p.startAction(a) })
+		btn := newButton("Start", icon("play"), func() { p.startAction(a) })
 		btn.Importance = widget.MediumImportance
 		if a.mode == InstallWizard {
 			btn.Importance = widget.HighImportance

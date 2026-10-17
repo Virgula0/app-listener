@@ -39,8 +39,8 @@ type policyEditor struct {
 	help     *widget.Label
 	bins     *binaryList
 	enforced *widget.Label
-	apply    *widget.Button
-	revert   *widget.Button
+	apply    *handButton
+	revert   *handButton
 	syncing  bool
 }
 
@@ -57,8 +57,8 @@ func newPolicyEditor(s *shell, hooks policyHooks) *policyEditor {
 	e.modes.Required = true
 	e.help = mutedText("")
 	e.bins = newBinaryList(s, e.changed)
-	e.revert = widget.NewButtonWithIcon("Revert", icon("arrow-clockwise"), hooks.revert)
-	e.apply = widget.NewButtonWithIcon("Apply", icon("check"), hooks.apply)
+	e.revert = newButton("Revert", icon("arrow-clockwise"), hooks.revert)
+	e.apply = newButton("Apply", icon("check"), hooks.apply)
 	e.apply.Importance = widget.HighImportance
 	e.enforced = mutedText("")
 	return e

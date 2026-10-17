@@ -5,6 +5,8 @@ package gui
 import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 )
 
 // cardGap separates cards in a grid and stacked sections of a page.
@@ -17,10 +19,19 @@ const cardGap = 14
 type adaptiveGrid struct {
 	maxCols int
 	cols    int
+	// gap overrides cardGap when set.
+	gap float32
 }
 
 func newAdaptiveGrid(maxCols int, objs ...fyne.CanvasObject) *fyne.Container {
 	return container.New(&adaptiveGrid{maxCols: maxCols, cols: maxCols}, objs...)
+}
+
+func (g *adaptiveGrid) spacing() float32 {
+	if g.gap > 0 {
+		return g.gap
+	}
+	return cardGap
 }
 
 func visible(objs []fyne.CanvasObject) []fyne.CanvasObject {
@@ -43,7 +54,7 @@ func cellMin(objs []fyne.CanvasObject) fyne.Size {
 
 func (g *adaptiveGrid) columnsFor(width float32, cell fyne.Size, n int) int {
 	cols := g.maxCols
-	for cols > 1 && float32(cols)*cell.Width+float32(cols-1)*cardGap > width {
+	for cols > 1 && float32(cols)*cell.Width+float32(cols-1)*g.spacing() > width {
 		cols--
 	}
 	return max(1, min(cols, n))
@@ -67,7 +78,8 @@ func (g *adaptiveGrid) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 		return
 	}
 	g.cols = g.columnsFor(size.Width, cellMin(objs), len(objs))
-	w := (size.Width - float32(g.cols-1)*cardGap) / float32(g.cols)
+	gap := g.spacing()
+	w := (size.Width - float32(g.cols-1)*gap) / float32(g.cols)
 	y := float32(0)
 	for r, h := range rowHeights(objs, g.cols) {
 		for c := 0; c < g.cols; c++ {
@@ -75,10 +87,10 @@ func (g *adaptiveGrid) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 			if i >= len(objs) {
 				break
 			}
-			objs[i].Move(fyne.NewPos(float32(c)*(w+cardGap), y))
+			objs[i].Move(fyne.NewPos(float32(c)*(w+gap), y))
 			objs[i].Resize(fyne.NewSize(w, h))
 		}
-		y += h + cardGap
+		y += h + gap
 	}
 }
 
@@ -89,7 +101,7 @@ func (g *adaptiveGrid) MinSize(objs []fyne.CanvasObject) fyne.Size {
 	}
 	cols := max(1, min(g.cols, len(objs)))
 	hs := rowHeights(objs, cols)
-	h := float32(len(hs)-1) * cardGap
+	h := float32(len(hs)-1) * g.spacing()
 	for _, rh := range hs {
 		h += rh
 	}
@@ -125,4 +137,34 @@ func (gapVBox) MinSize(objs []fyne.CanvasObject) fyne.Size {
 		}
 	}
 	return s
+}
+
+// checkGrid is a set of checkboxes, all checked at first, that wraps into rows on narrow windows
+// (a horizontal CheckGroup never wraps and sets its container's minimum width).
+type checkGrid struct {
+	root   *fyne.Container
+	checks []*widget.Check
+}
+
+func newCheckGrid(names []string) *checkGrid {
+	g := &checkGrid{}
+	objs := make([]fyne.CanvasObject, len(names))
+	for i, n := range names {
+		c := widget.NewCheck(n, nil)
+		c.Checked = true
+		g.checks = append(g.checks, c)
+		objs[i] = c
+	}
+	g.root = container.New(&adaptiveGrid{maxCols: 6, cols: 6, gap: theme.Padding()}, objs...)
+	return g
+}
+
+func (g *checkGrid) selected() []string {
+	var out []string
+	for _, c := range g.checks {
+		if c.Checked {
+			out = append(out, c.Text)
+		}
+	}
+	return out
 }

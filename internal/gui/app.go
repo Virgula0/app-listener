@@ -7,6 +7,8 @@ package gui
 
 import (
 	"fmt"
+	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -92,9 +94,16 @@ func Run(opts Options) (err error) {
 	wmEnv := restoreSessionEnv()
 	defer cleanupSessionEnv()
 	defer filterFyneLogs()()
-	// fyne logs a failed GLFW init and then panics on the first window call.
+	// fyne logs a failed GLFW init and then panics on the first window call; a panic once the window
+	// is up is a bug, reported with its stack.
+	var started atomic.Bool
 	defer func() {
-		if r := recover(); r != nil {
+		r := recover()
+		switch {
+		case r == nil:
+		case started.Load():
+			err = fmt.Errorf("--gui: internal error: %v\n%s", r, debug.Stack())
+		default:
 			err = fmt.Errorf("--gui: no display reachable (%v): run it from a graphical session "+
 				"(under sudo it needs the invoking user's WAYLAND_DISPLAY or DISPLAY)", r)
 		}
@@ -119,6 +128,7 @@ func Run(opts Options) (err error) {
 	w.SetMaster()
 	w.SetCloseIntercept(s.confirmClose)
 	a.Lifecycle().SetOnStarted(func() {
+		started.Store(true)
 		if s.floatPref() {
 			s.setFloating(true)
 		}
@@ -256,10 +266,10 @@ func (s *shell) layoutSidebar() {
 	if s.collapsed {
 		collapseIcon = "caret-right"
 	}
-	toggle := widget.NewButtonWithIcon("", icon(collapseIcon), s.toggleSidebar)
+	toggle := newButton("", icon(collapseIcon), s.toggleSidebar)
 	toggle.Importance = widget.LowImportance
 
-	themeBtn := widget.NewButtonWithIcon("", s.themeIcon(), nil)
+	themeBtn := newButton("", s.themeIcon(), nil)
 	themeBtn.Importance = widget.LowImportance
 	themeBtn.OnTapped = func() {
 		s.toggleTheme()
@@ -358,7 +368,7 @@ const dialogMargin = 24
 func (s *shell) showSized(d sizedDialog, want fyne.Size) {
 	s.dialogs[d] = want
 	d.SetOnClosed(func() { delete(s.dialogs, d) })
-	s.fitDialog(d, want)
+	// Show first: a FileDialog's Resize dereferences the dialog Show creates.
 	d.Show()
 	s.fitDialog(d, want)
 }
@@ -372,6 +382,10 @@ func (s *shell) fitDialog(d sizedDialog, want fyne.Size) {
 	d.Resize(fyne.NewSize(
 		fyne.Max(1, fyne.Min(want.Width, c.Width-2*dialogMargin)),
 		fyne.Max(1, fyne.Min(want.Height, c.Height-2*dialogMargin))))
+	// A modal's overlay centers it only on layout: re-center at the new size.
+	for _, o := range s.win.Canvas().Overlays().List() {
+		o.Refresh()
+	}
 }
 
 func (s *shell) refitDialogs(fyne.Size) {
@@ -382,7 +396,7 @@ func (s *shell) refitDialogs(fyne.Size) {
 
 // scrollable lets a dialog's content shrink below its natural size and scroll instead.
 func scrollable(content fyne.CanvasObject) fyne.CanvasObject {
-	return container.NewVScroll(content)
+	return container.NewScroll(content)
 }
 
 // resizeWatch is a stack layout that reports size changes of the window content.

@@ -21,7 +21,7 @@ func (p *filesPage) addTarget() {
 	win := p.shell.win
 	path := widget.NewEntry()
 	path.SetPlaceHolder("/home/user/.ssh")
-	browseDir := widget.NewButtonWithIcon("Folder…", icon("folder"), func() {
+	browseDir := newButton("Folder…", icon("folder"), func() {
 		d := dialog.NewFolderOpen(func(u fyne.ListableURI, err error) {
 			if err == nil && u != nil {
 				path.SetText(u.Path())
@@ -29,7 +29,7 @@ func (p *filesPage) addTarget() {
 		}, win)
 		p.shell.showFile(d, "")
 	})
-	browseFile := widget.NewButtonWithIcon("File…", icon("file"), func() {
+	browseFile := newButton("File…", icon("file"), func() {
 		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
 			if err == nil && r != nil {
 				path.SetText(r.URI().Path())
@@ -42,6 +42,7 @@ func (p *filesPage) addTarget() {
 	depth := widget.NewEntry()
 	depth.SetText("0")
 	depthHint := mutedText("0 = every level")
+	depthHint.Wrapping = fyne.TextWrapOff
 	recursive := widget.NewCheck("Include subfolders", func(on bool) {
 		if on {
 			depth.Enable()
@@ -55,15 +56,13 @@ func (p *filesPage) addTarget() {
 	for _, e := range ebpf.EventTypes() {
 		names = append(names, e.String())
 	}
-	events := widget.NewCheckGroup(names, nil)
-	events.Horizontal = true
-	events.SetSelected(names)
+	events := newCheckGrid(names)
 
 	form := widget.NewForm(
 		widget.NewFormItem("Path", container.NewBorder(nil, nil, nil, container.NewHBox(browseDir, browseFile), path)),
 		widget.NewFormItem("Scope", recursive),
 		widget.NewFormItem("Max depth", container.NewBorder(nil, nil, nil, depthHint, depth)),
-		widget.NewFormItem("Show events", events),
+		widget.NewFormItem("Show events", events.root),
 	)
 	note := mutedText("The monitor starts right away. The guard starts off: configure it in the Guard tab, " +
 		"or whitelist and blacklist processes from the activity you observe.")
@@ -73,7 +72,7 @@ func (p *filesPage) addTarget() {
 			if !ok {
 				return
 			}
-			spec, err := specFromForm(path.Text, recursive.Checked, depth.Text, events.Selected)
+			spec, err := specFromForm(path.Text, recursive.Checked, depth.Text, events.selected())
 			if err != nil {
 				dialog.ShowError(err, win)
 				return

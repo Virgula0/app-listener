@@ -247,3 +247,19 @@ func boldLabel(s string) *widget.Label {
 func hfill(grow fyne.CanvasObject, rest ...fyne.CanvasObject) *fyne.Container {
 	return container.NewBorder(nil, nil, nil, container.NewHBox(rest...), grow)
 }
+
+// handButton is a widget.Button that shows the pointing-hand cursor (fyne's Button keeps the arrow).
+type handButton struct {
+	widget.Button
+}
+
+func newButton(label string, ic fyne.Resource, tapped func()) *handButton {
+	b := &handButton{}
+	b.Text, b.Icon, b.OnTapped = label, ic, tapped
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func newTextButton(label string, tapped func()) *handButton { return newButton(label, nil, tapped) }
+
+func (b *handButton) Cursor() desktop.Cursor { return desktop.PointerCursor }

@@ -73,7 +73,7 @@ func (v *targetView) header() fyne.CanvasObject {
 	}
 	title := boldLabel(v.t.Spec.Path)
 	title.Truncation = fyne.TextTruncateEllipsis
-	remove := widget.NewButtonWithIcon("Remove", icon("trash"), func() { v.page.removeTarget(v.t) })
+	remove := newButton("Remove", icon("trash"), func() { v.page.removeTarget(v.t) })
 	remove.Importance = widget.DangerImportance
 	summary := widget.NewLabel(specSummary(v.t.Spec))
 	summary.Importance = widget.LowImportance

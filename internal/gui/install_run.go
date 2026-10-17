@@ -52,7 +52,7 @@ type runView struct {
 	result *widget.Label
 	// logBox holds barBox and result: showing or hiding them needs its relayout.
 	logBox *fyne.Container
-	back   *widget.Button
+	back   *handButton
 
 	stages []stageItem
 	lines  []logLine
@@ -94,8 +94,8 @@ func newRunView(s *shell, onBack func()) *runView {
 		}
 	}
 
-	r.back = widget.NewButton("Back to Install", onBack)
-	copyLog := widget.NewButtonWithIcon("Copy log", icon("copy"), func() {
+	r.back = newTextButton("Back to Install", onBack)
+	copyLog := newButton("Copy log", icon("copy"), func() {
 		s.app.Clipboard().SetContent(r.logText())
 	})
 	copyLog.Importance = widget.LowImportance

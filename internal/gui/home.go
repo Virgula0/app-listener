@@ -103,7 +103,7 @@ func (h *homePage) windowCard() fyne.CanvasObject {
 }
 
 func (h *homePage) workspaceCard(iconName string, c fyne.ThemeColorName, title, desc string, target pageID) fyne.CanvasObject {
-	open := widget.NewButtonWithIcon("Open", icon("caret-right"), func() { h.shell.show(target) })
+	open := newButton("Open", icon("caret-right"), func() { h.shell.show(target) })
 	open.IconPlacement = widget.ButtonIconTrailingText
 	open.Importance = widget.LowImportance
 	body := container.NewVBox(

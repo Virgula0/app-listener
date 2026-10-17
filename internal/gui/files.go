@@ -25,7 +25,14 @@ type filesPage struct {
 	detail  *fyne.Container
 	views   map[int]*targetView
 	current *targetView
+
+	root      *fyne.Container
+	side      fyne.CanvasObject
+	offset    float64
+	collapsed bool
 }
+
+const prefTargetsCollapsed = "targetsCollapsed"
 
 const pollInterval = 400 * time.Millisecond
 
@@ -48,27 +55,59 @@ func (p *filesPage) view() fyne.CanvasObject {
 		}
 	}
 
-	add := widget.NewButtonWithIcon("Add", icon("plus"), p.addTarget)
+	add := newButton("Add", icon("plus"), p.addTarget)
 	add.Importance = widget.HighImportance
-	header := hfill(boldLabel("Targets"), add)
+	collapse := newButton("", icon("sidebar-simple"), p.toggleTargets)
+	collapse.Importance = widget.LowImportance
+	header := hfill(boldLabel("Targets"), add, collapse)
 	side := newPanel(container.NewBorder(header, nil, nil, nil, p.list))
 	side.inset = theme.Padding() * 2
+	p.side = side
 
 	p.showEmpty()
-	split := container.NewHSplit(side, p.detail)
-	split.Offset = 0.24
+	p.offset = 0.24
+	p.root = container.NewStack()
+	p.collapsed = p.shell.app.Preferences().Bool(prefTargetsCollapsed)
+	p.layoutTargets()
 	p.shell.every(pollInterval, func() {
 		if p.current != nil {
 			p.current.refresh(false)
 		}
 		p.list.Refresh()
 	})
-	return split
+	return p.root
+}
+
+// layoutTargets shows the target list beside the detail, or a narrow rail when collapsed.
+func (p *filesPage) layoutTargets() {
+	if p.collapsed {
+		expand := newButton("", icon("caret-right"), p.toggleTargets)
+		expand.Importance = widget.LowImportance
+		add := newButton("", icon("plus"), p.addTarget)
+		add.Importance = widget.HighImportance
+		rail := newPanel(container.NewVBox(expand, add))
+		rail.inset = theme.Padding() * 2
+		p.root.Objects = []fyne.CanvasObject{container.NewBorder(nil, nil, rail, nil, p.detail)}
+	} else {
+		split := container.NewHSplit(p.side, p.detail)
+		split.Offset = p.offset
+		p.root.Objects = []fyne.CanvasObject{split}
+	}
+	p.root.Refresh()
+}
+
+func (p *filesPage) toggleTargets() {
+	if split, ok := p.root.Objects[0].(*container.Split); ok {
+		p.offset = split.Offset
+	}
+	p.collapsed = !p.collapsed
+	p.shell.app.Preferences().SetBool(prefTargetsCollapsed, p.collapsed)
+	p.layoutTargets()
 }
 
 func (p *filesPage) showEmpty() {
 	p.current = nil
-	addBtn := widget.NewButtonWithIcon("Add a folder or file", icon("plus"), p.addTarget)
+	addBtn := newButton("Add a folder or file", icon("plus"), p.addTarget)
 	addBtn.Importance = widget.HighImportance
 	p.detail.Objects = []fyne.CanvasObject{container.NewCenter(container.NewVBox(
 		container.NewCenter(newIconTile("folders", theme.ColorNamePrimary, 72)),

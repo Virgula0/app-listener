@@ -102,8 +102,8 @@ func (u *installUI) showMultiSelect(title, description string, choices []wizard.
 			c.SetChecked(on)
 		}
 	}
-	all := widget.NewButton("Select all", func() { setAll(true) })
-	none := widget.NewButton("Select none", func() { setAll(false) })
+	all := newTextButton("Select all", func() { setAll(true) })
+	none := newTextButton("Select none", func() { setAll(false) })
 	top := promptBody(title, description, hfill(count, all, none))
 	body := container.NewBorder(top, nil, nil, nil, container.NewVScroll(list))
 	d := dialog.NewCustomConfirm(u.run.name, "Continue", "Cancel", body, func(ok bool) {
@@ -148,7 +148,7 @@ func (u *installUI) Input(f wizard.Field) (string, error) {
 
 // pathButtons fill entry from a folder or file picker opened in the invoking user's home.
 func (u *installUI) pathButtons(entry *widget.Entry) fyne.CanvasObject {
-	folder := widget.NewButtonWithIcon("Folder…", icon("folder"), func() {
+	folder := newButton("Folder…", icon("folder"), func() {
 		d := dialog.NewFolderOpen(func(l fyne.ListableURI, err error) {
 			if err == nil && l != nil {
 				entry.SetText(l.Path())
@@ -156,7 +156,7 @@ func (u *installUI) pathButtons(entry *widget.Entry) fyne.CanvasObject {
 		}, u.s.win)
 		u.s.showFile(d, "")
 	})
-	file := widget.NewButtonWithIcon("File…", icon("file"), func() {
+	file := newButton("File…", icon("file"), func() {
 		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
 			if err == nil && r != nil {
 				entry.SetText(r.URI().Path())

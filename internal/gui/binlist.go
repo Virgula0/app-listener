@@ -25,7 +25,7 @@ type binaryList struct {
 	entries  []ebpf.BinaryEntry
 	extras   []workbench.NetExtra
 	list     *widget.List
-	add      *widget.Button
+	add      *handButton
 	onChange func()
 	editable bool
 }
@@ -49,7 +49,7 @@ func newBinaryList(s *shell, onChange func()) *binaryList {
 				row.set(x.Entry, x.Why, nil)
 			}
 		})
-	b.add = widget.NewButtonWithIcon("Add executable…", icon("plus"), b.pick)
+	b.add = newButton("Add executable…", icon("plus"), b.pick)
 	return b
 }
 
@@ -99,7 +99,7 @@ func (b *binaryList) changed() {
 func (b *binaryList) pick() {
 	path := widget.NewEntry()
 	path.SetPlaceHolder("/usr/bin/curl")
-	browse := widget.NewButtonWithIcon("Browse…", icon("folder"), func() {
+	browse := newButton("Browse…", icon("folder"), func() {
 		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
 			if err == nil && r != nil {
 				path.SetText(r.URI().Path())
@@ -140,7 +140,7 @@ type binaryRow struct {
 	path    *widget.Label
 	detail  *widget.Label
 	caption *pill
-	remove  *widget.Button
+	remove  *handButton
 }
 
 func newBinaryRow() *binaryRow {
@@ -148,7 +148,7 @@ func newBinaryRow() *binaryRow {
 	r.path.Truncation = fyne.TextTruncateEllipsis
 	r.detail.Wrapping = fyne.TextWrapOff
 	r.detail.SizeName = theme.SizeNameCaptionText
-	r.remove = widget.NewButtonWithIcon("", icon("x"), nil)
+	r.remove = newButton("", icon("x"), nil)
 	r.remove.Importance = widget.LowImportance
 	r.ExtendBaseWidget(r)
 	return r

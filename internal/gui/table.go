@@ -43,7 +43,7 @@ func newDataTable(cols []column, rows func() int, cellFn func(row, col int) cell
 		func() fyne.CanvasObject {
 			l := widget.NewLabel("")
 			l.Truncation = fyne.TextTruncateEllipsis
-			return container.NewStack(canvas.NewRectangle(color.Transparent), l)
+			return container.New(bleedLayout{}, canvas.NewRectangle(color.Transparent), l)
 		},
 		func(id widget.TableCellID, o fyne.CanvasObject) {
 			box := o.(*fyne.Container)
@@ -66,6 +66,8 @@ func newDataTable(cols []column, rows func() int, cellFn func(row, col int) cell
 			l.SetText(c.text)
 		})
 	d.ShowHeaderColumn = false
+	// Per-cell separators would split the selection band into one block per column.
+	d.HideSeparators = true
 	d.CreateHeader = func() fyne.CanvasObject {
 		l := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 		l.Importance = widget.LowImportance
@@ -112,4 +114,29 @@ func (d *dataTable) texts() (headers []string, rows [][]string) {
 		}
 	}
 	return headers, rows
+}
+
+// bleedLayout stretches its first object (the selection background) over the padding fyne's Table
+// leaves between cells, so a selected row reads as one band; the rest fill the cell.
+type bleedLayout struct{}
+
+func (bleedLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	pad := theme.Padding()
+	for i, o := range objs {
+		if i == 0 {
+			o.Move(fyne.NewPos(-pad/2, -pad/2))
+			o.Resize(size.AddWidthHeight(pad, pad))
+			continue
+		}
+		o.Move(fyne.NewPos(0, 0))
+		o.Resize(size)
+	}
+}
+
+func (bleedLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	var m fyne.Size
+	for _, o := range objs[1:] {
+		m = m.Max(o.MinSize())
+	}
+	return m
 }
