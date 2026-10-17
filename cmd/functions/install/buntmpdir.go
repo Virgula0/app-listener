@@ -5,11 +5,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // bunUser is one user who opted into the Bun $TMPDIR redirect, with the launcher command names to
@@ -53,24 +53,23 @@ func askBunTmpdirUsers(cfg *daemonconfig.Config) ([]bunUser, error) {
 		if len(launchers) == 0 {
 			continue
 		}
-		set := true
-		if ferr := huh.NewForm(huh.NewGroup(
-			huh.NewConfirm().
-				Title(fmt.Sprintf("Redirect Bun app extraction for user %s?", u.Name)).
-				Description(fmt.Sprintf(
-					"%s bundles a native library Bun extracts to $TMPDIR each launch and loads;\n"+
-						"on world-writable /tmp the trust guard denies that load. This will:\n"+
-						"  - create %s (0700, owned by that user)\n"+
-						"  - add a shell-function wrapper for %s to the user's startup file\n"+
-						"    (.zshrc / .bashrc / fish conf.d) running them with $TMPDIR there\n"+
-						"The daemon reserves .bun-* below that dir for the app, so it loads its own\n"+
-						"extraction while nothing else can plant or load one. Interactive shells only —\n"+
-						"a Bun app launched from a desktop menu still uses /tmp.",
-					strings.Join(launchers, ", "), inst.BunTmpDir(u.Home), strings.Join(launchers, ", "))).
-				Affirmative("Set it up").
-				Negative("Skip").
-				Value(&set),
-		)).Run(); ferr != nil {
+		set, ferr := wizard.Confirm(wizard.Question{
+			Title: fmt.Sprintf("Redirect Bun app extraction for user %s?", u.Name),
+			Description: fmt.Sprintf(
+				"%s bundles a native library Bun extracts to $TMPDIR each launch and loads;\n"+
+					"on world-writable /tmp the trust guard denies that load. This will:\n"+
+					"  - create %s (0700, owned by that user)\n"+
+					"  - add a shell-function wrapper for %s to the user's startup file\n"+
+					"    (.zshrc / .bashrc / fish conf.d) running them with $TMPDIR there\n"+
+					"The daemon reserves .bun-* below that dir for the app, so it loads its own\n"+
+					"extraction while nothing else can plant or load one. Interactive shells only —\n"+
+					"a Bun app launched from a desktop menu still uses /tmp.",
+				strings.Join(launchers, ", "), inst.BunTmpDir(u.Home), strings.Join(launchers, ", ")),
+			Affirmative: "Set it up",
+			Negative:    "Skip",
+			Default:     true,
+		})
+		if ferr != nil {
 			return nil, ferr
 		}
 		if !set {

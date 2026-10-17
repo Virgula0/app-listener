@@ -13,7 +13,6 @@ import (
 
 	"github.com/Virgula0/app-listener/cmd/common"
 	"github.com/Virgula0/app-listener/cmd/printers"
-	"github.com/Virgula0/app-listener/internal/gui"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/monitor"
@@ -69,13 +68,6 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// --gui is a root persistent flag inherited here. Fail fast, before any
-	// eBPF setup, when this binary was built without GUI support.
-	if launchGUI, _ := cmd.Flags().GetBool("gui"); launchGUI && !gui.Available {
-		return errors.New("--gui: this app-listener binary was built without GUI support — " +
-			"rebuild with `make build GUI=1` (or `go build -tags gui`), or drop --gui for the terminal UI")
-	}
-
 	rawTargets, ebpfTargets, err := prepareMonitorTargets()
 	if err != nil {
 		return err
@@ -108,15 +100,9 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 
 	displayPaths := common.MakeDisplayPaths(rawTargets)
 
-	// --gui is a root persistent flag, inherited by this command.
-	launchGUI, _ := cmd.Flags().GetBool("gui")
-
 	switch {
 	case headless:
 		runHeadless(ucase)
-	case launchGUI:
-		// Availability was checked up front (before eBPF setup).
-		return gui.Run(ucase.Events(), displayPaths, recursive, depth)
 	case serve.Enabled:
 		fan := tui.NewEventFanout(ucase.Events())
 		defer fan.Stop()

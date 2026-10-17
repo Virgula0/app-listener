@@ -73,7 +73,8 @@ Every mode has three presentations:
 - **`--headless`**: no TUI, one line per event on stderr, with a stable prefix per mode that
   scripts and the integration tests parse: `EVENT|` (monitor), `GUARD|` (guard), `NETEVENT|`
   (network-monitor), `NETGUARD|` (network-guard), `DAEMON ...` (daemon; journald under systemd).
-- **`--gui`** (monitor only): a desktop window, available in builds made with `make build GUI=1`.
+- **`--gui`**: the desktop window, in builds made with `make build GUI=1`. It replaces the
+  subcommand and its flags; see [Desktop GUI](gui.md).
 
 ### Global flags
 
@@ -81,7 +82,7 @@ Every mode has three presentations:
 |---|---|
 | `-v, --verbose <0..4>` | Verbosity of the headless stream and `--dump-log`: `0` errors only, `1` essential, `2` current display, `3` plus internal details, `4` everything. Requires `--headless`. |
 | `--dump-log <file>` | Mirror every log line into this file as plain text (asks before overwriting). |
-| `--gui` | Desktop GUI instead of the TUI (monitor only, `-tags gui` build). |
+| `--gui` | Open the [desktop GUI](gui.md); every other subcommand and flag is ignored (`-tags gui` build). |
 
 ## Watching from a browser: `--serve`
 
@@ -96,4 +97,4 @@ sudo app-listener monitor -w /tmp --serve=0.0.0.0:8080 --user me --password s3cr
 - Binds to loopback (`127.0.0.1:9999`) unless you give an address.
 - `--user` and `--password` add HTTP Basic Auth and must be given together.
 - No TLS. Put a reverse proxy in front when binding off-loopback.
-- Mutually exclusive with `--headless` and `--gui`.
+- Mutually exclusive with `--headless`. `--gui` ignores it.

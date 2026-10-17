@@ -93,7 +93,7 @@ needs cgo (`mlock`). A `CGO_ENABLED=0` build no longer compiles.
 |---|---|
 | `make build` | Full pipeline in a **rootful Docker** container: dumps `vmlinux.h` from the host BTF, regenerates BPF bindings, builds to `build/linux/app-listener`. Nothing but Docker needed on the host. |
 | `make build-host` | Same pipeline on the host — needs a **recent** `clang`/LLVM (`docker/builder.Dockerfile` pins clang 22; clang 14 emits a `guard_path_rename` that overflows the BPF verifier's 1M-insn budget on modern kernels — issue #45), `bpftool`, Go 1.26+, GCC. |
-| `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui` (fyne desktop window for `monitor --gui`, ~20 MiB larger, X11/OpenGL deps) — off by default because the daemon shares this binary. |
+| `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui` (fyne desktop window opened by `--gui`, ~20 MiB larger, X11/OpenGL deps) — off by default because the daemon shares this binary. |
 | `make generate` | Regenerate BPF bindings (`bpf2go`). Needs `bpftool` + readable `/sys/kernel/btf/vmlinux`. `ARCH` (amd64/arm64) defaults to the host's and must equal it: vmlinux.h and `__TARGET_ARCH_*` (PT_REGS layout) are the host's, so the eBPF never cross-builds. |
 | `make vuln` | govulncheck (pinned `GOVULNCHECK_VERSION`) over the module; `GUI=1` scans the `-tags gui` build. Needs generated bindings. |
 | `make check-compatibility` | Static host check (kernel version, `.config`, BTF, BPF-LSM activation, fscrypt prereqs). Run before building/running on a new host. `--binary <path>` (as root) also loads that binary's guard eBPF into the running verifier (`daemon --check`), catching a prebuilt/kernel mismatch; `scripts/install.sh` runs this against the downloaded release before installing anything. |
@@ -341,8 +341,15 @@ an unchanged binary, never to admit one; every other re-sync opens fresh.
 Every mode has a bubbletea TUI (`internal/tui/*_model.go`), a `--headless` stderr writer
 with a stable `EVENT|` / `GUARD|` / `DAEMON …` / `NETEVENT|` line format that the
 integration tests parse, and `--serve[=host:port]` which mirrors the event stream
-read-only over WebSockets (`internal/tui/serve.go`). `--gui` (build-tag `gui`) is
-fyne, monitor-only; `internal/gui/stub.go` is the no-op for non-gui builds.
+read-only over WebSockets (`internal/tui/serve.go`). `--gui` (build-tag `gui`) is one fyne
+window for every interactive mode, intercepted in `cmd.Execute` before cobra
+(`cmd/functions/desktop`), so it ignores the subcommand and all other flags;
+`internal/gui/stub.go` is the no-op for non-gui builds. Icons are Phosphor SVGs whose path data is
+normalized to explicit commands: oksvg drops implicit repeated arcs and ignores `<g transform>`.
+`APPLISTENER_GUI_SNAPSHOTS=<dir> go test -tags gui ./internal/gui/` renders every page headlessly.
+The GUI installer (`install.RunWith`, prompts routed via `wizard.Use`) must never deploy the fyne
+build as the daemon: it deploys a staged headless build (`update.FetchVerified`/`FetchLatest` or a
+local file), which `RunWith` itself re-checks with `headless.Check`; never `os.Executable()`.
 Verbosity ladder lives in `internal/constants`; `--verbose` requires `--headless`.
 
 ## Comment style

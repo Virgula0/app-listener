@@ -16,7 +16,6 @@ require (
 	github.com/cilium/ebpf v0.22.0
 	github.com/google/fscrypt v0.3.6
 	github.com/gorilla/websocket v1.5.3
-	github.com/jezek/xgb v1.3.1
 	github.com/mattn/go-runewidth v0.0.24
 	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/moby/moby/api v1.54.2
@@ -36,6 +35,7 @@ require (
 	fyne.io/systray v1.12.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/BurntSushi/toml v1.6.0 // indirect
+	github.com/FyshOS/fancyfs v0.0.1 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/anthonynsimon/bild v0.14.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect

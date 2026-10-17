@@ -194,3 +194,14 @@ func ownedBy(path string, uid uint32, typ os.FileMode) bool {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	return ok && st.Uid == uid
 }
+
+// invokingHome is the home of the user sudo/pkexec ran us for, else ours.
+func invokingHome() string {
+	if uid, ok := invokingUID(); ok {
+		if u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10)); err == nil {
+			return u.HomeDir
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return home
+}

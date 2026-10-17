@@ -538,3 +538,27 @@ func TestSanityCheckBinaryRefusesOtherMachine(t *testing.T) {
 		t.Fatal("sanityCheckBinary accepted a non-ELF file")
 	}
 }
+
+func TestFetchReleaseByTag(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo/releases/tags/v1.2.3":
+			_ = json.NewEncoder(w).Encode(githubRelease{TagName: "v1.2.3"})
+		case "/repos/owner/repo/releases/tags/v9.9.9":
+			_ = json.NewEncoder(w).Encode(githubRelease{TagName: "v1.0.0"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	if r, err := fetchRelease(srv.URL, "owner/repo", "v1.2.3", srv.Client()); err != nil || r.TagName != "v1.2.3" {
+		t.Fatalf("fetchRelease = %+v, %v", r, err)
+	}
+	if _, err := fetchRelease(srv.URL, "owner/repo", "v9.9.9", srv.Client()); err == nil {
+		t.Fatal("a release answering with another tag must be refused")
+	}
+	if _, err := fetchRelease(srv.URL, "owner/repo", "v0.0.1", srv.Client()); err == nil {
+		t.Fatal("a missing tag must fail")
+	}
+}
+

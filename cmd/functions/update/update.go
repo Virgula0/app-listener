@@ -32,6 +32,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Virgula0/app-listener/certificates"
+	"github.com/Virgula0/app-listener/internal/headless"
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/wizard"
@@ -358,6 +359,9 @@ func downloadReleaseFiles(client *http.Client, dir string, assets releaseAssets,
 	return binPath, checksumPath, sigPath, nil
 }
 
+// InstalledVersion is the version the installed binary reports ("unknown" when it can't tell).
+func InstalledVersion() string { return readInstalledVersion(systemd.InstallBinaryPath) }
+
 // readInstalledVersion runs the installed binary with --version; failures or
 // unknown output map to "unknown", treated as older than any release.
 func readInstalledVersion(installPath string) string {
@@ -593,6 +597,82 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// FetchVerified downloads this architecture's release binary of tag (the headless asset, never the
+// GUI's) into the caller-owned dir and runs every check update does before returning its path. The
+// GUI installer deploys it instead of itself: the daemon must not be the fyne build.
+func FetchVerified(tag, dir string) (string, error) {
+	assets, err := assetsFor(runtime.GOARCH)
+	if err != nil {
+		return "", err
+	}
+	r, err := fetchRelease(githubAPIBase, defaultRepo, tag, updateHTTPClient())
+	if err != nil {
+		return "", err
+	}
+	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&r, assets)
+	if err != nil {
+		return "", err
+	}
+	return downloadAndVerify(dir, &r, assets, binURL, binDigest, checksumURL, sigURL)
+}
+
+// FetchLatest is FetchVerified for the newest release of a channel (preRelease: the pre-YYYYMMDD
+// builds, else stable vX.Y.Z), picked as `update --channel` picks it; it returns that release's tag.
+func FetchLatest(preRelease bool, dir string) (path, tag string, err error) {
+	channel := channelStable
+	if preRelease {
+		channel = channelPreRelease
+	}
+	assets, err := assetsFor(runtime.GOARCH)
+	if err != nil {
+		return "", "", err
+	}
+	releases, err := fetchReleases(githubAPIBase, defaultRepo, updateHTTPClient())
+	if err != nil {
+		return "", "", err
+	}
+	r, ok := pickLatestRelease(filterChannel(releases, channel))
+	if !ok {
+		return "", "", fmt.Errorf("no %s release is published", channel)
+	}
+	log.Infof("latest %s release: %s (published %s)", channel, r.TagName, r.PublishedAt)
+	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&r, assets)
+	if err != nil {
+		return "", "", err
+	}
+	path, err = downloadAndVerify(dir, &r, assets, binURL, binDigest, checksumURL, sigURL)
+	return path, r.TagName, err
+}
+
+// fetchRelease returns the release tagged tag.
+func fetchRelease(apiBase, repo, tag string, client *http.Client) (githubRelease, error) {
+	url := fmt.Sprintf("%s/repos/%s/releases/tags/%s", apiBase, repo, tag)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return githubRelease{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "app-listener-updater")
+	resp, err := client.Do(req)
+	if err != nil {
+		return githubRelease{}, fmt.Errorf("fetching release %s of %s: %w", tag, repo, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return githubRelease{}, fmt.Errorf("fetching release %s of %s: HTTP %d: %s", tag, repo, resp.StatusCode,
+			strings.TrimSpace(string(body)))
+	}
+	var r githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return githubRelease{}, fmt.Errorf("decoding release %s: %w", tag, err)
+	}
+	if r.TagName != tag {
+		return githubRelease{}, fmt.Errorf("asked for release %s, GitHub returned %s", tag, r.TagName)
+	}
+	return r, nil
+}
+
 // verifyRelease checks the checksum's Ed25519 signature against the embedded key, that it was
 // signed for assetName, then the checksum against the binary, then the GitHub asset digest.
 func verifyRelease(binPath, checksumPath, sigPath, assetDigest, assetName string) error {
@@ -700,7 +780,7 @@ func sanityCheckBinary(path, wantVersion string, machine elf.Machine) error {
 	if !strings.Contains(string(out), wantVersion) {
 		return fmt.Errorf("the downloaded binary reports %q, expected tag %q — refusing to deploy", strings.TrimSpace(string(out)), wantVersion)
 	}
-	return nil
+	return headless.Check(path)
 }
 
 // applyUpdate stops the daemon (verifying lock state), atomically replaces the binary, writes unit

@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/charmbracelet/huh"
-
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/install"
@@ -81,20 +79,12 @@ func find(systemConfigPath string, listUsers func() ([]install.User, error), dis
 // Select shows the backups in a preselected TUI multi-select and returns the
 // chosen ones.
 func Select(entries []Backup, title, description string) ([]Backup, error) {
-	opts := make([]huh.Option[int], 0, len(entries))
+	choices := make([]wizard.Choice, len(entries))
 	for i := range entries {
-		opts = append(opts, huh.NewOption(entries[i].BackupPath, i).Selected(true))
+		choices[i] = wizard.Choice{Label: entries[i].BackupPath, Selected: true}
 	}
-	var pickedIdx []int
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewMultiSelect[int]().
-			Title(title).
-			Description(description).
-			Options(opts...).
-			Height(10).
-			Value(&pickedIdx),
-	))
-	if err := form.WithKeyMap(wizard.MultiSelectKeymap()).Run(); err != nil {
+	pickedIdx, err := wizard.MultiSelect(title, description, choices, 10)
+	if err != nil {
 		return nil, err
 	}
 	picked := make([]Backup, 0, len(pickedIdx))

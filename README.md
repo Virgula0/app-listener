@@ -22,7 +22,7 @@ Hi alice! You've successfully authenticated, but GitHub does not provide shell a
 ```
 
 > [!NOTE]
-> A vibe-coding experiment, coded mainly with DeepSeek V4 Flash and Claude Code. Not for
+> A vibe-coding experiment, coded mainly with DeepSeek V4 Flash and Claude Code. Still not ready for
 > production systems.
 
 ## Quick install

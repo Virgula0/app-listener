@@ -22,11 +22,12 @@ import (
 )
 
 var (
-	amd64Bin            string
-	netTesterAmd64Bin   string
-	guardTestAmd64Bin   string
-	fscryptTestAmd64Bin string
-	tuiTestAmd64Bin     string
+	amd64Bin             string
+	netTesterAmd64Bin    string
+	guardTestAmd64Bin    string
+	fscryptTestAmd64Bin  string
+	tuiTestAmd64Bin      string
+	netguardTestAmd64Bin string
 )
 
 // hostInfraBindPaths are host binaries the LSM network guard blocks in whitelist mode because its
@@ -72,6 +73,7 @@ func TestMain(m *testing.M) {
 	guardTestAmd64Bin = absPath("../build/test/guard-amd64")
 	fscryptTestAmd64Bin = absPath("../build/test/fscrypt-amd64")
 	tuiTestAmd64Bin = absPath("../build/test/tui-amd64")
+	netguardTestAmd64Bin = absPath("../build/test/networkguard-amd64")
 
 	// Daemon mode links fscrypt, which needs cgo (mlock): CGO_ENABLED=0 no longer compiles. The
 	// binary must still be static: it runs in ubuntu:latest containers whose glibc (2.39) is older
@@ -118,6 +120,16 @@ func TestMain(m *testing.M) {
 	cmdTuiTest.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	if err := cmdTuiTest.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build tui test binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	// The network guard's root-only checks (internal/networkguard/harness_test.go): no cgo either.
+	cmdNetguardTest := exec.Command("go", "test", "-tags", "ci", "-c", "-o", netguardTestAmd64Bin,
+		"../internal/networkguard/")
+	cmdNetguardTest.Stderr = os.Stderr
+	cmdNetguardTest.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+	if err := cmdNetguardTest.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build network guard test binary: %v\n", err)
 		os.Exit(1)
 	}
 

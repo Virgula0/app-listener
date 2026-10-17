@@ -7,11 +7,11 @@ import (
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/pmezard/go-difflib/difflib"
 
 	"github.com/Virgula0/app-listener/internal/codeedit"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // UnifiedDiff renders a unified diff between two file contents, labeled
@@ -41,23 +41,20 @@ func ConfirmOverwrite(path string, existing, desired []byte) (bool, error) {
 	if err := ShowDiff(path, UnifiedDiff(string(existing), string(desired))); err != nil {
 		return false, err
 	}
-	overwrite := false
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title(fmt.Sprintf("Overwrite %s with the new version?", path)).
-			Description("The existing file differs from the one this installer ships. Keeping the existing file leaves the previous version in place.").
-			Affirmative("Overwrite").
-			Negative("Keep existing").
-			Value(&overwrite),
-	)).Run(); err != nil {
-		return false, err
-	}
-	return overwrite, nil
+	return wizard.Confirm(wizard.Question{
+		Title:       fmt.Sprintf("Overwrite %s with the new version?", path),
+		Description: "The existing file differs from the one this installer ships. Keeping the existing file leaves the previous version in place.",
+		Affirmative: "Overwrite",
+		Negative:    "Keep existing",
+	})
 }
 
 // ShowDiff displays a diff in a full-screen read-only viewer. Close it
 // with q, Esc or Enter.
 func ShowDiff(title, diff string) error {
+	if ui := wizard.Active(); ui != nil {
+		return ui.ShowDiff(title, diff)
+	}
 	m := newDiffModel(title, diff)
 	p := tea.NewProgram(&m, tea.WithAltScreen())
 	_, err := p.Run()

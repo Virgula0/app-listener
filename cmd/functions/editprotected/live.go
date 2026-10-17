@@ -12,6 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/tui"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // runLiveEdit is the daemon-running flow: password asked ONCE up front (before any protected path
@@ -166,13 +167,8 @@ func readPutContent() ([]byte, error) {
 
 // promptPassword reads a password without echoing it.
 func promptPassword(title string) (string, error) {
-	var pw string
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewInput().
-			Title(title).
-			EchoMode(huh.EchoModePassword).
-			Value(&pw),
-	)).Run(); err != nil {
+	pw, err := wizard.Input(wizard.Field{Title: title, Secret: true})
+	if err != nil {
 		return "", err
 	}
 	if pw == "" {

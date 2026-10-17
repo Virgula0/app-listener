@@ -1,0 +1,328 @@
+//go:build gui
+
+package gui
+
+import (
+	"errors"
+	"image/png"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	log "github.com/sirupsen/logrus"
+
+	"github.com/Virgula0/app-listener/internal/guard"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/networkguard"
+	"github.com/Virgula0/app-listener/internal/repository"
+	"github.com/Virgula0/app-listener/internal/wizard"
+	"github.com/Virgula0/app-listener/internal/workbench"
+)
+
+// TestSnapshots renders the window off-screen into $APPLISTENER_GUI_SNAPSHOTS (a directory) for
+// design review; skipped when unset.
+func TestSnapshots(t *testing.T) {
+	dir := os.Getenv("APPLISTENER_GUI_SNAPSHOTS")
+	if dir == "" {
+		t.Skip("APPLISTENER_GUI_SNAPSHOTS not set")
+	}
+	for _, v := range []struct {
+		name    string
+		variant fyne.ThemeVariant
+	}{{"dark", theme.VariantDark}, {"light", theme.VariantLight}} {
+		a := test.NewApp()
+		a.Settings().SetTheme(&appTheme{variant: v.variant})
+		if v.variant == theme.VariantLight {
+			a.Preferences().SetString("theme", "light")
+		}
+		w := a.NewWindow("app-listener")
+		s := newShell(a, w, Options{Version: "dev"})
+		s.syncBackground = true
+		fe := &snapEngines{}
+		s.files = workbench.NewFiles(fe.engines())
+		ne := &snapNet{}
+		s.network = workbench.NewNetwork(ne.engines())
+		w.SetContent(s.view())
+		w.Resize(fyne.NewSize(1280, 820))
+		s.setStatus(sysStatus{root: true, lsmErr: errors.New("bpf not in /sys/kernel/security/lsm")})
+		for _, p := range pageDefs {
+			s.show(p.id)
+			save(t, filepath.Join(dir, v.name+"-"+p.title+".png"), w)
+		}
+
+		s.setStatus(sysStatus{root: true})
+		fillFiles(t, s, fe)
+		fp := newFilesPage(s, s.files)
+		s.views[pageFiles] = fp.view()
+		s.show(pageFiles)
+		fp.reloadTargets(s.files.Targets()[0])
+		for i, tab := range []string{"Activity", "Processes", "Guard"} {
+			fp.current.tabs.SelectIndex(i)
+			fp.current.refresh(true)
+			save(t, filepath.Join(dir, v.name+"-Files-"+tab+".png"), w)
+		}
+
+		fillNetwork(t, s, ne)
+		np := newNetworkPage(s, s.network)
+		s.views[pageNetwork] = np.view()
+		s.show(pageNetwork)
+		for i, tab := range []string{"Activity", "Processes", "Watched", "Guard"} {
+			np.tabs.SelectIndex(i)
+			np.refresh(true)
+			save(t, filepath.Join(dir, v.name+"-Network-"+tab+".png"), w)
+		}
+
+		snapInstall(t, s, filepath.Join(dir, v.name+"-Install-"))
+		w.Close()
+	}
+}
+
+// TestIconGallery renders every embedded icon (and the logo) for a rasterizer check.
+func TestIconGallery(t *testing.T) {
+	dir := os.Getenv("APPLISTENER_GUI_SNAPSHOTS")
+	if dir == "" {
+		t.Skip("APPLISTENER_GUI_SNAPSHOTS not set")
+	}
+	a := test.NewApp()
+	a.Settings().SetTheme(&appTheme{variant: theme.VariantDark})
+	entries, _ := assets.ReadDir("assets/icons")
+	grid := container.NewGridWithColumns(6)
+	for _, e := range entries {
+		n := strings.TrimSuffix(e.Name(), ".svg")
+		img := canvas.NewImageFromResource(icon(n))
+		img.FillMode = canvas.ImageFillContain
+		img.SetMinSize(fyne.NewSquareSize(32))
+		grid.Add(container.NewVBox(img, widget.NewLabel(n)))
+	}
+	logo := newLogo(96)
+	w := a.NewWindow("g")
+	w.SetContent(container.NewBorder(logo, nil, nil, nil, grid))
+	w.Resize(fyne.NewSize(1200, 1100))
+	save(t, filepath.Join(dir, "gallery.png"), w)
+}
+
+type snapEngines struct {
+	monitors []chan ebpf.FileEvent
+	guards   []chan guard.GuardEvent
+}
+
+type snapMonitor struct{ ch chan ebpf.FileEvent }
+
+func (m *snapMonitor) Start() error                   { return nil }
+func (m *snapMonitor) Stop()                          {}
+func (m *snapMonitor) Events() <-chan ebpf.FileEvent  { return m.ch }
+func (m *snapMonitor) SetEventTypes([]ebpf.EventType) {}
+
+type snapGuard struct{ ch chan guard.GuardEvent }
+
+func (g *snapGuard) Start() error                         { return nil }
+func (g *snapGuard) Stop()                                {}
+func (g *snapGuard) Events() <-chan guard.GuardEvent      { return g.ch }
+func (g *snapGuard) SetBinaries([]ebpf.BinaryEntry) error { return nil }
+
+func (f *snapEngines) engines() workbench.FileEngines {
+	return workbench.FileEngines{
+		NewMonitor: func(ebpf.Target, bool, int) (repository.MonitorRepository, error) {
+			ch := make(chan ebpf.FileEvent, 64)
+			f.monitors = append(f.monitors, ch)
+			return &snapMonitor{ch: ch}, nil
+		},
+		NewGuard: func(string, guard.Mode, []ebpf.BinaryEntry, bool, int) (workbench.FileGuard, error) {
+			ch := make(chan guard.GuardEvent, 64)
+			f.guards = append(f.guards, ch)
+			return &snapGuard{ch: ch}, nil
+		},
+	}
+}
+
+// fillFiles adds two targets with a whitelist and a little traffic.
+func fillFiles(t *testing.T, s *shell, fe *snapEngines) {
+	t.Helper()
+	home := t.TempDir()
+	ssh := filepath.Join(home, ".ssh")
+	gnupg := filepath.Join(home, ".gnupg")
+	for _, d := range []string{ssh, gnupg} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tg, err := s.files.Add(workbench.FileSpec{Path: ssh, Recursive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.files.Add(workbench.FileSpec{Path: gnupg, Recursive: true}); err != nil {
+		t.Fatal(err)
+	}
+	agent := ebpf.BinaryEntry{Path: "/usr/bin/ssh-agent", Comm: "ssh-agent", Hash: [32]byte{0xab, 0xcd, 0x12}}
+	if err := tg.Apply(workbench.Policy{Mode: workbench.GuardWhitelist, Binaries: []ebpf.BinaryEntry{agent}}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixNano()
+	for i, ev := range []struct {
+		comm, path string
+		typ        ebpf.EventType
+	}{
+		{"ssh", "id_ed25519", ebpf.EventOpen}, {"ssh", "id_ed25519", ebpf.EventRead},
+		{"ssh-agent", "id_ed25519", ebpf.EventRead}, {"code", "config", ebpf.EventStat},
+		{"python3", "known_hosts", ebpf.EventOpen},
+	} {
+		fe.monitors[0] <- ebpf.FileEvent{PID: uint32(4000 + i), Comm: ev.comm, Path: filepath.Join(ssh, ev.path), //nolint:gosec // test
+			Type: ev.typ, Timestamp: now + int64(i)*int64(time.Millisecond)}
+	}
+	fe.guards[0] <- guard.GuardEvent{FileEvent: ebpf.FileEvent{PID: 4242, Comm: "stealer", Type: ebpf.EventOpen,
+		Path: filepath.Join(ssh, "id_ed25519"), Timestamp: now + int64(10*time.Millisecond)}, Blocked: true,
+		Exe: guard.GuardInodeKey{Dev: 2049, Ino: 1311}}
+	fe.guards[0] <- guard.GuardEvent{FileEvent: ebpf.FileEvent{PID: 4100, Comm: "ssh-agent", Type: ebpf.EventRead,
+		Path: filepath.Join(ssh, "id_ed25519"), Timestamp: now + int64(11*time.Millisecond)}}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c, _ := tg.Counts(); c.Observed+c.Allowed+c.Denied == 7 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("events never reached the target")
+}
+
+func save(t *testing.T, path string, w fyne.Window) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, w.Canvas().Capture()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type snapNet struct {
+	mon   chan ebpf.NetEvent
+	guard chan networkguard.NetGuardEvent
+}
+
+type snapNetMonitor struct{ ch chan ebpf.NetEvent }
+
+func (m *snapNetMonitor) Start() error                      { return nil }
+func (m *snapNetMonitor) Stop()                             {}
+func (m *snapNetMonitor) Events() <-chan ebpf.NetEvent      { return m.ch }
+func (m *snapNetMonitor) SetEventTypes([]ebpf.NetEventType) {}
+
+type snapNetGuard struct {
+	ch chan networkguard.NetGuardEvent
+}
+
+func (g *snapNetGuard) Start() error                              { return nil }
+func (g *snapNetGuard) Stop()                                     {}
+func (g *snapNetGuard) Events() <-chan networkguard.NetGuardEvent { return g.ch }
+
+func (f *snapNet) engines() workbench.NetEngines {
+	return workbench.NetEngines{
+		NewMonitor: func([]ebpf.BinaryEntry) (repository.NetworkMonitorRepository, error) {
+			f.mon = make(chan ebpf.NetEvent, 64)
+			return &snapNetMonitor{ch: f.mon}, nil
+		},
+		NewGuard: func(workbench.NetGuardConfig, repository.NetworkGuardRepository) (repository.NetworkGuardRepository, error) {
+			f.guard = make(chan networkguard.NetGuardEvent, 64)
+			return &snapNetGuard{ch: f.guard}, nil
+		},
+		Infra: func() ([]string, error) { return []string{"/usr/lib/systemd/systemd-resolved"}, nil },
+		Hash:  func(p string) (ebpf.BinaryEntry, error) { return snapEntry(p), nil },
+		Self:  func() (string, error) { return "/usr/local/bin/app-listener-gui", nil },
+	}
+}
+
+func snapEntry(path string) ebpf.BinaryEntry {
+	return ebpf.EntryWithHash(path, [32]byte{byte(len(path)), 0x5e, 0x77})
+}
+
+// fillNetwork watches two programs, starts a whitelist and feeds a little traffic.
+func fillNetwork(t *testing.T, s *shell, f *snapNet) {
+	t.Helper()
+	curl, firefox := snapEntry("/usr/bin/curl"), snapEntry("/usr/lib/firefox/firefox")
+	if err := s.network.Watch([]ebpf.BinaryEntry{curl, firefox}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.network.Apply(workbench.NetPolicy{Mode: workbench.GuardWhitelist, Binaries: []ebpf.BinaryEntry{firefox},
+		AutoInfra: true, Throttle: true}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixNano()
+	at := func(i int) int64 { return now + int64(i)*int64(time.Millisecond) }
+	f.mon <- ebpf.NetEvent{PID: 5100, Comm: "firefox", Type: ebpf.NetDNS, Protocol: 17,
+		SrcAddr: "10.0.0.7:51122", DstAddr: "127.0.0.53:53", Timestamp: at(0)}
+	f.mon <- ebpf.NetEvent{PID: 5100, Comm: "firefox", Type: ebpf.NetConnect, Protocol: 6,
+		SrcAddr: "10.0.0.7:40112", DstAddr: "140.82.121.4:443", Timestamp: at(1)}
+	f.mon <- ebpf.NetEvent{PID: 5100, Comm: "firefox", Type: ebpf.NetSend, Protocol: 6, Size: 517,
+		SrcAddr: "10.0.0.7:40112", DstAddr: "140.82.121.4:443", Timestamp: at(2)}
+	f.mon <- ebpf.NetEvent{PID: 5201, Comm: "curl", Type: ebpf.NetConnect, Protocol: 6,
+		SrcAddr: "10.0.0.7:40200", DstAddr: "93.184.215.14:80", Timestamp: at(3)}
+	f.guard <- networkguard.NetGuardEvent{NetEvent: ebpf.NetEvent{PID: 5201, Comm: "curl", Type: ebpf.NetConnect,
+		Protocol: 6, DstAddr: "93.184.215.14:80", Timestamp: at(4)}, Blocked: true}
+	f.guard <- networkguard.NetGuardEvent{NetEvent: ebpf.NetEvent{PID: 5300, Comm: "node", Type: ebpf.NetConnect,
+		Protocol: 6, DstAddr: "104.16.0.35:443", Timestamp: at(5)}, Blocked: true, Reason: "ld-preload"}
+	f.guard <- networkguard.NetGuardEvent{NetEvent: ebpf.NetEvent{PID: 5100, Comm: "firefox", Type: ebpf.NetConnect,
+		Protocol: 6, DstAddr: "140.82.121.4:443", Timestamp: at(6)}}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c, _ := s.network.Counts(); c.Observed+c.Allowed+c.Denied == 7 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("network events never arrived")
+}
+
+// snapInstall renders the Install page with a staged build, a run in progress, a failed run and a
+// prompt.
+func snapInstall(t *testing.T, s *shell, prefix string) {
+	t.Helper()
+	ip := newInstallPage(s)
+	s.install = ip
+	s.views[pageInstall] = ip.view()
+	s.show(pageInstall)
+	ip.bin = &stagedBinary{path: "/tmp/app-listener-gui-81723/app-listener-local", sha: strings.Repeat("3fa9c0d1", 8)}
+	ip.present = installedBinary{present: true, version: "v0.3.0", sha: "ff"}
+	ip.daemonUp = true
+	ip.renderBinary()
+	s.win.Resize(fyne.NewSize(1280, 1240)) // the whole overview, actions included
+	save(t, prefix+"Overview.png", s.win)
+	s.win.Resize(fyne.NewSize(1280, 820))
+
+	ip.run.start("Install wizard", "shield-check")
+	ip.show(ip.run.root)
+	for _, st := range []string{"Stopping the daemon", "Deploying the binary and the master key",
+		"Choosing what to protect", "Encrypting"} {
+		ip.run.stage(st)
+	}
+	now := time.Now()
+	for i, l := range []logLine{
+		{level: log.InfoLevel, text: "daemon stopped"},
+		{level: log.InfoLevel, text: "binary is installed: /usr/local/sbin/app-listener"},
+		{level: log.WarnLevel, text: "~/.config/Code: general-purpose tools whitelisted (python3)"},
+		{level: log.InfoLevel, text: "migrating /home/user/.ssh into an encrypted directory"},
+	} {
+		l.at = now.Add(time.Duration(i) * time.Second)
+		ip.run.appendLog(l)
+	}
+	ip.run.progress("Encrypting /home/user/.ssh", 0.42)
+	save(t, prefix+"Run.png", s.win)
+
+	ip.run.finish(errors.New("filesystem /home is not fscrypt-ready: run `fscrypt setup /home`"), false)
+	save(t, prefix+"Failed.png", s.win)
+
+	ui := &installUI{s: s, run: ip.run}
+	ui.showMultiSelect("Which users should be protected?", "Their catalog folders are probed next.",
+		[]wizard.Choice{{Label: "alice (/home/alice)", Selected: true}, {Label: "bob (/home/bob)"}},
+		func(multiAnswer) {})
+	save(t, prefix+"Prompt.png", s.win)
+	s.win.Canvas().Overlays().Top().Hide()
+}

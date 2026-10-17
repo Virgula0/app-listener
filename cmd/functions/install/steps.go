@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
@@ -33,23 +32,20 @@ func pickUsers() ([]inst.User, error) {
 		return nil, fmt.Errorf("no login users with a home directory found in /etc/passwd")
 	}
 
-	opts := make([]huh.Option[inst.User], 0, len(users))
+	choices := make([]wizard.Choice, len(users))
 	for i := range users {
 		u := &users[i]
-		label := fmt.Sprintf("%s (uid %d, home %s)", u.Name, u.UID, u.Home)
-		opts = append(opts, huh.NewOption(label, *u).Selected(true))
+		choices[i] = wizard.Choice{Label: fmt.Sprintf("%s (uid %d, home %s)", u.Name, u.UID, u.Home), Selected: true}
 	}
-	var picked []inst.User
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewMultiSelect[inst.User]().
-			Title("Which users should be protected?").
-			Description("Every selected user's critical directories (SSH, keys, browsers, ...) are scanned in the next step.").
-			Options(opts...).
-			Height(10).
-			Value(&picked),
-	))
-	if err := form.WithKeyMap(wizard.MultiSelectKeymap()).Run(); err != nil {
+	idx, err := wizard.MultiSelect("Which users should be protected?",
+		"Every selected user's critical directories (SSH, keys, browsers, ...) are scanned in the next step.",
+		choices, 10)
+	if err != nil {
 		return nil, err
+	}
+	picked := make([]inst.User, 0, len(idx))
+	for _, i := range idx {
+		picked = append(picked, users[i])
 	}
 	if len(picked) == 0 {
 		return nil, fmt.Errorf("no users selected")
@@ -127,20 +123,12 @@ func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 // the multi-select, and returns the flattened per-path candidates of picked groups.
 func pickFromCandidates(candidates []inst.Candidate, title, description string) ([]inst.Candidate, error) {
 	groups := groupCandidates(candidates)
-	opts := make([]huh.Option[int], 0, len(groups))
+	choices := make([]wizard.Choice, len(groups))
 	for i := range groups {
-		opts = append(opts, huh.NewOption(groups[i].label, i).Selected(true))
+		choices[i] = wizard.Choice{Label: groups[i].label, Selected: true}
 	}
-	var pickedIdx []int
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewMultiSelect[int]().
-			Title(title).
-			Description(description).
-			Options(opts...).
-			Height(12).
-			Value(&pickedIdx),
-	))
-	if err := form.WithKeyMap(wizard.MultiSelectKeymap()).Run(); err != nil {
+	pickedIdx, err := wizard.MultiSelect(title, description, choices, 12)
+	if err != nil {
 		return nil, err
 	}
 	var picked []inst.Candidate
@@ -159,15 +147,13 @@ func pickFromCandidates(candidates []inst.Candidate, title, description string) 
 // doesn't exist is a fatal error (installer contract).
 func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error) {
 	for {
-		var input string
-		if err := huh.NewForm(huh.NewGroup(
-			huh.NewInput().
-				Title("Additional directory or file to protect").
-				Description("Leave empty and confirm to continue. The path must exist. Whitelist its binaries later in the editor.").
-				Prompt("> ").
-				Placeholder("/path/to/extra-secret (empty = done)").
-				Value(&input),
-		)).Run(); err != nil {
+		input, err := wizard.Input(wizard.Field{
+			Title:       "Additional directory or file to protect",
+			Description: "Leave empty and confirm to continue. The path must exist. Whitelist its binaries later in the editor.",
+			Placeholder: "/path/to/extra-secret (empty = done)",
+			Path:        true,
+		})
+		if err != nil {
 			return nil, err
 		}
 		input = strings.TrimSpace(input)
@@ -312,15 +298,13 @@ func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Confi
 			continue
 		}
 
-		answer := true
-		formErr := huh.NewForm(huh.NewGroup(
-			huh.NewConfirm().
-				Title(fmt.Sprintf("Require fscrypt encryption for %s?", sectionPath)).
-				Description("The resource is not encrypted yet: the installer will encrypt it in place, keeping a backup.").
-				Affirmative("Yes, encrypt").
-				Negative("No encryption").
-				Value(&answer),
-		)).Run()
+		answer, formErr := wizard.Confirm(wizard.Question{
+			Title:       fmt.Sprintf("Require fscrypt encryption for %s?", sectionPath),
+			Description: "The resource is not encrypted yet: the installer will encrypt it in place, keeping a backup.",
+			Affirmative: "Yes, encrypt",
+			Negative:    "No encryption",
+			Default:     true,
+		})
 		if formErr != nil {
 			return "", nil, formErr
 		}

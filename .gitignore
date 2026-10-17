@@ -4,6 +4,7 @@ build/linux/
 # Generated BPF bindings (intermediate)
 build/generated/
 build/test
+build/gui-test
 build/bpfstats
 build/pprof
 

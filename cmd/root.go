@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/Virgula0/app-listener/cmd/functions/daemon"
+	"github.com/Virgula0/app-listener/cmd/functions/desktop"
 	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
 	"github.com/Virgula0/app-listener/cmd/functions/guard"
 	"github.com/Virgula0/app-listener/cmd/functions/install"
@@ -28,8 +29,9 @@ var rootCmd = &cobra.Command{
 	Long: `app-listener is a TUI/GUI application that monitors and guards
 file system operations using eBPF.
 
-Use --gui to launch the graphical interface instead of the terminal TUI
-(only available for the monitor subcommand).`,
+Use --gui (GUI build only) to open the desktop window instead: it covers the
+file and network workspaces and the installer, and ignores every other
+subcommand and flag.`,
 	// Enables the built-in --version flag; value injected at build time
 	// (see internal/constants.Version).
 	Version: constants.Version,
@@ -55,8 +57,8 @@ Use --gui to launch the graphical interface instead of the terminal TUI
 	},
 }
 
-// guiFlag backs the persistent --gui flag, consumed by the monitor subcommand
-// (the only one that currently supports a GUI backend).
+// guiFlag registers --gui for help and parsing only: Execute intercepts it before cobra runs
+// (desktop.Requested).
 var guiFlag bool
 
 // verboseFlag backs the global --verbose (constants.VerboseLevel ladder) for the headless console
@@ -81,6 +83,10 @@ var overwritePrompt = func(path string) (bool, error) {
 }
 
 func Execute() error {
+	if on, ignored := desktop.Requested(os.Args[1:]); on {
+		initLogger()
+		return desktop.Run(ignored)
+	}
 	return rootCmd.Execute()
 }
 
@@ -99,7 +105,7 @@ func initLogger() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().BoolVarP(&guiFlag, "gui", "", false, "Launch the desktop GUI instead of the TUI (monitor only; requires a build with -tags gui / make GUI=1)")
+	rootCmd.PersistentFlags().BoolVarP(&guiFlag, "gui", "", false, "Open the desktop GUI; every other subcommand and flag is ignored (requires the GUI build: -tags gui / make GUI=1)")
 	rootCmd.PersistentFlags().IntVarP(&verboseFlag, "verbose", "v", 0,
 		fmt.Sprintf("Verbosity level 0..%d for the headless console stream and --dump-log "+
 			"(%d=errors only, %d=essential, %d=current display, %d=+internal details, %d=everything). "+

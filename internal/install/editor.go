@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Virgula0/app-listener/internal/codeedit"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // ErrEditCanceled is returned by EditText when the user aborts the
@@ -33,6 +34,13 @@ const (
 // name names (see codeedit.NewHighlighter). Ctrl+S saves and returns the text; Esc aborts with
 // ErrEditCanceled.
 func EditText(title, name, initial string) (string, error) {
+	if ui := wizard.Active(); ui != nil {
+		text, err := ui.EditText(title, name, initial)
+		if errors.Is(err, wizard.ErrCanceled) {
+			return "", ErrEditCanceled
+		}
+		return text, err
+	}
 	m := newEditorModel(title, name, initial)
 	p := tea.NewProgram(&m, tea.WithAltScreen())
 	result, err := p.Run()
