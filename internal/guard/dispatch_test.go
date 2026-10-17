@@ -53,6 +53,10 @@ func TestDeliverLabelsCrossResourceProcessGates(t *testing.T) {
 	if got := nextLabel(r2); got != "/r2" {
 		t.Fatalf("a one-resource process gate is that resource's: %q", got)
 	}
+	e.deliver(resGlobal, &GuardEvent{Blocked: true})
+	if got := nextLabel(r1); got != CrossResourceLabel {
+		t.Fatalf("a cross-resource rename must not be labelled with its reporter's path: %q", got)
+	}
 }
 
 func TestSetInspectorsBounded(t *testing.T) {

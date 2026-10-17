@@ -76,6 +76,13 @@ lib_binary /home/alice/.local/share/Steam/ubuntu12_32/steam
 The block name is a label the installer uses to find the block again. Older configs that nest
 these directives inside a `[watch]` section are still accepted.
 
+Moving a file from one guarded tree into another is refused to every process but the daemon,
+with one exception: two `lib_dir` trees with exactly the same writers, where those writers may
+rename a file (not a directory) from one into the other. That is how Steam installs an update from
+its staging dir `package/` into `linux32/`, `ubuntu12_32/` and the other runtime dirs. The moved
+file stays protected by the tree it lands in. A refused move is logged with
+`resource=cross-resource`.
+
 ## Generic Electron apps: `[electron_apps]`
 
 An Electron with `resources/default_app.asar` next to it (Arch's `/usr/lib/electronNN/electron`,

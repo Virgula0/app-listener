@@ -799,8 +799,12 @@ func (e *engine) deliver(resID uint32, ev *GuardEvent) {
 	switch {
 	case resID == resGlobal:
 		target = e.globalOwnerLocked()
-		if ev.Process != "" {
+		switch {
+		case ev.Process != "":
 			ev.Scope = MultipleResourceLabel
+		case ev.FsGate == "":
+			// The only other file events this slot judges: a rename/link between two resources.
+			ev.Scope = CrossResourceLabel
 		}
 	case e.setAt[resID] != "":
 		target = e.setOwnerLocked(resID)

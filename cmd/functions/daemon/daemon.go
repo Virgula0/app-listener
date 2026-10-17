@@ -1090,7 +1090,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	}
 	opts = append(opts, eventFilterOptions()...)
 	if r.ReadOnly {
-		opts = append(opts, guard.WithChmodDropWrite())
+		opts = append(opts, guard.WithChmodDropWrite(), guard.WithMovePeer(r.MovePeer()))
 	}
 	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0, opts...)
 	if err != nil {

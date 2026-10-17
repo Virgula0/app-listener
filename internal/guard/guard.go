@@ -86,6 +86,10 @@ func (ev *GuardEvent) Op() string {
 // resources no taint set covers, and which ones is not recorded.
 const MultipleResourceLabel = "multiple"
 
+// CrossResourceLabel is GuardEvent.Scope for a rename or link between two resources, judged by the
+// GLOBAL slot (xres_judge in guard.bpf.c): it belongs to neither resource's guard.
+const CrossResourceLabel = "cross-resource"
+
 // ResourceLabel is what ev is logged under when delivered to the guard of resource.
 func (ev *GuardEvent) ResourceLabel(resource string) string {
 	switch {
@@ -253,6 +257,8 @@ type Guard struct {
 	quietPID uint32
 	// chmodDropWrite: WithChmodDropWrite.
 	chmodDropWrite bool
+	// movePeer: WithMovePeer.
+	movePeer uint64
 	// systemPatterns: WithSystemPatterns.
 	systemPatterns []daemonconfig.BinaryRule
 	// vetted: whitelist path -> the inode it was hashed from (binaryKey). Guarded by mu.
@@ -337,6 +343,15 @@ func WithoutAllowedEvents() GuardOption {
 func WithoutOwnAllowedEvents() GuardOption {
 	return func(g *Guard) {
 		g.quietPID = uint32(os.Getpid()) //nolint:gosec // pids fit in 32 bits (PID_MAX_LIMIT 2^22)
+	}
+}
+
+// WithMovePeer sets a lib_dir's move-peer class (daemonconfig.Resource.MovePeer): a file may be
+// renamed between two lib_dirs of one nonzero class by their (identical) writers; see
+// xres_judge_move in guard.bpf.c.
+func WithMovePeer(peer uint64) GuardOption {
+	return func(g *Guard) {
+		g.movePeer = peer
 	}
 }
 
@@ -1478,6 +1493,9 @@ func (g *Guard) writeGuardConfig(modeKey uint64) error {
 	}
 	if g.chmodDropWrite {
 		cfg.ChmodDropWrite = 1
+	}
+	if g.mode == ModeReadOnly {
+		cfg.MovePeer = g.movePeer
 	}
 	if putErr := g.objs().GuardResConfig.Put(g.resID, cfg); putErr != nil {
 		return fmt.Errorf("writing resource slot %d: %w", g.resID, putErr)
