@@ -56,7 +56,7 @@ func ShowDiff(title, diff string) error {
 		return ui.ShowDiff(title, diff)
 	}
 	m := newDiffModel(title, diff)
-	p := tea.NewProgram(&m, tea.WithAltScreen())
+	p := tea.NewProgram(&m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }
@@ -65,7 +65,10 @@ type diffModel struct {
 	textarea textarea.Model
 	hl       *codeedit.Highlighter
 	find     codeedit.Finder
+	sel      codeedit.Selection
 	title    string
+	// top is the viewer's first screen row in the last View (mouse coordinates).
+	top int
 }
 
 func newDiffModel(title, diff string) diffModel {
@@ -90,9 +93,16 @@ func (m *diffModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetWidth(max(msg.Width-editorSidePadding, editMinWidth))
 		m.textarea.SetHeight(max(msg.Height-editorChromeLines, editMinHeight))
 	}
+	if msg, ok := msg.(tea.MouseMsg); ok {
+		m.sel.Mouse(&m.textarea, m.hl, msg, msg.X, msg.Y-m.top)
+		return m, nil
+	}
 	if msg, ok := msg.(tea.KeyMsg); ok {
 		if m.find.Update(&m.textarea, msg) {
 			return m, nil
+		}
+		if ok, cmd := m.sel.Key(&m.textarea, msg, false); ok {
+			return m, cmd
 		}
 		switch msg.String() {
 		case "q", "esc", "enter", "ctrl+q":
@@ -116,8 +126,9 @@ func (m *diffModel) View() string {
 	b.WriteString("\n\n")
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color("240")).
-		Render("q / Esc / Enter: continue  ·  Ctrl+F find"))
+		Render("q / Esc / Enter: continue  ·  Ctrl+F find  ·  Shift+arrows/mouse select  ·  Ctrl+C copy"))
 	b.WriteString("\n\n")
-	b.WriteString(m.find.View(m.hl, &m.textarea))
+	m.top = lipgloss.Height(b.String()) - 1
+	b.WriteString(m.find.View(m.hl, &m.textarea, &m.sel))
 	return b.String()
 }

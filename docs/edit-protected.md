@@ -13,8 +13,13 @@ sudo app-listener edit-protected --timeout-session 10m  # revoke a live session 
 sudo app-listener edit-protected --edit-config          # edit the running daemon.conf; saving reloads it
 ```
 
-It opens the directory in a two-pane editor. `Ctrl+S` saves atomically. Binaries, symlinks and
-files over 2 MiB are refused.
+It opens the directory in a two-pane editor, the file tree on the left. `Ctrl+S` saves
+atomically. Binaries, symlinks and files over 2 MiB are refused.
+
+`Alt+←` and `Alt+→` move between the tree and the editor; the focused pane's title is
+underlined. The open file stays in the editor while you browse the tree, and `Esc` closes it.
+`Ctrl+B` hides the tree and shows it again (`Alt+←` shows it too). Opening another file over unsaved changes asks first.
+A click selects a tree row and a second click opens it; a click in the editor places the cursor.
 
 ## Offline and live mode
 
@@ -131,10 +136,23 @@ diff/changelog viewers open at the first line.
 | `Ctrl+S` | Save |
 | `Tab` / `Shift+Tab` | Indent / dedent by four spaces |
 | `PgUp` / `PgDn` | Page |
-| `Ctrl+←` / `Ctrl+→` | Jump between words and punctuation, across lines |
+| `Ctrl+←` / `Ctrl+→` | Jump between words and punctuation, across lines (`Alt+←` / `Alt+→` too, except in edit-protected, where they switch panes) |
+| `Shift` + arrows, `Home`, `End` | Select; with `Ctrl+Shift`, `←`/`→` select by word and `Home`/`End` to the buffer's ends |
+| Mouse drag | Select (the wheel scrolls) |
+| `Ctrl+A` | Select everything |
+| `Ctrl+C` | Copy the selection |
+| `Ctrl+X` / `Ctrl+V` | Cut / paste (editors only); typing, `Backspace` or `Delete` replace the selection |
+| `Esc` | Drop the selection (when there is one) |
 | `Ctrl+F` | Find box: *Search* jumps to the next match, *Search all* marks every match |
 | `Ctrl+R` | Find and replace (editors only): *Replace* / *Replace all* |
 | `Tab`, `Enter`, `Esc` (in a box) | Move between fields, activate, close |
+
+The editors capture the mouse, so a drag selects text in the editor only, never the tree or the
+line numbers. Most terminals still make their own selection with `Shift` held down. Copying uses
+the OSC 52 escape sequence, which puts the text on your desktop clipboard through `sudo`, `ssh`
+and tmux (with `set-clipboard on`) in terminals that support it (kitty, foot, Alacritty, WezTerm,
+iTerm2, Windows Terminal, ...). `Ctrl+V` pastes what was last copied in the editor; your terminal's
+paste (usually `Ctrl+Shift+V`) pastes from the desktop clipboard.
 
 Matching is literal and smart-case: case-sensitive only when the query has an upper-case letter.
 Text is syntax-highlighted by file name or `#!` line (Go, Python, C, shell, JSON, YAML, TOML, INI,

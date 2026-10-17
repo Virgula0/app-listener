@@ -42,7 +42,7 @@ func EditText(title, name, initial string) (string, error) {
 		return text, err
 	}
 	m := newEditorModel(title, name, initial)
-	p := tea.NewProgram(&m, tea.WithAltScreen())
+	p := tea.NewProgram(&m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	result, err := p.Run()
 	if err != nil {
 		return "", err
@@ -61,8 +61,11 @@ type editorModel struct {
 	textarea textarea.Model
 	hl       *codeedit.Highlighter
 	find     codeedit.Finder
+	sel      codeedit.Selection
 	title    string
 	canceled bool
+	// top is the editor's first screen row in the last View (mouse coordinates).
+	top int
 }
 
 func newEditorModel(title, name, initial string) editorModel {
@@ -88,9 +91,16 @@ func (m *editorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textarea.SetWidth(max(msg.Width-editorSidePadding, editMinWidth))
 		m.textarea.SetHeight(max(msg.Height-editorChromeLines, editMinHeight))
 	}
+	if msg, ok := msg.(tea.MouseMsg); ok {
+		m.sel.Mouse(&m.textarea, m.hl, msg, msg.X, msg.Y-m.top)
+		return m, nil
+	}
 	if msg, ok := msg.(tea.KeyMsg); ok {
 		if m.find.Update(&m.textarea, msg) {
 			return m, nil
+		}
+		if ok, cmd := m.sel.Key(&m.textarea, msg, true); ok {
+			return m, cmd
 		}
 		switch msg.String() {
 		case editSaveKey:
@@ -119,8 +129,10 @@ func (m *editorModel) View() string {
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(lipgloss.Color("240")).
 		Render("Ctrl+S save  ·  Esc cancel (no changes are kept)  ·  Ctrl+F find  ·  Ctrl+R replace  ·  " +
-			"Ctrl+←/→ word  ·  PgUp/PgDn page  ·  Tab indent"))
+			"Ctrl+←/→ word  ·  Shift+arrows/mouse select  ·  Ctrl+C/X/V copy/cut/paste  ·  PgUp/PgDn page  ·  " +
+			"Tab indent"))
 	b.WriteString("\n\n")
-	b.WriteString(m.find.View(m.hl, &m.textarea))
+	m.top = lipgloss.Height(b.String()) - 1
+	b.WriteString(m.find.View(m.hl, &m.textarea, &m.sel))
 	return b.String()
 }

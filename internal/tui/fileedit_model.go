@@ -74,6 +74,10 @@ var (
 			Foreground(lipgloss.Color("141"))
 
 	paneSepStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+
+	// The focused pane's title is underlined across the pane, like tmux's active border.
+	paneTitleActive = lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("141"))
+	paneTitleIdle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 )
 
 // fileNode is one row of the lazily-expanding tree of the opened vault.
@@ -108,10 +112,15 @@ type fileEditModel struct {
 	editor    textarea.Model
 	hl        *codeedit.Highlighter
 	find      codeedit.Finder
+	sel       codeedit.Selection
 	editPath  string
 	original  string
 	dirty     bool
 	previewOK bool
+	// editorOpen keeps the file in the right pane while the tree has the focus (Alt+←); Esc or
+	// Ctrl+S in the editor closes it.
+	editorOpen bool
+	treeHidden bool
 
 	input     textinput.Model
 	inputKind fileKind
@@ -128,6 +137,7 @@ type fileEditModel struct {
 	confirmPrompt string
 	confirmQuit   bool
 	pendingDelete string
+	pendingOpen   *fileNode
 
 	width  int
 	height int
@@ -143,7 +153,9 @@ type fileEditModel struct {
 func RunFileEditor(root string) error {
 	m := newFileEditModel(root)
 	defer m.vault.close()
-	prog := tea.NewProgram(m, tea.WithAltScreen())
+	// Mouse capture keeps a drag inside the editor (the terminal's own selection spans both
+	// panes); RunFileEditorSession captures it too.
+	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := prog.Run()
 	return err
 }
@@ -202,19 +214,34 @@ func (m *fileEditModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
 	case tea.KeyMsg:
-		prevMode := m.mode
+		before := m.layoutKey()
 		cmd, quit := m.handleKey(msg)
 		if quit {
 			return m, tea.Quit
 		}
-		if m.mode != prevMode {
-			// A mode change alters the pane split (sidebar/half/focus): re-fit before the next
-			// render.
+		if m.layoutKey() != before {
 			m.refit()
 		}
 		return m, cmd
+	case tea.MouseMsg:
+		before := m.layoutKey()
+		m.handleMouse(msg)
+		if m.layoutKey() != before {
+			m.refit()
+		}
 	}
 	return m, nil
+}
+
+// layoutKey is what the pane split depends on: a change re-fits before the next render.
+func (m *fileEditModel) layoutKey() [3]int {
+	b := func(v bool) int {
+		if v {
+			return 1
+		}
+		return 0
+	}
+	return [3]int{int(m.mode), b(m.editorOpen), b(m.treeHidden)}
 }
 
 // treeSidebarWidth: tree pane width while editing (the editor is the focus; the tree shrinks to a
@@ -222,10 +249,14 @@ func (m *fileEditModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 const treeSidebarWidth = 32
 
 // paneLayout returns the tree and right-pane widths for the current mode from the usable content
-// width minus one separator column: modeEdit uses a sidebar, other modes split evenly.
+// width minus one separator column: an open editor gets a sidebar tree, a hidden tree none, other
+// modes split evenly.
 func (m *fileEditModel) paneLayout() (left, right int) {
 	usable := max(m.width-appStyle.GetHorizontalMargins(), 4)
-	if m.mode == modeEdit {
+	if m.treeHidden {
+		return 0, usable
+	}
+	if m.mode == modeEdit || m.editorOpen {
 		left = min(treeSidebarWidth, usable/3)
 	} else {
 		left = usable / 2
@@ -246,11 +277,14 @@ func (m *fileEditModel) resize(width, height int) {
 func (m *fileEditModel) refit() {
 	m.leftW, m.rightW = m.paneLayout()
 	m.editor.SetWidth(max(m.rightW, 10))
-	m.editor.SetHeight(max(m.paneHeight()-1, 3))
+	m.editor.SetHeight(max(m.contentHeight(), 3))
 	m.ensureCursorVisible()
 }
 
 func (m *fileEditModel) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if (m.mode == modeNav || m.mode == modeEdit && !m.find.Active()) && m.paneKey(msg.String()) {
+		return nil, false
+	}
 	switch m.mode {
 	case modeNav:
 		return m.updateNavKey(msg)
@@ -311,7 +345,11 @@ func (m *fileEditModel) navAction(msg tea.KeyMsg) bool {
 		m.beginChown()
 	case "ctrl+s":
 		m.savePending()
-	case "q", keyEsc, "ctrl+c":
+	case keyEsc, "q", "ctrl+c":
+		if msg.String() == keyEsc && m.editorOpen {
+			m.closeEditor()
+			return false
+		}
 		if m.editPath != "" && m.dirty {
 			m.confirmPrompt = "Discard unsaved changes to " + filepath.Base(m.editPath) + "?"
 			m.confirmQuit = true
@@ -328,17 +366,21 @@ func (m *fileEditModel) updateEditKey(msg tea.KeyMsg) (textarea.Model, tea.Cmd) 
 		m.dirty = m.editor.Value() != m.original
 		return m.editor, nil
 	}
+	if ok, cmd := m.sel.Key(&m.editor, msg, true); ok {
+		m.dirty = m.editor.Value() != m.original
+		if note := m.sel.TakeNote(); note != "" {
+			m.status = note
+		}
+		return m.editor, cmd
+	}
 	switch msg.String() {
 	case "ctrl+s":
 		if err := m.save(); err != nil {
 			m.status = err.Error()
 		}
-		m.find.Close()
-		m.editor.Blur()
-		m.mode = modeNav
+		m.closeEditor()
 	case keyEsc:
-		m.editor.Blur()
-		m.mode = modeNav
+		m.closeEditor()
 	default:
 		var cmd tea.Cmd
 		if !codeedit.Edit(&m.editor, msg) {
@@ -386,7 +428,7 @@ func (m *fileEditModel) updateChownKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	switch msg.String() {
 	case "j", "down":
 		m.chownCur = clamp(m.chownCur+1, len(m.chownUsers)-1)
-		rows := max(m.paneHeight()-2, 1)
+		rows := max(m.contentHeight()-2, 1)
 		if m.chownCur >= m.chownTop+rows {
 			m.chownTop = m.chownCur - rows + 1
 		}
@@ -409,11 +451,143 @@ func (m *fileEditModel) updateConfirmKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		if m.confirmQuit {
 			return nil, true
 		}
+		if n := m.pendingOpen; n != nil {
+			m.pendingOpen, m.dirty, m.mode = nil, false, modeNav
+			if i := m.indexOf(n); i >= 0 {
+				m.cur = i
+			}
+			if err := m.enterEditor(); err != nil {
+				m.status = err.Error()
+			}
+			return nil, false
+		}
 		m.confirmDelete()
 	case "n", keyEsc, "q":
+		m.pendingOpen = nil
 		m.mode = modeNav
 	}
 	return nil, false
+}
+
+// paneKey moves between the panes (Alt+←/→) and hides the tree (Ctrl+B); reports whether it
+// used k. Ctrl+←/→ stay the editor's word jumps.
+func (m *fileEditModel) paneKey(k string) bool {
+	switch k {
+	case "alt+left":
+		m.focusTree()
+	case "alt+right":
+		m.focusEditor()
+	case "ctrl+b":
+		m.toggleTree()
+	default:
+		return false
+	}
+	return true
+}
+
+// focusTree gives the tree the keyboard; an open file stays on the right.
+func (m *fileEditModel) focusTree() {
+	m.treeHidden = false
+	if m.mode == modeEdit {
+		m.find.Close()
+		m.sel.Clear()
+		m.editor.Blur()
+		m.mode = modeNav
+	}
+}
+
+// focusEditor returns to the open file, else opens the selected file.
+func (m *fileEditModel) focusEditor() {
+	switch {
+	case m.mode == modeEdit:
+	case m.editorOpen:
+		m.mode = modeEdit
+		m.editor.Focus()
+		m.status = "editing " + m.editPath
+	default:
+		if n := m.selected(); n != nil && !n.isDir {
+			m.openSelected()
+		}
+	}
+}
+
+func (m *fileEditModel) toggleTree() {
+	switch {
+	case m.treeHidden:
+		m.treeHidden = false
+	case !m.editorOpen:
+		m.status = "open a file first: the file tree is the only pane"
+	default:
+		m.treeHidden = true
+		m.focusEditor()
+	}
+}
+
+// closeEditor leaves the editor for the tree and its details pane; unsaved changes stay in the
+// buffer until another file is opened.
+func (m *fileEditModel) closeEditor() {
+	m.find.Close()
+	m.sel.Clear()
+	m.editor.Blur()
+	m.editorOpen, m.treeHidden = false, false
+	m.mode = modeNav
+}
+
+// handleMouse: a click selects a tree row (a second click opens it) or places the editor's cursor
+// and starts a selection; dragging extends it; the wheel scrolls the pane under the pointer.
+func (m *fileEditModel) handleMouse(msg tea.MouseMsg) {
+	if m.mode != modeNav && m.mode != modeEdit {
+		return
+	}
+	x, y := msg.X-appStyle.GetMarginLeft(), msg.Y-m.contentTop()
+	editorX := m.leftW + 1
+	if m.treeHidden {
+		editorX = 0
+	}
+	if m.sel.Dragging() || m.editorOpen && x >= editorX {
+		m.editorMouse(msg, x-editorX, y)
+		return
+	}
+	if !m.treeHidden && x < m.leftW {
+		m.treeMouse(msg, y)
+	}
+}
+
+// editorMouse: input on the editor focuses it first (a blurred textarea neither scrolls nor
+// takes the cursor).
+func (m *fileEditModel) editorMouse(msg tea.MouseMsg, x, y int) {
+	wheel := msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown
+	if m.mode == modeNav && (wheel || msg.Action == tea.MouseActionPress) {
+		m.focusEditor()
+	}
+	if m.mode == modeEdit {
+		m.sel.Mouse(&m.editor, m.hl, msg, x, y)
+	}
+}
+
+func (m *fileEditModel) treeMouse(msg tea.MouseMsg, y int) {
+	switch {
+	case msg.Button == tea.MouseButtonWheelUp:
+		m.move(-3)
+	case msg.Button == tea.MouseButtonWheelDown:
+		m.move(3)
+	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft:
+		i := m.top + y
+		if y < 0 || i >= len(m.rows) {
+			return
+		}
+		m.focusTree()
+		if i == m.cur {
+			m.openSelected()
+			return
+		}
+		m.cur = i
+	}
+}
+
+// contentTop is the screen row of the panes' first content row: margin, header, pane titles.
+func (m *fileEditModel) contentTop() int {
+	return appStyle.GetMarginTop() + 2
 }
 
 // loadChildren fills a directory node with sorted, lazily loaded children (directories first, then
@@ -492,7 +666,7 @@ func (m *fileEditModel) ensureCursorVisible() {
 	if m.cur < m.top {
 		m.top = m.cur
 	}
-	rows := m.paneHeight()
+	rows := m.contentHeight()
 	if m.cur >= m.top+rows {
 		m.top = m.cur - rows + 1
 	}
@@ -555,20 +729,27 @@ func (m *fileEditModel) enterEditor() error {
 		m.status = n.path + " is a symlink — editing it is refused"
 		return nil
 	}
-	if m.editPath == n.path && m.dirty {
-		m.mode = modeEdit
+	if m.editPath == n.path && (m.dirty || m.editorOpen) {
+		m.mode, m.editorOpen = modeEdit, true
 		m.editor.Focus()
 		m.status = "editing " + n.path
+		return nil
+	}
+	if m.dirty && m.editPath != "" {
+		m.confirmPrompt = "Discard unsaved changes to " + filepath.Base(m.editPath) + "?"
+		m.pendingOpen = n
+		m.mode = modeConfirm
 		return nil
 	}
 	if err := m.previewFile(n.path); err != nil {
 		return err
 	}
 	if !m.previewOK {
+		m.editorOpen = false
 		m.status = "cannot edit " + n.path
 		return nil
 	}
-	m.mode = modeEdit
+	m.mode, m.editorOpen = modeEdit, true
 	m.editor.Focus()
 	m.status = "editing " + n.path
 	return nil
@@ -601,6 +782,7 @@ func (m *fileEditModel) previewFile(path string) error {
 	m.original = string(data)
 	m.hl = codeedit.NewHighlighter(path, m.original)
 	m.find.Close()
+	m.sel.Clear()
 	codeedit.SetText(&m.editor, m.original)
 	m.previewOK = true
 	m.dirty = false
@@ -899,8 +1081,14 @@ func (m *fileEditModel) paneHeight() int {
 	if m.height < 6 {
 		return 2
 	}
-	// 2 chrome rows (header + top margin) plus the legend's wrapped rows at this width.
-	return max(m.height-2-m.legendRows(), 2)
+	// The margins, the header row and the legend's wrapped rows. A frame taller than the
+	// terminal loses its top rows, which shifts every mouse row by as many.
+	return max(m.height-appStyle.GetVerticalMargins()-1-m.legendRows(), 2)
+}
+
+// contentHeight is a pane's height below its title row.
+func (m *fileEditModel) contentHeight() int {
+	return max(m.paneHeight()-1, 1)
 }
 
 // legendRows: terminal rows the width-wrapped legend occupies in the current mode.
@@ -927,16 +1115,56 @@ func (m *fileEditModel) View() string {
 	return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, head, m.body(), m.legend()))
 }
 
-// body lays the tree and info/editor pane side by side, each fixed to its column width.
+// body lays the tree and info/editor pane side by side, each fixed to its column width and titled,
+// the focused pane's title underlined.
 func (m *fileEditModel) body() string {
-	return lipgloss.JoinHorizontal(lipgloss.Top,
-		m.renderTree(m.leftW, m.paneHeight()),
-		paneSepStyle.Render("│"),
-		// Fix the right column to rightW so it reaches the terminal edge (renderRight clips to
-		// rightW, so Width only pads; MaxWidth guards a stray wide line).
-		lipgloss.NewStyle().Width(m.rightW).MaxWidth(m.rightW).
-			Render(m.renderRight(m.rightW, m.paneHeight())),
-	)
+	h, ph := m.contentHeight(), m.paneHeight()
+	// Fix the right column to rightW so it reaches the terminal edge (renderRight clips to
+	// rightW, so Width only pads; MaxWidth guards a stray wide line), and both panes to exactly
+	// paneHeight rows: see paneHeight.
+	pane := lipgloss.NewStyle().Height(ph).MaxHeight(ph)
+	right := pane.Width(m.rightW).MaxWidth(m.rightW).Render(
+		paneTitle(m.rightTitle(), m.rightW, m.mode != modeNav) + "\n" +
+			strings.TrimSuffix(m.renderRight(m.rightW, h), "\n"))
+	if m.treeHidden {
+		return right
+	}
+	left := pane.Render(paneTitle("Files", m.leftW, m.mode == modeNav) + "\n" +
+		strings.TrimSuffix(m.renderTree(m.leftW, h), "\n"))
+	sep := strings.TrimSuffix(strings.Repeat("│\n", ph), "\n")
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, paneSepStyle.Render(sep), right)
+}
+
+func paneTitle(text string, width int, active bool) string {
+	label := clipLabel(" "+text, width)
+	label += strings.Repeat(" ", max(0, width-lipgloss.Width(label)))
+	if active {
+		return paneTitleActive.Render(label)
+	}
+	return paneTitleIdle.Render(label)
+}
+
+func (m *fileEditModel) rightTitle() string {
+	switch {
+	case m.mode == modeInput:
+		return "New entry"
+	case m.mode == modeChmod:
+		return "Permissions"
+	case m.mode == modeChown:
+		return "Owner"
+	case m.mode == modeConfirm:
+		return "Confirm"
+	case !m.editorOpen:
+		return "Details"
+	}
+	t := "Editor · " + filepath.Base(m.editPath)
+	if m.dirty {
+		t += " ●"
+	}
+	if m.treeHidden {
+		t += "   (ctrl+b shows the files)"
+	}
+	return t
 }
 
 func (m *fileEditModel) renderTree(width, height int) string {
@@ -966,8 +1194,10 @@ func (m *fileEditModel) renderTree(width, height int) string {
 
 func (m *fileEditModel) renderRight(width, height int) string {
 	switch m.mode {
-	case modeEdit:
-		return m.find.View(m.hl, &m.editor)
+	case modeNav, modeEdit:
+		if m.editorOpen {
+			return m.find.View(m.hl, &m.editor, &m.sel)
+		}
 	case modeInput:
 		kind := "file"
 		if m.inputKind == createDir {
@@ -1058,17 +1288,23 @@ var legendHints = map[fileEditMode][]hint{
 		{"↑/↓ j/k", "move"},
 		{"→/↵ l", "open"},
 		{"← h", "back"},
+		{"alt+→", "editor"},
+		{"ctrl+b", "toggle files"},
 		{"g/G", "top/bottom"},
 		{"a/A", "new file/dir"},
 		{"d", "delete"},
 		{"m", "chmod"},
 		{"c", "chown"},
 		{"ctrl+s", "save"},
-		{"q/esc", "quit"},
+		{"q/esc", "quit (esc: close the editor first)"},
 	},
 	modeEdit: {
 		{"ctrl+s", "save & close"},
 		{"esc", "close"},
+		{"alt+←", "files"},
+		{"ctrl+b", "toggle files"},
+		{"⇧+arrows/mouse", "select"},
+		{"ctrl+c/x/v", "copy/cut/paste"},
 		{"ctrl+f", "find"},
 		{"ctrl+r", "replace"},
 		{"ctrl+←/→", "word jump"},
