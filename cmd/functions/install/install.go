@@ -4,12 +4,13 @@
 package install
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
@@ -165,20 +166,28 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	return runWizard()
+}
+
+// runWizard is the installer body after the maintenance flags (steps 0-11 of the command help).
+func runWizard() error {
 	if err := checkRunningBinaryMatchesInstalled(); err != nil {
 		return err
 	}
 
 	// Stop the daemon first: it holds the files being reconfigured and would keep guarding the dirs
 	// being moved. Outside-systemd daemons are fatally refused (can't be controlled).
+	wizard.Stage("Stopping the daemon")
 	if err := systemd.StopDaemonIfRunning(); err != nil {
 		return err
 	}
 
+	wizard.Stage("Deploying the binary and the master key")
 	if err := prepareInstallation(); err != nil {
 		return err
 	}
 
+	wizard.Stage("Choosing what to protect")
 	cfgText, cfg, err := selectAndEditConfig()
 	if err != nil {
 		return err
@@ -192,6 +201,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	wizard.Stage("Encrypting")
 	vault := fscrypt.New()
 	cfgText, err = secureResources(vault, cfgText, cfg)
 	if err != nil {
@@ -205,10 +215,12 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	wizard.Stage("Installing services and starting the daemon")
 	if err := deploy(cfgText, sshUsers, bunUsers, editPassword); err != nil {
 		return err
 	}
 
+	wizard.Stage("Cleaning up")
 	if err := cleanOrphanedFscrypt(cfg); err != nil {
 		return err
 	}
@@ -306,44 +318,47 @@ func validateMaintenanceFlags(f maintenanceFlags) error {
 // build ships is diffed and asked, then whether to restart the daemon now or leave it on the old
 // binary until a manual restart.
 func installBinaryOnly() error {
-	if err := buildBinaryIfNeeded(); err != nil {
-		return err
+	src := deploySource
+	if src == "" {
+		if err := buildBinaryIfNeeded(); err != nil {
+			return err
+		}
+		src = buildBinaryPath
 	}
 
 	if !systemd.DaemonUnitInstalled() {
-		if err := systemd.DeployInstalledBinary(buildBinaryPath, nil); err != nil {
+		if err := systemd.DeployInstalledBinary(src, nil); err != nil {
 			return fmt.Errorf("installing binary: %w", err)
 		}
 		log.Info("binary-only install complete: binary deployed; the daemon service is not installed (run `sudo app-listener install`)")
 		return nil
 	}
 
-	unit, err := systemd.PlanDaemonUnitUpdate(buildBinaryPath, inst.ConfirmOverwrite)
+	unit, err := systemd.PlanDaemonUnitUpdate(src, inst.ConfirmOverwrite)
 	if err != nil {
 		return err
 	}
 
-	restart := true
-	if formErr := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Restart the daemon now?").
-			Description("The daemon service is installed. Restarting picks up the new binary immediately (the current default). Skipping leaves the running daemon on the old binary — restart it yourself later (systemctl restart app-listener-daemon) to run the new one.").
-			Affirmative("Yes, restart now").
-			Negative("No, skip the restart").
-			Value(&restart),
-	)).Run(); formErr != nil {
+	restart, formErr := wizard.Confirm(wizard.Question{
+		Title:       "Restart the daemon now?",
+		Description: "The daemon service is installed. Restarting picks up the new binary immediately (the current default). Skipping leaves the running daemon on the old binary — restart it yourself later (systemctl restart app-listener-daemon) to run the new one.",
+		Affirmative: "Yes, restart now",
+		Negative:    "No, skip the restart",
+		Default:     true,
+	})
+	if formErr != nil {
 		return formErr
 	}
 
 	if !restart {
-		if err := systemd.DeployInstalledBinaryNoRestart(buildBinaryPath, unit); err != nil {
+		if err := systemd.DeployInstalledBinaryNoRestart(src, unit); err != nil {
 			return fmt.Errorf("installing binary: %w", err)
 		}
 		log.Info("binary-only install complete: binary deployed; the daemon restart was skipped — restart it manually (systemctl restart app-listener-daemon) to run the new binary")
 		return nil
 	}
 
-	if err := systemd.DeployInstalledBinary(buildBinaryPath, unit); err != nil {
+	if err := systemd.DeployInstalledBinary(src, unit); err != nil {
 		return fmt.Errorf("installing binary: %w", err)
 	}
 	log.Info("binary-only install complete: the daemon is running the new binary")
@@ -449,6 +464,9 @@ func checkRunningBinaryMatchesInstalled() error {
 	if err != nil {
 		return nil //nolint:nilerr // nothing installed yet: ensureInstalledBinary deploys this exact binary next
 	}
+	if deploySource != "" {
+		return checkInstalledMatchesSource()
+	}
 
 	self, err := os.Executable()
 	if err != nil {
@@ -476,6 +494,48 @@ func checkRunningBinaryMatchesInstalled() error {
 		self, installedBinaryPath, self)
 }
 
+// checkInstalledMatchesSource is checkRunningBinaryMatchesInstalled for a GUI run: the window is
+// never the deployed binary, so the installed one must be byte-identical to the headless build this
+// run would deploy, or the daemon that comes back would be another version than the one configured.
+func checkInstalledMatchesSource() error {
+	same, err := sameContent(installedBinaryPath, deploySource)
+	if err != nil {
+		return err
+	}
+	if !same {
+		return fmt.Errorf("the binary installed at %s is not this version's headless build: deploy it "+
+			"first from a terminal (`app-listener update`, or `install --binary-only`), then run the wizard again", installedBinaryPath)
+	}
+	return nil
+}
+
+func sameContent(a, b string) (bool, error) {
+	ha, err := fileSHA256(a)
+	if err != nil {
+		return false, err
+	}
+	hb, err := fileSHA256(b)
+	if err != nil {
+		return false, err
+	}
+	return ha == hb, nil
+}
+
+func fileSHA256(path string) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return sum, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, fmt.Errorf("hashing %s: %w", path, err)
+	}
+	h.Sum(sum[:0])
+	return sum, nil
+}
+
 // ensureInstalledBinary makes sure the binary is deployed at its service path. An existing one is
 // left untouched (upgrades go through `install --binary-only` or `app-listener update`, which
 // restart the daemon). A missing one (first run after `make build` or the one-line installer) is
@@ -488,14 +548,18 @@ func ensureInstalledBinary() error {
 		return fmt.Errorf("checking %s: %w", installedBinaryPath, err)
 	}
 
-	self, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("locating the running binary to deploy: %w", err)
+	self := deploySource
+	if self == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("locating the running binary to deploy: %w", err)
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(exe); resolveErr == nil {
+			exe = resolved
+		}
+		self = exe
 	}
-	if resolved, resolveErr := filepath.EvalSymlinks(self); resolveErr == nil {
-		self = resolved
-	}
-	log.Infof("binary not installed yet: deploying the running executable %s -> %s (no recompilation)", self, installedBinaryPath)
+	log.Infof("binary not installed yet: deploying %s -> %s (no recompilation)", self, installedBinaryPath)
 	if err := os.MkdirAll(filepath.Dir(installedBinaryPath), 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", filepath.Dir(installedBinaryPath), err)
 	}
@@ -723,15 +787,12 @@ func cleanupBackups(cfg *daemonconfig.Config) error {
 		if _, err := os.Lstat(backup); err != nil {
 			continue
 		}
-		remove := false
-		err := huh.NewForm(huh.NewGroup(
-			huh.NewConfirm().
-				Title(fmt.Sprintf("Remove migration backup %s?", backup)).
-				Description("The installation succeeded; the backup is no longer needed. The original unencrypted data was already copied into the encrypted directory.").
-				Affirmative("Remove").
-				Negative("Keep").
-				Value(&remove),
-		)).Run()
+		remove, err := wizard.Confirm(wizard.Question{
+			Title:       fmt.Sprintf("Remove migration backup %s?", backup),
+			Description: "The installation succeeded; the backup is no longer needed. The original unencrypted data was already copied into the encrypted directory.",
+			Affirmative: "Remove",
+			Negative:    "Keep",
+		})
 		if err != nil {
 			return err
 		}

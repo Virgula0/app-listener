@@ -6,12 +6,12 @@ import (
 	"slices"
 	"syscall"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // resolveFilesystemPrereqs makes every encryption root's filesystem ready for fscrypt. For each
@@ -98,16 +98,12 @@ func collectFilesystemPrereqs(vault *fscrypt.Vault, cfg *daemonconfig.Config) ([
 // confirmRunPrereq asks whether the installer should run one remediation
 // command now. Negative = abort the install.
 func confirmRunPrereq(p fscrypt.Prereq) (bool, error) {
-	proceed := false
-	err := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Prerequisite not met: " + p.Title).
-			Description(p.Reason +
-				"\n\nThe installer can run this now, as root:\n    " + p.Command() +
-				"\n\nChoose “Abort” to stop and run it yourself instead.").
-			Affirmative("Run it now").
-			Negative("Abort").
-			Value(&proceed),
-	)).Run()
-	return proceed, err
+	return wizard.Confirm(wizard.Question{
+		Title: "Prerequisite not met: " + p.Title,
+		Description: p.Reason +
+			"\n\nThe installer can run this now, as root:\n    " + p.Command() +
+			"\n\nChoose “Abort” to stop and run it yourself instead.",
+		Affirmative: "Run it now",
+		Negative:    "Abort",
+	})
 }

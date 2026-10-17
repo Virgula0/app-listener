@@ -383,9 +383,10 @@ var (
 // findBoxMaxWidth caps the box; it shrinks to fit narrow panes.
 const findBoxMaxWidth = 46
 
-// View renders ta through h (as Highlighter.View, with the matches marked) and, while open, the box
-// over its top-right corner, or the bottom-right one when the cursor is under the top.
-func (f *Finder) View(h *Highlighter, ta *textarea.Model) string {
+// View renders ta through h (as Highlighter.View, with the matches and sel marked) and, while
+// open, the box over its top-right corner, or the bottom-right one when the cursor is under the
+// top. sel may be nil.
+func (f *Finder) View(h *Highlighter, ta *textarea.Model, sel *Selection) string {
 	if h == nil {
 		h = &Highlighter{}
 	}
@@ -393,6 +394,7 @@ func (f *Finder) View(h *Highlighter, ta *textarea.Model) string {
 		f.refresh(ta)
 	}
 	h.marks, h.current, h.hasCurrent = f.marks()
+	h.markSelection(ta, sel)
 	base := h.View(ta)
 	if !f.open {
 		return base

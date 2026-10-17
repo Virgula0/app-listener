@@ -3,11 +3,11 @@ package install
 import (
 	"fmt"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/cmd/functions/editprotected"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // promptEditPassword offers the optional edit-protected password. Collected here, persisted only by
@@ -29,15 +29,14 @@ func promptEditPassword(cfg *daemonconfig.Config) (string, error) {
 		desc += "\nRecommended: at least one directory will be encrypted."
 	}
 
-	want := anyEncrypted
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title("Set an edit-protected authentication password? (optional)").
-			Description(desc).
-			Affirmative("Set a password").
-			Negative("Skip").
-			Value(&want),
-	)).Run(); err != nil {
+	want, err := wizard.Confirm(wizard.Question{
+		Title:       "Set an edit-protected authentication password? (optional)",
+		Description: desc,
+		Affirmative: "Set a password",
+		Negative:    "Skip",
+		Default:     anyEncrypted,
+	})
+	if err != nil {
 		return "", err
 	}
 	if !want {

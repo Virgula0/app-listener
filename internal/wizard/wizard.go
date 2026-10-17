@@ -10,24 +10,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
 // ConfirmOnce asks a single yes/no question (default: no).
 func ConfirmOnce(question, affirmative string) (bool, error) {
-	answer := false
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title(question).
-			Affirmative(affirmative).
-			Negative("Cancel").
-			Value(&answer),
-	)).Run(); err != nil {
-		return false, err
-	}
-	return answer, nil
+	return Confirm(Question{Title: question, Affirmative: affirmative, Negative: "Cancel"})
 }
 
 // bottomBar is a one-line progress bar pinned at the terminal bottom. Loggers (logrus and the
@@ -118,8 +107,11 @@ func renderBar(label string, fraction float64) string {
 }
 
 // WithBottomBar runs run with the progress bar active and loggers routed through it, restoring the
-// terminal on return.
+// terminal on return. Under a UI (Use) the bar is that UI's progress.
 func WithBottomBar(run func(bar *BottomBar) error) error {
+	if ui := Active(); ui != nil {
+		return ui.Progress(func(set func(string, float64)) error { return run(&BottomBar{ui: set}) })
+	}
 	bar := newBottomBar(os.Stderr)
 	prevStd := stdlog.Writer()
 	prevLogrus := log.StandardLogger().Out
@@ -137,9 +129,14 @@ func WithBottomBar(run func(bar *BottomBar) error) error {
 // WithBottomBar callbacks.
 type BottomBar struct {
 	*bottomBar
+	ui func(label string, fraction float64)
 }
 
 // Set renders (or updates) the bar at the bottom of the terminal.
 func (b *BottomBar) Set(label string, fraction float64) {
+	if b.ui != nil {
+		b.ui(label, fraction)
+		return
+	}
 	b.set(label, fraction)
 }

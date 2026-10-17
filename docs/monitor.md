@@ -35,5 +35,4 @@ daemon is active does not trip the daemon's guards on their protected files.
 | `-d, --depth <n>` | `0` | Max depth (needs `--recursive`; `0` = unlimited) |
 | `-e, --events <list>` | all | Comma-separated subset of the events above |
 | `--headless` | `false` | No TUI; log `EVENT\|` lines to stderr |
-| `--gui` | `false` | Desktop GUI (needs a `make build GUI=1` build). X11 or Wayland; under `sudo`/`pkexec` it reuses the invoking user's display session |
 | `--serve[=host:port]` | off | Mirror the TUI to a browser, see [How it works](how-it-works.md#watching-from-a-browser---serve) |

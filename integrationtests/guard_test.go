@@ -2437,6 +2437,17 @@ func (s *IntegrationSuite) TestGuard_SlotReuse_DoesNotInheritWhitelist() {
 	s.runGuardTest(c, "TestStoppedResourceWhitelistNotInheritedBySlotReuse")
 }
 
+// The GUI's live policy edit (Guard.SetBinaries): rows change on the running guard, each step
+// enforced by a real exec, in both modes; a stopped guard refuses and writes nothing.
+func (s *IntegrationSuite) TestGuard_SetBinaries_Live() {
+	c := s.newGuardTestContainer()
+	// pooled: terminated at suite end
+
+	s.runGuardTest(c, "TestSetBinariesWhitelistLive")
+	s.runGuardTest(c, "TestSetBinariesBlacklistLive")
+	s.runGuardTest(c, "TestSetBinariesRefusedAfterStop")
+}
+
 // Deferred-whitelist flow (the Discord startup fix): a binary unreadable at guard-build time stays
 // out of the whitelist (denied) until ResolvePendingBinaries runs after the "unlock", then is
 // allowed; the unlock never precedes the entry.

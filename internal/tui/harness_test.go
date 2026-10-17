@@ -47,7 +47,7 @@ func (s *editorHarness) TestChownInsideVault() {
 	target := root + "/config"
 	s.Require().NoError(os.WriteFile(target, []byte("x"), 0o600))
 	m := newFileEditModel(root)
-	defer m.vault.close()
+	defer m.vault.Close()
 	m.chownPath = target
 	m.chownUsers = []chownUser{{label: "nobody", uid: 65534, gid: 65534}}
 	m.applyChown()

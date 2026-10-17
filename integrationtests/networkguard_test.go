@@ -464,3 +464,22 @@ func (s *IntegrationSuite) TestNetworkGuard_CLI_Errors() {
 		s.Require().Containsf(out, tc.want, "%s: unexpected error message: %s", tc.name, out)
 	}
 }
+
+// runNetguardHarness runs one subtest of internal/networkguard/harness_test.go (netguardTestAmd64Bin).
+func (s *IntegrationSuite) runNetguardHarness(subtest string) {
+	c := s.netguardContainer()
+	// pooled: terminated at suite end
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, netguardTestAmd64Bin, "/networkguard.test", 0o755))
+	code, out := s.exec(c, []string{"sh", "-c",
+		"APPLISTENER_NETGUARD_HARNESS=1 /networkguard.test -test.v -test.run " +
+			shQuote("^TestNetGuardHarness/"+subtest+"$")})
+	s.Require().Equalf(0, code, "networkguard.test %s failed: %s", subtest, out)
+	s.Require().Containsf(out, "--- PASS: TestNetGuardHarness/"+subtest, "networkguard.test %s did not run: %s", subtest, out)
+}
+
+// The GUI replaces a running network guard on every policy edit: the new one must keep the old
+// one's code-suspect marks, and refuse to start when it can't read them.
+func (s *IntegrationSuite) TestNetworkGuard_SwapInheritsSuspectMarks() {
+	s.runNetguardHarness("TestSwapInheritsSuspectMarks")
+	s.runNetguardHarness("TestInheritFromStoppedGuardRefused")
+}

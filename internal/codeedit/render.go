@@ -281,11 +281,15 @@ const (
 	markNone = iota
 	markMatch
 	markCurrent
+	markSelected
 )
 
 func (h *Highlighter) markAt(l, col int) int {
 	if h.hasCurrent && h.current.line == l && col >= h.current.start && col < h.current.end {
 		return markCurrent
+	}
+	if h.selected(l, col) {
+		return markSelected
 	}
 	for _, m := range h.marks[l] {
 		if col >= m.start && col < m.end {
@@ -298,8 +302,11 @@ func (h *Highlighter) markAt(l, col int) int {
 // markStyle is token class c's color; a find match keeps it (plain text takes the keyword color),
 // underlined and bold, and the current match is reversed so the color becomes its background.
 func markStyle(c uint8, mk int) lipgloss.Style {
-	if mk == markNone {
+	switch mk {
+	case markNone:
 		return tokenStyles[c]
+	case markSelected:
+		return selectedStyle.Inherit(tokenStyles[c])
 	}
 	if c == clsNone || c >= clsStrong && c <= clsEmph {
 		c = clsKeyword

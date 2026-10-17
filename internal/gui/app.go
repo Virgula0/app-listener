@@ -1,552 +1,523 @@
 //go:build gui
 
-// Package gui is the optional fyne desktop window for `monitor --gui`, behind the `gui` build tag:
-// fyne adds X11/OpenGL/font/image dependencies (~15 MiB) and package-init goroutines that don't
-// belong in the daemon sharing this binary. Build with `-tags gui` (or `make build GUI=1`).
+// Package gui is the desktop window `app-listener --gui` opens, behind the `gui` build tag: fyne
+// adds X11/OpenGL/font/image dependencies (~15 MiB) and package-init goroutines that don't belong
+// in the daemon sharing this binary. Build with `-tags gui` (or `make build GUI=1`).
 package gui
 
 import (
 	"fmt"
-	"os"
-	"strings"
-	"sync"
+	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"github.com/jezek/xgb"
-	"github.com/jezek/xgb/xproto"
 
-	"github.com/Virgula0/app-listener/internal/infrastructure"
-	"github.com/Virgula0/app-listener/internal/procstats"
+	"github.com/Virgula0/app-listener/internal/wm"
+	"github.com/Virgula0/app-listener/internal/workbench"
 )
 
 // Available reports whether this binary was built with the fyne desktop GUI
 // (this file is only compiled under the `gui` build tag).
 const Available = true
 
-var colLabels = []string{"Time", "Type", "Process", "Path", "Detail"}
-var colDefaultWidths = []float32{120, 80, 90, 400, 200}
+const appID = "com.virgula0.app-listener"
 
-type columnState struct {
-	sync.RWMutex
-	widths []float32
+type pageID int
+
+const (
+	pageHome pageID = iota
+	pageFiles
+	pageNetwork
+	pageProtected
+	pageUpdate
+	pageInstall
+)
+
+type pageDef struct {
+	id       pageID
+	icon     string
+	title    string
+	subtitle string
 }
 
-func newColumnState(widths []float32) *columnState {
-	w := make([]float32, len(widths))
-	copy(w, widths)
-	return &columnState{widths: w}
+var pageDefs = []pageDef{
+	{pageHome, "house", "Home", "System checks and workspaces"},
+	{pageFiles, "folders", "Files", "Monitor folders and files, then guard them with a whitelist or blacklist"},
+	{pageNetwork, "globe-hemisphere-west", "Network", "Watch binaries' network activity and enforce a network guard"},
+	{pageProtected, "lock-simple", "Protected", "Edit protected directories, grant temporary access, edit the daemon's configuration"},
+	{pageUpdate, "arrow-clockwise", "Update", "Update the installed daemon to the latest signed release"},
+	{pageInstall, "download-simple", "Install", "Set up the protection daemon"},
 }
 
-type guiModel struct {
-	events    <-chan ebpf.FileEvent
-	allEvents []ebpf.FileEvent
-	filtered  []ebpf.FileEvent
-	filter    string
-	mu        sync.RWMutex
-	paths     []string
-	recursive bool
-	depth     int
-	cols      *columnState
+// shell is the window frame: sidebar navigation, page header and the active page.
+type shell struct {
+	app    fyne.App
+	win    fyne.Window
+	opts   Options
+	status sysStatus
 
-	prevEventID  int
-	eventsPerSec float64
+	nav      map[pageID]*navItem
+	views    map[pageID]fyne.CanvasObject
+	title    *widget.Label
+	subtitle *widget.Label
+	body     *fyne.Container
+	home     *homePage
+	current  pageID
+	filesPg  *filesPage
+	netPg    *networkPage
+	files    *workbench.Files
+	network  *workbench.Network
+	install  *installPage
+	update   *updatePage
+	protect  *protectedPage
+	// startBackend runs the installed binary's edit-protected backend (a fake in tests).
+	startBackend func() (backendLink, error)
+
+	wm        wm.Session
+	collapsed bool
+	sidebar   *fyne.Container
+	navBox    *fyne.Container
+	frame     *fyne.Container
+	stats     procStats
+	statLines [3]*widget.Label
+	// picker is the open file or folder picker, which Ctrl+F searches.
+	picker *picker
+	// dialogs are the open sized dialogs and the size each asked for (refitDialogs).
+	dialogs map[sizedDialog]fyne.Size
+	// syncBackground makes background synchronous and every a no-op: fyne's test driver runs fyne.Do
+	// inline on the calling goroutine, so a real goroutine would race the test's own rendering.
+	syncBackground bool
 }
 
-func (m *guiModel) applyFilter() {
-	if m.filter == "" {
-		m.filtered = make([]ebpf.FileEvent, len(m.allEvents))
-		copy(m.filtered, m.allEvents)
-		return
-	}
-
-	m.filtered = m.filtered[:0]
-	for _, ev := range m.allEvents {
-		if strings.Contains(strings.ToLower(ev.Path), m.filter) ||
-			strings.Contains(strings.ToLower(ev.Comm), m.filter) ||
-			strings.Contains(strings.ToLower(ev.Type.String()), m.filter) ||
-			strings.Contains(strings.ToLower(ev.Dest), m.filter) {
-			m.filtered = append(m.filtered, ev)
-		}
-	}
-}
-
-func (m *guiModel) getFiltered(i int) ebpf.FileEvent {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if i >= len(m.filtered) {
-		return ebpf.FileEvent{}
-	}
-	return m.filtered[i]
-}
-
-func (m *guiModel) filteredLen() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.filtered)
-}
-
-// ── dataRow ────────────────────────────────────────────────────────────────
-
-type dataRow struct {
-	widget.BaseWidget
-	cells []*widget.Label
-	cols  *columnState
-}
-
-func newDataRow(cols *columnState) *dataRow {
-	r := &dataRow{cols: cols}
-	for range colLabels {
-		l := widget.NewLabel("")
-		l.Selectable = true
-		l.Truncation = fyne.TextTruncateClip
-		r.cells = append(r.cells, l)
-	}
-	r.ExtendBaseWidget(r)
-	return r
-}
-
-func (r *dataRow) setEvent(ev *ebpf.FileEvent) {
-	r.cells[0].SetText(time.Unix(0, ev.Timestamp).Format("15:04:05.000"))
-	r.cells[1].SetText(ev.Type.String())
-	r.cells[2].SetText(ev.Comm)
-
-	path := ev.Path
-	if ev.PID != 0 {
-		path = fmt.Sprintf("%s (pid=%d)", ev.Path, ev.PID)
-	}
-	r.cells[3].SetText(path)
-
-	detail := ""
-	switch ev.Type {
-	case ebpf.EventRead, ebpf.EventWrite, ebpf.EventMmap:
-		detail = fmt.Sprintf("fd=%d", ev.FD)
-	case ebpf.EventRename, ebpf.EventSymlink, ebpf.EventHardlink:
-		detail = ev.Dest
-	}
-	r.cells[4].SetText(detail)
-}
-
-func (r *dataRow) CreateRenderer() fyne.WidgetRenderer {
-	objs := make([]fyne.CanvasObject, len(r.cells))
-	for i, c := range r.cells {
-		objs[i] = c
-	}
-	return &dataRowRenderer{row: r, objs: objs}
-}
-
-type dataRowRenderer struct {
-	row  *dataRow
-	objs []fyne.CanvasObject
-}
-
-func (rr *dataRowRenderer) Layout(size fyne.Size) {
-	rr.row.cols.RLock()
-	widths := rr.row.cols.widths
-	rr.row.cols.RUnlock()
-
-	total := float32(0)
-	for _, w := range widths {
-		total += w
-	}
-	if total == 0 {
-		return
-	}
-
-	x := float32(0)
-	for i, l := range rr.row.cells {
-		w := size.Width * widths[i] / total
-		l.Resize(fyne.NewSize(w, size.Height))
-		l.Move(fyne.NewPos(x, 0))
-		x += w
-	}
-}
-
-func (rr *dataRowRenderer) MinSize() fyne.Size {
-	return fyne.NewSize(800, 36)
-}
-
-func (rr *dataRowRenderer) Objects() []fyne.CanvasObject {
-	return rr.objs
-}
-
-func (rr *dataRowRenderer) Refresh() {
-	rr.Layout(rr.row.Size())
-}
-
-func (rr *dataRowRenderer) Destroy() {}
-
-// ── headerWidget ───────────────────────────────────────────────────────────
-
-type headerWidget struct {
-	widget.BaseWidget
-	labels   []*widget.Label
-	cols     *columnState
-	onResize func()
-}
-
-func newHeaderWidget(cols *columnState, onResize func()) *headerWidget {
-	h := &headerWidget{
-		cols:     cols,
-		onResize: onResize,
-	}
-	for _, label := range colLabels {
-		l := widget.NewLabelWithStyle(label, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-		h.labels = append(h.labels, l)
-	}
-	h.ExtendBaseWidget(h)
-	return h
-}
-
-// dividerIndex returns the column divider index closest to x, or -1 if none.
-func (h *headerWidget) dividerIndex(x float32, size fyne.Size) int {
-	h.cols.RLock()
-	total := float32(0)
-	for _, w := range h.cols.widths {
-		total += w
-	}
-	h.cols.RUnlock()
-	if total == 0 || size.Width == 0 {
-		return -1
-	}
-
-	cum := float32(0)
-	for i := 0; i < len(h.cols.widths)-1; i++ {
-		cum += size.Width * h.cols.widths[i] / total
-		if x >= cum-4 && x <= cum+4 {
-			return i
-		}
-	}
-	return -1
-}
-
-func (h *headerWidget) Dragged(e *fyne.DragEvent) {
-	idx := h.dividerIndex(e.Position.X, h.Size())
-	if idx < 0 || idx+1 >= len(h.cols.widths) {
-		return
-	}
-
-	h.cols.Lock()
-	h.cols.widths[idx] += e.Dragged.DX
-	h.cols.widths[idx+1] -= e.Dragged.DX
-	minW := float32(40)
-	if h.cols.widths[idx] < minW {
-		h.cols.widths[idx] = minW
-	}
-	if h.cols.widths[idx+1] < minW {
-		h.cols.widths[idx+1] = minW
-	}
-	h.cols.Unlock()
-
-	h.Refresh()
-	if h.onResize != nil {
-		h.onResize()
-	}
-}
-
-func (h *headerWidget) DragEnd() {}
-
-func (h *headerWidget) MinSize() fyne.Size {
-	return fyne.NewSize(800, 36)
-}
-
-func (h *headerWidget) CreateRenderer() fyne.WidgetRenderer {
-	objs := make([]fyne.CanvasObject, len(h.labels))
-	for i, l := range h.labels {
-		objs[i] = l
-	}
-	return &headerRenderer{h: h, objs: objs}
-}
-
-type headerRenderer struct {
-	h    *headerWidget
-	objs []fyne.CanvasObject
-}
-
-func (hr *headerRenderer) Layout(size fyne.Size) {
-	hr.h.cols.RLock()
-	widths := hr.h.cols.widths
-	hr.h.cols.RUnlock()
-
-	total := float32(0)
-	for _, w := range widths {
-		total += w
-	}
-	if total == 0 || size.Width == 0 {
-		return
-	}
-
-	x := float32(0)
-	for i, l := range hr.h.labels {
-		w := size.Width * widths[i] / total
-		l.Resize(fyne.NewSize(w, size.Height))
-		l.Move(fyne.NewPos(x, 0))
-		x += w
-	}
-}
-
-func (hr *headerRenderer) MinSize() fyne.Size {
-	return fyne.NewSize(800, 36)
-}
-
-func (hr *headerRenderer) Objects() []fyne.CanvasObject {
-	return hr.objs
-}
-
-func (hr *headerRenderer) Refresh() {
-	hr.Layout(hr.h.Size())
-}
-
-func (hr *headerRenderer) Destroy() {}
-
-// ── Run ────────────────────────────────────────────────────────────────────
-
-func Run(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) (err error) {
-	restoreSessionEnv()
+// Run opens the window and blocks until it is closed.
+func Run(opts Options) (err error) {
+	wmEnv := restoreSessionEnv()
 	defer cleanupSessionEnv()
-	// fyne logs a failed GLFW init and then panics on the first window call.
+	defer filterFyneLogs()()
+	// fyne logs a failed GLFW init and then panics on the first window call; a panic once the window
+	// is up is a bug, reported with its stack.
+	var started atomic.Bool
 	defer func() {
-		if r := recover(); r != nil {
+		r := recover()
+		switch {
+		case r == nil:
+		case started.Load():
+			err = fmt.Errorf("--gui: internal error: %v\n%s", r, debug.Stack())
+		default:
 			err = fmt.Errorf("--gui: no display reachable (%v): run it from a graphical session "+
 				"(under sudo it needs the invoking user's WAYLAND_DISPLAY or DISPLAY)", r)
 		}
 	}()
-	m := &guiModel{
-		events:    events,
-		allEvents: make([]ebpf.FileEvent, 0, 500),
-		filtered:  make([]ebpf.FileEvent, 0, 500),
-		paths:     paths,
-		recursive: recursive,
-		depth:     depth,
-		cols:      newColumnState(colDefaultWidths),
-	}
 
-	os.Setenv("FYNE_THEME", "dark")
-	// Opts out of fyne's off-main-goroutine marshalling: every widget call from a goroutine here
+	// Opts out of fyne's off-main-goroutine marshaling: every widget call from a goroutine here
 	// goes through fyne.Do. Set before the app exists: fyne reads it once, on first use.
-	app.SetMetadata(fyne.AppMetadata{Migrations: map[string]bool{"fyneDo": true}})
-	fyneApp := app.NewWithID("com.virgula0.app-listener")
-	win := fyneApp.NewWindow("app-listener — File System Monitor (eBPF)")
+	app.SetMetadata(fyne.AppMetadata{
+		ID: appID, Name: "app-listener", Version: opts.Version,
+		Migrations: map[string]bool{"fyneDo": true},
+	})
+	a := app.NewWithID(appID)
+	a.Settings().SetTheme(&appTheme{variant: savedVariant(a)})
+	a.SetIcon(logoResource)
 
-	recursiveStr := "no"
-	if recursive {
-		recursiveStr = fmt.Sprintf("yes (depth:%d)", depth)
-	}
-
-	infoLabel := widget.NewLabelWithStyle(
-		fmt.Sprintf("Watching: %s  |  Recursive: %s  |  Events: 0  |  Uptime: 0s",
-			strings.Join(paths, ", "), recursiveStr),
-		fyne.TextAlignLeading,
-		fyne.TextStyle{Monospace: true})
-
-	resLabel := widget.NewLabelWithStyle(
-		"Memory: —  |  CPU: —  |  Events/s: —",
-		fyne.TextAlignLeading,
-		fyne.TextStyle{Monospace: true, Bold: true})
-
-	filterEntry := widget.NewEntry()
-	filterEntry.SetPlaceHolder("Filter by path, process, or event type...")
-
-	header := newHeaderWidget(m.cols, func() {
-		// called after columns are resized
+	w := a.NewWindow("app-listener")
+	s := newShell(a, w, opts)
+	s.wm = detectWM(wmEnv)
+	w.SetContent(s.view())
+	w.Resize(preferredSize)
+	w.CenterOnScreen()
+	w.SetMaster()
+	w.SetCloseIntercept(s.confirmClose)
+	a.Lifecycle().SetOnStarted(func() {
+		started.Store(true)
+		if s.floatPref() {
+			s.setFloating(true)
+		}
 	})
 
-	list := widget.NewList(
-		m.filteredLen,
-		func() fyne.CanvasObject {
-			return newDataRow(m.cols)
-		},
-		func(id widget.ListItemID, item fyne.CanvasObject) {
-			row := item.(*dataRow)
-			ev := m.getFiltered(id)
-			row.setEvent(&ev)
-		},
-	)
+	w.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierShortcutDefault},
+		func(fyne.Shortcut) { s.focusSearch() })
 
-	header.onResize = func() {
-		list.Refresh()
+	s.reprobe()
+	s.every(time.Second, s.updateStats)
+	w.ShowAndRun()
+	if s.protect != nil && s.protect.link != nil {
+		s.protect.link.Close() // narrows a live grant, re-locks an offline vault
 	}
-	// Redraw now: otherwise the list only re-reads m.filtered on the next event.
-	filterEntry.OnChanged = func(s string) {
-		m.mu.Lock()
-		m.filter = strings.ToLower(s)
-		m.applyFilter()
-		m.mu.Unlock()
-		list.Refresh()
+	s.network.Close()
+	s.files.Close()
+	if s.install != nil {
+		s.install.cleanup()
 	}
-
-	infoBox := container.NewVBox(infoLabel, filterEntry, header)
-	content := container.NewBorder(infoBox, resLabel, nil, nil, list)
-	win.SetContent(content)
-	win.Resize(fyne.NewSize(1100, 650))
-
-	startTime := time.Now()
-	go m.listenEvents(infoLabel, list, startTime, recursiveStr)
-	go m.uptimeTicker(infoLabel, resLabel, startTime, recursiveStr)
-	// The float hint is an X11 property; a Wayland window has no X id to set it on.
-	if os.Getenv("WAYLAND_DISPLAY") == "" {
-		floatWindow()
-	}
-
-	win.ShowAndRun()
 	return nil
 }
 
-func (m *guiModel) listenEvents(
-	infoLabel *widget.Label, list *widget.List,
-	startTime time.Time, recursiveStr string,
-) {
-	for ev := range m.events {
-		m.mu.Lock()
-		m.allEvents = append(m.allEvents, ev)
-		if len(m.allEvents) > 500 {
-			m.allEvents = m.allEvents[len(m.allEvents)-500:]
+// confirmClose asks before quitting mid-run: the installer or updater would stop between two steps,
+// and an open edit-protected session ends (unsaved edits are lost).
+func (s *shell) confirmClose() {
+	if s.protect != nil && s.protect.link != nil {
+		dialog.ShowConfirm("End the edit-protected session?", "Closing the window ends the open session: a "+
+			"live grant is revoked, an offline directory is locked again, and unsaved edits are lost.",
+			func(ok bool) {
+				if ok {
+					s.win.Close()
+				}
+			}, s.win)
+		return
+	}
+	if !s.running() {
+		s.win.Close()
+		return
+	}
+	dialog.ShowConfirm("Quit during a run?", "Closing the window stops the installer or updater midway. "+
+		"Steps already completed stay applied; re-run it afterwards to resume.", func(ok bool) {
+		if ok {
+			s.win.Close()
 		}
-		m.applyFilter()
-		count := len(m.allEvents)
-		uptime := time.Since(startTime).Round(time.Second)
-		m.mu.Unlock()
-
-		fyne.Do(func() {
-			list.Refresh()
-			infoLabel.SetText(fmt.Sprintf(
-				"Watching: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
-				strings.Join(m.paths, ", "), recursiveStr, count, uptime,
-			))
-		})
-	}
+	}, s.win)
 }
 
-func (m *guiModel) uptimeTicker(
-	infoLabel *widget.Label, resLabel *widget.Label,
-	startTime time.Time, recursiveStr string,
-) {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		m.mu.Lock()
-		count := len(m.allEvents)
-		eventsDelta := m.eventID() - m.prevEventID
-		m.eventsPerSec = float64(eventsDelta)
-		m.prevEventID = m.eventID()
-		m.mu.Unlock()
-
-		uptime := time.Since(startTime).Round(time.Second)
-		resText := m.formatResourceBar(startTime)
-
-		fyne.Do(func() {
-			infoLabel.SetText(fmt.Sprintf(
-				"Watching: %s  |  Recursive: %s  |  Events: %d  |  Uptime: %s",
-				strings.Join(m.paths, ", "), recursiveStr, count, uptime,
-			))
-			resLabel.SetText(resText)
-		})
-	}
+// reprobe re-runs the system checks off the UI goroutine.
+func (s *shell) reprobe() {
+	var st sysStatus
+	s.background(func() { st = probeSystem() }, func() { s.setStatus(st) })
 }
 
-func (m *guiModel) eventID() int {
-	return len(m.allEvents)
-}
-
-func (m *guiModel) formatResourceBar(startTime time.Time) string {
-	s, err := procstats.Read()
-	if err != nil {
-		return "Memory: --  |  CPU: --  |  Events/s: --"
+// every runs fn on the UI goroutine at each interval for the window's lifetime (never under
+// syncBackground: tests refresh by hand).
+func (s *shell) every(interval time.Duration, fn func()) {
+	if s.syncBackground {
+		return
 	}
-
-	rssMB := float64(s.RSS) / 1024 / 1024
-	cpuTotal := s.CPUUser + s.CPUSys
-	cpuSec := cpuTotal.Seconds()
-	uptimeSec := time.Since(startTime).Seconds()
-	cpuPct := 0.0
-	if uptimeSec > 0 {
-		cpuPct = (cpuSec / uptimeSec) * 100
-	}
-
-	return fmt.Sprintf("Memory: %.1f MB  |  CPU: %.1f%%  |  Events/s: %.0f",
-		rssMB, cpuPct, m.eventsPerSec)
-}
-
-// ── X11 float hint ─────────────────────────────────────────────────────────
-
-func floatWindow() {
 	go func() {
-		time.Sleep(200 * time.Millisecond)
-		setFloatHint()
+		tick := time.NewTicker(interval)
+		defer tick.Stop()
+		for range tick.C {
+			fyne.Do(fn)
+		}
 	}()
 }
 
-func setFloatHint() {
-	conn, err := xgb.NewConn()
-	if err != nil {
+// background runs work off the UI goroutine, then done on it.
+func (s *shell) background(work, done func()) {
+	if s.syncBackground {
+		work()
+		done()
 		return
 	}
-	defer conn.Close()
-
-	setup := xproto.Setup(conn)
-	root := setup.DefaultScreen(conn).Root
-
-	wid := findTopLevelWindow(conn, root, "app-listener")
-	if wid == 0 {
-		return
-	}
-
-	typeAtom := internAtom(conn, "_NET_WM_WINDOW_TYPE")
-	utilityAtom := internAtom(conn, "_NET_WM_WINDOW_TYPE_DIALOG")
-	if typeAtom == 0 || utilityAtom == 0 {
-		return
-	}
-
-	data := make([]byte, 4)
-	xgb.Put32(data, uint32(utilityAtom))
-	xproto.ChangeProperty(conn, xproto.PropModeReplace, wid,
-		typeAtom, xproto.AtomAtom, 32, 1, data)
+	go func() {
+		work()
+		fyne.Do(done)
+	}()
 }
 
-func findTopLevelWindow(conn *xgb.Conn, root xproto.Window, substr string) xproto.Window {
-	netClientList := internAtom(conn, "_NET_CLIENT_LIST")
-	if netClientList == 0 {
-		return 0
+func savedVariant(a fyne.App) fyne.ThemeVariant {
+	if a.Preferences().StringWithFallback("theme", "dark") == "light" {
+		return theme.VariantLight
 	}
-
-	reply, err := xproto.GetProperty(conn, false, root,
-		netClientList, xproto.AtomWindow, 0, 4096).Reply()
-	if err != nil || reply == nil {
-		return 0
-	}
-
-	netWmName := internAtom(conn, "_NET_WM_NAME")
-	utf8Str := internAtom(conn, "UTF8_STRING")
-	if netWmName == 0 || utf8Str == 0 {
-		return 0
-	}
-
-	for i := 0; i < len(reply.Value)/4; i++ {
-		wid := xproto.Window(xgb.Get32(reply.Value[i*4:]))
-		nameReply, err := xproto.GetProperty(conn, false, wid,
-			netWmName, utf8Str, 0, 4096).Reply()
-		if err != nil || nameReply == nil || len(nameReply.Value) == 0 {
-			continue
-		}
-		if strings.Contains(string(nameReply.Value), substr) {
-			return wid
-		}
-	}
-	return 0
+	return theme.VariantDark
 }
 
-func internAtom(conn *xgb.Conn, name string) xproto.Atom {
-	nameLen := len(name)
-	if nameLen > 65535 {
-		return 0
+func newShell(a fyne.App, w fyne.Window, opts Options) *shell {
+	s := &shell{
+		app:      a,
+		win:      w,
+		opts:     opts,
+		nav:      map[pageID]*navItem{},
+		views:    map[pageID]fyne.CanvasObject{},
+		dialogs:  map[sizedDialog]fyne.Size{},
+		title:    widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		subtitle: mutedText(""),
+		body:     container.NewStack(),
 	}
-	reply, err := xproto.InternAtom(conn, false, uint16(nameLen), name).Reply()
-	if err != nil {
-		return 0
+	s.title.SizeName = theme.SizeNameHeadingText
+	s.subtitle.Wrapping = fyne.TextWrapOff
+	s.subtitle.Truncation = fyne.TextTruncateEllipsis
+	s.home = newHomePage(s)
+	s.startBackend = startBackend
+	s.files = workbench.NewFiles(workbench.RealFileEngines())
+	s.network = workbench.NewNetwork(workbench.RealNetEngines())
+	return s
+}
+
+func (s *shell) view() fyne.CanvasObject {
+	s.navBox = container.NewVBox()
+	for _, d := range pageDefs {
+		n := newNavItem(d.icon, d.title, func() { s.show(d.id) })
+		s.nav[d.id] = n
+		s.navBox.Add(n)
 	}
-	return reply.Atom
+	for i := range s.statLines {
+		s.statLines[i] = mutedText("")
+		s.statLines[i].Wrapping = fyne.TextWrapOff
+		s.statLines[i].SizeName = theme.SizeNameCaptionText
+	}
+	s.updateStats()
+
+	s.sidebar = container.NewStack()
+	s.collapsed = s.app.Preferences().Bool(prefSidebarCollapsed)
+	s.layoutSidebar()
+	sidebarBox := newPanel(s.sidebar)
+	sidebarBox.fill = colorSidebar
+	sidebarBox.inset = theme.Padding() * 2
+
+	header := container.New(layout.NewCustomPaddedVBoxLayout(-10), s.title, s.subtitle)
+	main := container.NewBorder(container.New(layout.NewCustomPaddedLayout(4, 12, 0, 0), header), nil, nil, nil, s.body)
+
+	s.show(pageHome)
+	s.frame = container.NewBorder(nil, nil, container.NewPadded(sidebarBox), nil,
+		container.New(layout.NewCustomPaddedLayout(12, 16, 8, 24), main))
+	return container.New(&resizeWatch{onResize: s.refitDialogs}, s.frame)
+}
+
+const prefSidebarCollapsed = "sidebarCollapsed"
+
+// layoutSidebar fills the sidebar for the current collapsed state: brand, navigation, process stats,
+// version and theme toggle, or only the icons.
+func (s *shell) layoutSidebar() {
+	for _, n := range s.nav {
+		n.setCompact(s.collapsed)
+	}
+	collapseIcon := "sidebar-simple"
+	if s.collapsed {
+		collapseIcon = "caret-right"
+	}
+	toggle := newButton("", icon(collapseIcon), s.toggleSidebar)
+	toggle.Importance = widget.LowImportance
+
+	themeBtn := newButton("", s.themeIcon(), nil)
+	themeBtn.Importance = widget.LowImportance
+	themeBtn.OnTapped = func() {
+		s.toggleTheme()
+		themeBtn.SetIcon(s.themeIcon())
+	}
+
+	var top, bottom fyne.CanvasObject
+	if s.collapsed {
+		top = container.NewVBox(container.NewCenter(newLogo(30)), container.NewCenter(toggle), widget.NewSeparator(), s.navBox)
+		bottom = container.NewVBox(widget.NewSeparator(), container.NewCenter(themeBtn))
+	} else {
+		brand := container.NewHBox(newLogo(34), container.NewCenter(
+			widget.NewLabelWithStyle("app-listener", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})))
+		version := mutedText(s.opts.Version)
+		version.SizeName = theme.SizeNameCaptionText
+		stats := container.New(layout.NewCustomPaddedVBoxLayout(-12), s.statLines[0], s.statLines[1], s.statLines[2])
+		top = container.NewVBox(hfill(container.NewPadded(brand), container.NewCenter(toggle)), widget.NewSeparator(), s.navBox)
+		bottom = container.NewVBox(widget.NewSeparator(), sectionTitle("USAGE"), stats, widget.NewSeparator(),
+			hfill(version, themeBtn))
+	}
+	s.sidebar.Objects = []fyne.CanvasObject{container.NewBorder(top, bottom, nil, nil)}
+	s.sidebar.Refresh()
+	if s.frame != nil {
+		s.frame.Refresh() // the sidebar's width changed: lay the page out again
+	}
+}
+
+func (s *shell) toggleSidebar() {
+	s.collapsed = !s.collapsed
+	s.app.Preferences().SetBool(prefSidebarCollapsed, s.collapsed)
+	s.layoutSidebar()
+}
+
+func (s *shell) updateStats() {
+	cpu, mem, rate := s.stats.sample().lines()
+	for i, text := range []string{cpu, mem, rate} {
+		if s.statLines[i] != nil && s.statLines[i].Text != text {
+			s.statLines[i].SetText(text)
+		}
+	}
+}
+
+func (s *shell) show(id pageID) {
+	s.current = id
+	for pid, n := range s.nav {
+		n.setSelected(pid == id)
+	}
+	for _, d := range pageDefs {
+		if d.id == id {
+			s.title.SetText(d.title)
+			s.subtitle.SetText(d.subtitle)
+		}
+	}
+	v, ok := s.views[id]
+	if !ok {
+		// The page fills the window when it fits and scrolls when the window is smaller than it
+		// (fyne grows scroll content to the viewport): a tiling WM may impose any size.
+		v = container.NewScroll(s.build(id))
+		s.views[id] = v
+	}
+	s.body.Objects = []fyne.CanvasObject{v}
+	s.body.Refresh()
+}
+
+func (s *shell) build(id pageID) fyne.CanvasObject {
+	switch id {
+	case pageHome:
+		return s.home.view()
+	case pageFiles:
+		s.filesPg = newFilesPage(s, s.files)
+		return s.filesPg.view()
+	case pageNetwork:
+		s.netPg = newNetworkPage(s, s.network)
+		return s.netPg.view()
+	case pageProtected:
+		s.protect = newProtectedPage(s)
+		return s.protect.view()
+	case pageUpdate:
+		s.update = newUpdatePage(s)
+		return s.update.view()
+	default:
+		s.install = newInstallPage(s)
+		return s.install.view()
+	}
+}
+
+// preferredSize is the window's size when nothing smaller is imposed (fyne units).
+var preferredSize = fyne.NewSize(1280, 820)
+
+// sizedDialog is a dialog showSized can resize.
+type sizedDialog interface {
+	Show()
+	Resize(fyne.Size)
+	SetOnClosed(func())
+}
+
+const dialogMargin = 24
+
+// showSized shows d at want, capped to the window less a margin; refitDialogs keeps it capped as the
+// window is resized (a tiling WM can shrink the window under an open dialog). Content larger than
+// the cap must scroll: see scrollable.
+func (s *shell) showSized(d sizedDialog, want fyne.Size) {
+	s.dialogs[d] = want
+	d.SetOnClosed(func() { delete(s.dialogs, d) })
+	d.Show()
+	s.fitDialog(d, want)
+}
+
+func (s *shell) fitDialog(d sizedDialog, want fyne.Size) {
+	c := s.win.Canvas().Size()
+	if c.Width <= 0 || c.Height <= 0 {
+		d.Resize(want)
+		return
+	}
+	d.Resize(fyne.NewSize(
+		fyne.Max(1, fyne.Min(want.Width, c.Width-2*dialogMargin)),
+		fyne.Max(1, fyne.Min(want.Height, c.Height-2*dialogMargin))))
+	// A modal's overlay centers it only on layout: re-center at the new size.
+	for _, o := range s.win.Canvas().Overlays().List() {
+		o.Refresh()
+	}
+}
+
+func (s *shell) refitDialogs(fyne.Size) {
+	for d, want := range s.dialogs {
+		s.fitDialog(d, want)
+	}
+}
+
+// scrollable lets a dialog's content shrink below its natural size and scroll instead.
+func scrollable(content fyne.CanvasObject) fyne.CanvasObject {
+	return container.NewScroll(content)
+}
+
+// resizeWatch is a stack layout that reports size changes of the window content.
+type resizeWatch struct {
+	last     fyne.Size
+	onResize func(fyne.Size)
+}
+
+func (r *resizeWatch) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range objs {
+		o.Move(fyne.NewPos(0, 0))
+		o.Resize(size)
+	}
+	if size != r.last {
+		r.last = size
+		if r.onResize != nil {
+			r.onResize(size)
+		}
+	}
+}
+
+func (r *resizeWatch) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	var m fyne.Size
+	for _, o := range objs {
+		m = m.Max(o.MinSize())
+	}
+	return m
+}
+
+// focusSearch focuses the open picker's search, else the filter of the table on screen (Ctrl+F).
+func (s *shell) focusSearch() {
+	var e *widget.Entry
+	switch {
+	case s.picker != nil:
+		s.picker.focusSearch()
+		return
+	case s.current == pageFiles && s.filesPg != nil && s.filesPg.current != nil:
+		e = s.filesPg.current.searchEntry()
+	case s.current == pageNetwork && s.netPg != nil:
+		e = s.netPg.searchEntry()
+	}
+	if e != nil {
+		s.win.Canvas().Focus(e)
+	}
+}
+
+func (s *shell) setStatus(st sysStatus) {
+	s.status = st
+	s.home.applyStatus(st)
+}
+
+// themeIcon names the variant the toggle switches to.
+func (s *shell) themeIcon() fyne.Resource {
+	if savedVariant(s.app) == theme.VariantLight {
+		return icon("moon")
+	}
+	return icon("sun")
+}
+
+func (s *shell) toggleTheme() {
+	next := theme.VariantLight
+	name := "light"
+	if savedVariant(s.app) == theme.VariantLight {
+		next, name = theme.VariantDark, "dark"
+	}
+	s.app.Preferences().SetString("theme", name)
+	s.app.Settings().SetTheme(&appTheme{variant: next})
+}
+
+// busy shows a progress dialog while work runs off the UI goroutine, then reports its error or
+// runs done.
+func (s *shell) busy(title string, work func() error, done func()) {
+	d := dialog.NewCustomWithoutButtons(title, widget.NewProgressBarInfinite(), s.win)
+	d.Show()
+	go func() {
+		err := work()
+		fyne.Do(func() {
+			d.Hide()
+			if err != nil {
+				dialog.ShowError(err, s.win)
+				return
+			}
+			if done != nil {
+				done()
+			}
+		})
+	}()
+}
+
+func newLogo(side float32) fyne.CanvasObject {
+	img := canvas.NewImageFromResource(logoResource)
+	img.FillMode = canvas.ImageFillContain
+	img.SetMinSize(fyne.NewSquareSize(side))
+	return img
 }

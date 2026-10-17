@@ -158,7 +158,7 @@ func TestFinderViewOverlaysBoxAndMarks(t *testing.T) {
 	f := NewFinder(true)
 	plain := hl.View(ta)
 	keys(t, &f, ta, "ctrl+r", "n", "e", "e", "d", "l", "e")
-	got := f.View(hl, ta)
+	got := f.View(hl, ta, nil)
 	rows, base := strings.Split(got, "\n"), strings.Split(plain, "\n")
 	if len(rows) != len(base) {
 		t.Fatalf("overlay changed the height: %d vs %d", len(rows), len(base))
@@ -177,7 +177,7 @@ func TestFinderViewOverlaysBoxAndMarks(t *testing.T) {
 		t.Fatalf("current match not underlined+reversed:\n%q", rows[0])
 	}
 	f.Close()
-	if f.View(hl, ta) != NewHighlighter("main.go", content).View(ta) {
+	if f.View(hl, ta, nil) != NewHighlighter("main.go", content).View(ta) {
 		t.Fatal("a closed finder must render exactly as Highlighter.View")
 	}
 }

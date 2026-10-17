@@ -36,6 +36,10 @@ type Highlighter struct {
 	marks      map[int][]span
 	current    span
 	hasCurrent bool
+
+	// Selection (Finder.View): [selFrom, selTo) in text order.
+	selFrom, selTo pos
+	hasSel         bool
 }
 
 // NewHighlighter picks the language from name (base name or extension; daemon.conf has its own

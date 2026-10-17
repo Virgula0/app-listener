@@ -27,8 +27,11 @@ func (m *sessionModel) View() string { return m.inner.View() }
 
 // RunSession runs m full-screen for a live session: onActivity runs on every input, and the
 // program quits as soon as ended closes. ended reports whether that is why it returned.
-func RunSession(m tea.Model, onActivity func(), ended <-chan struct{}) (endedByPeer bool, err error) {
-	prog := tea.NewProgram(&sessionModel{inner: m, onActivity: onActivity}, tea.WithAltScreen())
+func RunSession(
+	m tea.Model, onActivity func(), ended <-chan struct{}, opts ...tea.ProgramOption,
+) (endedByPeer bool, err error) {
+	opts = append([]tea.ProgramOption{tea.WithAltScreen()}, opts...)
+	prog := tea.NewProgram(&sessionModel{inner: m, onActivity: onActivity}, opts...)
 	finished := make(chan struct{})
 	peer := make(chan bool, 1)
 	go func() {
@@ -48,6 +51,6 @@ func RunSession(m tea.Model, onActivity func(), ended <-chan struct{}) (endedByP
 // RunFileEditorSession is RunFileEditor under RunSession.
 func RunFileEditorSession(root string, onActivity func(), ended <-chan struct{}) (endedByPeer bool, err error) {
 	m := newFileEditModel(root)
-	defer m.vault.close()
-	return RunSession(m, onActivity, ended)
+	defer m.vault.Close()
+	return RunSession(m, onActivity, ended, tea.WithMouseCellMotion())
 }

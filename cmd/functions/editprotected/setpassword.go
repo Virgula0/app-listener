@@ -28,9 +28,16 @@ func authorizeFirstTimeSetPassword(daemonRunning bool) error {
 	return nil
 }
 
-// runSetPassword sets a first edit-protected password or rotates a cli-managed one. A password
-// chosen during `install` is owned by the installer and refused here with a pointer.
+// runSetPassword sets a first edit-protected password or rotates a cli-managed one.
 func runSetPassword() error {
+	return setPassword(func() (string, error) { return promptPassword("Current edit-protected password") },
+		PromptNewPassword)
+}
+
+// setPassword is runSetPassword's flow, shared with the GUI backend: current is asked only when
+// rotating, next yields the new password. A password chosen during `install` is owned by the
+// installer and refused here with a pointer.
+func setPassword(current, next func() (string, error)) error {
 	encoded, err := LoadHashFile()
 	switch {
 	case errors.Is(err, ErrNoHashFile):
@@ -49,11 +56,11 @@ func runSetPassword() error {
 			return errors.New("the edit-protected password was set during installation and cannot be rotated here — " +
 				"re-run `sudo app-listener install` to change it (it re-prompts for the password)")
 		}
-		current, pErr := promptPassword("Current edit-protected password")
+		cur, pErr := current()
 		if pErr != nil {
 			return pErr
 		}
-		ok, vErr := Verify(encoded, current)
+		ok, vErr := Verify(encoded, cur)
 		if vErr != nil {
 			return vErr
 		}
@@ -62,7 +69,7 @@ func runSetPassword() error {
 		}
 	}
 
-	newPw, err := PromptNewPassword()
+	newPw, err := next()
 	if err != nil {
 		return err
 	}
@@ -80,6 +87,13 @@ func runSetPassword() error {
 // runClearPassword removes the password (of any origin) after proving
 // knowledge of it, disabling live mode.
 func runClearPassword() error {
+	return clearPassword(func() (string, error) {
+		return promptPassword("Current edit-protected password (to confirm removal)")
+	})
+}
+
+// clearPassword is runClearPassword's flow, shared with the GUI backend.
+func clearPassword(current func() (string, error)) error {
 	encoded, err := LoadHashFile()
 	if errors.Is(err, ErrNoHashFile) {
 		log.Info("no edit-protected password is configured — nothing to clear")
@@ -89,11 +103,11 @@ func runClearPassword() error {
 		return err
 	}
 
-	current, err := promptPassword("Current edit-protected password (to confirm removal)")
+	cur, err := current()
 	if err != nil {
 		return err
 	}
-	ok, err := Verify(encoded, current)
+	ok, err := Verify(encoded, cur)
 	if err != nil {
 		return err
 	}
