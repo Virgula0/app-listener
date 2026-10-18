@@ -319,8 +319,18 @@ pprof:
 	@echo
 	@echo ">> saved to $(PPROF_OUT)/  (interactive: go tool pprof -http=: $(PPROF_OUT)/heap.pb.gz)"
 
-deploy:
+# The Dockerfile builds on the toolchain image, so it must exist first. Rootless Docker can build
+# but never load eBPF (capabilities don't cross the user namespace), so the instance would be inert.
+deploy: deploy-preflight build-image
 	docker compose up --build -d
+
+deploy-preflight:
+	@if docker info -f '{{println .SecurityOptions}}' 2>/dev/null | grep -q rootless; then \
+		echo "ERROR: 'make deploy' needs rootful Docker: a rootless container can't load eBPF"; \
+		echo "       run: sudo make deploy   (sudo drops DOCKER_HOST, so it talks to /var/run/docker.sock)"; \
+		exit 1; \
+	fi
+.PHONY: deploy-preflight
 .PHONY: deploy
 
 deploy-down:

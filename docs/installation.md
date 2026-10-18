@@ -203,10 +203,14 @@ The desktop window runs the same uninstall from its Install workspace (see
 ## Docker
 
 ```bash
-docker compose build
-docker compose run --rm app-listener monitor -w /tmp
+sudo make deploy
+docker exec -it app-listener app-listener monitor -w /tmp
 ```
 
-Multi-stage build on a Debian-slim runner. eBPF needs the host kernel: run it privileged, or with
-`/sys/kernel/btf/` mounted and `CAP_BPF`. `make build` uses a separate toolchain image
-(`docker/builder.Dockerfile`), not this one.
+`make deploy` builds the binary inside Docker, on the toolchain image (`docker/builder.Dockerfile`),
+so nothing is compiled or written on the host, and starts an idle container to `docker exec` into
+(`/app` is the working directory and on `PATH`). It needs rootful Docker: a rootless container can't
+load eBPF, so `deploy` refuses it (`sudo` drops a rootless `DOCKER_HOST`). The container is
+privileged and gets the host's `/sys/kernel/security` read-only, so the guard modes still refuse to
+start on a kernel without BPF-LSM. `$MONITOR_DIR` (default `./data`) is mounted read-only at
+`/data`. `make deploy-down` stops it.
