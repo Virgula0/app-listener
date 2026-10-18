@@ -8,7 +8,7 @@ subcommand, flag, config option and known limitation.
 - [Compatibility](compatibility.md): supported distributions, kernel versions, enabling BPF-LSM.
 - [Installation](installation.md): the one-line installer, building from source, the install
   wizard, `update`, `uninstall`, Docker.
-- [How it works](how-it-works.md): the eBPF attach model, binary identity, output formats, `--serve`.
+- [How it works](how-it-works.md): where it sits next to AppArmor/SELinux, the eBPF attach model, binary identity, output formats, `--serve`.
 - [Desktop GUI](gui.md): `--gui`, the window covering the file and network modes, the updater and the installer.
 
 ## Modes
