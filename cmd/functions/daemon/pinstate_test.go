@@ -54,7 +54,7 @@ func TestPinStateRoundTrip(t *testing.T) {
 	}
 }
 
-// Mirrors TestWriteHashFileInPlaceOverPlaceholder: once a record exists, a second write (a reload's
+// Once a record exists, a second write (a reload's
 // fresh generation) must rewrite the SAME inode, never create-and-swap: once the ModeReadOnly
 // self-guard on /etc/app-listener is attached, only rewriting an EXISTING entry is permitted.
 func TestWritePinStateInPlace(t *testing.T) {

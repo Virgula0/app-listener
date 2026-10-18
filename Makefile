@@ -1,4 +1,4 @@
-.PHONY: build build-host build-image build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint vuln test test-integration check-compatibility deploy deploy-down tidy clean pprof
+.PHONY: build build-host build-image build-linux install-linter install-deps generate generate-monitor generate-guard generate-networkmonitor run run-guard run-networkmonitor lint vuln test test-e2e test-integration check-compatibility deploy deploy-down tidy clean pprof
 
 BINARY_NAME = app-listener
 OUTPUT_DIR  = build/linux
@@ -108,7 +108,7 @@ build-image:
 	docker build -t $(BUILD_IMAGE) -f docker/builder.Dockerfile .
 .PHONY: build-image
 
-# GUI=1 links the fyne desktop window for `monitor --gui` (~20 MiB larger
+# GUI=1 links the fyne desktop window opened by `--gui` (~20 MiB larger
 # binary, X11/OpenGL deps). Off by default: the daemon and the other
 # subcommands share this binary and must not carry a GUI toolkit.
 GUI ?=
@@ -250,6 +250,13 @@ vuln:
 test:
 	CGO_ENABLED=1 go test $$(go list ./... | grep -v /integrationtests) --count=1 -p 1
 .PHONY: test
+
+# GUI end to end (-tags gui,e2e): renders every page and the README walkthrough off-screen, no root
+# or display. SNAPSHOTS=<dir> / DEMO=<dir> keep the PNGs / the walkthrough's frames.
+test-e2e:
+	APPLISTENER_GUI_SNAPSHOTS=$(SNAPSHOTS) APPLISTENER_GUI_DEMO=$(DEMO) CGO_ENABLED=1 \
+		go test -tags gui,e2e ./internal/gui/ -run 'TestSnapshots|TestIconGallery|TestDemoReel' -v --count=1
+.PHONY: test-e2e
 
 test-integration:
 	$(MAKE) -C integrationtests/exploits

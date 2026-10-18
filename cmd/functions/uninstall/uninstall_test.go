@@ -3,6 +3,7 @@ package uninstall
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Virgula0/app-listener/internal/fscrypt"
@@ -131,5 +132,13 @@ func TestDecryptDirectoriesEmpty(t *testing.T) {
 	}
 	if err := decryptDirectories(fscrypt.New(), []string{}); err != nil {
 		t.Errorf("decryptDirectories(empty) = %v, want nil", err)
+	}
+}
+
+func TestRunWithRefusesConcurrentRun(t *testing.T) {
+	runMu.Lock()
+	defer runMu.Unlock()
+	if err := RunWith(nil, Request{}); err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("RunWith during a run = %v, want an in-progress refusal", err)
 	}
 }

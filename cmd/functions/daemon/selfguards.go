@@ -26,9 +26,9 @@ type selfProtectSpec struct {
 
 // selfProtectSpecs are the guards over the daemon's own state, independent of any [watch] section:
 //
-//	/etc/app-listener                 ModeReadOnly: all may read (daemon.conf stays world-readable), only the app-listener binary may modify (binaries.db, the binary ledger, included)
-//	/etc/app-listener/fscrypt.key     ModeWhitelist, empty list: readable only by the app-listener binary
-//	/etc/app-listener/edit-auth.hash  ModeWhitelist, empty list: sealed like the key so a non-app-listener root process can neither read it (offline crack) nor overwrite it (install its own password)
+//	/etc/app-listener                       ModeReadOnly: all may read (daemon.conf stays world-readable), only the app-listener binary may modify
+//	/etc/app-listener/fscrypt.key           ModeWhitelist, empty list: readable only by the app-listener binary
+//	/etc/app-listener/binaries.db{,-journal} ModeWhitelist, empty list: the ledger holds the edit-protected password hash, sealed like the key so a non-app-listener root process can neither read it (offline crack) nor overwrite it (install its own password); the PERSIST journal keeps old pages, old hashes included
 //
 // guard_inodes holds one owner per inode, so the sealed files start BEFORE the directory: a live
 // inner resource makes the directory's scans skip them (innerResourceOwnsLocked). Started after it,
@@ -37,12 +37,13 @@ type selfProtectSpec struct {
 func selfProtectSpecs() []selfProtectSpec {
 	return []selfProtectSpec{
 		{fscrypt.MasterKeyFile, guard.ModeWhitelist},
-		{editprotected.HashFile, guard.ModeWhitelist},
+		{binledger.DefaultPath, guard.ModeWhitelist},
+		{binledger.JournalPath(binledger.DefaultPath), guard.ModeWhitelist},
 		{selfProtectDir, guard.ModeReadOnly},
 	}
 }
 
-// sealed: the spec seals a secret (fscrypt.key, edit-auth.hash), so the daemon refuses to start
+// sealed: the spec seals a secret (fscrypt.key, binaries.db), so the daemon refuses to start
 // without it rather than unlock vaults whose key any root process could read.
 func (s selfProtectSpec) sealed() bool { return s.mode == guard.ModeWhitelist }
 
@@ -52,7 +53,7 @@ func (s selfProtectSpec) sealed() bool { return s.mode == guard.ModeWhitelist }
 const selfSweepEvery = 30 * time.Second
 
 // selfGuards holds the always-on guards over the daemon's own on-disk state, outside the usecase's
-// guard set: a reload never rebuilds them, so fscrypt.key and edit-auth.hash stay sealed through it.
+// guard set: a reload never rebuilds them, so fscrypt.key and binaries.db stay sealed through it.
 // Every guard shares one LSM program set (guard/engine.go), so they cost resource slots, not links.
 //
 // The read-only directory guard is best effort: one that can't attach is logged and skipped. A
@@ -70,54 +71,22 @@ func newSelfGuards() *selfGuards {
 	return &selfGuards{events: make(chan usecase.DaemonEvent, 256)}
 }
 
-// ensureHashFilePlaceholder makes sure editprotected.HashFile exists (even zero-length) before self
-// guards attach, because:
-//   - its dedicated guard is only created when the file ALREADY exists at attach time (the os.Stat
-//     gate below), so a fresh install with no password would get none;
-//   - once the /etc/app-listener ReadOnly guard is attached, its self-allow covers rewriting an
-//     EXISTING entry but not creating one, so WriteHashFile's create-temp-then-rename was denied
-//     when the daemon was already guarding its own directory.
-//
-// An empty placeholder made before any guard exists sidesteps both: the file always exists, so its
-// ModeWhitelist guard (maskless self-allow, unaffected by the RO restriction) covers
-// WriteHashFile's in-place rewrite. Zero length = "no password configured"
-// (editprotected.HashFileExists/LoadHashFile treat empty as absent). No-op if /etc/app-listener
-// doesn't exist or the file is there.
-func ensureHashFilePlaceholder() error {
-	if _, err := os.Stat(editprotected.HashFile); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	if _, statErr := os.Stat(selfProtectDir); statErr != nil {
-		return nil //nolint:nilerr // no /etc/app-listener yet (nothing installed): nothing to bootstrap, not an error for the caller
-	}
-	f, err := os.OpenFile(editprotected.HashFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		if os.IsExist(err) {
-			return nil
-		}
-		return err
-	}
-	return f.Close()
-}
-
 // Events is the merged denial stream from every attached self guard, tagged
 // with the resource path (e.g. resource=/etc/app-listener). Never closed.
 func (s *selfGuards) Events() <-chan usecase.DaemonEvent { return s.events }
 
-// bootstrapSelfProtectPlaceholders pre-creates every file a later in-place-only write
-// (ensureHashFilePlaceholder) needs BEFORE any self guard attaches: once the RO guard is live, the
-// self binary can't create a new directory entry, only rewrite an existing one. Best-effort: a
-// failure just means the real writer (WriteHashFile, writePinState) falls back to
-// create-if-missing, which then races the RO guard.
+// bootstrapSelfProtectPlaceholders pre-creates every file a later in-place-only write needs BEFORE
+// any self guard attaches: once the RO guard is live, the self binary can't create a new directory
+// entry, only rewrite an existing one. It also imports a pre-ledger edit-auth.hash, whose file the
+// guards no longer cover. Best-effort: a failure just means the real writer (binledger,
+// writePinState) falls back to create-if-missing, which then races the RO guard.
 func bootstrapSelfProtectPlaceholders() {
-	if err := ensureHashFilePlaceholder(); err != nil {
-		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — setting an edit-protected password while the daemon runs may fail until it does", editprotected.HashFile, err)
-	}
 	if err := binledger.EnsurePlaceholders(binledger.DefaultPath); err != nil {
 		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — the binary ledger cannot be "+
 			"written once /etc/app-listener is self-guarded", binledger.DefaultPath, err)
+	}
+	if err := editprotected.MigrateLegacyHash(); err != nil {
+		log.Warnf("daemon: edit-protected password: %v", err)
 	}
 	if err := ensurePinStateFilePlaceholder(); err != nil {
 		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — daemon --lockdown may not be able to recover this run's generation after a crash", pinStateFile, err)

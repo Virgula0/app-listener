@@ -79,8 +79,9 @@ generates a new one.
 The daemon guards its own files in `/etc/app-listener` (config, fscrypt key, edit-protected
 password hash, binary ledger): only the app-listener binary can read or write them while it runs.
 
-If the fscrypt key or the password hash can't be sealed, the daemon refuses to start (exit status
-78) before unlocking anything. The `/etc/app-listener` directory guard alone is best effort: if it
+The password hash lives in the binary ledger (`binaries.db`), so the ledger and its journal are
+sealed like the key: no other process, root included, can read them. If the fscrypt key or the
+ledger can't be sealed, the daemon refuses to start (exit status 78) before unlocking anything. The `/etc/app-listener` directory guard alone is best effort: if it
 fails to attach, the daemon logs a `CRITICAL` line and keeps running.
 
 ## Quiet metadata denials

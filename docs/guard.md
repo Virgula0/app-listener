@@ -4,7 +4,7 @@ Denies file operations on a path, deciding by the identity of the program that a
 the foreground until you quit: useful for a quick lockdown, for testing a whitelist before putting
 it in the [daemon](daemon.md), or for guarding a path for the length of a session.
 
-![guard](../media/guard.gif)
+![guard](../media/tui/guard.gif)
 
 ```bash
 sudo app-listener guard /secret                    # block everything

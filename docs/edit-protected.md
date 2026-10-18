@@ -5,25 +5,34 @@ is the supported way to change a protected file, to give another program tempora
 change the daemon's own config.
 
 ```bash
-sudo app-listener edit-protected                        # live if a password is set and the daemon runs, else offline
-sudo app-listener edit-protected --set-password         # set or rotate the password
-sudo app-listener edit-protected --clear-password       # remove it (disables live mode)
+sudo app-listener edit-protected                        # live if the daemon runs, else offline
+sudo app-listener edit-protected --set-password         # change the password (asks the current one)
 sudo app-listener edit-protected --forward -w <bin> [-e EVENTS]   # temporary access for another binary
 sudo app-listener edit-protected --timeout-session 10m  # revoke a live session after 10 idle minutes
 sudo app-listener edit-protected --edit-config          # edit the running daemon.conf; saving reloads it
 ```
 
-It opens the directory in a two-pane editor. `Ctrl+S` saves atomically. Binaries, symlinks and
-files over 2 MiB are refused.
+It opens the directory in a two-pane editor, the file tree on the left. `Ctrl+S` saves
+atomically. Binaries, symlinks and files over 2 MiB are refused.
+
+`Alt+←` and `Alt+→` move between the tree and the editor; the focused pane's title is
+underlined. The open file stays in the editor while you browse the tree, and `Esc` closes it.
+`Ctrl+B` hides the tree and shows it again (`Alt+←` shows it too). Opening another file over unsaved changes asks first.
+A click selects a tree row and a second click opens it; a click in the editor places the cursor.
+
+The desktop window's Protected workspace offers the same actions; see [gui.md](gui.md#protected).
+It drives this binary through `edit-protected --backend`, a hidden mode that speaks JSON lines on
+stdin/stdout. That mode is the window's channel, not for direct use: it refuses a terminal and any
+other flag, and asks the daemon for nothing the modes above can't.
 
 ## Offline and live mode
 
 The mode is chosen automatically.
 
-- **Offline** (default): refused while the daemon runs. Re-scans the catalog, unlocks one vault
-  with the master key, lets you edit, and locks it again on exit. A vault never stays open.
-- **Live**: when an edit-protected password was chosen during `sudo app-listener install` **and**
-  the daemon is running. Nothing is stopped and the fscrypt vaults are never touched:
+- **Offline**: when the daemon is stopped. Re-scans the catalog, unlocks one vault with the master
+  key, lets you edit, and locks it again on exit. A vault never stays open.
+- **Live**: when the daemon is running with the edit-protected password chosen during
+  `sudo app-listener install`. Nothing is stopped and the fscrypt vaults are never touched:
   1. you enter the password, **first**;
   2. only then does the daemon return the list of guarded directories to pick from;
   3. it briefly grants write access to the one you pick;
@@ -32,19 +41,28 @@ The mode is chosen automatically.
 An unauthenticated caller learns **nothing** about which directories are protected. Grants are
 one at a time and are revoked on disconnect, on a SIGHUP reload, or after `--timeout-session`
 (default `30m`, up to `24h`; e.g. `10m`, `45s`) without activity. Every editor keypress resets
-that timer. The control socket locks out after 5 failed attempts.
+that timer. 5 wrong passwords lock every password check for a minute (see below).
 
 ### The password and the control socket
 
 The password is **separate from the fscrypt master key**: it only authenticates `edit-protected`.
-Its PBKDF2 hash is stored at `/etc/app-listener/edit-auth.hash` (`0600` root), guarded by the
-running daemon like `fscrypt.key` (readable and writable only by the app-listener binary).
+The installer requires one. Its PBKDF2 hash is stored in the `edit_auth` table of
+`/etc/app-listener/binaries.db` (`0600` root). The running daemon seals that database and its
+journal like `fscrypt.key`: only the app-listener binary can read or write them. An
+`edit-auth.hash` file left by an older release is imported on the daemon's next start (only when
+the database has no password yet) and removed.
 
-When that file exists, the daemon opens `/run/app-listener-daemon.control` (`0600`). It accepts
-only root peers whose executable is the app-listener binary itself.
+With a password configured, the daemon opens `/run/app-listener-daemon.control` (`0600`). It
+accepts only root peers whose executable is the app-listener binary itself.
 
-`--set-password` is refused if the password was set at install time; re-run `install` to rotate
-that one.
+`--set-password` changes the password; it can't be removed. It asks the current password first:
+with the daemon running, the daemon checks it (`AUTH`) and stores the new one itself; with the
+daemon stopped, it is checked locally. Every check, the daemon's and the local one, draws on the
+same budget kept in the database: 5 wrong passwords lock all of them for a minute, and restarting
+the daemon doesn't reset it. A forgotten password is replaced by reinstalling: `uninstall` keeping
+the folders encrypted and the master key, then `install` (the wizard refuses while a completed
+installation is recorded). An install older than the mandatory password has none: `--set-password`
+sets the first one with the daemon stopped (it refuses while the daemon runs).
 
 ### Non-interactive writes
 
@@ -131,10 +149,23 @@ diff/changelog viewers open at the first line.
 | `Ctrl+S` | Save |
 | `Tab` / `Shift+Tab` | Indent / dedent by four spaces |
 | `PgUp` / `PgDn` | Page |
-| `Ctrl+←` / `Ctrl+→` | Jump between words and punctuation, across lines |
+| `Ctrl+←` / `Ctrl+→` | Jump between words and punctuation, across lines (`Alt+←` / `Alt+→` too, except in edit-protected, where they switch panes) |
+| `Shift` + arrows, `Home`, `End` | Select; with `Ctrl+Shift`, `←`/`→` select by word and `Home`/`End` to the buffer's ends |
+| Mouse drag | Select (the wheel scrolls) |
+| `Ctrl+A` | Select everything |
+| `Ctrl+C` | Copy the selection |
+| `Ctrl+X` / `Ctrl+V` | Cut / paste (editors only); typing, `Backspace` or `Delete` replace the selection |
+| `Esc` | Drop the selection (when there is one) |
 | `Ctrl+F` | Find box: *Search* jumps to the next match, *Search all* marks every match |
 | `Ctrl+R` | Find and replace (editors only): *Replace* / *Replace all* |
 | `Tab`, `Enter`, `Esc` (in a box) | Move between fields, activate, close |
+
+The editors capture the mouse, so a drag selects text in the editor only, never the tree or the
+line numbers. Most terminals still make their own selection with `Shift` held down. Copying uses
+the OSC 52 escape sequence, which puts the text on your desktop clipboard through `sudo`, `ssh`
+and tmux (with `set-clipboard on`) in terminals that support it (kitty, foot, Alacritty, WezTerm,
+iTerm2, Windows Terminal, ...). `Ctrl+V` pastes what was last copied in the editor; your terminal's
+paste (usually `Ctrl+Shift+V`) pastes from the desktop clipboard.
 
 Matching is literal and smart-case: case-sensitive only when the query has an upper-case letter.
 Text is syntax-highlighted by file name or `#!` line (Go, Python, C, shell, JSON, YAML, TOML, INI,

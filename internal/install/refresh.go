@@ -36,7 +36,7 @@ type RefreshOptions struct {
 	Live bool
 	// KeepExisting keeps a section's whitelist lines whose file still exists, dropping only
 	// vanished ones (the daemon's own refresh). Off, the section is rebuilt from the catalog alone,
-	// so a line the catalog doesn't produce is dropped (`install --update-catalog-only`). On, the
+	// so a line the catalog doesn't produce is dropped (`install --refresh-catalog-only`). On, the
 	// app's [libraries] block also loses catalog-pattern lib_dir / lib_binary lines whose path is gone.
 	KeepExisting bool
 	Scan         SectionScan
@@ -45,7 +45,7 @@ type RefreshOptions struct {
 }
 
 // RefreshCatalog re-expands the whitelist of every catalog section of confText (the text cfg was
-// parsed from). What it admits is what `install --update-catalog-only` admits: catalog globs,
+// parsed from). What it admits is what `install --refresh-catalog-only` admits: catalog globs,
 // confSafeMatch, homeMatchConfined, and library directives added (see KeepExisting). User sections are
 // kept verbatim.
 func RefreshCatalog(confText string, cfg *daemonconfig.Config, users []User, opts RefreshOptions) (string, []SectionChange, error) {

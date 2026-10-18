@@ -37,7 +37,7 @@ var readMasterKey = readKey
 // guard_path_rename's destination-parent check in guard.bpf.c), so a create-temp-then-rename for
 // the sidecar is denied once the guard is live. So this package only rewrites the sidecar's
 // EXISTING inode in place (EnsureRecoverySidecarPlaceholder, stageRecovery, clearRecovery). Empty
-// sidecar = nothing to recover (like editprotected.HashFile's empty-means-unset).
+// sidecar = nothing to recover.
 //
 // The staged content is sealed under the master key, never raw plaintext: a sidecar left by a crash
 // survives a reboot (which drops every BPF-LSM pin), so it must be useless on its own.
@@ -224,8 +224,7 @@ func transformFileInPlace(path string, newContent []byte) error {
 // writeSidecarInPlace rewrites sidecar with content (may be empty) on its EXISTING inode (open,
 // truncate, write, fsync; never rename). The O_CREATE branch is a bootstrap fallback for when
 // EnsureRecoverySidecarPlaceholder hasn't run (the install-time pass runs before any guard exists);
-// once a guard watches path the sidecar always exists, so the open-existing branch is taken. Same
-// two-branch shape and justification as editprotected.WriteHashFile.
+// once a guard watches path the sidecar always exists, so the open-existing branch is taken.
 func writeSidecarInPlace(sidecar string, content []byte) error {
 	if err := rejectSidecarSymlink(sidecar); err != nil {
 		return err

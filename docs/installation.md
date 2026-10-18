@@ -64,9 +64,21 @@ A TUI wizard that runs in a safe order:
    browsers, VPNs, password stores, crypto wallets, ...) and lets you pick which to guard.
 5. Encrypts the selected directories. Each is backed up first and the backup is verified against
    the master key.
-6. Deploys the systemd units, the binary and the config.
-7. Runs `daemon --check` on the deployed binary before enabling the service: if this kernel's
+6. Asks for the edit-protected password (mandatory; see [edit-protected](edit-protected.md)). When
+   resuming an interrupted install, an existing password is kept unless you choose to replace it.
+7. Deploys the systemd units, the binary and the config.
+8. Runs `daemon --check` on the deployed binary before enabling the service: if this kernel's
    verifier rejects the guard eBPF, the service is not enabled.
+
+An interrupted wizard (a canceled prompt, a failed step) is resumed by running it again: the
+existing master key is kept, already encrypted directories are verified and identical files are
+skipped. Once a wizard completes (daemon running and enabled, orphaned fscrypt metadata cleaned), it
+records the installation in `/etc/app-listener/install-complete` (version and time), and from then
+on the wizard refuses to run. Change a completed installation with `--diff-catalog`,
+`--refresh-catalog-only`, `edit-protected --edit-config` or [`update`](#update), or run
+[`uninstall`](#uninstall) first to start over. `--binary-only` and the other flags below are not
+affected. An installation completed before this record existed has none, so its wizard still runs
+until one completes.
 
 Earlier versions installed pacman/apt hooks and a boot unit to refresh the catalog; the wizard,
 `install --binary-only` and `update` remove them, since the daemon now refreshes the catalog itself.
@@ -116,15 +128,15 @@ it aborts. Every command it may run is listed in `internal/fscrypt/prereq.go`.
 | Flag | Description |
 |---|---|
 | `--diff-catalog` | Incremental wizard: lists the catalog directories that exist on the host but are **not** in `daemon.conf` yet, lets you pick which to add, appends them and encrypts them (backup first). Existing sections stay byte-for-byte intact. Stops the daemon for the cycle and restarts it on the merged config. Requires a previous installation; interactive only. |
-| `--update-catalog-only` | Re-expands every catalog-matched whitelist and rewrites the config, dropping every line the catalog does not produce. Stops the daemon and unlocks each vault under an ephemeral self-only guard. The running daemon already does this on its own (see [catalog refresh](catalog.md#catalog-refresh)), so you normally never need it. |
-| `--live` | With `--update-catalog-only`: refresh without stopping the daemon (no lock churn), applied via SIGHUP. Requires the daemon to be running. |
+| `--refresh-catalog-only` | Re-expands every catalog-matched whitelist and rewrites the config, dropping every line the catalog does not produce. Stops the daemon and unlocks each vault under an ephemeral self-only guard. The running daemon already does this on its own (see [catalog refresh](catalog.md#catalog-refresh)), so you normally never need it. |
+| `--live` | With `--refresh-catalog-only`: refresh without stopping the daemon (no lock churn), applied via SIGHUP. Requires the daemon to be running. |
 | `--allow-metadata-output` | Installs the daemon unit **without** `--no-log-metadata-blocks`, so denied metadata-only process inspections (`op=PTRACE mode=READ`) are logged. Use it to diagnose an app that breaks with nothing logged; re-run `install` without it to quiet them again. |
 | `--binary-only` | Moves the freshly built binary to the install path and recreates the PATH symlink. No wizard, config or fscrypt. If the daemon service is installed, diffs its unit against the one the new build ships (replaced only if you accept, as with [`update`](#update)) and asks whether to restart it now; a skipped restart applies the accepted unit on the next one. |
-| `--restore-backups` | Undoes the fscrypt migration: lists the `.app_listener.backup` directories, and after one confirmation deletes the encrypted copies and moves the backups back. Refused while the daemon runs. |
-| `--delete-post-backups` | Deletes the `.app_listener.backup` directories (listed, confirmed once). |
-| `-y, --yes` | Skips confirmation prompts (for `--update-catalog-only` in scripts). |
+| `--restore-backups` | Undoes the fscrypt migration: lists the `.app_listener.backup` directories, and after a confirmation naming each one deletes the encrypted copies and moves the backups back. Refused while the daemon runs. |
+| `--delete-post-backups` | Deletes the `.app_listener.backup` directories (listed, then a confirmation naming each one). Works with the daemon running: the backups sit outside every guarded tree. |
+| `-y, --yes` | Skips confirmation prompts (for `--refresh-catalog-only` in scripts). |
 
-`--update-catalog-only` refreshes the whitelists of existing sections; `--diff-catalog` adds new
+`--refresh-catalog-only` refreshes the whitelists of existing sections; `--diff-catalog` adds new
 sections. Run both to fully re-sync with the catalog.
 
 ## Update
@@ -139,6 +151,16 @@ Self-updates from the latest signed release of `--channel` (`stable`, the defaul
 `pre-release`), fetching the asset for the running binary's architecture. The Ed25519 signature,
 signed asset name, checksum, GitHub asset digest and ELF machine are all verified before anything
 is written.
+
+The desktop window (`--gui`) runs the same update from its Update workspace, with the changelog and
+the confirmations as dialogs (see [Desktop GUI](gui.md#update)).
+
+When the desktop build is installed (`/usr/local/sbin/app-listener-gui`, deployed by the window's
+installer), `update` replaces it with the new release's desktop asset, downloaded and verified
+like the binary before anything is written, after the daemon is back up. A release without one
+leaves the old desktop build in place with a warning. With the daemon already up to date, an
+installed desktop build of another version is brought to the daemon's release. Updating from the
+window also installs the desktop build when it is missing.
 
 The changelog covers every release of the channel between the installed version and the new one,
 newest first, with a link to the full compare. If the installed version is not among the fetched
@@ -159,12 +181,22 @@ denials logged.
 ```bash
 sudo app-listener uninstall
 sudo app-listener uninstall --delete-key
+sudo app-listener uninstall --keep-gui
 ```
 
 - Refuses while the daemon runs.
-- Re-scans the catalog and decrypts every protected directory in place.
+- Removes the completed-install record first, so an interrupted uninstall can be followed by a
+  fresh `install`.
+- Re-scans the catalog and asks, per encrypted directory, whether to decrypt it in place for good
+  (default: keep it encrypted).
+- Removes the binary, the desktop build (`app-listener-gui`, kept with `--keep-gui`), their PATH
+  symlinks, the units and the config.
 - Keeps the master key unless `--delete-key` is given. Without the key, any directory still
-  encrypted can never be unlocked again.
+  encrypted can never be unlocked again, so with directories left encrypted `--delete-key` asks
+  once more (default: keep the key).
+
+The desktop window runs the same uninstall from its Install workspace (see
+[Desktop GUI](gui.md#uninstall)).
 - At the end, lists any `.app_listener.backup` migration copies and offers to delete them (all
   preselected, one confirmation). They are plain unencrypted copies and harmless to keep.
 

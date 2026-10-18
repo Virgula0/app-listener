@@ -9,6 +9,7 @@ subcommand, flag, config option and known limitation.
 - [Installation](installation.md): the one-line installer, building from source, the install
   wizard, `update`, `uninstall`, Docker.
 - [How it works](how-it-works.md): the eBPF attach model, binary identity, output formats, `--serve`.
+- [Desktop GUI](gui.md): `--gui`, the window covering the file and network modes, the updater and the installer.
 
 ## Modes
 

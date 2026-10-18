@@ -272,7 +272,7 @@ func groupedDiscordConf(t *testing.T, home string) (string, *daemonconfig.Config
 	return confText, cfg
 }
 
-// Regression (pacman-hook breaker): `install --update-catalog-only` addressed a grouped section's
+// Regression (pacman-hook breaker): `install --refresh-catalog-only` addressed a grouped section's
 // whitelist by its first watch sub-path, which has no [watch] header, so SetSectionWhitelist failed
 // "section not found" and (non-live) left the daemon stopped. It must address the section by its
 // encryption root, re-expand the shared whitelist and keep the `watch:` structure.

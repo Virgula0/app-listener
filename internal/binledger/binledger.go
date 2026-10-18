@@ -1,17 +1,21 @@
-// Package binledger is the daemon's record of every whitelisted binary it has confirmed, by content
-// hash. Admission at start or reload otherwise trusts whatever sits at a whitelisted path, and
-// nothing guards those paths while the daemon is not running (issue #80): a binary whose hash is
-// not recorded is admitted only when the daemon can prove where it came from (cmd/functions/daemon
-// binvet.go), else it waits for `app-listener trust-binaries`.
+// Package binledger is binaries.db: the daemon's record of every whitelisted binary it has
+// confirmed, by content hash, plus the edit-protected password record (editauth.go). Admission at
+// start or reload otherwise trusts whatever sits at a whitelisted path, and nothing guards those
+// paths while the daemon is not running (issue #80): a binary whose hash is not recorded is
+// admitted only when the daemon can prove where it came from (cmd/functions/daemon binvet.go), else
+// it waits for `app-listener trust-binaries`.
 package binledger
 
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3" // database/sql driver
@@ -19,8 +23,8 @@ import (
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 )
 
-// DefaultPath lives in /etc/app-listener, which the daemon self-guards read-only: only the
-// app-listener binary may modify it.
+// DefaultPath lives in /etc/app-listener; the daemon seals it and its journal (whitelist-empty self
+// guards): only the app-listener binary may read or modify them, as they hold the password hash.
 const DefaultPath = "/etc/app-listener/binaries.db"
 
 // Source says how a hash entered the ledger.
@@ -47,33 +51,28 @@ type Ledger struct {
 	db *sql.DB
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS binaries (
-	line TEXT PRIMARY KEY,
-	sha256 BLOB NOT NULL,
-	source TEXT NOT NULL,
-	updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS grants (line TEXT PRIMARY KEY);
-CREATE TABLE IF NOT EXISTS pending (
-	line TEXT PRIMARY KEY,
-	resolved TEXT NOT NULL,
-	sha256 BLOB NOT NULL,
-	resources TEXT NOT NULL,
-	seen_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS hash_cache (
-	dev INTEGER NOT NULL,
-	ino INTEGER NOT NULL,
-	fsid INTEGER NOT NULL,
-	size INTEGER NOT NULL,
-	mtime_ns INTEGER NOT NULL,
-	ctime_ns INTEGER NOT NULL,
-	btime_ns INTEGER NOT NULL,
-	sha256 BLOB NOT NULL,
-	PRIMARY KEY (dev, ino)
-);`
+// schemaFS holds the CREATE statements, applied in file-name order at every Open.
+//
+//go:embed schema/*.sql
+var schemaFS embed.FS
+
+func applySchema(db *sql.DB) error {
+	files, err := fs.Glob(schemaFS, "schema/*.sql")
+	if err != nil {
+		return err
+	}
+	slices.Sort(files)
+	for _, f := range files {
+		stmts, err := schemaFS.ReadFile(f)
+		if err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(context.Background(), string(stmts)); err != nil {
+			return fmt.Errorf("%s: %w", f, err)
+		}
+	}
+	return nil
+}
 
 // Line is the whitelist line the ledger keys r on: the link when r is a symlink line, so a link
 // re-pointed at another confirmed binary is judged by that binary's content, not its path.
@@ -134,7 +133,7 @@ func Open(path string) (*Ledger, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.ExecContext(context.Background(), schema); err != nil {
+	if err := applySchema(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("binary ledger %s: %w", path, err)
 	}

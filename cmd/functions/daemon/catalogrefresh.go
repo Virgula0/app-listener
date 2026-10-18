@@ -290,7 +290,7 @@ func readEvents(fd int, buf []byte, handle func(wd int32, mask uint32, name stri
 }
 
 // refresh re-expands the catalog sections of the running config and applies the result through
-// the in-process reload. Admission is exactly `install --update-catalog-only`'s (RefreshCatalog).
+// the in-process reload. Admission is exactly `install --refresh-catalog-only`'s (RefreshCatalog).
 // Any failure leaves the running config, and daemon.conf, as they were.
 func (r *catalogRefresher) refresh() {
 	defer func() {

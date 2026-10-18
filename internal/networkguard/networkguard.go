@@ -62,9 +62,11 @@ type NetGuard struct {
 	memfd        bool // netg_memfd_alloc's target exists (netSpec)
 	mounts       *guard.MountVouch
 	lostSeen     [2]uint64 // suspect marks / exec stamps the kernel reported lost (warnDegraded)
+	inheritFrom  *NetGuard // WithSuspectsFrom
 }
 
-func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType, unsafe, throttle bool) (*NetGuard, error) {
+func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType, unsafe, throttle bool,
+	opts ...Option) (*NetGuard, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Warnf("failed to remove memlock rlimit: %v", err)
 	}
@@ -86,6 +88,9 @@ func NewNetGuard(mode Mode, binaries []BinaryEntry, eventset []ebpf.NetEventType
 		eventset: es,
 		ownPID:   os.Getpid(),
 		throttle: throttle,
+	}
+	for _, o := range opts {
+		o(g)
 	}
 
 	spec, memfd, err := netSpec(mode == ModeWhitelist)
@@ -138,6 +143,10 @@ func (g *NetGuard) setup() error {
 		return err
 	}
 	if g.mode == ModeWhitelist {
+		// Before the /proc judgement: marks set meanwhile come from this guard's own hooks.
+		if err := g.inheritSuspects(); err != nil {
+			return err
+		}
 		if err := g.markPreexisting(); err != nil {
 			return fmt.Errorf("judging processes started before the network guard: %w", err)
 		}

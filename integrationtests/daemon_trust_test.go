@@ -694,7 +694,7 @@ need_encryption: false
 	code, attack := s.exec(c, []string{"sh", "-c", "mv " + shQuote(discordDir+"/0.0.1") + " " + shQuote(evil) + " 2>&1"})
 	s.T().Logf("rename of the wildcard dir to a quote/newline name: rc=%d %s", code, attack)
 
-	code, refresh := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	code, refresh := s.exec(c, []string{"/app-listener", "install", "--refresh-catalog-only", "--live", "--yes"})
 	if code == 0 {
 		s.awaitLog(c, "configuration reloaded", 60*time.Second)
 	}
@@ -782,7 +782,7 @@ need_encryption: false
 	}
 
 	// The unattended refresh the boot unit / package-manager hooks run.
-	code, refresh := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	code, refresh := s.exec(c, []string{"/app-listener", "install", "--refresh-catalog-only", "--live", "--yes"})
 	if code == 0 {
 		s.awaitLog(c, "configuration reloaded", 60*time.Second)
 	}
@@ -1145,7 +1145,7 @@ need_encryption: false
 	loaded, out := s.preload(c, helper, plant)
 	s.Require().Falsef(loaded, "baseline: the plant must not load before the refresh: %s", out)
 
-	code, refresh := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	code, refresh := s.exec(c, []string{"/app-listener", "install", "--refresh-catalog-only", "--live", "--yes"})
 	if code == 0 {
 		s.awaitLog(c, "configuration reloaded", 60*time.Second)
 	}
@@ -1200,7 +1200,7 @@ need_encryption: false
 	loaded, out := s.preload(c, helper, plant)
 	s.Require().Falsef(loaded, "baseline: the plant must not load before the refresh: %s", out)
 
-	code, refresh := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	code, refresh := s.exec(c, []string{"/app-listener", "install", "--refresh-catalog-only", "--live", "--yes"})
 	if code == 0 {
 		s.awaitLog(c, "configuration reloaded", 60*time.Second)
 	}

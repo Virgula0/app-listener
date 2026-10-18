@@ -13,25 +13,10 @@ import (
 	"github.com/Virgula0/app-listener/internal/tui"
 )
 
-// auditAfterEdit loads the installed daemon.conf (if any) and audits the edited tree. interactive
+// auditAfterEdit audits the edited tree against the installed daemon.conf (if any). interactive
 // picks how findings surface: an acknowledge prompt (TUI) or plain warnings (--put, no TTY).
 func auditAfterEdit(resource string, interactive bool) {
-	cfg, err := daemonconfig.Load(systemd.SystemConfigPath)
-	if err != nil {
-		auditAfterEditWithConfig(nil, resource, interactive)
-		return
-	}
-	auditAfterEditWithConfig(cfg, resource, interactive)
-}
-
-// auditAfterEditWithConfig inspects the edited tree for anything outside the daemon's protection or
-// weakening it and reports findings. Advisory only: nothing is changed or blocked. Interactive
-// flows add a one-way acknowledgement so the warnings aren't missed; --put just logs.
-func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string, interactive bool) {
-	findings := make([]string, 0, 8)
-	findings = append(findings, auditTree(resource)...)
-	findings = append(findings, auditGroupCoverage(cfg, resource)...)
-
+	findings := auditFindings(resource)
 	if len(findings) == 0 {
 		log.Info("post-edit audit: no issues found")
 		return
@@ -51,6 +36,22 @@ func auditAfterEditWithConfig(cfg *daemonconfig.Config, resource string, interac
 		"Advisory only: the edit was saved and nothing here is changed or blocked.", findings); err != nil {
 		log.Warnf("could not show the post-edit audit: %v", err)
 	}
+}
+
+// auditFindings inspects the edited tree for anything outside the daemon's protection or weakening
+// it. Advisory only: nothing is changed or blocked.
+func auditFindings(resource string) []string {
+	cfg, err := daemonconfig.Load(systemd.SystemConfigPath)
+	if err != nil {
+		cfg = nil
+	}
+	return auditFindingsWithConfig(cfg, resource)
+}
+
+func auditFindingsWithConfig(cfg *daemonconfig.Config, resource string) []string {
+	findings := make([]string, 0, 8)
+	findings = append(findings, auditTree(resource)...)
+	return append(findings, auditGroupCoverage(cfg, resource)...)
 }
 
 // auditTree walks resource and flags symlinks, group/other-accessible files,

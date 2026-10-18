@@ -17,13 +17,12 @@ import (
 // net) reads it to recompute the bpffs pin paths (guard.PinPrefix / WithPinnedSelfVaultAccess) a
 // crashed daemon left, and to tell whether the owner might still be alive before touching them.
 //
-// Lives beside fscrypt.key and edit-auth.hash in the self-guarded /etc/app-listener (ModeReadOnly,
+// Lives beside fscrypt.key and binaries.db in the self-guarded /etc/app-listener (ModeReadOnly,
 // selfProtectSpecs). pid+gen aren't secret, but their INTEGRITY matters, which the RO self-guard
 // provides once a daemon runs (only the app-listener binary may overwrite it).
 const pinStateFileProd = "/etc/app-listener/pin-state.json"
 
-// pinStateFile is pinStateFileProd in production; tests point it at a temp
-// file (mirroring cmd/functions/editprotected/auth.go's hashFilePath).
+// pinStateFile is pinStateFileProd in production; tests point it at a temp file.
 var pinStateFile = pinStateFileProd
 
 // pinStateRecord is the on-disk shape of pinStateFile.
@@ -38,10 +37,10 @@ type pinStateRecord struct {
 var errNoPinState = errors.New("no usable pin-state record found")
 
 // writePinState records pin's generation for the config guards just brought up or rotated to
-// (reload), IN PLACE on the file's existing inode (like editprotected/auth.go's WriteHashFile, same
-// reason): once the RO self-guard on /etc/app-listener is attached, only rewriting an EXISTING
-// entry is permitted, so ensurePinStateFilePlaceholder creates it before that guard attaches and the
-// create fallback only covers a failed placeholder. Best-effort: failure only means `--lockdown` can't recover this generation, never that
+// (reload), IN PLACE on the file's existing inode: once the RO self-guard on /etc/app-listener is
+// attached, only rewriting an EXISTING entry is permitted, so ensurePinStateFilePlaceholder creates
+// it before that guard attaches and the create fallback only covers a failed placeholder.
+// Best-effort: failure only means `--lockdown` can't recover this generation, never that
 // startup/reload fails.
 func writePinState(pin pinCfg) error {
 	encoded, err := json.Marshal(pinStateRecord{PID: os.Getpid(), Gen: pin.gen, UpdatedAt: time.Now().UTC()})

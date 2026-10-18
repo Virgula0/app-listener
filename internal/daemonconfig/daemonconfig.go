@@ -232,6 +232,32 @@ func Parse(raw []byte) (*Config, error) {
 	return cfg, nil
 }
 
+// DeclaredPaths lists every section root and `watch:` path in raw without touching the filesystem
+// (Parse Lstats each one, which a live guard denies to a non-whitelisted caller). Not validated:
+// for probing siblings like migration backups, never for policy.
+func DeclaredPaths(raw []byte) []string {
+	var out []string
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if p, isSection, err := parseWatchSection(line); err == nil && isSection && p != "" {
+			out = append(out, p)
+			continue
+		}
+		if p, ok := parsePathDirective(line); ok {
+			out = append(out, p)
+			continue
+		}
+		if isWatchDirective(line) {
+			p := unquotePath(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "watch:"), "watch")))
+			if p != "" {
+				out = append(out, filepath.Clean(p))
+			}
+		}
+	}
+	return out
+}
+
 // parseConfig reads the file into cfg, one Resource per guarded tree (a watch group emits one per
 // `watch:` path).
 func parseConfig(cfg *Config, file io.Reader) error {

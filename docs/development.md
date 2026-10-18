@@ -55,10 +55,25 @@ Multi-stage build on a Debian-slim runner. eBPF needs the host kernel: run privi
 
 ## Demo GIFs
 
-The per-mode GIFs in [`media/`](../media) are referenced by the README. Keep each one short
-(under a minute) and small (a few hundred KB): scale to about 900 px wide at 6 fps with a reduced
-palette, for example:
+The README's media lives in [`media/`](../media): terminal recordings in `media/tui/`, desktop
+GUI screenshots and its walkthrough GIF in `media/gui/`. Keep each GIF short (under a minute) and
+small (a few hundred KB). For a terminal recording, scale to about 900 px wide at 6 fps with a
+reduced palette, for example:
 
 ```bash
-ffmpeg -i recording.mp4 -vf "fps=6,scale=880:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=64:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" media/<mode>.gif
+ffmpeg -i recording.mp4 -vf "fps=6,scale=880:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=64:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" media/tui/<mode>.gif
 ```
+
+The GUI media is rendered off-screen from fake engines, at the floating window's default
+1280x820, by the GUI end-to-end tests (`-tags gui,e2e`, kept out of `make test` for their run
+time; they need neither root nor a display). `make test-e2e` renders into a temp dir;
+`SNAPSHOTS=<dir>` keeps one PNG per page and state, `DEMO=<dir>` the walkthrough's frames and a
+concat list with each frame's duration:
+
+```bash
+mkdir -p /tmp/snaps /tmp/reel
+make test-e2e SNAPSHOTS=/tmp/snaps DEMO=/tmp/reel
+cd /tmp/reel && ffmpeg -f concat -i frames.txt -fps_mode vfr -vf "split[a][b];[a]palettegen=max_colors=128:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" demo.gif
+```
+
+Keep the GUI GIF at its native width: it is sharper and smaller than a scaled one.

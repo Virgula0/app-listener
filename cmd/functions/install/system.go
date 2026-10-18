@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
@@ -17,6 +16,7 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/safeio"
 	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 const (
@@ -160,22 +160,21 @@ func askSSHAgentUsers(cfg *daemonconfig.Config) ([]inst.User, error) {
 			continue
 		}
 
-		install := true
-		if ferr := huh.NewForm(huh.NewGroup(
-			huh.NewConfirm().
-				Title(fmt.Sprintf("Set up ssh-agent for user %s?", u.Name)).
-				Description(fmt.Sprintf(
-					"%s is guarded, so ssh-agent must run as a known service to keep reading the keys.\n"+
-						"This will:\n"+
-						"  - install and enable a per-user systemd unit (that user's session only) at %s\n"+
-						"  - add an SSH_AUTH_SOCK block to the user's shell startup file (.zshrc / .bashrc / fish conf.d)\n"+
-						"  - put `AddKeysToAgent yes` at the top of %s so ssh loads a key into the agent on first use\n"+
-						"    (a loaded key can be used through the agent socket by any process of that user)",
-					sshDir, unitPath, filepath.Join(sshDir, "config"))).
-				Affirmative("Set it up").
-				Negative("Skip").
-				Value(&install),
-		)).Run(); ferr != nil {
+		install, ferr := wizard.Confirm(wizard.Question{
+			Title: fmt.Sprintf("Set up ssh-agent for user %s?", u.Name),
+			Description: fmt.Sprintf(
+				"%s is guarded, so ssh-agent must run as a known service to keep reading the keys.\n"+
+					"This will:\n"+
+					"  - install and enable a per-user systemd unit (that user's session only) at %s\n"+
+					"  - add an SSH_AUTH_SOCK block to the user's shell startup file (.zshrc / .bashrc / fish conf.d)\n"+
+					"  - put `AddKeysToAgent yes` at the top of %s so ssh loads a key into the agent on first use\n"+
+					"    (a loaded key can be used through the agent socket by any process of that user)",
+				sshDir, unitPath, filepath.Join(sshDir, "config")),
+			Affirmative: "Set it up",
+			Negative:    "Skip",
+			Default:     true,
+		})
+		if ferr != nil {
 			return nil, ferr
 		}
 		if !install {

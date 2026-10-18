@@ -19,20 +19,29 @@ import (
 // sessionVars are the display variables sudo's env_reset drops; nothing else is ever imported.
 var sessionVars = []string{"XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY"}
 
+// wmVars locate the tiling WM's IPC socket (wm.Detect checks its owner). They are read from the
+// same ancestor but never exported: only the floating request uses them.
+var wmVars = []string{"HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK", "I3SOCK"}
+
 var displayRe = regexp.MustCompile(`^[A-Za-z0-9.\-]*:\d+(\.\d+)?$`)
 
 // restoreSessionEnv lets a root GUI reach the invoking user's compositor or X server under
 // sudo/pkexec. Only unset variables are filled, from the nearest ancestor running as that user,
-// and each must name a socket/dir/file that user owns (see xauthority for the cookie file).
-func restoreSessionEnv() {
+// and each must name a socket/dir/file that user owns (see xauthority for the cookie file). It
+// returns that ancestor's wmVars.
+func restoreSessionEnv() (wmEnv map[string]string) {
 	if os.Geteuid() != 0 {
-		return
+		return nil
 	}
 	uid, ok := invokingUID()
 	if !ok {
-		return
+		return nil
 	}
 	found := ancestorEnv(uid)
+	wmEnv = map[string]string{}
+	for _, k := range wmVars {
+		wmEnv[k] = found[k]
+	}
 	if os.Getenv("XDG_RUNTIME_DIR") == "" {
 		dir := found["XDG_RUNTIME_DIR"]
 		if dir == "" {
@@ -55,6 +64,7 @@ func restoreSessionEnv() {
 			_ = os.Setenv("XAUTHORITY", auth)
 		}
 	}
+	return wmEnv
 }
 
 // invokingUID is the non-root user sudo or pkexec ran us for (both set it themselves).
@@ -67,7 +77,7 @@ func invokingUID() (uint32, bool) {
 	return 0, false
 }
 
-// ancestorEnv reads sessionVars from the closest ancestor whose real uid is uid (the shell that
+// ancestorEnv reads sessionVars and wmVars from the closest ancestor whose real uid is uid (the shell that
 // ran sudo; sudo's own processes in between run as root).
 func ancestorEnv(uid uint32) map[string]string {
 	out := map[string]string{}
@@ -85,7 +95,7 @@ func ancestorEnv(uid uint32) map[string]string {
 			}
 			for _, kv := range bytes.Split(environ, []byte{0}) {
 				k, v, ok := strings.Cut(string(kv), "=")
-				if ok && slices.Contains(sessionVars, k) {
+				if ok && (slices.Contains(sessionVars, k) || slices.Contains(wmVars, k)) {
 					out[k] = v
 				}
 			}
@@ -193,4 +203,15 @@ func ownedBy(path string, uid uint32, typ os.FileMode) bool {
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	return ok && st.Uid == uid
+}
+
+// invokingHome is the home of the user sudo/pkexec ran us for, else ours.
+func invokingHome() string {
+	if uid, ok := invokingUID(); ok {
+		if u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10)); err == nil {
+			return u.HomeDir
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return home
 }

@@ -12,6 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/tui"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // runLiveEdit is the daemon-running flow: password asked ONCE up front (before any protected path
@@ -54,7 +55,7 @@ func runLiveEdit() error {
 	log.Infof("editing %s LIVE — the daemon keeps guarding it; write access is granted only for this session "+
 		"and revoked after %s without input", chosen, timeoutSession)
 	_, ended := session.Watch()
-	byDaemon, err := tui.RunFileEditorSession(chosen, session.Pinger(pingInterval()), ended)
+	byDaemon, err := tui.RunFileEditorSession(chosen, session.Pinger(pingInterval(timeoutSession)), ended)
 	if err != nil {
 		return fmt.Errorf("edit %s: %w", chosen, err)
 	}
@@ -165,14 +166,11 @@ func readPutContent() ([]byte, error) {
 }
 
 // promptPassword reads a password without echoing it.
-func promptPassword(title string) (string, error) {
-	var pw string
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewInput().
-			Title(title).
-			EchoMode(huh.EchoModePassword).
-			Value(&pw),
-	)).Run(); err != nil {
+func promptPassword(title string) (string, error) { return promptPasswordWith(title, "") }
+
+func promptPasswordWith(title, description string) (string, error) {
+	pw, err := wizard.Input(wizard.Field{Title: title, Description: description, Secret: true})
+	if err != nil {
 		return "", err
 	}
 	if pw == "" {

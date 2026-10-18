@@ -9,7 +9,8 @@ import (
 // selfDirGuarded matches the read-only directory self guard, the last one attached.
 var selfDirGuarded = regexp.MustCompile(`self-protection: guarding /etc/app-listener([^/]|$)`)
 
-// fscrypt.key and edit-auth.hash are sealed guards nested in the read-only /etc/app-listener guard.
+// fscrypt.key and binaries.db (the password hash) are sealed guards nested in the read-only
+// /etc/app-listener guard.
 // That guard's first sweep (selfSweepEvery, 30s after attach) rescans the directory; the rescan must
 // not re-assign the sealed files to the read-only resource, which lets every process read.
 func (s *IntegrationSuite) TestDaemon_SelfProtection_SweepKeepsKeySealed() {
@@ -39,8 +40,8 @@ need_encryption: false
 	for dl := time.Now().Add(75 * time.Second); time.Now().Before(dl); {
 		_, out := s.exec(c, []string{"sh", "-c", swapReaderPath + " /etc/app-listener/fscrypt.key 2>&1"})
 		s.Require().NotContainsf(out, "STOLEN|", "fscrypt.key became readable by a non-daemon process")
-		code, out := s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/edit-auth.hash >/dev/null 2>&1"})
-		s.Require().NotEqualf(0, code, "edit-auth.hash became readable by a non-daemon process: %s", out)
+		code, out := s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/binaries.db >/dev/null 2>&1"})
+		s.Require().NotEqualf(0, code, "binaries.db became readable by a non-daemon process: %s", out)
 		time.Sleep(3 * time.Second)
 	}
 
@@ -84,8 +85,8 @@ need_encryption: false
 	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/fscrypt.key 2>&1"})
 	s.Require().NotEqualf(0, code, "reading fscrypt.key must be denied: %s", out)
 	s.Require().NotContainsf(out, marker, "fscrypt.key is readable by a non-daemon process")
-	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/edit-auth.hash >/dev/null 2>&1"})
-	s.Require().NotEqualf(0, code, "edit-auth.hash is readable by a non-daemon process: %s", out)
+	code, out = s.exec(c, []string{"sh", "-c", "cat /etc/app-listener/binaries.db >/dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "binaries.db is readable by a non-daemon process: %s", out)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

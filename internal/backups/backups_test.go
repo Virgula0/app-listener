@@ -45,9 +45,7 @@ func TestFindSmoke(t *testing.T) {
 	got, err := find(
 		filepath.Join(t.TempDir(), "daemon.conf"), // does not exist: no installed config
 		func() ([]install.User, error) { return nil, nil },
-		func([]install.User) []install.Candidate {
-			return []install.Candidate{{Path: withBackup}, {Path: withoutBackup}}
-		},
+		func([]install.User) []string { return []string{withBackup, withoutBackup} },
 	)
 	if err != nil {
 		t.Fatalf("find: %v", err)
@@ -57,5 +55,33 @@ func TestFindSmoke(t *testing.T) {
 	}
 	if got[0].BackupPath != withBackup+fscrypt.BackupSuffix {
 		t.Errorf("inconsistent entry: %+v", got[0])
+	}
+}
+
+// A missing resource stands in for one the live guard refuses to stat: only its backup is probed.
+func TestFindUnstattableResources(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "registry.vdf")
+	vault := filepath.Join(root, "discord")
+	for _, bp := range []string{file + fscrypt.BackupSuffix, vault + fscrypt.BackupSuffix} {
+		if err := os.WriteFile(bp, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conf := filepath.Join(root, "daemon.conf")
+	raw := "[watch " + file + "]\n/usr/bin/steam\n\n[watch " + vault + "]\nwatch: \"" +
+		filepath.Join(vault, "Local State") + "\"\n\n[inspectors]\n/usr/bin/gdb\n"
+	if err := os.WriteFile(conf, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := find(conf,
+		func() ([]install.User, error) { return nil, nil },
+		func([]install.User) []string { return []string{file} })
+	if err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if len(got) != 2 || got[0].Path != file || got[1].Path != vault {
+		t.Fatalf("find = %+v, want %s and %s", got, file, vault)
 	}
 }

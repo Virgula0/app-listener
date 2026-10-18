@@ -204,6 +204,9 @@ type Guard struct {
 	// detector; verifyStop stops it (startBinaryHashVerifier).
 	binaryVerifyStates map[string]*binaryVerifyState
 	verifyStop         chan struct{}
+	// policyMu serializes SetBinaries against Stop: a write after Stop would land in a released
+	// slot another guard may already own.
+	policyMu sync.Mutex
 	// deployed: per canonical whitelisted path, the (dev, ino) in the BPF maps. A replaced key stays
 	// in the maps, admitting only processes started before its supersede, until its inode is gone
 	// (supersede.go).
@@ -2525,6 +2528,8 @@ func (g *Guard) isGuardedBinary(exePath string) bool {
 }
 
 func (g *Guard) Stop() {
+	g.policyMu.Lock()
+	defer g.policyMu.Unlock()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 

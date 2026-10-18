@@ -18,10 +18,10 @@ import (
 
 // revertSystemFiles removes every file the installer deployed: the daemon unit, the legacy
 // catalog-refresh unit and pacman/apt hooks an earlier install left, the binary at
-// /usr/local/sbin, the PATH symlink, /etc/app-listener/daemon.conf and the edit-protected password
-// hash. Both units are disabled first (best effort) and systemd reloaded. /etc/app-listener itself stays: the master key lives there
+// /usr/local/sbin, the PATH symlink, the desktop build and its symlink, /etc/app-listener/daemon.conf
+// and the edit-protected password hash; keepGUI leaves the desktop build. Both units are disabled first (best effort) and systemd reloaded. /etc/app-listener itself stays: the master key lives there
 // and only removeMasterKey deletes it.
-func revertSystemFiles() error {
+func revertSystemFiles(keepGUI bool) error {
 	for _, unit := range []string{systemd.DaemonServiceName, systemd.CatalogRefreshServiceName} {
 		if err := systemd.RunCmd("systemctl", "disable", unit); err != nil {
 			log.Warnf("systemctl disable %s failed: %v", unit, err)
@@ -30,13 +30,18 @@ func revertSystemFiles() error {
 
 	// The PATH symlink must go before the binary it points to.
 	systemd.RemoveBinSymlink()
+	if keepGUI {
+		log.Infof("keeping the desktop build at %s", systemd.GUIBinaryPath)
+	} else if err := systemd.RemoveGUIBinary(); err != nil {
+		return err
+	}
 
 	removed := 0
 	for _, path := range append([]string{
 		filepath.Join(systemd.SystemdDir, systemd.DaemonServiceName+".service"),
 		systemd.InstallBinaryPath,
 		systemd.SystemConfigPath,
-		editprotected.HashFile,
+		editprotected.LegacyHashFile,
 		binledger.DefaultPath,
 		binledger.JournalPath(binledger.DefaultPath),
 	}, systemd.LegacyCatalogRefreshFiles()...) {

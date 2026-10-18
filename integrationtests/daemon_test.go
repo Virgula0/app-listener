@@ -460,7 +460,7 @@ func (s *IntegrationSuite) TestDaemon_Bypass_LdPreloadBinaryWhitelistedByReload(
 
 	// The config lives OUTSIDE /etc/app-listener so this test can rewrite it: once the daemon runs,
 	// /etc/app-listener is self-guarded read-only and only the app-listener binary may write it (the
-	// real catalog refresh does so via `install --update-catalog-only`). /usr/bin/true is
+	// real catalog refresh does so via `install --refresh-catalog-only`). /usr/bin/true is
 	// whitelisted at startup; /usr/bin/cat is added only by the SIGHUP reload below, mirroring a
 	// catalog refresh picking up a new binary.
 	const cfgPath = "/tmp/poc-daemon.conf"
@@ -879,7 +879,7 @@ func (s *IntegrationSuite) daemonPinFiles(c testcontainers.Container) []string {
 //   - fscrypt.key is unreadable except by the app-listener binary (ModeWhitelist, empty list;
 //     stacks on the RO dir guard).
 //
-// The binary itself (uid 0) keeps full access so install / --genkey / --update-catalog-only work.
+// The binary itself (uid 0) keeps full access so install / --genkey / --refresh-catalog-only work.
 func (s *IntegrationSuite) TestDaemon_SelfProtection_ConfigAndKey() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1766,11 +1766,11 @@ func (s *IntegrationSuite) installFakeSystemctl(c testcontainers.Container) {
 // resource whose WHITELIST changes via a live SIGHUP reload: with a live racer through a normal
 // reload, then with a SIGKILL mid-reload. The resource must never end up fully unguarded.
 //
-// Trigger: `install --update-catalog-only --live --yes` on the built-in WireGuard entry
+// Trigger: `install --refresh-catalog-only --live --yes` on the built-in WireGuard entry
 // (/etc/wireguard, whitelisting /usr/bin/nmcli), not a raw shell rewrite of daemon.conf: the
 // /etc/app-listener self-guard (issue #53 follow-up) denies any non-daemon-binary write there, so a
 // NEW [watch] section can't be hand-added while the daemon runs (and adding a genuinely new
-// resource always stops the daemon first, per docs/installation.md). `--update-catalog-only --live` is the one
+// resource always stops the daemon first, per docs/installation.md). `--refresh-catalog-only --live` is the one
 // documented live path: it re-expands an EXISTING section's whitelist from the daemon's own binary
 // (GUARD_ALLOW_ROOT, same exe inode) and delivers via SIGHUP, with no external process writing the
 // guarded config.
@@ -1820,7 +1820,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	var leaked atomic.Bool
 	go s.raceUnauthorizedReader(c, resourceB, marker, stop, &leaked)
 
-	code, out := s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	code, out := s.exec(c, []string{"/app-listener", "install", "--refresh-catalog-only", "--live", "--yes"})
 	s.Require().Equalf(0, code, "live catalog refresh failed: %s", out)
 
 	reloaded := false
@@ -1854,7 +1854,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	s.startDaemon(c, baseConfig) // daemon.conf gets rewritten to baseConfig here, discarding round 1's patched whitelist
 	installNmcli()
 
-	code, out = s.exec(c, []string{"/app-listener", "install", "--update-catalog-only", "--live", "--yes"})
+	code, out = s.exec(c, []string{"/app-listener", "install", "--refresh-catalog-only", "--live", "--yes"})
 	s.Require().Equalf(0, code, "live catalog refresh (round 2 trigger) failed: %s", out)
 	time.Sleep(150 * time.Millisecond) // aim somewhere inside the guard swap (new attaches, old detaches)
 	s.sigDaemon(c, "KILL")

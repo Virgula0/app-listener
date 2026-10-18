@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/charmbracelet/huh"
-
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	"github.com/Virgula0/app-listener/internal/install"
@@ -29,14 +27,13 @@ type Backup struct {
 // Mirrors the installer's scope: resources of /etc/app-listener/daemon.conf (incl. manual dirs)
 // plus every catalog path for all local users and system entries.
 func Find() ([]Backup, error) {
-	return find(systemd.SystemConfigPath, install.ListUsers, install.DiscoverForUsers)
+	return find(systemd.SystemConfigPath, install.ListUsers, catalogPaths)
 }
 
-// find is Find's injectable core (systemConfigPath, listUsers, discoverForUsers as parameters) so
-// tests use fake data: on a host with the daemon installed, some catalog paths (e.g. Steam's
-// registry.vdf) are live guarded resources, and os.Lstat from outside their whitelist (the test
-// binary) trips the guard.
-func find(systemConfigPath string, listUsers func() ([]install.User, error), discoverForUsers func([]install.User) []install.Candidate) ([]Backup, error) {
+// find only ever stats path+BackupSuffix, never a candidate path itself: with the daemon running,
+// single-file resources (e.g. Steam's registry.vdf) deny STAT to this binary, and a candidate
+// dropped on that EPERM hid its backup.
+func find(systemConfigPath string, listUsers func() ([]install.User, error), catalogPathsFor func([]install.User) []string) ([]Backup, error) {
 	seen := make(map[string]bool)
 	var paths []string
 	add := func(p string) {
@@ -46,26 +43,24 @@ func find(systemConfigPath string, listUsers func() ([]install.User, error), dis
 		}
 	}
 
-	if _, err := os.Stat(systemConfigPath); err == nil {
-		cfg, loadErr := daemonconfig.Load(systemConfigPath)
-		if loadErr != nil {
-			return nil, fmt.Errorf("reading %s: %w", systemConfigPath, loadErr)
+	raw, err := os.ReadFile(systemConfigPath)
+	switch {
+	case err == nil:
+		// Grouped sections: the backup is at the encryption root (the whole vault is renamed
+		// aside), else at the watch path itself; keep both.
+		for _, p := range daemonconfig.DeclaredPaths(raw) {
+			add(p)
 		}
-		for i := range cfg.Resources {
-			// Grouped sections: the backup is at the encryption root (the whole vault is renamed
-			// aside), else at the watch path itself; keep both.
-			add(cfg.Resources[i].Path)
-			add(cfg.Resources[i].EncryptionRootOrPath())
-		}
+	case !os.IsNotExist(err):
+		return nil, fmt.Errorf("reading %s: %w", systemConfigPath, err)
 	}
 
 	users, err := listUsers()
 	if err != nil {
 		return nil, err
 	}
-	found := discoverForUsers(users)
-	for i := range found {
-		add(found[i].Path)
+	for _, p := range catalogPathsFor(users) {
+		add(p)
 	}
 
 	var out []Backup
@@ -78,23 +73,31 @@ func find(systemConfigPath string, listUsers func() ([]install.User, error), dis
 	return out, nil
 }
 
+// catalogPaths expands every catalog path for users plus the system entries, unprobed.
+func catalogPaths(users []install.User) []string {
+	var out []string
+	for i := range install.Catalog {
+		entry := &install.Catalog[i]
+		if entry.IsSystem() {
+			out = append(out, entry.PathsFor("", "")...)
+			continue
+		}
+		for _, u := range users {
+			out = append(out, entry.PathsFor(u.Home, u.Name)...)
+		}
+	}
+	return out
+}
+
 // Select shows the backups in a preselected TUI multi-select and returns the
 // chosen ones.
 func Select(entries []Backup, title, description string) ([]Backup, error) {
-	opts := make([]huh.Option[int], 0, len(entries))
+	choices := make([]wizard.Choice, len(entries))
 	for i := range entries {
-		opts = append(opts, huh.NewOption(entries[i].BackupPath, i).Selected(true))
+		choices[i] = wizard.Choice{Label: entries[i].BackupPath, Selected: true}
 	}
-	var pickedIdx []int
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewMultiSelect[int]().
-			Title(title).
-			Description(description).
-			Options(opts...).
-			Height(10).
-			Value(&pickedIdx),
-	))
-	if err := form.WithKeyMap(wizard.MultiSelectKeymap()).Run(); err != nil {
+	pickedIdx, err := wizard.MultiSelect(title, description, choices, 10)
+	if err != nil {
 		return nil, err
 	}
 	picked := make([]Backup, 0, len(pickedIdx))

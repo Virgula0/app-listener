@@ -5,8 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
+
+	"github.com/Virgula0/app-listener/internal/binledger"
 )
 
 func TestValidatePassword(t *testing.T) {
@@ -73,140 +74,149 @@ func TestVerifyMalformed(t *testing.T) {
 	}
 }
 
-func TestHashFileLifecycle(t *testing.T) {
-	dir := t.TempDir()
-	old := hashFilePath
-	hashFilePath = filepath.Join(dir, "edit-auth.hash")
-	t.Cleanup(func() { hashFilePath = old })
-
-	if ex, _ := HashFileExists(); ex {
-		t.Fatal("hash file should not exist yet")
-	}
-	if _, err := LoadHashFile(); !errors.Is(err, ErrNoHashFile) {
-		t.Fatalf("LoadHashFile before write = %v, want ErrNoHashFile", err)
-	}
-
-	enc, err := Hash("Correct-Horse-9", OriginCLI)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteHashFile(enc); err != nil {
-		t.Fatal(err)
-	}
-
-	info, err := os.Stat(hashFilePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("hash file mode = %o, want 600", info.Mode().Perm())
-	}
-
-	got, err := LoadHashFile()
-	if err != nil || got != enc {
-		t.Fatalf("LoadHashFile = %q, %v", got, err)
-	}
-
-	if err := RemoveHashFile(); err != nil {
-		t.Fatal(err)
-	}
-	if ex, _ := HashFileExists(); ex {
-		t.Fatal("hash file should be gone")
-	}
-	if err := RemoveHashFile(); err != nil {
-		t.Fatalf("RemoveHashFile on missing file = %v", err)
-	}
-}
-
-func hashFileInode(t *testing.T) uint64 {
+// useTempStore points the ledger and the legacy file at a temp dir.
+func useTempStore(t *testing.T) string {
 	t.Helper()
-	info, err := os.Lstat(hashFilePath)
-	if err != nil {
-		t.Fatalf("lstat %s: %v", hashFilePath, err)
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		t.Fatal("Stat_t unavailable on this platform")
-	}
-	return st.Ino
+	dir := t.TempDir()
+	oldLedger, oldLegacy := ledgerPath, legacyHashPath
+	ledgerPath, legacyHashPath = filepath.Join(dir, "binaries.db"), filepath.Join(dir, "edit-auth.hash")
+	t.Cleanup(func() { ledgerPath, legacyHashPath = oldLedger, oldLegacy })
+	return dir
 }
 
-// Regression for the daemon-self-denial bug: WriteHashFile must rewrite an EXISTING file (the
-// daemon's zero-length placeholder, selfguards.go ensureHashFilePlaceholder) on its SAME inode,
-// never create-and-rename: while the daemon runs, the parent is guarded ReadOnly and allows the
-// self binary to rewrite an existing entry, not create one.
-func TestWriteHashFileInPlaceOverPlaceholder(t *testing.T) {
-	dir := t.TempDir()
-	old := hashFilePath
-	hashFilePath = filepath.Join(dir, "edit-auth.hash")
-	t.Cleanup(func() { hashFilePath = old })
-
-	// Simulate the daemon's bootstrap: an empty placeholder already exists.
-	if err := os.WriteFile(hashFilePath, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if ex, err := HashFileExists(); err != nil || ex {
-		t.Fatalf("an empty placeholder must read as not-configured: exists=%v err=%v", ex, err)
-	}
-	before := hashFileInode(t)
-
-	enc, err := Hash("Correct-Horse-9", OriginCLI)
+func mustHash(t *testing.T, pw string, origin Origin) string {
+	t.Helper()
+	enc, err := Hash(pw, origin)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteHashFile(enc); err != nil {
-		t.Fatalf("WriteHashFile over an existing placeholder: %v", err)
-	}
-	if got := hashFileInode(t); got != before {
-		t.Errorf("WriteHashFile changed the inode: %d -> %d (a live daemon's self-guard would now be tracking the WRONG inode)", before, got)
-	}
-	got, err := LoadHashFile()
-	if err != nil || got != enc {
-		t.Fatalf("LoadHashFile after in-place write = %q, %v", got, err)
-	}
+	return enc
+}
 
-	// A second write (rotation) must also stay on the same inode.
-	enc2, err := Hash("Another-Correct-Horse-9", OriginCLI)
-	if err != nil {
+func TestStoreLoadHash(t *testing.T) {
+	useTempStore(t)
+	if ok, err := HashConfigured(); err != nil || ok {
+		t.Fatalf("fresh store configured=%v err=%v", ok, err)
+	}
+	if _, err := LoadHash(); !errors.Is(err, ErrNoPassword) {
+		t.Fatalf("LoadHash on a fresh store = %v, want ErrNoPassword", err)
+	}
+	enc := mustHash(t, "Correct-Horse-9", OriginInstall)
+	if err := StoreHash(enc); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteHashFile(enc2); err != nil {
-		t.Fatal(err)
+	if got, err := LoadHash(); err != nil || got != enc {
+		t.Fatalf("LoadHash = %q, %v", got, err)
 	}
-	if got := hashFileInode(t); got != before {
-		t.Errorf("second WriteHashFile changed the inode: %d -> %d", before, got)
+	if fi, err := os.Stat(ledgerPath); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("ledger %v %v, want mode 0600", fi, err)
 	}
 }
 
-// TestRemoveHashFileInPlace: clearing the password truncates in place
-// (same inode) rather than unlinking — for the same reason WriteHashFile
-// no longer renames: a live daemon's ReadOnly self-guard on the parent
-// directory does not permit creating a replacement entry later.
-func TestRemoveHashFileInPlace(t *testing.T) {
-	dir := t.TempDir()
-	old := hashFilePath
-	hashFilePath = filepath.Join(dir, "edit-auth.hash")
-	t.Cleanup(func() { hashFilePath = old })
+func TestStoreHashRefusesMalformed(t *testing.T) {
+	useTempStore(t)
+	for _, bad := range []string{"", "notahash", "pbkdf2-sha256$1000$AAAA$AAAA$bogus"} {
+		if err := StoreHash(bad); err == nil {
+			t.Fatalf("StoreHash(%q) accepted a record no password matches", bad)
+		}
+	}
+}
 
-	enc, err := Hash("Correct-Horse-9", OriginCLI)
-	if err != nil {
+func TestCheckPasswordSharesGuessBudget(t *testing.T) {
+	useTempStore(t)
+	const pw = "Correct-Horse-9"
+	if err := StoreHash(mustHash(t, pw, OriginInstall)); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteHashFile(enc); err != nil {
-		t.Fatal(err)
+	if err := CheckPassword(pw); err != nil {
+		t.Fatalf("correct password refused: %v", err)
 	}
-	before := hashFileInode(t)
+	for i := range binledger.MaxAuthFailures {
+		if err := CheckPassword("Wrong-Horse-99"); !errors.Is(err, ErrWrongPassword) {
+			t.Fatalf("guess %d: %v, want ErrWrongPassword", i+1, err)
+		}
+	}
+	var locked *binledger.LockedError
+	if err := CheckPassword(pw); !errors.As(err, &locked) {
+		t.Fatalf("correct password during the lockout: %v, want a lockout (no oracle while locked)", err)
+	}
+}
 
-	if err := RemoveHashFile(); err != nil {
+func TestMigrateLegacyHashImports(t *testing.T) {
+	useTempStore(t)
+	enc := mustHash(t, "Correct-Horse-9", OriginInstall)
+	if err := os.WriteFile(legacyHashPath, []byte(enc+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := hashFileInode(t); got != before {
-		t.Errorf("RemoveHashFile changed the inode: %d -> %d", before, got)
+	if err := MigrateLegacyHash(); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Lstat(hashFilePath); err != nil {
-		t.Errorf("RemoveHashFile must not unlink the file, got: %v", err)
+	if got, err := LoadHash(); err != nil || got != enc {
+		t.Fatalf("after migration LoadHash = %q, %v", got, err)
 	}
-	if ex, _ := HashFileExists(); ex {
-		t.Error("hash file should read as not-configured after remove")
+	if _, err := os.Lstat(legacyHashPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy file left behind: %v", err)
+	}
+}
+
+func TestMigrateLegacyHashNeverReplaces(t *testing.T) {
+	useTempStore(t)
+	cur := mustHash(t, "Correct-Horse-9", OriginCLI)
+	if err := StoreHash(cur); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyHashPath, []byte(mustHash(t, "Other-Horse-77", OriginInstall)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLegacyHash(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := LoadHash(); got != cur {
+		t.Fatal("a legacy file replaced the stored password")
+	}
+}
+
+func TestMigrateLegacyHashEmptyPlaceholder(t *testing.T) {
+	useTempStore(t)
+	if err := os.WriteFile(legacyHashPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLegacyHash(); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := HashConfigured(); ok {
+		t.Fatal("an empty placeholder configured a password")
+	}
+	if _, err := os.Lstat(legacyHashPath); !os.IsNotExist(err) {
+		t.Fatalf("placeholder left behind: %v", err)
+	}
+}
+
+func TestMigrateLegacyHashRefusesOddFiles(t *testing.T) {
+	dir := useTempStore(t)
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte(mustHash(t, "Correct-Horse-9", OriginInstall)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, legacyHashPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLegacyHash(); err == nil {
+		t.Fatal("a symlinked legacy file was imported")
+	}
+	if err := os.Remove(legacyHashPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyHashPath, []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLegacyHash(); err == nil {
+		t.Fatal("a malformed legacy record was accepted")
+	}
+	if _, err := os.Lstat(legacyHashPath); err != nil {
+		t.Fatalf("a malformed legacy file must stay for the operator to inspect: %v", err)
+	}
+	if ok, _ := HashConfigured(); ok {
+		t.Fatal("a refused legacy file configured a password")
 	}
 }

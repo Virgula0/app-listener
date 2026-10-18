@@ -66,13 +66,27 @@ every change to enforcement paths as security-sensitive:
   `/proc/<pid>/exe` inode for display only — never a policy input). `CONFIG`
   (`--edit-config`, `configedit.go`) is the other post-AUTH path: the daemon writes
   daemon.conf only while it still holds what it sent (compare-and-swap), reloads, and puts
-  the old bytes back if the reload fails; refused while a grant session is active. The password hash
-  (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded like `fscrypt.key`.
+  the old bytes back if the reload fails; refused while a grant session is active. `PASSWORD`
+  is the third post-AUTH path: the daemon validates and stores the new password itself. The
+  password is mandatory at install and can only be changed (never removed), proving the current
+  one: over the socket while the daemon runs, else `CheckPassword`. Its PBKDF2 hash lives in the
+  `edit_auth` table of `/etc/app-listener/binaries.db`, which the daemon seals (with its
+  journal) like `fscrypt.key`; a legacy `edit-auth.hash` is imported only into an empty table.
+  Every verifier draws on the persistent guess budget in that DB (`binledger.BeginAuthAttempt`).
   Don't loosen any of: the peer-exe check, AUTH-before-disclosure, the single-session lock,
-  the auth lockout, the `origin=install` guard on `--set-password`, the mask being restored
-  in `RevokeSelfEditAccess`, or the journal-before-write and CAS-restore rules above.
+  the auth lockout and the persistent budget, current-password proof on change, the first-time
+  `--set-password` refusal while a daemon runs, the mask being restored in
+  `RevokeSelfEditAccess`, or the journal-before-write and CAS-restore rules above.
+- **The GUI drives edit-protected through `edit-protected --backend`** (`cmd/functions/editprotected/
+  backend.go`, client `internal/editbackend`): the window runs the installed headless binary
+  (root-placed, same inode as the running daemon, re-checked on the started pid, allowlisted env,
+  Pdeathsig) and only renders. Keep: per-op state gating (nothing that opens a caller-named path
+  before AUTH: this binary has a root READ baseline on guarded trees), password only over the pipe
+  (never argv/env, no line breaks), file ops only through `internal/vaultfs` (shared with the TUI),
+  EOF = end (revoke / re-lock). The GUI process never opens a protected path or the control socket
+  and never gets a guard row; it refuses to `--forward -w` its own exe.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
-  key + edit-auth hash (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
+  key + `binaries.db` (password hash) (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.
 - Run `/security-review` on diffs that touch `internal/guard`, `internal/networkguard`,
   `internal/usecase/daemon.go`, `internal/fscrypt`, `internal/protected`, or any
@@ -93,7 +107,7 @@ needs cgo (`mlock`). A `CGO_ENABLED=0` build no longer compiles.
 |---|---|
 | `make build` | Full pipeline in a **rootful Docker** container: dumps `vmlinux.h` from the host BTF, regenerates BPF bindings, builds to `build/linux/app-listener`. Nothing but Docker needed on the host. |
 | `make build-host` | Same pipeline on the host — needs a **recent** `clang`/LLVM (`docker/builder.Dockerfile` pins clang 22; clang 14 emits a `guard_path_rename` that overflows the BPF verifier's 1M-insn budget on modern kernels — issue #45), `bpftool`, Go 1.26+, GCC. |
-| `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui` (fyne desktop window for `monitor --gui`, ~20 MiB larger, X11/OpenGL deps) — off by default because the daemon shares this binary. |
+| `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui` (fyne desktop window opened by `--gui`, ~20 MiB larger, X11/OpenGL deps) — off by default because the daemon shares this binary. |
 | `make generate` | Regenerate BPF bindings (`bpf2go`). Needs `bpftool` + readable `/sys/kernel/btf/vmlinux`. `ARCH` (amd64/arm64) defaults to the host's and must equal it: vmlinux.h and `__TARGET_ARCH_*` (PT_REGS layout) are the host's, so the eBPF never cross-builds. |
 | `make vuln` | govulncheck (pinned `GOVULNCHECK_VERSION`) over the module; `GUI=1` scans the `-tags gui` build. Needs generated bindings. |
 | `make check-compatibility` | Static host check (kernel version, `.config`, BTF, BPF-LSM activation, fscrypt prereqs). Run before building/running on a new host. `--binary <path>` (as root) also loads that binary's guard eBPF into the running verifier (`daemon --check`), catching a prebuilt/kernel mismatch; `scripts/install.sh` runs this against the downloaded release before installing anything. |
@@ -311,7 +325,7 @@ inotify hints schedule the guards' re-sync (system binaries, admitted live by
 every directory and symlink hop root's, outside user homes) or the shared
 `install.RefreshCatalog` plus an in-process reload (home apps; a new match outside the
 user's home must be root-placed too, `refreshAdmits`), compare-and-swapped against the config it runs. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
-edit-auth hash. When `edit-protected` has a password configured, `control.go` opens the
+`binaries.db` (ledger + password hash). When `edit-protected` has a password configured, `control.go` opens the
 live-edit control socket and `DaemonUseCase.GrantEditAccess` / the guard's
 `GrantSelfEditAccess`+`RevokeSelfEditAccess` implement the transient per-resource write
 grant. The `GuardRepository` port has daemon-specific methods (`PopulateInodes`,
@@ -341,8 +355,23 @@ an unchanged binary, never to admit one; every other re-sync opens fresh.
 Every mode has a bubbletea TUI (`internal/tui/*_model.go`), a `--headless` stderr writer
 with a stable `EVENT|` / `GUARD|` / `DAEMON …` / `NETEVENT|` line format that the
 integration tests parse, and `--serve[=host:port]` which mirrors the event stream
-read-only over WebSockets (`internal/tui/serve.go`). `--gui` (build-tag `gui`) is
-fyne, monitor-only; `internal/gui/stub.go` is the no-op for non-gui builds.
+read-only over WebSockets (`internal/tui/serve.go`). `--gui` (build-tag `gui`) is one fyne
+window for every interactive mode, intercepted in `cmd.Execute` before cobra
+(`cmd/functions/desktop`) only when no subcommand is given (a subcommand wins and runs in the
+terminal), so it ignores all other flags; `internal/gui/stub.go` is the no-op for non-gui builds.
+`internal/wm` floats the window on Hyprland/sway/i3 over the WM's IPC socket (owner-checked: root
+talks to the user's socket). Exports go through `safeio` (fyne's save dialog `os.Create`s as root). Icons are Phosphor SVGs whose path data is
+normalized to explicit commands: oksvg drops implicit repeated arcs and ignores `<g transform>`.
+`make test-e2e SNAPSHOTS=<dir>` (`-tags gui,e2e`, not in `make test`) renders every page headlessly;
+`DEMO=<dir>` the README walkthrough's frames (`docs/development.md`).
+The GUI installer (`install.RunWith`, prompts routed via `wizard.Use`) must never deploy the fyne
+build as the daemon: it deploys a staged headless build (`update.FetchVerified`/`FetchLatest` or a
+local file), which `RunWith` itself re-checks with `headless.Check`; never `os.Executable()`. The same
+release's desktop asset (`headless.CheckGUI`) goes to `systemd.GUIBinaryPath` after the wizard, and
+`update` keeps it on the daemon's release; never copy the window's own exe there. The GUI uninstaller
+(`uninstall.RunWith`) keeps the CLI's daemon-stopped refusal: the window never stops the daemon.
+The GUI updater (`update.RunWith`) runs `update` in the fyne process too: it only works because
+nothing it touches is daemon-guarded while the daemon runs (see its `TODO(self-binary-guard)`).
 Verbosity ladder lives in `internal/constants`; `--verbose` requires `--headless`.
 
 ## Comment style
