@@ -152,6 +152,7 @@ func (v *targetView) refresh(force bool) {
 	if text, c := guardPill(v.t.Policy()); text != v.guardPill.text {
 		v.guardPill.Set(text, c)
 		v.headerBox.Refresh() // the pill's width changed: lay the line out again
+		v.page.list.Refresh() // the target list shows the same pill
 	}
 	if e := v.t.LastError(); e != "" {
 		v.errLabel.SetText("Guard error: " + e)
