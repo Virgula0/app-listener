@@ -188,7 +188,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${SIGNING_KEY:-}" ]; then
-            echo "::error::RELEASE_SIGNING_KEY is not set in the release environment"
+            # A repository secret is not visible here: the called workflow gets no caller secrets.
+            echo "::error::RELEASE_SIGNING_KEY is not set as a secret of the 'release' environment (a repository secret of that name is not passed to this job)"
             exit 1
           fi
           key="$RUNNER_TEMP/app-listener-signing-key.pem"
