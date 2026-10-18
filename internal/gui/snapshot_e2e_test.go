@@ -1,4 +1,4 @@
-//go:build gui
+//go:build gui && e2e
 
 package gui
 
@@ -28,13 +28,19 @@ import (
 	"github.com/Virgula0/app-listener/internal/workbench"
 )
 
-// TestSnapshots renders the window off-screen into $APPLISTENER_GUI_SNAPSHOTS (a directory) for
-// design review; skipped when unset.
-func TestSnapshots(t *testing.T) {
-	dir := os.Getenv("APPLISTENER_GUI_SNAPSHOTS")
-	if dir == "" {
-		t.Skip("APPLISTENER_GUI_SNAPSHOTS not set")
+// e2eDir is where a render test writes: $env (an existing directory) to keep the output, else a
+// temp dir, so `make test-e2e` still drives every page.
+func e2eDir(t *testing.T, env string) string {
+	if dir := os.Getenv(env); dir != "" {
+		return dir
 	}
+	return t.TempDir()
+}
+
+// TestSnapshots renders every page and state off-screen into $APPLISTENER_GUI_SNAPSHOTS for design
+// review.
+func TestSnapshots(t *testing.T) {
+	dir := e2eDir(t, "APPLISTENER_GUI_SNAPSHOTS")
 	for _, v := range []struct {
 		name    string
 		variant fyne.ThemeVariant
@@ -127,10 +133,7 @@ func TestSnapshots(t *testing.T) {
 
 // TestIconGallery renders every embedded icon (and the logo) for a rasterizer check.
 func TestIconGallery(t *testing.T) {
-	dir := os.Getenv("APPLISTENER_GUI_SNAPSHOTS")
-	if dir == "" {
-		t.Skip("APPLISTENER_GUI_SNAPSHOTS not set")
-	}
+	dir := e2eDir(t, "APPLISTENER_GUI_SNAPSHOTS")
 	a := test.NewApp()
 	a.Settings().SetTheme(&appTheme{variant: theme.VariantDark})
 	entries, _ := assets.ReadDir("assets/icons")

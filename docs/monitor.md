@@ -4,7 +4,7 @@ Traces file operations under the watched paths. Nothing is blocked. Use it to le
 programs read a directory before you guard it, or to check what an install script or a new
 dependency does on disk.
 
-![monitor](../media/monitor.gif)
+![monitor](../media/tui/monitor.gif)
 
 ```bash
 sudo app-listener monitor -w ~/.ssh

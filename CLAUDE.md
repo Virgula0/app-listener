@@ -362,7 +362,8 @@ terminal), so it ignores all other flags; `internal/gui/stub.go` is the no-op fo
 `internal/wm` floats the window on Hyprland/sway/i3 over the WM's IPC socket (owner-checked: root
 talks to the user's socket). Exports go through `safeio` (fyne's save dialog `os.Create`s as root). Icons are Phosphor SVGs whose path data is
 normalized to explicit commands: oksvg drops implicit repeated arcs and ignores `<g transform>`.
-`APPLISTENER_GUI_SNAPSHOTS=<dir> go test -tags gui ./internal/gui/` renders every page headlessly.
+`make test-e2e SNAPSHOTS=<dir>` (`-tags gui,e2e`, not in `make test`) renders every page headlessly;
+`DEMO=<dir>` the README walkthrough's frames (`docs/development.md`).
 The GUI installer (`install.RunWith`, prompts routed via `wizard.Use`) must never deploy the fyne
 build as the daemon: it deploys a staged headless build (`update.FetchVerified`/`FetchLatest` or a
 local file), which `RunWith` itself re-checks with `headless.Check`; never `os.Executable()`. The same
