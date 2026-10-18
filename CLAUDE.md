@@ -34,7 +34,9 @@ every change to enforcement paths as security-sensitive:
   all attacker-controlled.
 - **New syscall / kernel path = new bypass surface.** When you add or change an LSM hook
   or a guarded operation, add a matching `integrationtests/exploits/*.c` case that proves
-  the operation is denied, and run `make test-integration` locally.
+  the operation is denied, and run `make test-integration` locally. A new guard hook also needs its
+  record probe (`Monitor.AttachRecordProbes`) and a `recordops.c` op, or `--record` proposes masks
+  the guard denies: `TestGuardHookCoverage` fails until then, `TestRecord_GuardParity` proves it.
 - **Watch the well-known bypass classes** already defended against (see `memory/*` and the
   exploit corpus): io_uring, `open_by_handle_at`, `copy_file_range`/`splice`/`sendfile`,
   `process_vm_readv`, raw block-device reads, btrfs copy ioctls (snapshot / `SEND` /
@@ -66,7 +68,11 @@ every change to enforcement paths as security-sensitive:
   `/proc/<pid>/exe` inode for display only — never a policy input). `CONFIG`
   (`--edit-config`, `configedit.go`) is the other post-AUTH path: the daemon writes
   daemon.conf only while it still holds what it sent (compare-and-swap), reloads, and puts
-  the old bytes back if the reload fails; refused while a grant session is active. `PASSWORD`
+  the old bytes back if the reload fails; refused while a grant session is active.
+  `--edit-config --record` (`internal/recorder`, `record*.go`) rides CONFIG: a monitor learns
+  accessors by kernel-reported exe `dev:ino`, classify re-verifies each by inode, then apply runs
+  encrypt (ends locked) → ledger pin (`RecordIfAbsent`, never over a verdict) → CAS PUT, rolling
+  back both on failure. Target paths are validated only after AUTH. `PASSWORD`
   is the third post-AUTH path: the daemon validates and stores the new password itself. The
   password is mandatory at install and can only be changed (never removed), proving the current
   one: over the socket while the daemon runs, else `CheckPassword`. Its PBKDF2 hash lives in the

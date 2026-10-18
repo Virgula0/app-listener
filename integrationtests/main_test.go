@@ -28,6 +28,7 @@ var (
 	fscryptTestAmd64Bin  string
 	tuiTestAmd64Bin      string
 	netguardTestAmd64Bin string
+	recorderTestAmd64Bin string
 )
 
 // hostInfraBindPaths are host binaries the LSM network guard blocks in whitelist mode because its
@@ -74,6 +75,7 @@ func TestMain(m *testing.M) {
 	fscryptTestAmd64Bin = absPath("../build/test/fscrypt-amd64")
 	tuiTestAmd64Bin = absPath("../build/test/tui-amd64")
 	netguardTestAmd64Bin = absPath("../build/test/networkguard-amd64")
+	recorderTestAmd64Bin = absPath("../build/test/recorder-amd64")
 
 	// Daemon mode links fscrypt, which needs cgo (mlock): CGO_ENABLED=0 no longer compiles. The
 	// binary must still be static: it runs in ubuntu:latest containers whose glibc (2.39) is older
@@ -145,6 +147,19 @@ func TestMain(m *testing.M) {
 	cmdFscryptTest.Env = append(os.Environ(), "CGO_ENABLED=1", "GOOS=linux", "GOARCH=amd64")
 	if err := cmdFscryptTest.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build fscrypt test binary: %v\n%s\n", err, fscryptBuildErr.String())
+		os.Exit(1)
+	}
+
+	// The record-parity harness (internal/recorder/harness_test.go): the recorder links fscrypt
+	// (apply.go), so cgo + static like the fscrypt harness.
+	cmdRecorderTest := exec.Command("go", "test", "-tags", "ci", "-c",
+		"-ldflags", "-linkmode external -extldflags -static",
+		"-o", recorderTestAmd64Bin, "../internal/recorder/")
+	var recorderBuildErr bytes.Buffer
+	cmdRecorderTest.Stderr = &recorderBuildErr
+	cmdRecorderTest.Env = append(os.Environ(), "CGO_ENABLED=1", "GOOS=linux", "GOARCH=amd64")
+	if err := cmdRecorderTest.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build recorder test binary: %v\n%s\n", err, recorderBuildErr.String())
 		os.Exit(1)
 	}
 

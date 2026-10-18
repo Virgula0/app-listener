@@ -52,7 +52,7 @@ var sessionTimeouts = []struct {
 
 // protectedPage is the edit-protected workspace: edit a protected directory (live through the
 // daemon, or offline with it stopped), grant other binaries temporary access, edit daemon.conf,
-// manage the password. One workflow (one backend) at a time.
+// record access to new paths, manage the password. One workflow (one backend) at a time.
 type protectedPage struct {
 	s     *shell
 	stack *fyne.Container
@@ -92,7 +92,7 @@ func (p *protectedPage) view() fyne.CanvasObject {
 	p.pwBox = container.NewVBox()
 	p.editNote = warnText()
 
-	cards := newAdaptiveGrid(3,
+	cards := newAdaptiveGrid(2,
 		p.actionCard("lock-simple-open", theme.ColorNamePrimary, "Edit protected files",
 			"Open one guarded directory in a two-pane editor. Live: the daemon grants write access to that "+
 				"directory for this session only. Offline (daemon stopped): it is unlocked with the master key "+
@@ -103,6 +103,10 @@ func (p *protectedPage) view() fyne.CanvasObject {
 		p.actionCard("sliders-horizontal", colorInfo, "Daemon configuration",
 			"Edit the running daemon's daemon.conf: you review the diff, then the daemon writes and reloads it. "+
 				"A configuration that fails to reload is not kept. Live mode only.", p.startConfig, nil),
+		p.actionCard("circle-fill", theme.ColorNameError, "Record access",
+			"Guard new paths by learning who uses them: record every access while you use your applications, "+
+				"approve the binaries and libraries, optionally encrypt, and the daemon adds the sections and "+
+				"reloads. Live mode only.", p.startRecord, nil),
 	)
 	timeoutCard := newPanel(container.NewVBox(
 		hfill(boldLabel("Live session idle timeout"), p.timeout),

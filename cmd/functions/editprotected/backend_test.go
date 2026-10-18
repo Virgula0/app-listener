@@ -264,3 +264,33 @@ func TestBackendAuthTimeoutBounds(t *testing.T) {
 		}
 	}
 }
+
+// record_start resolves and watches caller-named paths as this binary: never before AUTH. The
+// later ops only follow their predecessor, so no step (plan, apply, delete) can be skipped to.
+func TestBackendRecordOpsFollowTheWorkflow(t *testing.T) {
+	b, _ := newTestBackend(t)
+	ops := []string{editbackend.OpRecordStart, editbackend.OpRecordStatus, editbackend.OpRecordStop,
+		editbackend.OpRecordPlan, editbackend.OpRecordApply, editbackend.OpRecordDeleteBackup}
+	for _, op := range ops {
+		if m := call(b, editbackend.Request{Op: op, Resources: []string{"/home/u/.ssh"}, Path: "/x"}); m.Err == "" {
+			t.Errorf("%s before auth: accepted", op)
+		}
+	}
+	b.state = stAuthed
+	for _, op := range ops[1:] {
+		if m := call(b, editbackend.Request{Op: op, Path: "/x"}); m.Err == "" {
+			t.Errorf("%s before record_start: accepted", op)
+		}
+	}
+	b.state = stRecording
+	for _, op := range []string{editbackend.OpRecordPlan, editbackend.OpRecordApply, editbackend.OpRecordDeleteBackup,
+		editbackend.OpConfigPut, editbackend.OpSelect} {
+		if m := call(b, editbackend.Request{Op: op, Path: "/x"}); m.Err == "" {
+			t.Errorf("%s while recording: accepted", op)
+		}
+	}
+	b.state = stRecorded
+	if m := call(b, editbackend.Request{Op: editbackend.OpRecordDeleteBackup, Path: "/x"}); m.Err == "" {
+		t.Error("record_delete_backup before an apply: accepted")
+	}
+}

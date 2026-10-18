@@ -22,6 +22,9 @@ var errConfigChanged = errors.New("daemon.conf changed while you were editing it
 // writes it and reloads; a failed reload keeps the running configuration and restores the file,
 // and the operator may edit again. --content-file replaces it non-interactively.
 func runEditConfig() error {
+	if len(recordFlags) > 0 {
+		return runRecord()
+	}
 	interactive := contentFileFlag == ""
 	if interactive && !term.IsTerminal(os.Stdin.Fd()) {
 		return errors.New("--edit-config needs a terminal for its editor; use --content-file <file> to replace " +

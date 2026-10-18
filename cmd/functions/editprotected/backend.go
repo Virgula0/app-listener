@@ -44,6 +44,9 @@ const (
 	stEditing                        // a vault is open (live SELECT or offline unlock)
 	stForwarding                     // a FORWARD grant is held
 	stConfig                         // daemon.conf fetched
+	stRecording                      // a recording runs (record_start)
+	stRecorded                       // stopped: review, plan, apply
+	stApplied                        // applied: only its backups may be deleted
 	stDone                           // only end
 )
 
@@ -72,6 +75,13 @@ var backendOps = map[string]backendOp{
 	editbackend.OpRemove:        {[]backendState{stEditing}, (*backend).remove},
 	editbackend.OpUsers:         {[]backendState{stEditing}, (*backend).users},
 	editbackend.OpPing:          {[]backendState{stEditing, stForwarding}, (*backend).ping},
+
+	editbackend.OpRecordStart:        {[]backendState{stAuthed}, (*backend).recordStart},
+	editbackend.OpRecordStatus:       {[]backendState{stRecording}, (*backend).recordStatus},
+	editbackend.OpRecordStop:         {[]backendState{stRecording}, (*backend).recordStop},
+	editbackend.OpRecordPlan:         {[]backendState{stRecorded}, (*backend).recordPlan},
+	editbackend.OpRecordApply:        {[]backendState{stRecorded}, (*backend).recordApply},
+	editbackend.OpRecordDeleteBackup: {[]backendState{stApplied}, (*backend).recordDeleteBackup},
 }
 
 // errSessionEnded: the daemon revoked the live grant; nothing more is written.
@@ -96,6 +106,7 @@ type backend struct {
 	resource  string
 	vault     *vaultfs.Vault
 	fsVault   *fscrypt.Vault // offline: the unlocked vault to re-lock
+	record    *recordFlow
 	ended     atomic.Bool
 	// closing: our own cleanup closes the connection, which is not the daemon ending it.
 	closing   atomic.Bool
@@ -251,6 +262,10 @@ func (b *backend) cleanupErr() error {
 	if b.vault != nil {
 		b.vault.Close()
 		b.vault = nil
+	}
+	if b.record != nil {
+		b.record.close()
+		b.record = nil
 	}
 	if b.session != nil {
 		b.session.End()

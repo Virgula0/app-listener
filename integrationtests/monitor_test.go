@@ -81,8 +81,8 @@ func (s *IntegrationSuite) TestMonitorAllEvents() {
 //   - truncate/chmod/chown/utimes/setxattr/removexattr -> ATTR (notify_change / vfs_setxattr /
 //     vfs_removexattr)
 //   - mknod(2)                     -> MKNOD (vfs_mknod)
-//   - stat/access/readlink         -> STAT (vfs_statx, security_inode_permission [MAY_ACCESS],
-//     vfs_readlink)
+//   - stat/access/readlink         -> STAT (security_inode_getattr, do_faccessat, vfs_readlink);
+//     statonly is lstat(2) alone: statp's access and readlink would hide a missed stat
 func (s *IntegrationSuite) TestMonitor_MetadataEvents() {
 	c := s.monitorContainer()
 	// pooled: terminated at suite end
@@ -91,7 +91,7 @@ func (s *IntegrationSuite) TestMonitor_MetadataEvents() {
 	s.exec(c, []string{"sh", "-c", "echo secret > /watch/file.txt"})
 	s.exec(c, []string{"ln", "-s", "/watch/file.txt", "/watch/link"})
 
-	for _, bin := range []string{"truncate", "chmod", "chown", "utimes", "setxattr", "mknod", "statp"} {
+	for _, bin := range []string{"truncate", "chmod", "chown", "utimes", "setxattr", "mknod", "statp", "statonly"} {
 		hostPath := absPath(fmt.Sprintf("./exploits/%s", bin))
 		err := c.CopyFileToContainer(s.ctx, hostPath, fmt.Sprintf("/exploits/%s", bin), 0755)
 		s.Require().NoError(err, "copy exploit binary %s", bin)
@@ -111,12 +111,20 @@ func (s *IntegrationSuite) TestMonitor_MetadataEvents() {
 		{binary: "utimes", arg: "/watch/file.txt", expect: "ATTR"},
 		{binary: "setxattr", arg: "/watch/file.txt", expect: "ATTR"},
 		{binary: "mknod", arg: "/watch/fifo1", expect: "MKNOD"},
+		{binary: "statonly", arg: "/watch/file.txt", expect: "STAT"},
 		{binary: "statp", arg: "/watch/link", expect: "STAT"},
 	}
 
 	for _, op := range ops {
 		code, out := s.exec(c, []string{fmt.Sprintf("/exploits/%s", op.binary), op.arg})
 		s.Require().Equalf(0, code, "%s must succeed: %s", op.binary, out)
+		if op.binary == "statonly" {
+			needle := "EVENT|STAT|statonly|" + op.arg + "|"
+			log, ok := s.waitForMonitorStd(c, needle, 5*time.Second)
+			s.Require().Truef(ok, "lstat(2) alone must emit %s:\n%s", needle, tailLast(log, 20))
+			logBefore = s.readMonitorLog(c)
+			continue
+		}
 		logAfter := s.waitForEventType(c, logBefore, op.expect, 5*time.Second)
 		logBefore = logAfter
 	}

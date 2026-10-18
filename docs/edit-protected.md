@@ -10,6 +10,7 @@ sudo app-listener edit-protected --set-password         # change the password (a
 sudo app-listener edit-protected --forward -w <bin> [-e EVENTS]   # temporary access for another binary
 sudo app-listener edit-protected --timeout-session 10m  # revoke a live session after 10 idle minutes
 sudo app-listener edit-protected --edit-config          # edit the running daemon.conf; saving reloads it
+sudo app-listener edit-protected --edit-config --record ~/work/secrets   # learn who uses a new path, then guard it
 ```
 
 It opens the directory in a two-pane editor, the file tree on the left. `Ctrl+S` saves
@@ -141,6 +142,50 @@ like `systemctl reload`.
 - Refused while a grant session is active.
 - Binaries added this way are vetted like any reload: one that isn't root-placed still needs
   [`trust-binaries`](binary-trust.md#trust-binaries).
+
+### Recording a new path: `--record`
+
+```bash
+sudo app-listener edit-protected --edit-config --record ~/work/secrets --record ~/.config/tool/token
+```
+
+Guarding a new directory or file needs its whitelist: the programs that legitimately use it.
+`--record` learns it, like AppArmor's complain mode. Live mode only, same password, and the paths
+are checked only after the password is accepted.
+
+1. **Record.** Every access to the paths is recorded (nothing is denied) until you press `Ctrl+C`,
+   `q`, `Enter` or `Esc`, or after 2 hours. The screen shows the elapsed time and the latest
+   accesses. Use the paths now the way you normally do: run the tools, start the apps.
+2. **Review.** Each program that touched the paths is listed with its operations, the paths, the
+   users it ran as and its notes. Root-placed programs are preselected; a program you placed
+   yourself, or a general tool (a shell, an interpreter, `cat`), is listed but not preselected.
+   Then the libraries those programs loaded from places the trust guard doesn't already accept;
+   none is preselected (each becomes an `allow_lib` line). Then whether to restrict each program
+   to the operations it was seen doing, and, per path, whether to encrypt it first.
+3. **Apply.** The diff of `daemon.conf` is shown and confirmed; then the paths to encrypt are
+   migrated (each is moved to `<path>.app_listener.backup` and copied back encrypted, ending
+   locked), the approved programs are recorded, and the daemon writes and reloads the config. If
+   any step fails, the encrypted paths are restored from their backups and `daemon.conf` is not
+   changed. Last, each backup is offered for deletion: it is a plaintext copy, outside every
+   guarded tree.
+
+How the recording stays safe:
+
+- **Anything that touched the paths is listed, malware included.** Approve only programs you ran
+  on purpose while recording.
+- A program is identified by the inode of its executable, as the kernel reports it, never by its
+  name or command line. A program whose file was replaced or deleted while it ran, or that runs
+  from a world-writable place (`/tmp`, `/dev/shm`, ...), is listed as not whitelistable. A uutils
+  multicall is keyed per applet.
+- A program you placed yourself is recorded in the [binary ledger](binary-trust.md) with the
+  content seen while recording, so the reload admits exactly that file. A program the ledger
+  already knows keeps its verdict: if its content changed since, it still needs `trust-binaries`.
+- Refused paths: system trees (`/usr`, `/proc`, `/etc/app-listener`, ...), whole roots such as
+  `/home` or a user's whole home, symbolic links, files with more than one hard link, migration
+  copies, and anything inside or around a path the daemon already guards (edit that section
+  instead) or another recorded path.
+- Encryption needs the filesystem prepared (the commands are shown otherwise; the installer can
+  run them); a path that can't be encrypted can still be recorded without encryption.
 
 ## Editor keys
 

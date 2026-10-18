@@ -2,8 +2,10 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include "inode_dev.h"
 
 #define MAX_PATH 256
+#define MON_PROT_EXEC 0x4
 
 enum event_type {
 	EVENT_OPEN,
@@ -18,6 +20,9 @@ enum event_type {
 	EVENT_ATTR,
 	EVENT_STAT,
 	EVENT_MKNOD,
+	// EVENT_EXEC names a new executable (path = its file, dest = bprm->filename) so userspace can
+	// map exe_dev/exe_ino to a path after a short-lived process exited. Never a file access.
+	EVENT_EXEC,
 };
 
 struct event {
@@ -36,6 +41,13 @@ struct event {
 	__u32 dev;
 	__u32 mode;
 	__u64 ino;
+	// The calling process's executable (mm->exe_file), keyed as the guard keys it (inode_dev);
+	// 0/0 for kernel threads.
+	__u64 exe_dev;
+	__u64 exe_ino;
+	// prot of an mmap/mprotect event (MON_PROT_EXEC = a code mapping); 0 otherwise.
+	__u32 prot;
+	__u32 pad2;
 };
 
 struct {
@@ -65,23 +77,60 @@ static __always_inline void fill_identity(struct event *e, struct dentry *dentry
 	e->mode = BPF_CORE_READ(inode, i_mode);
 }
 
-static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, const char *dest)
+struct exe_id {
+	__u64 dev;
+	__u64 ino;
+};
+
+// current_exe reads the caller's exe identity. Called before the ringbuf reservation: inode_dev is
+// a global function.
+static __always_inline void current_exe(struct exe_id *id)
 {
-	struct event *e;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct mm_struct *mm = NULL;
+	struct file *exe = NULL;
+	struct inode *inode = NULL;
 
-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	if (!task || bpf_probe_read_kernel(&mm, sizeof(mm), &task->mm) || !mm)
+		return;
+	if (bpf_probe_read_kernel(&exe, sizeof(exe), &mm->exe_file) || !exe)
+		return;
+	if (bpf_probe_read_kernel(&inode, sizeof(inode), &exe->f_inode) || !inode)
+		return;
+	bpf_probe_read_kernel(&id->ino, sizeof(id->ino), &inode->i_ino);
+	id->dev = inode_dev((__u64)inode);
+}
+
+static __always_inline struct event *reserve_event(__u32 type, __u32 fd, __u32 prot)
+{
+	struct exe_id id = {};
+	current_exe(&id);
+
+	struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
 	if (!e)
-		return 0;
-
-	fill_identity(e, NULL);
+		return NULL;
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
 	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
 	e->gid = (bpf_get_current_uid_gid() >> 32) & 0xFFFFFFFF;
 	e->type = type;
 	e->fd = fd;
-
+	e->pad = 0;
+	e->exe_dev = id.dev;
+	e->exe_ino = id.ino;
+	e->prot = prot;
+	e->pad2 = 0;
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	return e;
+}
+
+static __always_inline int emit_user(__u32 type, __u32 fd, const char *path, const char *dest, __u32 prot)
+{
+	struct event *e = reserve_event(type, fd, prot);
+	if (!e)
+		return 0;
+
+	fill_identity(e, NULL);
 
 	if (path)
 		bpf_probe_read_user_str(e->path, sizeof(e->path), path);
@@ -97,24 +146,19 @@ static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, co
 	return 0;
 }
 
-static __always_inline int emit_event_kern(__u32 type, __u32 fd, const char *path, const char *dest,
-					   struct dentry *dentry)
+static __always_inline int emit_event(__u32 type, __u32 fd, const char *path, const char *dest)
 {
-	struct event *e;
+	return emit_user(type, fd, path, dest, 0);
+}
 
-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+static __always_inline int emit_kern(__u32 type, __u32 fd, const char *path, const char *dest,
+				     struct dentry *dentry, __u32 prot)
+{
+	struct event *e = reserve_event(type, fd, prot);
 	if (!e)
 		return 0;
 
 	fill_identity(e, dentry);
-
-	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-	e->gid = (bpf_get_current_uid_gid() >> 32) & 0xFFFFFFFF;
-	e->type = type;
-	e->fd = fd;
-
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
 
 	if (path)
 		bpf_probe_read_kernel_str(e->path, sizeof(e->path), path);
@@ -128,6 +172,12 @@ static __always_inline int emit_event_kern(__u32 type, __u32 fd, const char *pat
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
+}
+
+static __always_inline int emit_event_kern(__u32 type, __u32 fd, const char *path, const char *dest,
+					   struct dentry *dentry)
+{
+	return emit_kern(type, fd, path, dest, dentry, 0);
 }
 
 // VFS-level kprobes: catch open/read/write from the common syscall families (normal syscalls,
@@ -547,6 +597,7 @@ SEC("kprobe/security_mmap_file")
 int trace_security_mmap_file(struct pt_regs *ctx)
 {
 	struct file *file = (struct file *)PT_REGS_PARM1(ctx);
+	__u32 prot = (__u32)PT_REGS_PARM2(ctx);
 	if (!file)
 		return 0;
 
@@ -561,7 +612,129 @@ int trace_security_mmap_file(struct pt_regs *ctx)
 	if (off < 0)
 		return 0;
 
-	return emit_event_kern(EVENT_MMAP, 0, buf + off, NULL, dentry);
+	return emit_kern(EVENT_MMAP, 0, buf + off, NULL, dentry, prot);
+}
+
+// security_file_mprotect: a file mapping made executable after mmap (some loaders map, then
+// mprotect PROT_EXEC). Only that transition is emitted.
+SEC("kprobe/security_file_mprotect")
+int trace_security_file_mprotect(struct pt_regs *ctx)
+{
+	struct vm_area_struct *vma = (struct vm_area_struct *)PT_REGS_PARM1(ctx);
+	__u32 prot = (__u32)PT_REGS_PARM3(ctx);
+	if (!vma || !(prot & MON_PROT_EXEC))
+		return 0;
+
+	struct file *file = NULL;
+	if (bpf_probe_read_kernel(&file, sizeof(file), &vma->vm_file) || !file)
+		return 0;
+	struct dentry *dentry = NULL;
+	if (bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry) || !dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_kern(EVENT_MMAP, 0, buf + off, NULL, dentry, prot);
+}
+
+// Record probes (Monitor.AttachRecordProbes): the guard's own LSM chokepoints for what the vfs_*
+// probes above miss, so a recording learns every op the guard will judge. path_mknod: O_CREAT
+// opens and regular-file mknod (vfs_mknod sees only devices/FIFOs/sockets). file_permission:
+// writev, pwritev, splice/sendfile/copy_file_range destinations. file_truncate: ftruncate and
+// O_TRUNC opens, which the guard judges as WRITE. inode_getxattr/listxattr: judged as STAT.
+#define MON_MAY_WRITE 0x2
+
+static __always_inline int emit_dentry(__u32 type, struct dentry *dentry)
+{
+	if (!dentry)
+		return 0;
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_event_kern(type, 0, buf + off, NULL, dentry);
+}
+
+SEC("kprobe/security_path_mknod")
+int trace_security_path_mknod(struct pt_regs *ctx)
+{
+	return emit_dentry(EVENT_MKNOD, (struct dentry *)PT_REGS_PARM2(ctx));
+}
+
+// stat(2) and fstat: NewMonitor attaches this, not vfs_getattr, which vfs_statx_path inlines on
+// some kernels (7.0); vfs_getattr is security_inode_getattr's only caller.
+SEC("kprobe/security_inode_getattr")
+int trace_security_inode_getattr(struct pt_regs *ctx)
+{
+	struct path *path = (struct path *)PT_REGS_PARM1(ctx);
+	struct dentry *dentry = NULL;
+	if (!path || bpf_probe_read_kernel(&dentry, sizeof(dentry), &path->dentry))
+		return 0;
+	return emit_dentry(EVENT_STAT, dentry);
+}
+
+SEC("kprobe/security_inode_getxattr")
+int trace_security_inode_getxattr(struct pt_regs *ctx)
+{
+	return emit_dentry(EVENT_STAT, (struct dentry *)PT_REGS_PARM1(ctx));
+}
+
+SEC("kprobe/security_inode_listxattr")
+int trace_security_inode_listxattr(struct pt_regs *ctx)
+{
+	return emit_dentry(EVENT_STAT, (struct dentry *)PT_REGS_PARM1(ctx));
+}
+
+static __always_inline int emit_file_write(struct file *file)
+{
+	struct dentry *dentry = NULL;
+	if (!file || bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry))
+		return 0;
+	return emit_dentry(EVENT_WRITE, dentry);
+}
+
+SEC("kprobe/security_file_permission")
+int trace_security_file_permission(struct pt_regs *ctx)
+{
+	if (!((int)PT_REGS_PARM2(ctx) & MON_MAY_WRITE))
+		return 0;
+	return emit_file_write((struct file *)PT_REGS_PARM1(ctx));
+}
+
+SEC("kprobe/security_file_truncate")
+int trace_security_file_truncate(struct pt_regs *ctx)
+{
+	return emit_file_write((struct file *)PT_REGS_PARM1(ctx));
+}
+
+// sched_process_exec runs after the exec succeeded: current's exe identity is the new image.
+// tp_btf needs no tracefs (often absent in containers).
+SEC("tp_btf/sched_process_exec")
+int trace_sched_process_exec(unsigned long long *ctx)
+{
+	struct linux_binprm *bprm = (struct linux_binprm *)ctx[2];
+	if (!bprm)
+		return 0;
+	struct file *file = NULL;
+	if (bpf_probe_read_kernel(&file, sizeof(file), &bprm->file) || !file)
+		return 0;
+	struct dentry *dentry = NULL;
+	if (bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry) || !dentry)
+		return 0;
+	const char *filename = NULL;
+	bpf_probe_read_kernel(&filename, sizeof(filename), &bprm->filename);
+
+	char buf[MAX_PATH] = {};
+	long off = read_path(dentry, buf, sizeof(buf));
+	if (off < 0)
+		return 0;
+
+	return emit_kern(EVENT_EXEC, 0, buf + off, filename, dentry, 0);
 }
 
 // VFS kprobes for metadata operations. They replace tracepoint/syscalls/sys_enter_* because
@@ -636,17 +809,9 @@ int trace_vfs_rename(struct pt_regs *ctx)
 	if (!old_dentry || !new_dentry)
 		return 0;
 
-	struct event *e;
-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	struct event *e = reserve_event(EVENT_RENAME, 0, 0);
 	if (!e)
 		return 0;
-
-	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-	e->gid = (bpf_get_current_uid_gid() >> 32) & 0xFFFFFFFF;
-	e->type = EVENT_RENAME;
-	e->fd = 0;
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
 
 	fill_path(old_dentry, e->path);
 	fill_path(new_dentry, e->dest);
@@ -681,17 +846,9 @@ int trace_vfs_link(struct pt_regs *ctx)
 	if (!old_dentry || !new_dentry)
 		return 0;
 
-	struct event *e;
-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	struct event *e = reserve_event(EVENT_HARDLINK, 0, 0);
 	if (!e)
 		return 0;
-
-	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-	e->gid = (bpf_get_current_uid_gid() >> 32) & 0xFFFFFFFF;
-	e->type = EVENT_HARDLINK;
-	e->fd = 0;
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
 
 	fill_path(old_dentry, e->path);
 	fill_path(new_dentry, e->dest);
@@ -771,27 +928,6 @@ int trace_vfs_mknod(struct pt_regs *ctx)
 	return emit_event_kern(EVENT_MKNOD, 0, buf + off, NULL, dentry);
 }
 
-SEC("kprobe/vfs_getattr")
-int trace_vfs_getattr(struct pt_regs *ctx)
-{
-	struct path *path = (struct path *)PT_REGS_PARM1(ctx);
-	if (!path)
-		return 0;
-
-	struct dentry *dentry;
-	if (bpf_probe_read_kernel(&dentry, sizeof(dentry), &path->dentry))
-		return 0;
-	if (!dentry)
-		return 0;
-
-	char buf[MAX_PATH] = {};
-	long off = read_path(dentry, buf, sizeof(buf));
-	if (off < 0)
-		return 0;
-
-	return emit_event_kern(EVENT_STAT, 0, buf + off, NULL, dentry);
-}
-
 SEC("kprobe/vfs_readlink")
 int trace_vfs_readlink(struct pt_regs *ctx)
 {
@@ -825,7 +961,7 @@ int trace_mmap(struct trace_event_raw_sys_enter *ctx)
 {
 	__s32 fd = (__s32)ctx->args[4];
 	if (fd >= 0)
-		return emit_event(EVENT_MMAP, fd, NULL, NULL);
+		return emit_user(EVENT_MMAP, fd, NULL, NULL, (__u32)ctx->args[2]);
 	return 0;
 }
 

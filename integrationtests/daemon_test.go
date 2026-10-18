@@ -84,7 +84,8 @@ func watchPathsInConfig(config string) []string {
 		if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
 			continue
 		}
-		if path := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]")); path != "" {
+		path := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))
+		if path = strings.Trim(path, `"`); path != "" { // generated configs quote the path
 			paths = append(paths, path)
 		}
 	}
