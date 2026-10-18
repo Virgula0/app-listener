@@ -30,7 +30,7 @@ type targetView struct {
 	activity *eventFeed
 	procs    *processView
 	policy   *policyTab
-	tabs     *container.AppTabs
+	tabs     *tabBar
 
 	countsVersion uint64
 }
@@ -45,13 +45,13 @@ func newTargetView(p *filesPage, t *workbench.FileTarget) *targetView {
 	v.policy = newPolicyTab(v)
 	v.activity = newFileFeed(v)
 	v.procs = newFileProcesses(v)
-	v.tabs = container.NewAppTabs(
-		container.NewTabItemWithIcon("Activity", icon("pulse"), v.activity.root),
-		container.NewTabItemWithIcon("Processes", icon("cpu"), v.procs.root),
-		container.NewTabItemWithIcon("Guard", icon("shield-check"), v.policy.root),
+	v.tabs = newTabBar(
+		tabItem{"Activity", "pulse", v.activity.root},
+		tabItem{"Processes", "cpu", v.procs.root},
+		tabItem{"Guard", "shield-check", v.policy.root},
 	)
 	v.counters = newCounterStrip("Denied")
-	v.root = container.NewBorder(newGapVBox(v.header(), v.counters.root, v.errLabel), nil, nil, nil, v.tabs)
+	v.root = container.NewBorder(newGapVBox(v.header(), v.counters.root, v.errLabel), nil, nil, nil, v.tabs.root)
 	return v
 }
 

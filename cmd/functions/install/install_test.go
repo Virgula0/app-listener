@@ -17,8 +17,8 @@ func TestValidateMaintenanceFlags(t *testing.T) {
 	}{
 		{"none", maintenanceFlags{}, ""},
 		{"diff alone", maintenanceFlags{diffCatalog: true}, ""},
-		{"update alone", maintenanceFlags{updateCatalog: true}, ""},
-		{"diff + update", maintenanceFlags{diffCatalog: true, updateCatalog: true}, "mutually exclusive"},
+		{"update alone", maintenanceFlags{refreshCatalog: true}, ""},
+		{"diff + update", maintenanceFlags{diffCatalog: true, refreshCatalog: true}, "mutually exclusive"},
 		{"diff + binary-only", maintenanceFlags{diffCatalog: true, binaryOnly: true}, "mutually exclusive"},
 		{"diff + yes", maintenanceFlags{diffCatalog: true, autoConfirm: true}, "--yes can only be used"},
 		{"diff + live", maintenanceFlags{diffCatalog: true, live: true}, "--live can only be used"},

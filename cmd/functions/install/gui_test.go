@@ -27,7 +27,7 @@ func TestRunWithRefusesNonHeadlessBinary(t *testing.T) {
 
 func TestNeedsBinary(t *testing.T) {
 	want := map[Mode]bool{
-		ModeWizard: true, ModeUpdateCatalog: false,
+		ModeWizard: true, ModeRefreshCatalog: false,
 		ModeDiffCatalog: false, ModeRestoreBackups: false, ModeDeleteBackups: false,
 	}
 	for m, w := range want {

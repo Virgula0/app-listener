@@ -135,16 +135,16 @@ func (s *shell) exportTable(baseName string, t *dataTable) {
 			}
 			data, err := encodeTable(format.Selected, headers, rows)
 			if err != nil {
-				dialog.ShowError(err, s.win)
+				showErrorDialog(err, s.win)
 				return
 			}
 			path := filepath.Join(strings.TrimSpace(folder.Text), strings.TrimSpace(name.Text))
 			s.confirmOverwrite(path, func() {
 				if err := writeUserFile(path, data); err != nil {
-					dialog.ShowError(fmt.Errorf("export to %s: %w", path, err), s.win)
+					showErrorDialog(fmt.Errorf("export to %s: %w", path, err), s.win)
 					return
 				}
-				dialog.ShowInformation("Exported", fmt.Sprintf("Wrote %d rows to %s.", len(rows), path), s.win)
+				showInformation("Exported", fmt.Sprintf("Wrote %d rows to %s.", len(rows), path), s.win)
 			})
 		}, s.win)
 	s.showSized(d, fyne.NewSize(640, 300))
@@ -156,7 +156,7 @@ func (s *shell) confirmOverwrite(path string, write func()) {
 		write()
 		return
 	}
-	dialog.ShowConfirm("Replace file?", path+" already exists. Replace it?", func(ok bool) {
+	showConfirm("Replace file?", path+" already exists. Replace it?", func(ok bool) {
 		if ok {
 			write()
 		}

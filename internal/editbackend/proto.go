@@ -19,7 +19,7 @@ import (
 
 // Proto is the wire version; both sides refuse a mismatch (GUI and installed binary of different
 // releases).
-const Proto = 1
+const Proto = 2
 
 // MaxLine bounds one JSON line: a write's content (base64, up to MaxWriteBytes) plus framing.
 const MaxLine = 8 << 20
@@ -50,7 +50,6 @@ const (
 	OpConfigPut     = "config_put"
 	OpPasswordState = "password_state"
 	OpSetPassword   = "set_password"
-	OpClearPassword = "clear_password"
 )
 
 // Kinds of backend messages: a reply to one request, or an unsolicited event.
@@ -114,7 +113,7 @@ type Hello struct {
 	// Live: the control socket exists (a running daemon with a password): edits go live, and
 	// forward / config are available. Otherwise edits run offline (daemon must be stopped).
 	Live bool `json:"live"`
-	// HasPassword: a password file is configured (with !Live: the daemon isn't running).
+	// HasPassword: a password is configured (with !Live: the daemon isn't running).
 	HasPassword bool `json:"has_password"`
 }
 

@@ -104,7 +104,7 @@ func (p *protectedPage) view() fyne.CanvasObject {
 		mutedText("The daemon revokes a live session after this long without input in the session's view "+
 			"(and, for temporary access, without a granted binary touching the directories)."),
 	))
-	p.over = container.NewVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), newGapVBox(
+	p.over = newFadeVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), newGapVBox(
 		newAdaptiveGrid(3, p.modeT.card, p.daemonT.card, p.pwT.card),
 		container.NewVBox(sectionTitle("ACTIONS"), cards),
 		container.NewVBox(sectionTitle("SESSION"), timeoutCard),
@@ -225,15 +225,15 @@ func originLabel(origin string) string {
 // goroutine with it.
 func (p *protectedPage) begin(then func(link backendLink)) {
 	if p.link != nil {
-		dialog.ShowInformation("A session is open", "Finish the open edit-protected session first.", p.s.win)
+		showInformation("A session is open", "Finish the open edit-protected session first.", p.s.win)
 		return
 	}
 	if p.s.running() {
-		dialog.ShowInformation("A run is in progress", "Wait for the installer or updater run to finish.", p.s.win)
+		showInformation("A run is in progress", "Wait for the installer or updater run to finish.", p.s.win)
 		return
 	}
 	if active := p.s.activeGuards(); len(active) > 0 {
-		dialog.ShowInformation("Guards are running", "Turn off "+strings.Join(active, ", ")+
+		showInformation("Guards are running", "Turn off "+strings.Join(active, ", ")+
 			" first (Files and Network workspaces): a guard running in this window doesn't admit the "+
 			"edit-protected backend, so it would deny its reads and writes.", p.s.win)
 		return
@@ -291,7 +291,7 @@ func (p *protectedPage) authenticate(link backendLink, title string, ok func(res
 				return
 			}
 			if err != nil {
-				dialog.ShowCustomConfirm(title, "Try again", "Cancel", mutedText(err.Error()), func(again bool) {
+				showCustomConfirm(title, "Try again", "Cancel", mutedText(err.Error()), func(again bool) {
 					if again {
 						p.authenticate(link, title, ok)
 					} else {
@@ -340,7 +340,7 @@ func (p *protectedPage) pickMany(title string, resources []string, ok func([]str
 		checks[0].Checked = true
 	}
 	body := container.NewBorder(promptBody("Which guarded directories should the binaries reach?",
-		"The access is revoked when you stop it."), nil, nil, nil, container.NewVScroll(list))
+		"The access is revoked when you stop it."), nil, nil, nil, newFadeVScroll(list))
 	d := dialog.NewCustomConfirm(title, "Grant", "Cancel", body, func(confirm bool) {
 		var picked []string
 		for i, c := range checks {
@@ -388,6 +388,5 @@ func (p *protectedPage) watchEnded(link backendLink, onEnded func(why string)) {
 
 // showError is a dialog naming the action that failed.
 func (s *shell) showError(title string, err error) {
-	d := dialog.NewError(fmt.Errorf("%s: %w", title, err), s.win)
-	d.Show()
+	showErrorDialog(fmt.Errorf("%s: %w", title, err), s.win)
 }

@@ -164,7 +164,7 @@ func Run(opts Options) (err error) {
 // and an open edit-protected session ends (unsaved edits are lost).
 func (s *shell) confirmClose() {
 	if s.protect != nil && s.protect.link != nil {
-		dialog.ShowConfirm("End the edit-protected session?", "Closing the window ends the open session: a "+
+		showConfirm("End the edit-protected session?", "Closing the window ends the open session: a "+
 			"live grant is revoked, an offline directory is locked again, and unsaved edits are lost.",
 			func(ok bool) {
 				if ok {
@@ -177,7 +177,7 @@ func (s *shell) confirmClose() {
 		s.win.Close()
 		return
 	}
-	dialog.ShowConfirm("Quit during a run?", "Closing the window stops the installer or updater midway. "+
+	showConfirm("Quit during a run?", "Closing the window stops the installer or updater midway. "+
 		"Steps already completed stay applied; re-run it afterwards to resume.", func(ok bool) {
 		if ok {
 			s.win.Close()
@@ -351,7 +351,7 @@ func (s *shell) show(id pageID) {
 	if !ok {
 		// The page fills the window when it fits and scrolls when the window is smaller than it
 		// (fyne grows scroll content to the viewport): a tiling WM may impose any size.
-		v = container.NewScroll(s.build(id))
+		v = newFadeScroll(s.build(id))
 		s.views[id] = v
 	}
 	s.body.Objects = []fyne.CanvasObject{v}
@@ -399,6 +399,7 @@ func (s *shell) showSized(d sizedDialog, want fyne.Size) {
 	s.dialogs[d] = want
 	d.SetOnClosed(func() { delete(s.dialogs, d) })
 	d.Show()
+	handCursorsOn(s.win)
 	s.fitDialog(d, want)
 }
 
@@ -425,7 +426,7 @@ func (s *shell) refitDialogs(fyne.Size) {
 
 // scrollable lets a dialog's content shrink below its natural size and scroll instead.
 func scrollable(content fyne.CanvasObject) fyne.CanvasObject {
-	return container.NewScroll(content)
+	return newFadeScroll(content)
 }
 
 // resizeWatch is a stack layout that reports size changes of the window content.
@@ -505,7 +506,7 @@ func (s *shell) busy(title string, work func() error, done func()) {
 		fyne.Do(func() {
 			d.Hide()
 			if err != nil {
-				dialog.ShowError(err, s.win)
+				showErrorDialog(err, s.win)
 				return
 			}
 			if done != nil {

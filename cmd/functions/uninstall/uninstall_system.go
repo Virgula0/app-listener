@@ -36,7 +36,7 @@ func revertSystemFiles() error {
 		filepath.Join(systemd.SystemdDir, systemd.DaemonServiceName+".service"),
 		systemd.InstallBinaryPath,
 		systemd.SystemConfigPath,
-		editprotected.HashFile,
+		editprotected.LegacyHashFile,
 		binledger.DefaultPath,
 		binledger.JournalPath(binledger.DefaultPath),
 	}, systemd.LegacyCatalogRefreshFiles()...) {

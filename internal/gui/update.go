@@ -69,7 +69,7 @@ func (p *updatePage) view() fyne.CanvasObject {
 	p.daemonT = newStatusTile("pulse", "Daemon")
 	p.latestT = newStatusTile("download-simple", "Latest release")
 
-	over := container.NewVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), container.NewVBox(
+	over := newFadeVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), container.NewVBox(
 		container.NewGridWithColumns(3, p.installedT.card, p.daemonT.card, p.latestT.card),
 		sectionTitle("SOURCE"),
 		p.sourceCard(),

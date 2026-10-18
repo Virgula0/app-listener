@@ -58,7 +58,6 @@ var backendOps = map[string]backendOp{
 	editbackend.OpOfflineOpen:   {[]backendState{stNew}, (*backend).offlineOpen},
 	editbackend.OpPasswordState: {[]backendState{stNew}, (*backend).passwordState},
 	editbackend.OpSetPassword:   {[]backendState{stNew}, (*backend).setPassword},
-	editbackend.OpClearPassword: {[]backendState{stNew}, (*backend).clearPassword},
 	editbackend.OpForwardCheck:  {[]backendState{stAuthed}, (*backend).forwardCheck},
 	editbackend.OpSelect:        {[]backendState{stAuthed}, (*backend).selectResource},
 	editbackend.OpForward:       {[]backendState{stAuthed}, (*backend).forward},
@@ -178,7 +177,7 @@ func (b *backend) serve(in *editbackend.Reader) error {
 }
 
 func (b *backend) hello(id uint64) *editbackend.Message {
-	hasPw, err := HashFileExists()
+	hasPw, err := HashConfigured()
 	m := &editbackend.Message{Kind: editbackend.KindReply, ID: id, Hello: &editbackend.Hello{
 		Proto: editbackend.Proto, Version: constants.Version, Live: b.live, HasPassword: hasPw,
 	}}
@@ -400,16 +399,16 @@ func (b *backend) ping(*editbackend.Request) (*editbackend.Message, error) {
 }
 
 func (b *backend) passwordState(*editbackend.Request) (*editbackend.Message, error) {
-	st := &editbackend.PwState{DaemonRunning: protected.DaemonRunning()}
-	encoded, err := LoadHashFile()
+	st := &editbackend.PwState{DaemonRunning: daemonRunning()}
+	encoded, err := LoadHash()
 	switch {
-	case errors.Is(err, ErrNoHashFile):
+	case errors.Is(err, ErrNoPassword):
 	case err != nil:
 		return nil, err
 	default:
 		origin, oErr := OriginOf(encoded)
 		if oErr != nil {
-			return nil, fmt.Errorf("the existing password file is unreadable (%w)", oErr)
+			return nil, fmt.Errorf("the stored password record is unreadable (%w)", oErr)
 		}
 		st.Configured, st.Origin = true, string(origin)
 	}
@@ -423,10 +422,6 @@ func (b *backend) setPassword(req *editbackend.Request) (*editbackend.Message, e
 	err := setPassword(func() (string, error) { return req.Password, checkSecret(req.Password) },
 		func() (string, error) { return req.NewPassword, ValidatePassword(req.NewPassword) })
 	return nil, err
-}
-
-func (b *backend) clearPassword(req *editbackend.Request) (*editbackend.Message, error) {
-	return nil, clearPassword(func() (string, error) { return req.Password, checkSecret(req.Password) })
 }
 
 func (b *backend) forwardCheck(req *editbackend.Request) (*editbackend.Message, error) {

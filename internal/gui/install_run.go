@@ -4,6 +4,7 @@ package gui
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
 	"time"
 
@@ -48,7 +49,7 @@ type runView struct {
 	bar    *widget.ProgressBar
 	barLbl *widget.Label
 	barBox *fyne.Container
-	logs   *widget.List
+	logs   *logGrid
 	result *widget.Label
 	// logBox holds barBox and result: showing or hiding them needs its relayout.
 	logBox *fyne.Container
@@ -71,28 +72,11 @@ func newRunView(s *shell, back string, onBack func()) *runView {
 	r.result.Wrapping = fyne.TextWrapWord
 	r.barBox = container.NewVBox(r.barLbl, r.bar)
 	r.barBox.Hide()
-	r.logs = widget.NewList(
-		func() int { return len(r.lines) },
-		func() fyne.CanvasObject {
-			l := widget.NewLabel("")
-			l.TextStyle = fyne.TextStyle{Monospace: true}
-			l.Truncation = fyne.TextTruncateEllipsis
-			return l
-		},
-		func(id widget.ListItemID, o fyne.CanvasObject) {
-			if id < len(r.lines) {
-				ln := r.lines[id]
-				l := o.(*widget.Label)
-				l.Importance = logImportance(ln.level)
-				l.SetText(ln.at.Format("15:04:05") + "  " + ln.text)
-			}
-		})
-	r.logs.OnSelected = func(id widget.ListItemID) {
-		r.logs.Unselect(id)
-		if id < len(r.lines) {
-			s.app.Clipboard().SetContent(r.lines[id].text)
+	r.logs = newLogGrid(func(row int) {
+		if row >= 0 && row < len(r.lines) {
+			s.app.Clipboard().SetContent(r.lines[row].text)
 		}
-	}
+	})
 
 	r.back = newTextButton(back, onBack)
 	copyLog := newButton("Copy log", icon("copy"), func() {
@@ -102,7 +86,7 @@ func newRunView(s *shell, back string, onBack func()) *runView {
 	r.head = container.NewBorder(nil, nil, r.tile, container.NewHBox(copyLog, r.back),
 		container.NewVBox(r.title, container.NewHBox(r.state)))
 
-	stepsCard := newPanel(container.NewBorder(boldLabel("Steps"), nil, nil, nil, container.NewVScroll(r.steps)))
+	stepsCard := newPanel(container.NewBorder(boldLabel("Steps"), nil, nil, nil, newFadeVScroll(r.steps)))
 	hint := widget.NewLabel("click a line to copy it")
 	hint.Importance = widget.LowImportance
 	hint.SizeName = theme.SizeNameCaptionText
@@ -115,16 +99,61 @@ func newRunView(s *shell, back string, onBack func()) *runView {
 	return r
 }
 
-func logImportance(l log.Level) widget.Importance {
+// logGrid is the run log: one row per line, scrolling both ways so a long line is never cut. A
+// tapped row is handed to onTap.
+type logGrid struct {
+	widget.TextGrid
+	onTap    func(row int)
+	rendered bool
+}
+
+func newLogGrid(onTap func(row int)) *logGrid {
+	g := &logGrid{onTap: onTap}
+	g.Scroll = fyne.ScrollBoth
+	g.ExtendBaseWidget(g)
+	return g
+}
+
+func (g *logGrid) CreateRenderer() fyne.WidgetRenderer {
+	r := g.TextGrid.CreateRenderer()
+	g.rendered = true
+	return r
+}
+
+func (g *logGrid) Tapped(e *fyne.PointEvent) {
+	row, _ := g.CursorLocationForPosition(e.Position)
+	g.onTap(row)
+}
+
+// scrollToBottom is TextGrid.ScrollToBottom, whose scroller exists only once rendered.
+func (g *logGrid) scrollToBottom() {
+	if g.rendered {
+		g.ScrollToBottom()
+	}
+}
+
+func logStyle(l log.Level) widget.TextGridStyle {
+	var c color.Color
 	switch {
 	case l <= log.ErrorLevel:
-		return widget.DangerImportance
+		c = themeColor(theme.ColorNameError)
 	case l == log.WarnLevel:
-		return widget.WarningImportance
+		c = themeColor(theme.ColorNameWarning)
 	case l >= log.DebugLevel:
-		return widget.LowImportance
+		c = themeColor(colorMuted)
+	default:
+		return nil
 	}
-	return widget.MediumImportance
+	return &widget.CustomTextGridStyle{FGColor: c}
+}
+
+func logRow(l logLine) widget.TextGridRow {
+	text := l.at.Format("15:04:05") + "  " + strings.ReplaceAll(l.text, "\n", " ")
+	cells := make([]widget.TextGridCell, 0, len(text))
+	for _, c := range text {
+		cells = append(cells, widget.TextGridCell{Rune: c})
+	}
+	return widget.TextGridRow{Cells: cells, Style: logStyle(l.level)}
 }
 
 // start resets the view for a run named name.
@@ -140,6 +169,7 @@ func (r *runView) start(name, iconName string) {
 	r.back.Disable()
 	r.progressDone()
 	r.renderSteps()
+	r.logs.Rows = nil
 	r.logs.Refresh()
 }
 
@@ -234,11 +264,13 @@ func (r *runView) progressDone() {
 
 func (r *runView) appendLog(l logLine) {
 	r.lines = append(r.lines, l)
+	r.logs.Rows = append(r.logs.Rows, logRow(l))
 	if over := len(r.lines) - maxLogLines; over > 0 {
 		r.lines = r.lines[over:]
+		r.logs.Rows = r.logs.Rows[over:]
 	}
 	r.logs.Refresh()
-	r.logs.ScrollToBottom()
+	r.logs.scrollToBottom()
 }
 
 func (r *runView) logText() string {

@@ -84,7 +84,7 @@ func (h *homePage) view() fyne.CanvasObject {
 	)
 
 	// The right inset keeps the cards clear of the scroll bar.
-	return container.NewVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), newGapVBox(
+	return newFadeVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), newGapVBox(
 		newPanel(hero),
 		container.NewVBox(sectionTitle("SYSTEM"), checks),
 		container.NewVBox(sectionTitle("WORKSPACES"), cards),

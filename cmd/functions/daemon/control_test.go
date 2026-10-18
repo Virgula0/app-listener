@@ -88,6 +88,18 @@ func TestReadGrantRequestForward(t *testing.T) {
 	}
 }
 
+func TestReadGrantRequestPassword(t *testing.T) {
+	req, err := readGrantRequest(bufio.NewReader(strings.NewReader("PASSWORD\nBrand-New-Horse-7\n")))
+	if err != nil || req.password != "Brand-New-Horse-7" || req.resource != "" || req.forward != nil || req.config {
+		t.Fatalf("got %+v, %v", req, err)
+	}
+	for _, bad := range []string{"PASSWORD\n\n", "PASSWORD x\nBrand-New-Horse-7\n", "PASSWORD\n"} {
+		if _, err := readGrantRequest(bufio.NewReader(strings.NewReader(bad))); err == nil {
+			t.Errorf("readGrantRequest(%q) should error", bad)
+		}
+	}
+}
+
 func TestRecordFailureLockout(t *testing.T) {
 	cs := &controlServer{}
 	for i := 0; i < maxAuthFailures-1; i++ {

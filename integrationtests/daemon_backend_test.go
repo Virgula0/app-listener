@@ -141,3 +141,52 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Backend_ForwardEndsOnEOF() {
 
 	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
 }
+
+// forwardSetup seeds a pre-ledger edit-auth.hash: the daemon imports it into binaries.db, which it
+// seals. A change goes through the daemon (AUTH with the current password, then PASSWORD); there is
+// no removal.
+func (s *IntegrationSuite) TestDaemon_EditProtected_ChangePasswordLive() {
+	c := s.forwardSetup()
+	defer c.Terminate(s.ctx)
+
+	code, _ := s.exec(c, []string{"sh", "-c", "test -e /etc/app-listener/edit-auth.hash"})
+	s.Require().NotEqualf(0, code, "the legacy edit-auth.hash was not migrated:\n%s", s.readDaemonLog(c))
+	for _, f := range []string{"/etc/app-listener/binaries.db", "/etc/app-listener/binaries.db-journal"} {
+		code, out := s.exec(c, []string{"sh", "-c", "cat " + f + " >/dev/null 2>&1"})
+		s.Require().NotEqualf(0, code, "%s is readable by a non-app-listener process: %s", f, out)
+		code, out = s.exec(c, []string{"sh", "-c", "echo x >> " + f + " 2>&1"})
+		s.Require().NotEqualf(0, code, "%s is writable by a non-app-listener process: %s", f, out)
+	}
+
+	const newPassword = "Brand-New-Secret-77"
+	r := s.runBackend(c, s.backendScript(
+		editbackend.Request{Op: editbackend.OpHello},
+		editbackend.Request{Op: editbackend.OpSetPassword, Password: "wrong-Pass-1234", NewPassword: newPassword},
+		editbackend.Request{Op: editbackend.OpSetPassword, Password: forwardPassword, NewPassword: "weak"},
+		editbackend.Request{Op: editbackend.OpSetPassword, Password: forwardPassword, NewPassword: newPassword},
+		editbackend.Request{Op: editbackend.OpEnd},
+	))
+	errs := s.backendErr(c)
+	s.Require().NotEmptyf(r[2].Err, "a change with a wrong current password was accepted: %+v", r[2])
+	s.Require().NotEmptyf(r[3].Err, "a weak new password was accepted: %+v", r[3])
+	s.Require().Emptyf(r[4].Err, "change: %+v\n%s\n%s", r[4], errs, s.readDaemonLog(c))
+	s.Require().Truef(s.awaitLog(c, "edit-protected password changed", 10*time.Second),
+		"the daemon did not store the change:\n%s", s.readDaemonLog(c))
+
+	r = s.runBackend(c, s.backendScript(
+		editbackend.Request{Op: editbackend.OpHello},
+		editbackend.Request{Op: editbackend.OpAuth, Password: forwardPassword},
+	))
+	s.Require().Containsf(r[2].Err, "authentication failed", "the old password still works: %+v", r[2])
+	r = s.runBackend(c, s.backendScript(
+		editbackend.Request{Op: editbackend.OpHello},
+		editbackend.Request{Op: editbackend.OpAuth, Password: newPassword},
+		editbackend.Request{Op: editbackend.OpEnd},
+	))
+	s.Require().Emptyf(r[2].Err, "the new password is refused: %+v\n%s", r[2], s.backendErr(c))
+
+	code, out := s.exec(c, []string{"sh", "-c", "/app-listener edit-protected --clear-password </dev/null 2>&1"})
+	s.Require().NotEqualf(0, code, "--clear-password must not exist: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
+}

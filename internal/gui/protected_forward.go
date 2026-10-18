@@ -40,7 +40,7 @@ const (
 
 func (p *protectedPage) startForward() {
 	if p.hello != nil && !p.hello.Live {
-		dialog.ShowInformation("Temporary access", "Temporary access needs the daemon running with an "+
+		showInformation("Temporary access", "Temporary access needs the daemon running with an "+
 			"edit-protected password configured (live mode).", p.s.win)
 		return
 	}
@@ -75,7 +75,7 @@ func (p *protectedPage) startForward() {
 			mutedText("The event types the rule covers. All checked = every event."))),
 		container.NewHBox(back, start),
 	)
-	p.show(container.NewVScroll(form))
+	p.show(newFadeVScroll(form))
 }
 
 func (f *forwardForm) setEvents(on bool) {
@@ -93,7 +93,7 @@ func (f *forwardForm) addTyped() {
 
 func (f *forwardForm) add(p string) {
 	if !filepath.IsAbs(p) {
-		dialog.ShowInformation("Binary", p+" is not an absolute path.", f.p.s.win)
+		showInformation("Binary", p+" is not an absolute path.", f.p.s.win)
 		return
 	}
 	for _, b := range f.bins {
@@ -143,19 +143,19 @@ func (f *forwardForm) selectedEvents() []string {
 func (f *forwardForm) submit() {
 	p := f.p
 	if len(f.bins) == 0 {
-		dialog.ShowInformation("Temporary access", "Add at least one binary.", p.s.win)
+		showInformation("Temporary access", "Add at least one binary.", p.s.win)
 		return
 	}
 	events := f.selectedEvents()
 	if events != nil && len(events) == 0 {
-		dialog.ShowInformation("Temporary access", "Check at least one event type.", p.s.win)
+		showInformation("Temporary access", "Check at least one event type.", p.s.win)
 		return
 	}
 	allow := f.rule.Selected == ruleAdmit
 	if allow {
 		for _, b := range f.bins {
 			if isOwnExecutable(b) {
-				dialog.ShowInformation("Temporary access", b+" is this window's own binary: it is never "+
+				showInformation("Temporary access", b+" is this window's own binary: it is never "+
 					"admitted. Its file access goes through the installed headless binary instead.", p.s.win)
 				return
 			}
@@ -210,7 +210,7 @@ func (f *forwardForm) confirmChecks(checks []editbackend.BinaryCheck, allow bool
 	}
 	if !allow || len(risky) == 0 {
 		if len(notes) > 0 {
-			dialog.ShowInformation("Temporary access", strings.Join(notes, "\n"), p.s.win)
+			showInformation("Temporary access", strings.Join(notes, "\n"), p.s.win)
 		}
 		ok()
 		return
@@ -251,7 +251,7 @@ func (f *forwardForm) grant(link backendLink, resources, bins []string, allow bo
 		p.show(v.root)
 		v.start()
 		if len(m.Notes) > 0 {
-			dialog.ShowInformation("Temporary access", strings.Join(m.Notes, "\n"), p.s.win)
+			showInformation("Temporary access", strings.Join(m.Notes, "\n"), p.s.win)
 		}
 	})
 }

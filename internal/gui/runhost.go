@@ -8,7 +8,6 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/wizard"
@@ -46,15 +45,15 @@ func (h *runHost) show(o fyne.CanvasObject) {
 // logs on that view; after runs on success.
 func (h *runHost) begin(name, iconName string, work func(ui wizard.UI) error, after func()) bool {
 	if h.s.running() {
-		dialog.ShowInformation("A run is in progress", "Wait for the installer or updater run to finish.", h.s.win)
+		showInformation("A run is in progress", "Wait for the installer or updater run to finish.", h.s.win)
 		return false
 	}
 	if h.s.sessionOpen() {
-		dialog.ShowInformation("An edit-protected session is open", "End it first (Protected workspace).", h.s.win)
+		showInformation("An edit-protected session is open", "End it first (Protected workspace).", h.s.win)
 		return false
 	}
 	if why := h.s.guardsBlocking(); why != "" {
-		dialog.ShowInformation("Guards are running", why, h.s.win)
+		showInformation("Guards are running", why, h.s.win)
 		return false
 	}
 	h.running = true

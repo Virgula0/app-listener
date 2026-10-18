@@ -33,8 +33,8 @@ func validateForwardFlags() error {
 	if err := validateForwardRule(); err != nil {
 		return err
 	}
-	if putFlag != "" || contentFileFlag != "" || setPasswordFlag || clearPasswordFlag {
-		return errors.New("--forward can't be combined with --put, --content-file, --set-password or --clear-password")
+	if putFlag != "" || contentFileFlag != "" || setPasswordFlag {
+		return errors.New("--forward can't be combined with --put, --content-file or --set-password")
 	}
 	return nil
 }

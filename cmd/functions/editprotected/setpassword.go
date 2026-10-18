@@ -11,9 +11,9 @@ import (
 )
 
 // authorizeFirstTimeSetPassword gates creating the FIRST edit-protected password (the transition
-// from "no password" to "live mode armed"). The daemon self-guards edit-auth.hash so no non-daemon
-// binary can write it, but that check is per-binary, not per-caller: `edit-protected --set-password`
-// IS the daemon binary, so absent this gate any root process could arm live mode on a running
+// from "no password" to "live mode armed"), for installs older than the mandatory install-time
+// password. The daemon seals binaries.db so no non-daemon binary can write it, but that check is
+// per-binary, not per-caller: `edit-protected --set-password` IS the daemon binary, so absent this gate any root process could arm live mode on a running
 // production daemon (whose vaults are unlocked) with no interaction and no proof of ownership, then
 // read every protected resource through the control socket. The audited bootstrap for the first
 // password is `install`; refuse the first-time CLI set while the daemon is running and point there.
@@ -28,47 +28,59 @@ func authorizeFirstTimeSetPassword(daemonRunning bool) error {
 	return nil
 }
 
-// runSetPassword sets a first edit-protected password or rotates a cli-managed one.
+// daemonRunning is anyDaemonRunning; tests replace it.
+var daemonRunning = anyDaemonRunning
+
+// anyDaemonRunning: the systemd unit, its control socket, or a daemon process outside systemd. An
+// unreadable /proc counts as running, the stricter path.
+func anyDaemonRunning() bool {
+	if protected.DaemonRunning() || LiveModeAvailable() {
+		return true
+	}
+	pids, err := protected.FindDaemonProcesses("/proc")
+	return err != nil || len(pids) > 0
+}
+
+// runSetPassword changes the edit-protected password, or sets the first one with the daemon stopped.
 func runSetPassword() error {
 	return setPassword(func() (string, error) { return promptPassword("Current edit-protected password") },
 		PromptNewPassword)
 }
 
-// setPassword is runSetPassword's flow, shared with the GUI backend: current is asked only when
-// rotating, next yields the new password. A password chosen during `install` is owned by the
-// installer and refused here with a pointer.
+// setPassword is runSetPassword's flow, shared with the GUI backend: current is asked only when a
+// password exists, next yields the new one. A change proves the current password first: to the
+// daemon over its control socket while it runs (AUTH, throttled, then PASSWORD), else through
+// CheckPassword's persistent guess budget, never an unthrottled local compare. There is no way to
+// remove the password.
 func setPassword(current, next func() (string, error)) error {
-	encoded, err := LoadHashFile()
-	switch {
-	case errors.Is(err, ErrNoHashFile):
+	configured, err := HashConfigured()
+	if err != nil {
+		return err
+	}
+	if !configured {
 		// First-time set: arming live edit-protected on a resource that had no password.
-		if aErr := authorizeFirstTimeSetPassword(protected.DaemonRunning()); aErr != nil {
+		if aErr := authorizeFirstTimeSetPassword(daemonRunning()); aErr != nil {
 			return aErr
 		}
-	case err != nil:
+		return storeNewPassword(next)
+	}
+	cur, err := current()
+	if err != nil {
 		return err
-	default:
-		origin, oErr := OriginOf(encoded)
-		if oErr != nil {
-			return fmt.Errorf("the existing password file is unreadable (%w) — remove %s and set a new one", oErr, HashFile)
-		}
-		if origin == OriginInstall {
-			return errors.New("the edit-protected password was set during installation and cannot be rotated here — " +
-				"re-run `sudo app-listener install` to change it (it re-prompts for the password)")
-		}
-		cur, pErr := current()
-		if pErr != nil {
-			return pErr
-		}
-		ok, vErr := Verify(encoded, cur)
-		if vErr != nil {
-			return vErr
-		}
-		if !ok {
+	}
+	if daemonRunning() {
+		return changePasswordLive(cur, next)
+	}
+	if err := CheckPassword(cur); err != nil {
+		if errors.Is(err, ErrWrongPassword) {
 			return errors.New("current password is incorrect")
 		}
+		return err
 	}
+	return storeNewPassword(next)
+}
 
+func storeNewPassword(next func() (string, error)) error {
 	newPw, err := next()
 	if err != nil {
 		return err
@@ -77,82 +89,79 @@ func setPassword(current, next func() (string, error)) error {
 	if err != nil {
 		return err
 	}
-	if err := WriteHashFile(hashed); err != nil {
-		return fmt.Errorf("writing %s: %w", HashFile, err)
+	if err := StoreHash(hashed); err != nil {
+		return fmt.Errorf("storing the edit-protected password: %w", err)
 	}
-	log.Infof("edit-protected password saved to %s", HashFile)
-	return reloadDaemonForPasswordChange()
+	log.Info("edit-protected password saved")
+	return nil
 }
 
-// runClearPassword removes the password (of any origin) after proving
-// knowledge of it, disabling live mode.
-func runClearPassword() error {
-	return clearPassword(func() (string, error) {
-		return promptPassword("Current edit-protected password (to confirm removal)")
-	})
-}
-
-// clearPassword is runClearPassword's flow, shared with the GUI backend.
-func clearPassword(current func() (string, error)) error {
-	encoded, err := LoadHashFile()
-	if errors.Is(err, ErrNoHashFile) {
-		log.Info("no edit-protected password is configured — nothing to clear")
-		return nil
+// changePasswordLive changes the password through the running daemon, which stores it itself.
+func changePasswordLive(cur string, next func() (string, error)) error {
+	if !LiveModeAvailable() {
+		return errors.New("the daemon is running but its control socket " + ControlSocket + " is not present: " +
+			"reload it (systemctl reload " + systemd.DaemonServiceName + ") or stop it, then retry")
 	}
+	session, err := dialLiveSession()
 	if err != nil {
 		return err
 	}
-
-	cur, err := current()
+	defer session.End()
+	if _, authErr := session.Authenticate(cur); authErr != nil {
+		return fmt.Errorf("the daemon refused the current password: %w", authErr)
+	}
+	newPw, err := next()
 	if err != nil {
 		return err
 	}
-	ok, err := Verify(encoded, cur)
-	if err != nil {
-		return err
+	if err := session.ChangePassword(newPw); err != nil {
+		return fmt.Errorf("the daemon refused the new password: %w", err)
 	}
-	if !ok {
-		return errors.New("password is incorrect — not clearing")
-	}
-
-	if err := RemoveHashFile(); err != nil {
-		return fmt.Errorf("removing %s: %w", HashFile, err)
-	}
-	log.Infof("edit-protected password removed (%s) — live edit-protected is now disabled", HashFile)
-	return reloadDaemonForPasswordChange()
+	log.Info("edit-protected password changed")
+	return nil
 }
 
-// PromptNewPassword reads the new password twice and enforces the strength
-// floor. Exported for the installer's optional edit-protected password step.
-func PromptNewPassword() (string, error) {
-	first, err := promptPassword("New edit-protected password")
+// invalidPassword is a refused new password: too weak, or the two entries differ.
+type invalidPassword struct{ error }
+
+// passwordRules is shown with every new-password prompt.
+const passwordRules = "At least 12 characters, no whitespace, three of: lowercase, uppercase, digits, symbols." //nolint:gosec // help text, not a credential
+
+// PromptNewPassword reads the new password twice and enforces the strength floor.
+func PromptNewPassword() (string, error) { return promptNewPassword("") }
+
+// PromptNewPasswordUntilValid asks again, saying why, until an entry is accepted or the prompt is
+// canceled: the installer's mandatory step.
+func PromptNewPasswordUntilValid() (string, error) {
+	problem := ""
+	for {
+		pw, err := promptNewPassword(problem)
+		var inv invalidPassword
+		if !errors.As(err, &inv) {
+			return pw, err
+		}
+		problem = inv.Error() + ". Try again."
+	}
+}
+
+func promptNewPassword(problem string) (string, error) {
+	desc := passwordRules
+	if problem != "" {
+		desc = problem + "\n" + passwordRules
+	}
+	first, err := promptPasswordWith("New edit-protected password", desc)
 	if err != nil {
 		return "", err
 	}
 	if vErr := ValidatePassword(first); vErr != nil {
-		return "", vErr
+		return "", invalidPassword{vErr}
 	}
 	again, err := promptPassword("New edit-protected password (again)")
 	if err != nil {
 		return "", err
 	}
 	if first != again {
-		return "", errors.New("the two entries do not match")
+		return "", invalidPassword{errors.New("the two entries do not match")}
 	}
 	return first, nil
-}
-
-// reloadDaemonForPasswordChange asks a running daemon (SIGHUP; the reload handler calls
-// control.refresh) to reconcile its control socket with the new password state. A stopped daemon
-// picks it up on next start.
-func reloadDaemonForPasswordChange() error {
-	if !systemd.IsDaemonActive() {
-		return nil
-	}
-	log.Info("reloading the daemon so it picks up the password change ...")
-	if err := systemd.ReloadDaemonIfActive(); err != nil {
-		return fmt.Errorf("the password file was written but reloading the daemon failed (%w) — run: sudo systemctl reload %s",
-			err, systemd.DaemonServiceName)
-	}
-	return nil
 }

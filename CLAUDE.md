@@ -66,11 +66,17 @@ every change to enforcement paths as security-sensitive:
   `/proc/<pid>/exe` inode for display only — never a policy input). `CONFIG`
   (`--edit-config`, `configedit.go`) is the other post-AUTH path: the daemon writes
   daemon.conf only while it still holds what it sent (compare-and-swap), reloads, and puts
-  the old bytes back if the reload fails; refused while a grant session is active. The password hash
-  (`/etc/app-listener/edit-auth.hash`, PBKDF2, `0600`) is self-guarded like `fscrypt.key`.
+  the old bytes back if the reload fails; refused while a grant session is active. `PASSWORD`
+  is the third post-AUTH path: the daemon validates and stores the new password itself. The
+  password is mandatory at install and can only be changed (never removed), proving the current
+  one: over the socket while the daemon runs, else `CheckPassword`. Its PBKDF2 hash lives in the
+  `edit_auth` table of `/etc/app-listener/binaries.db`, which the daemon seals (with its
+  journal) like `fscrypt.key`; a legacy `edit-auth.hash` is imported only into an empty table.
+  Every verifier draws on the persistent guess budget in that DB (`binledger.BeginAuthAttempt`).
   Don't loosen any of: the peer-exe check, AUTH-before-disclosure, the single-session lock,
-  the auth lockout, the `origin=install` guard on `--set-password`, the mask being restored
-  in `RevokeSelfEditAccess`, or the journal-before-write and CAS-restore rules above.
+  the auth lockout and the persistent budget, current-password proof on change, the first-time
+  `--set-password` refusal while a daemon runs, the mask being restored in
+  `RevokeSelfEditAccess`, or the journal-before-write and CAS-restore rules above.
 - **The GUI drives edit-protected through `edit-protected --backend`** (`cmd/functions/editprotected/
   backend.go`, client `internal/editbackend`): the window runs the installed headless binary
   (root-placed, same inode as the running daemon, re-checked on the started pid, allowlisted env,
@@ -80,7 +86,7 @@ every change to enforcement paths as security-sensitive:
   EOF = end (revoke / re-lock). The GUI process never opens a protected path or the control socket
   and never gets a guard row; it refuses to `--forward -w` its own exe.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
-  key + edit-auth hash (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
+  key + `binaries.db` (password hash) (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.
 - Run `/security-review` on diffs that touch `internal/guard`, `internal/networkguard`,
   `internal/usecase/daemon.go`, `internal/fscrypt`, `internal/protected`, or any
@@ -319,7 +325,7 @@ inotify hints schedule the guards' re-sync (system binaries, admitted live by
 every directory and symlink hop root's, outside user homes) or the shared
 `install.RefreshCatalog` plus an in-process reload (home apps; a new match outside the
 user's home must be root-placed too, `refreshAdmits`), compare-and-swapped against the config it runs. `selfguards.go` makes the daemon guard its own `/etc/app-listener` config + key +
-edit-auth hash. When `edit-protected` has a password configured, `control.go` opens the
+`binaries.db` (ledger + password hash). When `edit-protected` has a password configured, `control.go` opens the
 live-edit control socket and `DaemonUseCase.GrantEditAccess` / the guard's
 `GrantSelfEditAccess`+`RevokeSelfEditAccess` implement the transient per-resource write
 grant. The `GuardRepository` port has daemon-specific methods (`PopulateInodes`,

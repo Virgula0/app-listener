@@ -28,7 +28,7 @@ To add catalog directories that appeared after you installed (a newly installed 
 
 The daemon keeps the catalog whitelists current by itself. It watches the catalog's directories
 (inotify, as a hint only) and re-expands the catalog whitelists at startup and whenever a binary
-is written below a catalog pattern, with the same rules as `install --update-catalog-only`,
+is written below a catalog pattern, with the same rules as `install --refresh-catalog-only`,
 keeping lines whose binary still exists. In the app's `[libraries]` block it also drops the
 `lib_dir` and `lib_binary` lines a catalog pattern produced whose path is gone (an old version
 directory the updater removed). Hand-written lines stay, and nothing is dropped from an encrypted

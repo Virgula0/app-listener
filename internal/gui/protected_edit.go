@@ -336,7 +336,7 @@ func (v *editView) onSelect(uid string) {
 		return
 	}
 	if v.dirty {
-		dialog.ShowConfirm("Unsaved changes", "Discard unsaved changes to "+path.Base(v.editPath)+"?",
+		showConfirm("Unsaved changes", "Discard unsaved changes to "+path.Base(v.editPath)+"?",
 			func(ok bool) {
 				if ok {
 					v.openFile(uid)
@@ -569,7 +569,7 @@ func (v *editView) chown() {
 		}
 		pick := widget.NewSelect(labels, nil)
 		pick.Selected = keep
-		dialog.ShowForm("Owner", "Apply", "Cancel", []*widget.FormItem{
+		showForm("Owner", "Apply", "Cancel", []*widget.FormItem{
 			widget.NewFormItem("Entry", selectable(path.Join(v.resource, uid))),
 			widget.NewFormItem("Owner", pick),
 		}, func(ok bool) {
@@ -598,7 +598,7 @@ func (v *editView) remove() {
 	if e.Dir {
 		msg += " (recursively)"
 	}
-	dialog.ShowConfirm("Delete", msg, func(ok bool) {
+	showConfirm("Delete", msg, func(ok bool) {
 		if !ok {
 			return
 		}
@@ -653,7 +653,7 @@ func (v *editView) onEnded(why string) {
 // end narrows the grant (or re-locks) and shows the post-edit audit, like the CLI on exit.
 func (v *editView) end() {
 	if v.dirty && !v.ended {
-		dialog.ShowConfirm("Unsaved changes", "End the session and discard unsaved changes to "+
+		showConfirm("Unsaved changes", "End the session and discard unsaved changes to "+
 			path.Base(v.editPath)+"?", func(ok bool) {
 			if ok {
 				v.dirty = false
@@ -687,6 +687,6 @@ func showAudit(s *shell, findings []string) {
 	}
 	d := dialog.NewCustom("Post-edit audit — potential issues", "Close", container.NewBorder(
 		promptBody("Advisory only", "The edit was saved and nothing here is changed or blocked."), nil, nil, nil,
-		container.NewVScroll(list)), s.win)
+		newFadeVScroll(list)), s.win)
 	s.showSized(d, fyne.NewSize(860, 520))
 }

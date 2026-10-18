@@ -173,7 +173,7 @@ and the password's state.
 | Edit protected files | `edit-protected` |
 | Temporary access | `edit-protected --forward -w/-b [-e]` |
 | Daemon configuration | `edit-protected --edit-config` |
-| Set, change or remove the password | `--set-password`, `--clear-password` |
+| Change the password (asks the current one; it can't be removed) | `--set-password` |
 | Live session idle timeout | `--timeout-session` (5 minutes to 4 hours) |
 
 Every live action asks for the password first; only then does the daemon list the guarded
@@ -238,21 +238,21 @@ window's version.
 ### The daemon binary
 
 The daemon never runs the GUI build. The installer deploys a headless build instead, staged first in
-a root-only (`0700`) temporary folder that is deleted when the window closes. **Source** picks where
-it comes from:
+a root-only (`0700`) temporary folder that is deleted when the window closes. **Source** picks the
+release it is downloaded from; only signed releases are offered, never a local file:
 
 | Source | Headless build |
 |---|---|
 | This version's release (release windows only, the default there) | The headless asset of this window's own tag. |
 | Latest stable release | The newest `vX.Y.Z` release, as `update` picks it. |
 | Latest pre-release | The newest `pre-YYYYMMDD-<sha>` build of main, as `update --channel pre-release` picks it. |
-| Local file | A headless binary you built (`make build`), copied in. It is not signature-verified, and the page says so. |
 
 Every download runs the checks `update` runs: Ed25519 signature, checksum, GitHub digest, ELF
 architecture and `--version`. Whatever the source, the build must be an app-listener binary without
 the `gui` tag or a fyne dependency (read from its Go build info); the installer checks that again
 itself right before deploying, and there is no fallback to copying the window's own executable.
-The page then shows the staged build's tag (or "local build"), SHA-256 and path.
+The page then shows the staged build's tag, SHA-256 and path. To deploy a build of your own, use
+`install --binary-only` from a terminal.
 
 When the staged build is another version than the window (always the case for a development
 window), the page says so: the window's installer writes `daemon.conf`, and before the service is
@@ -264,13 +264,14 @@ load it.
 | Action | CLI equivalent | Needs the staged build |
 |---|---|---|
 | Install wizard | `install` | yes |
-| Refresh catalog whitelists (Live: keep the daemon running) | `install --update-catalog-only` (`--live`) | no |
+| Refresh catalog whitelists (Live: keep the daemon running) | `install --refresh-catalog-only` (`--live`) | no |
 | Protect new catalog folders | `install --diff-catalog` | no |
 | Restore backups | `install --restore-backups` | no |
 | Delete backups | `install --delete-post-backups` | no |
 
 **Log denied metadata inspections** is `--allow-metadata-output`. There is no `--yes`: every
-confirmation is asked.
+confirmation is asked. Restore and Delete backups list the backups found, then ask once more naming
+each one; Restore is refused while the daemon runs, Delete is not.
 
 The wizard needs the installed binary to be identical to the staged build, as the terminal
 wizard needs it to be the one running: if they differ, update it first (the Update workspace, or

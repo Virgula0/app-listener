@@ -105,7 +105,7 @@ func (u *installUI) showMultiSelect(title, description string, choices []wizard.
 	all := newTextButton("Select all", func() { setAll(true) })
 	none := newTextButton("Select none", func() { setAll(false) })
 	top := promptBody(title, description, hfill(count, all, none))
-	body := container.NewBorder(top, nil, nil, nil, container.NewVScroll(list))
+	body := container.NewBorder(top, nil, nil, nil, newFadeVScroll(list))
 	d := dialog.NewCustomConfirm(u.run.name, "Continue", "Cancel", body, func(ok bool) {
 		var picked []int
 		for i, c := range checks {
@@ -176,7 +176,7 @@ func (u *installUI) EditText(title, name, text string) (string, error) {
 func (u *installUI) ShowDiff(title, diff string) error {
 	ask(func(reply func(struct{})) {
 		d := dialog.NewCustom(u.run.name, "Close", container.NewBorder(promptBody(title, ""), nil, nil, nil,
-			container.NewScroll(diffText(diff))), u.s.win)
+			newFadeScroll(diffText(diff))), u.s.win)
 		d.SetOnClosed(func() { reply(struct{}{}) })
 		u.s.showSized(d, fyne.NewSize(1040, 720))
 	})
@@ -194,7 +194,7 @@ func (u *installUI) showText(title, text string, closed func()) {
 	body := selectable(text)
 	body.Wrapping = fyne.TextWrapWord
 	d := dialog.NewCustom(u.run.name, "Close", container.NewBorder(promptBody(title, ""), nil, nil, nil,
-		container.NewScroll(body)), u.s.win)
+		newFadeScroll(body)), u.s.win)
 	d.SetOnClosed(closed)
 	u.s.showSized(d, fyne.NewSize(1040, 720))
 }

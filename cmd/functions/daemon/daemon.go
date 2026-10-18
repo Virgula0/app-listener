@@ -220,7 +220,7 @@ func startPprof(addr string) {
 //   - SIGTERM/SIGINT: otherwise a signal during startup kills the process with no deferred Stop,
 //     leaving unlocked vault keys provisioned until ExecStopPost (guards are pinned, so trees stay
 //     enforced).
-//   - SIGHUP: a reload (`edit-protected --set-password`, `install --update-catalog-only`) can arrive
+//   - SIGHUP: a reload (`edit-protected --edit-config`, `install --refresh-catalog-only`) can arrive
 //     seconds after start; SIGHUP's default is to terminate, so it would kill the daemon
 //     mid-startup.
 //
@@ -274,7 +274,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	defer stopSignals()
 
 	// Always-on guards over the daemon's own state (/etc/app-listener, fscrypt.key,
-	// edit-auth.hash), attached synchronously HERE, before the config guards touch bpffs: otherwise
+	// binaries.db), attached synchronously HERE, before the config guards touch bpffs: otherwise
 	// a killed predecessor's self-guard pins (swept by CleanupStalePins, same pin.base) would leave
 	// a window with no replacements. pinstate.go's ensurePinStateFilePlaceholder keeps
 	// writePinState working under the live RO self-guard. They stay attached across every reload.
@@ -531,8 +531,8 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		// A reload rebuilds every guard, so end any live edit-protected grant first (its client
 		// gets EOF; the tree is read-only again before the swap).
 		control.endActiveSession("configuration reload")
-		// A password added/removed via `edit-protected --set-password` takes effect here:
-		// start/stop the control socket.
+		// A first password set offline (installs older than the mandatory one) opens the control
+		// socket here.
 		defer control.refresh()
 
 		liveGen, cfg, err := reloadOnce(d, configPath, vault, pin.base, vet)
@@ -736,7 +736,7 @@ func (p *pendingGroupUnlock) lockRoots(vault *fscrypt.Vault) {
 // unlockPendingGroupRoots unlocks the vault of every PathPending grouped resource so buildGuards
 // can resolve real sub-path inodes. Each root is unlocked UNDER an ephemeral recursive self-only
 // guard attached first (denies every reader but the root daemon; same discipline as the running
-// daemon and --update-catalog-only). Returns an empty tracker when nothing is pending. reloading:
+// daemon and --refresh-catalog-only). Returns an empty tracker when nothing is pending. reloading:
 // a root already unlocked belongs to the running config and is never recorded for lock-back.
 func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg, reloading bool) (*pendingGroupUnlock, error) {
 	seen := make(map[string]bool)

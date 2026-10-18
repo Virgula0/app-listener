@@ -9,7 +9,6 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -151,7 +150,7 @@ func (p *filesPage) removeTarget(t *workbench.FileTarget) {
 	if t.Policy().Mode != workbench.GuardOff {
 		msg += "\n\nIts guard stops too: the path is no longer protected by this window."
 	}
-	dialog.ShowConfirm("Remove target", msg, func(ok bool) {
+	showConfirm("Remove target", msg, func(ok bool) {
 		if !ok {
 			return
 		}

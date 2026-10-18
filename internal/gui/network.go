@@ -31,7 +31,7 @@ type networkPage struct {
 	procs     *processView
 	watch     *watchTab
 	guard     *netGuardTab
-	tabs      *container.AppTabs
+	tabs      *tabBar
 
 	countsVersion uint64
 }
@@ -50,17 +50,17 @@ func (p *networkPage) view() fyne.CanvasObject {
 	p.watch = newWatchTab(p)
 	p.feed = p.newFeed()
 	p.procs = p.newProcesses()
-	p.tabs = container.NewAppTabs(
-		container.NewTabItemWithIcon("Watched", icon("eye"), p.watch.root),
-		container.NewTabItemWithIcon("Activity", icon("pulse"), p.feed.root),
-		container.NewTabItemWithIcon("Processes", icon("cpu"), p.procs.root),
-		container.NewTabItemWithIcon("Guard", icon("shield-check"), p.guard.root),
+	p.tabs = newTabBar(
+		tabItem{"Watched", "eye", p.watch.root},
+		tabItem{"Activity", "pulse", p.feed.root},
+		tabItem{"Processes", "cpu", p.procs.root},
+		tabItem{"Guard", "shield-check", p.guard.root},
 	)
 	p.pills = container.NewHBox(p.monPill, p.guardPill)
 	top := newGapVBox(p.counters.root, p.pills, p.errLabel)
 	p.refresh(true)
 	p.shell.every(pollInterval, func() { p.refresh(false) })
-	return container.NewBorder(top, nil, nil, nil, p.tabs)
+	return container.NewBorder(top, nil, nil, nil, p.tabs.root)
 }
 
 // searchEntry is the filter of the visible table tab, nil on the others.

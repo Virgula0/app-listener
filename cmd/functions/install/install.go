@@ -24,21 +24,21 @@ import (
 
 func init() {
 	InstallCmd.Flags().Bool("restore-backups", false,
-		"Undo the fscrypt migration: list the found .app_listener.backup directories in the TUI and, after one confirmation, delete the encrypted copies and move the backups back (aborts while the daemon is running)")
+		"Undo the fscrypt migration: list the found .app_listener.backup directories in the TUI and, after a confirmation naming them, delete the encrypted copies and move the backups back (aborts while the daemon is running)")
 	InstallCmd.Flags().Bool("delete-post-backups", false,
-		"Delete the found .app_listener.backup directories (listed in the TUI, confirmed once, with progress)")
+		"Delete the found .app_listener.backup directories (listed in the TUI, confirmed naming each one, with progress; the daemon may keep running)")
 	InstallCmd.Flags().Bool("binary-only", false,
 		"Move the freshly built binary to the install path (and recreate the PATH symlink); no wizard, no config, no fscrypt. If the daemon service is installed, shows the diff when its unit differs from the one the new build ships and asks whether to replace it, then asks (TUI) whether to restart it now to run the new binary or skip the restart for later")
-	InstallCmd.Flags().Bool("update-catalog-only", false,
+	InstallCmd.Flags().Bool("refresh-catalog-only", false,
 		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
 	InstallCmd.Flags().Bool("diff-catalog", false,
 		"Diff the catalog against the installed daemon.conf: list the critical directories that exist on the host but are not yet guarded, let you pick which to add, then append them to the config and encrypt them like a fresh install (existing sections untouched; stops the daemon for the cycle; requires a previous installation)")
 	InstallCmd.Flags().Bool("live", false,
-		"With --update-catalog-only: refresh the whitelists WITHOUT stopping the daemon (vaults are already unlocked and guarded by the running daemon; the config change is applied via SIGHUP reload). Requires the daemon to be running")
+		"With --refresh-catalog-only: refresh the whitelists WITHOUT stopping the daemon (vaults are already unlocked and guarded by the running daemon; the config change is applied via SIGHUP reload). Requires the daemon to be running")
 	InstallCmd.Flags().BoolVar(&allowMetadataOutput, "allow-metadata-output", false,
 		"Install the daemon unit WITHOUT --no-log-metadata-blocks, so denied metadata-only process inspections (op=PTRACE mode=READ) are logged; useful to diagnose an app that breaks with nothing logged")
 	InstallCmd.Flags().BoolP("yes", "y", false,
-		"Skip all confirmation prompts (use with --update-catalog-only for non-interactive use, e.g. scripts)")
+		"Skip all confirmation prompts (use with --refresh-catalog-only for non-interactive use, e.g. scripts)")
 }
 
 var InstallCmd = &cobra.Command{
@@ -80,6 +80,10 @@ The wizard walks through the whole installation:
      migrated — then encrypts the ones that need it (keeping a
      .app_listener.backup copy) while a progress bar shows the copy
      progress
+  7a. asks for the edit-protected password (mandatory): it authenticates
+     edit-protected's live mode and is stored hashed in binaries.db, which
+     the running daemon seals. On a re-run an existing password is kept
+     unless you choose to replace it (the recovery for a forgotten one)
   8. installs the systemd units from the embedded daemon-samples and
      writes the config to /etc/app-listener/daemon.conf (the binary is left
      as deployed). The PATH symlink /usr/local/bin/app-listener is
@@ -111,13 +115,15 @@ overwrite an older backup.
 
 Use --restore-backups to undo the migration instead of installing: the
 found .app_listener.backup directories are shown in a TUI list and, after
-a single confirmation, the encrypted directories are deleted and the
-backups moved back, restoring the original unencrypted content. It aborts
-while the daemon is running.
+a confirmation naming each one, the encrypted directories are deleted and
+the backups moved back, restoring the original unencrypted content. It
+aborts while the daemon is running.
 
 Use --delete-post-backups to delete the found .app_listener.backup
-directories instead of installing (also shown in a TUI list first). Both
-options show a TUI progress bar while running.
+directories instead of installing (also shown in a TUI list first, then
+confirmed naming each one). The daemon may keep running: the backups sit
+outside every guarded tree. Both options show a TUI progress bar while
+running.
 
 Use --binary-only for a shortcut that only deploys the binary: it builds
 build/linux/app-listener when it does not exist and replaces
@@ -131,7 +137,7 @@ default — or skip the restart, which still replaces the binary file but
 leaves the running daemon on its old (already-loaded) binary until you
 restart it yourself.
 
-Use --update-catalog-only to refresh the whitelist of every guarded
+Use --refresh-catalog-only to refresh the whitelist of every guarded
 directory from the catalog by hand: encrypted vaults are unlocked, glob
 patterns are re-expanded (picking up new binaries and dropping every line
 the catalog does not produce), and the diff is shown before overwriting.
@@ -147,7 +153,7 @@ same picker as the wizard, the selected ones are appended to the config
 and encrypted like a fresh install, and every existing section is left
 byte-for-byte intact. It stops the daemon for the cycle and restarts it on
 the merged config. Requires a previous installation. Unlike
---update-catalog-only this never touches existing sections' whitelists —
+--refresh-catalog-only this never touches existing sections' whitelists —
 run both to fully re-sync.`,
 	Args: cobra.NoArgs,
 	RunE: runInstall,
@@ -210,7 +216,7 @@ func runWizard() error {
 
 	// Collected now, persisted in deploy() only after every step that could still abort has
 	// succeeded, just before the daemon's first start (writeEditPasswordHash).
-	editPassword, err := promptEditPassword(cfg)
+	editPassword, err := promptEditPassword()
 	if err != nil {
 		return err
 	}
@@ -231,13 +237,13 @@ func runWizard() error {
 // maintenanceFlags holds the parsed CLI flags of the install command's mutually exclusive
 // maintenance modes.
 type maintenanceFlags struct {
-	restore       bool
-	deleteBackup  bool
-	binaryOnly    bool
-	updateCatalog bool
-	diffCatalog   bool
-	live          bool
-	autoConfirm   bool
+	restore        bool
+	deleteBackup   bool
+	binaryOnly     bool
+	refreshCatalog bool
+	diffCatalog    bool
+	live           bool
+	autoConfirm    bool
 }
 
 func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
@@ -252,7 +258,7 @@ func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
 	if f.binaryOnly, err = cmd.Flags().GetBool("binary-only"); err != nil {
 		return f, err
 	}
-	if f.updateCatalog, err = cmd.Flags().GetBool("update-catalog-only"); err != nil {
+	if f.refreshCatalog, err = cmd.Flags().GetBool("refresh-catalog-only"); err != nil {
 		return f, err
 	}
 	if f.diffCatalog, err = cmd.Flags().GetBool("diff-catalog"); err != nil {
@@ -284,8 +290,8 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 		return true, deletePostBackups()
 	case f.binaryOnly:
 		return true, installBinaryOnly()
-	case f.updateCatalog:
-		return true, runUpdateCatalogOnly(f.autoConfirm, f.live)
+	case f.refreshCatalog:
+		return true, runRefreshCatalogOnly(f.autoConfirm, f.live)
 	case f.diffCatalog:
 		return true, runDiffCatalog()
 	}
@@ -295,20 +301,20 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 // validateMaintenanceFlags rejects unsupported combinations: --yes/--live outside their owning
 // modes, and more than one mode at once.
 func validateMaintenanceFlags(f maintenanceFlags) error {
-	if f.autoConfirm && !f.updateCatalog && !f.restore && !f.deleteBackup {
-		return errors.New("--yes can only be used with --update-catalog-only, --restore-backups, or --delete-post-backups")
+	if f.autoConfirm && !f.refreshCatalog && !f.restore && !f.deleteBackup {
+		return errors.New("--yes can only be used with --refresh-catalog-only, --restore-backups, or --delete-post-backups")
 	}
-	if f.live && !f.updateCatalog {
-		return errors.New("--live can only be used with --update-catalog-only")
+	if f.live && !f.refreshCatalog {
+		return errors.New("--live can only be used with --refresh-catalog-only")
 	}
 	modes := 0
-	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.updateCatalog, f.diffCatalog} {
+	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.refreshCatalog, f.diffCatalog} {
 		if on {
 			modes++
 		}
 	}
 	if modes > 1 {
-		return errors.New("--restore-backups, --delete-post-backups, --binary-only, --update-catalog-only and --diff-catalog are mutually exclusive")
+		return errors.New("--restore-backups, --delete-post-backups, --binary-only, --refresh-catalog-only and --diff-catalog are mutually exclusive")
 	}
 	return nil
 }
@@ -370,21 +376,21 @@ func installBinaryOnly() error {
 // package var so tests can observe delivery.
 var deliverReload = systemd.EnableAndVerify
 
-// runUpdateCatalogOnly re-scans the catalog whitelist for every guarded directory in daemon.conf:
+// runRefreshCatalogOnly re-scans the catalog whitelist for every guarded directory in daemon.conf:
 // encrypted vaults are unlocked for stat, globs re-expanded, the diff shown for confirmation;
 // user-added sections kept verbatim.
 //
 // Live mode: the daemon keeps running (vaults unlocked, guards attached), so no unlock/lock cycle
 // or stop is needed and a changed config is delivered via SIGHUP. A stopped daemon can't support it
 // (locked vaults hide plaintext names), so the caller is told to use the stopped flow.
-func runUpdateCatalogOnly(autoConfirm, live bool) error {
+func runRefreshCatalogOnly(autoConfirm, live bool) error {
 	if live {
 		if !systemd.IsDaemonActive() {
 			return errors.New("live catalog refresh requires the daemon to be running: " +
-				"locked vaults hide plaintext names — use --update-catalog-only without --live, or start the daemon first")
+				"locked vaults hide plaintext names — use --refresh-catalog-only without --live, or start the daemon first")
 		}
 		vault := fscrypt.New()
-		changed, err := updateCatalogConfig(vault, autoConfirm, true)
+		changed, err := refreshCatalogConfig(vault, autoConfirm, true)
 		if err != nil {
 			return softenAutomatedRefreshErr(err, autoConfirm)
 		}
@@ -395,8 +401,8 @@ func runUpdateCatalogOnly(autoConfirm, live bool) error {
 		return err
 	}
 	vault := fscrypt.New()
-	if _, err := updateCatalogConfig(vault, autoConfirm, false); err != nil {
-		// updateCatalogConfig writes the config only after every section patched, so an error
+	if _, err := refreshCatalogConfig(vault, autoConfirm, false); err != nil {
+		// refreshCatalogConfig writes the config only after every section patched, so an error
 		// leaves the on-disk config unchanged. The flow stopped the daemon: bring it back on the
 		// existing config so a failed refresh never leaves protection off, then surface the
 		// original error.
@@ -452,7 +458,7 @@ var installedBinaryPath = systemd.InstallBinaryPath
 // see ensureInstalledBinary and guard.WithSelfAllowBinary).
 //
 // Why: with a binary already installed the wizard leaves it untouched and deploy() restarts the
-// daemon on that SAME binary; every self-guard decision (config, fscrypt key, edit-auth hash)
+// daemon on that SAME binary; every self-guard decision (config, fscrypt key, binaries.db)
 // trusts the exact on-disk file the daemon exec'd, never a same-name/same-content binary elsewhere
 // (that would bypass the "identity is dev:ino, never path/name" invariant). Running the wizard from
 // a freshly rebuilt standalone binary is an easy-to-hit mismatch that used to surface only at the
@@ -615,10 +621,10 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 
 // deploy installs services/hook, copies binary+config, enables the daemon. Existing files are
 // diffed: identical stay, differing ones show the diff and ask; a changed config reaches a running
-// daemon via SIGHUP. sshUsers (asked before encryption) get the ssh-agent unit. editPassword (maybe "") is
-// persisted via writeEditPasswordHash right before EnableAndVerify's first start on a fresh
-// install: everything that could abort has succeeded and the daemon isn't running, so that first
-// start already self-guards the hash and opens the control socket (no follow-up reload).
+// daemon via SIGHUP. sshUsers (asked before encryption) get the ssh-agent unit. editPassword ("" =
+// keep the existing one) is persisted via writeEditPasswordHash right before EnableAndVerify's
+// first start: everything that could abort has succeeded and the daemon isn't running, so that
+// first start already seals the hash and opens the control socket (no follow-up reload).
 func deploy(cfgText string, sshUsers []inst.User, bunUsers []bunUser, editPassword string) error {
 	if err := installServices(sshUsers); err != nil {
 		return err

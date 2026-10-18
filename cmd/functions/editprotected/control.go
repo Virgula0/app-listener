@@ -38,23 +38,25 @@ const ControlSocket = "/run/app-listener-daemon.control"
 //	client -> END\n                                   (session finished)
 //
 // or a configuration edit: CONFIG -> OK <n>\n<daemon.conf>; then END, or PUT <m>\n<bytes> -> OK |
-// ERR (the daemon reloads it, and restores the file if the reload fails).
+// ERR (the daemon reloads it, and restores the file if the reload fails);
+// or a password change: PASSWORD\n<new password>\n -> OK | ERR (the daemon stores its hash).
 //
 // The password is checked before any resource path is disclosed. The server revokes the grant on
 // EOF or after the idle timeout with neither a PING nor (FORWARD) a granted binary's event, and
 // closes the connection when it revokes on its own.
 const (
-	ctrlAuth    = "AUTH"
-	ctrlTimeout = "TIMEOUT"
-	ctrlSelect  = "SELECT"
-	ctrlForward = "FORWARD"
-	ctrlEvent   = "EVENT"
-	ctrlPing    = "PING"
-	ctrlEnd     = "END"
-	ctrlConfig  = "CONFIG"
-	ctrlPut     = "PUT"
-	ctrlOK      = "OK"
-	ctrlErr     = "ERR"
+	ctrlAuth     = "AUTH"
+	ctrlTimeout  = "TIMEOUT"
+	ctrlSelect   = "SELECT"
+	ctrlForward  = "FORWARD"
+	ctrlEvent    = "EVENT"
+	ctrlPing     = "PING"
+	ctrlEnd      = "END"
+	ctrlConfig   = "CONFIG"
+	ctrlPut      = "PUT"
+	ctrlPassword = "PASSWORD"
+	ctrlOK       = "OK"
+	ctrlErr      = "ERR"
 )
 
 // SessionTimeoutDefault is a live session's idle timeout when --timeout-session isn't given;
@@ -241,6 +243,29 @@ func (s *liveSession) PutConfig(next []byte) error {
 		return fmt.Errorf("sending the configuration: %w", err)
 	}
 	s.selected = false
+	line, err := s.readLine()
+	if err != nil {
+		return fmt.Errorf("reading the daemon's answer: %w", err)
+	}
+	if line == ctrlOK {
+		return nil
+	}
+	if msg, isErr := parseErr(line); isErr {
+		return errors.New(msg)
+	}
+	return fmt.Errorf("unexpected answer %q", line)
+}
+
+// ChangePassword has the daemon replace the password with next (Authenticate first, with the
+// current one). The daemon validates and hashes it; nothing else happens on the connection.
+func (s *liveSession) ChangePassword(next string) error {
+	if err := ValidatePassword(next); err != nil {
+		return err
+	}
+	_ = s.conn.SetDeadline(time.Now().Add(controlIOTimeout))
+	if _, err := fmt.Fprintf(s.conn, "%s\n%s\n", ctrlPassword, next); err != nil {
+		return fmt.Errorf("sending the password change: %w", err)
+	}
 	line, err := s.readLine()
 	if err != nil {
 		return fmt.Errorf("reading the daemon's answer: %w", err)

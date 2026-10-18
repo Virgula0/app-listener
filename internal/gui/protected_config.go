@@ -19,7 +19,7 @@ import (
 // the daemon writes it only while it still holds what was fetched, and reloads.
 func (p *protectedPage) startConfig() {
 	if p.hello != nil && !p.hello.Live {
-		dialog.ShowInformation("Daemon configuration", "Editing the configuration needs the daemon running with "+
+		showInformation("Daemon configuration", "Editing the configuration needs the daemon running with "+
 			"an edit-protected password configured (live mode). With the daemon stopped, edit "+
 			"/etc/app-listener/daemon.conf directly.", p.s.win)
 		return
@@ -86,7 +86,7 @@ func (v *configView) review() {
 	}
 	body := container.NewBorder(promptBody("Apply these changes and reload the daemon?",
 		"If the reload fails, the daemon keeps the current configuration and restores daemon.conf."), nil, nil, nil,
-		container.NewScroll(diffText(inst.UnifiedDiff(string(v.base), edited))))
+		newFadeScroll(diffText(inst.UnifiedDiff(string(v.base), edited))))
 	d := dialog.NewCustomConfirm("daemon.conf — changes to apply", "Apply", "Back to the editor", body,
 		func(ok bool) {
 			if ok {
@@ -108,7 +108,7 @@ func (v *configView) apply(edited string) {
 		case err == nil:
 			v.base = []byte(edited)
 			v.status.SetText("configuration saved and reloaded by the daemon")
-			dialog.ShowInformation("Daemon configuration", "Saved and reloaded by the daemon.", v.p.s.win)
+			showInformation("Daemon configuration", "Saved and reloaded by the daemon.", v.p.s.win)
 		case m.Stale:
 			// Diff the next review against what the daemon now holds; the edit stays in the editor.
 			v.base = m.Data
@@ -124,7 +124,7 @@ func (v *configView) apply(edited string) {
 
 func (v *configView) close() {
 	if v.editor.Text != string(v.base) {
-		dialog.ShowConfirm("Unsaved changes", "Discard your changes to daemon.conf?", func(ok bool) {
+		showConfirm("Unsaved changes", "Discard your changes to daemon.conf?", func(ok bool) {
 			if ok {
 				v.p.finish()
 			}

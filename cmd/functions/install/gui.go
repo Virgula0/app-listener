@@ -14,7 +14,7 @@ type Mode int
 
 const (
 	ModeWizard         Mode = iota
-	ModeUpdateCatalog       // --update-catalog-only (--live: Request.Live)
+	ModeRefreshCatalog      // --refresh-catalog-only (--live: Request.Live)
 	ModeDiffCatalog         // --diff-catalog
 	ModeRestoreBackups      // --restore-backups
 	ModeDeleteBackups       // --delete-post-backups
@@ -73,8 +73,8 @@ func RunWith(ui wizard.UI, req Request) error {
 	switch req.Mode {
 	case ModeWizard:
 		return runWizard()
-	case ModeUpdateCatalog:
-		return runUpdateCatalogOnly(false, req.Live)
+	case ModeRefreshCatalog:
+		return runRefreshCatalogOnly(false, req.Live)
 	case ModeDiffCatalog:
 		return runDiffCatalog()
 	case ModeRestoreBackups:

@@ -166,8 +166,10 @@ func readPutContent() ([]byte, error) {
 }
 
 // promptPassword reads a password without echoing it.
-func promptPassword(title string) (string, error) {
-	pw, err := wizard.Input(wizard.Field{Title: title, Secret: true})
+func promptPassword(title string) (string, error) { return promptPasswordWith(title, "") }
+
+func promptPasswordWith(title, description string) (string, error) {
+	pw, err := wizard.Input(wizard.Field{Title: title, Description: description, Secret: true})
 	if err != nil {
 		return "", err
 	}

@@ -83,7 +83,7 @@ func releaseBuild() bool {
 
 var installModes = map[gui.InstallMode]install.Mode{
 	gui.InstallWizard:         install.ModeWizard,
-	gui.InstallUpdateCatalog:  install.ModeUpdateCatalog,
+	gui.InstallRefreshCatalog: install.ModeRefreshCatalog,
 	gui.InstallDiffCatalog:    install.ModeDiffCatalog,
 	gui.InstallRestoreBackups: install.ModeRestoreBackups,
 	gui.InstallDeleteBackups:  install.ModeDeleteBackups,

@@ -63,7 +63,7 @@ func (p *filesPage) addTarget() {
 			}
 			spec, err := specFromForm(path.Text, recursive.Checked, depth.Text, events.selected())
 			if err != nil {
-				dialog.ShowError(err, win)
+				showErrorDialog(err, win)
 				return
 			}
 			var t *workbench.FileTarget

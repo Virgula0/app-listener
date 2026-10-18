@@ -325,13 +325,13 @@ func isInsidePath(path, dir string) bool {
 	return path != dir && strings.HasPrefix(path+"/", dir+"/")
 }
 
-// updateCatalogConfig reads the installed daemon.conf, re-expands the catalog whitelist for every
+// refreshCatalogConfig reads the installed daemon.conf, re-expands the catalog whitelist for every
 // matched section (inst.RefreshCatalog) and shows a diff for confirmation; unmatched (user-added)
 // sections are kept verbatim. autoConfirm logs the diff and overwrites without prompting. In live
 // mode the daemon keeps running (vaults already unlocked and guarded), so sections are re-scanned
 // without touching lock state and the caller applies the config via SIGHUP. Returns whether the
 // file was written (deliver to the daemon only then).
-func updateCatalogConfig(vault *fscrypt.Vault, autoConfirm, live bool) (changed bool, err error) {
+func refreshCatalogConfig(vault *fscrypt.Vault, autoConfirm, live bool) (changed bool, err error) {
 	oldText, err := os.ReadFile(systemd.SystemConfigPath)
 	if err != nil {
 		return false, fmt.Errorf("no previous installation found — run `app-listener install` first: %w", err)
@@ -433,7 +433,7 @@ func vaultScan(vault *fscrypt.Vault, live bool) inst.SectionScan {
 // rewrites its own bytes), which the read-only self mask denies. As in the daemon
 // (vaultOpForGuard), write is granted only for the vault call via WithSelfVaultAccess, and the
 // recovery sidecar is pre-staged before the guard attaches (creating it beside a guarded file is
-// denied once live). Without both, `install --update-catalog-only` failed with "truncate ...:
+// denied once live). Without both, `install --refresh-catalog-only` failed with "truncate ...:
 // operation not permitted" on file-vault sections (e.g. Steam's registry.vdf).
 func unlockUnderGuard(vault *fscrypt.Vault, path string) (*guard.Guard, error) {
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")

@@ -1,13 +1,13 @@
 // The `app-listener edit-protected` command opens fscrypt-encrypted (or plain) protected
 // directories in the embedded two-pane editor. Two modes, chosen automatically:
-//   - offline (no password configured, or daemon stopped): fatally refuses while the daemon runs,
+//   - offline (daemon stopped, or no password configured): fatally refuses while the daemon runs,
 //     re-scans the catalog like the uninstaller, unlocks ONE vault with the master key, edits,
 //     re-locks; a vault never stays open after return.
 //   - live (password set at install and daemon running): authenticates over the daemon's control
 //     socket, which briefly widens that one resource's guard for the write, then narrows it. The
 //     daemon keeps running; the vault lifecycle is untouched.
 //
-// `--set-password` / `--clear-password` manage the password. `--forward -w/-b [-e]` runs no editor:
+// `--set-password` changes the password (it can't be removed). `--forward -w/-b [-e]` runs no editor:
 // it holds temporary whitelist/blacklist rows for other binaries on the picked resources (live only).
 package editprotected
 
@@ -22,19 +22,18 @@ import (
 )
 
 var (
-	setPasswordFlag   bool
-	clearPasswordFlag bool
-	resourceFlags     []string
-	putFlag           string
-	contentFileFlag   string
-	forwardFlag       bool
-	whitelistFlags    []string
-	blacklistFlags    []string
-	eventsFlags       []string
-	yesFlag           bool
-	timeoutSession    time.Duration
-	editConfigFlag    bool
-	backendFlag       bool
+	setPasswordFlag bool
+	resourceFlags   []string
+	putFlag         string
+	contentFileFlag string
+	forwardFlag     bool
+	whitelistFlags  []string
+	blacklistFlags  []string
+	eventsFlags     []string
+	yesFlag         bool
+	timeoutSession  time.Duration
+	editConfigFlag  bool
+	backendFlag     bool
 )
 
 // editPasswordEnv carries the password for the non-interactive live apply
@@ -46,8 +45,8 @@ var EditProtectedCmd = &cobra.Command{
 	Short: "Edit a protected directory in the embedded TUI editor (live when an edit-protected password is set)",
 	Long: `Open one of the protected directories in the embedded two-pane editor.
 
-If an edit-protected password was chosen during ` + "`app-listener install`" + ` and
-the daemon is running, the edit happens LIVE: the command authenticates to
+When the daemon is running with the edit-protected password chosen during
+` + "`app-listener install`" + `, the edit happens LIVE: the command authenticates to
 the daemon over its local control socket, the daemon briefly grants write
 access to that one resource, you edit, and the grant is dropped again. The
 daemon keeps running and the fscrypt vaults are never touched. A live session
@@ -69,9 +68,11 @@ password): saving shows the diff, then the daemon writes it and reloads. If the
 reload fails, the daemon keeps the current configuration, restores the file,
 and you can edit again. --content-file <file> replaces it without the editor.
 
-Use --set-password to set or rotate the edit-protected password (only when
-it was not chosen during installation — rotating that one requires
-re-running the installer), and --clear-password to remove it.
+Use --set-password to change the edit-protected password: it asks the
+current one first (checked by the running daemon, or with the daemon stopped
+against the same attempt budget). The password can't be removed. An install
+older than the mandatory install-time password sets its first one here with
+the daemon stopped.
 
 For automation, --resource <path> --put <file-in-that-resource> performs one
 live write non-interactively: the new content is read from --content-file
@@ -97,9 +98,7 @@ interpreter (python, node, bash) admits every script it runs.
 
 func init() {
 	EditProtectedCmd.Flags().BoolVar(&setPasswordFlag, "set-password", false,
-		"Set or rotate the edit-protected authentication password (refused if it was set during installation)")
-	EditProtectedCmd.Flags().BoolVar(&clearPasswordFlag, "clear-password", false,
-		"Remove the edit-protected authentication password (disables live mode)")
+		"Change the edit-protected authentication password (asks the current one first)")
 	EditProtectedCmd.Flags().StringArrayVar(&resourceFlags, "resource", nil,
 		"Skip the picker and act on this configured watch path (repeatable with --forward)")
 	EditProtectedCmd.Flags().StringVar(&putFlag, "put", "",
@@ -128,9 +127,6 @@ func init() {
 }
 
 func validateFlags() error {
-	if setPasswordFlag && clearPasswordFlag {
-		return errors.New("--set-password and --clear-password are mutually exclusive")
-	}
 	if err := validateForwardFlags(); err != nil {
 		return err
 	}
@@ -140,8 +136,8 @@ func validateFlags() error {
 	if timeoutSession < time.Second || timeoutSession > SessionTimeoutMax {
 		return fmt.Errorf("--timeout-session must be between 1s and %s", SessionTimeoutMax)
 	}
-	if editConfigFlag && (forwardFlag || putFlag != "" || setPasswordFlag || clearPasswordFlag || len(resourceFlags) > 0) {
-		return errors.New("--edit-config can't be combined with --forward, --put, --resource, --set-password or --clear-password")
+	if editConfigFlag && (forwardFlag || putFlag != "" || setPasswordFlag || len(resourceFlags) > 0) {
+		return errors.New("--edit-config can't be combined with --forward, --put, --resource or --set-password")
 	}
 	return nil
 }
@@ -163,11 +159,8 @@ func runEditProtected(cmd *cobra.Command, args []string) error {
 	if setPasswordFlag {
 		return runSetPassword()
 	}
-	if clearPasswordFlag {
-		return runClearPassword()
-	}
 
-	hasPassword, err := HashFileExists()
+	hasPassword, err := HashConfigured()
 	if err != nil {
 		return err
 	}

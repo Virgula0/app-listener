@@ -117,7 +117,7 @@ func (p *picker) content() fyne.CanvasObject {
 
 	top := container.NewVBox(hfill(p.path, up, hidden), hfill(p.search, deep))
 	bottom := hfill(p.selected, p.status)
-	return container.NewBorder(top, bottom, container.NewVScroll(p.places()), nil, p.list)
+	return container.NewBorder(top, bottom, newFadeVScroll(p.places()), nil, p.list)
 }
 
 func (p *picker) places() fyne.CanvasObject {

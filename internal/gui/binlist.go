@@ -117,7 +117,7 @@ func (b *binaryList) pick() {
 
 func (b *binaryList) addPath(path string) {
 	if !filepath.IsAbs(path) {
-		dialog.ShowError(fmt.Errorf("%q is not an absolute path", path), b.shell.win)
+		showErrorDialog(fmt.Errorf("%q is not an absolute path", path), b.shell.win)
 		return
 	}
 	var entry ebpf.BinaryEntry

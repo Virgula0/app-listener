@@ -9,13 +9,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -26,29 +24,26 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// stagedBinary is the headless build the installer deploys, copied or downloaded into the page's
-// root-only staging directory so nobody else can swap it before the deploy reads it.
+// stagedBinary is the signature-verified headless release the installer deploys, downloaded into
+// the page's root-only staging directory so nobody else can swap it before the deploy reads it.
 type stagedBinary struct {
-	path, sha string
-	// tag is set for a signature-verified release download, empty for a local file.
-	tag string
+	path, sha, tag string
 }
 
-// binSource is where the headless build comes from.
+// binSource is the release channel the headless build is downloaded from. Only signed releases:
+// an unverified local file is never offered for deploy.
 type binSource int
 
 const (
 	srcThisVersion binSource = iota // this window's own release tag
 	srcStable
 	srcPreRelease
-	srcLocal
 )
 
 var srcLabels = map[binSource]string{
 	srcThisVersion: "This version's release",
 	srcStable:      "Latest stable release",
 	srcPreRelease:  "Latest pre-release",
-	srcLocal:       "Local file",
 }
 
 // installedBinary is what systemd.InstallBinaryPath holds now.
@@ -73,8 +68,8 @@ var installActions = []installAction{
 	{InstallWizard, "shield-check", theme.ColorNamePrimary, "Install wizard", "install",
 		"Pick the users and folders to protect, review daemon.conf, encrypt with fscrypt and start the daemon. " +
 			"Safe to re-run: a finished or interrupted install is resumed.", true},
-	{InstallUpdateCatalog, "arrow-clockwise", theme.ColorNameSuccess, "Refresh catalog whitelists",
-		"install --update-catalog-only", "Re-expand the catalog's whitelists for every guarded folder, show the " +
+	{InstallRefreshCatalog, "arrow-clockwise", theme.ColorNameSuccess, "Refresh catalog whitelists",
+		"install --refresh-catalog-only", "Re-expand the catalog's whitelists for every guarded folder, show the " +
 			"diff and rewrite daemon.conf. Your own sections are kept. Live reloads the running daemon instead of " +
 			"stopping it.", false},
 	{InstallDiffCatalog, "plus", theme.ColorNameSuccess, "Protect new catalog folders", "install --diff-catalog",
@@ -82,9 +77,10 @@ var installActions = []installAction{
 			"guard them like a fresh install.", false},
 	{InstallRestoreBackups, "lock-simple-open", theme.ColorNameWarning, "Restore backups", "install --restore-backups",
 		"Undo a migration: delete the encrypted folders and move their .app_listener.backup copies back. " +
-			"Refused while the daemon runs.", false},
+			"Refused while the daemon runs; asks before touching anything.", false},
 	{InstallDeleteBackups, "trash", theme.ColorNameError, "Delete backups", "install --delete-post-backups",
-		"Permanently delete the .app_listener.backup copies the migration kept.", false},
+		"Permanently delete the .app_listener.backup copies the migration kept. Works with the daemon running; " +
+			"asks before deleting.", false},
 }
 
 // installPage is the Install workspace: the headless build the daemon will run, the installer's
@@ -125,7 +121,7 @@ func (p *installPage) view() fyne.CanvasObject {
 	p.meta = widget.NewCheck("Log denied metadata inspections", nil)
 	p.live = widget.NewCheck("Live: keep the daemon running", nil)
 
-	over := container.NewVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), container.NewVBox(
+	over := newFadeVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), container.NewVBox(
 		container.NewGridWithColumns(3, p.installedT.card, p.daemonT.card, p.windowT.card),
 		sectionTitle("DAEMON BINARY"),
 		p.binaryCard(),
@@ -151,10 +147,10 @@ func (p *installPage) binaryCard() fyne.CanvasObject {
 	p.binNote = widget.NewLabel("")
 	p.binNote.Wrapping = fyne.TextWrapWord
 	p.binNote.Importance = widget.WarningImportance
-	p.binBtn = newTextButton("", p.acquire)
+	p.binBtn = newButton("Download and verify", icon("download-simple"), func() { p.download(p.source) })
 	p.binBtn.Importance = widget.HighImportance
 
-	sources := []binSource{srcStable, srcPreRelease, srcLocal}
+	sources := []binSource{srcStable, srcPreRelease}
 	if p.s.opts.Release {
 		sources = append([]binSource{srcThisVersion}, sources...)
 	}
@@ -191,26 +187,8 @@ func (p *installPage) renderSource() {
 	case srcPreRelease:
 		p.binIntro.SetText("The newest pre-release (the pre-YYYYMMDD builds of main), what " +
 			"update --channel pre-release installs." + verified)
-	case srcLocal:
-		p.binIntro.SetText("A headless binary you built (make build, without GUI=1), copied into a " +
-			"root-only folder. It is not signature-verified.")
-	}
-	if p.source == srcLocal {
-		p.binBtn.SetText("Choose binary…")
-		p.binBtn.SetIcon(icon("file"))
-	} else {
-		p.binBtn.SetText("Download and verify")
-		p.binBtn.SetIcon(icon("download-simple"))
 	}
 	p.binCard.Refresh()
-}
-
-func (p *installPage) acquire() {
-	if p.source == srcLocal {
-		p.chooseLocal()
-		return
-	}
-	p.download(p.source)
 }
 
 func (p *installPage) actionGrid() fyne.CanvasObject {
@@ -231,7 +209,7 @@ func (p *installPage) actionGrid() fyne.CanvasObject {
 		flag.SizeName = theme.SizeNameCaptionText
 		top := container.NewVBox(newIconTile(a.icon, a.color, 40), boldLabel(a.title), flag, mutedText(a.desc))
 		bottom := container.NewHBox(btn)
-		if a.mode == InstallUpdateCatalog {
+		if a.mode == InstallRefreshCatalog {
 			bottom = container.NewVBox(p.live, container.NewHBox(btn))
 		}
 		if a.needsBin {
@@ -244,20 +222,14 @@ func (p *installPage) actionGrid() fyne.CanvasObject {
 
 // renderBinary shows the staged build and enables the actions that deploy it.
 func (p *installPage) renderBinary() {
-	switch {
-	case p.bin == nil:
+	if p.bin == nil {
 		p.binTile.Set("terminal-window", colorMuted)
 		p.binState.Set("none yet", colorMuted)
 		p.binInfo.SetText("")
 		p.binInfo.Hide()
-	case p.bin.tag != "":
+	} else {
 		p.binTile.Set("shield-check", theme.ColorNameSuccess)
 		p.binState.Set("release "+p.bin.tag+" · signature verified", theme.ColorNameSuccess)
-		p.binInfo.SetText("sha256 " + p.bin.sha + "\n" + p.bin.path)
-		p.binInfo.Show()
-	default:
-		p.binTile.Set("warning", theme.ColorNameWarning)
-		p.binState.Set("local build · not signature-verified", theme.ColorNameWarning)
 		p.binInfo.SetText("sha256 " + p.bin.sha + "\n" + p.bin.path)
 		p.binInfo.Show()
 	}
@@ -368,7 +340,7 @@ func (p *installPage) startAction(a *installAction) {
 		return
 	}
 	req := InstallRequest{Mode: a.mode, AllowMetadataOutput: p.meta.Checked,
-		Live: a.mode == InstallUpdateCatalog && p.live.Checked}
+		Live: a.mode == InstallRefreshCatalog && p.live.Checked}
 	if p.bin != nil {
 		req.Binary = p.bin.path
 	}
@@ -405,7 +377,7 @@ func (p *installPage) download(src binSource) {
 	thisTag := p.s.opts.Version
 	dir, err := p.ensureStaging()
 	if err != nil {
-		dialog.ShowError(err, p.s.win)
+		showErrorDialog(err, p.s.win)
 		return
 	}
 	var staged *stagedBinary
@@ -452,55 +424,4 @@ func (p *installPage) download(src binSource) {
 		p.bin = nil
 		p.renderBinary()
 	}
-}
-
-func (p *installPage) chooseLocal() {
-	start, _ := os.Getwd()
-	p.s.pickPath(pickFile, "Choose a headless app-listener binary", start, func(path string) {
-		dir, err := p.ensureStaging()
-		if err != nil {
-			dialog.ShowError(err, p.s.win)
-			return
-		}
-		p.bin = nil
-		p.renderBinary()
-		var staged *stagedBinary
-		p.s.busy("Checking the binary…", func() error {
-			r, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer r.Close()
-			staged, err = stageLocal(r, dir, headless.Check)
-			return err
-		}, func() {
-			p.bin = staged
-			p.renderBinary()
-		})
-	})
-}
-
-// stageLocal copies src into dir (a fresh 0700 file) and refuses it unless it is the headless build.
-func stageLocal(src io.Reader, dir string, check func(string) error) (*stagedBinary, error) {
-	dst := filepath.Join(dir, "app-listener-local")
-	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
-	if err != nil {
-		return nil, err
-	}
-	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(f, h), src)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = check(dst)
-	}
-	if err != nil {
-		_ = os.Remove(dst)
-		return nil, err
-	}
-	return &stagedBinary{path: dst, sha: hex.EncodeToString(h.Sum(nil))}, nil
 }

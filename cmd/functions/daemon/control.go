@@ -62,18 +62,24 @@ const (
 //	client -> END\n | PUT <m>\n<m bytes>
 //	server -> OK\n | ERR <reason>\n                    (reloaded | refused, file restored)
 //
+// or, after AUTH, a password change (the current one was just proven):
+//
+//	client -> PASSWORD\n<new password>\n
+//	server -> OK\n | ERR <reason>\n                    (stored in binaries.db | refused)
+//
 // The password is verified BEFORE any resource path is disclosed, so an unauthenticated caller
 // learns nothing about the protected directories.
 const (
-	ctrlAuth    = "AUTH"
-	ctrlTimeout = "TIMEOUT"
-	ctrlSelect  = "SELECT"
-	ctrlForward = "FORWARD"
-	ctrlEvent   = "EVENT"
-	ctrlPing    = "PING"
-	ctrlEnd     = "END"
-	ctrlConfig  = "CONFIG"
-	ctrlPut     = "PUT"
+	ctrlAuth     = "AUTH"
+	ctrlTimeout  = "TIMEOUT"
+	ctrlSelect   = "SELECT"
+	ctrlForward  = "FORWARD"
+	ctrlEvent    = "EVENT"
+	ctrlPing     = "PING"
+	ctrlEnd      = "END"
+	ctrlConfig   = "CONFIG"
+	ctrlPut      = "PUT"
+	ctrlPassword = "PASSWORD"
 	// maxForwardResources / maxForwardBinaries bound one FORWARD request.
 	maxForwardResources = 64
 	maxForwardBinaries  = 32
@@ -84,11 +90,10 @@ const (
 // paths only after that, and on SELECT asks the use case to widen the target resource's guard for
 // the session. One session at a time.
 type controlServer struct {
-	uc       usecase.DaemonUseCase
-	ln       net.Listener
-	selfDev  uint64
-	selfIno  uint64
-	hashPath string
+	uc      usecase.DaemonUseCase
+	ln      net.Listener
+	selfDev uint64
+	selfIno uint64
 	// configEditor: the manager's, nil until the reload exists.
 	configEditor func() *configEditor
 
@@ -130,10 +135,9 @@ func (s *editControlSession) end() {
 	})
 }
 
-// controlManager owns the optional control socket across the daemon's life: created when an
-// edit-protected password exists, torn down when removed. The reload handler calls refresh(), so
-// `edit-protected --set-password/--clear-password` on a running daemon takes effect on the next
-// SIGHUP.
+// controlManager owns the control socket across the daemon's life: created once an edit-protected
+// password exists (an install older than the mandatory password may have none until
+// `edit-protected --set-password`, offline, sets it; the reload handler's refresh() picks it up).
 type controlManager struct {
 	uc usecase.DaemonUseCase
 	mu sync.Mutex
@@ -160,9 +164,9 @@ func (m *controlManager) refresh() {
 	if m == nil {
 		return
 	}
-	exists, err := editprotected.HashFileExists()
+	exists, err := editprotected.HashConfigured()
 	if err != nil {
-		log.Errorf("daemon: cannot check the edit-protected password file (%v) — leaving the control socket as-is", err)
+		log.Errorf("daemon: cannot read the edit-protected password (%v) — leaving the control socket as-is", err)
 		return
 	}
 
@@ -177,7 +181,7 @@ func (m *controlManager) refresh() {
 		}
 		m.cs = cs
 	case !exists && m.cs != nil:
-		log.Info("daemon: edit-protected password removed — closing the control socket")
+		log.Info("daemon: no edit-protected password — closing the control socket")
 		m.cs.close()
 		m.cs = nil
 	}
@@ -243,8 +247,7 @@ func startControlServer(uc usecase.DaemonUseCase, configEditor func() *configEdi
 		return nil, fmt.Errorf("securing control socket %s: %w", editprotected.ControlSocket, chErr)
 	}
 
-	cs := &controlServer{uc: uc, ln: ln, selfDev: selfDev, selfIno: selfIno, hashPath: editprotected.HashFile,
-		configEditor: configEditor}
+	cs := &controlServer{uc: uc, ln: ln, selfDev: selfDev, selfIno: selfIno, configEditor: configEditor}
 	go cs.acceptLoop()
 	log.Infof("daemon: edit-protected control socket ready at %s", editprotected.ControlSocket)
 	return cs, nil
@@ -322,8 +325,8 @@ func (cs *controlServer) handle(conn net.Conn) {
 	cs.serveRequest(conn, reader)
 }
 
-// serveRequest is phase 2: SELECT or FORWARD (a grant session), or CONFIG; the client has been
-// navigating a picker.
+// serveRequest is phase 2: SELECT or FORWARD (a grant session), CONFIG or PASSWORD; the client has
+// been navigating a picker.
 func (cs *controlServer) serveRequest(conn net.Conn, reader *bufio.Reader) {
 	_ = conn.SetDeadline(time.Now().Add(controlSelectTimeout))
 	req, err := readGrantRequest(reader)
@@ -334,6 +337,10 @@ func (cs *controlServer) serveRequest(conn net.Conn, reader *bufio.Reader) {
 	}
 	if req.config {
 		cs.runConfigEdit(conn, reader)
+		return
+	}
+	if req.password != "" {
+		cs.changePassword(conn, req.password)
 		return
 	}
 
@@ -504,6 +511,8 @@ type grantRequest struct {
 	timeout  time.Duration
 	// config: CONFIG, an edit of daemon.conf (runConfigEdit), not a grant.
 	config bool
+	// password: PASSWORD's new password (changePassword), not a grant.
+	password string
 }
 
 type forwardRequest struct {
@@ -526,8 +535,8 @@ func (r *grantRequest) label() string {
 	return r.resource
 }
 
-// readGrantRequest parses an optional "TIMEOUT <seconds>" line, then "SELECT <resource-path>" or a
-// FORWARD block.
+// readGrantRequest parses an optional "TIMEOUT <seconds>" line, then "SELECT <resource-path>", a
+// FORWARD block, CONFIG or PASSWORD.
 func readGrantRequest(reader *bufio.Reader) (*grantRequest, error) {
 	req := &grantRequest{timeout: editprotected.SessionTimeoutDefault}
 	line, err := reader.ReadString('\n')
@@ -546,12 +555,11 @@ func readGrantRequest(reader *bufio.Reader) (*grantRequest, error) {
 	}
 	fields := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 2)
 	switch fields[0] {
-	case ctrlConfig:
+	case ctrlConfig, ctrlPassword:
 		if len(fields) != 1 {
-			return nil, fmt.Errorf("expected bare %q", ctrlConfig)
+			return nil, fmt.Errorf("expected bare %q", fields[0])
 		}
-		req.config = true
-		return req, nil
+		return req, readBareRequest(reader, fields[0], req)
 	case ctrlSelect:
 		if len(fields) != 2 || strings.TrimSpace(fields[1]) == "" {
 			return nil, fmt.Errorf("expected %q <resource-path>", ctrlSelect)
@@ -567,7 +575,23 @@ func readGrantRequest(reader *bufio.Reader) (*grantRequest, error) {
 		}
 		return req, nil
 	}
-	return nil, fmt.Errorf("expected %q, %q or %q", ctrlSelect, ctrlForward, ctrlConfig)
+	return nil, fmt.Errorf("expected %q, %q, %q or %q", ctrlSelect, ctrlForward, ctrlConfig, ctrlPassword)
+}
+
+// readBareRequest fills req for CONFIG, or for PASSWORD from the new password's line.
+func readBareRequest(reader *bufio.Reader, cmd string, req *grantRequest) error {
+	if cmd == ctrlConfig {
+		req.config = true
+		return nil
+	}
+	pw, err := reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if req.password = strings.TrimRight(pw, "\r\n"); req.password == "" {
+		return errors.New("empty password")
+	}
+	return nil
 }
 
 func readForwardRequest(reader *bufio.Reader, header string) (*forwardRequest, error) {
@@ -702,19 +726,30 @@ func (cs *controlServer) activate(req *grantRequest, revoke func() error,
 	return session, nil
 }
 
+// checkPassword draws on the persistent guess budget the CLI shares (editprotected.CheckPassword),
+// on top of this socket's own lockout: restarting the daemon doesn't reset it.
 func (cs *controlServer) checkPassword(password string) error {
-	encoded, err := editprotected.LoadHashFile()
+	return editprotected.CheckPassword(password)
+}
+
+// changePassword stores the hash of next, sent by a peer that just proved the current password.
+// The strength floor is enforced here, not trusted from the client.
+func (cs *controlServer) changePassword(conn net.Conn, next string) {
+	err := editprotected.ValidatePassword(next)
+	var hashed string
+	if err == nil {
+		hashed, err = editprotected.Hash(next, editprotected.OriginCLI)
+	}
+	if err == nil {
+		err = editprotected.StoreHash(hashed)
+	}
 	if err != nil {
-		return fmt.Errorf("reading the edit-protected password file: %w", err)
+		_ = cs.reply(conn, false, err.Error())
+		log.Warnf("daemon: control: password change refused: %v", err)
+		return
 	}
-	ok, err := editprotected.Verify(encoded, password)
-	if err != nil {
-		return fmt.Errorf("verifying the password: %w", err)
-	}
-	if !ok {
-		return errors.New("authentication failed")
-	}
-	return nil
+	_ = cs.reply(conn, true, "")
+	log.Warn("daemon: control: edit-protected password changed")
 }
 
 func (cs *controlServer) recordFailure() {

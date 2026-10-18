@@ -7,7 +7,6 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -72,7 +71,7 @@ func (e *policyEditor) layout(side fyne.CanvasObject) fyne.CanvasObject {
 	footer.inset = 10
 	var right fyne.CanvasObject
 	if side != nil {
-		scroll := container.NewVScroll(side)
+		scroll := newFadeVScroll(side)
 		scroll.SetMinSize(fyne.NewSize(sideWidth, 0))
 		right = scroll
 	}
@@ -151,7 +150,7 @@ func confirmWarnings(s *shell, title string, warnings []string, ok func()) {
 	for _, w := range warnings {
 		msg += "• " + w + "\n"
 	}
-	dialog.ShowConfirm(title, msg+"\nApply anyway?", func(yes bool) {
+	showConfirm(title, msg+"\nApply anyway?", func(yes bool) {
 		if yes {
 			ok()
 		}

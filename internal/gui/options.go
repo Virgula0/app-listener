@@ -17,7 +17,7 @@ type InstallMode int
 
 const (
 	InstallWizard InstallMode = iota
-	InstallUpdateCatalog
+	InstallRefreshCatalog
 	InstallDiffCatalog
 	InstallRestoreBackups
 	InstallDeleteBackups

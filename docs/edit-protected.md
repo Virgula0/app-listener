@@ -5,9 +5,8 @@ is the supported way to change a protected file, to give another program tempora
 change the daemon's own config.
 
 ```bash
-sudo app-listener edit-protected                        # live if a password is set and the daemon runs, else offline
-sudo app-listener edit-protected --set-password         # set or rotate the password
-sudo app-listener edit-protected --clear-password       # remove it (disables live mode)
+sudo app-listener edit-protected                        # live if the daemon runs, else offline
+sudo app-listener edit-protected --set-password         # change the password (asks the current one)
 sudo app-listener edit-protected --forward -w <bin> [-e EVENTS]   # temporary access for another binary
 sudo app-listener edit-protected --timeout-session 10m  # revoke a live session after 10 idle minutes
 sudo app-listener edit-protected --edit-config          # edit the running daemon.conf; saving reloads it
@@ -30,10 +29,10 @@ other flag, and asks the daemon for nothing the modes above can't.
 
 The mode is chosen automatically.
 
-- **Offline** (default): refused while the daemon runs. Re-scans the catalog, unlocks one vault
-  with the master key, lets you edit, and locks it again on exit. A vault never stays open.
-- **Live**: when an edit-protected password was chosen during `sudo app-listener install` **and**
-  the daemon is running. Nothing is stopped and the fscrypt vaults are never touched:
+- **Offline**: when the daemon is stopped. Re-scans the catalog, unlocks one vault with the master
+  key, lets you edit, and locks it again on exit. A vault never stays open.
+- **Live**: when the daemon is running with the edit-protected password chosen during
+  `sudo app-listener install`. Nothing is stopped and the fscrypt vaults are never touched:
   1. you enter the password, **first**;
   2. only then does the daemon return the list of guarded directories to pick from;
   3. it briefly grants write access to the one you pick;
@@ -42,19 +41,27 @@ The mode is chosen automatically.
 An unauthenticated caller learns **nothing** about which directories are protected. Grants are
 one at a time and are revoked on disconnect, on a SIGHUP reload, or after `--timeout-session`
 (default `30m`, up to `24h`; e.g. `10m`, `45s`) without activity. Every editor keypress resets
-that timer. The control socket locks out after 5 failed attempts.
+that timer. 5 wrong passwords lock every password check for a minute (see below).
 
 ### The password and the control socket
 
 The password is **separate from the fscrypt master key**: it only authenticates `edit-protected`.
-Its PBKDF2 hash is stored at `/etc/app-listener/edit-auth.hash` (`0600` root), guarded by the
-running daemon like `fscrypt.key` (readable and writable only by the app-listener binary).
+The installer requires one. Its PBKDF2 hash is stored in the `edit_auth` table of
+`/etc/app-listener/binaries.db` (`0600` root). The running daemon seals that database and its
+journal like `fscrypt.key`: only the app-listener binary can read or write them. An
+`edit-auth.hash` file left by an older release is imported on the daemon's next start (only when
+the database has no password yet) and removed.
 
-When that file exists, the daemon opens `/run/app-listener-daemon.control` (`0600`). It accepts
-only root peers whose executable is the app-listener binary itself.
+With a password configured, the daemon opens `/run/app-listener-daemon.control` (`0600`). It
+accepts only root peers whose executable is the app-listener binary itself.
 
-`--set-password` is refused if the password was set at install time; re-run `install` to rotate
-that one.
+`--set-password` changes the password; it can't be removed. It asks the current password first:
+with the daemon running, the daemon checks it (`AUTH`) and stores the new one itself; with the
+daemon stopped, it is checked locally. Every check, the daemon's and the local one, draws on the
+same budget kept in the database: 5 wrong passwords lock all of them for a minute, and restarting
+the daemon doesn't reset it. Re-running `install` (daemon stopped) offers to replace a forgotten
+password. An install older than the mandatory password has none: `--set-password` sets the first
+one with the daemon stopped (it refuses while the daemon runs; `install` is the other way).
 
 ### Non-interactive writes
 
