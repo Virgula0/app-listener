@@ -236,6 +236,9 @@ func pickBinaries(rec *recorder.Recording) ([]*recorder.Binary, error) {
 		if b.GeneralTool {
 			label += "  [general tool]"
 		}
+		if b.ShellHelper {
+			label += "  [shell prompt/hook]"
+		}
 		cands = append(cands, b)
 		choices = append(choices, wizard.Choice{Label: label, Selected: b.Suggested})
 	}

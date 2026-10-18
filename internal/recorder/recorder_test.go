@@ -495,3 +495,16 @@ func TestProgressNamesMulticallApplets(t *testing.T) {
 		t.Fatalf("%+v", p)
 	}
 }
+
+func TestShellHelpersStartDeselected(t *testing.T) {
+	for line, want := range map[string]bool{
+		"/usr/bin/starship": true, "/home/u/.cache/gitstatus/gitstatusd-linux-x86_64": true,
+		"/usr/bin/zoxide": true, "/usr/bin/ls": false, "/usr/bin/starshipd": false,
+	} {
+		b := &Binary{Line: line, Exe: line}
+		finishBinary(b, exeVerdict{placed: true})
+		if b.ShellHelper != want || b.Suggested == want {
+			t.Errorf("%s: ShellHelper=%v Suggested=%v", line, b.ShellHelper, b.Suggested)
+		}
+	}
+}

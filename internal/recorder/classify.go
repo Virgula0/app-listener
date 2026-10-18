@@ -48,6 +48,7 @@ type Binary struct {
 	Suggested    bool
 	SystemPlaced bool
 	GeneralTool  bool
+	ShellHelper  bool
 	// Libs are the code mappings an allow_lib would have to cover (Need), or that can't be
 	// proposed (Problem); system and guarded-tree libraries are only counted (TrustedLibs).
 	Libs        []Lib
@@ -62,6 +63,26 @@ type Lib struct {
 	Path    string
 	Why     string
 	Problem string
+}
+
+// shellHelpers run from the shell's prompt or cd hooks in whatever directory it is in, so they show
+// up whenever a recorded path is the cwd. Matched on the basename (or a `name-` prefix, e.g.
+// gitstatusd-linux-x86_64); it only clears a default selection, never admits anything.
+var shellHelpers = []string{
+	"starship", "oh-my-posh", "gitstatusd", "direnv", "zoxide", "atuin", "mcfly", "mise", "rtx",
+	"fzf", "carapace",
+}
+
+func isShellHelper(paths ...string) bool {
+	for _, p := range paths {
+		base := strings.TrimRight(filepath.Base(p), "0123456789.")
+		for _, h := range shellHelpers {
+			if base == h || strings.HasPrefix(base, h+"-") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // worldWritableRoots never hold a library or executable worth proposing: anyone can plant there.
@@ -255,12 +276,13 @@ func newBinary(exe string, group []RawAccessor, v exeVerdict, targets []Target, 
 }
 
 // finishBinary adds the review notes and the default selection: only a root-placed executable that
-// isn't a general tool starts selected.
+// isn't a general tool or a shell helper starts selected.
 func finishBinary(b *Binary, v exeVerdict) {
 	if !b.Admissible() {
 		return
 	}
 	b.GeneralTool = install.ResolvesToGeneralTool(b.Line)
+	b.ShellHelper = !b.GeneralTool && isShellHelper(b.Line, b.Exe)
 	if !v.placed {
 		b.Notes = append(b.Notes, fmt.Sprintf("not root-placed (owner uid %d): its owner, or malware running "+
 			"as them, could have put it there; once whitelisted the daemon write-protects it", v.owner))
@@ -269,10 +291,14 @@ func finishBinary(b *Binary, v exeVerdict) {
 		b.Notes = append(b.Notes, "a general tool (interpreter, shell, copier): whitelisting it lets every "+
 			"script or command run through it reach the path")
 	}
+	if b.ShellHelper {
+		b.Notes = append(b.Notes, "a shell prompt or hook: it runs in whatever directory the shell is in, "+
+			"so it likely touched the path only because the shell was there")
+	}
 	if len(b.UIDs) > 1 {
 		b.Notes = append(b.Notes, fmt.Sprintf("ran as %d different users", len(b.UIDs)))
 	}
-	b.Suggested = v.placed && !b.GeneralTool
+	b.Suggested = v.placed && !b.GeneralTool && !b.ShellHelper
 }
 
 // maskFor is the least-privilege event list for what was observed: listing a directory needs READ

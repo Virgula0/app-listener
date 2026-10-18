@@ -158,7 +158,9 @@ are checked only after the password is accepted.
    accesses. Use the paths now the way you normally do: run the tools, start the apps.
 2. **Review.** Each program that touched the paths is listed with its operations, the paths, the
    users it ran as and its notes. Root-placed programs are preselected; a program you placed
-   yourself, or a general tool (a shell, an interpreter, `cat`), is listed but not preselected.
+   yourself, a general tool (a shell, an interpreter, `cat`), or a shell prompt or hook that runs
+   in whatever directory you are in (`starship`, `direnv`, `zoxide`, `atuin`, `fzf`, ...) is listed
+   but not preselected.
    Then the libraries those programs loaded from places the trust guard doesn't already accept;
    none is preselected (each becomes an `allow_lib` line). Then whether to restrict each program
    to the operations it was seen doing, and, per path, whether to encrypt it first.
