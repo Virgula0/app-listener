@@ -120,3 +120,91 @@ func (s *guardUnitTest) TestSetBinariesRefusedAfterStop() {
 		GuardResInodeKey{ResId: slot, Ino: GuardInodeKey{Dev: dev, Ino: ino}}, &action),
 		"a refused SetBinaries must leave no row in the released slot")
 }
+
+// appendByte changes path's content (and so its hash) while keeping it a runnable ELF.
+func appendByte(s *guardUnitTest, path string) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	s.Require().NoError(err)
+	_, err = f.Write([]byte{0})
+	s.Require().NoError(err)
+	s.Require().NoError(f.Close())
+}
+
+func (s *guardUnitTest) newBlacklist(root string, binaries []BinaryEntry) *Guard {
+	g, err := NewGuard(root, ModeBlacklist, binaries, true, 0, WithEagerPopulate())
+	s.Require().NoError(err)
+	s.Require().NoError(g.Start())
+	return g
+}
+
+// Re-adding a changed binary diffs as added + removed for one path: the remove must not delete
+// the block row the add just wrote.
+func (s *guardUnitTest) TestSetBinariesBlacklistReAddChanged() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+	for _, replace := range []bool{false, true} {
+		root, seed := s.seededRoot()
+		a, _ := s.policyTools()
+		g := s.newBlacklist(root, []BinaryEntry{a})
+		s.requireAccess(seed, map[string]bool{a.Path: false})
+
+		if replace {
+			next := a.Path + ".new"
+			s.Require().NoError(copySelf(next))
+			appendByte(s, next)
+			s.Require().NoError(os.Rename(next, a.Path))
+		} else {
+			appendByte(s, a.Path)
+		}
+		changed, err := ComputeBinaryEntry(a.Path)
+		s.Require().NoError(err)
+		s.Require().NotEqual(a.Hash, changed.Hash)
+
+		s.Require().NoError(g.SetBinaries([]BinaryEntry{changed}), "replace=%v", replace)
+		s.requireAccess(seed, map[string]bool{a.Path: false})
+		g.Stop()
+	}
+}
+
+func (s *guardUnitTest) sharedInodePaths(a BinaryEntry) map[string]BinaryEntry {
+	sym, hard := a.Path+".sym", a.Path+".hard"
+	s.Require().NoError(os.Symlink(a.Path, sym))
+	s.Require().NoError(os.Link(a.Path, hard))
+	s.T().Cleanup(func() { os.Remove(sym); os.Remove(hard) })
+	out := make(map[string]BinaryEntry, 2)
+	for kind, p := range map[string]string{"symlink": sym, "hardlink": hard} {
+		e, err := ComputeBinaryEntry(p)
+		s.Require().NoError(err)
+		out[kind] = e
+	}
+	return out
+}
+
+// Two listed paths to one inode share its row: dropping one must leave the other enforced.
+func (s *guardUnitTest) TestSetBinariesSharedInodeRemoveOne() {
+	if os.Getuid() != 0 {
+		s.T().Skip("Skipping BPF test: requires root")
+	}
+	for _, mode := range []Mode{ModeBlacklist, ModeWhitelist} {
+		a, _ := s.policyTools()
+		for kind, link := range s.sharedInodePaths(a) {
+			for _, keepLink := range []bool{false, true} {
+				root, seed := s.seededRoot()
+				var g *Guard
+				if mode == ModeBlacklist {
+					g = s.newBlacklist(root, []BinaryEntry{a, link})
+				} else {
+					g = s.newGuardedTree(root, []BinaryEntry{a, link}, nil)
+				}
+				remain := a
+				if keepLink {
+					remain = link
+				}
+				s.Require().NoError(g.SetBinaries([]BinaryEntry{remain}), "%s %s", modeString(mode), kind)
+				s.requireAccess(seed, map[string]bool{remain.Path: mode == ModeWhitelist})
+				g.Stop()
+			}
+		}
+	}
+}

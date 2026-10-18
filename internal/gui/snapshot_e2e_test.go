@@ -183,7 +183,14 @@ func (f *snapEngines) engines() workbench.FileEngines {
 			f.guards = append(f.guards, ch)
 			return &snapGuard{ch: ch}, nil
 		},
+		Hash: func(p string) (ebpf.BinaryEntry, error) { return ebpf.EntryWithHash(p, snapFileHashes[p]), nil },
 	}
+}
+
+// snapFileHashes are the whitelisted entries' hashes the e2e pages apply.
+var snapFileHashes = map[string][32]byte{
+	"/usr/bin/ssh":       {0x5c, 0x1e, 0x09},
+	"/usr/bin/ssh-agent": {0xab, 0xcd, 0x12},
 }
 
 // fillFiles adds two targets with a whitelist and a little traffic.

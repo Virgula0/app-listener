@@ -69,6 +69,7 @@ type FileGuard interface {
 type FileEngines struct {
 	NewMonitor func(t ebpf.Target, recursive bool, depth int) (repository.MonitorRepository, error)
 	NewGuard   func(path string, mode guard.Mode, bins []ebpf.BinaryEntry, recursive bool, depth int) (FileGuard, error)
+	Hash       func(path string) (ebpf.BinaryEntry, error)
 }
 
 // Files is the Files workspace: several targets side by side, each with its own monitor and guard.
@@ -306,7 +307,8 @@ func (t *FileTarget) ApplyLeavesGap(p Policy) bool {
 // (Guard.SetBinaries). Turning on: a fresh guard. Mode change: from a blacklist the new guard is
 // up before the old one goes (no gap); from a whitelist the old one must go first (ApplyLeavesGap).
 // On error the previous guard keeps running, except after a gap step, where the target is left
-// unguarded and LastError says so.
+// unguarded and LastError says so. A whitelist binary changed since it was added is refused
+// (verifyHashes); a blacklist blocks whatever the path names now, so it needs no check.
 func (t *FileTarget) Apply(p Policy) error {
 	t.policyMu.Lock()
 	defer t.policyMu.Unlock()
@@ -321,7 +323,11 @@ func (t *FileTarget) Apply(p Policy) error {
 	t.mu.Unlock()
 
 	var err error
+	if p.Mode == GuardWhitelist {
+		err = verifyHashes(t.w.engines.Hash, p.Binaries)
+	}
 	switch {
+	case err != nil:
 	case p.Mode == GuardOff:
 		t.swapGuard(nil, p)
 	case cur.Mode == p.Mode:

@@ -111,6 +111,12 @@ How Apply changes a running guard:
 | Blacklist | Whitelist or Off | The new guard (if any) starts before the old one stops. |
 | Whitelist | Blacklist or Off | The whitelist stops first, so the path is briefly unprotected. The dialog warns before applying. |
 
+Before a whitelist is applied, every listed executable is hashed again; one whose content changed
+since it was added is refused ("changed since it was added: remove it and add it again") and the
+running guard stays as it was. A blacklist is not checked: it blocks whatever file the path names
+when Apply runs. An executable listed under two paths (a symlink or a hard link to the same file)
+stays allowed or blocked until both are removed.
+
 If a new guard fails to start, the target is left unguarded and the error is shown under its
 header. Events caused by the GUI itself are not listed. Removing a target, or closing the window,
 stops its guard and then its monitor.

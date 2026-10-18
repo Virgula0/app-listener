@@ -50,7 +50,10 @@ The installer requires one. Its PBKDF2 hash is stored in the `edit_auth` table o
 `/etc/app-listener/binaries.db` (`0600` root). The running daemon seals that database and its
 journal like `fscrypt.key`: only the app-listener binary can read or write them. An
 `edit-auth.hash` file left by an older release is imported on the daemon's next start (only when
-the database has no password yet) and removed.
+the database has no password yet) and removed. It is removed even when it can't be imported (a
+malformed record, an unreadable database), since nothing seals it: the daemon then logs a
+CRITICAL error, and with no password left you set one with the daemon stopped
+(`edit-protected --set-password`).
 
 With a password configured, the daemon opens `/run/app-listener-daemon.control` (`0600`). It
 accepts only root peers whose executable is the app-listener binary itself.

@@ -210,13 +210,52 @@ func TestMigrateLegacyHashRefusesOddFiles(t *testing.T) {
 	if err := os.WriteFile(legacyHashPath, []byte("garbage"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := MigrateLegacyHash(); err == nil {
-		t.Fatal("a malformed legacy record was accepted")
+	err := MigrateLegacyHash()
+	if err == nil || !strings.Contains(err.Error(), "--set-password") {
+		t.Fatalf("a malformed legacy record: err = %v, want a refusal that says to set a password", err)
 	}
-	if _, err := os.Lstat(legacyHashPath); err != nil {
-		t.Fatalf("a malformed legacy file must stay for the operator to inspect: %v", err)
+	if _, err := os.Lstat(legacyHashPath); !os.IsNotExist(err) {
+		t.Fatalf("a refused legacy file must not stay readable: %v", err)
 	}
 	if ok, _ := HashConfigured(); ok {
 		t.Fatal("a refused legacy file configured a password")
+	}
+}
+
+// The legacy file is unsealed: a failed import still removes it.
+func TestMigrateLegacyHashImportFailureRemoves(t *testing.T) {
+	useTempStore(t)
+	if err := os.WriteFile(legacyHashPath, []byte(mustHash(t, "Correct-Horse-9", OriginInstall)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(ledgerPath, 0o700); err != nil { // binaries.db can't be opened
+		t.Fatal(err)
+	}
+	if err := MigrateLegacyHash(); err == nil {
+		t.Fatal("want the import failure reported")
+	}
+	if _, err := os.Lstat(legacyHashPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy file left readable after a failed import: %v", err)
+	}
+}
+
+// A malformed legacy file next to a stored password is removed and leaves that password alone.
+func TestMigrateLegacyHashMalformedKeepsStored(t *testing.T) {
+	useTempStore(t)
+	cur := mustHash(t, "Correct-Horse-9", OriginCLI)
+	if err := StoreHash(cur); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyHashPath, []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateLegacyHash(); err == nil || strings.Contains(err.Error(), "--set-password") {
+		t.Fatalf("err = %v, want a refusal that keeps the stored password", err)
+	}
+	if got, _ := LoadHash(); got != cur {
+		t.Fatal("a malformed legacy file touched the stored password")
+	}
+	if _, err := os.Lstat(legacyHashPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy file left behind: %v", err)
 	}
 }

@@ -86,7 +86,7 @@ func bootstrapSelfProtectPlaceholders() {
 			"written once /etc/app-listener is self-guarded", binledger.DefaultPath, err)
 	}
 	if err := editprotected.MigrateLegacyHash(); err != nil {
-		log.Warnf("daemon: edit-protected password: %v", err)
+		log.Errorf("daemon: CRITICAL: edit-protected password: %v", err)
 	}
 	if err := ensurePinStateFilePlaceholder(); err != nil {
 		log.Warnf("daemon: self-protection: could not pre-create %s (%v) — daemon --lockdown may not be able to recover this run's generation after a crash", pinStateFile, err)

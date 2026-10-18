@@ -17,7 +17,7 @@ import (
 // "" when the existing password is kept.
 func promptEditPassword() (string, error) {
 	if err := editprotected.MigrateLegacyHash(); err != nil {
-		log.Warnf("edit-protected password: %v", err)
+		log.Errorf("edit-protected password: %v", err)
 	}
 	configured, err := editprotected.HashConfigured()
 	if err != nil {
