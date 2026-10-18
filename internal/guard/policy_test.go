@@ -186,9 +186,10 @@ func (s *guardUnitTest) TestSetBinariesSharedInodeRemoveOne() {
 	if os.Getuid() != 0 {
 		s.T().Skip("Skipping BPF test: requires root")
 	}
+	a, _ := s.policyTools()
+	links := s.sharedInodePaths(a)
 	for _, mode := range []Mode{ModeBlacklist, ModeWhitelist} {
-		a, _ := s.policyTools()
-		for kind, link := range s.sharedInodePaths(a) {
+		for kind, link := range links {
 			for _, keepLink := range []bool{false, true} {
 				root, seed := s.seededRoot()
 				var g *Guard
