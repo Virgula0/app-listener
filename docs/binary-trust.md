@@ -141,7 +141,9 @@ Refused, because their applets can't be told apart:
   is vetted;
 - **GNU coreutils built as one binary** (Fedora's `coreutils-single`, whose applets are
   `#!/usr/bin/coreutils --coreutils-prog-shebang=...` scripts);
-- a uutils path that isn't an applet's own name.
+- a uutils path that isn't an applet's own name;
+- a uutils build with no root-placed `coreutils` link beside it, in `/usr/bin` or in `/bin` (a
+  copy, say): Ubuntu's uutils only lists its applets when run under that name.
 
 Where they are refused: `guard -w/-b`, `network-guard -w/-b` and `edit-protected --forward` reject
 them; the installer and `edit-protected --edit-config` refuse a new such line; the catalog never

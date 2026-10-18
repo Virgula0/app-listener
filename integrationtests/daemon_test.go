@@ -2943,12 +2943,12 @@ func (s *IntegrationSuite) TestDaemon_TaintSet_JudgedByItsOwnResources() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
 
-	// readlink copies keep their basename: ubuntu's coreutils is one multi-call binary.
+	// GNU readlink copies: a uutils copy has no `coreutils` link to list its applets through.
 	s.exec(c, []string{"sh", "-c",
 		"mkdir -p /r1 /r2 /r3 /etc/app-listener /opt/app /opt/y /opt/pboth /opt/pone /opt/pnone" +
 			" && echo s1 > /r1/secret && echo s2 > /r2/secret && echo s3 > /r3/secret" +
 			" && cp /usr/bin/dash /opt/app/app && cp /usr/bin/dash /opt/y/y" +
-			" && for p in pboth pone pnone; do cp /usr/bin/readlink /opt/$p/readlink; done" +
+			" && for p in pboth pone pnone; do cp /usr/bin/gnureadlink /opt/$p/readlink; done" +
 			" && mkfifo /tmp/f /tmp/g"})
 	s.startDaemon(c, `[watch /r1]
 need_encryption: false
@@ -3008,7 +3008,7 @@ func (s *IntegrationSuite) TestDaemon_TaintStaysOneResourceAcrossReload() {
 	s.exec(c, []string{"sh", "-c",
 		"mkdir -p /r1 /r2 /etc/app-listener /opt/app /opt/pin /opt/pnone" +
 			" && echo s1 > /r1/secret && echo s2 > /r2/secret && cp /usr/bin/dash /opt/app/app" +
-			" && cp /usr/bin/readlink /opt/pin/readlink && cp /usr/bin/readlink /opt/pnone/readlink"})
+			" && cp /usr/bin/gnureadlink /opt/pin/readlink && cp /usr/bin/gnureadlink /opt/pnone/readlink"})
 	// /r2 keeps /opt/pin/readlink out of GLOBAL's intersection whitelist.
 	s.startDaemon(c, `[watch /r1]
 need_encryption: false
