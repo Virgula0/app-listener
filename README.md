@@ -43,6 +43,22 @@ kernel boot parameter), on `x86_64` and `aarch64`. See [Compatibility](docs/comp
 `sudo app-listener update` keeps it current, and `sudo app-listener uninstall` decrypts everything
 and removes the service.
 
+> [!TIP]
+> **Or install from the [desktop app](#desktop-app).** Download
+> `app-listener-gui` (`app-listener-gui-arm64` on `aarch64`) from the
+> [latest release](https://github.com/Virgula0/app-listener/releases/latest) and open its
+> **Install** page:
+>
+> ```bash
+> chmod +x app-listener-gui && sudo ./app-listener-gui --gui
+> ```
+>
+> It downloads and verifies the signed release itself, then runs the same wizard with every
+> prompt as a dialog, and installs the desktop app next to the daemon. The window you downloaded
+> by hand is not checked for you: its `.sha256` and `.sha256.sig` sit next to it in the release,
+> signed with the [release key](certificates/app-listener-release.pub). See
+> [Desktop GUI](docs/gui.md#install).
+
 ## Desktop app
 
 Prefer a window to a terminal? The `app-listener-gui` build puts every interactive mode in one
