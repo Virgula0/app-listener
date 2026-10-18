@@ -415,7 +415,11 @@ See `memory/release-promote-flow.md`. A release is a *build*, not a tag rename:
 `release.yml` cuts a `pre-*` pre-release per push to main; `promote-release.yml` rebuilds
 a stable `vX.Y.Z`. `_build-release.yml` is the reusable build job: one native leg per arch
 (`ubuntu-26.04` / `ubuntu-26.04-arm`), each running `daemon --check --verifier-only` on the
-objects it ships; any failed leg publishes nothing.
+objects it ships; any failed leg publishes nothing. Signing is its own `sign` job on a fresh
+runner, the only one with `RELEASE_SIGNING_KEY` (a `release` environment secret, gated by a
+required reviewer): never give the key to a step in a job that runs docker, Go modules or a
+third-party action, and keep the `sha256sum` + `openssl pkeyutl` output byte-identical
+(install.sh and `update` verify it).
 
 ## graphify
 

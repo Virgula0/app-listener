@@ -303,11 +303,13 @@ func (n *Network) apply(p NetPolicy) error {
 	return nil
 }
 
-// verify re-hashes every listed binary: the guard keys on whatever inode the path names when it
-// starts, so a file replaced since it was chosen must not be admitted in its place.
-func (n *Network) verify(bins []ebpf.BinaryEntry) error {
+func (n *Network) verify(bins []ebpf.BinaryEntry) error { return verifyHashes(n.engines.Hash, bins) }
+
+// verifyHashes re-hashes every listed binary: a guard keys on whatever inode the path names when
+// it applies, so a file replaced since it was chosen must not be admitted in its place.
+func verifyHashes(hash func(string) (ebpf.BinaryEntry, error), bins []ebpf.BinaryEntry) error {
 	for _, b := range bins {
-		now, err := n.engines.Hash(b.Path)
+		now, err := hash(b.Path)
 		if err != nil {
 			return err
 		}

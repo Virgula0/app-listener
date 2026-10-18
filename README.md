@@ -90,7 +90,9 @@ That is also what stops supply-chain malware: a poisoned package runs inside `no
 your build tool, none of which is on the whitelist of your secrets, so whatever it smuggles in
 reads nothing. You get the strength of mandatory access control with a policy as simple as a list
 of directories and allowed programs: no AppArmor or SELinux profiles to write, and neither is
-required.
+required. AppArmor confines the programs you wrote a profile for and leaves every other process
+unchecked; app-listener guards the directory against every process, including the ones you never
+heard of ([why not AppArmor?](docs/how-it-works.md#why-not-an-apparmor-profile)).
 
 Programs are recognized by the file they run from (its inode), so renaming a binary to `ssh` or
 faking its process name gets it nothing. When the daemon is not running, protected directories are

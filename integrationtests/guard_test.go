@@ -2438,7 +2438,8 @@ func (s *IntegrationSuite) TestGuard_SlotReuse_DoesNotInheritWhitelist() {
 }
 
 // The GUI's live policy edit (Guard.SetBinaries): rows change on the running guard, each step
-// enforced by a real exec, in both modes; a stopped guard refuses and writes nothing.
+// enforced by a real exec, in both modes; a re-added or shared-inode entry keeps its row; a
+// stopped guard refuses and writes nothing.
 func (s *IntegrationSuite) TestGuard_SetBinaries_Live() {
 	c := s.newGuardTestContainer()
 	// pooled: terminated at suite end
@@ -2446,6 +2447,8 @@ func (s *IntegrationSuite) TestGuard_SetBinaries_Live() {
 	s.runGuardTest(c, "TestSetBinariesWhitelistLive")
 	s.runGuardTest(c, "TestSetBinariesBlacklistLive")
 	s.runGuardTest(c, "TestSetBinariesRefusedAfterStop")
+	s.runGuardTest(c, "TestSetBinariesBlacklistReAddChanged")
+	s.runGuardTest(c, "TestSetBinariesSharedInodeRemoveOne")
 }
 
 // Deferred-whitelist flow (the Discord startup fix): a binary unreadable at guard-build time stays

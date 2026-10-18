@@ -263,7 +263,8 @@ func CheckPassword(pw string) error {
 
 // MigrateLegacyHash moves a LegacyHashFile record into binaries.db, then removes the file. It is
 // imported only while binaries.db holds no password: a stale file never replaces the current one.
-// A malformed record is left in place and reported (no password = live mode off).
+// The file is removed even when the import fails (malformed record, DB error): unlike binaries.db
+// it is not sealed, so any root process could read and crack it offline.
 func MigrateLegacyHash() error {
 	fi, err := os.Lstat(legacyHashPath)
 	if os.IsNotExist(err) {
@@ -275,26 +276,43 @@ func MigrateLegacyHash() error {
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file: not imported", legacyHashPath)
 	}
+	importErr := importLegacyHash()
+	if rmErr := os.Remove(legacyHashPath); rmErr != nil {
+		return errors.Join(importErr, fmt.Errorf("removing %s: %w", legacyHashPath, rmErr))
+	}
+	if importErr == nil {
+		return nil
+	}
+	if ok, _ := HashConfigured(); ok {
+		return fmt.Errorf("%w: %s removed, the password in %s stays", importErr, legacyHashPath, ledgerPath)
+	}
+	return fmt.Errorf("%w: %s removed and no edit-protected password is set: stop the daemon and "+
+		"run `app-listener edit-protected --set-password`", importErr, legacyHashPath)
+}
+
+func importLegacyHash() error {
 	data, err := os.ReadFile(legacyHashPath)
 	if err != nil {
 		return err
 	}
-	if rec := strings.TrimSpace(string(data)); rec != "" {
-		if _, err := parseHash(rec); err != nil {
-			return fmt.Errorf("%s: %w: not imported", legacyHashPath, err)
-		}
-		cur, err := LoadHash()
-		switch {
-		case errors.Is(err, ErrNoPassword):
-			if storeErr := StoreHash(rec); storeErr != nil {
-				return fmt.Errorf("importing %s: %w", legacyHashPath, storeErr)
-			}
-			log.Infof("edit-protected password imported from %s into %s", legacyHashPath, ledgerPath)
-		case err != nil:
-			return err
-		case cur != rec:
-			log.Warnf("%s differs from the password in %s: keeping the latter", legacyHashPath, ledgerPath)
-		}
+	rec := strings.TrimSpace(string(data))
+	if rec == "" {
+		return nil
 	}
-	return os.Remove(legacyHashPath)
+	if _, parseErr := parseHash(rec); parseErr != nil {
+		return fmt.Errorf("%s: %w: not imported", legacyHashPath, parseErr)
+	}
+	cur, err := LoadHash()
+	switch {
+	case errors.Is(err, ErrNoPassword):
+		if storeErr := StoreHash(rec); storeErr != nil {
+			return fmt.Errorf("importing %s: %w", legacyHashPath, storeErr)
+		}
+		log.Infof("edit-protected password imported from %s into %s", legacyHashPath, ledgerPath)
+	case err != nil:
+		return fmt.Errorf("importing %s: %w", legacyHashPath, err)
+	case cur != rec:
+		log.Warnf("%s differs from the password in %s: keeping the latter", legacyHashPath, ledgerPath)
+	}
+	return nil
 }

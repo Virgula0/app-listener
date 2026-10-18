@@ -34,7 +34,8 @@ func (g *Guard) SetBinaries(entries []BinaryEntry) error {
 	g.mu.Unlock()
 
 	if g.mode == ModeWhitelist {
-		if err := g.removeBinaries(removed); err != nil {
+		kept := slices.DeleteFunc(slices.Clone(entries), func(e BinaryEntry) bool { return slices.Contains(added, e) })
+		if err := g.removeBinaries(removed, kept); err != nil {
 			return err
 		}
 		return g.addBinaries(added)
@@ -42,7 +43,8 @@ func (g *Guard) SetBinaries(entries []BinaryEntry) error {
 	if err := g.addBinaries(added); err != nil {
 		return err
 	}
-	return g.removeBinaries(removed)
+	// After the adds: a re-added path or a second path to one inode owns the row just written.
+	return g.removeBinaries(removed, entries)
 }
 
 // diffBinaries splits next against cur by path; a same-path entry with another hash is in both.
@@ -91,19 +93,19 @@ func (g *Guard) addBinaries(added []BinaryEntry) error {
 }
 
 // removeBinaries drops every row this guard wrote for the entries' paths, superseded keys
-// included (keyPaths), then forgets them.
-func (g *Guard) removeBinaries(removed []BinaryEntry) error {
+// included (keyPaths), then forgets them. A key or canonical path one of keep still owns (same
+// path re-added, symlink or hardlink to one inode) keeps its row and bookkeeping: deleting it
+// would silently unblock (blacklist) or deny (whitelist) the kept entry.
+func (g *Guard) removeBinaries(removed, keep []BinaryEntry) error {
 	if len(removed) == 0 {
 		return nil
 	}
 	g.mu.Lock()
+	kept := g.keptLocked(keep)
 	var keys []GuardInodeKey
 	for _, b := range removed {
-		if k, ok := g.deployed[canonicalBinaryPath(b.Path)]; ok {
-			keys = append(keys, k)
-		}
-		for k, p := range g.keyPaths {
-			if p == b.Path && !slices.Contains(keys, k) {
+		for _, k := range g.entryKeysLocked(b.Path) {
+			if _, owned := kept.owners[k]; !owned && !slices.Contains(keys, k) {
 				keys = append(keys, k)
 			}
 		}
@@ -118,18 +120,69 @@ func (g *Guard) removeBinaries(removed []BinaryEntry) error {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.forgetLocked(removed, keys, kept)
+	return nil
+}
+
+type keptEntries struct {
+	owners    map[GuardInodeKey]string // key -> a kept entry's path
+	canonical map[string]bool
+	paths     map[string]bool
+}
+
+func (g *Guard) keptLocked(keep []BinaryEntry) keptEntries {
+	kept := keptEntries{
+		owners:    make(map[GuardInodeKey]string),
+		canonical: make(map[string]bool, len(keep)),
+		paths:     make(map[string]bool, len(keep)),
+	}
+	for _, e := range keep {
+		for _, k := range g.entryKeysLocked(e.Path) {
+			kept.owners[k] = e.Path
+		}
+		kept.canonical[canonicalBinaryPath(e.Path)] = true
+		kept.paths[e.Path] = true
+	}
+	return kept
+}
+
+// forgetLocked drops the bookkeeping of removed entries and their deleted keys, keeping what kept
+// still uses; a kept key last recorded under a removed path moves to its owner's.
+func (g *Guard) forgetLocked(removed []BinaryEntry, keys []GuardInodeKey, kept keptEntries) {
 	for _, b := range removed {
-		canonical := canonicalBinaryPath(b.Path)
-		delete(g.deployed, canonical)
-		delete(g.binaryVerifyStates, canonical)
+		g.binaries = slices.DeleteFunc(g.binaries, func(e BinaryEntry) bool { return e == b })
+		if kept.paths[b.Path] {
+			continue
+		}
 		delete(g.canonicalPaths, b.Path)
 		g.holdLocked(b.Path, nil)
-		g.binaries = slices.DeleteFunc(g.binaries, func(e BinaryEntry) bool { return e == b })
+		if canonical := canonicalBinaryPath(b.Path); !kept.canonical[canonical] {
+			delete(g.deployed, canonical)
+			delete(g.binaryVerifyStates, canonical)
+		}
 	}
 	for _, k := range keys {
 		delete(g.keyPaths, k)
 	}
-	return nil
+	for k, p := range kept.owners {
+		if cur, ok := g.keyPaths[k]; ok && !kept.paths[cur] {
+			g.keyPaths[k] = p
+		}
+	}
+}
+
+// entryKeysLocked is every key this guard wrote for path: the deployed one and superseded ones.
+func (g *Guard) entryKeysLocked(path string) []GuardInodeKey {
+	var keys []GuardInodeKey
+	if k, ok := g.deployed[canonicalBinaryPath(path)]; ok {
+		keys = append(keys, k)
+	}
+	for k, p := range g.keyPaths {
+		if p == path && !slices.Contains(keys, k) {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 // deleteExeRows removes k's action and mask rows for this resource (and the unattested-applet row

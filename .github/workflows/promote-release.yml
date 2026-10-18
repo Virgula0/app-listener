@@ -72,8 +72,6 @@ jobs:
     with:
       version: ${{ needs.meta.outputs.version }}
       ref: ${{ needs.meta.outputs.ref }}
-    secrets:
-      signing-key: ${{ secrets.RELEASE_SIGNING_KEY }}
 
   release:
     needs: [meta, build]

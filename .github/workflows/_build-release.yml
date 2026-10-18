@@ -2,7 +2,7 @@ name: Build & sign release assets
 
 # Reusable build core for release.yml and promote-release.yml. Checks out
 # `ref`, compiles the linux/amd64 and linux/arm64 binaries with `version`
-# embedded, then sha256s and Ed25519-signs each. Each arch builds natively on
+# embedded; a separate `sign` job then sha256s and Ed25519-signs each. Each arch builds natively on
 # its own runner: the eBPF is compiled against that runner kernel's BTF and
 # register layout, so it cannot be cross-built. Asset names (install.sh and
 # `app-listener update` pick theirs by exact name):
@@ -10,7 +10,14 @@ name: Build & sign release assets
 #          binaries' `update` looks these names up)
 #   arm64: app-listener-arm64, app-listener-gui-arm64
 # The GUI builds (make build-linux GUI=1) are best-effort and for manual
-# download only. Each arch uploads a `release-assets-<arch>` artifact.
+# download only. Each arch uploads an `unsigned-<arch>` artifact; `sign` uploads
+# them signed as `release-assets-signed`.
+#
+# The signing key never reaches a build leg: those run docker, Go modules and
+# third-party actions, any of which could read a secret from a later step on the
+# same runner. `sign` runs on a fresh runner with only GitHub's own actions, and
+# reads RELEASE_SIGNING_KEY from the `release` environment (required reviewer,
+# main / v* only), so a pushed workflow can't read it without approval.
 
 on:
   workflow_call:
@@ -23,10 +30,6 @@ on:
         description: Commit, tag or branch to build from.
         required: true
         type: string
-    secrets:
-      signing-key:
-        description: Ed25519 PEM private key (RELEASE_SIGNING_KEY).
-        required: true
 
 permissions:
   contents: read
@@ -150,21 +153,49 @@ jobs:
           SUFFIX: ${{ matrix.suffix }}
         run: sudo "dist/app-listener$SUFFIX" daemon --check --verifier-only
 
+      - name: Upload unsigned binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: build
+    runs-on: ubuntu-26.04
+    environment: release
+    steps:
+      # Only the public key: nothing from the checked-out ref is executed here.
+      - name: Check out the release public key
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          sparse-checkout: certificates
+          sparse-checkout-cone-mode: true
+
+      - name: Download unsigned binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: unsigned-*
+          merge-multiple: true
+          path: dist
+
       - name: Checksum and Ed25519-sign the binaries
         env:
-          SIGNING_KEY: ${{ secrets.signing-key }}
-          SUFFIX: ${{ matrix.suffix }}
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${SIGNING_KEY:-}" ]; then
-            echo "::error::RELEASE_SIGNING_KEY is not set"
+            echo "::error::RELEASE_SIGNING_KEY is not set in the release environment"
             exit 1
           fi
           key="$RUNNER_TEMP/app-listener-signing-key.pem"
-          printf '%s\n' "$SIGNING_KEY" > "$key"
-          chmod 600 "$key"
+          trap 'rm -f "$key"' EXIT
+          ( umask 077 && printf '%s\n' "$SIGNING_KEY" > "$key" )
           # sha256sum records the asset name; `update` checks it against the name it fetched.
-          for b in "app-listener$SUFFIX" "app-listener-gui$SUFFIX"; do
+          for b in app-listener app-listener-gui app-listener-arm64 app-listener-gui-arm64; do
             [ -f "dist/$b" ] || continue
             ( cd dist && sha256sum "$b" > "$b.sha256" )
             openssl pkeyutl -sign -rawin -inkey "$key" \
@@ -173,13 +204,12 @@ jobs:
               -inkey certificates/app-listener-release.pub \
               -in "dist/$b.sha256" -sigfile "dist/$b.sha256.sig"
           done
-          rm -f "$key"
           ls -la dist
 
       - name: Upload release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-assets-${{ matrix.arch }}
+          name: release-assets-signed
           path: dist
           if-no-files-found: error
           retention-days: 1

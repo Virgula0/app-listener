@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -68,6 +69,7 @@ type fakeEngines struct {
 	guards   []*fakeGuard
 	monitor  *fakeMonitor
 	guardErr error
+	hashes   map[string][32]byte // what Hash reads now, per path
 }
 
 func (f *fakeEngines) engines() FileEngines {
@@ -87,12 +89,19 @@ func (f *fakeEngines) engines() FileEngines {
 			f.guards = append(f.guards, g)
 			return g, nil
 		},
+		Hash: func(p string) (ebpf.BinaryEntry, error) {
+			h, ok := f.hashes[p]
+			if !ok {
+				return ebpf.BinaryEntry{}, os.ErrNotExist
+			}
+			return ebpf.BinaryEntry{Path: p, Hash: h}, nil
+		},
 	}
 }
 
 func newTestTarget(t *testing.T) (*FileTarget, *fakeEngines) {
 	t.Helper()
-	fe := &fakeEngines{j: &journal{}}
+	fe := &fakeEngines{j: &journal{}, hashes: map[string][32]byte{binA.Path: binA.Hash}}
 	w := NewFiles(fe.engines())
 	t.Cleanup(w.Close)
 	tg, err := w.Add(FileSpec{Path: t.TempDir(), Recursive: true})
@@ -241,7 +250,7 @@ func TestApplyOffStopsGuard(t *testing.T) {
 }
 
 func TestRemoveStopsGuardThenMonitor(t *testing.T) {
-	fe := &fakeEngines{j: &journal{}}
+	fe := &fakeEngines{j: &journal{}, hashes: map[string][32]byte{binA.Path: binA.Hash}}
 	w := NewFiles(fe.engines())
 	tg, err := w.Add(FileSpec{Path: t.TempDir()})
 	if err != nil {
@@ -264,7 +273,7 @@ func TestRemoveStopsGuardThenMonitor(t *testing.T) {
 }
 
 func TestAddRefusesOverlap(t *testing.T) {
-	fe := &fakeEngines{j: &journal{}}
+	fe := &fakeEngines{j: &journal{}, hashes: map[string][32]byte{binA.Path: binA.Hash}}
 	w := NewFiles(fe.engines())
 	defer w.Close()
 	root := t.TempDir()
@@ -379,5 +388,39 @@ func TestEntryForRefusesReplacedPath(t *testing.T) {
 	}
 	if _, err := EntryFor(Exe{Path: p}); !errors.Is(err, ErrExeUnknown) {
 		t.Fatalf("an unresolved exe must be ErrExeUnknown, got %v", err)
+	}
+}
+
+// A whitelist binary replaced since it was added must not be admitted in its place, on a fresh
+// guard or an in-place edit; the running guard and its policy stay.
+func TestApplyWhitelistRefusesChangedBinary(t *testing.T) {
+	tg, fe := newTestTarget(t)
+	fe.hashes[binA.Path] = [32]byte{9}
+	mark := len(fe.j.entries())
+	err := tg.Apply(Policy{Mode: GuardWhitelist, Binaries: []ebpf.BinaryEntry{binA}})
+	if err == nil || !strings.Contains(err.Error(), "changed since it was added") {
+		t.Fatalf("err = %v, want the changed-binary refusal", err)
+	}
+	if got := since(fe, mark); len(got) != 0 {
+		t.Fatalf("no guard may be built for a changed binary, got %q", got)
+	}
+
+	fe.hashes[binA.Path] = binA.Hash
+	if err := tg.Apply(Policy{Mode: GuardWhitelist}); err != nil {
+		t.Fatal(err)
+	}
+	fe.hashes[binA.Path] = [32]byte{9}
+	mark = len(fe.j.entries())
+	if err := tg.Apply(Policy{Mode: GuardWhitelist, Binaries: []ebpf.BinaryEntry{binA}}); err == nil {
+		t.Fatal("an in-place edit must refuse a changed binary too")
+	}
+	if got := since(fe, mark); len(got) != 0 {
+		t.Fatalf("calls = %q, want none", got)
+	}
+	if p := tg.Policy(); p.Mode != GuardWhitelist || len(p.Binaries) != 0 || tg.LastError() == "" {
+		t.Fatalf("policy = %+v, lastErr = %q: want the running empty whitelist and the error", p, tg.LastError())
+	}
+	if err := tg.Apply(Policy{Mode: GuardBlacklist, Binaries: []ebpf.BinaryEntry{binA}}); err != nil {
+		t.Fatalf("a blacklist blocks whatever the path names now: %v", err)
 	}
 }

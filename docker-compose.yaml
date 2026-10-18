@@ -7,8 +7,11 @@ services:
     stdin_open: true
     tty: true
     restart: unless-stopped
-    cap_add:
-      - BPF
-      - SYS_ADMIN
+    # Loading eBPF and attaching kprobes/LSM hooks needs the host's real root: this only works
+    # under rootful Docker (`make deploy` refuses rootless), as the integration suite does.
+    privileged: true
     volumes:
       - ${MONITOR_DIR:-./data}:/data:ro
+      # Host securityfs, so CheckBPFLSM reads the real LSM list: the guard modes then refuse to
+      # start on a kernel without BPF-LSM instead of needing APPLISTENER_ASSUME_BPF_LSM.
+      - /sys/kernel/security:/sys/kernel/security:ro

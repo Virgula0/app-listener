@@ -19,6 +19,38 @@ alongside them when they are active.
 Applied per directory, this segregates applications from each other: each app's config and
 secrets are readable by that app only, not by the other programs running as the same user.
 
+### Why not an AppArmor profile?
+
+AppArmor is built to confine a **program**: a profile attaches to an executable and lists what it
+may touch. A process with no profile is `unconfined` and AppArmor never checks it. That is the
+right tool to sandbox a browser, but it can't say "nobody but `ssh` reads `~/.ssh`": the info
+stealer you are worried about is exactly the program nobody wrote a profile for.
+
+app-listener puts the policy on the **directory** instead. Every process that touches it is
+checked, and only the listed programs get through. Anything unknown is denied by default.
+
+You can bend AppArmor into that shape, but only by confining every process on the system: load a
+profile for init early in boot that allows everything except the secret directories, let every
+child inherit it, and switch the allowed programs to a permissive profile. That policy is
+fragile (a mistake in init's profile can leave the machine unbootable), every new allowed app is
+another edit, and it still leaves these gaps:
+
+| | AppArmor | app-listener |
+|---|---|---|
+| Who the policy is for | The confined program | The protected directory |
+| Processes nobody listed | Unconfined, so allowed | Denied |
+| How a program is recognized | Its exec **path** | Its executable's **inode** (`dev:ino`) |
+| Allowed binary in a user-writable path (`~/.local/bin`, an app's own dir) | Whatever file sits at that path gets the permissive profile, so overwriting it takes it over | A replaced file is a new inode, denied until it is trusted ([Binary trust](binary-trust.md#binary-replacement)) |
+| Data while the protection is off | Plain files on disk | Encrypted with fscrypt, unlocked only after the guard attaches |
+| Seeing what touches the directory before you lock it | Complain mode, per profile | `monitor`, per directory |
+
+The path-based identity matters most here: many of the programs that hold secrets (AI agent CLIs,
+Electron apps, self-updating tools) live in paths the user can write, which is also where malware
+running as that user can write.
+
+The two are not exclusive. Both are LSMs and stack: an AppArmor deny and an app-listener deny both
+apply, so existing AppArmor profiles keep working next to the daemon.
+
 ## eBPF at three levels
 
 The eBPF programs are compiled and embedded in the single `app-listener` binary. Each mode

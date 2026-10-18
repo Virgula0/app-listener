@@ -22,6 +22,7 @@ func RealFileEngines() FileEngines {
 			// walk would be denied by the whitelist itself).
 			return guard.NewGuard(path, mode, bins, recursive, depth, guard.WithEagerPopulate())
 		},
+		Hash: ebpf.ComputeBinaryEntry,
 	}
 }
 
