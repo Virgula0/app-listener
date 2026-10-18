@@ -21,7 +21,9 @@ type navItem struct {
 	selected bool
 	hovered  bool
 	compact  bool
-	onTap    func()
+	// badge is a dot next to the label (on the icon when compact): something new on that page.
+	badge bool
+	onTap func()
 }
 
 func newNavItem(iconName, label string, onTap func()) *navItem {
@@ -33,6 +35,13 @@ func newNavItem(iconName, label string, onTap func()) *navItem {
 func (n *navItem) setSelected(on bool) {
 	if n.selected != on {
 		n.selected = on
+		n.Refresh()
+	}
+}
+
+func (n *navItem) setBadge(on bool) {
+	if n.badge != on {
+		n.badge = on
 		n.Refresh()
 	}
 }
@@ -62,6 +71,7 @@ func (n *navItem) CreateRenderer() fyne.WidgetRenderer {
 		bar: canvas.NewRectangle(color.Transparent),
 		img: canvas.NewImageFromResource(nil),
 		txt: canvas.NewText(n.label, color.Transparent),
+		dot: canvas.NewCircle(color.Transparent),
 	}
 	r.img.FillMode = canvas.ImageFillContain
 	r.Refresh()
@@ -73,20 +83,24 @@ type navItemRenderer struct {
 	bg, bar *canvas.Rectangle
 	img     *canvas.Image
 	txt     *canvas.Text
+	dot     *canvas.Circle
 }
 
-const navIconSize, navHeight = 20, 40
+const navIconSize, navHeight, navDot = 20, 40, 8
 
 func (r *navItemRenderer) Layout(size fyne.Size) {
 	r.bg.Resize(size)
 	r.bar.Move(fyne.NewPos(0, size.Height*0.25))
 	r.bar.Resize(fyne.NewSize(3, size.Height*0.5))
 	pad := theme.Padding() * 2
+	r.dot.Resize(fyne.NewSquareSize(navDot))
 	if r.n.compact {
 		r.img.Move(fyne.NewPos((size.Width-navIconSize)/2, (size.Height-navIconSize)/2))
 		r.img.Resize(fyne.NewSquareSize(navIconSize))
+		r.dot.Move(fyne.NewPos((size.Width+navIconSize)/2-navDot/2, (size.Height-navIconSize)/2-navDot/2))
 		return
 	}
+	r.dot.Move(fyne.NewPos(size.Width-pad-navDot, (size.Height-navDot)/2))
 	r.img.Move(fyne.NewPos(pad+4, (size.Height-navIconSize)/2))
 	r.img.Resize(fyne.NewSquareSize(navIconSize))
 	ts := r.txt.MinSize()
@@ -99,7 +113,7 @@ func (r *navItemRenderer) MinSize() fyne.Size {
 	if r.n.compact {
 		return fyne.NewSize(2*pad+8+navIconSize, navHeight)
 	}
-	return fyne.NewSize(pad+4+navIconSize+pad+r.txt.MinSize().Width+pad, navHeight)
+	return fyne.NewSize(pad+4+navIconSize+pad+r.txt.MinSize().Width+pad+navDot+pad, navHeight)
 }
 
 func (r *navItemRenderer) Refresh() {
@@ -125,6 +139,9 @@ func (r *navItemRenderer) Refresh() {
 	}
 	r.txt.TextStyle = fyne.TextStyle{Bold: r.n.selected}
 	r.txt.Hidden = r.n.compact
+	r.dot.FillColor = themeColor(colorInfo)
+	r.dot.Hidden = !r.n.badge
+	r.dot.Refresh()
 	r.bg.Refresh()
 	r.bar.Refresh()
 	r.img.Refresh()
@@ -132,7 +149,7 @@ func (r *navItemRenderer) Refresh() {
 }
 
 func (r *navItemRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.bg, r.bar, r.img, r.txt}
+	return []fyne.CanvasObject{r.bg, r.bar, r.img, r.txt, r.dot}
 }
 
 func (r *navItemRenderer) Destroy() {}

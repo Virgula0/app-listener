@@ -108,7 +108,7 @@ func protectedShell(t *testing.T, link *fakeLink) (*shell, *protectedPage) {
 	t.Cleanup(a.Quit)
 	a.Settings().SetTheme(&appTheme{variant: theme.VariantDark})
 	w := a.NewWindow("app-listener")
-	s := newShell(a, w, Options{Version: "dev"})
+	s := newShell(a, w, &Options{Version: "dev"})
 	s.syncBackground = true
 	s.startBackend = func() (backendLink, error) { return link, nil }
 	w.SetContent(s.view())

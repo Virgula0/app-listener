@@ -45,7 +45,7 @@ func TestSnapshots(t *testing.T) {
 			a.Preferences().SetString("theme", "light")
 		}
 		w := a.NewWindow("app-listener")
-		s := newShell(a, w, Options{Version: "dev"})
+		s := newShell(a, w, &Options{Version: "dev"})
 		s.syncBackground = true
 		fe := &snapEngines{}
 		s.files = workbench.NewFiles(fe.engines())
@@ -329,11 +329,12 @@ func snapInstall(t *testing.T, s *shell, prefix string) {
 	s.install = ip
 	s.views[pageInstall] = ip.view()
 	s.show(pageInstall)
-	ip.bin = &stagedBinary{path: "/tmp/app-listener-gui-81723/app-listener-local", sha: strings.Repeat("3fa9c0d1", 8)}
-	ip.present = installedBinary{present: true, version: "v0.3.0", sha: "ff"}
+	ip.bin = &stagedBinary{path: "/tmp/app-listener-gui-81723/app-listener", sha: strings.Repeat("3fa9c0d1", 8),
+		tag: "v0.3.0", guiPath: "/tmp/app-listener-gui-81723/app-listener-gui", guiSha: strings.Repeat("9be0a412", 8)}
+	ip.present = installedBinary{present: true, version: "v0.3.0", sha: "ff", guiVersion: "v0.2.9"}
 	ip.daemonUp = true
 	ip.renderBinary()
-	s.win.Resize(fyne.NewSize(1280, 1240)) // the whole overview, actions included
+	s.win.Resize(fyne.NewSize(1280, 2450)) // the whole overview, actions and uninstall included
 	save(t, prefix+"Overview.png", s.win)
 	s.win.Resize(fyne.NewSize(1280, 820))
 
@@ -378,7 +379,9 @@ func snapUpdate(t *testing.T, s *shell, prefix string) {
 	up.daemonUp, up.loaded = true, true
 	up.latest[false] = &latestRelease{tag: "v0.4.0", newer: true}
 	up.renderStatus()
+	s.setUpdateAvailable("v0.4.0", true)
 	save(t, prefix+"Overview.png", s.win)
+	s.setUpdateAvailable("", false)
 
 	up.run.start("Update: Latest stable release", "arrow-clockwise")
 	up.show(up.run.root)

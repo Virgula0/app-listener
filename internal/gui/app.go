@@ -99,7 +99,7 @@ type shell struct {
 }
 
 // Run opens the window and blocks until it is closed.
-func Run(opts Options) (err error) {
+func Run(opts *Options) (err error) {
 	wmEnv := restoreSessionEnv()
 	defer cleanupSessionEnv()
 	defer filterFyneLogs()()
@@ -147,7 +147,9 @@ func Run(opts Options) (err error) {
 		func(fyne.Shortcut) { s.focusSearch() })
 
 	s.reprobe()
+	s.checkForUpdate()
 	s.every(time.Second, s.updateStats)
+	s.every(6*time.Hour, s.checkForUpdate)
 	w.ShowAndRun()
 	if s.protect != nil && s.protect.link != nil {
 		s.protect.link.Close() // narrows a live grant, re-locks an offline vault
@@ -226,11 +228,11 @@ func savedVariant(a fyne.App) fyne.ThemeVariant {
 	return theme.VariantDark
 }
 
-func newShell(a fyne.App, w fyne.Window, opts Options) *shell {
+func newShell(a fyne.App, w fyne.Window, opts *Options) *shell {
 	s := &shell{
 		app:      a,
 		win:      w,
-		opts:     opts,
+		opts:     *opts,
 		nav:      map[pageID]*navItem{},
 		views:    map[pageID]fyne.CanvasObject{},
 		dialogs:  map[sizedDialog]fyne.Size{},

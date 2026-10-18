@@ -3,9 +3,13 @@ package install
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 
+	log "github.com/sirupsen/logrus"
+
 	"github.com/Virgula0/app-listener/internal/headless"
+	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
@@ -25,7 +29,10 @@ type Request struct {
 	Mode Mode
 	// Binary is the verified headless build deployed in place of the running executable: the GUI
 	// build must never become the daemon. Required by the modes that deploy (needsBinary).
-	Binary              string
+	Binary string
+	// GUIBinary is the verified desktop build of the same release, installed at
+	// systemd.GUIBinaryPath once the wizard completes ("" = none: not chosen, or the release has none).
+	GUIBinary           string
 	Live                bool
 	AllowMetadataOutput bool
 }
@@ -57,6 +64,11 @@ func RunWith(ui wizard.UI, req Request) error {
 		if err := headless.Check(req.Binary); err != nil {
 			return fmt.Errorf("refusing to deploy %s: %w", req.Binary, err)
 		}
+		if req.GUIBinary != "" {
+			if err := headless.CheckGUI(req.GUIBinary); err != nil {
+				return fmt.Errorf("refusing to install %s as the desktop build: %w", req.GUIBinary, err)
+			}
+		}
 	}
 	restoreUI := wizard.Use(ui)
 	prevSrc, prevMeta := deploySource, allowMetadataOutput
@@ -72,7 +84,10 @@ func RunWith(ui wizard.UI, req Request) error {
 
 	switch req.Mode {
 	case ModeWizard:
-		return runWizard()
+		if err := runWizard(); err != nil {
+			return err
+		}
+		return installGUI(req.GUIBinary)
 	case ModeRefreshCatalog:
 		return runRefreshCatalogOnly(false, req.Live)
 	case ModeDiffCatalog:
@@ -83,4 +98,18 @@ func RunWith(ui wizard.UI, req Request) error {
 		return deletePostBackups()
 	}
 	return fmt.Errorf("unknown installer mode %d", req.Mode)
+}
+
+// installGUI installs the desktop build next to the daemon after a completed wizard.
+func installGUI(path string) error {
+	if path == "" {
+		log.Info("the desktop build was not installed: only the daemon was")
+		return nil
+	}
+	wizard.Stage("Installing the desktop build")
+	if err := systemd.DeployGUIBinary(path); err != nil {
+		return fmt.Errorf("the daemon is installed, but its desktop build was not: %w", err)
+	}
+	log.Infof("desktop build installed: run it with `sudo %s --gui`", filepath.Base(systemd.GUISymlinkPath))
+	return nil
 }

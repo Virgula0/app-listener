@@ -14,6 +14,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/cmd/functions/install"
+	"github.com/Virgula0/app-listener/cmd/functions/uninstall"
 	"github.com/Virgula0/app-listener/cmd/functions/update"
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/gui"
@@ -62,8 +63,11 @@ func Run(ignored []string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("--gui needs root to load eBPF programs: run `sudo %s --gui`", os.Args[0])
 	}
-	return gui.Run(gui.Options{Version: constants.Version, Release: releaseBuild(), Install: installHooks(),
-		Update: gui.UpdateHooks{Run: update.RunWith, Latest: update.Latest}})
+	return gui.Run(&gui.Options{Version: constants.Version, Release: releaseBuild(), Install: installHooks(),
+		Update: gui.UpdateHooks{Run: update.RunWith, Latest: update.Latest},
+		Uninstall: gui.UninstallHooks{Run: func(ui wizard.UI, req gui.UninstallRequest) error {
+			return uninstall.RunWith(ui, uninstall.Request{DeleteKey: req.DeleteKey, KeepGUI: req.KeepGUI})
+		}}})
 }
 
 // releaseBuild reports whether -ldflags stamped constants.Version, as the release pipeline does: the
@@ -97,11 +101,21 @@ func installHooks() gui.InstallHooks {
 				return fmt.Errorf("unknown installer mode %d", req.Mode)
 			}
 			return install.RunWith(ui, install.Request{
-				Mode: mode, Binary: req.Binary, Live: req.Live, AllowMetadataOutput: req.AllowMetadataOutput,
+				Mode: mode, Binary: req.Binary, GUIBinary: req.GUIBinary, Live: req.Live,
+				AllowMetadataOutput: req.AllowMetadataOutput,
 			})
 		},
-		Fetch:            update.FetchVerified,
-		FetchLatest:      update.FetchLatest,
-		InstalledVersion: update.InstalledVersion,
+		Fetch: func(tag, dir string) (gui.StagedRelease, error) {
+			return staged(update.FetchVerified(tag, dir))
+		},
+		FetchLatest: func(pre bool, dir string) (gui.StagedRelease, error) {
+			return staged(update.FetchLatest(pre, dir))
+		},
+		InstalledVersion:    update.InstalledVersion,
+		InstalledGUIVersion: update.InstalledGUIVersion,
 	}
+}
+
+func staged(r update.Release, err error) (gui.StagedRelease, error) {
+	return gui.StagedRelease{Tag: r.Tag, Binary: r.Binary, GUI: r.GUI}, err
 }

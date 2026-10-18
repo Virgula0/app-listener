@@ -46,3 +46,15 @@ func TestCheck(t *testing.T) {
 		t.Fatal("a file without build info must be refused")
 	}
 }
+
+func TestCheckGUI(t *testing.T) {
+	if err := CheckGUI(buildTiny(t, mainPath, "netgo,gui")); err != nil {
+		t.Fatalf("a -tags gui build must pass: %v", err)
+	}
+	if err := CheckGUI(buildTiny(t, mainPath, "netgo,ci")); err == nil {
+		t.Fatal("a headless build must be refused")
+	}
+	if err := CheckGUI(buildTiny(t, "example.com/other", "gui")); err == nil {
+		t.Fatal("another program must be refused")
+	}
+}

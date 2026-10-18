@@ -35,7 +35,7 @@ func openPicker(t *testing.T, mode pickMode, dir string) (*shell, *picker, *stri
 	t.Cleanup(a.Quit)
 	w := a.NewWindow("x")
 	w.Resize(fyne.NewSize(1000, 700))
-	s := newShell(a, w, Options{})
+	s := newShell(a, w, &Options{})
 	s.syncBackground = true
 	got := new(string)
 	s.pickPath(mode, "Pick", dir, func(p string) { *got = p })

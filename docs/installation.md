@@ -145,6 +145,13 @@ is written.
 The desktop window (`--gui`) runs the same update from its Update workspace, with the changelog and
 the confirmations as dialogs (see [Desktop GUI](gui.md#update)).
 
+When the desktop build is installed (`/usr/local/sbin/app-listener-gui`, deployed by the window's
+installer), `update` replaces it with the new release's desktop asset, downloaded and verified
+like the binary before anything is written, after the daemon is back up. A release without one
+leaves the old desktop build in place with a warning. With the daemon already up to date, an
+installed desktop build of another version is brought to the daemon's release. Updating from the
+window also installs the desktop build when it is missing.
+
 The changelog covers every release of the channel between the installed version and the new one,
 newest first, with a link to the full compare. If the installed version is not among the fetched
 releases (a local `dev` build, or older than the 100 newest), it shows every fetched release up to
@@ -164,12 +171,20 @@ denials logged.
 ```bash
 sudo app-listener uninstall
 sudo app-listener uninstall --delete-key
+sudo app-listener uninstall --keep-gui
 ```
 
 - Refuses while the daemon runs.
-- Re-scans the catalog and decrypts every protected directory in place.
+- Re-scans the catalog and asks, per encrypted directory, whether to decrypt it in place for good
+  (default: keep it encrypted).
+- Removes the binary, the desktop build (`app-listener-gui`, kept with `--keep-gui`), their PATH
+  symlinks, the units and the config.
 - Keeps the master key unless `--delete-key` is given. Without the key, any directory still
-  encrypted can never be unlocked again.
+  encrypted can never be unlocked again, so with directories left encrypted `--delete-key` asks
+  once more (default: keep the key).
+
+The desktop window runs the same uninstall from its Install workspace (see
+[Desktop GUI](gui.md#uninstall)).
 - At the end, lists any `.app_listener.backup` migration copies and offers to delete them (all
   preselected, one confirmation). They are plain unencrypted copies and harmless to keep.
 

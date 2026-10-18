@@ -2,7 +2,8 @@
 
 The `app-listener-gui` release asset (or a `make build GUI=1` build) adds a desktop window to the
 same binary. It covers the interactive modes in one place; the daemon has no GUI and stays a
-systemd service, and `uninstall` stays terminal-only.
+systemd service. Installing from the window also installs this desktop build as
+`/usr/local/sbin/app-listener-gui` (see [Install](#install)).
 
 ```bash
 sudo app-listener-gui --gui
@@ -209,22 +210,36 @@ type into it. Prefer a Wayland session when editing secrets.
 ## Update
 
 The Update workspace runs `update` in the window with every prompt as a dialog. The page shows the
-installed version, whether the daemon runs, and the newest release of the selected **Channel**
-(looked up on GitHub when the page opens, on a channel change and on **Check**), with whether
-`update` would install it.
+installed version (and the desktop build's), whether the daemon runs, and the newest release of the
+selected **Channel** (looked up on GitHub when the page opens, on a channel change and on **Check**),
+with whether `update` would install it. A newer release also shows an **A new version is available**
+banner at the top of the page, with an **Update now** button.
+
+The window checks for a newer release by itself too: when it opens, every 6 hours, and after each
+run. The installed version's own channel is checked (`pre-*` builds track pre-releases, anything
+else stable). A newer release puts a dot on the **Update** entry of the sidebar. A failed lookup
+(offline, or a network whitelist running in this window) leaves the dot as it was.
 
 | Channel | CLI equivalent |
 |---|---|
-| Latest stable release (default) | `update` |
-| Latest pre-release | `update --channel pre-release` |
+| Latest stable release (default for an installed `vX.Y.Z`) | `update` |
+| Latest pre-release (default for an installed `pre-*` build) | `update --channel pre-release` |
 
 There is no local-file source and no `--yes`. **Update** runs the same steps as the terminal: the
 release's headless asset is downloaded and verified (Ed25519 signature, checksum, GitHub digest,
 ELF architecture, `--version`, no `gui` build tag); the changelog since the installed version opens
 in a dialog and you confirm; a changed daemon unit shows its diff and asks; then the daemon is
 stopped, its folders verified locked, the binary replaced atomically and the daemon started again.
-Nothing changes before that last step, and the window's own build is never installed. An installed
-version that is already the newest finishes with "up to date" in the log and changes nothing.
+Nothing changes before that last step.
+
+The release's desktop build is downloaded and verified with the headless one (same checks, but it
+must carry the `gui` tag) and then replaces `/usr/local/sbin/app-listener-gui`, or is installed
+there when missing. **Also install or update the desktop build** (on by default) controls this;
+unchecked, only the daemon is updated and that file is left as is. An open window keeps running
+its old version until you restart it; the window's own executable is never copied. A release
+without a desktop build for this architecture updates the daemon only and logs a warning. When the
+daemon is already the newest, **Update** only brings the desktop build to the daemon's version
+(with the option checked; nothing to do when it already is).
 
 The run view, the close confirmation and the guard rule are the Install workspace's (below): no
 update starts while a guard runs in this window, nor while an installer run is in progress.
@@ -232,27 +247,37 @@ update starts while a guard runs in this window, nor while an installer run is i
 ## Install
 
 The Install workspace runs `install` with every prompt as a dialog. The page shows the installed
-binary (and whether it is identical to the build staged below), whether the daemon runs, and this
-window's version.
+binary (and whether it is identical to the build staged below), whether the daemon runs, and the
+installed desktop build (and whether it is on the daemon's version).
 
-### The daemon binary
+### The release
 
-The daemon never runs the GUI build. The installer deploys a headless build instead, staged first in
-a root-only (`0700`) temporary folder that is deleted when the window closes. **Source** picks the
-release it is downloaded from; only signed releases are offered, never a local file:
+The daemon never runs the GUI build. The installer deploys a release's headless build instead, and
+installs the same release's desktop build next to it, so the host gets both:
 
-| Source | Headless build |
+| Path | Build | Run it |
+|---|---|---|
+| `/usr/local/sbin/app-listener` (`/usr/local/bin` symlink) | headless, the daemon | `sudo app-listener <mode>` |
+| `/usr/local/sbin/app-listener-gui` (`/usr/local/bin` symlink) | desktop | `sudo app-listener-gui --gui` |
+
+Both are staged first in a root-only (`0700`) temporary folder that is deleted when the window
+closes. **Source** picks the release they are downloaded from; only signed releases are offered,
+never a local file:
+
+| Source | Release |
 |---|---|
 | This version's release (release windows only, the default there) | The headless asset of this window's own tag. |
 | Latest stable release | The newest `vX.Y.Z` release, as `update` picks it. |
 | Latest pre-release | The newest `pre-YYYYMMDD-<sha>` build of main, as `update --channel pre-release` picks it. |
 
-Every download runs the checks `update` runs: Ed25519 signature, checksum, GitHub digest, ELF
-architecture and `--version`. Whatever the source, the build must be an app-listener binary without
-the `gui` tag or a fyne dependency (read from its Go build info); the installer checks that again
-itself right before deploying, and there is no fallback to copying the window's own executable.
-The page then shows the staged build's tag, SHA-256 and path. To deploy a build of your own, use
-`install --binary-only` from a terminal.
+Every download runs the checks `update` runs on each build: Ed25519 signature, signed asset name,
+checksum, GitHub digest, ELF architecture and `--version`. The headless build must be an
+app-listener binary without the `gui` tag or a fyne dependency, the desktop build one with them
+(read from the Go build info); the installer checks both again itself right before deploying, and
+there is no fallback to copying the window's own executable. The page then shows the staged tag
+and each build's SHA-256 and path. The release builds its desktop asset best-effort: a release
+without one stages the headless build alone, the page says so, and the wizard installs only the
+daemon. To deploy a build of your own, use `install --binary-only` from a terminal.
 
 When the staged build is another version than the window (always the case for a development
 window), the page says so: the window's installer writes `daemon.conf`, and before the service is
@@ -269,13 +294,19 @@ load it.
 | Restore backups | `install --restore-backups` | no |
 | Delete backups | `install --delete-post-backups` | no |
 
+**Also install the desktop build (app-listener-gui)** (on by default) installs the staged
+release's desktop build once the wizard completes. Unchecked, the wizard installs only the daemon.
+It is disabled when the staged release has no desktop build.
+
 **Log denied metadata inspections** is `--allow-metadata-output`. There is no `--yes`: every
 confirmation is asked. Restore and Delete backups list the backups found, then ask once more naming
 each one; Restore is refused while the daemon runs, Delete is not.
 
 The wizard needs the installed binary to be identical to the staged build, as the terminal
 wizard needs it to be the one running: if they differ, update it first (the Update workspace, or
-`install --binary-only` from a terminal). The GUI has no binary-only action.
+`install --binary-only` from a terminal). The GUI has no binary-only action. Once the wizard
+completes, it installs the staged desktop build at `/usr/local/sbin/app-listener-gui`, replacing
+any one there (when the option above is checked); a canceled or failed wizard installs none.
 
 Starting an action switches to its run view: the steps reached so far, a progress bar for long
 copies (migration, backups, the download), and the log. A canceled prompt stops the run where it
@@ -285,3 +316,20 @@ first.
 No action starts while a guard runs in this window (a Files target or the network guard): the
 installer moves and encrypts protected folders, restarts the daemon and downloads from GitHub,
 and none of those guards admit it. Turn them off first.
+
+### Uninstall
+
+The **Uninstall** card at the bottom of the page runs `uninstall` with every prompt as a dialog, on
+the same run view (and under the same rules) as the actions above:
+
+| Option | CLI equivalent |
+|---|---|
+| Keep the desktop build (app-listener-gui), off by default | `--keep-gui` |
+| Also delete the fscrypt master key, off by default | `--delete-key` |
+
+Like the terminal, it is refused while the daemon runs (under systemd or not): the button is
+disabled until you stop it (`sudo systemctl stop app-listener-daemon`, which locks its folders
+again). The window doesn't stop the daemon itself. **Uninstall** first shows a summary to confirm,
+then each encrypted folder is asked about (decrypt permanently, or keep encrypted), and the
+per-user ssh-agent setup and the backup cleanup ask as in the terminal. Removing the desktop build
+deletes `/usr/local/sbin/app-listener-gui`; the open window keeps running until you close it.

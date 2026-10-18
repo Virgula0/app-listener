@@ -365,7 +365,10 @@ normalized to explicit commands: oksvg drops implicit repeated arcs and ignores 
 `APPLISTENER_GUI_SNAPSHOTS=<dir> go test -tags gui ./internal/gui/` renders every page headlessly.
 The GUI installer (`install.RunWith`, prompts routed via `wizard.Use`) must never deploy the fyne
 build as the daemon: it deploys a staged headless build (`update.FetchVerified`/`FetchLatest` or a
-local file), which `RunWith` itself re-checks with `headless.Check`; never `os.Executable()`.
+local file), which `RunWith` itself re-checks with `headless.Check`; never `os.Executable()`. The same
+release's desktop asset (`headless.CheckGUI`) goes to `systemd.GUIBinaryPath` after the wizard, and
+`update` keeps it on the daemon's release; never copy the window's own exe there. The GUI uninstaller
+(`uninstall.RunWith`) keeps the CLI's daemon-stopped refusal: the window never stops the daemon.
 The GUI updater (`update.RunWith`) runs `update` in the fyne process too: it only works because
 nothing it touches is daemon-guarded while the daemon runs (see its `TODO(self-binary-guard)`).
 Verbosity ladder lives in `internal/constants`; `--verbose` requires `--headless`.

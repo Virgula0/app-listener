@@ -75,6 +75,7 @@ func (h *runHost) begin(name, iconName string, work func(ui wizard.UI) error, af
 				h.settled()
 			}
 			h.s.reprobe()
+			h.s.checkForUpdate()
 		})
 	}()
 	return true

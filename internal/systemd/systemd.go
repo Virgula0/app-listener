@@ -25,6 +25,10 @@ const (
 	// BinSymlinkPath exposes the binary as app-listener: /usr/local/bin is
 	// in every user's default PATH, /usr/local/sbin normally is not.
 	BinSymlinkPath = "/usr/local/bin/app-listener"
+	// GUIBinaryPath and GUISymlinkPath are the desktop (fyne) build, deployed next to the daemon by
+	// the GUI's installer and kept on the daemon's release by update. Never the service binary.
+	GUIBinaryPath  = "/usr/local/sbin/app-listener-gui"
+	GUISymlinkPath = "/usr/local/bin/app-listener-gui"
 	// SystemConfigDir and SystemConfigPath hold the installed daemon config.
 	SystemConfigDir  = "/etc/app-listener"
 	SystemConfigPath = "/etc/app-listener/daemon.conf"
@@ -303,6 +307,35 @@ func RemoveBinSymlinkAt(linkPath, targetPath string) {
 		return
 	}
 	log.Infof("removed symlink %s", linkPath)
+}
+
+// GUIInstalled reports whether the desktop build is deployed at GUIBinaryPath.
+func GUIInstalled() bool {
+	_, err := os.Lstat(GUIBinaryPath)
+	return err == nil
+}
+
+// DeployGUIBinary installs srcPath (a verified desktop build) at GUIBinaryPath and its PATH symlink.
+// The daemon is untouched: it never runs this file, and a running window keeps its old inode.
+func DeployGUIBinary(srcPath string) error {
+	if err := os.MkdirAll(filepath.Dir(GUIBinaryPath), 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", filepath.Dir(GUIBinaryPath), err)
+	}
+	if err := ReplaceInstalledBinary(srcPath, GUIBinaryPath); err != nil {
+		return err
+	}
+	return EnsureBinSymlinkAt(GUISymlinkPath, GUIBinaryPath)
+}
+
+// RemoveGUIBinary deletes the desktop build and its PATH symlink (a foreign symlink is kept).
+func RemoveGUIBinary() error {
+	RemoveBinSymlinkAt(GUISymlinkPath, GUIBinaryPath)
+	if err := os.Remove(GUIBinaryPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing %s: %w", GUIBinaryPath, err)
+	} else if err == nil {
+		log.Infof("removed %s", GUIBinaryPath)
+	}
+	return nil
 }
 
 // ReplaceInstalledBinary swaps srcPath into dstPath atomically (mode 0700): staged in a sibling

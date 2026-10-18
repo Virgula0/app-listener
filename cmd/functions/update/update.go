@@ -103,6 +103,12 @@ newer one exists:
   5. replaces the installed binary atomically (and the unit, if accepted)
   6. restarts the systemd daemon (it is stopped first so the watch
      directories are verified locked again before the new binary starts)
+  7. when the desktop build is installed (/usr/local/sbin/app-listener-gui,
+     deployed by the GUI's installer), replaces it with the release's,
+     downloaded and verified with the binary in steps 1-2; a release
+     without one leaves it in place with a warning. When the daemon is
+     already up to date, an installed desktop build of another version is
+     brought to the daemon's release
 
 The stable channel tracks non-pre-release releases (vX.Y.Z tags); the
 pre-release channel tracks the pre-YYYYMMDD-<sha> builds produced by the
@@ -117,26 +123,38 @@ repository are accepted.`,
 	RunE: runUpdate,
 }
 
-// releaseAssets names one architecture's release assets (.github/workflows/_build-release.yml).
+// releaseAssets names one architecture's release assets (.github/workflows/_build-release.yml);
+// check tells the build apart (headless.Check, or headless.CheckGUI for the desktop asset).
 type releaseAssets struct {
 	binary, checksum, signature string
 	machine                     elf.Machine
+	check                       func(path string) error
 }
 
-// assetsFor maps a Go architecture to its release assets. amd64 keeps the unsuffixed names: older
-// binaries' `update` looks them up.
+// assetsFor maps a Go architecture to its headless release assets. amd64 keeps the unsuffixed
+// names: older binaries' `update` looks them up.
 func assetsFor(goarch string) (releaseAssets, error) {
+	return archAssets(goarch, "app-listener", headless.Check)
+}
+
+// guiAssetsFor is assetsFor for the desktop build (app-listener-gui[-arm64]).
+func guiAssetsFor(goarch string) (releaseAssets, error) {
+	return archAssets(goarch, "app-listener-gui", headless.CheckGUI)
+}
+
+func archAssets(goarch, base string, check func(string) error) (releaseAssets, error) {
 	var bin string
 	var machine elf.Machine
 	switch goarch {
 	case "amd64":
-		bin, machine = "app-listener", elf.EM_X86_64
+		bin, machine = base, elf.EM_X86_64
 	case "arm64":
-		bin, machine = "app-listener-arm64", elf.EM_AARCH64
+		bin, machine = base+"-arm64", elf.EM_AARCH64
 	default:
 		return releaseAssets{}, fmt.Errorf("no release is published for linux/%s: build from source (make build)", goarch)
 	}
-	return releaseAssets{binary: bin, checksum: bin + ".sha256", signature: bin + ".sha256.sig", machine: machine}, nil
+	return releaseAssets{binary: bin, checksum: bin + ".sha256", signature: bin + ".sha256.sig", machine: machine,
+		check: check}, nil
 }
 
 // githubRelease mirrors the updater-relevant fields of the releases API.
@@ -163,12 +181,14 @@ func validateChannel(ch string) error {
 // runUpdate drives the update flow: every check runs first; changelog and
 // confirmation come last unless --yes skips them.
 func runUpdate(cmd *cobra.Command, args []string) error {
-	return run(channelFlag, yesFlag)
+	return run(channelFlag, yesFlag, systemd.GUIInstalled())
 }
 
 // RunWith updates to the latest release of the stable (or pre-release) channel with every prompt on
 // ui: the desktop GUI's updater. Like the CLI it deploys the release's headless asset, never the
-// running executable. One run at a time: wizard.Use is process-wide.
+// running executable. withGUI also installs or updates the release's desktop build at
+// systemd.GUIBinaryPath; without it that file is left as is. One run at a time: wizard.Use is
+// process-wide.
 //
 // TODO(self-binary-guard): runs in the GUI process (not the daemon's exe inode), safe only because
 // nothing it touches is daemon-guarded: with the daemon up it just execs and hashes
@@ -176,13 +196,13 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 // systemctl stop. When the daemon guards its own binary, keep those reads open to root (ModeReadOnly)
 // or move them after the stop; a guard outliving the stop leaves the daemon stopped on a failed
 // swap, so then hand the swap to the installed binary (fixed argv, no shell) or to the daemon.
-func RunWith(ui wizard.UI, preRelease bool) error {
+func RunWith(ui wizard.UI, preRelease, withGUI bool) error {
 	if !runMu.TryLock() {
 		return errors.New("an update is already in progress")
 	}
 	defer runMu.Unlock()
 	defer wizard.Use(ui)()
-	return run(channelOf(preRelease), false)
+	return run(channelOf(preRelease), false, withGUI)
 }
 
 var runMu sync.Mutex
@@ -194,8 +214,9 @@ func channelOf(preRelease bool) string {
 	return channelStable
 }
 
-// run is the update of channel; auto is --yes (no changelog viewer or prompts).
-func run(channel string, auto bool) error {
+// run is the update of channel; auto is --yes (no changelog viewer or prompts). withGUI puts the
+// desktop build on the daemon's release (installing it when missing).
+func run(channel string, auto, withGUI bool) error {
 	assets, err := checkUpdatePreconditions(channel)
 	if err != nil {
 		return err
@@ -217,13 +238,17 @@ func run(channel string, auto bool) error {
 	log.Infof("latest %s release: %s (published %s)", channel, c.latest.TagName, c.latest.PublishedAt)
 	if !c.newer {
 		log.Infof("installed version %s is up to date", installed)
+		if withGUI {
+			return syncGUI(installed)
+		}
 		return nil
 	}
-	return deploy(c, assets, installed, channel, auto)
+	return deploy(c, assets, installed, channel, auto, withGUI)
 }
 
-// deploy downloads and verifies c's release, asks (changelog, unit diff) and swaps it in.
-func deploy(c *candidate, assets releaseAssets, installed, channel string, auto bool) error {
+// deploy downloads and verifies c's release (and its desktop build when withGUI), asks (changelog,
+// unit diff) and swaps it in.
+func deploy(c *candidate, assets releaseAssets, installed, channel string, auto, withGUI bool) error {
 	latest, releases := c.latest, c.all
 	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&latest, assets)
 	if err != nil {
@@ -242,6 +267,13 @@ func deploy(c *candidate, assets releaseAssets, installed, channel string, auto 
 	binPath, err := downloadAndVerify(tmp, &latest, assets, binURL, binDigest, checksumURL, sigURL)
 	if err != nil {
 		return err
+	}
+	guiPath := ""
+	if withGUI {
+		wizard.Stage("Downloading and verifying the desktop build of " + latest.TagName)
+		if guiPath, err = fetchGUI(tmp, &latest); err != nil {
+			return err
+		}
 	}
 
 	wizard.Stage("Reviewing the changelog")
@@ -262,7 +294,84 @@ func deploy(c *candidate, assets releaseAssets, installed, channel string, auto 
 	}
 
 	wizard.Stage("Installing " + latest.TagName + " and restarting the daemon")
-	return applyUpdate(binPath, unit)
+	if err := applyUpdate(binPath, unit); err != nil {
+		return err
+	}
+	if guiPath == "" {
+		return nil
+	}
+	wizard.Stage("Installing the desktop build of " + latest.TagName)
+	if err := deployGUI(guiPath); err != nil {
+		return fmt.Errorf("the daemon runs %s, but its desktop build was not installed: %w", latest.TagName, err)
+	}
+	return nil
+}
+
+// deployGUI installs the verified desktop build at systemd.GUIBinaryPath.
+func deployGUI(path string) error {
+	if err := systemd.DeployGUIBinary(path); err != nil {
+		return err
+	}
+	log.Infof("desktop build installed at %s: an open window keeps running the old one until it is restarted",
+		systemd.GUIBinaryPath)
+	return nil
+}
+
+// fetchGUI downloads and verifies r's desktop build into dir. "" with a warning when r ships none
+// for this architecture (the release builds it best-effort); a present asset that fails any check
+// is an error.
+func fetchGUI(dir string, r *githubRelease) (string, error) {
+	assets, err := guiAssetsFor(runtime.GOARCH)
+	if err != nil {
+		return "", err
+	}
+	if !hasAsset(r, assets.binary) {
+		log.Warnf("release %s has no %s asset: its desktop build is not installed", r.TagName, assets.binary)
+		return "", nil
+	}
+	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(r, assets)
+	if err != nil {
+		return "", err
+	}
+	return downloadAndVerify(dir, r, assets, binURL, binDigest, checksumURL, sigURL)
+}
+
+func hasAsset(r *githubRelease, name string) bool {
+	for i := range r.Assets {
+		if r.Assets[i].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// syncGUI puts the desktop build on the installed daemon's release when the daemon itself is up to
+// date: the window drives that daemon (edit-protected --backend), so the two ship together.
+func syncGUI(installed string) error {
+	if systemd.GUIInstalled() && readInstalledVersion(systemd.GUIBinaryPath) == installed {
+		log.Infof("the desktop build at %s is on %s too", systemd.GUIBinaryPath, installed)
+		return nil
+	}
+	if !preVersionRe.MatchString(installed) && !stableVersionRe.MatchString(installed) {
+		log.Warnf("the installed daemon (%s) is not a release build: no desktop build to match it", installed)
+		return nil
+	}
+	wizard.Stage("Downloading and verifying the desktop build of " + installed)
+	r, err := fetchRelease(githubAPIBase, defaultRepo, installed, updateHTTPClient())
+	if err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp("", "app-listener-update-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	path, err := fetchGUI(tmp, &r)
+	if err != nil || path == "" {
+		return err
+	}
+	wizard.Stage("Installing the desktop build of " + installed)
+	return deployGUI(path)
 }
 
 // confirmUnit shows the daemon unit diff and asks; autoConfirm logs the diff and accepts it.
@@ -315,7 +424,7 @@ func downloadAndVerify(tmp string, r *githubRelease, assets releaseAssets, binUR
 	}
 	log.Infof("release %s verified: Ed25519 signature, sha256 checksum and GitHub digest match", r.TagName)
 
-	err = sanityCheckBinary(binPath, r.TagName, assets.machine)
+	err = sanityCheckBinary(binPath, r.TagName, assets)
 	if err != nil {
 		return "", err
 	}
@@ -397,6 +506,14 @@ func downloadReleaseFiles(client *http.Client, dir string, assets releaseAssets,
 
 // InstalledVersion is the version the installed binary reports ("unknown" when it can't tell).
 func InstalledVersion() string { return readInstalledVersion(systemd.InstallBinaryPath) }
+
+// InstalledGUIVersion is InstalledVersion for the desktop build; "" when none is installed.
+func InstalledGUIVersion() string {
+	if !systemd.GUIInstalled() {
+		return ""
+	}
+	return readInstalledVersion(systemd.GUIBinaryPath)
+}
 
 // readInstalledVersion runs the installed binary with --version; failures or
 // unknown output map to "unknown", treated as older than any release.
@@ -633,23 +750,42 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// FetchVerified downloads this architecture's release binary of tag (the headless asset, never the
-// GUI's) into the caller-owned dir and runs every check update does before returning its path. The
-// GUI installer deploys it instead of itself: the daemon must not be the fyne build.
-func FetchVerified(tag, dir string) (string, error) {
-	assets, err := assetsFor(runtime.GOARCH)
-	if err != nil {
-		return "", err
-	}
+// Release is a downloaded, verified release: Binary is its headless asset, GUI its desktop build
+// ("" when the release ships none for this architecture).
+type Release struct {
+	Tag, Binary, GUI string
+}
+
+// FetchVerified downloads this architecture's headless and desktop builds of tag into the
+// caller-owned dir and runs every check update does on each. The GUI installer deploys the headless
+// one as the daemon instead of itself (the daemon must not be the fyne build) and the desktop one
+// at systemd.GUIBinaryPath.
+func FetchVerified(tag, dir string) (Release, error) {
 	r, err := fetchRelease(githubAPIBase, defaultRepo, tag, updateHTTPClient())
 	if err != nil {
-		return "", err
+		return Release{}, err
 	}
-	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&r, assets)
+	return fetchPair(dir, &r)
+}
+
+func fetchPair(dir string, r *githubRelease) (Release, error) {
+	assets, err := assetsFor(runtime.GOARCH)
 	if err != nil {
-		return "", err
+		return Release{}, err
 	}
-	return downloadAndVerify(dir, &r, assets, binURL, binDigest, checksumURL, sigURL)
+	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(r, assets)
+	if err != nil {
+		return Release{}, err
+	}
+	bin, err := downloadAndVerify(dir, r, assets, binURL, binDigest, checksumURL, sigURL)
+	if err != nil {
+		return Release{}, err
+	}
+	gui, err := fetchGUI(dir, r)
+	if err != nil {
+		return Release{}, err
+	}
+	return Release{Tag: r.TagName, Binary: bin, GUI: gui}, nil
 }
 
 // candidate is a channel's newest release, every release (the changelog spans them) and whether
@@ -695,28 +831,19 @@ func Latest(preRelease bool, installed string) (tag string, newer bool, err erro
 }
 
 // FetchLatest is FetchVerified for the newest release of a channel (preRelease: the pre-YYYYMMDD
-// builds, else stable vX.Y.Z), picked as `update --channel` picks it; it returns that release's tag.
-func FetchLatest(preRelease bool, dir string) (path, tag string, err error) {
+// builds, else stable vX.Y.Z), picked as `update --channel` picks it.
+func FetchLatest(preRelease bool, dir string) (Release, error) {
 	channel := channelOf(preRelease)
-	assets, err := assetsFor(runtime.GOARCH)
-	if err != nil {
-		return "", "", err
-	}
 	releases, err := fetchReleases(githubAPIBase, defaultRepo, updateHTTPClient())
 	if err != nil {
-		return "", "", err
+		return Release{}, err
 	}
 	r, ok := pickLatestRelease(filterChannel(releases, channel))
 	if !ok {
-		return "", "", fmt.Errorf("no %s release is published", channel)
+		return Release{}, fmt.Errorf("no %s release is published", channel)
 	}
 	log.Infof("latest %s release: %s (published %s)", channel, r.TagName, r.PublishedAt)
-	binURL, binDigest, checksumURL, sigURL, err := resolveAssets(&r, assets)
-	if err != nil {
-		return "", "", err
-	}
-	path, err = downloadAndVerify(dir, &r, assets, binURL, binDigest, checksumURL, sigURL)
-	return path, r.TagName, err
+	return fetchPair(dir, &r)
 }
 
 // fetchRelease returns the release tagged tag.
@@ -835,9 +962,11 @@ func parseChecksum(data []byte) (sum, name string, err error) {
 	return fields[0], strings.TrimPrefix(fields[1], "*"), nil
 }
 
-// sanityCheckBinary refuses a file that is not an ELF for machine or whose --version misses the
-// wanted tag.
-func sanityCheckBinary(path, wantVersion string, machine elf.Machine) error {
+// sanityCheckBinary refuses a file that is not an ELF for assets' machine, whose --version misses
+// the wanted tag, or that assets.check refuses (the headless build where the GUI is expected, or
+// the reverse).
+func sanityCheckBinary(path, wantVersion string, assets releaseAssets) error {
+	machine := assets.machine
 	f, err := elf.Open(path)
 	if err != nil {
 		return fmt.Errorf("%s is not an ELF executable: %w", path, err)
@@ -855,7 +984,7 @@ func sanityCheckBinary(path, wantVersion string, machine elf.Machine) error {
 	if !strings.Contains(string(out), wantVersion) {
 		return fmt.Errorf("the downloaded binary reports %q, expected tag %q — refusing to deploy", strings.TrimSpace(string(out)), wantVersion)
 	}
-	return headless.Check(path)
+	return assets.check(path)
 }
 
 // applyUpdate stops the daemon (verifying lock state), atomically replaces the binary, writes unit

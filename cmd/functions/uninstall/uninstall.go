@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
+	"sync"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
@@ -25,9 +27,14 @@ import (
 // without it still-encrypted directories can never be unlocked again.
 var deleteKeyFlag bool
 
+// keepGUIFlag leaves the desktop build (systemd.GUIBinaryPath) installed.
+var keepGUIFlag bool
+
 func init() {
 	UninstallCmd.Flags().BoolVar(&deleteKeyFlag, "delete-key", false,
 		"Also delete the fscrypt master key at /etc/app-listener/fscrypt.key after the uninstall (kept by default: without it still-encrypted directories can never be unlocked again)")
+	UninstallCmd.Flags().BoolVar(&keepGUIFlag, "keep-gui", false,
+		"Keep the desktop build (/usr/local/sbin/app-listener-gui) and its PATH symlink")
 }
 
 var UninstallCmd = &cobra.Command{
@@ -53,14 +60,16 @@ The wizard reverts everything the installer installed:
   4. cleans the orphaned fscrypt metadata left behind by the decrypted
      directories (still-encrypted directories keep their metadata)
   5. reverts the installed systemd unit, the boot-time catalog-refresh unit
-     and pacman/apt hooks an earlier version left, binary, PATH symlink
-     and config, and — after a final confirmation (default: no) and only
-     for units whose content matches the bundled sample — the per-user
+     and pacman/apt hooks an earlier version left, binary, PATH symlink,
+     the desktop build (app-listener-gui) and config, and — after a final
+     confirmation (default: no) and only for units whose content matches
+     the bundled sample — the per-user
      ssh-agent systemd units and the SSH_AUTH_SOCK / AddKeysToAgent blocks
      the installer added to the users' shell startup files and ~/.ssh/config
   6. deletes the fscrypt master key ONLY when --delete-key is passed; the
      default keeps it, because without it every still-encrypted directory
-     can never be unlocked again
+     can never be unlocked again (with directories still encrypted, it
+     asks once more first, default: keep the key)
   7. asks whether to delete the migration backups (.app_listener.backup):
      the found ones are listed (all preselected) and, after one
      confirmation, removed — they are plain unencrypted copies, so keeping
@@ -77,20 +86,51 @@ completed.`,
 
 // runUninstall drives the whole uninstall flow.
 func runUninstall(cmd *cobra.Command, args []string) error {
+	return run(Request{DeleteKey: deleteKeyFlag, KeepGUI: keepGUIFlag})
+}
+
+// Request is one uninstall: the --delete-key and --keep-gui choices.
+type Request struct {
+	DeleteKey, KeepGUI bool
+}
+
+var runMu sync.Mutex
+
+// RunWith uninstalls with every prompt on ui: the desktop GUI's uninstaller. One run at a time:
+// wizard.Use is process-wide.
+func RunWith(ui wizard.UI, req Request) error {
+	if !runMu.TryLock() {
+		return errors.New("an uninstall is already in progress")
+	}
+	defer runMu.Unlock()
+	defer wizard.Use(ui)()
+	return run(req)
+}
+
+func run(req Request) error {
 	if os.Geteuid() != 0 {
 		return errors.New("uninstall must be run as root: sudo app-listener uninstall")
 	}
 
 	// The daemon guards the very dirs being decrypted/deleted; refuse while
 	// it lives instead of stopping it — nothing gets re-enabled afterwards.
+	wizard.Stage("Checking the daemon is stopped")
 	if err := protected.RequireDaemonStopped(); err != nil {
 		return err
 	}
 
 	vault := fscrypt.New()
 
-	if err := decryptStep(vault); err != nil {
+	wizard.Stage("Decrypting")
+	stillEncrypted, err := decryptStep(vault)
+	if err != nil {
 		return err
+	}
+	deleteKey := req.DeleteKey
+	if deleteKey && len(stillEncrypted) > 0 {
+		if deleteKey, err = confirmKeyDeletion(stillEncrypted); err != nil {
+			return err
+		}
 	}
 
 	// Scan for migration backups while daemon.conf still exists (it names manual dirs the catalog
@@ -100,6 +140,7 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	wizard.Stage("Reverting the per-user setup")
 	if err := revertSSHAgents(); err != nil {
 		return err
 	}
@@ -108,11 +149,12 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := revertSystemFiles(); err != nil {
+	wizard.Stage("Removing the installed files")
+	if err := revertSystemFiles(req.KeepGUI); err != nil {
 		return err
 	}
 
-	if deleteKeyFlag {
+	if deleteKey {
 		if err := removeMasterKey(); err != nil {
 			return err
 		}
@@ -120,6 +162,7 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 		log.Infof("keeping the fscrypt master key at %s (pass --delete-key to remove it)", fscrypt.MasterKeyFile)
 	}
 
+	wizard.Stage("Cleaning up backups")
 	if err := offerBackupCleanup(backupEntries); err != nil {
 		return err
 	}
@@ -160,34 +203,53 @@ func offerBackupCleanup(entries []backups.Backup) error {
 	return nil
 }
 
+// confirmKeyDeletion asks before --delete-key locks the still-encrypted dirs forever (default: keep).
+func confirmKeyDeletion(stillEncrypted []string) (bool, error) {
+	del, err := wizard.Confirm(wizard.Question{
+		Title: fmt.Sprintf("Delete the master key although %d directory(ies) stay encrypted?", len(stillEncrypted)),
+		Description: "Without the key these can never be unlocked again:\n  " +
+			strings.Join(stillEncrypted, "\n  "),
+		Affirmative: "Delete the key",
+		Negative:    "Keep the key",
+	})
+	if err != nil {
+		return false, err
+	}
+	if !del {
+		log.Infof("keeping the fscrypt master key at %s: directories stay encrypted", fscrypt.MasterKeyFile)
+	}
+	return del, nil
+}
+
 // decryptStep scans for fscrypt-encrypted catalog dirs, verifies the master key against each, asks
 // per dir whether to decrypt permanently, decrypts the confirmed ones and cleans the fscrypt
-// metadata they orphan. No-op when nothing is encrypted.
-func decryptStep(vault *fscrypt.Vault) error {
+// metadata they orphan; it returns the dirs left encrypted. No-op when nothing is encrypted.
+func decryptStep(vault *fscrypt.Vault) ([]string, error) {
 	encrypted, scanErr := protected.ScanEncryptedCatalogDirs(vault)
 	if scanErr != nil {
-		return scanErr
+		return nil, scanErr
 	}
 	if len(encrypted) == 0 {
-		return nil
+		return nil, nil
 	}
 	if verifyErr := protected.VerifyEncryptedKeys(vault, encrypted); verifyErr != nil {
-		return verifyErr
+		return nil, verifyErr
 	}
 	toDecrypt, pickErr := pickDirsToDecrypt(encrypted)
 	if pickErr != nil {
-		return pickErr
+		return nil, pickErr
 	}
+	kept := slices.DeleteFunc(slices.Clone(encrypted), func(p string) bool { return slices.Contains(toDecrypt, p) })
 	if decErr := decryptDirectories(vault, toDecrypt); decErr != nil {
-		return decErr
+		return nil, decErr
 	}
 	if len(toDecrypt) == 0 {
-		return nil
+		return kept, nil
 	}
 	log.Infof("permanently decrypted %d directory(ies)", len(toDecrypt))
 	// Decrypted dirs left orphaned /.fscrypt metadata behind; remove it
 	// while keeping the still-encrypted directories' metadata.
-	return cleanOrphanedMetadata()
+	return kept, cleanOrphanedMetadata()
 }
 
 // pickDirsToDecrypt confirms permanent decryption per encrypted dir (default: no).
@@ -209,18 +271,12 @@ func pickDirsToDecrypt(encrypted []string) ([]string, error) {
 
 // askDecrypt shows path's permanent-decryption confirmation (default: no).
 func askDecrypt(path string) (bool, error) {
-	answer := false
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().
-			Title(fmt.Sprintf("Permanently remove fscrypt encryption from %s?", path)).
-			Description("The directory remains readable, but the encryption — and its confidentiality — is permanently removed.").
-			Affirmative("Decrypt & unprotect").
-			Negative("Keep encrypted").
-			Value(&answer),
-	)).Run(); err != nil {
-		return false, err
-	}
-	return answer, nil
+	return wizard.Confirm(wizard.Question{
+		Title:       fmt.Sprintf("Permanently remove fscrypt encryption from %s?", path),
+		Description: "The directory remains readable, but the encryption — and its confidentiality — is permanently removed.",
+		Affirmative: "Decrypt & unprotect",
+		Negative:    "Keep encrypted",
+	})
 }
 
 // decryptDirectories decrypts each dir behind a progress bar, failing

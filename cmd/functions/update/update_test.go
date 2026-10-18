@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/Virgula0/app-listener/certificates"
+	"github.com/Virgula0/app-listener/internal/headless"
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
@@ -483,6 +484,33 @@ func TestAssetsFor(t *testing.T) {
 	}
 }
 
+func TestGUIAssetsFor(t *testing.T) {
+	// _build-release.yml publishes these names; the signed checksum carries them.
+	amd, err := guiAssetsFor("amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if amd.binary != "app-listener-gui" || amd.signature != "app-listener-gui.sha256.sig" || amd.machine != elf.EM_X86_64 {
+		t.Fatalf("amd64 GUI assets = %+v", amd)
+	}
+	arm, err := guiAssetsFor("arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if arm.binary != "app-listener-gui-arm64" || arm.checksum != "app-listener-gui-arm64.sha256" || arm.machine != elf.EM_AARCH64 {
+		t.Fatalf("arm64 GUI assets = %+v", arm)
+	}
+}
+
+func TestFetchGUIWithoutAsset(t *testing.T) {
+	// The release's GUI build is best-effort: a release without it must not fail the update.
+	r := &githubRelease{TagName: "v1.0.0"}
+	path, err := fetchGUI(t.TempDir(), r)
+	if err != nil || path != "" {
+		t.Fatalf("fetchGUI on a release without a GUI asset = %q, %v; want \"\", nil", path, err)
+	}
+}
+
 func TestResolveAssetsPicksArch(t *testing.T) {
 	r := &githubRelease{TagName: "v1.0.0"}
 	for _, n := range []string{"app-listener", "app-listener.sha256", "app-listener.sha256.sig",
@@ -525,7 +553,7 @@ func TestSanityCheckBinaryRefusesOtherMachine(t *testing.T) {
 	if machine == elf.EM_AARCH64 {
 		other = elf.EM_X86_64
 	}
-	err = sanityCheckBinary(self, "v-never", other)
+	err = sanityCheckBinary(self, "v-never", releaseAssets{machine: other, check: headless.Check})
 	if err == nil || !strings.Contains(err.Error(), "built for") {
 		t.Fatalf("sanityCheckBinary with a foreign machine = %v, want a machine refusal", err)
 	}
@@ -534,7 +562,7 @@ func TestSanityCheckBinaryRefusesOtherMachine(t *testing.T) {
 	if err := os.WriteFile(notELF, []byte("#!/bin/sh\necho v1.0.0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := sanityCheckBinary(notELF, "v1.0.0", machine); err == nil {
+	if err := sanityCheckBinary(notELF, "v1.0.0", releaseAssets{machine: machine, check: headless.Check}); err == nil {
 		t.Fatal("sanityCheckBinary accepted a non-ELF file")
 	}
 }
@@ -561,7 +589,6 @@ func TestFetchReleaseByTag(t *testing.T) {
 		t.Fatal("a missing tag must fail")
 	}
 }
-
 
 // recordUI is a wizard.UI that records the changelog it was shown and answers Confirm with answer.
 type recordUI struct {
@@ -615,7 +642,7 @@ func TestConfirmUpdateWithoutTerminalOrUIRefuses(t *testing.T) {
 func TestRunWithRefusesConcurrentRun(t *testing.T) {
 	runMu.Lock()
 	defer runMu.Unlock()
-	if err := RunWith(&recordUI{}, false); err == nil || !strings.Contains(err.Error(), "already in progress") {
+	if err := RunWith(&recordUI{}, false, true); err == nil || !strings.Contains(err.Error(), "already in progress") {
 		t.Fatalf("RunWith during a run = %v, want an in-progress refusal", err)
 	}
 }

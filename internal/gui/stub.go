@@ -9,4 +9,4 @@ const Available = false
 
 // Run is unreachable in the default build (the --gui entry checks Available and errors out); it
 // exists only so the package compiles without the `gui` tag.
-func Run(Options) error { return nil }
+func Run(*Options) error { return nil }

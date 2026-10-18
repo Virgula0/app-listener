@@ -24,10 +24,13 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// stagedBinary is the signature-verified headless release the installer deploys, downloaded into
-// the page's root-only staging directory so nobody else can swap it before the deploy reads it.
+// stagedBinary is the signature-verified release the installer deploys (its headless build as the
+// daemon, its desktop build at systemd.GUIBinaryPath), downloaded into the page's root-only staging
+// directory so nobody else can swap it before the deploy reads it. guiPath "" = the release has no
+// desktop build.
 type stagedBinary struct {
-	path, sha, tag string
+	path, sha, tag  string
+	guiPath, guiSha string
 }
 
 // binSource is the release channel the headless build is downloaded from. Only signed releases:
@@ -46,12 +49,14 @@ var srcLabels = map[binSource]string{
 	srcPreRelease:  "Latest pre-release",
 }
 
-// installedBinary is what systemd.InstallBinaryPath holds now.
+// installedBinary is what systemd.InstallBinaryPath holds now; guiVersion is the desktop build's
+// at systemd.GUIBinaryPath ("" = not installed).
 type installedBinary struct {
-	present bool
-	version string
-	sha     string
-	err     error
+	present    bool
+	version    string
+	sha        string
+	err        error
+	guiVersion string
 }
 
 type installAction struct {
@@ -66,8 +71,9 @@ type installAction struct {
 
 var installActions = []installAction{
 	{InstallWizard, "shield-check", theme.ColorNamePrimary, "Install wizard", "install",
-		"Pick the users and folders to protect, review daemon.conf, encrypt with fscrypt and start the daemon. " +
-			"Safe to re-run: a finished or interrupted install is resumed.", true},
+		"Pick the users and folders to protect, review daemon.conf, encrypt with fscrypt and start the daemon, " +
+			"then install the release's desktop build as app-listener-gui. Safe to re-run: a finished or " +
+			"interrupted install is resumed.", true},
 	{InstallRefreshCatalog, "arrow-clockwise", theme.ColorNameSuccess, "Refresh catalog whitelists",
 		"install --refresh-catalog-only", "Re-expand the catalog's whitelists for every guarded folder, show the " +
 			"diff and rewrite daemon.conf. Your own sections are kept. Live reloads the running daemon instead of " +
@@ -93,6 +99,8 @@ type installPage struct {
 	bin      *stagedBinary
 	present  installedBinary
 	daemonUp bool
+	// daemonProc is a daemon process running outside systemd (uninstall refuses it too).
+	daemonProc bool
 
 	installedT, daemonT, windowT *statusTile
 	binTile                      *iconTile
@@ -101,8 +109,9 @@ type installPage struct {
 	binInfo, binIntro, binNote   *widget.Label
 	binBtn                       *handButton
 	source                       binSource
-	meta, live                   *widget.Check
+	meta, live, withGUI          *widget.Check
 	binButtons                   []*handButton
+	uninst                       uninstallCard
 }
 
 func newInstallPage(s *shell) *installPage {
@@ -114,23 +123,29 @@ func newInstallPage(s *shell) *installPage {
 func (p *installPage) view() fyne.CanvasObject {
 	p.installedT = newStatusTile("terminal-window", "Installed binary")
 	p.daemonT = newStatusTile("pulse", "Daemon")
-	p.windowT = newStatusTile("house", "This window")
-	p.windowT.set(true, p.s.opts.Version, "The desktop build. It is never deployed as the daemon: the daemon "+
-		"runs the headless build below.", colorInfo)
+	p.windowT = newStatusTile("sidebar-simple", "Desktop build")
 
 	p.meta = widget.NewCheck("Log denied metadata inspections", nil)
 	p.live = widget.NewCheck("Live: keep the daemon running", nil)
+	p.withGUI = widget.NewCheck("Also install the desktop build (app-listener-gui)", nil)
+	p.withGUI.Checked = true
 
 	over := newFadeVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), container.NewVBox(
 		container.NewGridWithColumns(3, p.installedT.card, p.daemonT.card, p.windowT.card),
-		sectionTitle("DAEMON BINARY"),
+		sectionTitle("RELEASE"),
 		p.binaryCard(),
 		sectionTitle("OPTIONS"),
-		newPanel(container.NewVBox(p.meta, mutedText("Installs the daemon unit without "+
-			"--no-log-metadata-blocks, so denied process inspections (op=PTRACE mode=READ) are logged. Use it "+
-			"to diagnose an app that breaks with nothing logged. Applies to every action that writes the unit."))),
+		newPanel(container.NewVBox(
+			p.withGUI, mutedText("Once the wizard completes, the staged release's desktop build is installed at "+
+				systemd.GUIBinaryPath+" (symlinked in /usr/local/bin): run it with sudo app-listener-gui --gui. "+
+				"It is verified like the headless build, and Update keeps it on the daemon's release."),
+			p.meta, mutedText("Installs the daemon unit without "+
+				"--no-log-metadata-blocks, so denied process inspections (op=PTRACE mode=READ) are logged. Use it "+
+				"to diagnose an app that breaks with nothing logged. Applies to every action that writes the unit."))),
 		sectionTitle("ACTIONS"),
 		p.actionGrid(),
+		sectionTitle("UNINSTALL"),
+		p.uninstallCard(),
 	)))
 	root := p.mount(over, "Back to Install")
 	p.renderBinary()
@@ -169,7 +184,7 @@ func (p *installPage) binaryCard() fyne.CanvasObject {
 	p.source = sources[0]
 
 	p.binHead = container.NewBorder(nil, nil, p.binTile, nil,
-		container.NewVBox(boldLabel("Headless build to deploy"), container.NewHBox(p.binState)))
+		container.NewVBox(boldLabel("Release to deploy"), container.NewHBox(p.binState)))
 	source := container.NewBorder(nil, nil, boldLabel("Source"), p.binBtn, pick)
 	p.binCard = container.NewVBox(p.binHead, source, p.binIntro, p.binInfo, p.binNote)
 	p.renderSource()
@@ -177,11 +192,12 @@ func (p *installPage) binaryCard() fyne.CanvasObject {
 }
 
 func (p *installPage) renderSource() {
-	const verified = " Its Ed25519 signature, checksum and GitHub digest are verified before anything is " +
-		"installed. A network whitelist active in this window would block the download."
+	const verified = " Its headless build becomes the daemon and its desktop build is installed as " +
+		"app-listener-gui. Each one's Ed25519 signature, checksum and GitHub digest are verified before " +
+		"anything is installed. A network whitelist active in this window would block the download."
 	switch p.source {
 	case srcThisVersion:
-		p.binIntro.SetText("The headless asset of this window's own release, " + p.s.opts.Version + "." + verified)
+		p.binIntro.SetText("This window's own release, " + p.s.opts.Version + "." + verified)
 	case srcStable:
 		p.binIntro.SetText("The newest stable release (vX.Y.Z), what update installs by default." + verified)
 	case srcPreRelease:
@@ -229,8 +245,12 @@ func (p *installPage) renderBinary() {
 		p.binInfo.Hide()
 	} else {
 		p.binTile.Set("shield-check", theme.ColorNameSuccess)
-		p.binState.Set("release "+p.bin.tag+" · signature verified", theme.ColorNameSuccess)
-		p.binInfo.SetText("sha256 " + p.bin.sha + "\n" + p.bin.path)
+		p.binState.Set("release "+p.bin.tag+" · signatures verified", theme.ColorNameSuccess)
+		info := "daemon   sha256 " + p.bin.sha + "\n         " + p.bin.path
+		if p.bin.guiPath != "" {
+			info += "\ndesktop  sha256 " + p.bin.guiSha + "\n         " + p.bin.guiPath
+		}
+		p.binInfo.SetText(info)
 		p.binInfo.Show()
 	}
 	note := ""
@@ -248,22 +268,32 @@ func (p *installPage) renderBinary() {
 			b.Enable()
 		}
 	}
+	if p.bin != nil && p.bin.guiPath == "" {
+		p.withGUI.Disable()
+	} else {
+		p.withGUI.Enable()
+	}
 	p.renderInstalled()
 }
 
 // versionNote warns when the staged build is another version than this window, whose installer code
-// writes daemon.conf.
+// writes daemon.conf, or ships no desktop build.
 func (p *installPage) versionNote() string {
-	if p.s.opts.Release && p.bin.tag == p.s.opts.Version {
-		return ""
+	var notes []string
+	if !p.s.opts.Release || p.bin.tag != p.s.opts.Version {
+		name := p.s.opts.Version
+		if !p.s.opts.Release {
+			name = "a development build"
+		}
+		notes = append(notes, "Not this window's version: this window is "+name+", and its installer writes "+
+			"daemon.conf. Before the service is enabled the deployed build checks that config (daemon --check); "+
+			"the install stops if it can't load it.")
 	}
-	name := p.s.opts.Version
-	if !p.s.opts.Release {
-		name = "a development build"
+	if p.bin.guiPath == "" {
+		notes = append(notes, "This release ships no desktop build for this architecture: the wizard installs "+
+			"only the daemon.")
 	}
-	return "Not this window's version: this window is " + name + ", and its installer writes daemon.conf. " +
-		"Before the service is enabled the deployed build checks that config (daemon --check); the install " +
-		"stops if it can't load it."
+	return strings.Join(notes, "\n")
 }
 
 func (p *installPage) renderInstalled() {
@@ -288,32 +318,57 @@ func (p *installPage) renderInstalled() {
 	} else {
 		p.daemonT.set(true, "stopped", "No daemon is running.", theme.ColorNameWarning)
 	}
+	p.renderDesktop()
+	p.renderUninstall()
+}
+
+// renderDesktop shows the desktop build at systemd.GUIBinaryPath. This window is never deployed as
+// the daemon, nor copied there: the wizard installs the staged release's own desktop build.
+func (p *installPage) renderDesktop() {
+	ib := p.present
+	switch {
+	case ib.guiVersion == "":
+		p.windowT.set(true, "not installed", "The wizard installs the staged release's desktop build at "+
+			systemd.GUIBinaryPath+". This window is "+p.s.opts.Version+".", colorMuted)
+	case ib.present && ib.guiVersion != ib.version:
+		p.windowT.set(true, ib.guiVersion, "Not the daemon's version ("+ib.version+"): the wizard and Update "+
+			"install the matching one. This window is "+p.s.opts.Version+".", theme.ColorNameWarning)
+	default:
+		p.windowT.set(true, ib.guiVersion, systemd.GUIBinaryPath+". This window is "+p.s.opts.Version+".",
+			theme.ColorNameSuccess)
+	}
 }
 
 // refreshStatus re-reads the installed binary and the daemon off the UI goroutine.
 func (p *installPage) refreshStatus() {
-	versionOf := p.hooks.InstalledVersion
+	versionOf, guiVersionOf := p.hooks.InstalledVersion, p.hooks.InstalledGUIVersion
 	var ib installedBinary
-	var up bool
+	var up, proc bool
 	p.s.background(func() {
-		ib = readInstalled(versionOf)
+		ib = readInstalled(versionOf, guiVersionOf)
 		up = protected.DaemonRunning()
+		pids, err := protected.FindDaemonProcesses("/proc")
+		proc = err != nil || len(pids) > 0
 	}, func() {
-		p.present, p.daemonUp = ib, up
+		p.present, p.daemonUp, p.daemonProc = ib, up, proc
 		p.renderInstalled()
 	})
 }
 
-// readInstalled execs and hashes the installed binary from this (non-daemon) process.
-// TODO(self-binary-guard): see update.RunWith.
-func readInstalled(versionOf func() string) installedBinary {
+// readInstalled execs and hashes the installed binary from this (non-daemon) process, and asks the
+// desktop build's version. TODO(self-binary-guard): see update.RunWith.
+func readInstalled(versionOf, guiVersionOf func() string) installedBinary {
+	var guiVersion string
+	if guiVersionOf != nil {
+		guiVersion = guiVersionOf()
+	}
 	if _, err := os.Stat(systemd.InstallBinaryPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return installedBinary{}
+			return installedBinary{guiVersion: guiVersion}
 		}
-		return installedBinary{err: err}
+		return installedBinary{err: err, guiVersion: guiVersion}
 	}
-	ib := installedBinary{present: true, version: "unknown"}
+	ib := installedBinary{present: true, version: "unknown", guiVersion: guiVersion}
 	if versionOf != nil {
 		ib.version = versionOf()
 	}
@@ -325,6 +380,37 @@ func readInstalled(versionOf func() string) installedBinary {
 	defer f.Close()
 	ib.sha, ib.err = hashReader(f)
 	return ib
+}
+
+// stageRelease checks that rel's builds are what they claim (headless, desktop) and hashes them.
+func stageRelease(rel StagedRelease) (*stagedBinary, error) {
+	if err := headless.Check(rel.Binary); err != nil {
+		return nil, err
+	}
+	sb := &stagedBinary{path: rel.Binary, tag: rel.Tag, guiPath: rel.GUI}
+	var err error
+	if sb.sha, err = hashFile(rel.Binary); err != nil {
+		return nil, err
+	}
+	if rel.GUI == "" {
+		return sb, nil
+	}
+	if checkErr := headless.CheckGUI(rel.GUI); checkErr != nil {
+		return nil, checkErr
+	}
+	if sb.guiSha, err = hashFile(rel.GUI); err != nil {
+		return nil, err
+	}
+	return sb, nil
+}
+
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	return hashReader(f)
 }
 
 func hashReader(r io.Reader) (string, error) {
@@ -343,6 +429,9 @@ func (p *installPage) startAction(a *installAction) {
 		Live: a.mode == InstallRefreshCatalog && p.live.Checked}
 	if p.bin != nil {
 		req.Binary = p.bin.path
+		if p.withGUI.Checked {
+			req.GUIBinary = p.bin.guiPath
+		}
 	}
 	run := p.hooks.Run
 	p.begin(a.title, a.icon, func(ui wizard.UI) error {
@@ -387,34 +476,21 @@ func (p *installPage) download(src binSource) {
 		}
 		restore := wizard.Use(ui)
 		defer restore()
-		var path, tag string
+		var rel StagedRelease
 		var err error
 		if src == srcThisVersion {
 			ui.Stage("Downloading and verifying " + thisTag)
-			tag = thisTag
-			path, err = fetch(tag, dir)
+			rel, err = fetch(thisTag, dir)
 		} else {
 			ui.Stage("Downloading and verifying the " + strings.ToLower(srcLabels[src]))
-			path, tag, err = fetchLatest(src == srcPreRelease, dir)
+			rel, err = fetchLatest(src == srcPreRelease, dir)
 		}
 		if err != nil {
 			return err
 		}
-		ui.Stage("Checking it is the headless build")
-		if checkErr := headless.Check(path); checkErr != nil {
-			return checkErr
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		sum, err := hashReader(f)
-		if err != nil {
-			return err
-		}
-		staged = &stagedBinary{path: path, sha: sum, tag: tag}
-		return nil
+		ui.Stage("Checking the headless and desktop builds")
+		staged, err = stageRelease(rel)
+		return err
 	}, func() {
 		p.bin = staged
 		p.renderBinary()
