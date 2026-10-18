@@ -48,8 +48,6 @@ jobs:
     with:
       version: ${{ needs.meta.outputs.tag }}
       ref: ${{ github.sha }}
-    secrets:
-      signing-key: ${{ secrets.RELEASE_SIGNING_KEY }}
 
   release:
     needs: [meta, build]
