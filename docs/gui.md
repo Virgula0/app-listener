@@ -182,7 +182,9 @@ directories. A wrong password can be retried (the daemon's lockout applies).
 
 **Edit protected files** opens one directory in a tree and an editor, live (the daemon grants write
 access to it for the session) or offline (the daemon must be stopped; the directory is unlocked
-with the master key and locked again when the session ends). Ctrl+S saves. Binaries, symlinks and
+with the master key and locked again when the session ends). When only the offline flow applies
+and a daemon runs (no password, or its control socket is missing), the card says to stop it and
+**Start** stays disabled; so does **Set password** for an install with no password yet. Ctrl+S saves. Binaries, symlinks and
 files over 2 MiB are refused; **New file**, **New folder**, **Permissions**, **Owner** (a login
 user) and **Delete** work as in the terminal editor. Typing and using the session's controls is
 activity for the idle timeout. If the daemon ends the session (idle timeout, reload), the page
@@ -289,7 +291,7 @@ load it.
 | Action | CLI equivalent | Needs the staged build |
 |---|---|---|
 | Install wizard | `install` | yes |
-| Refresh catalog whitelists (Live: keep the daemon running) | `install --refresh-catalog-only` (`--live`) | no |
+| Refresh catalog whitelists (Live: keep the daemon running, on by default) | `install --refresh-catalog-only` (`--live`) | no |
 | Protect new catalog folders | `install --diff-catalog` | no |
 | Restore backups | `install --restore-backups` | no |
 | Delete backups | `install --delete-post-backups` | no |
@@ -301,6 +303,14 @@ It is disabled when the staged release has no desktop build.
 **Log denied metadata inspections** is `--allow-metadata-output`. There is no `--yes`: every
 confirmation is asked. Restore and Delete backups list the backups found, then ask once more naming
 each one; Restore is refused while the daemon runs, Delete is not.
+
+A card whose action the installer would refuse says why and keeps **Start** disabled: Restore
+while any daemon runs (`sudo systemctl stop app-listener-daemon` first, which locks its folders
+again); the wizard, Protect new catalog folders and a non-live refresh stop a systemd daemon
+themselves, so only a daemon running outside systemd disables them; a live refresh needs the
+daemon running under systemd. The install wizard is also disabled once an installation has
+completed (`/etc/app-listener/install-complete`, see [installation](installation.md#the-install-wizard)):
+uninstall first to run it again. The window never stops the daemon itself.
 
 The wizard needs the installed binary to be identical to the staged build, as the terminal
 wizard needs it to be the one running: if they differ, update it first (the Update workspace, or

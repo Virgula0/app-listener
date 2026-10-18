@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
@@ -26,8 +27,10 @@ func (p *protectedPage) fillPasswordBox() {
 	switch {
 	case !p.pw.Configured && p.pw.DaemonRunning:
 		set.Disable()
-		p.pwBox.Add(hfill(mutedText("No password (an install older than the mandatory one). Stop the daemon "+
-			"to set it here, or re-run the installer."), set))
+		note := warnText()
+		setWarn(note, daemonStopNote(true, false)+" Or re-run the installer.")
+		p.pwBox.Add(hfill(container.NewVBox(mutedText("No password (an install older than the mandatory one): "+
+			"a first one is set only with the daemon stopped."), note), set))
 	case !p.pw.Configured:
 		p.pwBox.Add(hfill(mutedText("No password: live mode is off until one is set."), set))
 	default:

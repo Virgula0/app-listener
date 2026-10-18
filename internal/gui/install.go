@@ -72,8 +72,8 @@ type installAction struct {
 var installActions = []installAction{
 	{InstallWizard, "shield-check", theme.ColorNamePrimary, "Install wizard", "install",
 		"Pick the users and folders to protect, review daemon.conf, encrypt with fscrypt and start the daemon, " +
-			"then install the release's desktop build as app-listener-gui. Safe to re-run: a finished or " +
-			"interrupted install is resumed.", true},
+			"then install the release's desktop build as app-listener-gui. An interrupted install is resumed; " +
+			"after a completed one, uninstall first to run it again.", true},
 	{InstallRefreshCatalog, "arrow-clockwise", theme.ColorNameSuccess, "Refresh catalog whitelists",
 		"install --refresh-catalog-only", "Re-expand the catalog's whitelists for every guarded folder, show the " +
 			"diff and rewrite daemon.conf. Your own sections are kept. Live reloads the running daemon instead of " +
@@ -101,6 +101,11 @@ type installPage struct {
 	daemonUp bool
 	// daemonProc is a daemon process running outside systemd (uninstall refuses it too).
 	daemonProc bool
+	// loaded: the daemon state above has been read once.
+	loaded bool
+	// cert is the completed-install record (nil = none); certErr is why it couldn't be read.
+	cert    *protected.InstallCert
+	certErr error
 
 	installedT, daemonT, windowT *statusTile
 	binTile                      *iconTile
@@ -110,8 +115,16 @@ type installPage struct {
 	binBtn                       *handButton
 	source                       binSource
 	meta, live, withGUI          *widget.Check
-	binButtons                   []*handButton
+	gates                        []actionGate
 	uninst                       uninstallCard
+}
+
+// actionGate is an action card's Start button and the note that says why it is refused.
+type actionGate struct {
+	a    *installAction
+	btn  *handButton
+	note *widget.Label
+	box  *fyne.Container
 }
 
 func newInstallPage(s *shell) *installPage {
@@ -126,7 +139,8 @@ func (p *installPage) view() fyne.CanvasObject {
 	p.windowT = newStatusTile("sidebar-simple", "Desktop build")
 
 	p.meta = widget.NewCheck("Log denied metadata inspections", nil)
-	p.live = widget.NewCheck("Live: keep the daemon running", nil)
+	p.live = widget.NewCheck("Live: keep the daemon running", func(bool) { p.renderActions() })
+	p.live.Checked = true
 	p.withGUI = widget.NewCheck("Also install the desktop build (app-listener-gui)", nil)
 	p.withGUI.Checked = true
 
@@ -216,21 +230,22 @@ func (p *installPage) actionGrid() fyne.CanvasObject {
 		if a.mode == InstallWizard {
 			btn.Importance = widget.HighImportance
 		}
-		if a.needsBin {
-			p.binButtons = append(p.binButtons, btn)
-		}
 		flag := widget.NewLabel(a.flag)
 		flag.TextStyle = fyne.TextStyle{Monospace: true}
 		flag.Importance = widget.LowImportance
 		flag.SizeName = theme.SizeNameCaptionText
 		top := container.NewVBox(newIconTile(a.icon, a.color, 40), boldLabel(a.title), flag, mutedText(a.desc))
-		bottom := container.NewHBox(btn)
-		if a.mode == InstallRefreshCatalog {
-			bottom = container.NewVBox(p.live, container.NewHBox(btn))
-		}
+		bottom := container.NewVBox()
 		if a.needsBin {
-			bottom = container.NewVBox(mutedText("Needs the headless build above."), bottom)
+			bottom.Add(mutedText("Needs the headless build above."))
 		}
+		if a.mode == InstallRefreshCatalog {
+			bottom.Add(p.live)
+		}
+		note := warnText()
+		bottom.Add(note)
+		bottom.Add(container.NewHBox(btn))
+		p.gates = append(p.gates, actionGate{a: a, btn: btn, note: note, box: bottom})
 		grid.Add(newPanel(container.NewBorder(top, bottom, nil, nil)))
 	}
 	return grid
@@ -261,13 +276,6 @@ func (p *installPage) renderBinary() {
 	p.binNote.Hidden = note == ""
 	p.binHead.Refresh()
 	p.binCard.Refresh() // binInfo's and binNote's visibility changed
-	for _, b := range p.binButtons {
-		if p.bin == nil {
-			b.Disable()
-		} else {
-			b.Enable()
-		}
-	}
 	if p.bin != nil && p.bin.guiPath == "" {
 		p.withGUI.Disable()
 	} else {
@@ -319,7 +327,60 @@ func (p *installPage) renderInstalled() {
 		p.daemonT.set(true, "stopped", "No daemon is running.", theme.ColorNameWarning)
 	}
 	p.renderDesktop()
+	p.renderActions()
 	p.renderUninstall()
+}
+
+// renderActions refuses up front what the installer would: the wizard after a completed install
+// (protected.RequireNoInstallCert); the wizard, the catalog diff and a stopped-flow refresh stop a
+// systemd daemon themselves but not one outside systemd; a live refresh needs the unit active; the
+// restore needs no daemon at all.
+func (p *installPage) renderActions() {
+	for _, g := range p.gates {
+		note := ""
+		if p.loaded {
+			note = p.actionNote(g.a)
+		}
+		setWarn(g.note, note)
+		if note == "" && (!g.a.needsBin || p.bin != nil) {
+			g.btn.Enable()
+		} else {
+			g.btn.Disable()
+		}
+		g.box.Refresh()
+	}
+}
+
+func (p *installPage) actionNote(a *installAction) string {
+	switch a.mode {
+	case InstallRestoreBackups:
+		return daemonStopNote(p.daemonUp, p.daemonProc)
+	case InstallRefreshCatalog:
+		if p.live.Checked {
+			if !p.daemonUp {
+				return "Live needs the daemon running under systemd (locked folders hide their file names): " +
+					"start it, or untick Live to refresh with it stopped."
+			}
+			return ""
+		}
+		fallthrough
+	case InstallWizard:
+		switch {
+		case p.certErr != nil:
+			return p.certErr.Error() + ": the wizard refuses to run. Uninstall removes it."
+		case p.cert != nil:
+			return "Already installed (" + p.cert.Version + ", completed " +
+				p.cert.CompletedAt.Local().Format("2006-01-02 15:04") + "): uninstall first to run the wizard " +
+				"again. The other actions keep working on this installation."
+		case !p.daemonUp && p.daemonProc:
+			return outsideSystemdNote
+		}
+	case InstallDiffCatalog:
+		if !p.daemonUp && p.daemonProc {
+			return outsideSystemdNote
+		}
+	}
+	return ""
 }
 
 // renderDesktop shows the desktop build at systemd.GUIBinaryPath. This window is never deployed as
@@ -344,13 +405,17 @@ func (p *installPage) refreshStatus() {
 	versionOf, guiVersionOf := p.hooks.InstalledVersion, p.hooks.InstalledGUIVersion
 	var ib installedBinary
 	var up, proc bool
+	var cert *protected.InstallCert
+	var certErr error
 	p.s.background(func() {
 		ib = readInstalled(versionOf, guiVersionOf)
 		up = protected.DaemonRunning()
 		pids, err := protected.FindDaemonProcesses("/proc")
 		proc = err != nil || len(pids) > 0
+		cert, certErr = protected.ReadInstallCert()
 	}, func() {
-		p.present, p.daemonUp, p.daemonProc = ib, up, proc
+		p.present, p.daemonUp, p.daemonProc, p.loaded = ib, up, proc, true
+		p.cert, p.certErr = cert, certErr
 		p.renderInstalled()
 	})
 }

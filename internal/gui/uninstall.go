@@ -30,9 +30,7 @@ func (p *installPage) uninstallCard() fyne.CanvasObject {
 	u.deleteKey = widget.NewCheck("Also delete the fscrypt master key", nil)
 	u.btn = newButton("Uninstall", icon("trash"), p.confirmUninstall)
 	u.btn.Importance = widget.DangerImportance
-	u.note = widget.NewLabel("")
-	u.note.Wrapping = fyne.TextWrapWord
-	u.note.Importance = widget.WarningImportance
+	u.note = warnText()
 
 	flag := widget.NewLabel("uninstall")
 	flag.TextStyle = fyne.TextStyle{Monospace: true}
@@ -53,22 +51,28 @@ func (p *installPage) uninstallCard() fyne.CanvasObject {
 	return newPanel(u.box)
 }
 
+const outsideSystemdNote = "A daemon process runs outside systemd: stop it first."
+
+// daemonStopNote is why an action that needs the daemon stopped is refused ("" = none runs).
+func daemonStopNote(unit, proc bool) string {
+	switch {
+	case unit:
+		return "The daemon is running: stop it first (sudo systemctl stop " + systemd.DaemonServiceName +
+			"). Stopping it locks its folders again."
+	case proc:
+		return outsideSystemdNote
+	}
+	return ""
+}
+
 // renderUninstall enables the uninstall only with no daemon running, as the uninstaller requires.
 func (p *installPage) renderUninstall() {
 	u := &p.uninst
 	if u.btn == nil {
 		return
 	}
-	note := ""
-	switch {
-	case p.daemonUp:
-		note = "The daemon is running: stop it first (sudo systemctl stop " + systemd.DaemonServiceName +
-			"). Stopping it locks its folders again."
-	case p.daemonProc:
-		note = "A daemon process runs outside systemd: stop it first."
-	}
-	u.note.SetText(note)
-	u.note.Hidden = note == ""
+	note := daemonStopNote(p.daemonUp, p.daemonProc)
+	setWarn(u.note, note)
 	if note == "" && !p.running {
 		u.btn.Enable()
 	} else {

@@ -22,6 +22,8 @@ func TestValidateMaintenanceFlags(t *testing.T) {
 		{"diff + binary-only", maintenanceFlags{diffCatalog: true, binaryOnly: true}, "mutually exclusive"},
 		{"diff + yes", maintenanceFlags{diffCatalog: true, autoConfirm: true}, "--yes can only be used"},
 		{"diff + live", maintenanceFlags{diffCatalog: true, live: true}, "--live can only be used"},
+		{"mark-complete alone", maintenanceFlags{markComplete: true}, ""},
+		{"mark-complete + binary-only", maintenanceFlags{markComplete: true, binaryOnly: true}, "mutually exclusive"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

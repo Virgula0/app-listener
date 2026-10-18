@@ -10,9 +10,9 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// promptEditPassword asks for the mandatory edit-protected password. An existing one is kept unless
-// the user replaces it (the recovery for a forgotten password: the installer runs as root with the
-// daemon stopped, the audited bootstrap). Collected here, persisted only by writeEditPasswordHash
+// promptEditPassword asks for the mandatory edit-protected password. An existing one (a resumed
+// install) is kept unless the user replaces it: the installer runs as root with the daemon stopped,
+// the audited bootstrap. Collected here, persisted only by writeEditPasswordHash
 // from deploy() right before the daemon's first start, after every step that could abort. Returns
 // "" when the existing password is kept.
 func promptEditPassword() (string, error) {

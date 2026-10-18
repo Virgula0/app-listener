@@ -64,11 +64,21 @@ A TUI wizard that runs in a safe order:
    browsers, VPNs, password stores, crypto wallets, ...) and lets you pick which to guard.
 5. Encrypts the selected directories. Each is backed up first and the backup is verified against
    the master key.
-6. Asks for the edit-protected password (mandatory; see [edit-protected](edit-protected.md)). On a
-   re-run an existing password is kept unless you choose to replace it.
+6. Asks for the edit-protected password (mandatory; see [edit-protected](edit-protected.md)). When
+   resuming an interrupted install, an existing password is kept unless you choose to replace it.
 7. Deploys the systemd units, the binary and the config.
 8. Runs `daemon --check` on the deployed binary before enabling the service: if this kernel's
    verifier rejects the guard eBPF, the service is not enabled.
+
+An interrupted wizard (a canceled prompt, a failed step) is resumed by running it again: the
+existing master key is kept, already encrypted directories are verified and identical files are
+skipped. Once a wizard completes (daemon running and enabled, orphaned fscrypt metadata cleaned), it
+records the installation in `/etc/app-listener/install-complete` (version and time), and from then
+on the wizard refuses to run. Change a completed installation with `--diff-catalog`,
+`--refresh-catalog-only`, `edit-protected --edit-config` or [`update`](#update), or run
+[`uninstall`](#uninstall) first to start over. `--binary-only` and the other flags below are not
+affected. An installation completed before this record existed has none, so its wizard still runs
+until one completes.
 
 Earlier versions installed pacman/apt hooks and a boot unit to refresh the catalog; the wizard,
 `install --binary-only` and `update` remove them, since the daemon now refreshes the catalog itself.
@@ -175,6 +185,8 @@ sudo app-listener uninstall --keep-gui
 ```
 
 - Refuses while the daemon runs.
+- Removes the completed-install record first, so an interrupted uninstall can be followed by a
+  fresh `install`.
 - Re-scans the catalog and asks, per encrypted directory, whether to decrypt it in place for good
   (default: keep it encrypted).
 - Removes the binary, the desktop build (`app-listener-gui`, kept with `--keep-gui`), their PATH

@@ -192,6 +192,11 @@ func IsDaemonActive() bool {
 	return strings.TrimSpace(SystemctlOutput("is-active", DaemonServiceName)) == daemonActiveState
 }
 
+// IsDaemonEnabled reports whether the unit starts at boot.
+func IsDaemonEnabled() bool {
+	return strings.TrimSpace(SystemctlOutput("is-enabled", DaemonServiceName)) == daemonEnabledState
+}
+
 // ReloadDaemonIfActive sends SIGHUP (systemctl reload) if running, else no-op. For changes picked
 // up on reload, e.g. the edit-protected password file.
 func ReloadDaemonIfActive() error {

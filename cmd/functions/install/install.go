@@ -15,9 +15,11 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Virgula0/app-listener/internal/binledger"
+	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/protected"
 	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
@@ -39,6 +41,10 @@ func init() {
 		"Install the daemon unit WITHOUT --no-log-metadata-blocks, so denied metadata-only process inspections (op=PTRACE mode=READ) are logged; useful to diagnose an app that breaks with nothing logged")
 	InstallCmd.Flags().BoolP("yes", "y", false,
 		"Skip all confirmation prompts (use with --refresh-catalog-only for non-interactive use, e.g. scripts)")
+	// The GUI wizard's last step: the window isn't the app-listener binary, so the daemon's guard on
+	// /etc/app-listener denies it the completed-install record; the installed binary writes it.
+	InstallCmd.Flags().Bool("mark-complete", false, "Record a completed installation (internal: run by the GUI wizard)")
+	_ = InstallCmd.Flags().MarkHidden("mark-complete")
 }
 
 var InstallCmd = &cobra.Command{
@@ -82,8 +88,8 @@ The wizard walks through the whole installation:
      progress
   7a. asks for the edit-protected password (mandatory): it authenticates
      edit-protected's live mode and is stored hashed in binaries.db, which
-     the running daemon seals. On a re-run an existing password is kept
-     unless you choose to replace it (the recovery for a forgotten one)
+     the running daemon seals. When resuming an interrupted install an
+     existing password is kept unless you choose to replace it
   8. installs the systemd units from the embedded daemon-samples and
      writes the config to /etc/app-listener/daemon.conf (the binary is left
      as deployed). The PATH symlink /usr/local/bin/app-listener is
@@ -104,9 +110,13 @@ The wizard walks through the whole installation:
      signature is removed — existing directories keep their metadata)
  11. asks whether to delete the migration backups
 
-The installer is safe to re-run: an interrupted or completed installation
-is detected and resumed (existing master key kept, already encrypted
-directories verified, identical files skipped, backups never overwritten).
+An interrupted installation is resumed by running the wizard again
+(existing master key kept, already encrypted directories verified,
+identical files skipped, backups never overwritten). A completed one is
+recorded in /etc/app-listener/install-complete and the wizard then refuses
+to run: use the maintenance flags below or 'app-listener update', or run
+'app-listener uninstall' first to start over. --binary-only and the other
+maintenance flags are not affected.
 
 Aborting (Esc) any step stops the installer; the system is left untouched
 except for steps that already completed. A directory whose
@@ -177,6 +187,9 @@ func runInstall(cmd *cobra.Command, args []string) error {
 
 // runWizard is the installer body after the maintenance flags (steps 0-11 of the command help).
 func runWizard() error {
+	if err := protected.RequireNoInstallCert(); err != nil {
+		return err
+	}
 	if err := checkRunningBinaryMatchesInstalled(); err != nil {
 		return err
 	}
@@ -230,8 +243,40 @@ func runWizard() error {
 	if err := cleanOrphanedFscrypt(cfg); err != nil {
 		return err
 	}
+	// Before the backup prompts: keeping or skipping a backup doesn't make the install incomplete.
+	certifyInstall()
 
 	return cleanupBackups(cfg)
+}
+
+// certifyInstall records the completed install, after which the wizard refuses to run again. Under
+// the GUI the installed binary writes it (see --mark-complete). A failure only loses that refusal,
+// never protection, so it warns instead of failing a finished install.
+func certifyInstall() {
+	var err error
+	if deploySource == "" {
+		err = markComplete()
+	} else {
+		err = systemd.RunCmd(systemd.InstallBinaryPath, "install", "--mark-complete")
+	}
+	if err != nil {
+		log.Warnf("the installation completed, but recording it in %s failed: %v — the install wizard "+
+			"won't refuse a re-run", protected.InstallCertPath(), err)
+		return
+	}
+	log.Infof("installation recorded in %s: run `app-listener uninstall` before installing again",
+		protected.InstallCertPath())
+}
+
+// markComplete is --mark-complete: only a running, enabled daemon counts as installed.
+func markComplete() error {
+	if !systemd.IsDaemonActive() {
+		return errors.New("the daemon is not running: the installation is not complete")
+	}
+	if !systemd.IsDaemonEnabled() {
+		return errors.New("the daemon is not enabled across reboots: the installation is not complete")
+	}
+	return protected.WriteInstallCert(constants.Version)
 }
 
 // maintenanceFlags holds the parsed CLI flags of the install command's mutually exclusive
@@ -244,6 +289,7 @@ type maintenanceFlags struct {
 	diffCatalog    bool
 	live           bool
 	autoConfirm    bool
+	markComplete   bool
 }
 
 func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
@@ -270,6 +316,9 @@ func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
 	if f.autoConfirm, err = cmd.Flags().GetBool("yes"); err != nil {
 		return f, err
 	}
+	if f.markComplete, err = cmd.Flags().GetBool("mark-complete"); err != nil {
+		return f, err
+	}
 	return f, nil
 }
 
@@ -294,6 +343,8 @@ func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
 		return true, runRefreshCatalogOnly(f.autoConfirm, f.live)
 	case f.diffCatalog:
 		return true, runDiffCatalog()
+	case f.markComplete:
+		return true, markComplete()
 	}
 	return false, nil
 }
@@ -308,7 +359,7 @@ func validateMaintenanceFlags(f maintenanceFlags) error {
 		return errors.New("--live can only be used with --refresh-catalog-only")
 	}
 	modes := 0
-	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.refreshCatalog, f.diffCatalog} {
+	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.refreshCatalog, f.diffCatalog, f.markComplete} {
 		if on {
 			modes++
 		}

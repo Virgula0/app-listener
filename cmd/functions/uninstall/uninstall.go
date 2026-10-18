@@ -118,6 +118,10 @@ func run(req Request) error {
 	if err := protected.RequireDaemonStopped(); err != nil {
 		return err
 	}
+	// First: an uninstall interrupted past this point leaves a system the wizard may resume.
+	if err := protected.RemoveInstallCert(); err != nil {
+		return err
+	}
 
 	vault := fscrypt.New()
 

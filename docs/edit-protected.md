@@ -59,9 +59,10 @@ accepts only root peers whose executable is the app-listener binary itself.
 with the daemon running, the daemon checks it (`AUTH`) and stores the new one itself; with the
 daemon stopped, it is checked locally. Every check, the daemon's and the local one, draws on the
 same budget kept in the database: 5 wrong passwords lock all of them for a minute, and restarting
-the daemon doesn't reset it. Re-running `install` (daemon stopped) offers to replace a forgotten
-password. An install older than the mandatory password has none: `--set-password` sets the first
-one with the daemon stopped (it refuses while the daemon runs; `install` is the other way).
+the daemon doesn't reset it. A forgotten password is replaced by reinstalling: `uninstall` keeping
+the folders encrypted and the master key, then `install` (the wizard refuses while a completed
+installation is recorded). An install older than the mandatory password has none: `--set-password`
+sets the first one with the daemon stopped (it refuses while the daemon runs).
 
 ### Non-interactive writes
 

@@ -230,6 +230,21 @@ func mutedText(s string) *widget.Label {
 	return l
 }
 
+// warnText is the wrapped warning hint a card shows while its action is refused; hidden when empty.
+func warnText() *widget.Label {
+	l := widget.NewLabel("")
+	l.Wrapping = fyne.TextWrapWord
+	l.Importance = widget.WarningImportance
+	l.Hidden = true
+	return l
+}
+
+// setWarn shows s on l (hiding it when empty); the caller refreshes l's parent.
+func setWarn(l *widget.Label, s string) {
+	l.SetText(s)
+	l.Hidden = s == ""
+}
+
 // sectionTitle is an uppercase caption heading a group of cards.
 func sectionTitle(s string) fyne.CanvasObject {
 	l := widget.NewLabelWithStyle(s, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})

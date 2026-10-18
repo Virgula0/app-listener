@@ -71,6 +71,10 @@ type protectedPage struct {
 	timeout             *widget.Select
 	actions             []*handButton
 	pwBox               *fyne.Container
+	// editNote/editBox: why an offline edit is refused (a daemon runs without its control socket).
+	editNote *widget.Label
+	editBox  *fyne.Container
+	editBtn  *handButton
 }
 
 func newProtectedPage(s *shell) *protectedPage { return &protectedPage{s: s} }
@@ -86,18 +90,19 @@ func (p *protectedPage) view() fyne.CanvasObject {
 	p.timeout = widget.NewSelect(labels, nil)
 	p.timeout.Selected = "30 minutes"
 	p.pwBox = container.NewVBox()
+	p.editNote = warnText()
 
 	cards := newAdaptiveGrid(3,
 		p.actionCard("lock-simple-open", theme.ColorNamePrimary, "Edit protected files",
 			"Open one guarded directory in a two-pane editor. Live: the daemon grants write access to that "+
 				"directory for this session only. Offline (daemon stopped): it is unlocked with the master key "+
-				"and locked again when you close the editor.", p.startEdit),
+				"and locked again when you close the editor.", p.startEdit, p.editNote),
 		p.actionCard("arrows-left-right", colorInfo, "Temporary access",
 			"Let other binaries reach guarded directories (admit) or deny whitelisted ones, until you stop it. "+
-				"Live mode only.", p.startForward),
+				"Live mode only.", p.startForward, nil),
 		p.actionCard("sliders-horizontal", colorInfo, "Daemon configuration",
 			"Edit the running daemon's daemon.conf: you review the diff, then the daemon writes and reloads it. "+
-				"A configuration that fails to reload is not kept. Live mode only.", p.startConfig),
+				"A configuration that fails to reload is not kept. Live mode only.", p.startConfig, nil),
 	)
 	timeoutCard := newPanel(container.NewVBox(
 		hfill(boldLabel("Live session idle timeout"), p.timeout),
@@ -122,14 +127,41 @@ func (p *protectedPage) view() fyne.CanvasObject {
 	return p.stack
 }
 
-func (p *protectedPage) actionCard(iconName string, c fyne.ThemeColorName, title, desc string, run func()) fyne.CanvasObject {
+// actionCard builds a workflow card; note (nil = none) is its refusal hint, set by renderEditGate.
+func (p *protectedPage) actionCard(iconName string, c fyne.ThemeColorName, title, desc string, run func(),
+	note *widget.Label) fyne.CanvasObject {
 	open := newButton("Start", icon("caret-right"), run)
 	open.IconPlacement = widget.ButtonIconTrailingText
 	open.Importance = widget.LowImportance
 	p.actions = append(p.actions, open)
-	return newPanel(container.NewVBox(newIconTile(iconName, c, 48),
-		widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		mutedText(desc), container.NewHBox(open)))
+	box := container.NewVBox(newIconTile(iconName, c, 48),
+		widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), mutedText(desc))
+	if note != nil {
+		box.Add(note)
+		p.editBox, p.editBtn = box, open
+	}
+	box.Add(container.NewHBox(open))
+	return newPanel(box)
+}
+
+// offlineRefused: the offline flow applies but a daemon runs, which the backend refuses.
+func (p *protectedPage) offlineRefused() bool {
+	return p.probErr == nil && p.hello != nil && !p.hello.Live && p.pw != nil && p.pw.DaemonRunning
+}
+
+// renderEditGate disables Edit while only the refused offline flow is left.
+func (p *protectedPage) renderEditGate() {
+	note := ""
+	if p.offlineRefused() {
+		note = daemonStopNote(true, false) + " Or give it a password and restart it to edit live."
+	}
+	setWarn(p.editNote, note)
+	if note == "" {
+		p.editBtn.Enable()
+	} else {
+		p.editBtn.Disable()
+	}
+	p.editBox.Refresh()
 }
 
 // show swaps the page body; session views get the overview's right inset (clear of the scroll bar).
@@ -212,6 +244,7 @@ func (p *protectedPage) applyStatus() {
 		}
 	}
 	p.fillPasswordBox()
+	p.renderEditGate()
 }
 
 func originLabel(origin string) string {
@@ -247,6 +280,7 @@ func (p *protectedPage) begin(then func(link backendLink)) {
 		for _, b := range p.actions {
 			b.Enable()
 		}
+		p.renderEditGate()
 		if err != nil {
 			p.s.showError("edit-protected", err)
 			return
