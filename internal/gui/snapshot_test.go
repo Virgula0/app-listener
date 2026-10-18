@@ -198,13 +198,16 @@ func fillFiles(t *testing.T, s *shell, fe *snapEngines) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.files.Add(workbench.FileSpec{Path: gnupg, Recursive: true}); err != nil {
+	tg2, err := s.files.Add(workbench.FileSpec{Path: gnupg, Recursive: true})
+	if err != nil {
 		t.Fatal(err)
 	}
 	agent := ebpf.BinaryEntry{Path: "/usr/bin/ssh-agent", Comm: "ssh-agent", Hash: [32]byte{0xab, 0xcd, 0x12}}
 	if err := tg.Apply(workbench.Policy{Mode: workbench.GuardWhitelist, Binaries: []ebpf.BinaryEntry{agent}}); err != nil {
 		t.Fatal(err)
 	}
+	// Add stats real dirs; once the engines run, Spec.Path is display-only: show a home, not a TempDir.
+	ssh, tg.Spec.Path, tg2.Spec.Path = "/home/alice/.ssh", "/home/alice/.ssh", "/home/alice/.gnupg"
 	now := time.Now().UnixNano()
 	for i, ev := range []struct {
 		comm, path string

@@ -100,6 +100,25 @@ choose, started at boot and kept in step with package upgrades and self-updating
 VS Code or Steam. You set it up with `sudo app-listener install`, and change protected files later
 with `sudo app-listener edit-protected`.
 
+## Desktop app
+
+Prefer a window to a terminal? The `app-listener-gui` build puts every interactive mode in one
+desktop app: watch folders and programs live, turn what you see into a whitelist with a click,
+edit protected files, and install or update the daemon. See [Desktop GUI](docs/gui.md).
+
+```bash
+sudo app-listener-gui --gui
+```
+
+| | |
+|---|---|
+| ![Files: live activity on ~/.ssh](media/gui/files-activity.png) | ![Files: whitelist guard](media/gui/files-guard.png) |
+| **Files**: every operation on `~/.ssh` and the program behind it. Select a row to whitelist or blacklist that program. | **Guard**: only `ssh-agent` may touch `~/.ssh`; everything else is denied, root included. |
+| ![Network: connections and verdicts](media/gui/network-activity.png) | ![Protected: editing a guarded directory](media/gui/protected-edit.png) |
+| **Network**: what each program connects to, and what the network guard denied. | **Protected**: edit the daemon's guarded files; write access lasts only for this session. |
+| ![Protected: temporary access for vim](media/gui/protected-forward.png) | ![Install wizard](media/gui/install-wizard.png) |
+| **Temporary access**: let `vim` into `~/.ssh` until you stop it, and see each of its operations. | **Install**: the same wizard as `sudo app-listener install`, step by step. |
+
 ## Limits
 
 app-listener decides *which program* may read a file, not *why*. If the AWS CLI is allowed into

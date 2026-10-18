@@ -11,7 +11,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `6e8302b1`
+- Built from commit: `7d2b7248`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -103,7 +103,7 @@
 - render.go
 - controlServer
 - github.com/charmbracelet/bubbles/textarea.Model
-- recoverFileInPlace
+- openFileVaultWithMasterKey
 - liveSession
 - daemon mode (fscrypt + whitelist lifecycle)
 - FORWARD temporary -w/-b whitelist grants
@@ -141,7 +141,7 @@
 - launch_probe.c
 - install.sh
 - mc_tag.h
-- openFileVaultWithMasterKey
+- recoverFileInPlace
 - make test-integration (rootful Docker suite)
 - IntegrationSuite
 - supersede_probe.c
@@ -167,7 +167,7 @@
 - ConfinedEntry
 - EventType
 - layout.go
-- .runEditorHarness
+- copyRegularAt
 - newTestTarget
 - Installation
 - backend_test.go
@@ -179,7 +179,7 @@
 - feed.go
 - shell
 - runView
-- WithSuspectsFrom
+- writeWithin
 - parseGuardEvent
 - fileedit_symlink_test.go
 - ReadInstallCert
@@ -197,36 +197,36 @@
 - Binary trust
 - guard: block file access by program
 - network-guard: block network access by program
-- bpfLsmListed
+- WithSuspectsFrom
 - Development
 - app-listener documentation
 - Self-updating apps and the catalog
 - network-monitor: see what a program talks to
 - vouchedDevs
-- DiscoverInfraBinaries
+- bpfLsmListed
 - edit-protected
 - monitor: see what touches a path
 - kernel-prof.sh
-- launchKey
+- DiscoverInfraBinaries
 - pathCache
 - installHooks
-- harnessSuite
-- writeWithin
+- launchKey
+- CleanupStalePins
 - runNetworkGuard
-- copyRegularAt
+- Vault
 - Desktop GUI
 - IntegrationSuite
 - Ledger
 - inode_dev.h
 - .eventTypeAllowed
-- CleanupStalePins
-- copyXattrs
+- harnessSuite
+- .runEditorHarness
 - golang.org/x/sys/unix.Timespec
-- VerifyInstalledResourcesLocked
+- copyXattrs
 - buildOneGuard
 - MulticallError
 - bleedLayout
-- Vault
+- VerifyInstalledResourcesLocked
 - TestMain
 
 ## God Nodes (most connected - your core abstractions)
@@ -590,9 +590,9 @@ Nodes (5): swapFile(), startControlServer(), TestRecordFailureLockout(), configE
 Cohesion: 0.15
 Nodes (19): findButton, span, findAll(), Finder, lowerRunes(), NewFinder(), newFindInput(), overlay() (+11 more)
 
-### Community 87 - "recoverFileInPlace"
-Cohesion: 0.31
-Nodes (13): classifyRegularFileTarget(), clearRecovery(), EnsureRecoverySidecarPlaceholder(), fileVaultRecoverPath(), recoverFileInPlace(), rejectSidecarSymlink(), stageRecovery(), inode() (+5 more)
+### Community 87 - "openFileVaultWithMasterKey"
+Cohesion: 0.18
+Nodes (14): deriveFileVaultSubkey(), newFileVaultAEAD(), openFileVault(), openFileVaultWithMasterKey(), sealFileVault(), sealFileVaultWithMasterKey(), mustSubkey(), TestDeriveFileVaultSubkeyDeterministicAndSeparated() (+6 more)
 
 ### Community 88 - "liveSession"
 Cohesion: 0.27
@@ -718,9 +718,9 @@ Nodes (6): die(), download(), info(), install.sh script, usage(), warn()
 Cohesion: 0.24
 Nodes (10): mc_attest(), mc_basename(), mc_leader_start(), mc_stamp_fork(), mc_stamp_free(), mc_tag_bits(), netg_exec_applet(), netg_task_free() (+2 more)
 
-### Community 127 - "openFileVaultWithMasterKey"
-Cohesion: 0.18
-Nodes (14): deriveFileVaultSubkey(), newFileVaultAEAD(), openFileVault(), openFileVaultWithMasterKey(), sealFileVault(), sealFileVaultWithMasterKey(), mustSubkey(), TestDeriveFileVaultSubkeyDeterministicAndSeparated() (+6 more)
+### Community 127 - "recoverFileInPlace"
+Cohesion: 0.31
+Nodes (13): classifyRegularFileTarget(), clearRecovery(), EnsureRecoverySidecarPlaceholder(), fileVaultRecoverPath(), recoverFileInPlace(), rejectSidecarSymlink(), stageRecovery(), inode() (+5 more)
 
 ### Community 128 - "make test-integration (rootful Docker suite)"
 Cohesion: 0.40
@@ -790,6 +790,10 @@ Nodes (17): snapEngines, snapMonitor, BpfEvent, EventType, eventUnitTest, FileEv
 Cohesion: 0.23
 Nodes (10): adaptiveGrid, checkGrid, gapVBox, TestAdaptiveGridDropsColumns(), cellMin(), newAdaptiveGrid(), newCheckGrid(), newGapVBox() (+2 more)
 
+### Community 156 - "copyRegularAt"
+Cohesion: 0.31
+Nodes (10): copyDirContents(), copyEntry(), copyRegularAt(), copySymlinkAt(), copyTreeRoot(), fchownFromInfo(), futimesFromInfo(), readDirNames() (+2 more)
+
 ### Community 157 - "newTestTarget"
 Cohesion: 0.09
 Nodes (22): FileEngines, NewFiles(), newTestTarget(), since(), TestAddRefusesOverlap(), TestApplyFromBlacklistFailureKeepsOldGuard(), TestApplyFromBlacklistOverlaps(), TestApplyFromWhitelistFailureReportsUnguarded() (+14 more)
@@ -830,9 +834,9 @@ Nodes (31): installUI, multiAnswer, pageDef, pageID, resizeWatch, shell, sizedDi
 Cohesion: 0.07
 Nodes (15): logGrid, logHook, logLine, runHost, runView, stageItem, stageState, logRow() (+7 more)
 
-### Community 168 - "WithSuspectsFrom"
-Cohesion: 0.36
-Nodes (4): WithSuspectsFrom(), RealNetEngines(), netguardHarness, Option
+### Community 168 - "writeWithin"
+Cohesion: 0.22
+Nodes (9): atomicWriteAt(), descendNoFollow(), refuseExistingSymlink(), TestWriteWithin_PlainFile(), TestWriteWithin_RefusesSymlinkDirComponent(), TestWriteWithin_RefusesSymlinkTarget(), TestWriteWithin_RejectsEscape(), writeAndSync() (+1 more)
 
 ### Community 169 - "parseGuardEvent"
 Cohesion: 0.25
@@ -894,9 +898,9 @@ Nodes (6): Executables inside the guarded tree, Flags, guard: block file access 
 Cohesion: 0.33
 Nodes (6): Code integrity (`-w`), Flags, Multicall binaries, network-guard: block network access by program, Replaced binaries, What code integrity cannot stop
 
-### Community 189 - "bpfLsmListed"
-Cohesion: 0.33
-Nodes (7): bpfLsmListed(), CheckBPFLSM(), CheckBPFLSMAt(), TestBpfLsmListed(), TestBpfLsmListedMissingFile(), TestCheckBPFLSM(), writeLSM()
+### Community 189 - "WithSuspectsFrom"
+Cohesion: 0.36
+Nodes (4): WithSuspectsFrom(), RealNetEngines(), netguardHarness, Option
 
 ### Community 190 - "Development"
 Cohesion: 0.33
@@ -918,9 +922,9 @@ Nodes (4): Events, Flags, Multicall binaries, network-monitor: see what a progra
 Cohesion: 0.33
 Nodes (6): isFuseType(), parseMajorMinor(), TestParseMajorMinorMatchesStatEncoding(), TestVouchedDevs(), TestVouchedDevsFailsClosed(), vouchedDevs()
 
-### Community 195 - "DiscoverInfraBinaries"
+### Community 195 - "bpfLsmListed"
 Cohesion: 0.33
-Nodes (6): DiscoverInfraBinaries(), infraFromRunning(), runningExecutables(), pathIsRunning(), TestDiscoverInfraBinaries(), TestInfraFromRunning()
+Nodes (7): bpfLsmListed(), CheckBPFLSM(), CheckBPFLSMAt(), TestBpfLsmListed(), TestBpfLsmListedMissingFile(), TestCheckBPFLSM(), writeLSM()
 
 ### Community 196 - "edit-protected"
 Cohesion: 0.25
@@ -930,6 +934,10 @@ Nodes (8): edit-protected, Editing the daemon config, Editor keys, Exit audit, N
 Cohesion: 0.67
 Nodes (3): Events, Flags, monitor: see what touches a path
 
+### Community 199 - "DiscoverInfraBinaries"
+Cohesion: 0.33
+Nodes (6): DiscoverInfraBinaries(), infraFromRunning(), runningExecutables(), pathIsRunning(), TestDiscoverInfraBinaries(), TestInfraFromRunning()
+
 ### Community 200 - "pathCache"
 Cohesion: 0.39
 Nodes (4): evalSymlinksOrEmpty(), newPathCache(), pathCache, pathCacheEntry
@@ -938,17 +946,13 @@ Nodes (4): evalSymlinksOrEmpty(), newPathCache(), pathCache, pathCacheEntry
 Cohesion: 0.18
 Nodes (10): installHooks(), releaseBuild(), Requested(), Run(), TestRequested(), TestSubcommandOutranksGUI(), Execute(), initLogger() (+2 more)
 
-### Community 203 - "writeWithin"
-Cohesion: 0.22
-Nodes (9): atomicWriteAt(), descendNoFollow(), refuseExistingSymlink(), TestWriteWithin_PlainFile(), TestWriteWithin_RefusesSymlinkDirComponent(), TestWriteWithin_RefusesSymlinkTarget(), TestWriteWithin_RejectsEscape(), writeAndSync() (+1 more)
+### Community 203 - "CleanupStalePins"
+Cohesion: 0.40
+Nodes (5): CleanupStalePins(), genOfPinFile(), TestCleanupStalePins(), TestCleanupStalePinsMissingBase(), TestGenOfPinFile()
 
 ### Community 204 - "runNetworkGuard"
 Cohesion: 0.08
 Nodes (22): ParseNetEventsFlag(), computeGuardBinaries(), confirmUnsafe(), discoverInfra(), resolveGuardMode(), runHeadless(), runNetworkGuard(), runTUI() (+14 more)
-
-### Community 205 - "copyRegularAt"
-Cohesion: 0.31
-Nodes (10): copyDirContents(), copyEntry(), copyRegularAt(), copySymlinkAt(), copyTreeRoot(), fchownFromInfo(), futimesFromInfo(), readDirNames() (+2 more)
 
 ### Community 206 - "Desktop GUI"
 Cohesion: 0.15
@@ -966,21 +970,17 @@ Nodes (3): ctx_ptr(), sb_dev(), guard_inode_free()
 Cohesion: 0.29
 Nodes (3): TestEventTypeAllowedConcurrent(), TestSetEventTypesBeforeStartNoRace(), TestSetEventTypesRace()
 
-### Community 212 - "CleanupStalePins"
-Cohesion: 0.40
-Nodes (5): CleanupStalePins(), genOfPinFile(), TestCleanupStalePins(), TestCleanupStalePinsMissingBase(), TestGenOfPinFile()
-
-### Community 213 - "copyXattrs"
+### Community 215 - "copyXattrs"
 Cohesion: 0.50
 Nodes (4): TestCopyXattrsPreservesUserAttributes(), copyXattrs(), listXattrNames(), splitXattrNames()
-
-### Community 215 - "VerifyInstalledResourcesLocked"
-Cohesion: 0.67
-Nodes (3): TestVerifyResourcesLocked(), VerifyInstalledResourcesLocked(), VerifyResourcesLocked()
 
 ### Community 216 - "buildOneGuard"
 Cohesion: 0.09
 Nodes (34): buildOneGuard(), eventFilterOptions(), TestEventFilterOptions(), newSelfGuards(), selfProtectSpecs(), startSelfGuard(), startSelfGuards(), resolveGuardConfig() (+26 more)
+
+### Community 221 - "VerifyInstalledResourcesLocked"
+Cohesion: 0.67
+Nodes (3): TestVerifyResourcesLocked(), VerifyInstalledResourcesLocked(), VerifyResourcesLocked()
 
 ### Community 222 - "TestMain"
 Cohesion: 0.50
