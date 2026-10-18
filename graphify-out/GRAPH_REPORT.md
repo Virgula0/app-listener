@@ -1,7 +1,7 @@
 # Graph Report - app-listener  (2026-10-18)
 
 ## Corpus Check
-- 471 files · ~1,692,358 words
+- 471 files · ~1,692,535 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 13 file(s) not represented in the graph (top: (none) 8, .service 2, .pub 1)
 
@@ -11,7 +11,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `6ef9689a`
+- Built from commit: `7cafbddf`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -977,16 +977,16 @@ Nodes (3): TestMain(), helperChild(), TestMain()
 _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `Guard` connect `Guard` to `daemon/daemon.go`, `hashFileShared`, `fakeDaemon`, `guardUnitTest`, `os.File`, `time.Time`, `rootHandle`, `.objs`, `.dispatch`, `GuardEvent`, `time.Duration`, `runDaemon`, `makeReloadHandler`, `SanitizeText`, `sync.Mutex`, `GuardInodeKey`, `DaemonEvent`?**
-  _High betweenness centrality (0.032) - this node is a cross-community bridge._
+  _High betweenness centrality (0.035) - this node is a cross-community bridge._
 - **What connects `IntegrationSuite`, `github.com/Virgula0/app-listener`, `open_by_handle_at POC` to the rest of the system?**
   _31 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `testing.T` be split into smaller, more focused modules?**
   _Cohesion score 0.020934536201711776 - nodes in this community are weakly interconnected._
 - **Why does `absPath()` connect `IntegrationSuite` to `IntegrationSuite`, `go_pkg_strings`, `TestMain`, `IntegrationSuite`, `IntegrationSuite`, `go_pkg_github_com_testcontainers_testcontainers_go`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `integrationtests/networkguard_test.go`, `IntegrationSuite`, `daemon_multicall_test.go`?**
-  _High betweenness centrality (0.030) - this node is a cross-community bridge._
+  _High betweenness centrality (0.029) - this node is a cross-community bridge._
 - **Should `IntegrationSuite` be split into smaller, more focused modules?**
   _Cohesion score 0.08958130477117819 - nodes in this community are weakly interconnected._
-- **Why does `Editor keys` connect `edit-protected` to `run`, `backend`?**
-  _High betweenness centrality (0.029) - this node is a cross-community bridge._
+- **Why does `IntegrationSuite` connect `IntegrationSuite` to `.newGuardTestContainer`?**
+  _High betweenness centrality (0.021) - this node is a cross-community bridge._
 - **Should `Vault` be split into smaller, more focused modules?**
   _Cohesion score 0.06829573934837092 - nodes in this community are weakly interconnected._
