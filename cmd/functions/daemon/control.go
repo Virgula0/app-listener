@@ -137,7 +137,7 @@ func (s *editControlSession) end() {
 
 // controlManager owns the control socket across the daemon's life: created once an edit-protected
 // password exists (an install older than the mandatory password may have none until
-// `edit-protected --set-password`, offline, sets it; the reload handler's refresh() picks it up).
+// `edit-protected password`, offline, sets it; the reload handler's refresh() picks it up).
 type controlManager struct {
 	uc usecase.DaemonUseCase
 	mu sync.Mutex

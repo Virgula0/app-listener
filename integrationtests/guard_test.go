@@ -871,7 +871,7 @@ func (s *IntegrationSuite) TestGuard_BlocksNewFiles() {
 }
 
 // ---------------------------------------------------------------
-// Test: blacklist + event filter
+// Test: blacklist, per-event verdicts
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Blacklist_Events() {
@@ -881,12 +881,11 @@ func (s *IntegrationSuite) TestGuard_Blacklist_Events() {
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'events test' > /watch/data.txt"})
 
-	// Blacklist rm, filter events to OPEN,WRITE,DELETE (exclude READ)
-	// rm should be blocked on DELETE; cat opening the file should generate OPEN/READ but READ is excluded
-	s.startGuardStd(c, "/watch", "-b", "/usr/bin/rm", "-e", "OPEN,WRITE,DELETE")
+	// Blacklist rm: its DELETE is blocked, cat's OPEN is not.
+	s.startGuardStd(c, "/watch", "-b", "/usr/bin/rm")
 	logBefore := s.readGuardLog(c)
 
-	// 1. cat opens the file (OPEN allowed, READ filtered)
+	// 1. cat opens the file
 	code, out := s.exec(c, []string{"sh", "-c", "cat /watch/data.txt > /dev/null 2>&1"})
 	s.Require().Equalf(0, code, "cat should be allowed: %s", out)
 
@@ -914,7 +913,7 @@ func (s *IntegrationSuite) TestGuard_Blacklist_Events() {
 }
 
 // ---------------------------------------------------------------
-// Test: whitelist + event filter
+// Test: whitelist, per-event verdicts
 // ---------------------------------------------------------------
 
 func (s *IntegrationSuite) TestGuard_Whitelist_Events() {
@@ -924,9 +923,8 @@ func (s *IntegrationSuite) TestGuard_Whitelist_Events() {
 	s.exec(c, []string{"mkdir", "-p", "/watch"})
 	s.exec(c, []string{"sh", "-c", "echo 'events whitelist' > /watch/data.txt"})
 
-	// Whitelist cat, filter to OPEN,WRITE,DELETE (exclude READ)
 	// cat is whitelisted → allowed; rm is not → blocked
-	s.startGuardStd(c, "/watch", "-w", "/usr/bin/cat", "-e", "OPEN,WRITE,DELETE")
+	s.startGuardStd(c, "/watch", "-w", "/usr/bin/cat")
 	logBefore := s.readGuardLog(c)
 
 	// 1. cat is whitelisted → allowed
@@ -2438,16 +2436,6 @@ func (s *IntegrationSuite) TestGuard_Bypass_StatMetadata() {
 
 	code, out = s.exec(c, []string{"/exploits/statonly", "/watch/secret"})
 	s.Require().Equalf(0, code, "whitelisted stat must succeed: %s", out)
-	s.Require().Contains(out, "SIZE=20")
-
-	s.stopGuard(c)
-
-	// Phase 3: a READ-restricted whitelist entry still gets STAT. Regression for the `ssh
-	// READ,WRITE` breakage: with inode_getattr enforcing EVENT_STAT, a binary whitelisted to READ
-	// must still stat (every reader stats first), so eventMask implies STAT from READ/WRITE/MMAP.
-	s.startGuardStd(c, "/watch", "-w", "/exploits/statonly", "-e", "READ")
-	code, out = s.exec(c, []string{"/exploits/statonly", "/watch/secret"})
-	s.Require().Equalf(0, code, "a READ-masked whitelist entry must still be allowed to stat: %s", out)
 	s.Require().Contains(out, "SIZE=20")
 	s.stopGuard(c)
 }

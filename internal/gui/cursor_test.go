@@ -80,3 +80,23 @@ func TestTabBarShowsOnlySelectedPage(t *testing.T) {
 		t.Fatal("out-of-range index changed the selection")
 	}
 }
+
+func TestChoiceWidgetsPointingHand(t *testing.T) {
+	a := test.NewApp()
+	t.Cleanup(a.Quit)
+	opts := []string{"a", "b"}
+	type choice interface {
+		desktop.Cursorable
+		fyne.Disableable
+	}
+	for _, w := range []choice{newCheck("x", nil), newRadioGroup(opts, nil), newCheckGroup(opts, nil),
+		newSelect(opts, nil)} {
+		if w.Cursor() != desktop.PointerCursor {
+			t.Errorf("%T: enabled cursor %v", w, w.Cursor())
+		}
+		w.Disable()
+		if w.Cursor() != desktop.DefaultCursor {
+			t.Errorf("%T: disabled cursor %v", w, w.Cursor())
+		}
+	}
+}

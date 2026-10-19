@@ -13,7 +13,7 @@ import (
 
 // pinStateFile records which pin generation (and PID) this process's CONFIG guards (the [watch]
 // sections from buildGuards, never selfguards.go's, whose generation never rotates) are pinned
-// under. A separate process with no live *guard.Guard (`daemon --lockdown`, the ExecStopPost safety
+// under. A separate process with no live *guard.Guard (`daemon lockdown`, the ExecStopPost safety
 // net) reads it to recompute the bpffs pin paths (guard.PinPrefix / WithPinnedSelfVaultAccess) a
 // crashed daemon left, and to tell whether the owner might still be alive before touching them.
 //
@@ -33,14 +33,14 @@ type pinStateRecord struct {
 }
 
 // errNoPinState: no trustworthy pin-generation record (pre-upgrade daemon, fresh install never
-// started, malformed/empty file). `daemon --lockdown` then does a plain, unwidened lock attempt.
+// started, malformed/empty file). `daemon lockdown` then does a plain, unwidened lock attempt.
 var errNoPinState = errors.New("no usable pin-state record found")
 
 // writePinState records pin's generation for the config guards just brought up or rotated to
 // (reload), IN PLACE on the file's existing inode: once the RO self-guard on /etc/app-listener is
 // attached, only rewriting an EXISTING entry is permitted, so ensurePinStateFilePlaceholder creates
 // it before that guard attaches and the create fallback only covers a failed placeholder.
-// Best-effort: failure only means `--lockdown` can't recover this generation, never that
+// Best-effort: failure only means `daemon lockdown` can't recover this generation, never that
 // startup/reload fails.
 func writePinState(pin pinCfg) error {
 	encoded, err := json.Marshal(pinStateRecord{PID: os.Getpid(), Gen: pin.gen, UpdatedAt: time.Now().UTC()})
@@ -133,7 +133,7 @@ func readPinState() (pinStateRecord, error) {
 // i.e. a live daemon still owns rec.Gen and nothing may touch (or load) its pins (that would race
 // its access to the guarded resources). Dead, gone or PID-recycled reads as not alive. In the
 // normal ExecStopPost flow this is always false (systemd runs it after the main process exits); the
-// check covers manual, repeated or racing --lockdown invocations and relockStaleVaults' reuse of
+// check covers manual, repeated or racing `daemon lockdown` invocations and relockStaleVaults' reuse of
 // this path.
 func pinOwnerLikelyAlive(rec pinStateRecord) bool {
 	if rec.PID <= 0 {

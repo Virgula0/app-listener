@@ -14,7 +14,6 @@ import (
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
 
 	"github.com/Virgula0/app-listener/internal/editbackend"
 	"github.com/Virgula0/app-listener/internal/recorder"
@@ -178,7 +177,7 @@ func TestForwardRefusesOwnExecutable(t *testing.T) {
 	link.reqs = nil
 	p.startForward()
 	f := &forwardForm{p: p, bins: []string{exe}, events: newCheckGrid(forwardEvents)}
-	f.rule = widget.NewRadioGroup([]string{ruleAdmit, ruleDeny}, nil)
+	f.rule = newRadioGroup([]string{ruleAdmit, ruleDeny}, nil)
 	f.rule.SetSelected(ruleAdmit)
 	f.submit()
 	if slices.Contains(link.ops(), editbackend.OpForwardCheck) || p.link != nil {
@@ -210,5 +209,19 @@ func TestRecordReviewExtendsAnExistingSection(t *testing.T) {
 	}
 	if notices := existingNotices(rec.Targets); len(notices) != 2 {
 		t.Fatalf("one warning and the current whitelist per existing target: %d objects", len(notices))
+	}
+}
+
+func TestProtectedLiveCardsGated(t *testing.T) {
+	for _, live := range []bool{true, false} {
+		_, p := protectedShell(t, newFakeLink(live))
+		if len(p.live) != 3 {
+			t.Fatalf("live cards: %d", len(p.live))
+		}
+		for _, g := range p.live {
+			if g.btn.Disabled() == live || (g.note.Text == "") != live {
+				t.Errorf("live=%v: disabled=%v note=%q", live, g.btn.Disabled(), g.note.Text)
+			}
+		}
 	}
 }

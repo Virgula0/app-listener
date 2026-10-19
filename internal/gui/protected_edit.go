@@ -567,7 +567,7 @@ func (v *editView) chown() {
 		for _, u := range m.Users {
 			labels = append(labels, fmt.Sprintf("%s (uid %d, gid %d)", u.Name, u.UID, u.GID))
 		}
-		pick := widget.NewSelect(labels, nil)
+		pick := newSelect(labels, nil)
 		pick.Selected = keep
 		showForm("Owner", "Apply", "Cancel", []*widget.FormItem{
 			widget.NewFormItem("Entry", selectable(path.Join(v.resource, uid))),

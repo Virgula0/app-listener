@@ -286,7 +286,7 @@ func (rec *Recording) Plan(sel *Selection) (*Plan, error) {
 		case i < 0:
 			return nil, fmt.Errorf("%s is not a path of this recording", e)
 		case rec.Targets[i].Existing != nil:
-			return nil, fmt.Errorf("%s is already in daemon.conf: change its need_encryption with --edit-config", e)
+			return nil, fmt.Errorf("%s is already in daemon.conf: change its need_encryption with edit-protected config", e)
 		}
 		p.Encrypt = append(p.Encrypt, e)
 	}

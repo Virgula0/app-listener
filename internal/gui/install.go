@@ -75,16 +75,16 @@ var installActions = []installAction{
 			"then install the release's desktop build as app-listener-gui. An interrupted install is resumed; " +
 			"after a completed one, uninstall first to run it again.", true},
 	{InstallRefreshCatalog, "arrow-clockwise", theme.ColorNameSuccess, "Refresh catalog whitelists",
-		"install --refresh-catalog-only", "Re-expand the catalog's whitelists for every guarded folder, show the " +
+		"install catalog refresh", "Re-expand the catalog's whitelists for every guarded folder, show the " +
 			"diff and rewrite daemon.conf. Your own sections are kept. Live reloads the running daemon instead of " +
 			"stopping it.", false},
-	{InstallDiffCatalog, "plus", theme.ColorNameSuccess, "Protect new catalog folders", "install --diff-catalog",
+	{InstallDiffCatalog, "plus", theme.ColorNameSuccess, "Protect new catalog folders", "install catalog diff",
 		"Find the critical folders on this host that daemon.conf doesn't guard yet, pick some, and encrypt and " +
-			"guard them like a fresh install.", false},
-	{InstallRestoreBackups, "lock-simple-open", theme.ColorNameWarning, "Restore backups", "install --restore-backups",
+			"guard them like a fresh install. Needs the daemon stopped; asks at the end whether to start it.", false},
+	{InstallRestoreBackups, "lock-simple-open", theme.ColorNameWarning, "Restore backups", "install backups restore",
 		"Undo a migration: delete the encrypted folders and move their .app_listener.backup copies back. " +
 			"Refused while the daemon runs; asks before touching anything.", false},
-	{InstallDeleteBackups, "trash", theme.ColorNameError, "Delete backups", "install --delete-post-backups",
+	{InstallDeleteBackups, "trash", theme.ColorNameError, "Delete backups", "install backups delete",
 		"Permanently delete the .app_listener.backup copies the migration kept. Works with the daemon running; " +
 			"asks before deleting.", false},
 }
@@ -114,7 +114,7 @@ type installPage struct {
 	binInfo, binIntro, binNote   *widget.Label
 	binBtn                       *handButton
 	source                       binSource
-	meta, live, withGUI          *widget.Check
+	meta, live, withGUI          *handCheck
 	gates                        []actionGate
 	uninst                       uninstallCard
 }
@@ -127,10 +127,19 @@ type actionGate struct {
 	box  *fyne.Container
 }
 
+// set shows note and disables the button while it is non-empty.
+func (g *actionGate) set(note string) {
+	setWarn(g.note, note)
+	if note == "" {
+		g.btn.Enable()
+	} else {
+		g.btn.Disable()
+	}
+	g.box.Refresh()
+}
+
 func newInstallPage(s *shell) *installPage {
-	p := &installPage{runHost: runHost{s: s}, hooks: s.opts.Install}
-	p.settled = p.refreshStatus
-	return p
+	return &installPage{runHost: runHost{s: s}, hooks: s.opts.Install}
 }
 
 func (p *installPage) view() fyne.CanvasObject {
@@ -138,10 +147,10 @@ func (p *installPage) view() fyne.CanvasObject {
 	p.daemonT = newStatusTile("pulse", "Daemon")
 	p.windowT = newStatusTile("sidebar-simple", "Desktop build")
 
-	p.meta = widget.NewCheck("Log denied metadata inspections", nil)
-	p.live = widget.NewCheck("Live: keep the daemon running", func(bool) { p.renderActions() })
+	p.meta = newCheck("Log denied metadata inspections", nil)
+	p.live = newCheck("Live: keep the daemon running", func(bool) { p.renderActions() })
 	p.live.Checked = true
-	p.withGUI = widget.NewCheck("Also install the desktop build (app-listener-gui)", nil)
+	p.withGUI = newCheck("Also install the desktop build (app-listener-gui)", nil)
 	p.withGUI.Checked = true
 
 	over := newFadeVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 0, 14), container.NewVBox(
@@ -151,7 +160,7 @@ func (p *installPage) view() fyne.CanvasObject {
 		sectionTitle("OPTIONS"),
 		newPanel(container.NewVBox(
 			p.withGUI, mutedText("Once the wizard completes, the staged release's desktop build is installed at "+
-				systemd.GUIBinaryPath+" (symlinked in /usr/local/bin): run it with sudo app-listener-gui --gui. "+
+				systemd.GUIBinaryPath+" (symlinked in /usr/local/bin): run it with sudo app-listener-gui. "+
 				"It is verified like the headless build, and Update keeps it on the daemon's release."),
 			p.meta, mutedText("Installs the daemon unit without "+
 				"--no-log-metadata-blocks, so denied process inspections (op=PTRACE mode=READ) are logged. Use it "+
@@ -190,7 +199,7 @@ func (p *installPage) binaryCard() fyne.CanvasObject {
 			labels[i] += " (" + p.s.opts.Version + ")"
 		}
 	}
-	pick := widget.NewSelect(labels, func(l string) {
+	pick := newSelect(labels, func(l string) {
 		p.source = sources[slices.Index(labels, l)]
 		p.renderSource()
 	})
@@ -294,7 +303,7 @@ func (p *installPage) versionNote() string {
 			name = "a development build"
 		}
 		notes = append(notes, "Not this window's version: this window is "+name+", and its installer writes "+
-			"daemon.conf. Before the service is enabled the deployed build checks that config (daemon --check); "+
+			"daemon.conf. Before the service is enabled the deployed build checks that config (daemon check); "+
 			"the install stops if it can't load it.")
 	}
 	if p.bin.guiPath == "" {
@@ -318,7 +327,7 @@ func (p *installPage) renderInstalled() {
 		p.installedT.set(true, ib.version, "Identical to the staged headless build.", theme.ColorNameSuccess)
 	default:
 		p.installedT.set(true, ib.version, "Differs from the staged build, and the wizard needs them identical: "+
-			"update it first (the Update workspace, or install --binary-only from a terminal).", theme.ColorNameWarning)
+			"update it first (the Update workspace, or install binary from a terminal).", theme.ColorNameWarning)
 	}
 	if p.daemonUp {
 		p.daemonT.set(true, "running", "The installer stops it where a step needs that and starts it again.",
@@ -332,9 +341,9 @@ func (p *installPage) renderInstalled() {
 }
 
 // renderActions refuses up front what the installer would: the wizard after a completed install
-// (protected.RequireNoInstallCert); the wizard, the catalog diff and a stopped-flow refresh stop a
-// systemd daemon themselves but not one outside systemd; a live refresh needs the unit active; the
-// restore needs no daemon at all.
+// (protected.RequireNoInstallCert); the wizard and a stopped-flow refresh stop a systemd daemon
+// themselves but not one outside systemd; a live refresh needs the unit active; the catalog diff and
+// the restore need no daemon at all.
 func (p *installPage) renderActions() {
 	for _, g := range p.gates {
 		note := ""
@@ -359,7 +368,7 @@ func (p *installPage) actionNote(a *installAction) string {
 		if p.live.Checked {
 			if !p.daemonUp {
 				return "Live needs the daemon running under systemd (locked folders hide their file names): " +
-					"start it, or untick Live to refresh with it stopped."
+					"start it on the Daemon page, or untick Live to refresh with it stopped."
 			}
 			return ""
 		}
@@ -376,9 +385,7 @@ func (p *installPage) actionNote(a *installAction) string {
 			return outsideSystemdNote
 		}
 	case InstallDiffCatalog:
-		if !p.daemonUp && p.daemonProc {
-			return outsideSystemdNote
-		}
+		return daemonStopNote(p.daemonUp, p.daemonProc)
 	}
 	return ""
 }

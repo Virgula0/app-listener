@@ -197,6 +197,45 @@ func IsDaemonEnabled() bool {
 	return strings.TrimSpace(SystemctlOutput("is-enabled", DaemonServiceName)) == daemonEnabledState
 }
 
+// DaemonUnitState is the daemon unit's systemd ActiveState and SubState ("" when unknown).
+func DaemonUnitState() (active, sub string) {
+	for line := range strings.Lines(SystemctlOutput("show", "-p", "ActiveState", "-p", "SubState", DaemonServiceName)) {
+		k, v, _ := strings.Cut(strings.TrimSpace(line), "=")
+		switch k {
+		case "ActiveState":
+			active = v
+		case "SubState":
+			sub = v
+		}
+	}
+	return active, sub
+}
+
+// StartDaemon starts the daemon unit (Type=notify: systemctl returns once the guards are attached and
+// the vaults unlocked) and verifies it is active. A daemon outside systemd is refused.
+func StartDaemon() error {
+	if IsDaemonActive() {
+		log.Info("daemon is already running")
+		return nil
+	}
+	pids, err := protected.FindDaemonProcesses("/proc")
+	if err != nil {
+		return fmt.Errorf("scanning for a running daemon process: %w", err)
+	}
+	if len(pids) > 0 {
+		return fmt.Errorf("the daemon is running outside systemd (pid(s) %v): stop it first, e.g. kill %d", pids, pids[0])
+	}
+	log.Infof("starting %s ...", DaemonServiceName)
+	if err := RunCmd("systemctl", "start", DaemonServiceName); err != nil {
+		return fmt.Errorf("systemctl start %s: %w — inspect with: journalctl -u %s -e", DaemonServiceName, err, DaemonServiceName)
+	}
+	if !IsDaemonActive() {
+		return fmt.Errorf("daemon is not running after start — inspect with: journalctl -u %s -e", DaemonServiceName)
+	}
+	log.Info("daemon is running")
+	return nil
+}
+
 // ReloadDaemonIfActive sends SIGHUP (systemctl reload) if running, else no-op. For changes picked
 // up on reload, e.g. the edit-protected password file.
 func ReloadDaemonIfActive() error {
@@ -425,7 +464,7 @@ func DeployInstalledBinary(srcPath string, unit []byte) error {
 // DeployInstalledBinaryNoRestart installs the service binary WITHOUT stopping a running daemon: the
 // atomic rename-over means it keeps executing its old unlinked inode, so guards stay attached and
 // unlocked vaults are untouched. A non-nil unit is written and daemon-reloaded, taking effect on the
-// next restart. For `install --binary-only` when the admin skips the restart; the caller must tell
+// next restart. For `install binary` when the admin skips the restart; the caller must tell
 // them to restart manually.
 func DeployInstalledBinaryNoRestart(srcPath string, unit []byte) error {
 	if err := ReplaceInstalledBinary(srcPath, InstallBinaryPath); err != nil {

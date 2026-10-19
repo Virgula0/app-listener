@@ -40,18 +40,18 @@ func (s *IntegrationSuite) forwardSetup(daemonFlags ...string) testcontainers.Co
 	return c
 }
 
-// startForward backgrounds `edit-protected --forward <args>`, its pid in /tmp/fwd.pid and output
+// startForward backgrounds `edit-protected forward <args>`, its pid in /tmp/fwd.pid and output
 // in /tmp/fwd.log, and waits for the n-th GRANTED line. The session idles out in 30s unless args
-// set --timeout-session: a grant that should never have activated can't outlive the test by 30m.
+// set --idle-timeout: a grant that should never have activated can't outlive the test by 30m.
 func (s *IntegrationSuite) startForward(c testcontainers.Container, args string, n int) {
-	if !strings.Contains(args, "--timeout-session") {
-		args += " --timeout-session 30s"
+	if !strings.Contains(args, "--idle-timeout") {
+		args += " --idle-timeout 30s"
 	}
 	cmd := "APP_LISTENER_EDIT_PASSWORD=" + forwardPassword +
-		" nohup /app-listener edit-protected --forward --resource /protected " + args +
+		" nohup /app-listener edit-protected forward --resource /protected " + args +
 		" > /tmp/fwd.log 2>&1 & echo $! > /tmp/fwd.pid"
 	code, out := s.exec(c, []string{"sh", "-c", cmd})
-	s.Require().Equalf(0, code, "starting edit-protected --forward: %s", out)
+	s.Require().Equalf(0, code, "starting edit-protected forward: %s", out)
 	s.Require().Truef(s.awaitLogCount(c, "temporary access GRANTED", n, 15*time.Second),
 		"grant #%d never became active, client:\n%s\ndaemon:\n%s", n, s.forwardLog(c), s.readDaemonLog(c))
 }
@@ -90,7 +90,7 @@ func (s *IntegrationSuite) requireRead(c testcontainers.Container, cmd string, a
 	s.Require().Containsf(out, "Operation not permitted", "%s: expected a guard denial, got: %s", why, out)
 }
 
-// edit-protected --forward (issue #85): -w admits a binary only while the client holds the session,
+// edit-protected forward (issue #85): -w admits a binary only while the client holds the session,
 // -e narrows what it may do, -b denies a whitelisted binary, and every exit path (END, client
 // SIGKILL) restores the configured whitelist exactly.
 func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_AllowBlockRevoke() {
@@ -138,7 +138,7 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_Refusals() {
 	// Bounded twice: a request wrongly granted would otherwise hold the session for 30m.
 	run := func(env, args string) (int, string) {
 		return s.exec(c, []string{"sh", "-c", "APP_LISTENER_EDIT_PASSWORD=" + env +
-			" timeout 30 /app-listener edit-protected --forward --timeout-session 10s " + args + " 2>&1"})
+			" timeout 30 /app-listener edit-protected forward --idle-timeout 10s " + args + " 2>&1"})
 	}
 	code, out := run(forwardPassword, "--resource /protected -w /app-listener --yes")
 	s.Require().NotEqualf(0, code, "the app-listener binary must never be granted: %s", out)
@@ -171,7 +171,7 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_InPlaceRewriteRevoke
 
 	s.exec(c, []string{"sh", "-c", "cp " + fwdUnlisted + " /tmp/mysed && chmod 755 /tmp/mysed"})
 	code, out := s.exec(c, []string{"sh", "-c", "APP_LISTENER_EDIT_PASSWORD=" + forwardPassword +
-		" timeout 30 /app-listener edit-protected --forward --resource /protected -w /tmp/mysed < /dev/null 2>&1"})
+		" timeout 30 /app-listener edit-protected forward --resource /protected -w /tmp/mysed < /dev/null 2>&1"})
 	s.Require().NotEqualf(0, code, "a user-placed binary needs --yes without a terminal: %s", out)
 	s.Require().Containsf(out, "--yes", "%s", out)
 
@@ -193,7 +193,7 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_InPlaceRewriteRevoke
 }
 
 // Pinned links keep enforcing after a SIGKILL, with the temporary allow still in the pinned
-// whitelist: `daemon --lockdown` (ExecStopPost) must strip it from the journal, and a restart must
+// whitelist: `daemon lockdown` (ExecStopPost) must strip it from the journal, and a restart must
 // come back without it.
 func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_DaemonKilledMidGrant() {
 	c := s.forwardSetup()
@@ -208,7 +208,8 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_DaemonKilledMidGrant
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not die after SIGKILL")
 	s.requireRead(c, unlistedRead, true, "the pinned whitelist still holds the allow (what lockdown closes)")
 
-	code, out := s.runLockdown(c)
+	// The pre-subcommand spelling: an installed unit of an older release runs it as ExecStopPost.
+	code, out := s.exec(c, []string{"/app-listener", "daemon", "--lockdown"})
 	s.Require().Equalf(0, code, "daemon --lockdown: %s", out)
 	s.Require().Containsf(out, "stripped 1 temporary allow row", "lockdown did not strip the journaled allow: %s", out)
 	s.requireRead(c, unlistedRead, false, "sed after lockdown, daemon dead")
@@ -223,13 +224,13 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_DaemonKilledMidGrant
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after the final SIGTERM")
 }
 
-// The session ends after --timeout-session without activity; a granted binary touching the
+// The session ends after --idle-timeout without activity; a granted binary touching the
 // resource is activity and keeps it alive.
 func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_IdleTimeout() {
 	c := s.forwardSetup()
 	defer c.Terminate(s.ctx)
 
-	s.startForward(c, "-w "+fwdUnlisted+" --timeout-session 4s", 1)
+	s.startForward(c, "-w "+fwdUnlisted+" --idle-timeout 4s", 1)
 	for range 6 { // ~6s of reads, one per second: past the 4s timeout only if activity is ignored
 		s.requireRead(c, unlistedRead, true, "sed while the session is active")
 		time.Sleep(time.Second)
@@ -248,7 +249,7 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_IdleTimeout() {
 	s.exec(c, []string{"sh", "-c", "pkill -TERM -f 'app-listener daemon' || true"})
 }
 
-// edit-protected --edit-config: a valid edit is written and reloaded live; one the reload refuses
+// edit-protected config: a valid edit is written and reloaded live; one the reload refuses
 // leaves the running configuration and is rolled back on disk.
 func (s *IntegrationSuite) TestDaemon_EditProtected_EditConfig() {
 	c := s.forwardSetup()
@@ -258,12 +259,12 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_EditConfig() {
 	editConfig := func(content string) (int, string) {
 		s.exec(c, []string{"sh", "-c", "printf '%s' " + shQuote(content) + " > /tmp/new.conf"})
 		return s.exec(c, []string{"sh", "-c", "APP_LISTENER_EDIT_PASSWORD=" + forwardPassword +
-			" timeout 60 /app-listener edit-protected --edit-config --content-file /tmp/new.conf 2>&1"})
+			" timeout 60 /app-listener edit-protected config --from /tmp/new.conf 2>&1"})
 	}
 
 	s.requireRead(c, unlistedRead, false, "baseline: sed is not whitelisted")
 	code, out := editConfig(added)
-	s.Require().Equalf(0, code, "--edit-config: %s", out)
+	s.Require().Equalf(0, code, "edit-protected config: %s", out)
 	s.Require().Contains(out, "saved and reloaded")
 	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
 	s.Require().Equal(strings.TrimSpace(added), conf)
@@ -278,17 +279,17 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_EditConfig() {
 	s.requireRead(c, unlistedRead, true, "sed: the running configuration is unchanged")
 
 	// A uutils multicall under a non-applet name would be dropped at load: refused before writing.
-	reloads := strings.Count(s.readDaemonLog(c), "replaced via edit-protected --edit-config")
+	reloads := strings.Count(s.readDaemonLog(c), "replaced via edit-protected config")
 	code, out = editConfig(added + uutilsMulticall + "\n")
 	s.Require().NotEqualf(0, code, "a non-applet multicall line must be refused: %s", out)
 	s.Require().Containsf(out, `"coreutils" is not one of its applets`, "%s", out)
 	_, conf = s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
 	s.Require().Equal(strings.TrimSpace(added), conf, "a refused edit must leave daemon.conf as it was")
-	s.Require().Equalf(reloads, strings.Count(s.readDaemonLog(c), "replaced via edit-protected --edit-config"),
+	s.Require().Equalf(reloads, strings.Count(s.readDaemonLog(c), "replaced via edit-protected config"),
 		"a refused multicall edit was written:\n%s", s.readDaemonLog(c))
 
 	code, out = s.exec(c, []string{"sh", "-c", "APP_LISTENER_EDIT_PASSWORD=wrong-Pass-1234" +
-		" timeout 60 /app-listener edit-protected --edit-config --content-file /tmp/new.conf 2>&1"})
+		" timeout 60 /app-listener edit-protected config --from /tmp/new.conf 2>&1"})
 	s.Require().NotEqualf(0, code, "a wrong password must be refused: %s", out)
 	s.Require().Contains(out, "authentication failed")
 
@@ -354,7 +355,7 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_Forward_BlockedOnlyStreamsGr
 	}, 10*time.Second, 200*time.Millisecond, "--blocked-only must still log denials:\n%s", s.readDaemonLog(c))
 
 	for session := 1; session <= 2; session++ {
-		s.startForward(c, "-w "+fwdUnlisted+" --timeout-session 4s", session)
+		s.startForward(c, "-w "+fwdUnlisted+" --idle-timeout 4s", session)
 		for range 6 { // ~6s of reads: past the 4s idle timeout only if the session saw no events
 			s.requireRead(c, unlistedRead, true, "sed while the session is active")
 			time.Sleep(time.Second)

@@ -93,7 +93,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Multicall_Refusals() {
 	}
 	for _, tc := range cases {
 		_, out := s.exec(c, []string{"sh", "-c",
-			"timeout 20 /app-listener network-guard " + tc.flags + " --headless 2>&1; echo rc=$?"})
+			"timeout 20 /app-listener network guard " + tc.flags + " --headless 2>&1; echo rc=$?"})
 		s.Require().NotContainsf(out, "rc=0", "%s: network-guard started: %s", tc.name, out)
 		s.Require().NotContainsf(out, "rc=124", "%s: network-guard ran until the timeout: %s", tc.name, out)
 		s.Require().Containsf(out, tc.want, "%s: %s", tc.name, out)
@@ -151,7 +151,7 @@ func (s *IntegrationSuite) TestNetworkGuard_Multicall_GNUCoreutilsSingle() {
 
 	for _, flags := range []string{"-w /usr/bin/coreutils", "-w /usr/bin/cat", "-b /usr/bin/cat"} {
 		_, out := s.exec(c, []string{"sh", "-c",
-			"timeout 20 /app-listener network-guard " + flags + " --headless 2>&1; echo rc=$?"})
+			"timeout 20 /app-listener network guard " + flags + " --headless 2>&1; echo rc=$?"})
 		s.Require().NotContainsf(out, "rc=0", "%s: network-guard started: %s", flags, out)
 		s.Require().NotContainsf(out, "rc=124", "%s: network-guard ran until the timeout: %s", flags, out)
 		s.Require().Containsf(out, "is a gnu-coreutils multicall binary", "%s: %s", flags, out)

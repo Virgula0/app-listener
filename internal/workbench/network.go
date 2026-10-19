@@ -13,7 +13,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/repository"
 )
 
-// NetPolicy is the network guard's configuration: network-guard's -w/-b, --auto-infra, --unsafe,
+// NetPolicy is the network guard's configuration: `network guard`'s -w/-b, --auto-infra, --unsafe,
 // --no-throttle (inverted) and -e.
 type NetPolicy struct {
 	Mode      GuardMode
@@ -147,7 +147,7 @@ func (n *Network) MonitorEvents() []ebpf.NetEventType {
 	return slices.Clone(n.monEvents)
 }
 
-// SetMonitorEvents changes the monitor's event filter live (network-monitor's -e).
+// SetMonitorEvents changes the monitor's event filter live (`network monitor`'s -e).
 func (n *Network) SetMonitorEvents(types []ebpf.NetEventType) {
 	n.mu.Lock()
 	n.monEvents = slices.Clone(types)
@@ -235,7 +235,7 @@ func clonePolicy(p NetPolicy) NetPolicy {
 
 var errClosed = errors.New("the workspace is closed")
 
-// validate mirrors network-guard's flag checks.
+// validate mirrors `network guard`'s flag checks.
 func (p *NetPolicy) validate() error {
 	if p.Mode != GuardWhitelist && (p.Unsafe || p.AutoInfra) {
 		return errors.New("blocking local sockets and auto-allowing network daemons need whitelist mode")

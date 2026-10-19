@@ -1,23 +1,22 @@
 # Desktop GUI
 
-The `app-listener-gui` release asset (or a `make build GUI=1` build) adds a desktop window to the
-same binary. It covers the interactive modes in one place; the daemon has no GUI and stays a
-systemd service. Installing from the window also installs this desktop build as
-`/usr/local/sbin/app-listener-gui` (see [Install](#install)).
+The `app-listener-gui` release asset (or a `make build GUI=1` build) is the desktop window, a
+separate binary from the headless `app-listener`. It covers the interactive modes in one place; the
+daemon has no GUI and stays a systemd service. Installing from the window also installs this
+desktop build as `/usr/local/sbin/app-listener-gui` (see [Install](#install)).
 
 ```bash
-sudo app-listener-gui --gui
+sudo app-listener-gui
 ```
 
-- `--gui` opens the window only without a subcommand. Any other flag is then ignored, and a
-  warning names each one: everything a flag would set is a control in the window. With a
-  subcommand (`sudo app-listener-gui monitor --gui`), the subcommand runs in the terminal and
-  `--gui` is ignored with a warning.
+- It only opens the window: everything a flag would set is a control in it. It takes no
+  subcommand, only `--dump-log FILE`, `--version` and `--help`. The command-line modes are the
+  `app-listener` binary's, and the daemon never runs this build.
 - It needs root, like every mode it drives (each one loads eBPF programs).
 - X11 or Wayland. Under `sudo` or `pkexec` it reuses the invoking user's display session
   (`DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`), taken only from that user's own processes and
   files.
-- The default build answers `--gui` with an error naming the GUI build.
+- `make build` (no `GUI=1`) builds the headless `app-listener`, which has no window.
 - On a tiling window manager (Hyprland, sway, i3) the window opens floating, sized to fit its
   content and the output (1280x820 when it fits, at most 90% of the output) and centered. The
   WINDOW card on Home turns this off; unchecking it tiles the window again. The WM is reached
@@ -64,10 +63,11 @@ folder picker picks the folder shown. The path field above takes a typed absolut
 | Workspace | Covers |
 |---|---|
 | Files | `monitor` and `guard`, on several folders or files side by side. |
-| Network | `network-monitor` and `network-guard`. |
+| Network | `network monitor` and `network guard`. |
 | Protected | `edit-protected`: edit, temporary access, daemon config, password. |
 | Update | `update`, from the stable or the pre-release channel. |
-| Install | `install`: the wizard and its maintenance flags. |
+| Install | `install`: the wizard and its subcommands. |
+| Daemon | `systemctl start` / `stop app-listener-daemon`, with the unit's state and journal. |
 
 ## Files
 
@@ -123,15 +123,15 @@ stops its guard and then its monitor.
 
 ## Network
 
-The Network workspace runs `network-monitor` and `network-guard` together. Unlike Files, it has
+The Network workspace runs `network monitor` and `network guard` together. Unlike Files, it has
 one monitor and one guard: the network guard applies to the whole host.
 
 | Tab | Covers |
 |---|---|
-| Watched | The programs `network-monitor` traces (its positional binaries, added by typed full path or Browse...) and the events shown (`-e`). Changes apply at once. |
+| Watched | The programs `network monitor` traces (its positional binaries, added by typed full path or Browse...) and the events shown (`-e`). Changes apply at once. |
 | Activity | Monitor events and guard verdicts in one table (event, process, protocol, local and remote address, size). Selecting an event offers to watch, whitelist or blacklist its executable. |
 | Processes | One row per executable seen on the network, keyed by its inode, with whether it is watched and its place in the guard policy. |
-| Guard | The `network-guard` policy, applied with Apply. |
+| Guard | The `network guard` policy, applied with Apply. |
 
 Guard controls and their CLI equivalents:
 
@@ -150,7 +150,7 @@ under the list, marked as added automatically.
 Apply always starts the new guard before stopping the old one. While both run, an operation needs
 both to allow it, so a policy change never lets through what either policy blocks. The new guard
 keeps the old one's code-suspect marks (see [network-guard](network-guard.md#code-integrity--w)),
-and judges already running whitelisted programs from `/proc` as a fresh `network-guard` start does:
+and judges already running whitelisted programs from `/proc` as a fresh `network guard` start does:
 restart them for the full guarantee. If the new guard fails to start, the old one keeps running and
 the error is shown above the tabs.
 
@@ -178,11 +178,11 @@ and the password's state.
 | Action | CLI equivalent |
 |---|---|
 | Edit protected files | `edit-protected` |
-| Temporary access | `edit-protected --forward -w/-b [-e]` |
-| Daemon configuration | `edit-protected --edit-config` |
-| Record access | `edit-protected --edit-config --record <path>` |
-| Change the password (asks the current one; it can't be removed) | `--set-password` |
-| Live session idle timeout | `--timeout-session` (5 minutes to 4 hours) |
+| Temporary access | `edit-protected forward -w/-b [-e]` |
+| Daemon configuration | `edit-protected config` |
+| Record access | `edit-protected config record <path>` |
+| Change the password (asks the current one; it can't be removed) | `edit-protected password` |
+| Live session idle timeout | `--idle-timeout` (5 minutes to 4 hours) |
 
 Every live action asks for the password first; only then does the daemon list the guarded
 directories. A wrong password can be retried (the daemon's lockout applies).
@@ -191,7 +191,9 @@ directories. A wrong password can be retried (the daemon's lockout applies).
 access to it for the session) or offline (the daemon must be stopped; the directory is unlocked
 with the master key and locked again when the session ends). When only the offline flow applies
 and a daemon runs (no password, or its control socket is missing), the card says to stop it and
-**Start** stays disabled; so does **Set password** for an install with no password yet. Ctrl+S saves. Binaries, symlinks and
+**Start** stays disabled; so does **Set password** for an install with no password yet.
+**Temporary access**, **Daemon configuration** and **Record access** need the live daemon: their
+**Start** stays disabled, saying so, until it runs with a password (see [Daemon](#daemon)). Ctrl+S saves. Binaries, symlinks and
 files over 2 MiB are refused; **New file**, **New folder**, **Permissions**, **Owner** (a login
 user) and **Delete** work as in the terminal editor. Typing and using the session's controls is
 activity for the idle timeout. If the daemon ends the session (idle timeout, reload), the page
@@ -218,7 +220,7 @@ paths are encrypted, the daemon reloads, and each plaintext backup is offered fo
 `daemon.conf` already guards is extended instead: the recording page and the review warn about it
 and show its current whitelist (**ALREADY IN DAEMON.CONF**), programs it already whitelists are listed
 under **ALREADY WHITELISTED** and can't be checked, and encryption isn't offered for it. The rules are
-the terminal's; see [edit-protected.md](edit-protected.md#recording-a-new-path---record).
+the terminal's; see [edit-protected.md](edit-protected.md#recording-a-new-path-config-record).
 
 One session runs at a time, and none while an installer or updater run is in progress or a guard
 runs in this window (it would deny the backend's reads and writes). Closing the window during a
@@ -279,7 +281,7 @@ installs the same release's desktop build next to it, so the host gets both:
 | Path | Build | Run it |
 |---|---|---|
 | `/usr/local/sbin/app-listener` (`/usr/local/bin` symlink) | headless, the daemon | `sudo app-listener <mode>` |
-| `/usr/local/sbin/app-listener-gui` (`/usr/local/bin` symlink) | desktop | `sudo app-listener-gui --gui` |
+| `/usr/local/sbin/app-listener-gui` (`/usr/local/bin` symlink) | desktop | `sudo app-listener-gui` |
 
 Both are staged first in a root-only (`0700`) temporary folder that is deleted when the window
 closes. **Source** picks the release they are downloaded from; only signed releases are offered,
@@ -298,11 +300,11 @@ app-listener binary without the `gui` tag or a fyne dependency, the desktop buil
 there is no fallback to copying the window's own executable. The page then shows the staged tag
 and each build's SHA-256 and path. The release builds its desktop asset best-effort: a release
 without one stages the headless build alone, the page says so, and the wizard installs only the
-daemon. To deploy a build of your own, use `install --binary-only` from a terminal.
+daemon. To deploy a build of your own, use `install binary` from a terminal.
 
 When the staged build is another version than the window (always the case for a development
 window), the page says so: the window's installer writes `daemon.conf`, and before the service is
-enabled the deployed build checks that config with `daemon --check`; the install stops if it can't
+enabled the deployed build checks that config with `daemon check`; the install stops if it can't
 load it.
 
 ### Actions
@@ -310,10 +312,10 @@ load it.
 | Action | CLI equivalent | Needs the staged build |
 |---|---|---|
 | Install wizard | `install` | yes |
-| Refresh catalog whitelists (Live: keep the daemon running, on by default) | `install --refresh-catalog-only` (`--live`) | no |
-| Protect new catalog folders | `install --diff-catalog` | no |
-| Restore backups | `install --restore-backups` | no |
-| Delete backups | `install --delete-post-backups` | no |
+| Refresh catalog whitelists (Live: keep the daemon running, on by default) | `install catalog refresh` (`--live`) | no |
+| Protect new catalog folders | `install catalog diff` | no |
+| Restore backups | `install backups restore` | no |
+| Delete backups | `install backups delete` | no |
 
 **Also install the desktop build (app-listener-gui)** (on by default) installs the staged
 release's desktop build once the wizard completes. Unchecked, the wizard installs only the daemon.
@@ -323,17 +325,18 @@ It is disabled when the staged release has no desktop build.
 confirmation is asked. Restore and Delete backups list the backups found, then ask once more naming
 each one; Restore is refused while the daemon runs, Delete is not.
 
-A card whose action the installer would refuse says why and keeps **Start** disabled: Restore
-while any daemon runs (`sudo systemctl stop app-listener-daemon` first, which locks its folders
-again); the wizard, Protect new catalog folders and a non-live refresh stop a systemd daemon
-themselves, so only a daemon running outside systemd disables them; a live refresh needs the
-daemon running under systemd. The install wizard is also disabled once an installation has
-completed (`/etc/app-listener/install-complete`, see [installation](installation.md#the-install-wizard)):
-uninstall first to run it again. The window never stops the daemon itself.
+A card whose action the installer would refuse says why and keeps **Start** disabled: Restore and
+Protect new catalog folders while any daemon runs (stop it first on the [Daemon](#daemon) page,
+which locks its folders again; Protect new catalog folders then asks at the end whether to start
+it); the wizard and a non-live refresh stop a systemd daemon themselves, so only a daemon running
+outside systemd disables them; a live refresh needs the daemon running under systemd. The install
+wizard is also disabled once an installation has completed (`/etc/app-listener/install-complete`,
+see [installation](installation.md#the-install-wizard)): uninstall first to run it again. No action
+here stops the daemon for you.
 
 The wizard needs the installed binary to be identical to the staged build, as the terminal
 wizard needs it to be the one running: if they differ, update it first (the Update workspace, or
-`install --binary-only` from a terminal). The GUI has no binary-only action. Once the wizard
+`install binary` from a terminal). The GUI has no binary-only action. Once the wizard
 completes, it installs the staged desktop build at `/usr/local/sbin/app-listener-gui`, replacing
 any one there (when the option above is checked); a canceled or failed wizard installs none.
 
@@ -357,8 +360,36 @@ the same run view (and under the same rules) as the actions above:
 | Also delete the fscrypt master key, off by default | `--delete-key` |
 
 Like the terminal, it is refused while the daemon runs (under systemd or not): the button is
-disabled until you stop it (`sudo systemctl stop app-listener-daemon`, which locks its folders
-again). The window doesn't stop the daemon itself. **Uninstall** first shows a summary to confirm,
+disabled until you stop it on the [Daemon](#daemon) page (or `sudo systemctl stop
+app-listener-daemon`), which locks its folders again. Uninstall never stops the daemon itself. **Uninstall** first shows a summary to confirm,
 then each encrypted folder is asked about (decrypt permanently, or keep encrypted), and the
 per-user ssh-agent setup and the backup cleanup ask as in the terminal. Removing the desktop build
 deletes `/usr/local/sbin/app-listener-gui`; the open window keeps running until you close it.
+
+## Daemon
+
+The Daemon page, under Install in the sidebar, starts and stops the installed unit
+(`app-listener-daemon`) with `systemctl`. It shows whether the unit is installed, its state
+(systemd's `ActiveState` and `SubState`, re-read every two seconds while the page is open) and
+whether it starts at boot. The page never enables or disables the unit: the installer enables it.
+
+**Start** runs `systemctl start`, which returns once the daemon is ready: every guard attached
+before any encrypted folder is unlocked. **Stop** asks first, runs `systemctl stop` (the guards
+stay attached until every folder is locked again), then checks that every encrypted folder of the
+installed config is locked, as the installer does. Both switch to a run view: the progress bar
+follows the unit's `SubState` (it never advances on time alone), and the log shows the unit's
+journal while the operation runs.
+
+Both buttons are disabled, saying why, while the unit is not installed, a daemon runs outside
+systemd, the unit is already starting or stopping, an installer or updater run is in progress, an
+edit-protected session is open, or a guard runs in this window (the daemon's unlock and lockdown
+aren't admitted by it). Only the one that applies to the current state is enabled. Once it
+finishes, the Install and Protected pages re-read the daemon, so the actions that need it running
+(or stopped) are enabled or disabled again:
+
+| Needs the daemon | Actions |
+|---|---|
+| running | Protected: live edits, Temporary access, Daemon configuration, Record access. Install: a live catalog refresh. |
+| stopped | Install: Protect new catalog folders, Restore backups, Uninstall; Protected: offline edits. |
+
+In the terminal the same actions refuse with an error naming the state they need.

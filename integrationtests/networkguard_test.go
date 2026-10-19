@@ -18,7 +18,7 @@ var (
 func (s *IntegrationSuite) startNetworkGuardStd(c testcontainers.Container, extraFlags ...string) {
 	flags := strings.Join(extraFlags, " ")
 	netGuardLogPath = fmt.Sprintf("/tmp/netguard-%d.log", time.Now().UnixNano())
-	cmd := fmt.Sprintf("nohup /app-listener network-guard %s --headless > %s 2>&1 &", flags, netGuardLogPath)
+	cmd := fmt.Sprintf("nohup /app-listener network guard %s --headless > %s 2>&1 &", flags, netGuardLogPath)
 	netGuardPID = s.capturePID(c, cmd)
 
 	// Wait until the guard finished attaching its LSM hooks (not just a fixed
@@ -64,7 +64,7 @@ func (s *IntegrationSuite) stopNetGuard(c testcontainers.Container) {
 	if netGuardPID != 0 {
 		s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null || true", netGuardPID)})
 		if !s.awaitGone(c, netGuardPID, 3*time.Second) {
-			s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener network-guard' || true"})
+			s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener network guard' || true"})
 			s.awaitGone(c, netGuardPID, 3*time.Second)
 		}
 		netGuardPID = 0
@@ -453,13 +453,13 @@ func (s *IntegrationSuite) TestNetworkGuard_CLI_Errors() {
 		cmd  string
 		want string
 	}{
-		{"mutually-exclusive", "-b /net_tester -w /net_tester", "mutually exclusive"},
+		{"mutually-exclusive", "-b /net_tester -w /net_tester", "none of the others"},
 		{"auto-infra-blacklist", "-b /net_tester --auto-infra", "auto-infra is only available in whitelist mode"},
 		{"unsafe-blacklist", "-b /net_tester --unsafe", "unsafe is only available in whitelist mode"},
 		{"bad-event", "-w /net_tester -e BOGUS", "unknown network event type"},
 	}
 	for _, tc := range cases {
-		code, out := s.exec(c, []string{"sh", "-c", "timeout 10 /app-listener network-guard " + tc.cmd + " --headless 2>&1"})
+		code, out := s.exec(c, []string{"sh", "-c", "timeout 10 /app-listener network guard " + tc.cmd + " --headless 2>&1"})
 		s.Require().NotEqualf(0, code, "%s: should fail, got: %s", tc.name, out)
 		s.Require().Containsf(out, tc.want, "%s: unexpected error message: %s", tc.name, out)
 	}

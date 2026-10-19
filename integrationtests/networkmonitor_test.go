@@ -127,7 +127,7 @@ func (s *IntegrationSuite) startNetworkMonitorStd(c testcontainers.Container, bi
 
 	flags := strings.Join(extraFlags, " ")
 	netMonLogPath = fmt.Sprintf("/tmp/netmon-%d.log", time.Now().UnixNano())
-	cmd := fmt.Sprintf("nohup /app-listener network-monitor %s --headless %s > %s 2>&1 &", binaries, flags, netMonLogPath)
+	cmd := fmt.Sprintf("nohup /app-listener network monitor %s --headless %s > %s 2>&1 &", binaries, flags, netMonLogPath)
 	netMonPID = s.capturePID(c, cmd)
 
 	codeCheck, outCheck := s.exec(c, []string{"sh", "-c",
@@ -165,7 +165,7 @@ func (s *IntegrationSuite) stopNetMonitor(c testcontainers.Container) {
 	if netMonPID != 0 {
 		s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null || true", netMonPID)})
 		if !s.awaitGone(c, netMonPID, 3*time.Second) {
-			s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener network-monitor' || true"})
+			s.exec(c, []string{"sh", "-c", "pkill -f 'app-[l]istener network monitor' || true"})
 			s.awaitGone(c, netMonPID, 3*time.Second)
 		}
 		netMonPID = 0
@@ -357,7 +357,7 @@ func (s *IntegrationSuite) TestNetworkMonitor_InvalidEventType() {
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, "/net_tester", 0755))
 
 	// An unknown event type must be rejected before anything attaches.
-	code, out := s.exec(c, []string{"sh", "-c", "timeout 10 /app-listener network-monitor /net_tester -e BOGUS --headless 2>&1"})
+	code, out := s.exec(c, []string{"sh", "-c", "timeout 10 /app-listener network monitor /net_tester -e BOGUS --headless 2>&1"})
 	s.Require().NotEqualf(0, code, "invalid event type should make network-monitor fail, got: %s", out)
 	s.Require().Contains(out, "unknown network event type")
 }

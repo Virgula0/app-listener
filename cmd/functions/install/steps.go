@@ -433,7 +433,7 @@ func vaultScan(vault *fscrypt.Vault, live bool) inst.SectionScan {
 // rewrites its own bytes), which the read-only self mask denies. As in the daemon
 // (vaultOpForGuard), write is granted only for the vault call via WithSelfVaultAccess, and the
 // recovery sidecar is pre-staged before the guard attaches (creating it beside a guarded file is
-// denied once live). Without both, `install --refresh-catalog-only` failed with "truncate ...:
+// denied once live). Without both, `install catalog refresh` failed with "truncate ...:
 // operation not permitted" on file-vault sections (e.g. Steam's registry.vdf).
 func unlockUnderGuard(vault *fscrypt.Vault, path string) (*guard.Guard, error) {
 	self, err := ebpf.ComputeBinaryEntry("/proc/self/exe")

@@ -12,7 +12,19 @@ names older `update` binaries fetch; arm64's carry `-arm64`).
 
 `README.md` is the short user-facing tour; `docs/` (index `docs/README.md`) is the reference for
 every subcommand, flag and config option. Consult it before changing CLI surface, and update the
-matching `docs/*.md` page with any flag or behavior change. Docs prose avoids em/en dashes. This is a "vibe-coding experiment, not for production".
+matching `docs/*.md` page (and the tree in `docs/README.md`) with any flag or behavior change.
+Docs prose avoids em/en dashes.
+
+**CLI shape.** A cobra subcommand tree (`docs/README.md#command-tree`): options that only work
+together get their own subcommand (`edit-protected forward`, `install catalog refresh`), never a
+mode flag on the parent. A removed flag goes into `cmd/root.go`'s `movedFlags` (the error names
+its replacement). **Never rename or drop a spelling that a binary of another version runs**: the
+`daemon --check/--verifier-only/--lockdown/--genkey`, `daemon-unit`, `edit-protected
+--backend`, `install --mark-complete`, and `app-listener-gui --gui` (installed units' ExecStopPost,
+`install.sh`/`check-compatibility.sh` against a release, older `update`s, the installer against the
+installed binary). They stay listed in `--help` as aliases, never hidden. Call sites that may hit
+another version keep those spellings, and the shipped
+daemon unit stays byte-identical (any change prompts a unit diff on every `update`). This is a "vibe-coding experiment, not for production".
 
 ## Security is the product — do not regress it
 
@@ -35,7 +47,7 @@ every change to enforcement paths as security-sensitive:
 - **New syscall / kernel path = new bypass surface.** When you add or change an LSM hook
   or a guarded operation, add a matching `integrationtests/exploits/*.c` case that proves
   the operation is denied, and run `make test-integration` locally. A new guard hook also needs its
-  record probe (`Monitor.AttachRecordProbes`) and a `recordops.c` op, or `--record` proposes masks
+  record probe (`Monitor.AttachRecordProbes`) and a `recordops.c` op, or `config record` proposes masks
   the guard denies: `TestGuardHookCoverage` fails until then, `TestRecord_GuardParity` proves it.
 - **Watch the well-known bypass classes** already defended against (see `memory/*` and the
   exploit corpus): io_uring, `open_by_handle_at`, `copy_file_range`/`splice`/`sendfile`,
@@ -51,7 +63,7 @@ every change to enforcement paths as security-sensitive:
   watch path, then `SELECT <resource>` or `FORWARD` activates the grant — so an
   unauthenticated caller learns nothing about the protected directories. `SELECT`
   transiently widens **only** that one resource's `GUARD_ALLOW_ROOT` self event-mask.
-  `FORWARD` (`edit-protected --forward -w/-b [-e]`, `internal/guard/tempgrant.go`) is the
+  `FORWARD` (`edit-protected forward -w/-b [-e]`, `internal/guard/tempgrant.go`) is the
   one path that writes **whitelist rows** for other binaries: `-w` only where the resource
   has no row (never over a tamper-demoted `GUARD_BLOCK`, never the self key or an
   inspector), `-b` only over an existing `GUARD_ALLOW`. The daemon resolves every path
@@ -60,16 +72,16 @@ every change to enforcement paths as security-sensitive:
   compare-and-swap: it restores a row only while it still holds what the grant wrote and the
   permanent whitelist hasn't claimed (or the tamper detector demoted) the key. `-w` rows are
   journaled to `/etc/app-listener/temp-grants.json` **before** the write, so
-  `daemon --lockdown` / the next start strip them from a SIGKILLed daemon's pinned maps
+  `daemon lockdown` / the next start strip them from a SIGKILLed daemon's pinned maps
   (strip-only: a forged journal can deny, never admit). Both kinds: one session at a time,
   revoked on disconnect / SIGHUP / an idle timeout (`TIMEOUT`, default 30m, daemon-capped at
   24h) that only client `PING`s and, for `FORWARD`, the granted binaries' own events reset.
   `FORWARD` streams those events (`EVENT` lines, via `Guard.SetEventTap`, matched by
   `/proc/<pid>/exe` inode for display only — never a policy input). `CONFIG`
-  (`--edit-config`, `configedit.go`) is the other post-AUTH path: the daemon writes
+  (`edit-protected config`, `configedit.go`) is the other post-AUTH path: the daemon writes
   daemon.conf only while it still holds what it sent (compare-and-swap), reloads, and puts
   the old bytes back if the reload fails; refused while a grant session is active.
-  `--edit-config --record` (`internal/recorder`, `record*.go`) rides CONFIG: a monitor learns
+  `edit-protected config record` (`internal/recorder`, `record*.go`) rides CONFIG: a monitor learns
   accessors by kernel-reported exe `dev:ino`, classify re-verifies each by inode, then apply runs
   encrypt (ends locked) → ledger pin (`RecordIfAbsent`, never over a verdict) → CAS PUT, rolling
   back both on failure. Target paths are validated only after AUTH. `PASSWORD`
@@ -81,7 +93,7 @@ every change to enforcement paths as security-sensitive:
   Every verifier draws on the persistent guess budget in that DB (`binledger.BeginAuthAttempt`).
   Don't loosen any of: the peer-exe check, AUTH-before-disclosure, the single-session lock,
   the auth lockout and the persistent budget, current-password proof on change, the first-time
-  `--set-password` refusal while a daemon runs, the mask being restored in
+  `edit-protected password` refusal while a daemon runs, the mask being restored in
   `RevokeSelfEditAccess`, or the journal-before-write and CAS-restore rules above.
 - **The GUI drives edit-protected through `edit-protected --backend`** (`cmd/functions/editprotected/
   backend.go`, client `internal/editbackend`): the window runs the installed headless binary
@@ -90,7 +102,7 @@ every change to enforcement paths as security-sensitive:
   before AUTH: this binary has a root READ baseline on guarded trees), password only over the pipe
   (never argv/env, no line breaks), file ops only through `internal/vaultfs` (shared with the TUI),
   EOF = end (revoke / re-lock). The GUI process never opens a protected path or the control socket
-  and never gets a guard row; it refuses to `--forward -w` its own exe.
+  and never gets a guard row; it refuses to `forward -w` its own exe.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
   key + `binaries.db` (password hash) (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.
@@ -113,10 +125,10 @@ needs cgo (`mlock`). A `CGO_ENABLED=0` build no longer compiles.
 |---|---|
 | `make build` | Full pipeline in a **rootful Docker** container: dumps `vmlinux.h` from the host BTF, regenerates BPF bindings, builds to `build/linux/app-listener`. Nothing but Docker needed on the host. |
 | `make build-host` | Same pipeline on the host — needs a **recent** `clang`/LLVM (`docker/builder.Dockerfile` pins clang 22; clang 14 emits a `guard_path_rename` that overflows the BPF verifier's 1M-insn budget on modern kernels — issue #45), `bpftool`, Go 1.26+, GCC. |
-| `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui` (fyne desktop window opened by `--gui`, ~20 MiB larger, X11/OpenGL deps) — off by default because the daemon shares this binary. |
+| `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui`: the `app-listener-gui` build, which only opens the fyne window (~20 MiB larger, X11/OpenGL deps). Off by default: the default build is the headless CLI the daemon runs. |
 | `make generate` | Regenerate BPF bindings (`bpf2go`). Needs `bpftool` + readable `/sys/kernel/btf/vmlinux`. `ARCH` (amd64/arm64) defaults to the host's and must equal it: vmlinux.h and `__TARGET_ARCH_*` (PT_REGS layout) are the host's, so the eBPF never cross-builds. |
 | `make vuln` | govulncheck (pinned `GOVULNCHECK_VERSION`) over the module; `GUI=1` scans the `-tags gui` build. Needs generated bindings. |
-| `make check-compatibility` | Static host check (kernel version, `.config`, BTF, BPF-LSM activation, fscrypt prereqs). Run before building/running on a new host. `--binary <path>` (as root) also loads that binary's guard eBPF into the running verifier (`daemon --check`), catching a prebuilt/kernel mismatch; `scripts/install.sh` runs this against the downloaded release before installing anything. |
+| `make check-compatibility` | Static host check (kernel version, `.config`, BTF, BPF-LSM activation, fscrypt prereqs). Run before building/running on a new host. `--binary <path>` (as root) also loads that binary's guard eBPF into the running verifier (`daemon check`), catching a prebuilt/kernel mismatch; `scripts/install.sh` runs this against the downloaded release before installing anything. |
 
 BPF C sources live in `internal/<mode>/bpf/*.bpf.c`. `make generate` compiles each with
 clang and, via `bpf2go`, emits `internal/<mode>/<name>_bpf.go` plus
@@ -204,7 +216,7 @@ key/value size — not that it *is* that type. A 16-byte `struct inode_key` pass
 keyed by a 24-byte struct, or a `__u8` written into a `__u32`-valued map, loads fine
 whenever the neighbouring stack happens to be initialized, then silently reads garbage:
 lookups never match, stored values are random. Both happened here and both passed
-`daemon --check`. Userspace has the same trap — `cilium/ebpf` iteration with a wrong
+`daemon check`. Userspace has the same trap — `cilium/ebpf` iteration with a wrong
 value type fails at the first row. After changing a layout, `grep -n '(&<map>,'` every
 site and check each argument's declared type.
 
@@ -218,7 +230,7 @@ site and check each argument's declared type.
   the callback (see `symlink_scan_step`). It sets the guard's kernel floor at **5.17**.
   A `bpf_loop` that won't verify is usually *not* why a program is over budget — measure
   before assuming it is, which here was wrong twice.
-- `daemon --check` is the gate: it loads every guard program into this kernel's verifier.
+- `daemon check` is the gate: it loads every guard program into this kernel's verifier.
   Rootless Docker **cannot** load BPF at all (capabilities do not cross the user
   namespace), so verifier work needs host root or rootful Docker.
 
@@ -259,7 +271,7 @@ CI (`.github/workflows/ci.yml`) runs `make lint` and `make test` on non-draft PR
 `vuln.yml` runs `make vuln` (default + GUI build) on non-draft PRs and weekly on main.
 `verifier.yml` loads the PR's and the base's guard objects into the verifier of three runners
 (`ubuntu-24.04`: 6.17, `ubuntu-26.04`: 7.0, `ubuntu-26.04-arm`: arm64) with `bpfstats` and
-`daemon --check --verifier-only`, and fails on any rejection; its summary has the per-program
+`daemon check --verifier-only`, and fails on any rejection; its summary has the per-program
 cost deltas. Those are those kernels' verdicts only — still run bpfstats locally. Every job pins
 an explicit runner label, never `ubuntu-latest`.
 Integration tests are **not** in CI — run them locally when touching BPF or enforcement.
@@ -289,7 +301,7 @@ nothing, so the process refuses to start instead.
 
 - **kprobes** (`monitor`) — observe all I/O regardless of syscall path (io_uring, splice,
   sendfile, mmap) plus metadata ops.
-- **LSM hooks** (`guard`, `network-guard`, `daemon`) — the only kernel mechanism that can
+- **LSM hooks** (`guard`, `network guard`, `daemon`) — the only kernel mechanism that can
   **deny**. ~30 hooks; `file_open` + `file_permission`, the superseded-key set
   (`inode_unlink`, `inode_rename`, `bprm_committed_creds`, the `sched_process_fork`
   tracepoint), the `sched_process_exec` tracepoint (`guard_exec_applet`: multicall applet
@@ -300,7 +312,7 @@ nothing, so the process refuses to start instead.
   (`guard_spec.go`, resolved by BTF not version — a backport counts). A replaced binary's
   old `dev:ino` key admits only processes exec'd before the replacement and never a reused
   inode number (`exe_supersede.h`, shared by the guard and trust objects).
-- **tracepoints / kretprobes** (`network-monitor`) — TCP/UDP/DNS.
+- **tracepoints / kretprobes** (`network monitor`) — TCP/UDP/DNS.
 
 **Identity is the executable's inode, never its name or comm** — renaming or comm-spoofing
 a binary cannot move it past policy. Guard whitelist/blacklist entries, the network guard,
@@ -361,10 +373,10 @@ an unchanged binary, never to admit one; every other re-sync opens fresh.
 Every mode has a bubbletea TUI (`internal/tui/*_model.go`), a `--headless` stderr writer
 with a stable `EVENT|` / `GUARD|` / `DAEMON …` / `NETEVENT|` line format that the
 integration tests parse, and `--serve[=host:port]` which mirrors the event stream
-read-only over WebSockets (`internal/tui/serve.go`). `--gui` (build-tag `gui`) is one fyne
-window for every interactive mode, intercepted in `cmd.Execute` before cobra
-(`cmd/functions/desktop`) only when no subcommand is given (a subcommand wins and runs in the
-terminal), so it ignores all other flags; `internal/gui/stub.go` is the no-op for non-gui builds.
+read-only over WebSockets (`internal/tui/serve.go`). The `gui`-tag build (`app-listener-gui`) is one
+fyne window for every interactive mode: `cmd.Execute` runs `guiCmd` (no subcommands, so the daemon
+can never run the fyne build) instead of the CLI root when `gui.Available` (`cmd/functions/desktop`);
+`internal/gui/stub.go` is the no-op for non-gui builds.
 `internal/wm` floats the window on Hyprland/sway/i3 over the WM's IPC socket (owner-checked: root
 talks to the user's socket). Exports go through `safeio` (fyne's save dialog `os.Create`s as root). Icons are Phosphor SVGs whose path data is
 normalized to explicit commands: oksvg drops implicit repeated arcs and ignores `<g transform>`.
@@ -375,7 +387,9 @@ build as the daemon: it deploys a staged headless build (`update.FetchVerified`/
 local file), which `RunWith` itself re-checks with `headless.Check`; never `os.Executable()`. The same
 release's desktop asset (`headless.CheckGUI`) goes to `systemd.GUIBinaryPath` after the wizard, and
 `update` keeps it on the daemon's release; never copy the window's own exe there. The GUI uninstaller
-(`uninstall.RunWith`) keeps the CLI's daemon-stopped refusal: the window never stops the daemon.
+(`uninstall.RunWith`) keeps the CLI's daemon-stopped refusal and never stops the daemon itself; only
+the Daemon page (`internal/gui/daemon.go`: `systemd.StartDaemon` / `StopDaemonIfRunning`, the latter
+verifying every vault locked) starts or stops it, and it counts as `shell.running`.
 The GUI updater (`update.RunWith`) runs `update` in the fyne process too: it only works because
 nothing it touches is daemon-guarded while the daemon runs (see its `TODO(self-binary-guard)`).
 Verbosity ladder lives in `internal/constants`; `--verbose` requires `--headless`.
@@ -420,7 +434,7 @@ built-in Read / Edit / Write tools: shell access (`cat`, `>>`, `sed`) is denied 
 See `memory/release-promote-flow.md`. A release is a *build*, not a tag rename:
 `release.yml` cuts a `pre-*` pre-release per push to main; `promote-release.yml` rebuilds
 a stable `vX.Y.Z`. `_build-release.yml` is the reusable build job: one native leg per arch
-(`ubuntu-26.04` / `ubuntu-26.04-arm`), each running `daemon --check --verifier-only` on the
+(`ubuntu-26.04` / `ubuntu-26.04-arm`), each running `daemon check --verifier-only` on the
 objects it ships; any failed leg publishes nothing. Signing is its own `sign` job on a fresh
 runner, the only one with `RELEASE_SIGNING_KEY` (a `release` environment secret, gated by a
 required reviewer): never give the key to a step in a job that runs docker, Go modules or a

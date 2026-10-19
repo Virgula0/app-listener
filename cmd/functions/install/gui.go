@@ -18,10 +18,10 @@ type Mode int
 
 const (
 	ModeWizard         Mode = iota
-	ModeRefreshCatalog      // --refresh-catalog-only (--live: Request.Live)
-	ModeDiffCatalog         // --diff-catalog
-	ModeRestoreBackups      // --restore-backups
-	ModeDeleteBackups       // --delete-post-backups
+	ModeRefreshCatalog      // install catalog refresh (--live: Request.Live)
+	ModeDiffCatalog         // install catalog diff
+	ModeRestoreBackups      // install backups restore
+	ModeDeleteBackups       // install backups delete
 )
 
 // Request is one GUI run.
@@ -110,6 +110,6 @@ func installGUI(path string) error {
 	if err := systemd.DeployGUIBinary(path); err != nil {
 		return fmt.Errorf("the daemon is installed, but its desktop build was not: %w", err)
 	}
-	log.Infof("desktop build installed: run it with `sudo %s --gui`", filepath.Base(systemd.GUISymlinkPath))
+	log.Infof("desktop build installed: run it with `sudo %s`", filepath.Base(systemd.GUISymlinkPath))
 	return nil
 }

@@ -79,7 +79,7 @@ func (u *installUI) MultiSelect(title, description string, choices []wizard.Choi
 }
 
 func (u *installUI) showMultiSelect(title, description string, choices []wizard.Choice, reply func(multiAnswer)) {
-	checks := make([]*widget.Check, len(choices))
+	checks := make([]*handCheck, len(choices))
 	list := container.NewVBox()
 	count := mutedText("")
 	recount := func() {
@@ -92,7 +92,7 @@ func (u *installUI) showMultiSelect(title, description string, choices []wizard.
 		count.SetText(fmt.Sprintf("%d of %d selected", n, len(checks)))
 	}
 	for i, c := range choices {
-		checks[i] = widget.NewCheck(c.Label, func(bool) { recount() })
+		checks[i] = newCheck(c.Label, func(bool) { recount() })
 		checks[i].Checked = c.Selected
 		list.Add(checks[i])
 	}

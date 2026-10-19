@@ -1,5 +1,5 @@
 // inode_dev.h: the device half of every inode key, as stat(2) reports it. Shared by the guard,
-// trust and network-guard objects; userspace keys files by st_dev (KernelDev).
+// trust and network guard objects; userspace keys files by st_dev (KernelDev).
 #ifndef INODE_DEV_H
 #define INODE_DEV_H
 

@@ -26,8 +26,8 @@ func RealFileEngines() FileEngines {
 	}
 }
 
-// RealNetEngines builds the eBPF network monitor and guard, as `network-monitor` and
-// `network-guard` do.
+// RealNetEngines builds the eBPF network monitor and guard, as `network monitor` and
+// `network guard` do.
 func RealNetEngines() NetEngines {
 	return NetEngines{
 		NewMonitor: func(bins []ebpf.BinaryEntry) (repository.NetworkMonitorRepository, error) {

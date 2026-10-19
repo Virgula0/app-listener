@@ -1,12 +1,12 @@
-# network-monitor: see what a program talks to
+# network monitor: see what a program talks to
 
 Traces the network operations (TCP, UDP, DNS) of the listed binaries only. Use it to see where a
 tool phones home, or which hosts an app needs before you restrict it with
-[network-guard](network-guard.md).
+[network guard](network-guard.md).
 
 ```bash
-sudo app-listener network-monitor /usr/bin/curl /usr/bin/wget
-sudo app-listener network-monitor /usr/bin/curl -e CONNECT,DNS
+sudo app-listener network monitor /usr/bin/curl /usr/bin/wget
+sudo app-listener network monitor /usr/bin/curl -e CONNECT,DNS
 ```
 
 ## Flags

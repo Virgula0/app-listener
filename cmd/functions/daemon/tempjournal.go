@@ -10,9 +10,9 @@ import (
 	"github.com/Virgula0/app-listener/internal/guard"
 )
 
-// tempJournalFileProd records the allow rows of the live `edit-protected --forward` grant BEFORE
+// tempJournalFileProd records the allow rows of the live `edit-protected forward` grant BEFORE
 // they are written: pinned links keep enforcing after a SIGKILL, with those rows still in the
-// pinned whitelist, so `daemon --lockdown` and the next start strip them (stripTempJournal). In the
+// pinned whitelist, so `daemon lockdown` and the next start strip them (stripTempJournal). In the
 // self-guarded /etc/app-listener for the same integrity reason as pin-state.json; a forged journal
 // can only cause denials (StripPinnedTempAllows deletes, never adds).
 const tempJournalFileProd = "/etc/app-listener/temp-grants.json"

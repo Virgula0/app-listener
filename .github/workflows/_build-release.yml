@@ -90,7 +90,7 @@ jobs:
       # wrong and corrupt kernel memory at runtime (issue #45). Generate them
       # inside the pinned builder image (clang 22 + bpftool) against
       # the runner's BTF; CO-RE relocates field offsets at load time, and
-      # `daemon --check` fails the install closed on any kernel whose verifier
+      # `daemon check` fails the install closed on any kernel whose verifier
       # still rejects a program.
       - name: Regenerate eBPF bindings (pinned builder image)
         run: |
@@ -152,7 +152,7 @@ jobs:
       - name: Guard eBPF loads into the runner kernel's verifier
         env:
           SUFFIX: ${{ matrix.suffix }}
-        run: sudo "dist/app-listener$SUFFIX" daemon --check --verifier-only
+        run: sudo "dist/app-listener$SUFFIX" daemon check --verifier-only
 
       - name: Upload unsigned binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

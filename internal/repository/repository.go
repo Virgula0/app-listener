@@ -55,7 +55,7 @@ type GuardRepository interface {
 	// baseline. Only single-file resources need it (directory unlock/lock is pure keyring work).
 	// Distinct from GrantSelfEditAccess, the broader session-scoped grant for interactive edits.
 	WithSelfVaultAccess(fn func() error) error
-	// PlanTemporaryGrant validates an `edit-protected --forward` rule against this resource's
+	// PlanTemporaryGrant validates an `edit-protected forward` rule against this resource's
 	// rows without writing; the caller journals the grant's allow rows, then Applies it.
 	PlanTemporaryGrant(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error)
 	// SetEventTap streams every event this guard reads to fn (nil removes it); fn must not block.

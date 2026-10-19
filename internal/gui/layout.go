@@ -6,7 +6,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
 )
 
 // cardGap separates cards in a grid and stacked sections of a page.
@@ -143,14 +142,14 @@ func (gapVBox) MinSize(objs []fyne.CanvasObject) fyne.Size {
 // (a horizontal CheckGroup never wraps and sets its container's minimum width).
 type checkGrid struct {
 	root   *fyne.Container
-	checks []*widget.Check
+	checks []*handCheck
 }
 
 func newCheckGrid(names []string) *checkGrid {
 	g := &checkGrid{}
 	objs := make([]fyne.CanvasObject, len(names))
 	for i, n := range names {
-		c := widget.NewCheck(n, nil)
+		c := newCheck(n, nil)
 		c.Checked = true
 		g.checks = append(g.checks, c)
 		objs[i] = c

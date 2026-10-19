@@ -61,7 +61,7 @@ func TestGenerateConfParses(t *testing.T) {
 // TestGenerateSectionsHasNoHeaderAndAppends verifies GenerateSections emits
 // only the [watch] blocks (no file header) and that concatenating them onto
 // an existing config yields a file the daemon parser accepts, with the old
-// section preserved verbatim (install --diff-catalog).
+// section preserved verbatim (install catalog diff).
 func TestGenerateSectionsHasNoHeaderAndAppends(t *testing.T) {
 	oldDir := filepath.Join(t.TempDir(), "old")
 	newDir := filepath.Join(t.TempDir(), "new")

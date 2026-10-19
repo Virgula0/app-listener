@@ -109,7 +109,7 @@ func (s *IntegrationSuite) launchDaemonUnconfirmed(c testcontainers.Container, f
 	s.Require().Equalf(0, code, "starting daemon: %s", out)
 }
 
-// confirmConfigBinaries runs `trust-binaries --yes --no-reload` on every binary line of daemon.conf, as the
+// confirmConfigBinaries runs `trust --yes --no-reload` on every binary line of daemon.conf, as the
 // operator who wrote it would: a test of another layer keeps its meaning under the binary ledger
 // (issue #80), which otherwise refuses a line added or a binary replaced since the last start.
 func (s *IntegrationSuite) confirmConfigBinaries(c testcontainers.Container) {
@@ -118,7 +118,7 @@ func (s *IntegrationSuite) confirmConfigBinaries(c testcontainers.Container) {
 	if len(paths) == 0 {
 		return
 	}
-	code, out := s.exec(c, append([]string{"/app-listener", "trust-binaries", "--yes", "--no-reload"}, paths...))
+	code, out := s.exec(c, append([]string{"/app-listener", "trust", "add", "--yes", "--no-reload"}, paths...))
 	s.Require().Equalf(0, code, "confirming daemon.conf's binaries: %s", out)
 }
 
@@ -217,7 +217,7 @@ func (s *IntegrationSuite) readDaemonLog(c testcontainers.Container) string {
 
 // Regression for the self-key bypass: the daemon whitelists its own exe inode on every resource for
 // its fscrypt ioctls. Identity was keyed by exe inode alone, so ANY local user executing the same
-// binary got full allow on the tree (e.g. `app-listener network-monitor <guarded-file>` hashes the
+// binary got full allow on the tree (e.g. `app-listener network monitor <guarded-file>` hashes the
 // file before any capability check). The self entry must grant only uid 0 and only the needed
 // events (OPEN, READ).
 func (s *IntegrationSuite) TestDaemon_SelfWhitelist_NoUniversalKey() {
@@ -238,10 +238,10 @@ need_encryption: false
 	s.Require().NotEqualf(0, code, "baseline: non-whitelisted reader must be denied, got: %s", out)
 
 	// Exploit: a non-root process executes the daemon's own binary inode and
-	// makes it read the guarded file (network-monitor hashes its positional
+	// makes it read the guarded file (network monitor hashes its positional
 	// arguments before any capability check). Pre-fix this read is allowed.
 	code, out = s.exec(c, []string{"sh", "-c",
-		nobody + " timeout 10 /app-listener network-monitor /protected/secret 2>&1"})
+		nobody + " timeout 10 /app-listener network monitor /protected/secret 2>&1"})
 	s.T().Logf("exploit exit=%d out=%q", code, out)
 
 	log := s.readDaemonLog(c)
@@ -461,7 +461,7 @@ func (s *IntegrationSuite) TestDaemon_Bypass_LdPreloadBinaryWhitelistedByReload(
 
 	// The config lives OUTSIDE /etc/app-listener so this test can rewrite it: once the daemon runs,
 	// /etc/app-listener is self-guarded read-only and only the app-listener binary may write it (the
-	// real catalog refresh does so via `install --refresh-catalog-only`). /usr/bin/true is
+	// real catalog refresh does so via `install catalog refresh`). /usr/bin/true is
 	// whitelisted at startup; /usr/bin/cat is added only by the SIGHUP reload below, mirroring a
 	// catalog refresh picking up a new binary.
 	const cfgPath = "/tmp/poc-daemon.conf"
@@ -880,7 +880,7 @@ func (s *IntegrationSuite) daemonPinFiles(c testcontainers.Container) []string {
 //   - fscrypt.key is unreadable except by the app-listener binary (ModeWhitelist, empty list;
 //     stacks on the RO dir guard).
 //
-// The binary itself (uid 0) keeps full access so install / --genkey / --refresh-catalog-only work.
+// The binary itself (uid 0) keeps full access so install / `daemon genkey` / `install catalog refresh` work.
 func (s *IntegrationSuite) TestDaemon_SelfProtection_ConfigAndKey() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -1132,7 +1132,7 @@ need_encryption: false
 //   - reject a wrong password (lockout after enough failures is not asserted, to keep the test
 //     quick);
 //   - on a correct password from a root app-listener peer, briefly widen the target resource's
-//     guard so `edit-protected --put` can write, then narrow it (GRANTED / REVOKED both logged);
+//     guard so `edit-protected put` can write, then narrow it (GRANTED / REVOKED both logged);
 //   - allow only one live session at a time.
 func (s *IntegrationSuite) TestDaemon_EditProtected_LiveMode() {
 	const password = "Sup3r-Secret-99"
@@ -1147,7 +1147,7 @@ func (s *IntegrationSuite) TestDaemon_EditProtected_LiveMode() {
 		"mkdir -p /protected /etc/app-listener /outside && echo SECRET > /protected/secret && echo ORIGINAL > /outside/victim && " +
 			"chmod 755 /protected && chmod 600 /protected/secret && " +
 			// a symlink placed inside the tree BEFORE the daemon guards it —
-			// --put must refuse it, not follow it out of the guarded tree.
+			// put must refuse it, not follow it out of the guarded tree.
 			"ln -s /outside/victim /protected/escape && " +
 			"printf '%s\\n' " + shQuote(hash) + " > /etc/app-listener/edit-auth.hash && chmod 600 /etc/app-listener/edit-auth.hash"})
 
@@ -1172,7 +1172,7 @@ need_encryption: false
 
 	const sock = "/run/app-listener-daemon.control"
 	const nobody = "setpriv --reuid=65534 --regid=65534 --clear-groups"
-	const put = "/app-listener edit-protected --resource /protected --put live.txt"
+	const put = "/app-listener edit-protected put live.txt --resource /protected"
 
 	// 1. a peer that is not the app-listener binary is rejected before AUTH
 	//    is even considered — it never learns a single protected path.
@@ -1199,7 +1199,7 @@ need_encryption: false
 	// 4. correct password -> the grant works and the file is written.
 	code, out = s.exec(c, []string{"sh", "-c",
 		"echo LIVE-EDIT | APP_LISTENER_EDIT_PASSWORD=" + password + " " + put + " 2>&1"})
-	s.Require().Equalf(0, code, "live --put must succeed: %s", out)
+	s.Require().Equalf(0, code, "live put must succeed: %s", out)
 	_, content := s.exec(c, []string{"sh", "-c", "cat /protected/live.txt"})
 	s.Require().Equal("LIVE-EDIT", strings.TrimSpace(content))
 
@@ -1212,11 +1212,11 @@ need_encryption: false
 	code, out = s.exec(c, []string{"sh", "-c", "echo pwned > /protected/pwned 2>&1"})
 	s.Require().NotEqualf(0, code, "an unauthenticated write to the guarded tree must be denied: %s", out)
 
-	// 7. --put must not follow a symlink out of the guarded tree.
+	// 7. put must not follow a symlink out of the guarded tree.
 	code, out = s.exec(c, []string{"sh", "-c",
 		"echo PWNED | APP_LISTENER_EDIT_PASSWORD=" + password +
-			" /app-listener edit-protected --resource /protected --put escape 2>&1"})
-	s.Require().NotEqualf(0, code, "--put through a symlink must be refused: %s", out)
+			" /app-listener edit-protected put escape --resource /protected 2>&1"})
+	s.Require().NotEqualf(0, code, "put through a symlink must be refused: %s", out)
 	s.Require().Containsf(out, "symlink", "expected a symlink refusal, got: %s", out)
 	_, victim := s.exec(c, []string{"sh", "-c", "cat /outside/victim"})
 	s.Require().Equal("ORIGINAL", strings.TrimSpace(victim), "the symlink target outside the tree was written")
@@ -1236,7 +1236,7 @@ func shQuote(s string) string {
 // unauthorized process at any observable instant, however an attacker's read races start, reload,
 // stop or a hard kill. Ordering is attach -> unlock -> populate -> resolve -> re-sync; a SIGKILL
 // can't be caught, so the rest rests on the guard's LSM links staying pinned to /sys/fs/bpf and
-// `daemon --lockdown` (systemd ExecStopPost) recovering from ANY point, including mid-transform of
+// `daemon lockdown` (systemd ExecStopPost) recovering from ANY point, including mid-transform of
 // a file-vault (recovery sidecar, fscrypt/filevault.go).
 //
 // The tests emulate an attacker rather than reason about code: a background goroutine hammers the
@@ -1281,7 +1281,7 @@ func (s *IntegrationSuite) harnessMigrate(c testcontainers.Container, path strin
 }
 
 // assertFileVaultSealed confirms, via the whitelisted grep (not the harness), that a file-vault
-// path's raw bytes no longer expose marker: the check that `daemon --lockdown` did its job after a
+// path's raw bytes no longer expose marker: the check that `daemon lockdown` did its job after a
 // SIGKILL. The harness is never whitelisted, and the guard's pinned link may still enforce right
 // now (lockdown widens self-access to relock but doesn't unpin), so a harness call would be denied
 // whether or not the file is sealed (the false failure assertNoUnauthorizedPlaintext also avoids).
@@ -1370,11 +1370,11 @@ func (s *IntegrationSuite) awaitDaemonDead(c testcontainers.Container, timeout t
 	return false
 }
 
-// runLockdown execs `daemon --lockdown` (ExecStopPost safety net): force-locks every encryption
+// runLockdown execs `daemon lockdown` (ExecStopPost safety net): force-locks every encryption
 // root in daemon.conf and exits. It always exits 0 (best-effort per root), so callers check the
 // real state via harnessIsEncrypted, not the exit code.
 func (s *IntegrationSuite) runLockdown(c testcontainers.Container) (int, string) {
-	return s.exec(c, []string{"/app-listener", "daemon", "--lockdown"})
+	return s.exec(c, []string{"/app-listener", "daemon", "lockdown"})
 }
 
 // rawExec is s.exec without fatal assertions on transport errors: safe from a background goroutine
@@ -1418,7 +1418,7 @@ func (s *IntegrationSuite) raceUnauthorizedReader(c testcontainers.Container, pa
 // guard process is alive".
 func (s *IntegrationSuite) assertNoUnauthorizedPlaintext(c testcontainers.Container, path, marker, context string) {
 	// Best-effort only: the guard's pinned link may still enforce right now (a SIGKILL before
-	// Stop() unpins leaves it orphaned-but-active until `daemon --lockdown`), in which case the
+	// Stop() unpins leaves it orphaned-but-active until `daemon lockdown`), in which case the
 	// never-whitelisted harness is correctly denied. That is stronger evidence of "not exposed"
 	// than any report, so never a hard failure; only the unprivileged-reader check below is the
 	// real assertion.
@@ -1685,7 +1685,7 @@ func (s *IntegrationSuite) TestDaemon_RefusedReload_KeepsRunningVaultUnlocked() 
 
 // SIGKILLs the daemon at increasing delays after launch (early enough to plausibly land inside
 // attach/unlock/populate) and asserts that whatever state the kill caught, the file is never both
-// plaintext and reachable by an unauthorized reader; `daemon --lockdown` always recovers; and a
+// plaintext and reachable by an unauthorized reader; `daemon lockdown` always recovers; and a
 // clean restart round-trips the content uncorrupted (the recovery sidecar works on a real
 // interrupted transform).
 func (s *IntegrationSuite) TestDaemon_KillDuringUnlock_FileVault_NeverOrphansPlaintext() {
@@ -1721,7 +1721,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringUnlock_FileVault_NeverOrphansPla
 			// including mid in-place transform (recoverFileInPlace
 			// consuming the staged recovery sidecar).
 			code, out := s.runLockdown(c)
-			s.Require().Equalf(0, code, "round %d: daemon --lockdown exited non-zero: %s", i, out)
+			s.Require().Equalf(0, code, "round %d: daemon lockdown exited non-zero: %s", i, out)
 			s.assertFileVaultSealed(c, secretFile, marker, fmt.Sprintf("round %d: lockdown", i))
 
 			// A clean restart must round-trip the content without
@@ -1767,11 +1767,11 @@ func (s *IntegrationSuite) installFakeSystemctl(c testcontainers.Container) {
 // resource whose WHITELIST changes via a live SIGHUP reload: with a live racer through a normal
 // reload, then with a SIGKILL mid-reload. The resource must never end up fully unguarded.
 //
-// Trigger: `install --refresh-catalog-only --live --yes` on the built-in WireGuard entry
+// Trigger: `install catalog refresh --live --yes` on the built-in WireGuard entry
 // (/etc/wireguard, whitelisting /usr/bin/nmcli), not a raw shell rewrite of daemon.conf: the
 // /etc/app-listener self-guard (issue #53 follow-up) denies any non-daemon-binary write there, so a
 // NEW [watch] section can't be hand-added while the daemon runs (and adding a genuinely new
-// resource always stops the daemon first, per docs/installation.md). `--refresh-catalog-only --live` is the one
+// resource always stops the daemon first, per docs/installation.md). `install catalog refresh --live` is the one
 // documented live path: it re-expands an EXISTING section's whitelist from the daemon's own binary
 // (GUARD_ALLOW_ROOT, same exe inode) and delivers via SIGHUP, with no external process writing the
 // guarded config.
@@ -1821,7 +1821,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	var leaked atomic.Bool
 	go s.raceUnauthorizedReader(c, resourceB, marker, stop, &leaked)
 
-	code, out := s.exec(c, []string{"/app-listener", "install", "--refresh-catalog-only", "--live", "--yes"})
+	code, out := s.exec(c, []string{"/app-listener", "install", "catalog", "refresh", "--live", "--yes"})
 	s.Require().Equalf(0, code, "live catalog refresh failed: %s", out)
 
 	reloaded := false
@@ -1855,7 +1855,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 	s.startDaemon(c, baseConfig) // daemon.conf gets rewritten to baseConfig here, discarding round 1's patched whitelist
 	installNmcli()
 
-	code, out = s.exec(c, []string{"/app-listener", "install", "--refresh-catalog-only", "--live", "--yes"})
+	code, out = s.exec(c, []string{"/app-listener", "install", "catalog", "refresh", "--live", "--yes"})
 	s.Require().Equalf(0, code, "live catalog refresh (round 2 trigger) failed: %s", out)
 	time.Sleep(150 * time.Millisecond) // aim somewhere inside the guard swap (new attaches, old detaches)
 	s.sigDaemon(c, "KILL")
@@ -1869,7 +1869,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringReload_NoUnprotectedWindow() {
 // immediately followed by SIGKILL (systemd stop-timeout or an impatient admin).
 
 // Races a SIGKILL against the graceful-shutdown lockdown (Stop: lock vault before guard detach) and
-// verifies `daemon --lockdown` still finishes the job, with content never both plaintext and
+// verifies `daemon lockdown` still finishes the job, with content never both plaintext and
 // unguarded and no silent corruption on the next start.
 func (s *IntegrationSuite) TestDaemon_KillDuringShutdown_LockdownRecovers() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
@@ -1920,7 +1920,7 @@ func (s *IntegrationSuite) TestDaemon_KillDuringShutdown_LockdownRecovers() {
 // it before it ends cleanly.
 //
 // The client must be the real app-listener binary (authPeer refuses any other exe inode: the
-// "peer-exe check"), so the write step can't be slowed from outside; instead --put content is large
+// "peer-exe check"), so the write step can't be slowed from outside; instead the put content is large
 // (512 MiB) so write+fsync between GRANTED and END is long enough for a tight log-poll-then-kill
 // loop to land in the window on a fair fraction of runs. Best-effort race, but the assertions hold
 // whether or not the kill landed mid-grant: the widened mask is scoped to exactly (uid 0, the
@@ -1941,7 +1941,7 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 	s.exec(c, []string{"sh", "-c",
 		"mkdir -p /protected /etc/app-listener && echo ORIGINAL-CONTENT > " + secretFile + " && chmod 600 " + secretFile + " && " +
 			"printf '%s\\n' " + shQuote(hash) + " > /etc/app-listener/edit-auth.hash && chmod 600 /etc/app-listener/edit-auth.hash"})
-	// Large --content-file: slows the write+fsync inside the grant window
+	// Large --from: slows the write+fsync inside the grant window
 	// (see the function doc comment) without touching secretFile itself.
 	s.exec(c, []string{"sh", "-c", "dd if=/dev/zero of=/tmp/put_content.bin bs=1M count=512 status=none"})
 
@@ -1958,9 +1958,9 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 	s.Require().Truef(socketReady, "control socket never came up, log:\n%s", s.readDaemonLog(c))
 
 	code, out := s.exec(c, []string{"sh", "-c", fmt.Sprintf(
-		"APP_LISTENER_EDIT_PASSWORD=%s /app-listener edit-protected --resource /protected --put bigfile.bin --content-file /tmp/put_content.bin > /tmp/put.log 2>&1 &",
+		"APP_LISTENER_EDIT_PASSWORD=%s /app-listener edit-protected put bigfile.bin --resource /protected --from /tmp/put_content.bin > /tmp/put.log 2>&1 &",
 		password)})
-	s.Require().Equalf(0, code, "backgrounding edit-protected --put: %s", out)
+	s.Require().Equalf(0, code, "backgrounding edit-protected put: %s", out)
 
 	// Tight, no-sleep poll: every millisecond spent here eats into the
 	// (already narrow) window between GRANTED and the client's own END.
@@ -1990,7 +1990,7 @@ func (s *IntegrationSuite) TestDaemon_LiveEditGrant_KilledMidSession_NoResidualE
 
 	_, content := s.exec(c, []string{"cat", secretFile})
 	s.Require().Equal("ORIGINAL-CONTENT", strings.TrimSpace(content),
-		"the session's grant covers the whole resource tree, but secret.txt itself — untouched by the legitimate --put — must stay exactly as it was")
+		"the session's grant covers the whole resource tree, but secret.txt itself — untouched by the legitimate put — must stay exactly as it was")
 
 	// A fresh instance comes back at the read-only baseline: no residual
 	// session, and a plain write attempt outside any control-socket session

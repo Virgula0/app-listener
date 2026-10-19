@@ -14,7 +14,7 @@ import (
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
-// Temporary grants back `edit-protected --forward`: an authenticated root session adds whitelist
+// Temporary grants back `edit-protected forward`: an authenticated root session adds whitelist
 // rows (-w) only where the resource has none, or narrows an existing GUARD_ALLOW (-b), for its
 // lifetime. Revoke restores a row only while it still holds exactly what the grant wrote and the
 // permanent whitelist hasn't claimed the key since, so a concurrent resync, system-pattern admission
@@ -146,7 +146,7 @@ type TempRule struct {
 // TemporaryGrant is one resource's planned temporary rows (PlanTemporaryGrant).
 type TemporaryGrant interface {
 	// JournalRows are the allow rows Apply creates. Record them before Apply: after a crash
-	// `daemon --lockdown` strips them from the pinned maps (StripPinnedTempAllows).
+	// `daemon lockdown` strips them from the pinned maps (StripPinnedTempAllows).
 	JournalRows() []GuardResInodeKey
 	// Report describes binaries the grant leaves untouched, one line each.
 	Report() []string

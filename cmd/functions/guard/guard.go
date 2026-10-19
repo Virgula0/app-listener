@@ -1,7 +1,6 @@
 package guard
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -22,44 +21,32 @@ import (
 var (
 	blacklistPaths []string
 	whitelistPaths []string
-	eventsFlag     []string
 	guardRecursive bool
 	guardDepth     int
 	headless       bool
 )
 
 var GuardCmd = &cobra.Command{
-	Use:   "guard <path>",
-	Short: "Block file system access using eBPF LSM",
-	Long: `Guard a file or directory using eBPF LSM programs to block access
-by unauthorized processes.
-
-Use -b/--blacklist or -w/--whitelist (mutually exclusive) to specify
-process binaries to block or allow. Each binary is identified by its
-SHA256 hash.
-
-Examples:
-  app-listener guard /secret -b /usr/bin/cat
-  app-listener guard /etc/shadow -w /usr/bin/vim
-  app-listener guard /data -w /usr/bin/cat -e OPEN,READ`,
+	Use:   "guard PATH [-w BINARY... | -b BINARY...]",
+	Short: "Deny access to a file or directory with eBPF LSM",
+	Long: `Deny access to PATH. With -w only the listed binaries may access it (with
+neither -w nor -b, nothing may); with -b everything but the listed binaries may.
+Binaries are identified by inode, so renaming one doesn't move it past the rule.`,
+	Example: `  sudo app-listener guard /home/alice/.ssh -w /usr/bin/ssh -w /usr/bin/ssh-add
+  sudo app-listener guard /secret -b /usr/bin/cat`,
 	Args: cobra.ExactArgs(1),
 	RunE: runGuard,
 }
 
 func init() {
 	common.AddServeFlags(GuardCmd)
-	GuardCmd.Flags().StringSliceVarP(&blacklistPaths, "blacklist", "b", nil,
-		"Binary paths to blacklist (repeatable, mutually exclusive with -w)")
-	GuardCmd.Flags().StringSliceVarP(&whitelistPaths, "whitelist", "w", nil,
-		"Binary paths to whitelist (repeatable, mutually exclusive with -b)")
-	GuardCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
-		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD; default: all)")
-	GuardCmd.Flags().BoolVarP(&headless, "headless", "", false,
-		"Run without TUI, print events to stderr (for testing/scripting)")
-	GuardCmd.Flags().BoolVarP(&guardRecursive, "recursive", "r", true,
-		"Guard directory recursively")
-	GuardCmd.Flags().IntVarP(&guardDepth, "depth", "d", 0,
-		"Maximum directory depth to guard (default: 0 = unlimited, 1 = root files only, 2 = root + one subdirectory level, etc.)")
+	f := GuardCmd.Flags()
+	f.StringSliceVarP(&whitelistPaths, "whitelist", "w", nil, "Binary allowed to access PATH (repeatable)")
+	f.StringSliceVarP(&blacklistPaths, "blacklist", "b", nil, "Binary denied access to PATH (repeatable)")
+	common.AddHeadlessFlag(GuardCmd, &headless)
+	f.BoolVarP(&guardRecursive, "recursive", "r", true, "Include subdirectories (--recursive=false: PATH's own entries only)")
+	f.IntVarP(&guardDepth, "depth", "d", 0, "Maximum directory depth (0 = unlimited, 1 = PATH's own entries)")
+	GuardCmd.MarkFlagsMutuallyExclusive("whitelist", "blacklist")
 }
 
 func runGuard(cmd *cobra.Command, args []string) error {
@@ -71,12 +58,6 @@ func runGuard(cmd *cobra.Command, args []string) error {
 
 	mode, binaries, err := resolveGuardConfig()
 	if err != nil {
-		return err
-	}
-
-	// The fs guard engine does not consume an event filter; parsing still
-	// validates the -e flag values.
-	if _, err := common.ParseEventsFlag(eventsFlag); err != nil {
 		return err
 	}
 
@@ -127,10 +108,6 @@ func runGuard(cmd *cobra.Command, args []string) error {
 }
 
 func resolveGuardConfig() (guard.Mode, []guard.BinaryEntry, error) {
-	if len(blacklistPaths) > 0 && len(whitelistPaths) > 0 {
-		return 0, nil, errors.New("--blacklist and --whitelist are mutually exclusive")
-	}
-
 	var mode guard.Mode
 	var paths []string
 

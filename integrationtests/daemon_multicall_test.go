@@ -679,7 +679,7 @@ func (s *IntegrationSuite) TestDaemon_Multicall_OpaqueLineDropped() {
 
 	config := "[watch " + dir + "]\nneed_encryption: false\n/usr/bin/dash\n/usr/bin/gnuhead\n" + opq + "\n" + userUu + "\n"
 	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + config + "\nEOF"})
-	code, out = s.exec(c, []string{"/app-listener", "trust-binaries", "--yes", "--no-reload",
+	code, out = s.exec(c, []string{"/app-listener", "trust", "add", "--yes", "--no-reload",
 		"/usr/bin/dash", "/usr/bin/gnuhead"})
 	s.Require().Equalf(0, code, "confirming the single binaries: %s", out)
 	s.launchDaemonUnconfirmed(c)

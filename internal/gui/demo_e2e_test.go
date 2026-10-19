@@ -271,7 +271,7 @@ func demoInstall(s *shell, r *reel) {
 	}
 	ip.run.progressDone()
 	ip.run.stage("Deploying the daemon")
-	logf(log.InfoLevel, "daemon --check: every guard program verified on this kernel")
+	logf(log.InfoLevel, "daemon check: every guard program verified on this kernel")
 	logf(log.InfoLevel, "app-listener-daemon enabled and started")
 	r.shot(1000 * time.Millisecond)
 	ip.run.finish(nil, false)

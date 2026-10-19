@@ -21,7 +21,7 @@ func TestDaemonUnitCmdPrintsBundledUnit(t *testing.T) {
 	if !bytes.Equal(out.Bytes(), want) {
 		t.Fatalf("printed unit differs from the bundled one:\n%s", out.Bytes())
 	}
-	if !DaemonUnitCmd.Hidden {
-		t.Fatal("daemon-unit must stay hidden")
+	if DaemonUnitCmd.Hidden {
+		t.Fatal("daemon-unit must stay listed")
 	}
 }

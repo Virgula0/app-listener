@@ -24,7 +24,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/recorder"
 )
 
-// recordForm is the setup of `edit-protected --edit-config --record`: the paths to learn.
+// recordForm is the setup of `edit-protected config record`: the paths to learn.
 type recordForm struct {
 	p     *protectedPage
 	paths []string
@@ -299,18 +299,18 @@ type recordReview struct {
 	p       *protectedPage
 	link    backendLink
 	rec     *recorder.Recording
-	bins    map[string]*widget.Check
-	libs    map[string]*widget.Check
-	encrypt map[string]*widget.Check
-	masks   *widget.Check
+	bins    map[string]*handCheck
+	libs    map[string]*handCheck
+	encrypt map[string]*handCheck
+	masks   *handCheck
 	status  *widget.Label
 	root    fyne.CanvasObject
 	applied bool
 }
 
 func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording, blockers map[string]string) *recordReview {
-	r := &recordReview{p: p, link: link, rec: rec, bins: map[string]*widget.Check{}, libs: map[string]*widget.Check{},
-		encrypt: map[string]*widget.Check{}, status: mutedText("")}
+	r := &recordReview{p: p, link: link, rec: rec, bins: map[string]*handCheck{}, libs: map[string]*handCheck{},
+		encrypt: map[string]*handCheck{}, status: mutedText("")}
 	binBox, refused, covered, libBox := container.NewVBox(), container.NewVBox(), container.NewVBox(), container.NewVBox()
 	for i := range rec.Binaries {
 		b := &rec.Binaries[i]
@@ -322,7 +322,7 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 			covered.Add(binaryCard(b, nil))
 			continue
 		}
-		c := widget.NewCheck(logging.SanitizeText(b.Line), nil)
+		c := newCheck(logging.SanitizeText(b.Line), nil)
 		c.Checked = b.Suggested
 		r.bins[b.Line] = c
 		binBox.Add(binaryCard(b, c))
@@ -330,7 +330,7 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 			if l.Problem != "" || r.libs[l.Path] != nil {
 				continue
 			}
-			lc := widget.NewCheck(logging.SanitizeText(l.Path), nil)
+			lc := newCheck(logging.SanitizeText(l.Path), nil)
 			r.libs[l.Path] = lc
 			libBox.Add(container.NewVBox(lc, mutedText("loaded by "+logging.SanitizeText(b.Line))))
 		}
@@ -344,7 +344,7 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 		if t.Existing != nil {
 			continue
 		}
-		c := widget.NewCheck("Encrypt "+t.Path+" at rest", nil)
+		c := newCheck("Encrypt "+t.Path+" at rest", nil)
 		if why := blockers[t.Path]; why != "" {
 			c.Disable()
 			encBox.Add(container.NewVBox(c, mutedText("Guarded unencrypted: "+why)))
@@ -355,7 +355,7 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 		}
 		r.encrypt[t.Path] = c
 	}
-	r.masks = widget.NewCheck("Restrict each binary to the events it was seen doing", nil)
+	r.masks = newCheck("Restrict each binary to the events it was seen doing", nil)
 	review := newButton("Review changes", icon("check"), r.review)
 	review.Importance = widget.HighImportance
 	discard := newButton("Discard", icon("x"), r.discard)
@@ -392,7 +392,7 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 }
 
 // binaryCard describes one recorded executable; check is nil for one that can't be added.
-func binaryCard(b *recorder.Binary, check *widget.Check) fyne.CanvasObject {
+func binaryCard(b *recorder.Binary, check *handCheck) fyne.CanvasObject {
 	box := container.NewVBox()
 	if check != nil {
 		box.Add(check)

@@ -15,7 +15,7 @@ Binaries get replaced all the time (package upgrades, self-updating apps). The r
   - it is a root-owned file in a root-owned directory, on a filesystem mounted without `nosuid`
     (a package upgrade).
 - Anything else stays denied (`not re-admitted`), at the next reload or start too, until you
-  confirm it with [`trust-binaries`](#trust-binaries).
+  confirm it with [`trust`](#trust).
 - A new root-owned match of the catalog's absolute patterns (`/opt/*/jbr/bin/java`) is admitted
   the same way.
 
@@ -66,23 +66,23 @@ shared memory mapping can't change it later without moving its change time. A fi
 than a second before it is read is never cached. Rows unused by a start are dropped. The ready
 line in the journal says how many hashes came from the cache.
 
-## trust-binaries
+## trust
 
 ```bash
-sudo app-listener trust-binaries --list
-sudo app-listener trust-binaries                       # review and confirm one by one
-sudo app-listener trust-binaries /opt/myapp/bin/myapp  # confirm a hand-added line
+sudo app-listener trust list                      # only list the refused binaries
+sudo app-listener trust                           # review and confirm one by one
+sudo app-listener trust add /opt/myapp/bin/myapp  # confirm a hand-added line
 ```
 
 Lists the binaries the daemon refused (line, resolved path, resource, sha256, owner, mtime) and
 asks you to confirm each.
 
-| Flag | Description |
+| Command or flag | Description |
 |---|---|
-| `--list` | Only list the refused binaries |
-| `--yes` | Confirm every listed binary without asking |
-| `--no-reload` | Don't reload a running daemon afterwards |
-| `[path...]` | Confirm these lines as they are now (a line added to `daemon.conf` by hand) |
+| `trust list` | Only list the refused binaries |
+| `trust add PATH...` | Confirm these lines as they are now (a line added to `daemon.conf` by hand) |
+| `-y, --yes` | `trust` and `trust add`: confirm every binary without asking |
+| `--no-reload` | `trust` and `trust add`: don't reload a running daemon afterwards |
 
 Only the exact content that was refused is confirmed: a file that changed again is skipped and
 judged afresh.
@@ -133,7 +133,7 @@ Generic Electron binaries that run an app named on the command line are covered 
 
 `/lib64/ld-linux-x86-64.so.2 <program>` (any `ld-*.so*`, or a copy with its `DT_SONAME`) runs
 `<program>` with the loader as its executable, so a whitelisted loader admits every program run
-through it. `install`, `--edit-config` and `--record` refuse a new loader line; `--record` lists a
+through it. `install`, `edit-protected config` and `config record` refuse a new loader line; `config record` lists a
 program run that way as not whitelistable. Whitelist the program itself.
 
 ## Multicall binaries
@@ -155,15 +155,15 @@ Refused, because their applets can't be told apart:
 - a uutils build with no root-placed `coreutils` link beside it, in `/usr/bin` or in `/bin` (a
   copy, say): Ubuntu's uutils only lists its applets when run under that name.
 
-Where they are refused: `guard -w/-b`, `network-guard -w/-b` and `edit-protected --forward` reject
-them; the installer and `edit-protected --edit-config` refuse a new such line; the catalog never
+Where they are refused: `guard -w/-b`, `network guard -w/-b` and `edit-protected forward` reject
+them; the installer and `edit-protected config` refuse a new such line; the catalog never
 writes one; and the daemon drops one already in `daemon.conf` (CRITICAL in the log) while keeping
 everything else enforced.
 
 Use a dedicated binary instead: on Ubuntu the GNU `gnu*` tools or `coreutils-from-gnu`; on Fedora
 `dnf swap coreutils-single coreutils`.
 
-`network-monitor` watches an applet the same way; a multicall it can't tell apart is watched by
+`network monitor` watches an applet the same way; a multicall it can't tell apart is watched by
 its file, with a warning.
 
 Whitelisting a single binary with several hard links logs a warning: all its names share one
@@ -175,5 +175,5 @@ pressure-vessel hard-links its tools into each container it builds) are logged a
 **Processes started before the guard.** The applet is attested at exec, so a multicall process
 already running when a guard starts (or the daemon restarts; a `systemctl reload` keeps them) has
 no attested applet. A whitelist denies it and a blacklist blocks it until it execs again, and
-`network-monitor` doesn't report it. Restart long-running applet processes (a `tail -f`, a `sleep`
+`network monitor` doesn't report it. Restart long-running applet processes (a `tail -f`, a `sleep`
 loop) after starting the guard.

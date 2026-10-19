@@ -57,7 +57,7 @@ func readSource(t *testing.T, path string) string {
 	return string(b)
 }
 
-// TestGuardHookCoverage: a guard hook the recorder can't see makes --record propose a mask the guard
+// TestGuardHookCoverage: a guard hook the recorder can't see makes `config record` propose a mask the guard
 // then denies the program under. Adding a hook means adding its monitor probe (attached by
 // AttachRecordProbes or NewMonitor) and a recordops op, or saying here why it can't be learned.
 func TestGuardHookCoverage(t *testing.T) {

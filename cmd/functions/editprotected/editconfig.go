@@ -20,14 +20,11 @@ var errConfigChanged = errors.New("daemon.conf changed while you were editing it
 // runEditConfig edits the running daemon's daemon.conf: fetch it over the control socket, edit it
 // locally (no connection is held meanwhile: nothing is widened), then send it back. The daemon
 // writes it and reloads; a failed reload keeps the running configuration and restores the file,
-// and the operator may edit again. --content-file replaces it non-interactively.
+// and the operator may edit again. --from replaces it non-interactively.
 func runEditConfig() error {
-	if len(recordFlags) > 0 {
-		return runRecord()
-	}
-	interactive := contentFileFlag == ""
+	interactive := fromFlag == ""
 	if interactive && !term.IsTerminal(os.Stdin.Fd()) {
-		return errors.New("--edit-config needs a terminal for its editor; use --content-file <file> to replace " +
+		return errors.New("edit-protected config needs a terminal for its editor; use --from <file> to replace " +
 			"the configuration non-interactively")
 	}
 	password := os.Getenv(editPasswordEnv)
@@ -92,7 +89,7 @@ var (
 
 func nextConfig(text string, interactive bool) (string, error) {
 	if !interactive {
-		data, err := os.ReadFile(contentFileFlag)
+		data, err := os.ReadFile(fromFlag)
 		return string(data), err
 	}
 	edited, err := inst.EditText("daemon.conf (live — Ctrl+S reviews, applies and reloads)", "daemon.conf", text)

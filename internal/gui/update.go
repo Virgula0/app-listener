@@ -55,8 +55,8 @@ type updatePage struct {
 	intro                        *widget.Label
 	card                         *fyne.Container
 	updateBtn, checkBtn          *handButton
-	pick                         *widget.Select
-	withGUI                      *widget.Check
+	pick                         *handSelect
+	withGUI                      *handCheck
 	banner, content              *fyne.Container
 	bannerText                   *widget.Label
 }
@@ -109,7 +109,7 @@ func (p *updatePage) sourceCard() fyne.CanvasObject {
 	for i, c := range updateChannels {
 		labels[i] = c.label
 	}
-	p.pick = widget.NewSelect(labels, func(l string) {
+	p.pick = newSelect(labels, func(l string) {
 		p.picked = true
 		p.setChannel(updateChannels[slices.Index(labels, l)].preRelease)
 	})
@@ -118,7 +118,7 @@ func (p *updatePage) sourceCard() fyne.CanvasObject {
 	p.checkBtn = newButton("Check", icon("arrow-clockwise"), p.checkLatest)
 	p.updateBtn = newButton("Update", icon("download-simple"), p.start)
 	p.updateBtn.Importance = widget.HighImportance
-	p.withGUI = widget.NewCheck("Also install or update the desktop build (app-listener-gui)",
+	p.withGUI = newCheck("Also install or update the desktop build (app-listener-gui)",
 		func(bool) { p.renderLatest() })
 	p.withGUI.Checked = true
 	p.card = container.NewVBox(

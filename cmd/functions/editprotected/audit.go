@@ -14,7 +14,7 @@ import (
 )
 
 // auditAfterEdit audits the edited tree against the installed daemon.conf (if any). interactive
-// picks how findings surface: an acknowledge prompt (TUI) or plain warnings (--put, no TTY).
+// picks how findings surface: an acknowledge prompt (TUI) or plain warnings (put, no TTY).
 func auditAfterEdit(resource string, interactive bool) {
 	findings := auditFindings(resource)
 	if len(findings) == 0 {

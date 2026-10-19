@@ -475,14 +475,6 @@ func (s *IntegrationSuite) TestGuard_Bypass_StatMetadata_File() {
 	code, out = s.exec(c, []string{"/exploits/statonly", target})
 	s.Require().Equalf(0, code, "whitelisted stat of a single-file guarded target must succeed: %s", out)
 	s.Require().Contains(out, "SIZE=20")
-
-	s.stopGuard(c)
-
-	// ---- Phase 3: a READ-restricted whitelist entry still gets STAT ----
-	s.startGuardStd(c, target, "-w", "/exploits/statonly", "-e", "READ")
-	code, out = s.exec(c, []string{"/exploits/statonly", target})
-	s.Require().Equalf(0, code, "a READ-masked whitelist entry must still be allowed to stat a single-file target: %s", out)
-	s.Require().Contains(out, "SIZE=20")
 	s.stopGuard(c)
 }
 

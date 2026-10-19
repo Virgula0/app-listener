@@ -14,7 +14,7 @@ import (
 // traversing any symlink below root; missing intermediate directories are created (0700). Atomic
 // (temp file in the target dir + rename).
 //
-// The symlink-safe writer for the non-interactive --put path: os.WriteFile/os.MkdirAll follow
+// The symlink-safe writer for the non-interactive put path: os.WriteFile/os.MkdirAll follow
 // symlinks, so a symlink anywhere in a guarded tree (a dotfile manager's ~/.ssh/config, a planted
 // link) would redirect the write outside every guard, where the daemon imposes no constraint. Every
 // component below root is opened O_NOFOLLOW; a symlink is refused. The interactive editor enforces

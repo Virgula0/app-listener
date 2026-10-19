@@ -90,7 +90,7 @@ func (p *picker) content() fyne.CanvasObject {
 		return true
 	}
 	up := newButton("", theme.MoveUpIcon(), func() { p.navigate(filepath.Dir(p.dir)) })
-	hidden := widget.NewCheck("Hidden", func(on bool) { p.opt.hidden = on; p.reload() })
+	hidden := newCheck("Hidden", func(on bool) { p.opt.hidden = on; p.reload() })
 
 	p.search = newKeyEntry()
 	p.search.SetPlaceHolder("Search this folder (Ctrl+F)")
@@ -98,7 +98,7 @@ func (p *picker) content() fyne.CanvasObject {
 	p.search.OnChanged = func(string) { p.refilter() }
 	p.search.onKey = p.searchKey
 	p.search.onShortcut = p.findShortcut
-	deep := widget.NewCheck("Subfolders", func(on bool) { p.deep = on; p.refilter() })
+	deep := newCheck("Subfolders", func(on bool) { p.deep = on; p.refilter() })
 
 	p.list = widget.NewList(func() int { return len(p.shown) }, newPickRow, p.updateRow)
 	p.list.OnSelected = p.selectRow

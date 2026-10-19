@@ -25,12 +25,12 @@ sudo /usr/local/sbin/app-listener daemon --headless --verbose 3
 
 1. Find the denial in the journal; it names the program and the resource.
 2. If the program should have access, add its **real executable** (not a wrapper script) to the
-   resource's section with `sudo app-listener edit-protected --edit-config`
+   resource's section with `sudo app-listener edit-protected config`
    ([how to find it](how-it-works.md#identity-is-the-executables-inode)). For a one-off, use
-   `edit-protected --forward -w <binary>` instead.
+   `edit-protected forward -w <binary>` instead.
 3. If the journal says `binary-unconfirmed` or `not re-admitted`, the binary changed while it
    wasn't watched, or was replaced by something other than its updater. Check it, then
-   `sudo app-listener trust-binaries` ([Binary trust](binary-trust.md#trust-binaries)).
+   `sudo app-listener trust` ([Binary trust](binary-trust.md#trust)).
 4. `TRUST DENIED op=LAUNCH` means the app was started with an environment variable or flag that
    loads foreign code ([launch scan](binary-trust.md#launch-scan)). Start it without.
 
@@ -72,8 +72,8 @@ generates a new one.
 The install wizard backs up every directory before encrypting it, at `<dir>.app_listener.backup`.
 
 ```bash
-sudo app-listener install --restore-backups        # undo the migration from the backups
-sudo app-listener install --delete-post-backups    # delete the backups
+sudo app-listener install backups restore   # undo the migration from the backups
+sudo app-listener install backups delete    # delete the backups
 ```
 
 `uninstall` also offers to delete them at the end.

@@ -350,7 +350,7 @@ func installSSHAgentEnv(u inst.User) error {
 }
 
 // installConfig writes the final config to its system path and ensures the PATH symlink. The binary
-// is deployed separately (one-line installer or `install --binary-only`); the wizard only checks
+// is deployed separately (one-line installer or `install binary`); the wizard only checks
 // it's present (ensureInstalledBinary). A differing existing config is diffed and the user asked;
 // identical is left alone. Reports whether the installed config differs from what the daemon was
 // running with.

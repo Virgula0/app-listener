@@ -45,7 +45,8 @@ func (h *runHost) show(o fyne.CanvasObject) {
 // logs on that view; after runs on success.
 func (h *runHost) begin(name, iconName string, work func(ui wizard.UI) error, after func()) bool {
 	if h.s.running() {
-		showInformation("A run is in progress", "Wait for the installer or updater run to finish.", h.s.win)
+		showInformation("A run is in progress", "Wait for the running installer, updater or daemon run to finish.",
+			h.s.win)
 		return false
 	}
 	if h.s.sessionOpen() {
@@ -74,6 +75,7 @@ func (h *runHost) begin(name, iconName string, work func(ui wizard.UI) error, af
 			if h.settled != nil {
 				h.settled()
 			}
+			h.s.daemonChanged()
 			h.s.reprobe()
 			h.s.checkForUpdate()
 		})
@@ -81,9 +83,10 @@ func (h *runHost) begin(name, iconName string, work func(ui wizard.UI) error, af
 	return true
 }
 
-// running reports whether an installer or updater run is in progress.
+// running reports whether an installer, updater or daemon start/stop run is in progress.
 func (s *shell) running() bool {
-	return (s.install != nil && s.install.running) || (s.update != nil && s.update.running)
+	return (s.install != nil && s.install.running) || (s.update != nil && s.update.running) ||
+		(s.daemon != nil && s.daemon.running)
 }
 
 // sessionOpen reports an open edit-protected session: an install or update would restart the

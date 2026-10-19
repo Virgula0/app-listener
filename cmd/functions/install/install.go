@@ -24,168 +24,127 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-func init() {
-	InstallCmd.Flags().Bool("restore-backups", false,
-		"Undo the fscrypt migration: list the found .app_listener.backup directories in the TUI and, after a confirmation naming them, delete the encrypted copies and move the backups back (aborts while the daemon is running)")
-	InstallCmd.Flags().Bool("delete-post-backups", false,
-		"Delete the found .app_listener.backup directories (listed in the TUI, confirmed naming each one, with progress; the daemon may keep running)")
-	InstallCmd.Flags().Bool("binary-only", false,
-		"Move the freshly built binary to the install path (and recreate the PATH symlink); no wizard, no config, no fscrypt. If the daemon service is installed, shows the diff when its unit differs from the one the new build ships and asks whether to replace it, then asks (TUI) whether to restart it now to run the new binary or skip the restart for later")
-	InstallCmd.Flags().Bool("refresh-catalog-only", false,
-		"Re-scan the catalog whitelists for every guarded directory in the existing daemon.conf: unlocks encrypted vaults, re-expands glob patterns, drops deleted binaries, picks up new ones, and overwrites the config (use --yes to skip confirmation; requires a previous installation)")
-	InstallCmd.Flags().Bool("diff-catalog", false,
-		"Diff the catalog against the installed daemon.conf: list the critical directories that exist on the host but are not yet guarded, let you pick which to add, then append them to the config and encrypt them like a fresh install (existing sections untouched; stops the daemon for the cycle; requires a previous installation)")
-	InstallCmd.Flags().Bool("live", false,
-		"With --refresh-catalog-only: refresh the whitelists WITHOUT stopping the daemon (vaults are already unlocked and guarded by the running daemon; the config change is applied via SIGHUP reload). Requires the daemon to be running")
-	InstallCmd.Flags().BoolVar(&allowMetadataOutput, "allow-metadata-output", false,
-		"Install the daemon unit WITHOUT --no-log-metadata-blocks, so denied metadata-only process inspections (op=PTRACE mode=READ) are logged; useful to diagnose an app that breaks with nothing logged")
-	InstallCmd.Flags().BoolP("yes", "y", false,
-		"Skip all confirmation prompts (use with --refresh-catalog-only for non-interactive use, e.g. scripts)")
-	// The GUI wizard's last step: the window isn't the app-listener binary, so the daemon's guard on
-	// /etc/app-listener denies it the completed-install record; the installed binary writes it.
-	InstallCmd.Flags().Bool("mark-complete", false, "Record a completed installation (internal: run by the GUI wizard)")
-	_ = InstallCmd.Flags().MarkHidden("mark-complete")
-}
-
 var InstallCmd = &cobra.Command{
 	Use:   "install",
-	Short: "Interactive installer: protect directories with the daemon (fscrypt + systemd)",
-	Long: `Interactive, root-only installer for the daemon mode.
+	Short: "Install the daemon: pick directories, encrypt them, enable the service",
+	Long: `Interactive installer for the daemon. It deploys the binary to
+/usr/local/sbin/app-listener, creates the fscrypt master key, lets you pick the
+directories to protect (a catalog of SSH, GPG, AI agents, browsers, ...) and
+review daemon.conf, encrypts them (keeping a .app_listener.backup copy), asks
+for the edit-protected password, installs and starts the systemd service.
 
-The wizard walks through the whole installation:
-
-  0. stops a running daemon before anything else: an active systemd unit is
-     stopped (and re-enabled at the end); a daemon process running outside
-     systemd is a fatal error — stop it manually first
-  1. deploys the app-listener binary to /usr/local/sbin/app-listener when it
-     is not already there, by copying the running executable as-is (no
-     recompilation). An existing install is left untouched — upgrade it with
-     "install --binary-only" or "app-listener update"
-  2. ensures the fscrypt master key exists in /etc/app-listener/fscrypt.key
-  3. asks which users to protect and probes a catalog of critical
-     directories (SSH, keys, AI agents, IDEs, browsers, VPNs, ...)
-  4. lets you add further directories manually (they must exist)
-  5. shows the generated daemon.conf in an embedded editor for review
-  6. checks the encryption state of every configured directory and
-     verifies every already-encrypted directory unlocks with the master
-     key (a directory encrypted while declared need_encryption: false is
-     a fatal error)
-  6a. for every user whose ~/.ssh ends up guarded, asks once (naming the
-     user and paths) whether to set up ssh-agent: unit + shell SSH_AUTH_SOCK
-     block (installed in step 8) and "AddKeysToAgent yes" at the top of
-     ~/.ssh/config (created if missing, an existing AddKeysToAgent is kept),
-     done before encryption so the file is part of the migrated tree
-  6b. checks each backing filesystem is fscrypt-ready; for a fixable gap
-     (missing 'encrypt' feature flag, no 'fscrypt setup') it shows the
-     exact command and its reason and offers to run it now as root —
-     declining aborts the install, just like the old hard error
-  7. asks per-directory whether fscrypt encryption is required, but ONLY
-     for directories that are not yet encrypted and declare
-     need_encryption: true — need_encryption: false resources are skipped
-     silently, and already-encrypted ones are never asked and never
-     migrated — then encrypts the ones that need it (keeping a
-     .app_listener.backup copy) while a progress bar shows the copy
-     progress
-  7a. asks for the edit-protected password (mandatory): it authenticates
-     edit-protected's live mode and is stored hashed in binaries.db, which
-     the running daemon seals. When resuming an interrupted install an
-     existing password is kept unless you choose to replace it
-  8. installs the systemd units from the embedded daemon-samples and
-     writes the config to /etc/app-listener/daemon.conf (the binary is left
-     as deployed). The PATH symlink /usr/local/bin/app-listener is
-     (re)created. The pacman/apt catalog-refresh hooks and the boot-time
-     refresh unit an earlier version installed are removed: the daemon
-     refreshes the catalog itself. Already-installed files and an existing config are
-     compared with the bundled ones: identical files are left alone,
-     differing ones show the diff in the TUI and ask whether to overwrite.
-     The per-user ssh-agent systemd unit (and the SSH_AUTH_SOCK block in the
-     user's shell rc file) is installed for the users who accepted it in
-     step 6a
-  9. enables the daemon across reboots and ensures it is running. When the
-     config changed on a running daemon it is reloaded with SIGHUP instead
-     of restarted
- 10. cleans up orphaned fscrypt metadata: policies and raw-key protectors
-     left behind by directories that were encrypted and no longer exist
-     (only metadata carrying the installer's own app-listener-key-*
-     signature is removed — existing directories keep their metadata)
- 11. asks whether to delete the migration backups
-
-An interrupted installation is resumed by running the wizard again
-(existing master key kept, already encrypted directories verified,
-identical files skipped, backups never overwritten). A completed one is
-recorded in /etc/app-listener/install-complete and the wizard then refuses
-to run: use the maintenance flags below or 'app-listener update', or run
-'app-listener uninstall' first to start over. --binary-only and the other
-maintenance flags are not affected.
-
-Aborting (Esc) any step stops the installer; the system is left untouched
-except for steps that already completed. A directory whose
-.app_listener.backup exists aborts the migration with a fatal error: never
-overwrite an older backup.
-
-Use --restore-backups to undo the migration instead of installing: the
-found .app_listener.backup directories are shown in a TUI list and, after
-a confirmation naming each one, the encrypted directories are deleted and
-the backups moved back, restoring the original unencrypted content. It
-aborts while the daemon is running.
-
-Use --delete-post-backups to delete the found .app_listener.backup
-directories instead of installing (also shown in a TUI list first, then
-confirmed naming each one). The daemon may keep running: the backups sit
-outside every guarded tree. Both options show a TUI progress bar while
-running.
-
-Use --binary-only for a shortcut that only deploys the binary: it builds
-build/linux/app-listener when it does not exist and replaces
-/usr/local/sbin/app-listener atomically, recreating the
-/usr/local/bin/app-listener symlink — nothing else is touched (no config,
-no fscrypt, no services). When the daemon service is not installed yet it
-just deploys the binary and the symlink and stops there (there is no unit
-to restart). Otherwise it asks (TUI) whether to restart the daemon now —
-stopping it, replacing the binary and starting it again, the historical
-default — or skip the restart, which still replaces the binary file but
-leaves the running daemon on its old (already-loaded) binary until you
-restart it yourself.
-
-Use --refresh-catalog-only to refresh the whitelist of every guarded
-directory from the catalog by hand: encrypted vaults are unlocked, glob
-patterns are re-expanded (picking up new binaries and dropping every line
-the catalog does not produce), and the diff is shown before overwriting.
-User-added sections (not in the catalog) are preserved as-is. Requires a
-previous installation. The running daemon does this itself (it watches the
-catalog's directories and refreshes at startup, keeping lines whose binary
-still exists); this flag is for manual or debug use.
-
-Use --diff-catalog to add directories the catalog now discovers but the
-installed daemon.conf does not yet guard (a catalog update, or a newly
-installed application): the missing critical directories are listed in the
-same picker as the wizard, the selected ones are appended to the config
-and encrypted like a fresh install, and every existing section is left
-byte-for-byte intact. It stops the daemon for the cycle and restarts it on
-the merged config. Requires a previous installation. Unlike
---refresh-catalog-only this never touches existing sections' whitelists —
-run both to fully re-sync.`,
+Re-run it to resume an interrupted install. A completed install is recorded and
+the wizard then refuses: use the subcommands, 'update', or 'uninstall' first.`,
+	Example: `  sudo app-listener install
+  sudo app-listener install binary
+  sudo app-listener install catalog diff`,
 	Args: cobra.NoArgs,
 	RunE: runInstall,
 }
 
-func runInstall(cmd *cobra.Command, args []string) error {
+var binaryCmd = &cobra.Command{
+	Use:   "binary",
+	Short: "Deploy only this build's binary, then offer to restart the daemon",
+	Long: `Replace /usr/local/sbin/app-listener with build/linux/app-listener (built when
+missing) and recreate the /usr/local/bin symlink. Nothing else changes. With the
+service installed, a differing daemon unit is diffed and offered, then you pick
+whether to restart the daemon now or leave it on the old binary.`,
+	Args: cobra.NoArgs,
+	RunE: func(*cobra.Command, []string) error { return asRoot(installBinaryOnly) },
+}
+
+var catalogCmd = &cobra.Command{
+	Use:   "catalog",
+	Short: "Sync an existing install with the catalog of sensitive directories",
+	Args:  cobra.NoArgs,
+}
+
+var catalogRefreshCmd = &cobra.Command{
+	Use:   "refresh",
+	Short: "Re-expand the catalog whitelists of every guarded directory",
+	Long: `Re-expand the catalog's whitelist of every guarded directory (new binaries in,
+deleted ones out) and show the diff before writing daemon.conf. Sections not
+from the catalog are kept as they are. The daemon does this by itself; this is
+for manual or debug use. Without --live the daemon is stopped for the cycle.`,
+	Args: cobra.NoArgs,
+	RunE: func(*cobra.Command, []string) error {
+		return asRoot(func() error { return runRefreshCatalogOnly(refreshYes, refreshLive) })
+	},
+}
+
+var catalogDiffCmd = &cobra.Command{
+	Use:   "diff",
+	Short: "Add catalog directories the installed daemon.conf doesn't guard yet",
+	Long: `List the catalog directories that exist on this host but aren't guarded yet,
+append the ones you pick to daemon.conf and encrypt them like a fresh install.
+Existing sections stay byte-for-byte intact. The daemon must be stopped first;
+at the end you are asked whether to start it. Run 'catalog refresh' too to
+update existing whitelists.`,
+	Args: cobra.NoArgs,
+	RunE: func(*cobra.Command, []string) error { return asRoot(runDiffCatalog) },
+}
+
+var backupsCmd = &cobra.Command{
+	Use:   "backups",
+	Short: "Restore or delete the .app_listener.backup copies the encryption left",
+	Args:  cobra.NoArgs,
+}
+
+var backupsRestoreCmd = &cobra.Command{
+	Use:   "restore",
+	Short: "Undo the encryption: move the backups back over the encrypted directories",
+	Long: `Delete the encrypted directories and move their .app_listener.backup copies
+back, after a confirmation naming each one. Refused while the daemon runs.`,
+	Args: cobra.NoArgs,
+	RunE: func(*cobra.Command, []string) error { return asRoot(restoreBackups) },
+}
+
+var backupsDeleteCmd = &cobra.Command{
+	Use:   "delete",
+	Short: "Delete the backups (the daemon may keep running)",
+	Args:  cobra.NoArgs,
+	RunE:  func(*cobra.Command, []string) error { return asRoot(deletePostBackups) },
+}
+
+var (
+	refreshYes   bool
+	refreshLive  bool
+	markComplete bool
+)
+
+func init() {
+	InstallCmd.Flags().BoolVar(&allowMetadataOutput, "allow-metadata-output", false,
+		"Install the daemon unit without --no-log-metadata-blocks (logs denied op=PTRACE mode=READ inspections)")
+	// The installer runs it on the installed binary, which may be another version: never rename it.
+	// The GUI window isn't the app-listener binary, so the daemon's guard on /etc/app-listener denies
+	// it the completed-install record; the installed binary writes it.
+	InstallCmd.Flags().BoolVar(&markComplete, "mark-complete", false,
+		"Record a completed installation (the desktop installer runs it on the installed binary)")
+
+	catalogRefreshCmd.Flags().BoolVar(&refreshLive, "live", false,
+		"Keep the daemon running: apply the new config with a reload (needs the daemon running)")
+	catalogRefreshCmd.Flags().BoolVarP(&refreshYes, "yes", "y", false, "Write without asking (scripts)")
+
+	catalogCmd.AddCommand(catalogRefreshCmd, catalogDiffCmd)
+	backupsCmd.AddCommand(backupsRestoreCmd, backupsDeleteCmd)
+	InstallCmd.AddCommand(binaryCmd, catalogCmd, backupsCmd)
+}
+
+func asRoot(run func() error) error {
 	if os.Geteuid() != 0 {
 		return errors.New("install must be run as root: sudo app-listener install")
 	}
-
-	done, maintenanceErr := runMaintenanceMode(cmd)
-	if maintenanceErr != nil {
-		return maintenanceErr
-	}
-	if done {
-		return nil
-	}
-
-	return runWizard()
+	return run()
 }
 
-// runWizard is the installer body after the maintenance flags (steps 0-11 of the command help).
+func runInstall(*cobra.Command, []string) error {
+	if markComplete {
+		return asRoot(markInstallComplete)
+	}
+	return asRoot(runWizard)
+}
+
+// runWizard is the installer body (docs/installation.md#the-install-wizard).
 func runWizard() error {
 	if err := protected.RequireNoInstallCert(); err != nil {
 		return err
@@ -255,7 +214,7 @@ func runWizard() error {
 func certifyInstall() {
 	var err error
 	if deploySource == "" {
-		err = markComplete()
+		err = markInstallComplete()
 	} else {
 		err = systemd.RunCmd(systemd.InstallBinaryPath, "install", "--mark-complete")
 	}
@@ -268,8 +227,8 @@ func certifyInstall() {
 		protected.InstallCertPath())
 }
 
-// markComplete is --mark-complete: only a running, enabled daemon counts as installed.
-func markComplete() error {
+// markInstallComplete is --mark-complete: only a running, enabled daemon counts as installed.
+func markInstallComplete() error {
 	if !systemd.IsDaemonActive() {
 		return errors.New("the daemon is not running: the installation is not complete")
 	}
@@ -277,97 +236,6 @@ func markComplete() error {
 		return errors.New("the daemon is not enabled across reboots: the installation is not complete")
 	}
 	return protected.WriteInstallCert(constants.Version)
-}
-
-// maintenanceFlags holds the parsed CLI flags of the install command's mutually exclusive
-// maintenance modes.
-type maintenanceFlags struct {
-	restore        bool
-	deleteBackup   bool
-	binaryOnly     bool
-	refreshCatalog bool
-	diffCatalog    bool
-	live           bool
-	autoConfirm    bool
-	markComplete   bool
-}
-
-func parseMaintenanceFlags(cmd *cobra.Command) (maintenanceFlags, error) {
-	var f maintenanceFlags
-	var err error
-	if f.restore, err = cmd.Flags().GetBool("restore-backups"); err != nil {
-		return f, err
-	}
-	if f.deleteBackup, err = cmd.Flags().GetBool("delete-post-backups"); err != nil {
-		return f, err
-	}
-	if f.binaryOnly, err = cmd.Flags().GetBool("binary-only"); err != nil {
-		return f, err
-	}
-	if f.refreshCatalog, err = cmd.Flags().GetBool("refresh-catalog-only"); err != nil {
-		return f, err
-	}
-	if f.diffCatalog, err = cmd.Flags().GetBool("diff-catalog"); err != nil {
-		return f, err
-	}
-	if f.live, err = cmd.Flags().GetBool("live"); err != nil {
-		return f, err
-	}
-	if f.autoConfirm, err = cmd.Flags().GetBool("yes"); err != nil {
-		return f, err
-	}
-	if f.markComplete, err = cmd.Flags().GetBool("mark-complete"); err != nil {
-		return f, err
-	}
-	return f, nil
-}
-
-// runMaintenanceMode dispatches the mutually exclusive maintenance flags, reporting whether one
-// ran so the caller skips the installer body.
-func runMaintenanceMode(cmd *cobra.Command) (bool, error) {
-	f, err := parseMaintenanceFlags(cmd)
-	if err != nil {
-		return false, err
-	}
-	if err := validateMaintenanceFlags(f); err != nil {
-		return false, err
-	}
-	switch {
-	case f.restore:
-		return true, restoreBackups()
-	case f.deleteBackup:
-		return true, deletePostBackups()
-	case f.binaryOnly:
-		return true, installBinaryOnly()
-	case f.refreshCatalog:
-		return true, runRefreshCatalogOnly(f.autoConfirm, f.live)
-	case f.diffCatalog:
-		return true, runDiffCatalog()
-	case f.markComplete:
-		return true, markComplete()
-	}
-	return false, nil
-}
-
-// validateMaintenanceFlags rejects unsupported combinations: --yes/--live outside their owning
-// modes, and more than one mode at once.
-func validateMaintenanceFlags(f maintenanceFlags) error {
-	if f.autoConfirm && !f.refreshCatalog && !f.restore && !f.deleteBackup {
-		return errors.New("--yes can only be used with --refresh-catalog-only, --restore-backups, or --delete-post-backups")
-	}
-	if f.live && !f.refreshCatalog {
-		return errors.New("--live can only be used with --refresh-catalog-only")
-	}
-	modes := 0
-	for _, on := range []bool{f.restore, f.deleteBackup, f.binaryOnly, f.refreshCatalog, f.diffCatalog, f.markComplete} {
-		if on {
-			modes++
-		}
-	}
-	if modes > 1 {
-		return errors.New("--restore-backups, --delete-post-backups, --binary-only, --refresh-catalog-only and --diff-catalog are mutually exclusive")
-	}
-	return nil
 }
 
 // installBinaryOnly deploys only the freshly built binary (systemd.DeployInstalledBinary); config
@@ -438,7 +306,7 @@ func runRefreshCatalogOnly(autoConfirm, live bool) error {
 	if live {
 		if !systemd.IsDaemonActive() {
 			return errors.New("live catalog refresh requires the daemon to be running: " +
-				"locked vaults hide plaintext names — use --refresh-catalog-only without --live, or start the daemon first")
+				"locked vaults hide plaintext names — use `install catalog refresh` without --live, or start the daemon first")
 		}
 		vault := fscrypt.New()
 		changed, err := refreshCatalogConfig(vault, autoConfirm, true)
@@ -542,11 +410,11 @@ func checkRunningBinaryMatchesInstalled() error {
 	}
 	return fmt.Errorf(
 		"this binary (%s) is not the one already installed at %s — `install` leaves an existing binary "+
-			"untouched (see `install --binary-only` / `app-listener update`), so the daemon that comes back "+
+			"untouched (see `install binary` / `app-listener update`), so the daemon that comes back "+
 			"up during this wizard would still be running the OLD binary. Its self-protection only trusts "+
 			"its own on-disk file, so the wizard's last step (writing the edit-protected password hash) "+
 			"would fail with a confusing \"operation not permitted\" after everything else already ran.\n"+
-			"Run 'sudo %s install --binary-only' (or 'app-listener update') first to deploy this binary and "+
+			"Run 'sudo %s install binary' (or 'app-listener update') first to deploy this binary and "+
 			"restart the daemon on it, then re-run 'sudo app-listener install'",
 		self, installedBinaryPath, self)
 }
@@ -561,7 +429,7 @@ func checkInstalledMatchesSource() error {
 	}
 	if !same {
 		return fmt.Errorf("the binary installed at %s is not this version's headless build: deploy it "+
-			"first from a terminal (`app-listener update`, or `install --binary-only`), then run the wizard again", installedBinaryPath)
+			"first from a terminal (`app-listener update`, or `install binary`), then run the wizard again", installedBinaryPath)
 	}
 	return nil
 }
@@ -594,9 +462,9 @@ func fileSHA256(path string) ([sha256.Size]byte, error) {
 }
 
 // ensureInstalledBinary makes sure the binary is deployed at its service path. An existing one is
-// left untouched (upgrades go through `install --binary-only` or `app-listener update`, which
+// left untouched (upgrades go through `install binary` or `app-listener update`, which
 // restart the daemon). A missing one (first run after `make build` or the one-line installer) is
-// filled by copying the running executable as-is: no recompilation, no separate --binary-only step.
+// filled by copying the running executable as-is: no recompilation, no separate `install binary` step.
 func ensureInstalledBinary() error {
 	if _, err := os.Stat(installedBinaryPath); err == nil {
 		log.Infof("binary is installed: %s", installedBinaryPath)
@@ -677,34 +545,41 @@ func secureResources(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Con
 // first start: everything that could abort has succeeded and the daemon isn't running, so that
 // first start already seals the hash and opens the control socket (no follow-up reload).
 func deploy(cfgText string, sshUsers []inst.User, bunUsers []bunUser, editPassword string) error {
-	if err := installServices(sshUsers); err != nil {
-		return err
-	}
-	configChanged, err := installConfig(cfgText)
+	configChanged, err := deployFiles(cfgText, sshUsers, bunUsers, editPassword)
 	if err != nil {
-		return err
-	}
-	if err := preflightDeployedBinary(); err != nil {
-		return err
-	}
-	// Before the daemon (re)starts: the reserved .bun-* pattern activates only once each opted-in
-	// user's tmp dir exists.
-	if err := setupBunTmpdir(bunUsers); err != nil {
-		return err
-	}
-	if err := writeEditPasswordHash(editPassword); err != nil {
-		return err
-	}
-	if err := grantNewBinaries(cfgText); err != nil {
 		return err
 	}
 	return systemd.EnableAndVerify(configChanged)
 }
 
+// deployFiles is deploy without starting the daemon: units, config, eBPF preflight, Bun dirs,
+// password hash and ledger rows. configChanged reports whether daemon.conf was rewritten.
+func deployFiles(cfgText string, sshUsers []inst.User, bunUsers []bunUser, editPassword string) (bool, error) {
+	if err := installServices(sshUsers); err != nil {
+		return false, err
+	}
+	configChanged, err := installConfig(cfgText)
+	if err != nil {
+		return false, err
+	}
+	if err := preflightDeployedBinary(); err != nil {
+		return false, err
+	}
+	// Before the daemon (re)starts: the reserved .bun-* pattern activates only once each opted-in
+	// user's tmp dir exists.
+	if err := setupBunTmpdir(bunUsers); err != nil {
+		return false, err
+	}
+	if err := writeEditPasswordHash(editPassword); err != nil {
+		return false, err
+	}
+	return configChanged, grantNewBinaries(cfgText)
+}
+
 // grantNewBinaries lets the daemon's next start record every whitelist line the ledger doesn't
 // know yet (binledger.Grant): choosing a section in this wizard is the confirmation. Lines already
 // recorded keep their hash, so a binary that changed while the daemon was stopped for this install
-// still needs `trust-binaries`.
+// still needs `trust`.
 func grantNewBinaries(cfgText string) error {
 	cfg, err := daemonconfig.Parse([]byte(cfgText))
 	if err != nil {
@@ -728,7 +603,8 @@ func grantNewBinaries(cfgText string) error {
 	return nil
 }
 
-// preflightDeployedBinary runs `<installed binary> daemon --check` on the just-deployed binary and
+// preflightDeployedBinary runs `<installed binary> daemon --check` (the spelling every version
+// accepts) on the just-deployed binary and
 // config BEFORE enabling the service: BPF-LSM active and every guard eBPF program accepted by this
 // kernel's verifier (nothing attached). A failure means the daemon would crash-loop (or panic, with
 // a prebuilt object too complex for a newer kernel), so the install aborts having changed only the
@@ -748,7 +624,7 @@ func preflightDeployedBinary() error {
 }
 
 // buildBinaryIfNeeded compiles build/linux/app-listener if missing; refuses without a source tree.
-// Only the --binary-only path uses it (the full wizard never builds).
+// Only `install binary` uses it (the full wizard never builds).
 func buildBinaryIfNeeded() error {
 	if _, err := os.Stat(buildBinaryPath); err == nil {
 		log.Infof("binary already built: %s", buildBinaryPath)

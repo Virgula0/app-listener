@@ -31,7 +31,7 @@ const ControlSocket = "/run/app-listener-daemon.control"
 //	client -> [TIMEOUT <seconds>\n]                   (idle timeout; default SessionTimeoutDefault)
 //	          SELECT <resource>\n                       (edit)
 //	       |  FORWARD <allow|block> <events|*> <nres> <nbin>\n
-//	          <resource>\n × nres  <binary>\n × nbin   (--forward)
+//	          <resource>\n × nres  <binary>\n × nbin   (forward)
 //	server -> OK\n (SELECT) | OK <m>\n<note>\n × m (FORWARD) | ERR <reason>\n
 //	server -> EVENT <json guard.GuardEvent>\n …          (FORWARD: the granted binaries' events)
 //	client -> PING\n …                                 (activity: resets the idle timeout)
@@ -59,7 +59,7 @@ const (
 	ctrlErr      = "ERR"
 )
 
-// SessionTimeoutDefault is a live session's idle timeout when --timeout-session isn't given;
+// SessionTimeoutDefault is a live session's idle timeout when --idle-timeout isn't given;
 // SessionTimeoutMax bounds what the daemon accepts.
 const (
 	SessionTimeoutDefault = 30 * time.Minute

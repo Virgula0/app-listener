@@ -7,7 +7,7 @@ FROM golang:1.26-bookworm
 # BPF code generation is highly sensitive to the clang version: Debian
 # bookworm's stock clang 14 emits a `guard_path_rename` that overflows the
 # BPF verifier's 1,000,000-instruction budget on modern kernels, so the
-# container build fails `daemon --check` where an on-host build with a
+# container build fails `daemon check` where an on-host build with a
 # current clang passes (issue #45). Pin a current clang from apt.llvm.org so
 # `make build`, CI and every release binary match a modern host toolchain
 # (clang 22.x) and the guard programs verify.

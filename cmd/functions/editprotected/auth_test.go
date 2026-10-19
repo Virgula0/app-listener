@@ -211,7 +211,7 @@ func TestMigrateLegacyHashRefusesOddFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := MigrateLegacyHash()
-	if err == nil || !strings.Contains(err.Error(), "--set-password") {
+	if err == nil || !strings.Contains(err.Error(), "edit-protected password") {
 		t.Fatalf("a malformed legacy record: err = %v, want a refusal that says to set a password", err)
 	}
 	if _, err := os.Lstat(legacyHashPath); !os.IsNotExist(err) {
@@ -249,7 +249,7 @@ func TestMigrateLegacyHashMalformedKeepsStored(t *testing.T) {
 	if err := os.WriteFile(legacyHashPath, []byte("garbage"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := MigrateLegacyHash(); err == nil || strings.Contains(err.Error(), "--set-password") {
+	if err := MigrateLegacyHash(); err == nil || strings.Contains(err.Error(), "edit-protected password") {
 		t.Fatalf("err = %v, want a refusal that keeps the stored password", err)
 	}
 	if got, _ := LoadHash(); got != cur {

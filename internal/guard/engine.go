@@ -102,7 +102,7 @@ var sharedEngine engine
 //
 // The shared links outlive a reload (they are detached only when the last Guard stops), so a
 // reload MOVES the existing pins to the new generation instead of leaving them under the retired
-// one — otherwise `daemon --lockdown` would look for them under the generation pin-state records
+// one — otherwise `daemon lockdown` would look for them under the generation pin-state records
 // and find nothing, losing crash recovery for file vaults.
 func ConfigureSharedPinning(prefix string) {
 	sharedEngine.mu.Lock()
@@ -139,7 +139,7 @@ func (e *engine) repinLocked(prefix string) {
 			{ExeEventsPinName, e.objs.GuardExeEvents},
 		} {
 			if err := spec.m.Pin(prefix + spec.name); err != nil {
-				log.Errorf("guard: moving pinned %s to %s failed (%v) — 'daemon --lockdown' loses "+
+				log.Errorf("guard: moving pinned %s to %s failed (%v) — 'daemon lockdown' loses "+
 					"self-access widening for this generation", spec.name, prefix, err)
 			}
 		}
@@ -1018,7 +1018,7 @@ func (e *engine) clearGlobalAllowsLocked() error {
 	return nil
 }
 
-// pinSharedMaps pins the shared whitelist maps once, so `daemon --lockdown` can widen a file
+// pinSharedMaps pins the shared whitelist maps once, so `daemon lockdown` can widen a file
 // vault's self-access after the daemon died. Idempotent: the maps are pinned on first request and
 // re-pinning would MOVE the pin, orphaning the earlier path.
 func (e *engine) pinSharedMaps() {
@@ -1035,7 +1035,7 @@ func (e *engine) pinSharedMaps() {
 		{ExeEventsPinName, e.objs.GuardExeEvents},
 	} {
 		if err := spec.m.Pin(e.pinPrefix + spec.name); err != nil {
-			log.Errorf("guard: pinning %s failed (%v) — 'daemon --lockdown' will not be able to widen "+
+			log.Errorf("guard: pinning %s failed (%v) — 'daemon lockdown' will not be able to widen "+
 				"self-access if the daemon crashes while a vault is unlocked", spec.name, err)
 			return
 		}

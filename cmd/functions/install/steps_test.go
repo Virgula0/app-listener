@@ -129,8 +129,8 @@ func TestCheckRunningBinaryMatchesInstalled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error for an installed binary that is not this process's own exe")
 	}
-	if !strings.Contains(err.Error(), "install --binary-only") {
-		t.Errorf("error should point at the fix (install --binary-only / app-listener update): %v", err)
+	if !strings.Contains(err.Error(), "install binary") {
+		t.Errorf("error should point at the fix (install binary / app-listener update): %v", err)
 	}
 }
 
@@ -272,7 +272,7 @@ func groupedDiscordConf(t *testing.T, home string) (string, *daemonconfig.Config
 	return confText, cfg
 }
 
-// Regression (pacman-hook breaker): `install --refresh-catalog-only` addressed a grouped section's
+// Regression (pacman-hook breaker): `install catalog refresh` addressed a grouped section's
 // whitelist by its first watch sub-path, which has no [watch] header, so SetSectionWhitelist failed
 // "section not found" and (non-live) left the daemon stopped. It must address the section by its
 // encryption root, re-expand the shared whitelist and keep the `watch:` structure.

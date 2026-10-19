@@ -85,8 +85,8 @@ func RequireNoInstallCert() error {
 		return nil
 	}
 	return fmt.Errorf("app-listener %s is already installed (completed %s): the wizard only runs on a fresh "+
-		"or interrupted installation. Use `install --diff-catalog` to protect more folders, "+
-		"`install --refresh-catalog-only` to refresh the whitelists, `edit-protected --edit-config` to change "+
+		"or interrupted installation. Use `install catalog diff` to protect more folders, "+
+		"`install catalog refresh` to refresh the whitelists, `edit-protected config` to change "+
 		"daemon.conf or `app-listener update` for a new version, or run `app-listener uninstall` first to start over",
 		c.Version, c.CompletedAt.Local().Format("2006-01-02 15:04"))
 }

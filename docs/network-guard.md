@@ -1,4 +1,4 @@
-# network-guard: block network access by program
+# network guard: block network access by program
 
 Denies socket operations by binary identity through the LSM `socket_connect`, `socket_bind`,
 `socket_listen`, `socket_sendmsg` and `socket_recvmsg` hooks. Two typical uses: cut a single
@@ -6,8 +6,8 @@ tool off the network (`-b`), or let only a browser and the system's own network 
 (`-w`).
 
 ```bash
-sudo app-listener network-guard -b /usr/bin/curl -e CONNECT,SEND
-sudo app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
+sudo app-listener network guard -b /usr/bin/curl -e CONNECT,SEND
+sudo app-listener network guard -w /usr/lib/firefox/firefox --auto-infra
 ```
 
 ## Flags
@@ -19,7 +19,7 @@ sudo app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
 | `--auto-infra` | `false` | Auto-allow running infrastructure daemons (systemd-resolved, NetworkManager, ...). Without it DNS breaks for everyone in whitelist mode |
 | `--unsafe` | `false` | Also block AF_UNIX (X11, D-Bus, systemd); may break the desktop |
 | `--no-throttle` | `false` | Disable rate limiting (default: 1 event per type, verdict and process name per 250 ms) |
-| `-e, --events <list>` | all | `CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN` |
+| `-e, --events <list>` | all | Events to show: `CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN`. Display only: enforcement covers every operation |
 | `--headless` | `false` | No TUI; log `NETGUARD\|` lines to stderr |
 | `--serve[=host:port]` | off | Mirror the TUI to a browser |
 
