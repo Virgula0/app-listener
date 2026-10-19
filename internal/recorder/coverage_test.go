@@ -40,6 +40,7 @@ var hookCoverage = map[string]struct {
 	"file_ioctl_compat":    {none: "btrfs copy ioctls (compat), refused superblock-wide: never proposed"},
 	"sb_mount":             {none: "mounting over a tree needs CAP_SYS_ADMIN: never proposed"},
 	"ptrace_access_check":  {none: "process gate on tainted processes, not a file op"},
+	"task_prctl":           {none: "process gate: denies prctl(PR_SET_MM) exe_file rewrites, not a file op"},
 	"inode_free_security":  {none: "bookkeeping (evicts freed inodes)"},
 	"bprm_committed_creds": {none: "bookkeeping (supersede and taint on exec)"},
 	"task_free":            {none: "bookkeeping (exited processes)"},

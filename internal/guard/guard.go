@@ -665,11 +665,14 @@ func (g *Guard) PinDegraded() bool { return SharedPinDegraded() }
 
 // requiredHooks: without the first two, files could be opened and read unchecked; without the
 // inode/bprm ones, a superseded binary or a reused inode number would keep its whitelist entry
-// (exe_supersede.h); without the ioctl ones, a btrfs snapshot copies a guarded tree unguarded.
+// (exe_supersede.h); without the ioctl ones, a btrfs snapshot copies a guarded tree unguarded;
+// without task_prctl, a process repoints mm->exe_file at a whitelisted inode (prctl PR_SET_MM) and
+// borrows its identity, so the guard's inode-keyed policy is bypassable.
 var requiredHooks = map[string]bool{
 	"file_open": true, "file_permission": true,
 	"inode_unlink": true, "inode_rename": true, "bprm_committed_creds": true,
 	"file_ioctl": true, "file_ioctl_compat": true,
+	"task_prctl": true,
 }
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
@@ -761,6 +764,7 @@ func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []struct {
 		{o.GuardInodeListxattr, "inode_listxattr"},
 		{o.GuardInodeReadlink, "inode_readlink"},
 		{o.GuardSbMount, "sb_mount"},
+		{o.GuardTaskPrctl, "task_prctl"},
 		{o.GuardPtraceAccessCheck, "ptrace_access_check"},
 		{o.GuardBprmCheckSecurity, "bprm_check_security"},
 		{o.GuardTaskFree, "task_free"},
