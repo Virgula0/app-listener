@@ -73,8 +73,10 @@ and you can edit again. --content-file <file> replaces it without the editor.
 uses them: it records every access to the paths, keyed by the executable's
 inode, until you stop it, lists the binaries (and the libraries they load) for
 you to approve, can encrypt the paths first, then adds one section per path and
-reloads the daemon. Anything that touched the paths while recording is listed,
-malware included: approve only what you ran on purpose.
+reloads the daemon. A path daemon.conf already guards is extended instead: its
+current whitelist is shown and kept, and only new lines are added (the guard
+keeps denying the rest while recording). Anything that touched the paths while
+recording is listed, malware included: approve only what you ran on purpose.
 
 Use --set-password to change the edit-protected password: it asks the
 current one first (checked by the running daemon, or with the daemon stopped

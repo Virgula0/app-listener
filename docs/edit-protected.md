@@ -10,7 +10,7 @@ sudo app-listener edit-protected --set-password         # change the password (a
 sudo app-listener edit-protected --forward -w <bin> [-e EVENTS]   # temporary access for another binary
 sudo app-listener edit-protected --timeout-session 10m  # revoke a live session after 10 idle minutes
 sudo app-listener edit-protected --edit-config          # edit the running daemon.conf; saving reloads it
-sudo app-listener edit-protected --edit-config --record ~/work/secrets   # learn who uses a new path, then guard it
+sudo app-listener edit-protected --edit-config --record ~/work/secrets   # learn who uses a path, then guard it (or extend its section)
 ```
 
 It opens the directory in a two-pane editor, the file tree on the left. `Ctrl+S` saves
@@ -184,10 +184,31 @@ How the recording stays safe:
   already knows keeps its verdict: if its content changed since, it still needs `trust-binaries`.
 - Refused paths: system trees (`/usr`, `/proc`, `/etc/app-listener`, ...), whole roots such as
   `/home` or a user's whole home, symbolic links, files with more than one hard link, migration
-  copies, and anything inside or around a path the daemon already guards (edit that section
-  instead) or another recorded path.
+  copies, and anything inside or around a path the daemon already guards or another recorded path
+  (recording exactly a guarded path extends it, see below).
 - Encryption needs the filesystem prepared (the commands are shown otherwise; the installer can
   run them); a path that can't be encrypted can still be recorded without encryption.
+
+#### Extending a path `daemon.conf` already guards
+
+Recording exactly a guarded path (the path of a `[watch]` section, or a `watch:` path of a group)
+extends its section instead of adding one. Before the recording starts you are warned, and shown the
+lines the section already whitelists (the terminal asks to confirm; the GUI shows it on the recording
+page and again in the review). Then:
+
+- Every existing line stays as written; only the approved programs the section doesn't list yet are
+  added, after its last whitelist line. A program already whitelisted for every path it touched is
+  listed as such and can't be selected. One whose line restricts its events but that was seen doing
+  more gets a note: widen that line with `--edit-config`.
+- The guard keeps running while you record, so a program the section doesn't whitelist is denied
+  and seen only up to its first refused operation (usually the open). Restricting it to the events
+  it was seen doing would miss what it never got to do: prefer every event for it, or record again
+  once it is whitelisted.
+- In a `watch:` group the whitelist is shared: a line added for one path reaches the group's other
+  paths too, and the warning names them.
+- Encryption is not offered for such a path: change its `need_encryption` with `--edit-config`.
+- Selecting nothing new applies nothing. Paths around or inside a guarded path, a `lib_dir`, or a
+  group's encryption root are still refused.
 
 ## Editor keys
 

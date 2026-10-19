@@ -115,6 +115,46 @@ func (s *IntegrationSuite) TestRecord_GuardParity() {
 	s.stopParityDaemon(c)
 }
 
+// Recording a tree the daemon already guards extends its section: the guard keeps denying the
+// unwhitelisted copy, yet the recorder still sees its refused open (kprobe/vfs_open runs before
+// security_file_open), so the proposal adds that copy to the existing section and the copy the
+// section lists is reported as covered, not re-added.
+func (s *IntegrationSuite) TestRecord_ExtendsGuardedResource() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/recordops"), "/recordops", 0o755))
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, recorderTestAmd64Bin, "/recorder.test", 0o755))
+	const dir = parityRec + "/read"
+	code, out := s.exec(c, []string{"sh", "-c", "set -e; mkdir -p /ops " + parityRec + " " + parityOut + " /etc/app-listener; " +
+		"cp /recordops /ops/listed; cp /recordops /ops/fresh; /recordops setup " + dir + " " + parityOut})
+	s.Require().Equalf(0, code, "fixture: %s", out)
+	base := fmt.Sprintf("[watch %s]\n/ops/listed\nneed_encryption: false\n", parityRec)
+	// The daemon self-guards /etc/app-listener: the harness reads its own copy.
+	code, out = s.exec(c, []string{"sh", "-c", "cat > /base.conf <<'EOF'\n" + base + "\nEOF"})
+	s.Require().Equalf(0, code, "base: %s", out)
+	s.startDaemon(c, base)
+
+	script := fmt.Sprintf("/ops/listed read %[1]s %[2]s; echo \"RC listed $?\"; "+
+		"/ops/fresh read %[1]s %[2]s; echo \"RC fresh $?\"", dir, parityOut)
+	code, out = s.exec(c, []string{"env", "APPLISTENER_HARNESS_PATH=" + parityRec, "APPLISTENER_HARNESS_BASE=/base.conf",
+		"APPLISTENER_HARNESS_CMD=" + script, "/recorder.test", "-test.run", "TestRecorderHarness/TestRecord", "-test.v"})
+	s.Require().Equalf(0, code, "recording: %s", out)
+	rcs, masks, config := parseParityRecording(out)
+	s.Require().Equalf("0", rcs["listed"], "the listed copy reads under the guard:\n%s", out)
+	s.Require().NotEqualf("0", rcs["fresh"], "the unlisted copy is denied while recording:\n%s", out)
+	s.Require().Containsf(out, "EXISTING "+parityRec+" "+parityRec+"\n", "the target is not extended:\n%s", out)
+	s.Require().Containsf(out, "COVERED /ops/listed\n", "the listed copy is not covered:\n%s", out)
+	s.Require().Containsf(masks["/ops/fresh"], "OPEN", "the refused open was not recorded:\n%s", out)
+	s.Require().Equalf(1, strings.Count(config, "[watch "), "one section, extended:\n%s", config)
+	s.Require().Containsf(config, "/ops/listed\n\"/ops/fresh\" ", "the new line follows the listed one:\n%s", config)
+	s.stopParityDaemon(c)
+
+	s.startDaemon(c, config)
+	code, out = s.exec(c, []string{"/ops/fresh", "read", dir, parityOut})
+	s.Assert().Equalf(0, code, "the extended section admits the recorded copy: %s", out)
+	s.stopParityDaemon(c)
+}
+
 // paritySetup rebuilds every op's fixture (by /recordops, an inode no config names).
 func (s *IntegrationSuite) paritySetup(c testcontainers.Container) {
 	cmd := []string{"set -e", "rm -rf " + parityRec + " " + parityOut, "mkdir -p " + parityRec + " " + parityOut}

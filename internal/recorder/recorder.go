@@ -1,7 +1,7 @@
-// Package recorder learns a whitelist for paths the daemon doesn't guard yet: while it records,
-// every access to the targets is grouped by the executable inode the kernel reports for the acting
-// process (never its comm, argv or a path it names), together with the code that executable maps,
-// so `edit-protected --record` can propose daemon.conf sections. A proposal is only a suggestion:
+// Package recorder learns a whitelist for paths (new ones, or exactly a guarded one whose section it
+// extends): while it records, every access to the targets is grouped by the executable inode the
+// kernel reports for the acting process (never its comm, argv or a path it names), together with
+// the code that executable maps, so `edit-protected --record` can propose daemon.conf sections. A proposal is only a suggestion:
 // anything that touched a target during the window, malware included, is in it, so the operator
 // reviews every line and Classify marks what deserves suspicion.
 package recorder
@@ -37,8 +37,9 @@ const (
 
 // Target is one path being recorded.
 type Target struct {
-	Path  string
-	IsDir bool
+	Path     string
+	IsDir    bool
+	Existing *Existing `json:",omitempty"`
 }
 
 type exeKey struct{ dev, ino uint64 }

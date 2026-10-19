@@ -17,6 +17,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/install"
 )
 
 type fakeSource struct{ ch chan ebpf.FileEvent }
@@ -232,8 +233,8 @@ func TestValidateTargets(t *testing.T) {
 		"system tree":    {"/usr/lib/x"},
 		"daemon config":  {"/etc/app-listener"},
 		"whole home":     {home},
-		"guarded":        {guarded},
 		"inside guarded": {filepath.Join(guarded, "k")},
+		"around guarded": {filepath.Dir(guarded)},
 		"symlink":        {link},
 		"hard link":      {hard},
 		"overlap":        {secret, filepath.Join(secret, "f")},
@@ -243,6 +244,99 @@ func TestValidateTargets(t *testing.T) {
 		if _, err := ValidateTargets(paths, base, homes); err == nil {
 			t.Errorf("%s: %v accepted", name, paths)
 		}
+	}
+}
+
+func TestValidateTargetsExtendsAGuardedPath(t *testing.T) {
+	home := t.TempDir()
+	plain, root, libs := filepath.Join(home, ".ssh"), filepath.Join(home, "app"), filepath.Join(home, "libs")
+	m1, m2 := filepath.Join(root, "one"), filepath.Join(root, "two")
+	for _, d := range []string{plain, root, m1, m2, libs} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := mustParse(t, "[watch "+plain+"]\n/usr/bin/ls OPEN,READ\nneed_encryption: false\n\n"+
+		"[watch "+root+"]\nwatch: "+m1+"\nwatch: "+m2+"\n/usr/bin/cat\nlib_dir "+libs+"\nneed_encryption: false\n")
+	got, err := ValidateTargets([]string{plain, m1}, base, []string{home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex := got[0].Existing
+	if ex == nil || ex.Section != plain || !slices.Equal(ex.Lines(), []string{"/usr/bin/ls OPEN,READ"}) ||
+		len(ex.SharedWith) != 0 {
+		t.Fatalf("plain section: %+v", ex)
+	}
+	ex = got[1].Existing
+	if ex == nil || ex.Section != root || !ex.Has("/usr/bin/cat") || !slices.Equal(ex.SharedWith, []string{m2}) {
+		t.Fatalf("group member: %+v", ex)
+	}
+	for name, p := range map[string]string{"encryption root": root, "lib_dir": libs,
+		"inside a member": filepath.Join(m1, "x")} {
+		if _, err := ValidateTargets([]string{p}, base, nil); err == nil {
+			t.Errorf("%s: %s accepted", name, p)
+		}
+	}
+}
+
+func TestPlanExtendsAnExistingSection(t *testing.T) {
+	rec, a, b := testRecording(t)
+	rec.Targets[0].Existing = &Existing{Section: a, Allow: []ExistingRule{{Line: "/usr/bin/ssh"}}}
+	rec.Binaries[0].Whitelisted = []string{a}
+	for name, sel := range map[string]Selection{
+		"covered binary":   {Binaries: []string{"/usr/bin/ssh"}},
+		"encrypt existing": {Binaries: []string{"/usr/bin/git"}, Encrypt: []string{a}},
+	} {
+		if _, err := rec.Plan(&sel); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	rec.Targets[1].Existing = &Existing{Section: b}
+	if _, err := rec.Plan(&Selection{}); err == nil {
+		t.Fatal("a plan adding nothing must not apply")
+	}
+	rec.Targets[1].Existing = nil
+	p, err := rec.Plan(&Selection{Binaries: []string{"/usr/bin/git"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Sections) != 1 || p.Sections[0].Path != b || len(p.Extensions) != 1 || p.Extensions[0].Section != a ||
+		len(p.Extensions[0].Allow) != 1 || p.Extensions[0].Allow[0].Path != "/usr/bin/git" {
+		t.Fatalf("plan: %+v", p)
+	}
+	base := "[watch " + a + "]\n/usr/bin/ssh\n\nneed_encryption: false\n"
+	text, err := p.Render([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(text, "[watch "+a+"]\n/usr/bin/ssh\n\"/usr/bin/git\"\n\nneed_encryption: false\n") {
+		t.Fatalf("the existing section keeps its lines and gains the new one:\n%s", text)
+	}
+	p.Sections = nil
+	again, err := p.Render([]byte(text))
+	if err != nil || !slices.Equal(install.ParseSectionWhitelist(again, a), []string{"/usr/bin/ssh", "/usr/bin/git"}) {
+		t.Fatalf("re-rendering over a base that has the line never duplicates it: %v\n%s", err, again)
+	}
+	if _, err := p.Render([]byte("")); err == nil {
+		t.Fatal("an extension whose section vanished must not apply")
+	}
+}
+
+func TestNoteWhitelisted(t *testing.T) {
+	targets := []Target{{Path: "/a", Existing: &Existing{Allow: []ExistingRule{{Line: "/usr/bin/x",
+		Events: []string{"READ"}}}}}, {Path: "/b"}}
+	b := &Binary{Line: "/usr/bin/x", Targets: []string{"/a", "/b"}, Ops: []string{"OPEN", "READ", "STAT", "WRITE"}}
+	noteWhitelisted(b, targets)
+	if !slices.Equal(b.Whitelisted, []string{"/a"}) || b.Covered() {
+		t.Fatalf("whitelisted for /a only: %+v", b)
+	}
+	if !slices.ContainsFunc(b.Notes, func(n string) bool { return strings.Contains(n, "but seen doing WRITE too") }) {
+		t.Fatalf("only WRITE is beyond READ (it implies OPEN and STAT): %q", b.Notes)
+	}
+	b = &Binary{Line: "/usr/bin/x", Targets: []string{"/a"}}
+	finishBinary(b, exeVerdict{placed: true}, targets)
+	if !b.Covered() || b.Suggested {
+		t.Fatalf("a binary whitelisted everywhere it went starts deselected: %+v", b)
 	}
 }
 
@@ -502,7 +596,7 @@ func TestShellHelpersStartDeselected(t *testing.T) {
 		"/usr/bin/zoxide": true, "/usr/bin/ls": false, "/usr/bin/starshipd": false,
 	} {
 		b := &Binary{Line: line, Exe: line}
-		finishBinary(b, exeVerdict{placed: true})
+		finishBinary(b, exeVerdict{placed: true}, nil)
 		if b.ShellHelper != want || b.Suggested == want {
 			t.Errorf("%s: ShellHelper=%v Suggested=%v", line, b.ShellHelper, b.Suggested)
 		}

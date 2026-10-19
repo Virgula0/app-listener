@@ -122,6 +122,8 @@ type Message struct {
 	// Base is the daemon.conf a record_plan diff is against (Data is the new file).
 	Base []byte `json:"base,omitempty"`
 
+	// RecordTargets are record_start's validated paths, each with the section it already has.
+	RecordTargets  []recorder.Target   `json:"record_targets,omitempty"`
 	RecordProgress *recorder.Progress  `json:"record_progress,omitempty"`
 	Recording      *recorder.Recording `json:"recording,omitempty"`
 	// EncryptBlockers maps each recorded path to why it can't be encrypted live ("" = it can).

@@ -26,7 +26,7 @@ func (b *backend) recordStart(req *editbackend.Request) (*editbackend.Message, e
 	for i, t := range flow.targets {
 		paths[i] = t.Path
 	}
-	return &editbackend.Message{Resources: paths}, nil
+	return &editbackend.Message{Resources: paths, RecordTargets: flow.targets}, nil
 }
 
 func (b *backend) recordStatus(*editbackend.Request) (*editbackend.Message, error) {

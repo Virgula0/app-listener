@@ -94,6 +94,10 @@ func (f *recordFlow) encryptBlockers() map[string]string {
 	vault := fscrypt.New()
 	out := map[string]string{}
 	for _, t := range f.targets {
+		if t.Existing != nil {
+			out[t.Path] = "it is already in daemon.conf: change its need_encryption with --edit-config"
+			continue
+		}
 		out[t.Path] = encryptBlocker(vault, t.Path)
 	}
 	return out

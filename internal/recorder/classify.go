@@ -49,6 +49,8 @@ type Binary struct {
 	SystemPlaced bool
 	GeneralTool  bool
 	ShellHelper  bool
+	// Whitelisted are the targets whose existing section already lists Line.
+	Whitelisted []string
 	// Libs are the code mappings an allow_lib would have to cover (Need), or that can't be
 	// proposed (Problem); system and guarded-tree libraries are only counted (TrustedLibs).
 	Libs        []Lib
@@ -57,6 +59,11 @@ type Binary struct {
 
 // Admissible reports whether b can be whitelisted.
 func (b *Binary) Admissible() bool { return b.Line != "" && b.Problem == "" }
+
+// Covered reports whether every target b touched already whitelists it: there is nothing to add.
+func (b *Binary) Covered() bool {
+	return len(b.Whitelisted) > 0 && len(b.Whitelisted) == len(b.Targets)
+}
 
 // Lib is a library a recorded executable mapped as code.
 type Lib struct {
@@ -141,14 +148,14 @@ func classifyGroup(k exeKey, group []RawAccessor, targets []Target, base *daemon
 				} else {
 					b.Problem = refusal.Error()
 				}
-				finishBinary(&b, v)
+				finishBinary(&b, v, targets)
 				out = append(out, b)
 			}
 			return out
 		}
 	}
 	b := newBinary(exe, group, v, targets, base)
-	finishBinary(&b, v)
+	finishBinary(&b, v, targets)
 	return []Binary{b}
 }
 
@@ -276,11 +283,12 @@ func newBinary(exe string, group []RawAccessor, v exeVerdict, targets []Target, 
 }
 
 // finishBinary adds the review notes and the default selection: only a root-placed executable that
-// isn't a general tool or a shell helper starts selected.
-func finishBinary(b *Binary, v exeVerdict) {
+// isn't a general tool, a shell helper or already whitelisted everywhere it went starts selected.
+func finishBinary(b *Binary, v exeVerdict, targets []Target) {
 	if !b.Admissible() {
 		return
 	}
+	noteWhitelisted(b, targets)
 	b.GeneralTool = install.ResolvesToGeneralTool(b.Line)
 	b.ShellHelper = !b.GeneralTool && isShellHelper(b.Line, b.Exe)
 	if !v.placed {
@@ -298,7 +306,50 @@ func finishBinary(b *Binary, v exeVerdict) {
 	if len(b.UIDs) > 1 {
 		b.Notes = append(b.Notes, fmt.Sprintf("ran as %d different users", len(b.UIDs)))
 	}
-	b.Suggested = v.placed && !b.GeneralTool && !b.ShellHelper
+	b.Suggested = v.placed && !b.GeneralTool && !b.ShellHelper && !b.Covered()
+}
+
+// noteWhitelisted fills b.Whitelisted from the targets' existing sections, noting operations seen
+// beyond the events a line already allows: the guard denied those, and widening them is an edit of
+// the section, not something a recording proposes.
+func noteWhitelisted(b *Binary, targets []Target) {
+	for _, t := range targets {
+		if !slices.Contains(b.Targets, t.Path) || t.Existing == nil {
+			continue
+		}
+		i := slices.IndexFunc(t.Existing.Allow, func(r ExistingRule) bool { return r.Line == b.Line })
+		if i < 0 {
+			continue
+		}
+		b.Whitelisted = append(b.Whitelisted, t.Path)
+		if extra := beyondEvents(b.Ops, t.Existing.Allow[i].Events); len(extra) > 0 {
+			b.Notes = append(b.Notes, fmt.Sprintf("already whitelisted for %s with events %s, but seen doing %s "+
+				"too (denied): widen its line with --edit-config if it needs them", t.Path,
+				strings.Join(t.Existing.Allow[i].Events, ","), strings.Join(extra, ",")))
+		}
+	}
+	if len(b.Whitelisted) > 0 {
+		b.Notes = append(b.Notes, "already whitelisted for "+strings.Join(b.Whitelisted, ", "))
+	}
+}
+
+// beyondEvents are the ops outside allowed (empty = every event); READ, WRITE or MMAP imply OPEN
+// and STAT, as in the guard (guard.eventMask).
+func beyondEvents(ops, allowed []string) []string {
+	if len(allowed) == 0 {
+		return nil
+	}
+	implies := slices.ContainsFunc(allowed, func(e string) bool {
+		return e == ebpf.EventRead.String() || e == ebpf.EventWrite.String() || e == ebpf.EventMmap.String()
+	})
+	var out []string
+	for _, o := range ops {
+		if slices.Contains(allowed, o) || (implies && (o == ebpf.EventOpen.String() || o == ebpf.EventStat.String())) {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
 }
 
 // maskFor is the least-privilege event list for what was observed: listing a directory needs READ

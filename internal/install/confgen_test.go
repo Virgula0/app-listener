@@ -235,3 +235,30 @@ func TestSetSectionWhitelistRefusesUnsafePath(t *testing.T) {
 		}
 	}
 }
+
+func TestAppendSectionWhitelist(t *testing.T) {
+	conf := "[watch \"/a\"]\n\n    /usr/bin/ssh READ\n    # note\n\nneed_encryption: true\n\n" +
+		"[watch /g]\nwatch: /g/one\n# no binaries whitelisted: every access is denied\n\nneed_encryption: false\n\n" +
+		"[libraries \"x\"]\nallow_lib /usr/lib/x.so\n"
+	got, err := AppendSectionWhitelist(conf, "/a", []BinaryRule{{Path: "/usr/bin/ssh"},
+		{Path: "/usr/bin/git", Events: []string{"OPEN", "READ"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "    /usr/bin/ssh READ\n    \"/usr/bin/git\" OPEN,READ\n    # note\n") {
+		t.Fatalf("a new line follows the last whitelist line, indented alike; a listed one is skipped:\n%s", got)
+	}
+	got, err = AppendSectionWhitelist(got, "/g", []BinaryRule{{Path: "/usr/bin/cat"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "denied\n\"/usr/bin/cat\"\n\nneed_encryption: false\n\n[libraries") {
+		t.Fatalf("an empty section gets its first line before need_encryption:\n%s", got)
+	}
+	if _, err := AppendSectionWhitelist(got, "/missing", []BinaryRule{{Path: "/usr/bin/cat"}}); err == nil {
+		t.Fatal("a missing section must fail")
+	}
+	if _, err := AppendSectionWhitelist(got, "/a", []BinaryRule{{Path: "/x\"\n[watch /"}}); err == nil {
+		t.Fatal("a path that would inject a line must be refused")
+	}
+}

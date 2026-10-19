@@ -90,13 +90,15 @@ func validateTarget(raw string, base *daemonconfig.Config, homes []string) (Targ
 	default:
 		return Target{}, fmt.Errorf("%s is not a directory or a regular file", p)
 	}
+	t := Target{Path: p, IsDir: info.IsDir()}
 	if base != nil {
-		if g := guardedOverlap(p, base); g != "" {
-			return Target{}, fmt.Errorf("%s overlaps %s, which the daemon already guards: edit that section "+
-				"instead (or record a sibling path)", p, g)
+		ex, err := existingSection(p, base)
+		if err != nil {
+			return Target{}, err
 		}
+		t.Existing = ex
 	}
-	return Target{Path: p, IsDir: info.IsDir()}, nil
+	return t, nil
 }
 
 func refusedPath(p string, homes []string) error {
@@ -123,17 +125,111 @@ func overlaps(a, b string) bool {
 	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
 }
 
-// guardedOverlap is the guarded path (watch path or encryption root) of base p overlaps, or "".
-func guardedOverlap(p string, base *daemonconfig.Config) string {
-	for i := range base.Resources {
-		r := &base.Resources[i]
-		for _, g := range []string{r.Path, r.EncryptionRoot} {
-			if g != "" && overlaps(p, g) {
-				return g
-			}
+// Existing is the daemon.conf section already guarding a target: the recording extends it.
+type Existing struct {
+	// Section is the [watch] header new lines go to: the target, or for a `watch:` member its
+	// group's encryption root, whose whitelist every tree of the group shares (SharedWith).
+	Section    string
+	SharedWith []string
+	Allow      []ExistingRule
+	Encrypted  bool
+}
+
+// ExistingRule is one whitelist line of an Existing section; no Events = every event.
+type ExistingRule struct {
+	Line   string
+	Events []string
+}
+
+// Has reports whether line is already whitelisted there.
+func (e *Existing) Has(line string) bool {
+	return e != nil && slices.ContainsFunc(e.Allow, func(r ExistingRule) bool { return r.Line == line })
+}
+
+// Warning tells the operator that recording path, which daemon.conf already guards, extends it.
+func (e *Existing) Warning(path string) string {
+	w := path + " is already in daemon.conf ([watch " + e.Section + "]): the recording only adds whitelist " +
+		"lines to that section, every line it has stays. The guard keeps denying what it doesn't whitelist " +
+		"while you record, so such a program is seen only up to its first refused operation: its events are " +
+		"incomplete, prefer every event for it."
+	if len(e.SharedWith) > 0 {
+		w += " The whitelist is shared with " + strings.Join(e.SharedWith, ", ") + ": a line added for " + path +
+			" reaches them too."
+	}
+	return w
+}
+
+// Lines are the section's whitelist lines as daemon.conf reads them.
+func (e *Existing) Lines() []string {
+	out := make([]string, len(e.Allow))
+	for i, r := range e.Allow {
+		out[i] = r.Line
+		if len(r.Events) > 0 {
+			out[i] += " " + strings.Join(r.Events, ",")
 		}
 	}
-	return ""
+	return out
+}
+
+// existingSection is the section base guards exactly p with, or nil. Any other overlap with a
+// guarded path is refused: a file follows exactly one whitelist, so lines recorded for p would
+// neither reach a guarded tree nested in it nor the one around it.
+func existingSection(p string, base *daemonconfig.Config) (*Existing, error) {
+	match, err := guardedMatch(p, base)
+	if err != nil || match == nil {
+		return nil, err
+	}
+	ex := &Existing{Section: match.EncryptionRootOrPath(), Encrypted: match.NeedEncryption}
+	for _, b := range slices.Concat(match.Binaries, match.PendingBinaries) {
+		if b.LibBinary {
+			continue
+		}
+		rule := ExistingRule{Line: b.Path}
+		if b.Link != "" {
+			rule.Line = b.Link
+		}
+		for _, e := range b.Events {
+			rule.Events = append(rule.Events, e.String())
+		}
+		ex.Allow = append(ex.Allow, rule)
+	}
+	for i := range base.Resources {
+		r := &base.Resources[i]
+		if r != match && match.EncryptionRoot != "" && r.EncryptionRoot == match.EncryptionRoot {
+			ex.SharedWith = append(ex.SharedWith, r.Path)
+		}
+	}
+	return ex, nil
+}
+
+// guardedMatch is the resource of base guarding exactly p (nil when none), refusing every other
+// overlap but its own group's encryption root.
+func guardedMatch(p string, base *daemonconfig.Config) (*daemonconfig.Resource, error) {
+	var match *daemonconfig.Resource
+	for i := range base.Resources {
+		if base.Resources[i].Path == p {
+			match = &base.Resources[i]
+			break
+		}
+	}
+	if match != nil && match.ReadOnly {
+		return nil, fmt.Errorf("%s is a lib_dir of daemon.conf, not a guarded resource: edit its section "+
+			"instead", p)
+	}
+	for i := range base.Resources {
+		r := &base.Resources[i]
+		if r == match {
+			continue
+		}
+		for _, g := range []string{r.Path, r.EncryptionRoot} {
+			if g == "" || !overlaps(p, g) || (match != nil && g == match.EncryptionRoot) {
+				continue
+			}
+			return nil, fmt.Errorf("%s overlaps %s, which the daemon already guards: record exactly a "+
+				"guarded path to extend its whitelist, or a sibling path", p, g)
+		}
+	}
+	return match, nil
 }
 
 // Selection is what the operator approved after reviewing a Recording.
@@ -150,10 +246,18 @@ type Selection struct {
 
 // Plan is a validated Selection: what Render writes and Apply performs.
 type Plan struct {
-	Sections []install.Section
-	Libs     []string
-	Encrypt  []string
-	Binaries []PlannedBinary
+	Sections   []install.Section
+	Extensions []Extension
+	Libs       []string
+	Encrypt    []string
+	Binaries   []PlannedBinary
+}
+
+// Extension adds whitelist lines to a target's existing section.
+type Extension struct {
+	Path    string
+	Section string
+	Allow   []install.BinaryRule
 }
 
 // PlannedBinary is an approved whitelist line and the content the recording saw.
@@ -177,13 +281,27 @@ func (rec *Recording) Plan(sel *Selection) (*Plan, error) {
 		p.Libs = append(p.Libs, l)
 	}
 	for _, e := range dedupe(sel.Encrypt) {
-		if !slices.ContainsFunc(rec.Targets, func(t Target) bool { return t.Path == e }) {
+		i := slices.IndexFunc(rec.Targets, func(t Target) bool { return t.Path == e })
+		switch {
+		case i < 0:
 			return nil, fmt.Errorf("%s is not a path of this recording", e)
+		case rec.Targets[i].Existing != nil:
+			return nil, fmt.Errorf("%s is already in daemon.conf: change its need_encryption with --edit-config", e)
 		}
 		p.Encrypt = append(p.Encrypt, e)
 	}
 	for _, t := range rec.Targets {
-		p.Sections = append(p.Sections, sectionFor(t.Path, chosen, slices.Contains(p.Encrypt, t.Path), sel.Masks))
+		s := sectionFor(&t, chosen, slices.Contains(p.Encrypt, t.Path), sel.Masks)
+		switch {
+		case t.Existing == nil:
+			p.Sections = append(p.Sections, s)
+		case len(s.Allow) > 0:
+			p.Extensions = append(p.Extensions, Extension{Path: t.Path, Section: t.Existing.Section, Allow: s.Allow})
+		}
+	}
+	if len(p.Sections) == 0 && len(p.Extensions) == 0 {
+		return nil, errors.New("nothing to add: every recorded path is already in daemon.conf and no binary " +
+			"it doesn't whitelist yet is selected")
 	}
 	return p, nil
 }
@@ -201,6 +319,9 @@ func (rec *Recording) planBinaries(p *Plan, lines []string) (map[string]*Binary,
 		if b == nil {
 			return nil, fmt.Errorf("%s is not a whitelistable binary of this recording", line)
 		}
+		if b.Covered() {
+			return nil, fmt.Errorf("%s is already whitelisted for every path it touched", line)
+		}
 		sum, err := hex.DecodeString(b.SHA256)
 		if err != nil || len(sum) != 32 {
 			return nil, fmt.Errorf("%s: no content hash recorded", line)
@@ -213,12 +334,12 @@ func (rec *Recording) planBinaries(p *Plan, lines []string) (map[string]*Binary,
 	return chosen, nil
 }
 
-// sectionFor whitelists, for path, the chosen binaries that touched it.
-func sectionFor(path string, chosen map[string]*Binary, encrypt, masks bool) install.Section {
-	s := install.Section{Path: path, Encrypt: encrypt}
+// sectionFor whitelists, for t, the chosen binaries that touched it and its section doesn't list.
+func sectionFor(t *Target, chosen map[string]*Binary, encrypt, masks bool) install.Section {
+	s := install.Section{Path: t.Path, Encrypt: encrypt}
 	for _, line := range sortedLines(chosen) {
 		b := chosen[line]
-		if !slices.Contains(b.Targets, path) {
+		if !slices.Contains(b.Targets, t.Path) || t.Existing.Has(line) {
 			continue
 		}
 		rule := install.BinaryRule{Path: line}
@@ -258,12 +379,18 @@ func dedupe(in []string) []string {
 	return out
 }
 
-// Render adds the plan to base and checks the result as the daemon will: it parses, every new
-// section materializes as a guarded resource with its approved lines, and no line names a multicall
-// the daemon would drop. A section the parser skips (a path that vanished) would otherwise apply
-// cleanly and guard nothing.
+// Render adds the plan to base and checks the result as the daemon will: it parses, every new or
+// extended section materializes as a guarded resource with its approved lines, and no line names a
+// multicall the daemon would drop. A section the parser skips (a path that vanished) would otherwise
+// apply cleanly and guard nothing.
 func (p *Plan) Render(base []byte) (string, error) {
 	text := install.InsertSectionsBeforeLibraries(string(base), install.GenerateSections(p.Sections))
+	for _, e := range p.Extensions {
+		var err error
+		if text, err = install.AppendSectionWhitelist(text, e.Section, e.Allow); err != nil {
+			return "", fmt.Errorf("extending %s: %w", e.Path, err)
+		}
+	}
 	if len(p.Libs) > 0 {
 		text = install.EnsureLibraryBlock(text, &install.LibraryBlock{Name: LibraryBlockName, Libs: p.Libs})
 	}
@@ -279,32 +406,40 @@ func (p *Plan) Render(base []byte) (string, error) {
 		return "", err
 	}
 	for i := range p.Sections {
-		if err := sectionMaterialized(cfg, &p.Sections[i]); err != nil {
+		s := &p.Sections[i]
+		r, err := materialized(cfg, s.Path, s.Allow)
+		if err != nil {
+			return "", err
+		}
+		if r.NeedEncryption != s.Encrypt {
+			return "", fmt.Errorf("%s: need_encryption did not parse as written", s.Path)
+		}
+	}
+	for _, e := range p.Extensions {
+		if _, err := materialized(cfg, e.Path, e.Allow); err != nil {
 			return "", err
 		}
 	}
 	return text, nil
 }
 
-func sectionMaterialized(cfg *daemonconfig.Config, s *install.Section) error {
+// materialized is cfg's resource guarding path, once it whitelists every line of allow.
+func materialized(cfg *daemonconfig.Config, path string, allow []install.BinaryRule) (*daemonconfig.Resource, error) {
 	for i := range cfg.Resources {
 		r := &cfg.Resources[i]
-		if r.Path != s.Path {
+		if r.Path != path {
 			continue
 		}
 		rules := slices.Concat(r.Binaries, r.PendingBinaries)
-		for _, want := range s.Allow {
+		for _, want := range allow {
 			if !slices.ContainsFunc(rules, func(b daemonconfig.BinaryRule) bool {
-				return b.Path == want.Path || b.Link == want.Path
+				return !b.LibBinary && (b.Path == want.Path || b.Link == want.Path)
 			}) {
-				return fmt.Errorf("the daemon would not whitelist %s for %s (check its log)", want.Path, s.Path)
+				return nil, fmt.Errorf("the daemon would not whitelist %s for %s (check its log)", want.Path, path)
 			}
 		}
-		if r.NeedEncryption != s.Encrypt {
-			return fmt.Errorf("%s: need_encryption did not parse as written", s.Path)
-		}
-		return nil
+		return r, nil
 	}
-	return fmt.Errorf("the daemon would not guard %s: its section is skipped (the path vanished or is "+
-		"no longer a plain directory or file)", s.Path)
+	return nil, fmt.Errorf("the daemon would not guard %s: its section is skipped (the path vanished or is "+
+		"no longer a plain directory or file)", path)
 }

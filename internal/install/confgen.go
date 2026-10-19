@@ -2,6 +2,7 @@ package install
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -176,6 +177,59 @@ func SetSectionWhitelist(confText, path string, newRules []BinaryRule) (string, 
 	result = append(result, newLines...)
 	result = append(result, suffix...)
 	return strings.Join(result, "\n"), nil
+}
+
+// AppendSectionWhitelist adds the rules the [watch path] section doesn't list yet after its last
+// whitelist line, leaving every existing line as written.
+func AppendSectionWhitelist(confText, path string, rules []BinaryRule) (string, error) {
+	lines := strings.Split(confText, "\n")
+	start := findSectionStart(lines, path)
+	if start == -1 {
+		return "", fmt.Errorf("section for %q not found in configuration", path)
+	}
+	end := findSectionEnd(lines, start)
+	have := ParseSectionWhitelist(confText, path)
+	insertAt, indent := sectionTail(lines, start, end), ""
+	for i := start + 1; i < end; i++ {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "need_encryption:") ||
+			isWatchDirectiveText(t) || isPathDirectiveText(t) || isLibDirectiveText(t) {
+			continue
+		}
+		insertAt, indent = i+1, keepIndent(lines[i], "")
+	}
+	var add []string
+	for _, rule := range rules {
+		if slices.Contains(have, rule.Path) {
+			continue
+		}
+		if !ConfSafePath(rule.Path) {
+			return "", fmt.Errorf("refusing to write %q into the configuration: it holds a quote or control character", rule.Path)
+		}
+		line := indent + quotePath(rule.Path)
+		if len(rule.Events) > 0 {
+			line += " " + strings.Join(rule.Events, ",")
+		}
+		add = append(add, line)
+		have = append(have, rule.Path)
+	}
+	return strings.Join(slices.Insert(lines, insertAt, add...), "\n"), nil
+}
+
+// sectionTail is where a section without whitelist lines gets its first: before its blank-preceded
+// need_encryption directive, else after its last non-blank line.
+func sectionTail(lines []string, start, end int) int {
+	at := end
+	for i := start + 1; i < end; i++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "need_encryption:") {
+			at = i
+			break
+		}
+	}
+	for at > start+1 && strings.TrimSpace(lines[at-1]) == "" {
+		at--
+	}
+	return at
 }
 
 // isWatchDirectiveText recognizes a `watch: <path>` group-structure line

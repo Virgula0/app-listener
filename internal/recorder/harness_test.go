@@ -2,7 +2,9 @@
 // recording needs root and the monitor's kprobes. It records APPLISTENER_HARNESS_PATH
 // (colon-separated targets) while `sh -c "$APPLISTENER_HARNESS_CMD"` runs, then prints what
 // --record would propose: one MASK line per binary and the daemon.conf Plan.Render writes with
-// every admissible binary approved and Masks on.
+// every admissible binary approved and Masks on. APPLISTENER_HARNESS_BASE, when set, is the
+// daemon.conf the targets are validated, classified and rendered against (a guarded target is
+// extended; a binary it already whitelists prints COVERED instead of MASK).
 package recorder
 
 import (
@@ -31,8 +33,21 @@ func (s *harnessSuite) TestRecord() {
 	if paths == "" || script == "" {
 		s.T().Skip("APPLISTENER_HARNESS_PATH/CMD not set — this harness is driven by the integration suite")
 	}
-	targets, err := ValidateTargets(strings.Split(paths, ":"), nil, nil)
+	baseText, cfg := []byte(nil), &daemonconfig.Config{}
+	if p := os.Getenv("APPLISTENER_HARNESS_BASE"); p != "" {
+		var err error
+		baseText, err = os.ReadFile(p)
+		s.Require().NoError(err)
+		cfg, err = daemonconfig.Parse(baseText)
+		s.Require().NoError(err)
+	}
+	targets, err := ValidateTargets(strings.Split(paths, ":"), cfg, nil)
 	s.Require().NoError(err)
+	for _, t := range targets {
+		if t.Existing != nil {
+			fmt.Printf("EXISTING %s %s\n", t.Path, t.Existing.Section)
+		}
+	}
 	rec, err := Start(targets)
 	s.Require().NoError(err)
 	defer rec.Stop()
@@ -42,11 +57,15 @@ func (s *harnessSuite) TestRecord() {
 	s.Require().NoError(err, "the recorded command failed")
 	drain(rec)
 
-	recording := Classify(rec.Stop(), &daemonconfig.Config{})
+	recording := Classify(rec.Stop(), cfg)
 	sel := &Selection{Masks: true}
 	for _, b := range recording.Binaries {
 		if !b.Admissible() {
 			fmt.Printf("REFUSED %s %s\n", b.Exe, b.Problem)
+			continue
+		}
+		if b.Covered() {
+			fmt.Printf("COVERED %s\n", b.Line)
 			continue
 		}
 		fmt.Printf("MASK %s %s\n", b.Line, strings.Join(b.Mask, ","))
@@ -54,7 +73,7 @@ func (s *harnessSuite) TestRecord() {
 	}
 	plan, err := recording.Plan(sel)
 	s.Require().NoError(err)
-	text, err := plan.Render(nil)
+	text, err := plan.Render(baseText)
 	s.Require().NoError(err)
 	fmt.Printf("CONFIG-BEGIN\n%s\nCONFIG-END\n", text)
 }

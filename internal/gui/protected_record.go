@@ -61,7 +61,8 @@ func (p *protectedPage) startRecord() {
 		newPanel(mutedText("Every access to these paths is recorded, by the executable the kernel reports, "+
 			"until you stop it. Use the applications that need them meanwhile. You then pick the binaries to "+
 			"whitelist and the libraries to trust, can encrypt the paths, and the daemon adds one section "+
-			"per path and reloads. Anything that touched the paths is listed, malware included: approve only "+
+			"per path and reloads. A path daemon.conf already guards is extended instead: its whitelist is "+
+			"kept and shown, only new lines are added. Anything that touched the paths is listed, malware included: approve only "+
 			"what you ran on purpose.")),
 		container.NewHBox(back, start),
 	)
@@ -124,7 +125,7 @@ func (f *recordForm) submit() {
 					p.finish()
 					return
 				}
-				v := newRecordView(p, link, m.Resources)
+				v := newRecordView(p, link, m.Resources, m.RecordTargets)
 				p.leave = v.discard
 				p.show(v.root)
 				v.start()
@@ -147,22 +148,43 @@ type recordView struct {
 	done    bool
 }
 
-func newRecordView(p *protectedPage, link backendLink, paths []string) *recordView {
+func newRecordView(p *protectedPage, link backendLink, paths []string, targets []recorder.Target) *recordView {
 	v := &recordView{p: p, link: link, paths: paths, elapsed: boldLabel("00:00"), count: mutedText("0 accesses"),
 		stopped: make(chan struct{})}
 	stop := newButton("Stop recording", icon("stop"), v.stop)
 	stop.Importance = widget.DangerImportance
-	head := newPanel(container.NewVBox(
+	head := container.NewVBox(
 		container.NewBorder(nil, nil, container.NewHBox(newPill("REC", theme.ColorNameError), v.elapsed), stop,
 			nil),
 		selectable(strings.Join(paths, "\n")),
 		mutedText("Use the applications that need these paths now. Everything that touches them is listed for "+
 			"your review when you stop."),
-	))
+	)
+	for _, o := range existingNotices(targets) {
+		head.Add(o)
+	}
 	v.table = newDataTable([]column{{"Last", 90}, {"Accesses", 90}, {"Events", 220}, {"Executable", 520}},
 		func() int { return len(v.prog.Recent) }, v.cell, nil)
-	v.root = container.NewBorder(head, v.count, nil, nil, v.table)
+	v.root = container.NewBorder(newPanel(head), v.count, nil, nil, v.table)
 	return v
+}
+
+// existingNotices warn about each target daemon.conf already guards and show its whitelist.
+func existingNotices(targets []recorder.Target) []fyne.CanvasObject {
+	var out []fyne.CanvasObject
+	for _, t := range targets {
+		if t.Existing == nil {
+			continue
+		}
+		w := warnText()
+		setWarn(w, logging.SanitizeText(t.Existing.Warning(t.Path)))
+		allow := "Already whitelisted: nothing (every access is denied)."
+		if lines := t.Existing.Lines(); len(lines) > 0 {
+			allow = "Already whitelisted:\n" + logging.SanitizeText(strings.Join(lines, "\n"))
+		}
+		out = append(out, w, selectable(allow))
+	}
+	return out
 }
 
 func (v *recordView) cell(row, col int) cell {
@@ -289,11 +311,15 @@ type recordReview struct {
 func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording, blockers map[string]string) *recordReview {
 	r := &recordReview{p: p, link: link, rec: rec, bins: map[string]*widget.Check{}, libs: map[string]*widget.Check{},
 		encrypt: map[string]*widget.Check{}, status: mutedText("")}
-	binBox, refused, libBox := container.NewVBox(), container.NewVBox(), container.NewVBox()
+	binBox, refused, covered, libBox := container.NewVBox(), container.NewVBox(), container.NewVBox(), container.NewVBox()
 	for i := range rec.Binaries {
 		b := &rec.Binaries[i]
 		if !b.Admissible() {
 			refused.Add(binaryCard(b, nil))
+			continue
+		}
+		if b.Covered() {
+			covered.Add(binaryCard(b, nil))
 			continue
 		}
 		c := widget.NewCheck(logging.SanitizeText(b.Line), nil)
@@ -310,11 +336,14 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 		}
 	}
 	if len(r.bins) == 0 {
-		binBox.Add(mutedText("No binary can be whitelisted: applying guards the paths with an empty whitelist " +
-			"(every access denied)."))
+		binBox.Add(mutedText("No binary to add: applying guards the new paths with an empty whitelist " +
+			"(every access denied); the existing sections stay as they are."))
 	}
 	encBox := container.NewVBox()
 	for _, t := range rec.Targets {
+		if t.Existing != nil {
+			continue
+		}
 		c := widget.NewCheck("Encrypt "+t.Path+" at rest", nil)
 		if why := blockers[t.Path]; why != "" {
 			c.Disable()
@@ -336,7 +365,13 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 			formatClock(rec.Stopped.Sub(rec.Started)), rec.Events)),
 			mutedText("Only root-placed binaries that aren't general tools start checked. Check only what you ran "+
 				"on purpose."))),
-		sectionTitle("BINARIES TO WHITELIST"), newPanel(binBox),
+	}
+	if notices := existingNotices(rec.Targets); len(notices) > 0 {
+		parts = append(parts, sectionTitle("ALREADY IN DAEMON.CONF"), newPanel(container.NewVBox(notices...)))
+	}
+	parts = append(parts, sectionTitle("BINARIES TO WHITELIST"), newPanel(binBox))
+	if len(covered.Objects) > 0 {
+		parts = append(parts, sectionTitle("ALREADY WHITELISTED"), newPanel(covered))
 	}
 	if len(refused.Objects) > 0 {
 		parts = append(parts, sectionTitle("NOT WHITELISTABLE"), newPanel(refused))
@@ -347,24 +382,32 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 				"itself ships. None start checked."), libBox)))
 	}
 	parts = append(parts, sectionTitle("OPTIONS"), newPanel(container.NewVBox(r.masks, mutedText("Least "+
-		"privilege, but an operation the recording missed is then denied."))),
-		sectionTitle("ENCRYPTION"), newPanel(encBox), container.NewHBox(discard, review), r.status)
+		"privilege, but an operation the recording missed is then denied."))))
+	if len(encBox.Objects) > 0 {
+		parts = append(parts, sectionTitle("ENCRYPTION"), newPanel(encBox))
+	}
+	parts = append(parts, container.NewHBox(discard, review), r.status)
 	r.root = newFadeVScroll(newGapVBox(parts...))
 	return r
 }
 
-// binaryCard describes one recorded executable; check is nil for one that can't be whitelisted.
+// binaryCard describes one recorded executable; check is nil for one that can't be added.
 func binaryCard(b *recorder.Binary, check *widget.Check) fyne.CanvasObject {
 	box := container.NewVBox()
 	if check != nil {
 		box.Add(check)
 	} else {
-		name := b.Exe
+		name := b.Line
+		if name == "" {
+			name = b.Exe
+		}
 		if name == "" {
 			name = "(unnamed executable)"
 		}
 		box.Add(boldLabel(logging.SanitizeText(name)))
-		box.Add(mutedText(logging.SanitizeText(b.Problem)))
+		if b.Problem != "" {
+			box.Add(mutedText(logging.SanitizeText(b.Problem)))
+		}
 	}
 	box.Add(mutedText(fmt.Sprintf("%d accesses (%s) by %s, uid %v, on %s", b.Count, strings.Join(b.Ops, ","),
 		logging.SanitizeText(strings.Join(b.Comms, ",")), b.UIDs, logging.SanitizeText(strings.Join(b.Targets, ", ")))))
@@ -417,7 +460,7 @@ func (r *recordReview) review() {
 		body := container.NewBorder(promptBody("Apply and reload the daemon?",
 			"If anything fails, the encrypted paths are restored from their backups and daemon.conf keeps its "+
 				"current content."), nil, nil, nil, newFadeScroll(diffText(inst.UnifiedDiff(string(m.Base), string(m.Data)))))
-		d := dialog.NewCustomConfirm("daemon.conf — sections to add", "Apply", "Back", body, func(ok bool) {
+		d := dialog.NewCustomConfirm("daemon.conf — changes", "Apply", "Back", body, func(ok bool) {
 			if ok {
 				r.apply()
 			}
@@ -440,8 +483,8 @@ func (r *recordReview) apply() {
 			return
 		}
 		r.applied = true
-		r.status.SetText("added to daemon.conf and guarded by the daemon")
-		msg := "The recorded paths are added to daemon.conf and guarded by the daemon."
+		r.status.SetText("daemon.conf updated, the daemon guards the paths")
+		msg := "daemon.conf is updated with the recorded paths and the daemon guards them."
 		if len(m.Notes) > 0 {
 			msg += "\n\n" + strings.Join(m.Notes, "\n")
 		}

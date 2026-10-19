@@ -23,7 +23,8 @@ import (
 )
 
 // runRecord is `--edit-config --record <path>...`: record which binaries use the paths, review
-// them, optionally encrypt the paths, then add the sections to the running daemon's daemon.conf.
+// them, optionally encrypt the paths, then add (or extend) their sections in the running daemon's
+// daemon.conf.
 func runRecord() error {
 	if !term.IsTerminal(os.Stdin.Fd()) {
 		return errors.New("--record needs a terminal: it records until you stop it, then asks you to review")
@@ -40,6 +41,9 @@ func runRecord() error {
 		return err
 	}
 	defer flow.close()
+	if ok, cerr := confirmExtend(flow.targets); cerr != nil || !ok {
+		return declined(cerr, "nothing recorded")
+	}
 	err = flow.start()
 	if err == nil {
 		err = runRecordView(flow)
@@ -58,6 +62,41 @@ func runRecord() error {
 		return err
 	}
 	return confirmAndApply(flow, &sel)
+}
+
+// declined ends the flow quietly when the operator said no (err nil or an abort), else with err.
+func declined(err error, what string) error {
+	if err == nil || errors.Is(err, huh.ErrUserAborted) {
+		log.Info(what + " — daemon.conf is unchanged")
+		return nil
+	}
+	return err
+}
+
+// confirmExtend warns about every target daemon.conf already guards and shows its whitelist.
+func confirmExtend(targets []recorder.Target) (bool, error) {
+	var desc strings.Builder
+	for _, t := range targets {
+		if t.Existing == nil {
+			continue
+		}
+		desc.WriteString(t.Existing.Warning(t.Path) + "\n\nAlready whitelisted:\n")
+		for _, l := range t.Existing.Lines() {
+			desc.WriteString("  " + l + "\n")
+		}
+		if len(t.Existing.Allow) == 0 {
+			desc.WriteString("  (nothing: every access is denied)\n")
+		}
+		desc.WriteString("\n")
+	}
+	if desc.Len() == 0 {
+		return true, nil
+	}
+	return wizard.Confirm(wizard.Question{
+		Title:       "Extend paths daemon.conf already guards?",
+		Description: logging.SanitizeText(strings.TrimSpace(desc.String())),
+		Affirmative: "Record and extend", Negative: "Cancel", Default: true,
+	})
 }
 
 type recordTick struct{}
@@ -111,7 +150,12 @@ func (m *recordModel) View() string {
 	b.WriteString(recordLive.Render("● REC") + "  " + recordTitle.Render(formatElapsed(m.prog.Elapsed)) + "\n\n")
 	b.WriteString("Recording every access to:\n")
 	for _, t := range m.flow.targets {
-		b.WriteString("  " + logging.SanitizeText(t.Path) + "\n")
+		b.WriteString("  " + logging.SanitizeText(t.Path))
+		if t.Existing != nil {
+			b.WriteString(recordMuted.Render(fmt.Sprintf("  already in daemon.conf (%d whitelisted): "+
+				"extending it, the guard still denies the rest", len(t.Existing.Allow))))
+		}
+		b.WriteString("\n")
 	}
 	fmt.Fprintf(&b, "\n%d accesses by %d executables so far\n\n", m.prog.Events, m.prog.Binaries)
 	for _, s := range m.prog.Recent {
@@ -143,6 +187,12 @@ func printRecording(w io.Writer, rec *recorder.Recording) {
 	if rec.Dropped > 0 {
 		fmt.Fprintf(w, "  %d events were dropped (too many distinct executables or libraries)\n", rec.Dropped)
 	}
+	for _, t := range rec.Targets {
+		if t.Existing != nil {
+			fmt.Fprintf(w, "  %s is already in daemon.conf, whitelisting: %s\n", logging.SanitizeText(t.Path),
+				logging.SanitizeText(orNone(strings.Join(t.Existing.Lines(), "; "))))
+		}
+	}
 	if len(rec.Binaries) == 0 {
 		fmt.Fprintln(w, "  Nothing touched the recorded paths.")
 		return
@@ -151,6 +201,13 @@ func printRecording(w io.Writer, rec *recorder.Recording) {
 		printBinary(w, &rec.Binaries[i])
 	}
 	fmt.Fprintln(w)
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "nothing"
+	}
+	return s
 }
 
 func printBinary(w io.Writer, b *recorder.Binary) {
@@ -193,8 +250,12 @@ func reviewRecording(flow *recordFlow, rec *recorder.Recording) (recorder.Select
 		return sel, false, err
 	}
 	if len(bins) == 0 {
+		if !slices.ContainsFunc(rec.Targets, func(t recorder.Target) bool { return t.Existing == nil }) {
+			log.Info("no binary selected: nothing to add to the existing sections")
+			return sel, false, nil
+		}
 		empty, cerr := wizard.Confirm(wizard.Question{
-			Title: "No binary selected: guard the paths with an empty whitelist?",
+			Title: "No binary selected: guard the new paths with an empty whitelist?",
 			Description: "Every access to them would be denied until you edit the section " +
 				"(edit-protected --edit-config).",
 			Affirmative: "Guard, deny all", Negative: "Cancel",
@@ -226,10 +287,13 @@ func pickBinaries(rec *recorder.Recording) ([]*recorder.Binary, error) {
 	var choices []wizard.Choice
 	for i := range rec.Binaries {
 		b := &rec.Binaries[i]
-		if !b.Admissible() {
+		if !b.Admissible() || b.Covered() {
 			continue
 		}
 		label := logging.SanitizeText(b.Line) + "  (" + strings.Join(b.Ops, ",") + ")"
+		if len(b.Whitelisted) > 0 {
+			label += "  [already whitelisted for " + logging.SanitizeText(strings.Join(b.Whitelisted, ", ")) + "]"
+		}
 		if !b.SystemPlaced {
 			label += "  [not root-placed]"
 		}
@@ -301,6 +365,9 @@ func pickEncryption(flow *recordFlow) ([]string, error) {
 	blockers := flow.encryptBlockers()
 	var out []string
 	for _, t := range flow.targets {
+		if t.Existing != nil {
+			continue
+		}
 		if why := blockers[t.Path]; why != "" {
 			log.Warnf("%s will be guarded unencrypted: %s", t.Path, why)
 			continue
@@ -328,7 +395,7 @@ func confirmAndApply(flow *recordFlow, sel *recorder.Selection) error {
 	if err != nil {
 		return err
 	}
-	if derr := inst.ShowDiff("daemon.conf — sections to add", inst.UnifiedDiff(string(base), text)); derr != nil {
+	if derr := inst.ShowDiff("daemon.conf — changes", inst.UnifiedDiff(string(base), text)); derr != nil {
 		return derr
 	}
 	ok, err := wizard.Confirm(wizard.Question{
@@ -350,7 +417,7 @@ func confirmAndApply(flow *recordFlow, sel *recorder.Selection) error {
 	if err != nil {
 		return err
 	}
-	log.Info("the recorded paths are added to daemon.conf and guarded by the daemon")
+	log.Info("daemon.conf is updated with the recorded paths and the daemon guards them")
 	for _, n := range out.Notes {
 		log.Warn(n)
 	}

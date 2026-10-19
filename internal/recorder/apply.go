@@ -223,16 +223,23 @@ func (a *applier) rollback(cause error, encrypted []string, pinned []PlannedBina
 	return errors.Join(append([]error{cause}, errs...)...)
 }
 
-// unguarded notes every new section the running daemon doesn't report as guarded after the reload.
+// unguarded notes every new or extended section the running daemon doesn't report as guarded after the reload.
 func (a *applier) unguarded(p *Plan) []string {
 	guarded, err := a.store.Guarded()
 	if err != nil {
 		return []string{"could not confirm the new guards with the daemon: " + err.Error()}
 	}
-	var out []string
+	paths := make([]string, 0, len(p.Sections)+len(p.Extensions))
 	for _, s := range p.Sections {
-		if !slices.Contains(guarded, s.Path) {
-			out = append(out, "WARNING: the daemon does not report "+s.Path+" as guarded: check `journalctl -u "+
+		paths = append(paths, s.Path)
+	}
+	for _, e := range p.Extensions {
+		paths = append(paths, e.Path)
+	}
+	var out []string
+	for _, path := range paths {
+		if !slices.Contains(guarded, path) {
+			out = append(out, "WARNING: the daemon does not report "+path+" as guarded: check `journalctl -u "+
 				"app-listener-daemon`")
 		}
 	}
