@@ -453,7 +453,7 @@ func (s *IntegrationSuite) TestNetworkGuard_CLI_Errors() {
 		cmd  string
 		want string
 	}{
-		{"mutually-exclusive", "-b /net_tester -w /net_tester", "mutually exclusive"},
+		{"mutually-exclusive", "-b /net_tester -w /net_tester", "none of the others"},
 		{"auto-infra-blacklist", "-b /net_tester --auto-infra", "auto-infra is only available in whitelist mode"},
 		{"unsafe-blacklist", "-b /net_tester --unsafe", "unsafe is only available in whitelist mode"},
 		{"bad-event", "-w /net_tester -e BOGUS", "unknown network event type"},
