@@ -80,3 +80,19 @@ func TestDiffMergePreservesExistingAndParses(t *testing.T) {
 		t.Errorf("merged config has %d resources, want 2", len(cfg.Resources))
 	}
 }
+
+func TestAddedResourcesSkipsAlreadyGuardedSSH(t *testing.T) {
+	prev := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: "/home/u/.ssh", NeedEncryption: true},
+	}}
+	merged := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: "/home/u/.ssh", NeedEncryption: true},
+		{Path: "/home/u/.config/gh", NeedEncryption: true},
+	}}
+
+	got := addedResources(prev, merged)
+
+	if len(got.Resources) != 1 || got.Resources[0].Path != "/home/u/.config/gh" {
+		t.Fatalf("addedResources = %+v, want only /home/u/.config/gh", got.Resources)
+	}
+}
