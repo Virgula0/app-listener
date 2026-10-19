@@ -91,9 +91,10 @@ judged afresh.
 
 Identity is the executable, so `ELECTRON_RUN_AS_NODE=1 code -e ...` or
 `NODE_OPTIONS=--require=/tmp/x.js discord` is the whitelisted binary running **its caller's** code.
-For whitelisted Node/Electron, Chromium and JVM runtimes (detected from the binary's own strings,
-or the name `java`), the daemon judges the new process's environment and arguments at exec,
-before any of its code runs.
+For whitelisted Node/Electron, Chromium, JVM and Bun runtimes (detected from the binary's own
+strings, or the name `java`), the daemon judges the new process's environment and arguments at
+exec, before any of its code runs. Bun covers `bun build --compile` apps such as opencode and the
+native `claude`.
 
 A launch is **risky** when it has any of:
 
@@ -101,6 +102,8 @@ A launch is **risky** when it has any of:
   `NODE_OPTIONS` / `JAVA_TOOL_OPTIONS` / `_JAVA_OPTIONS` / `JDK_JAVA_OPTIONS` holding anything but
   a short allowlist of harmless options (heap size, warnings, TLS/CA settings, font and UI
   scaling);
+- Bun environment: `BUN_BE_BUN` (a compiled app becomes the `bun` CLI), `BUN_OPTIONS`
+  (`--preload`), `BUN_INSPECT*`, `BUN_RUNTIME_TRANSPILER_CACHE_PATH`;
 - code-loading flags: `--inspect*`, `--eval`, `--print`, `--require`, `--import`, `--loader`,
   `--env-file*`, `--remote-debugging-*`, `--load-extension`;
 - child-process launchers: `--renderer-cmd-prefix`, `--utility-cmd-prefix`,
@@ -125,6 +128,13 @@ binary was whitelisted is refused the same way (`op=PRELOADED`).
 
 Generic Electron binaries that run an app named on the command line are covered by
 [`[electron_apps]`](daemon-config.md#generic-electron-apps-electron_apps).
+
+## The dynamic loader
+
+`/lib64/ld-linux-x86-64.so.2 <program>` (any `ld-*.so*`, or a copy with its `DT_SONAME`) runs
+`<program>` with the loader as its executable, so a whitelisted loader admits every program run
+through it. `install`, `--edit-config` and `--record` refuse a new loader line; `--record` lists a
+program run that way as not whitelistable. Whitelist the program itself.
 
 ## Multicall binaries
 

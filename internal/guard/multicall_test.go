@@ -109,7 +109,7 @@ func TestExeKeyRefusesOpaqueMulticall(t *testing.T) {
 	}
 }
 
-func TestRefuseMulticallLines(t *testing.T) {
+func TestRefuseIdentityLines(t *testing.T) {
 	dir := t.TempDir()
 	bb := filepath.Join(dir, "wget")
 	marker := []byte("v xoBysuB") // reversed: see TestExeKeyRefusesOpaqueMulticall
@@ -136,15 +136,15 @@ func TestRefuseMulticallLines(t *testing.T) {
 		}
 		return &daemonconfig.Config{Resources: []daemonconfig.Resource{r}}
 	}
-	if err := RefuseMulticallLines(cfgOf(plain, bb), nil); !IsMulticallRefusal(err) {
+	if err := RefuseIdentityLines(cfgOf(plain, bb), nil); !IsMulticallRefusal(err) {
 		t.Fatalf("a new busybox line must be refused: %v", err)
 	}
-	if err := RefuseMulticallLines(cfgOf(plain, bb), cfgOf(bb)); err != nil {
+	if err := RefuseIdentityLines(cfgOf(plain, bb), cfgOf(bb)); err != nil {
 		t.Fatalf("a line prev already has must stay: %v", err)
 	}
 	libOnly := cfgOf()
 	libOnly.Resources[0].Binaries = []daemonconfig.BinaryRule{{Path: bb, LibBinary: true}}
-	if err := RefuseMulticallLines(libOnly, nil); err != nil {
+	if err := RefuseIdentityLines(libOnly, nil); err != nil {
 		t.Fatalf("a lib_binary writer is no whitelist identity: %v", err)
 	}
 }

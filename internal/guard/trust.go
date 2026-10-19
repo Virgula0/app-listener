@@ -30,6 +30,7 @@ const (
 	trustedJVM      uint8 = 8
 	trustedChromium uint8 = 16
 	trustedElectron uint8 = 32
+	trustedBun      uint8 = 64
 )
 
 // trust_event.kind — must match guard_trust.bpf.c.

@@ -259,10 +259,11 @@ func MulticallRefusal(path string) error {
 	return nil
 }
 
-// RefuseMulticallLines refuses cfg when a whitelist line it adds over prev (nil: every line) would be
-// dropped at load by MulticallRefusal. Lines prev already has stay: refusing them would block any
-// unrelated edit after a distro swapped a whitelisted binary for a multicall.
-func RefuseMulticallLines(cfg, prev *daemonconfig.Config) error {
+// RefuseIdentityLines refuses cfg when a whitelist line it adds over prev (nil: every line) names no
+// single program: a multicall the load would drop (MulticallRefusal), or the dynamic loader
+// (LoaderRefusal). Lines prev already has stay: refusing them would block any unrelated edit after a
+// distro swapped a whitelisted binary for a multicall.
+func RefuseIdentityLines(cfg, prev *daemonconfig.Config) error {
 	had := map[string]bool{}
 	if prev != nil {
 		for _, l := range whitelistLines(prev) {
@@ -276,6 +277,8 @@ func RefuseMulticallLines(cfg, prev *daemonconfig.Config) error {
 		}
 		had[l] = true
 		if err := MulticallRefusal(l); err != nil {
+			errs = append(errs, err)
+		} else if err := LoaderRefusal(l); err != nil {
 			errs = append(errs, err)
 		}
 	}

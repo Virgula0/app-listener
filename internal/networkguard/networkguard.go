@@ -128,7 +128,8 @@ func (g *NetGuard) setup() error {
 	if err := g.resolveOwnPID(); err != nil {
 		log.Warnf("network guard: own events may show (%v)", err)
 	}
-	if err := g.attachRequired(g.lifecycleHooks(), "binary identity would follow a reused inode number"); err != nil {
+	if err := g.attachRequired(g.lifecycleHooks(),
+		"binary identity would follow a reused inode number or a prctl exe_file swap"); err != nil {
 		return err
 	}
 	if g.mode == ModeWhitelist {

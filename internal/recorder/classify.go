@@ -138,7 +138,9 @@ func classifyGroup(k exeKey, group []RawAccessor, targets []Target, base *daemon
 	}
 	v := verifyExe(exe, k)
 	if v.problem == "" {
-		if refusal := guard.MulticallRefusal(exe); refusal != nil {
+		if refusal := guard.LoaderRefusal(exe); refusal != nil {
+			v.problem = refusal.Error()
+		} else if refusal := guard.MulticallRefusal(exe); refusal != nil {
 			out := make([]Binary, 0, len(group))
 			for i := range group {
 				b := newBinary(exe, group[i:i+1], v, targets, base)

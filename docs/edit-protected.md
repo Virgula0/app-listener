@@ -106,10 +106,10 @@ Before admitting a binary, know that:
 - A `-w` grant covers **every user** running that binary, like a `daemon.conf` whitelist line.
 - Admitting an **interpreter** (python, node, bash) admits every script it runs. A script's
   process is its interpreter, so the script itself is not what the guard sees.
-- A granted **Node/Electron, Chromium or JVM runtime** is judged at launch like a whitelisted one
-  ([launch scan](binary-trust.md#launch-scan)): started with env or flags that load its caller's
+- A granted **Node/Electron, Chromium, JVM or Bun runtime** is judged at launch like a whitelisted
+  one ([launch scan](binary-trust.md#launch-scan)): started with env or flags that load its caller's
   code (`ELECTRON_RUN_AS_NODE`, `NODE_OPTIONS=--require`, `--inspect`, `--remote-debugging-port`,
-  `JAVA_TOOL_OPTIONS=-javaagent`, ...), it is refused the directories (`TRUST DENIED op=LAUNCH`). This covers an app that embeds a
+  `JAVA_TOOL_OPTIONS=-javaagent`, `BUN_BE_BUN`, ...), it is refused the directories (`TRUST DENIED op=LAUNCH`). This covers an app that embeds a
   runtime (VS Code, Discord); it doesn't cover `node script.js` or a JVM given a class path, which
   run the script they're given.
 - A binary that isn't root-placed (anything under a home directory) can be rewritten in place by
@@ -177,8 +177,9 @@ How the recording stays safe:
   on purpose while recording.
 - A program is identified by the inode of its executable, as the kernel reports it, never by its
   name or command line. A program whose file was replaced or deleted while it ran, or that runs
-  from a world-writable place (`/tmp`, `/dev/shm`, ...), is listed as not whitelistable. A uutils
-  multicall is keyed per applet.
+  from a world-writable place (`/tmp`, `/dev/shm`, ...), is listed as not whitelistable, and so is
+  the dynamic loader (`ld.so <program>` runs any program as the loader). A uutils multicall is
+  keyed per applet.
 - A program you placed yourself is recorded in the [binary ledger](binary-trust.md) with the
   content seen while recording, so the reload admits exactly that file. A program the ledger
   already knows keeps its verdict: if its content changed since, it still needs `trust-binaries`.

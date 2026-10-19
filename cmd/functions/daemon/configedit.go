@@ -44,8 +44,8 @@ func (e *configEditor) apply(base, next []byte) error {
 	if err != nil {
 		prev = nil // every line is checked
 	}
-	if err := guard.RefuseMulticallLines(cfg, prev); err != nil {
-		return fmt.Errorf("the new configuration whitelists a multicall binary the daemon would drop: %w", err)
+	if err := guard.RefuseIdentityLines(cfg, prev); err != nil {
+		return fmt.Errorf("the new configuration whitelists an executable that is no single program: %w", err)
 	}
 	if err := swapFile(e.path, base, next); err != nil {
 		return err

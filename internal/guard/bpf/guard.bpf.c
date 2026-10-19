@@ -29,10 +29,7 @@
 #define PROT_WRITE 0x2    // mmap prot
 #define MAP_SHARED 0x1    // mmap flags
 
-// prctl(2) sub-options that rewrite mm->exe_file (CRIU's restore primitive); gated by guard_task_prctl.
-#define PR_SET_MM 35
-#define PR_SET_MM_EXE_FILE 13
-#define PR_SET_MM_MAP 14
+#include "prctl_gate.h"
 
 // guard_config[0] modes: 0/1 = blacklist/whitelist. GUARD_MODE_READONLY (2): every process may
 // READ, only whitelisted binaries may modify (write, truncate, rename, unlink, chmod, mkdir, mknod,
@@ -2359,26 +2356,15 @@ static __always_inline int current_is_inspector(void)
 	return !exe_refused((struct task_struct *)bpf_get_current_task(), &ik);
 }
 
-// Block ptrace/process_vm_readv/writev against any tainted process (one holding guarded content in
-// memory) unless the caller is whitelisted, or only reads metadata and is an inspector.
-// guard_task_prctl denies the two prctl(PR_SET_MM, ...) sub-options that repoint mm->exe_file:
-// PR_SET_MM_EXE_FILE and PR_SET_MM_MAP (which carries an exe_fd). This guard's identity IS
-// mm->exe_file (current_exe_inode / get_task_exe_inode), so without this gate a non-whitelisted
-// process opens a whitelisted binary and points its own exe_file at that inode (CRIU's restore
-// primitive, reachable unprivileged via an unshared user namespace), then reads guarded secrets as
-// that identity. The gate is global and cheap. It MUST return -ENOSYS for every other prctl: a
-// task_prctl LSM hook that returns 0 makes prctl() short-circuit, silently no-op'ing legit options
-// (PR_SET_NAME, PR_SET_DUMPABLE, ...). Only the two exe_file rewrites return -EPERM.
+// guard_task_prctl: this guard's identity IS mm->exe_file; see prctl_gate.h.
 SEC("lsm/task_prctl")
 int guard_task_prctl(unsigned long long *ctx)
 {
-	int option = (int)ctx[0];
-	unsigned long arg2 = (unsigned long)ctx[1];
-	if (option == PR_SET_MM && (arg2 == PR_SET_MM_MAP || arg2 == PR_SET_MM_EXE_FILE))
-		return -EPERM;
-	return -ENOSYS;
+	return prctl_gate(ctx);
 }
 
+// Block ptrace/process_vm_readv/writev against any tainted process (one holding guarded content in
+// memory) unless the caller is whitelisted, or only reads metadata and is an inspector.
 SEC("lsm/ptrace_access_check")
 int guard_ptrace_access_check(unsigned long long *ctx)
 {

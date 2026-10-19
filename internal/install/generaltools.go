@@ -12,17 +12,22 @@ import (
 
 // generalTools run attacker-chosen code or copy attacker-chosen bytes from their arguments (`git`,
 // `node -e`, `java -cp`, `cp`). Identity is the exe inode, so a resource whitelisting one is
-// readable by any script run through it (issue #79). Matched on the basename; a trailing version
-// (python3.12) too.
+// readable by any script run through it (issue #79). Matched on the basename, also without a
+// trailing version (python3.12, gawk-5.4.0) or a Debian alternative's suffix (nc.openbsd, vim.basic).
 var generalTools = []string{
-	"sh", "bash", "dash", "zsh", "fish", "ksh", "busybox", "toybox", "coreutils", "env",
+	"sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "csh", "tcsh", "ash", "yash",
+	"busybox", "toybox", "coreutils", "env",
 	"git", "node", "nodejs", "npm", "npx", "bun", "deno",
-	"python", "perl", "ruby", "php", "lua", "java",
+	"python", "perl", "ruby", "irb", "php", "lua", "luajit", "java", "tclsh", "wish", "expect", "guile",
+	"Rscript", "R", "julia", "pwsh", "gdb", "m4", "make", "sqlite3",
 	"cp", "mv", "install", "rsync", "tar", "curl", "wget",
 	"cat", "tac", "head", "tail", "dd", "od", "xxd", "hexdump", "hd", "strings", "base64", "base32",
 	"basenc", "sed", "awk", "gawk", "mawk", "grep", "egrep", "fgrep", "rg", "tee", "less", "more",
-	"vi", "vim", "nvim", "nano", "emacs", "openssl", "nc", "ncat", "netcat", "socat", "jq",
-	"gzip", "xz", "zstd", "bzip2", "zip", "7z", "cpio",
+	"sort", "uniq", "nl", "cut", "paste", "fold", "fmt", "pr", "rev", "expand", "unexpand", "join",
+	"comm", "diff", "split", "csplit", "shuf", "column", "iconv", "look", "tsort", "ptx", "bat", "batcat",
+	"vi", "vim", "view", "ex", "ed", "red", "nvim", "nano", "emacs", "openssl", "nc", "ncat", "netcat",
+	"socat", "jq", "gzip", "gunzip", "zcat", "xz", "xzcat", "zstd", "zstdcat", "bzip2", "bzcat", "zip",
+	"unzip", "7z", "cpio", "pv",
 }
 
 // ResolvesToGeneralTool reports whether path, or the file it resolves to, is named like a general
@@ -37,7 +42,14 @@ func ResolvesToGeneralTool(path string) bool {
 
 func namedGeneralTool(path string) bool {
 	base := filepath.Base(path)
-	return slices.Contains(generalTools, base) || slices.Contains(generalTools, strings.TrimRight(base, "0123456789."))
+	unversioned := func(n string) string { return strings.TrimRight(strings.TrimRight(n, "0123456789."), "-_") }
+	alt, _, _ := strings.Cut(base, ".")
+	for _, n := range []string{base, unversioned(base), alt, unversioned(alt)} {
+		if slices.Contains(generalTools, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // GeneralToolsOf lists the general tools res whitelists.

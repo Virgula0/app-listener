@@ -45,6 +45,11 @@ Attach the guards, then unlock the vaults, then populate the protected inodes, t
 binaries that didn't exist yet, then re-sync. Nothing is ever unlocked before its guard is
 attached.
 
+A vault holding a file with a hard link outside it is never unlocked: the guard covers only names
+inside the tree, and a link can be made while the daemon is stopped (fscrypt allows linking a
+locked file into an unencrypted directory). The start (or reload) fails and names the files; remove
+their outside names (`find / -xdev -samefile <file>`) and start again.
+
 ### Boot ordering
 
 The unit is `Type=notify` and ordered

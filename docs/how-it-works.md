@@ -64,7 +64,8 @@ attaches at the level that fits its job:
 
 Because enforcement happens in the kernel, it applies to every way of reaching a file: a plain
 `open`, io_uring, `open_by_handle_at`, `copy_file_range`, raw block devices, hard links, renames
-and so on. The repository ships a corpus of bypass attempts
+and so on. A hard link made while no guard runs is caught before the vault unlocks (see
+[daemon](daemon.md#startup-order)). The repository ships a corpus of bypass attempts
 ([`integrationtests/exploits`](../integrationtests/exploits/README.md)) that the integration tests
 run against every enforcing mode.
 

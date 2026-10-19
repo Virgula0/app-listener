@@ -59,7 +59,8 @@
 #define TRUSTED_JVM 8    // a whitelisted JVM launcher (launch env judged, trust_launch)
 #define TRUSTED_CHROMIUM 16 // a whitelisted Chromium-based binary (launch argv judged, trust_launch)
 #define TRUSTED_ELECTRON 32 // a generic Electron: runs the app its first positional argv names
-#define TRUSTED_RUNTIMES (TRUSTED_NODE | TRUSTED_JVM | TRUSTED_CHROMIUM | TRUSTED_ELECTRON)
+#define TRUSTED_BUN 64      // a Bun runtime or `bun build --compile` exe (launch env judged)
+#define TRUSTED_RUNTIMES (TRUSTED_NODE | TRUSTED_JVM | TRUSTED_CHROMIUM | TRUSTED_ELECTRON | TRUSTED_BUN)
 
 // trust_event.kind
 #define TRUST_LIBLOAD 0    // a whitelisted binary mapped an untrusted library
@@ -346,7 +347,7 @@ struct launch_scan {
 	__u64 pos;     // user address of the next string
 	__u64 arg_end; // argv ends, env begins
 	__u64 env_end;
-	__u32 classes; // the exe's TRUSTED_NODE / TRUSTED_JVM bits
+	__u32 classes; // the exe's TRUSTED_RUNTIMES bits
 	__u32 tok;     // >0: judging the tokens of buf's value from this offset
 	__u32 intok;   // inside a judged token: skipping to its end
 	__u32 vpos;    // offset of buf's value (after '=')
@@ -1513,7 +1514,7 @@ static long launch_step(__u64 i, void *ctx)
 	return 0;
 }
 
-// trust_exec_launch judges a whitelisted Node/Electron, Chromium or JVM runtime's launch: an env var or argv
+// trust_exec_launch judges a whitelisted Node/Electron, Chromium, JVM or Bun runtime's launch: an env var or argv
 // flag that makes it run code its caller chose (trust_launch) marks the process code-suspect
 // (SUSPECT_LAUNCH), so it never reads a secret nor changes an app's code tree. sched_process_exec
 // fires after the new stack holds argv/env and before any user code runs, so nothing in the image

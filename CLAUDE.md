@@ -312,7 +312,7 @@ when the basenames of `bprm->filename` and `argv[0]` are the same applet of that
 real key (`GuardInodeKey.Real()`). BusyBox/toybox are refused. A blacklisted applet also needs
 its `MC_TAG_NONE` row (`Unattested()`): uutils can still run it from `argv[0]`. The network
 objects share `internal/bpf/mc_tag.h` (guard.bpf.c keeps its own copy: pinned verifier cost);
-writers of daemon.conf refuse new non-applet lines up front (`guard.RefuseMulticallLines`).
+writers of daemon.conf refuse new non-applet and dynamic-loader lines up front (`guard.RefuseIdentityLines`).
 Stamps are per process: a multicall process exec'd before a guard (re)started keys as NONE.
 
 ### The daemon (`internal/usecase/daemon.go`, `cmd/functions/daemon`)

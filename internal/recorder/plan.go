@@ -402,7 +402,7 @@ func (p *Plan) Render(base []byte) (string, error) {
 	if err != nil {
 		prev = nil
 	}
-	if err := guard.RefuseMulticallLines(cfg, prev); err != nil {
+	if err := guard.RefuseIdentityLines(cfg, prev); err != nil {
 		return "", err
 	}
 	for i := range p.Sections {

@@ -60,6 +60,7 @@ struct inode_key {
 #pragma clang diagnostic ignored "-Wunused-function" // helpers only the guard objects call
 #include "exe_supersede.h"
 #pragma clang diagnostic pop
+#include "prctl_gate.h"
 
 // net_guard_event.reason. A suspect process's reason is its trust_code_suspect value.
 #define NETG_REASON_CODE SUSPECT_PRELOAD // mapped code its exe doesn't vouch for, or traced at start
@@ -741,6 +742,14 @@ int netg_task_free(unsigned long long *ctx)
 	exe_stamp_free(task, tgid);
 	bpf_map_delete_elem(&trust_code_suspect, &tgid);
 	return 0;
+}
+
+// check_watched keys on mm->exe_file: a swap via prctl(PR_SET_MM) would borrow a whitelisted
+// binary's network access (or shed a blacklisted one). See prctl_gate.h.
+SEC("lsm/task_prctl")
+int netg_task_prctl(unsigned long long *ctx)
+{
+	return prctl_gate(ctx);
 }
 
 // Exec replaces every mapping. Runs before the new image's segments and libraries are mapped, so

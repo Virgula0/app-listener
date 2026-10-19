@@ -68,9 +68,11 @@ func (g *NetGuard) attachRequired(hooks []hook, what string) error {
 
 // lifecycleHooks keep a key's identity over time (exe_supersede.h) and the per-process exec stamps
 // and code-suspect marks: without unlink/rename/inode_free a reused inode number inherits a
-// whitelist row, without fork/exec/exit a stamp or mark is lost or outlives its process.
+// whitelist row, without fork/exec/exit a stamp or mark is lost or outlives its process; without
+// task_prctl a process repoints mm->exe_file (prctl PR_SET_MM) and borrows another binary's key.
 func (g *NetGuard) lifecycleHooks() []hook {
 	return []hook{
+		{g.objs.NetgTaskPrctl, "task_prctl", true},
 		{g.objs.NetgSchedFork, "sched_process_fork", false},
 		{g.objs.NetgTaskFree, "task_free", true},
 		{g.objs.NetgBprmCommitted, "bprm_committed_creds", true},

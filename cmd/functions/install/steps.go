@@ -240,7 +240,7 @@ func runConfigEditor(title, initial string, prev *daemonconfig.Config) (string, 
 
 		cfg, err := validateConfigText(edited)
 		if err == nil {
-			err = guard.RefuseMulticallLines(cfg, prev)
+			err = guard.RefuseIdentityLines(cfg, prev)
 		}
 		if err != nil {
 			log.Errorf("config is invalid: %v — fix it and save again (or press Esc to abort)", err)

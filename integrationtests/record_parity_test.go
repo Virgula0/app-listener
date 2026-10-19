@@ -155,6 +155,42 @@ func (s *IntegrationSuite) TestRecord_ExtendsGuardedResource() {
 	s.stopParityDaemon(c)
 }
 
+// A program run through the dynamic loader (`ld.so <program>`) has the loader as its exe inode. A
+// recording of one must refuse the loader, not propose it: whitelisted, it admits every program run
+// through it, here one the recording never saw. GNU grep/sed, not cat/head: uutils coreutils refuses
+// to run under the loader's name.
+func (s *IntegrationSuite) TestRecord_LoaderNeverProposed() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/recordops"), "/recordops", 0o755))
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, recorderTestAmd64Bin, "/recorder.test", 0o755))
+	const (
+		dir    = parityRec + "/read"
+		loader = "/lib64/ld-linux-x86-64.so.2"
+	)
+	code, out := s.exec(c, []string{"sh", "-c", "set -e; mkdir -p /ops /etc/app-listener " + parityRec + " " +
+		parityOut + "; cp /recordops /ops/app; /recordops setup " + dir + " " + parityOut})
+	s.Require().Equalf(0, code, "fixture: %s", out)
+
+	script := fmt.Sprintf("/ops/app read %[1]s %[2]s; echo \"RC app $?\"; %[3]s /usr/bin/grep -h . %[1]s/f; echo \"RC ld $?\"",
+		dir, parityOut, loader)
+	code, out = s.exec(c, []string{"env", "APPLISTENER_HARNESS_PATH=" + parityRec,
+		"APPLISTENER_HARNESS_CMD=" + script, "/recorder.test", "-test.run", "TestRecorderHarness/TestRecord", "-test.v"})
+	s.Require().Equalf(0, code, "recording: %s", out)
+	rcs, masks, config := parseParityRecording(out)
+	s.Require().Equalf("0", rcs["ld"], "the loader-run grep read while recording:\n%s", out)
+	for line := range masks {
+		s.Require().NotContainsf(line, "ld-linux", "the loader was proposed:\n%s", out)
+	}
+	s.Require().NotContainsf(config, "ld-linux", "the loader reached daemon.conf:\n%s", config)
+	s.Require().Containsf(out, "dynamic loader", "the loader must be reported refused:\n%s", out)
+
+	s.startDaemon(c, config)
+	_, out = s.exec(c, []string{"sh", "-c", loader + " /usr/bin/sed -n p " + dir + "/f 2>&1"})
+	s.Require().NotContainsf(out, "parity-data", "a program run through the loader read the recorded tree: %s", out)
+	s.stopParityDaemon(c)
+}
+
 // paritySetup rebuilds every op's fixture (by /recordops, an inode no config names).
 func (s *IntegrationSuite) paritySetup(c testcontainers.Container) {
 	cmd := []string{"set -e", "rm -rf " + parityRec + " " + parityOut, "mkdir -p " + parityRec + " " + parityOut}

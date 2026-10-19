@@ -58,6 +58,13 @@ var launchRules = func() []launchRule {
 		launchRule{launchEnv, "_JAVA_OPTIONS", trustedJVM, launchTokens},
 		launchRule{launchEnv, "JDK_JAVA_OPTIONS", trustedJVM, launchTokens},
 	)
+	// A Bun exe ignores NODE_OPTIONS and passes argv to its script, but BUN_BE_BUN=1 turns a compiled
+	// app into the bun CLI (`app -e …`), BUN_OPTIONS takes runtime flags (--preload), and the
+	// inspector variables open a debugger. Any of them set is risky.
+	for _, e := range []string{"BUN_BE_BUN", "BUN_OPTIONS", "BUN_INSPECT", "BUN_INSPECT_CONNECT_TO",
+		"BUN_INSPECT_PRELOAD", "BUN_INSPECT_NOTIFY", "BUN_RUNTIME_TRANSPILER_CACHE_PATH"} {
+		rules = append(rules, launchRule{launchEnv, e, trustedBun, launchPresent})
+	}
 	// --env-file reads NODE_OPTIONS (and the rest) from a file argv names.
 	for _, a := range []string{"--inspect", "--eval", "--print", "--require", "--import", "--loader",
 		"--experimental-loader", "--env-file", "--env-file-if-exists", "--experimental-config-file"} {
@@ -139,7 +146,8 @@ func (t *TrustGuard) setLaunchRules() error {
 }
 
 // attachLaunchScan attaches trust_exec_launch. Required: without it a whitelisted runtime started
-// with NODE_OPTIONS=--require or ELECTRON_RUN_AS_NODE runs its caller's code with full access.
+// with NODE_OPTIONS=--require, ELECTRON_RUN_AS_NODE or BUN_BE_BUN runs its caller's code with full
+// access.
 func (t *TrustGuard) attachLaunchScan() error {
 	if err := t.setLaunchRules(); err != nil {
 		return fmt.Errorf("required trust launch rules: %w", err)
@@ -168,10 +176,13 @@ var runtimeMarkers = []struct {
 	{[]byte("remote-debugging-port"), trustedChromium},
 	{[]byte("JDK_JAVA_OPTIONS"), trustedJVM},
 	{[]byte("JAVA_TOOL_OPTIONS"), trustedJVM},
+	{[]byte("BUN_INSPECT"), trustedBun},
+	{[]byte("BUN_BE_BUN"), trustedBun},
+	{[]byte("BUN_OPTIONS"), trustedBun},
 }
 
 // trustedRuntimes: every class runtimeClass reports.
-const trustedRuntimes = trustedNode | trustedJVM | trustedChromium | trustedElectron
+const trustedRuntimes = trustedNode | trustedJVM | trustedChromium | trustedElectron | trustedBun
 
 type classCacheKey struct {
 	dev, ino     uint64

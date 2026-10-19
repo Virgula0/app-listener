@@ -521,6 +521,9 @@ func (v *Vault) Unlock(path string) error {
 			return fmt.Errorf("get policy for %s: %w", path, err)
 		}
 		// Locked file: unopenable, so fall back to provisionLockedFile.
+		if linkErr := refuseOutsideHardlinks(path); linkErr != nil {
+			return fmt.Errorf("unlock %s: %w", path, linkErr)
+		}
 		if provErr := v.provisionLockedFile(fsctx, path); provErr != nil {
 			return fmt.Errorf("unlock %s: %w", path, provErr)
 		}
@@ -528,6 +531,9 @@ func (v *Vault) Unlock(path string) error {
 	}
 	if policy.IsProvisionedByTargetUser() {
 		return nil
+	}
+	if err = refuseOutsideHardlinks(path); err != nil {
+		return fmt.Errorf("unlock %s: %w", path, err)
 	}
 
 	keyBytes, err := readKey()
