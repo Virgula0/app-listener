@@ -19,6 +19,10 @@ var generalTools = []string{
 	"git", "node", "nodejs", "npm", "npx", "bun", "deno",
 	"python", "perl", "ruby", "php", "lua", "java",
 	"cp", "mv", "install", "rsync", "tar", "curl", "wget",
+	"cat", "tac", "head", "tail", "dd", "od", "xxd", "hexdump", "hd", "strings", "base64", "base32",
+	"basenc", "sed", "awk", "gawk", "mawk", "grep", "egrep", "fgrep", "rg", "tee", "less", "more",
+	"vi", "vim", "nvim", "nano", "emacs", "openssl", "nc", "ncat", "netcat", "socat", "jq",
+	"gzip", "xz", "zstd", "bzip2", "zip", "7z", "cpio",
 }
 
 // ResolvesToGeneralTool reports whether path, or the file it resolves to, is named like a general
@@ -32,7 +36,8 @@ func ResolvesToGeneralTool(path string) bool {
 }
 
 func namedGeneralTool(path string) bool {
-	return slices.Contains(generalTools, strings.TrimRight(filepath.Base(path), "0123456789."))
+	base := filepath.Base(path)
+	return slices.Contains(generalTools, base) || slices.Contains(generalTools, strings.TrimRight(base, "0123456789."))
 }
 
 // GeneralToolsOf lists the general tools res whitelists.

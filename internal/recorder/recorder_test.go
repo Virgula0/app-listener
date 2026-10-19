@@ -590,6 +590,18 @@ func TestProgressNamesMulticallApplets(t *testing.T) {
 	}
 }
 
+func TestFileReadersStartDeselected(t *testing.T) {
+	for _, line := range []string{"/usr/bin/cat", "/usr/bin/dd", "/usr/bin/head", "/usr/bin/base64",
+		"/usr/bin/xxd", "/usr/bin/sed", "/usr/bin/awk", "/usr/bin/grep", "/usr/bin/openssl", "/usr/bin/nc",
+		"/usr/bin/bzip2", "/usr/bin/base32"} {
+		b := &Binary{Line: line, Exe: line}
+		finishBinary(b, exeVerdict{placed: true}, nil)
+		if !b.GeneralTool || b.Suggested {
+			t.Errorf("%s: GeneralTool=%v Suggested=%v", line, b.GeneralTool, b.Suggested)
+		}
+	}
+}
+
 func TestShellHelpersStartDeselected(t *testing.T) {
 	for line, want := range map[string]bool{
 		"/usr/bin/starship": true, "/home/u/.cache/gitstatus/gitstatusd-linux-x86_64": true,
