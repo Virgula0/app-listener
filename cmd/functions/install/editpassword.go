@@ -27,7 +27,7 @@ func promptEditPassword() (string, error) {
 		keep, err := wizard.Confirm(wizard.Question{
 			Title: "Keep the current edit-protected password?",
 			Description: "It authenticates `app-listener edit-protected` (live edits, temporary access, " +
-				"configuration edits). Change it any time with `edit-protected --set-password`, which asks the " +
+				"configuration edits). Change it any time with `edit-protected password`, which asks the " +
 				"current one. Replace it here only if it is forgotten.",
 			Affirmative: "Keep it",
 			Negative:    "Replace it",

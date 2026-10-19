@@ -105,7 +105,7 @@ func writeUserFile(path string, data []byte) error {
 // (filters applied).
 func (s *shell) exportTable(baseName string, t *dataTable) {
 	headers, rows := t.texts()
-	format := widget.NewRadioGroup(exportFormats, nil)
+	format := newRadioGroup(exportFormats, nil)
 	format.Horizontal = true
 	format.Required = true
 	format.Selected = exportFormats[0]

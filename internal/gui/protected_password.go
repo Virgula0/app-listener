@@ -13,7 +13,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/editbackend"
 )
 
-// fillPasswordBox offers what `--set-password` would accept now: a change, which asks the current
+// fillPasswordBox offers what `edit-protected password` would accept now: a change, which asks the current
 // password, or the first password of an install older than the mandatory one. Never a removal.
 func (p *protectedPage) fillPasswordBox() {
 	p.pwBox.Objects = nil
@@ -39,7 +39,7 @@ func (p *protectedPage) fillPasswordBox() {
 	p.pwBox.Refresh()
 }
 
-// passwordDialog is --set-password: the current password (when changing) and the new one twice.
+// passwordDialog is edit-protected password: the current password (when changing) and the new one twice.
 func (p *protectedPage) passwordDialog(change bool) {
 	cur, next, again := widget.NewPasswordEntry(), widget.NewPasswordEntry(), widget.NewPasswordEntry()
 	items := []*widget.FormItem{}

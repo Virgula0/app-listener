@@ -7,9 +7,9 @@ dependency does on disk.
 ![monitor](../media/tui/monitor.gif)
 
 ```bash
-sudo app-listener monitor -w ~/.ssh
-sudo app-listener monitor -w /var/log --recursive --depth 3
-sudo app-listener monitor -w /path/to/file.txt -e OPEN,READ
+sudo app-listener monitor ~/.ssh
+sudo app-listener monitor /var/log --recursive --depth 3
+sudo app-listener monitor /path/to/file.txt -e OPEN,READ
 ```
 
 ## Events
@@ -28,9 +28,10 @@ daemon is active does not trip the daemon's guards on their protected files.
 
 ## Flags
 
+`app-listener monitor PATH...` takes one or more files or directories as arguments.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-w, --watch <path>` | required | Path to monitor (repeatable) |
 | `-r, --recursive` | `false` | Recurse into subdirectories |
 | `-d, --depth <n>` | `0` | Max depth (needs `--recursive`; `0` = unlimited) |
 | `-e, --events <list>` | all | Comma-separated subset of the events above |

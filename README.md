@@ -50,7 +50,7 @@ and removes the service.
 > **Install** page:
 >
 > ```bash
-> chmod +x app-listener-gui && sudo ./app-listener-gui --gui
+> chmod +x app-listener-gui && sudo ./app-listener-gui
 > ```
 >
 > It downloads and verifies the signed release itself, then runs the same wizard with every
@@ -66,7 +66,7 @@ desktop app: watch folders and programs live, turn what you see into a whitelist
 edit protected files, and install or update the daemon. See [Desktop GUI](docs/gui.md).
 
 ```bash
-sudo app-listener-gui --gui
+sudo app-listener-gui
 ```
 
 ![Desktop app walkthrough: a guard on ~/.ssh, network verdicts, a live edit, the install wizard](media/gui/demo.gif)
@@ -110,7 +110,7 @@ agents, browsers, password managers, messaging apps, crypto wallets) and writes 
 anything. It is the quickest way to learn what a new tool or package actually reads.
 
 ```bash
-sudo app-listener monitor -w ~/.ssh
+sudo app-listener monitor ~/.ssh
 ```
 
 ![monitor](media/tui/monitor.gif)
@@ -124,14 +124,14 @@ sudo app-listener guard ~/secret -w /usr/bin/cat
 
 ![guard](media/tui/guard.gif)
 
-**`network-monitor`** and **`network-guard`** do the same for the network: see what a program
+**`network monitor`** and **`network guard`** do the same for the network: see what a program
 connects to, cut a single tool off, or let only your browser and the system's own services out. A
 whitelisted program loses its access if someone injects code into it with `LD_PRELOAD` or a
 planted library.
 
 ```bash
-sudo app-listener network-monitor /usr/bin/curl
-sudo app-listener network-guard -w /usr/lib/firefox/firefox --auto-infra
+sudo app-listener network monitor /usr/bin/curl
+sudo app-listener network guard -w /usr/lib/firefox/firefox --auto-infra
 ```
 
 **`daemon`** is the mode most people want: permanent, encrypted protection of the directories you
@@ -148,6 +148,9 @@ never shells, interpreters or general tools like `git` or `cp`. It does not defe
 already has root. See [Limitations](docs/limitations.md).
 
 ## Documentation
+
+`app-listener --help` lists the commands, and every one takes `--help`; the whole tree is in
+[docs/](docs/README.md#command-tree).
 
 Every mode, flag and config option is documented in **[docs/](docs/README.md)**, starting from
 [how it works](docs/how-it-works.md), the [daemon](docs/daemon.md) and

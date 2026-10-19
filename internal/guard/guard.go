@@ -676,7 +676,7 @@ var requiredHooks = map[string]bool{
 }
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
-// (g.pinPrefix+suffix); exported so `daemon --lockdown` (no live Guard) can reopen just those maps.
+// (g.pinPrefix+suffix); exported so `daemon lockdown` (no live Guard) can reopen just those maps.
 const (
 	ExeActionsPinName = "exe-actions"
 	ExeEventsPinName  = "exe-events"
@@ -687,7 +687,7 @@ const (
 )
 
 // pinSelfMaps pins guard_exe_actions/guard_exe_events when a self binary is registered and pinning
-// is on, solely for `daemon --lockdown`, which widens a file-vault's self access from a fresh
+// is on, solely for `daemon lockdown`, which widens a file-vault's self access from a fresh
 // process to lock it after a crash. Failure is logged, not fatal (only that recovery path is lost).
 func (g *Guard) pinSelfMaps() {
 	if g.pinPrefix == "" || !g.selfKeySet {
@@ -704,7 +704,7 @@ func (g *Guard) pinSelfMaps() {
 		MaxEntries: 1,
 	})
 	if err != nil {
-		log.Errorf("guard %s: creating resource-id map failed (%v) — 'daemon --lockdown' will not be "+
+		log.Errorf("guard %s: creating resource-id map failed (%v) — 'daemon lockdown' will not be "+
 			"able to widen self-access here if the daemon crashes while this resource is unlocked",
 			g.path, err)
 		return
@@ -715,7 +715,7 @@ func (g *Guard) pinSelfMaps() {
 		return
 	}
 	if err := m.Pin(g.pinPrefix + ResIDPinName); err != nil {
-		log.Errorf("guard %s: pinning %s failed (%v) — 'daemon --lockdown' will not be able to widen "+
+		log.Errorf("guard %s: pinning %s failed (%v) — 'daemon lockdown' will not be able to widen "+
 			"self-access here if the daemon crashes while this resource is unlocked",
 			g.path, ResIDPinName, err)
 	}
@@ -1004,7 +1004,7 @@ func (g *Guard) WithSelfVaultAccess(fn func() error) error {
 }
 
 // WithPinnedSelfVaultAccess is WithSelfVaultAccess for a process with no live *Guard: `daemon
-// --lockdown` (ExecStopPost) locking a file-vault after its daemon died. It works on the pinned
+// lockdown` (ExecStopPost) locking a file-vault after its daemon died. It works on the pinned
 // guard_exe_actions/guard_exe_events maps left by pinSelfMaps. pinPrefix must be
 // base+gen+resource-hash (PinPrefix); the caller recovers gen (see pinstate.go).
 //

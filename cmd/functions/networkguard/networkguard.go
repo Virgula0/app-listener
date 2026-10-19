@@ -34,58 +34,34 @@ var (
 )
 
 var NetworkGuardCmd = &cobra.Command{
-	Use:   "network-guard",
-	Short: "Block network operations of specific binaries using eBPF LSM",
-	Long: `Block or allow network operations (TCP, UDP, DNS, etc.) of specific
-binary executables using eBPF LSM programs.
+	Use:   "guard [-w BINARY... | -b BINARY...]",
+	Short: "Deny network access (AF_INET/AF_INET6) with eBPF LSM",
+	Long: `Deny IPv4/IPv6 network operations. With -b only the listed binaries are
+blocked (safe on a desktop). With -w every binary but the listed ones is
+blocked; with neither, everything is.
 
-Blacklist mode (-b): block AF_INET/AF_INET6 network operations for the
-listed binaries. Everything else is allowed. This mode is safe for desktop
-environments since only the listed binaries are affected.
-
-Whitelist mode (-w): block AF_INET/AF_INET6 network operations for all
-binaries except the listed ones. When neither -b nor -w is given, whitelist
-mode with no allowed binaries is assumed (everything is blocked).
-Add --unsafe to also block AF_UNIX sockets (used by X11, D-Bus, etc.) —
-this may break desktop applications. --unsafe is only available in whitelist
-mode.
-
---auto-infra (whitelist mode only): automatically allowlist the essential
-system network daemons (DNS resolver, network manager, etc.) that must stay
-online for whitelisted applications to function — e.g. systemd-resolved,
-which performs upstream DNS lookups on behalf of every process.
-
-The two modes are mutually exclusive.
-
-Examples:
-  app-listener network-guard -b /usr/bin/curl
-  app-listener network-guard -b /usr/bin/curl /usr/bin/wget -e CONNECT,SEND
-  app-listener network-guard -w /usr/bin/vim -e CONNECT,LISTEN
-  app-listener network-guard -w /usr/bin/python3 --unsafe
-  app-listener network-guard -w /usr/bin/firefox --auto-infra
-  app-listener network-guard -w /usr/bin/firefox --auto-infra --no-throttle
-  app-listener network-guard`,
+Whitelist mode only: --auto-infra also admits the running system network
+daemons (DNS resolver, network manager), and --unsafe also blocks AF_UNIX
+sockets, which breaks X11 and D-Bus clients.`,
+	Example: `  sudo app-listener network guard -b /usr/bin/curl -b /usr/bin/wget
+  sudo app-listener network guard -w /usr/bin/firefox --auto-infra`,
 	Args: cobra.NoArgs,
 	RunE: runNetworkGuard,
 }
 
 func init() {
 	common.AddServeFlags(NetworkGuardCmd)
-	NetworkGuardCmd.Flags().StringSliceVarP(&blacklistPaths, "blacklist", "b", nil,
-		"Binary paths to blacklist (block AF_INET/AF_INET6 network operations)")
-	NetworkGuardCmd.Flags().StringSliceVarP(&whitelistPaths, "whitelist", "w", nil,
-		"Binary paths to whitelist (allow AF_INET/AF_INET6, block everything else)")
-	NetworkGuardCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
-		"Event types to REPORT (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all). "+
-			"Display filter only — enforcement always covers every operation regardless of this set")
-	NetworkGuardCmd.Flags().BoolVarP(&headless, "headless", "", false,
-		"Run without TUI, print events to stderr (for testing/scripting)")
-	NetworkGuardCmd.Flags().BoolVarP(&unsafeFlag, "unsafe", "", false,
-		"Also block AF_UNIX sockets (whitelist mode only). May break desktop applications that use X11/D-Bus communication")
-	NetworkGuardCmd.Flags().BoolVarP(&autoInfraFlag, "auto-infra", "", false,
-		"Automatically allowlist running system network daemons (e.g. the DNS resolver) in whitelist mode so they keep working")
-	NetworkGuardCmd.Flags().BoolVarP(&noThrottleFlag, "no-throttle", "", false,
-		"Emit every network event without rate limiting (default: 1 event per type+process per 250ms to protect the ring buffer from flooding)")
+	f := NetworkGuardCmd.Flags()
+	f.StringSliceVarP(&whitelistPaths, "whitelist", "w", nil, "Binary allowed on the network (repeatable)")
+	f.StringSliceVarP(&blacklistPaths, "blacklist", "b", nil, "Binary blocked from the network (repeatable)")
+	f.StringSliceVarP(&eventsFlag, "events", "e", nil,
+		"Event types to show: "+common.NetEventList+" (default all; display only, enforcement covers every operation)")
+	common.AddHeadlessFlag(NetworkGuardCmd, &headless)
+	f.BoolVar(&unsafeFlag, "unsafe", false, "Also block AF_UNIX sockets (whitelist mode; breaks X11/D-Bus clients)")
+	f.BoolVar(&autoInfraFlag, "auto-infra", false, "Admit the running system network daemons, e.g. the DNS resolver (whitelist mode)")
+	f.BoolVar(&noThrottleFlag, "no-throttle", false,
+		"Show every event (default: at most 1 per event type and process per 250ms)")
+	NetworkGuardCmd.MarkFlagsMutuallyExclusive("whitelist", "blacklist")
 }
 
 func runNetworkGuard(cmd *cobra.Command, args []string) error {

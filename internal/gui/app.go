@@ -1,6 +1,6 @@
 //go:build gui
 
-// Package gui is the desktop window `app-listener --gui` opens, behind the `gui` build tag: fyne
+// Package gui is the desktop window `app-listener-gui` opens, behind the `gui` build tag: fyne
 // adds X11/OpenGL/font/image dependencies (~15 MiB) and package-init goroutines that don't belong
 // in the daemon sharing this binary. Build with `-tags gui` (or `make build GUI=1`).
 package gui
@@ -40,6 +40,7 @@ const (
 	pageProtected
 	pageUpdate
 	pageInstall
+	pageDaemon
 )
 
 type pageDef struct {
@@ -56,6 +57,7 @@ var pageDefs = []pageDef{
 	{pageProtected, "lock-simple", "Protected", "Edit protected directories, grant temporary access, edit the daemon's configuration"},
 	{pageUpdate, "arrow-clockwise", "Update", "Update the installed daemon to the latest signed release"},
 	{pageInstall, "download-simple", "Install", "Set up the protection daemon"},
+	{pageDaemon, "pulse", "Daemon", "Start or stop the protection daemon with systemctl"},
 }
 
 // shell is the window frame: sidebar navigation, page header and the active page.
@@ -79,6 +81,7 @@ type shell struct {
 	install  *installPage
 	update   *updatePage
 	protect  *protectedPage
+	daemon   *daemonPage
 	// startBackend runs the installed binary's edit-protected backend (a fake in tests).
 	startBackend func() (backendLink, error)
 
@@ -111,9 +114,9 @@ func Run(opts *Options) (err error) {
 		switch {
 		case r == nil:
 		case started.Load():
-			err = fmt.Errorf("--gui: internal error: %v\n%s", r, debug.Stack())
+			err = fmt.Errorf("gui: internal error: %v\n%s", r, debug.Stack())
 		default:
-			err = fmt.Errorf("--gui: no display reachable (%v): run it from a graphical session "+
+			err = fmt.Errorf("gui: no display reachable (%v): run it from a graphical session "+
 				"(under sudo it needs the invoking user's WAYLAND_DISPLAY or DISPLAY)", r)
 		}
 	}()
@@ -350,7 +353,9 @@ func (s *shell) show(id pageID) {
 		}
 	}
 	v, ok := s.views[id]
-	if !ok {
+	if ok {
+		s.refreshPage(id)
+	} else {
 		// The page fills the window when it fits and scrolls when the window is smaller than it
 		// (fyne grows scroll content to the viewport): a tiling WM may impose any size.
 		v = newFadeScroll(s.build(id))
@@ -376,9 +381,39 @@ func (s *shell) build(id pageID) fyne.CanvasObject {
 	case pageUpdate:
 		s.update = newUpdatePage(s)
 		return s.update.view()
+	case pageDaemon:
+		s.daemon = newDaemonPage(s)
+		return s.daemon.view()
 	default:
 		s.install = newInstallPage(s)
 		return s.install.view()
+	}
+}
+
+// refreshPage re-reads the daemon state a page shows when it comes back into view: the daemon may
+// have been started or stopped meanwhile.
+func (s *shell) refreshPage(id pageID) {
+	switch {
+	case id == pageInstall && s.install != nil && !s.install.running:
+		s.install.refreshStatus()
+	case id == pageProtected && s.protect != nil:
+		s.protect.probe()
+	case id == pageDaemon && s.daemon != nil && !s.daemon.running:
+		s.daemon.refresh()
+	}
+}
+
+// daemonChanged refreshes every built page whose actions depend on whether the daemon runs, after
+// a run (any of them may have started or stopped it).
+func (s *shell) daemonChanged() {
+	if s.install != nil && !s.install.running {
+		s.install.refreshStatus()
+	}
+	if s.protect != nil {
+		s.protect.probe()
+	}
+	if s.daemon != nil && !s.daemon.running {
+		s.daemon.refresh()
 	}
 }
 

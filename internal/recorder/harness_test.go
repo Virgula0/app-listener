@@ -1,7 +1,7 @@
 // harness_test.go is the record-parity harness (integrationtests/record_parity_test.go): a real
 // recording needs root and the monitor's kprobes. It records APPLISTENER_HARNESS_PATH
 // (colon-separated targets) while `sh -c "$APPLISTENER_HARNESS_CMD"` runs, then prints what
-// --record would propose: one MASK line per binary and the daemon.conf Plan.Render writes with
+// `config record` would propose: one MASK line per binary and the daemon.conf Plan.Render writes with
 // every admissible binary approved and Masks on. APPLISTENER_HARNESS_BASE, when set, is the
 // daemon.conf the targets are validated, classified and rendered against (a guarded target is
 // extended; a binary it already whitelists prints COVERED instead of MASK).

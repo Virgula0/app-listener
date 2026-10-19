@@ -142,7 +142,7 @@ func TestNetApplyFlagRules(t *testing.T) {
 	n, _ := newFakeNet(t)
 	for _, p := range []NetPolicy{{Mode: GuardBlacklist, Unsafe: true}, {Mode: GuardBlacklist, AutoInfra: true}} {
 		if err := n.Apply(p); err == nil {
-			t.Fatalf("%+v must be refused, as network-guard does", p)
+			t.Fatalf("%+v must be refused, as `network guard` does", p)
 		}
 	}
 }

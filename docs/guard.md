@@ -19,7 +19,8 @@ sudo app-listener guard /secret -b /usr/bin/rm     # block only rm
 - **Blacklist** (`-b`): only the listed binaries are blocked.
 
 `-w` and `-b` are mutually exclusive. Binaries are matched by inode, see
-[How it works](how-it-works.md#identity-is-the-executables-inode).
+[How it works](how-it-works.md#identity-is-the-executables-inode). The rule covers every
+operation: `guard` has no per-event filter (the [daemon](daemon-config.md) has one per binary).
 
 ## Flags
 
@@ -30,7 +31,6 @@ sudo app-listener guard /secret -b /usr/bin/rm     # block only rm
 | `-b, --blacklist <binary>` | none | Binaries blocked (repeatable) |
 | `-r, --recursive` | `true` | Recurse into subdirectories |
 | `-d, --depth <n>` | `0` | Max depth (`0` = unlimited) |
-| `-e, --events <list>` | all | Event types to enforce (same set as [monitor](monitor.md#events)) |
 | `--headless` | `false` | No TUI; log `GUARD\|` lines to stderr |
 | `--serve[=host:port]` | off | Mirror the TUI to a browser |
 

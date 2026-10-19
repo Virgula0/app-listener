@@ -121,7 +121,7 @@ func newEventFeed(s *shell, spec *feedSpec) *eventFeed {
 
 	f.search = newSearchEntry(spec.placeholder, func(s string) { f.filter.Text = s; f.refresh(true) })
 
-	verdict := widget.NewSelect([]string{"All verdicts", "Denied", "Allowed", "Observed"}, func(s string) {
+	verdict := newSelect([]string{"All verdicts", "Denied", "Allowed", "Observed"}, func(s string) {
 		f.filter.Verdicts = verdictFilters[s]
 		f.refresh(true)
 	})

@@ -7,13 +7,12 @@ import (
 	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
-// DaemonUnitCmd prints the daemon unit this build bundles: `update` and `install --binary-only`
+// DaemonUnitCmd prints the daemon unit this build bundles: `update` and `install binary`
 // run it on the binary they deploy, so the unit diffed is the new release's, not the running one's.
 var DaemonUnitCmd = &cobra.Command{
-	Use:    systemd.DaemonUnitCommand,
-	Short:  "Print the bundled daemon systemd unit",
-	Hidden: true,
-	Args:   cobra.NoArgs,
+	Use:   systemd.DaemonUnitCommand,
+	Short: "Print the bundled daemon systemd unit (update runs it on the binary it deploys)",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		unit, err := inst.SampleContent(systemd.DaemonServiceName + ".service")
 		if err != nil {

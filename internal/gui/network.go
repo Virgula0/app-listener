@@ -206,7 +206,7 @@ func (p *networkPage) newProcesses() *processView {
 	})
 }
 
-// watchTab edits the programs the network monitor follows (network-monitor's binaries and -e).
+// watchTab edits the programs the network monitor follows (`network monitor`'s binaries and -e).
 type watchTab struct {
 	p    *networkPage
 	root fyne.CanvasObject
@@ -244,13 +244,13 @@ func (w *watchTab) watchExe(e workbench.Exe) {
 
 // newNetEventChecks is a horizontal check group of the network event types (nil = all, as -e). The
 // last checked box can't be cleared: no event type at all is not a filter -e can express.
-func newNetEventChecks(selected []ebpf.NetEventType, onChange func([]ebpf.NetEventType)) *widget.CheckGroup {
+func newNetEventChecks(selected []ebpf.NetEventType, onChange func([]ebpf.NetEventType)) *handCheckGroup {
 	all := ebpf.NetEventTypes()
 	names := make([]string, len(all))
 	for i, t := range all {
 		names[i] = t.String()
 	}
-	g := widget.NewCheckGroup(names, nil)
+	g := newCheckGroup(names, nil)
 	g.Horizontal = true
 	if len(selected) == 0 {
 		selected = all

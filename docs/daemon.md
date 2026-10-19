@@ -14,26 +14,37 @@ attached.** Directories are unlocked only after their guard is in place, and loc
 shutdown *while the guards still deny*.
 
 ```bash
-sudo app-listener daemon --genkey   # create the fscrypt master key
+sudo app-listener daemon genkey   # create the fscrypt master key
 sudo app-listener daemon            # run with /etc/app-listener/daemon.conf
 ```
 
 You rarely run it by hand: `install` deploys it as the `app-listener-daemon` systemd service.
 
-## Flags
+## Commands and flags
+
+| Command | Description |
+|---|---|
+| `daemon` | Run the daemon (the systemd service's `ExecStart`) |
+| `daemon check [--verifier-only]` | Check BPF-LSM is active and load every guard eBPF program into this kernel's verifier, attaching nothing; exit non-zero on any rejection. `--verifier-only` skips the BPF-LSM activation check (CI hosts that build BPF-LSM in without enabling it): a pass then says the programs verify, not that the host enforces |
+| `daemon lockdown` | Force-lock every encryption root in the config and exit. The systemd unit runs it as `ExecStopPost`, after every exit (clean stop, crash, SIGKILL, startup timeout) |
+| `daemon genkey` | Generate `/etc/app-listener/fscrypt.key` and exit (regenerating asks for confirmation) |
+
+`--config <path>` applies to all four. Config resolution order: this flag, then
+`/etc/app-listener/daemon.conf`, then `daemon-samples/daemon.conf`.
+
+Flags of `daemon` itself:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config <path>` | none | Config resolution order: this flag, then `/etc/app-listener/daemon.conf`, then `daemon-samples/daemon.conf` |
 | `--headless` | `false` | Log `DAEMON ...` lines to stderr (journald when run as a systemd service) |
 | `--blocked-only` | `false` | Print only denied attempts (presentation only) |
 | `--no-log-metadata-blocks` | `false` | Don't log denied metadata-only process inspections; see [below](#quiet-metadata-denials) |
-| `--genkey` | `false` | Generate `/etc/app-listener/fscrypt.key` and exit (regenerating asks for confirmation) |
-| `--check` | `false` | Preflight: check BPF-LSM is active and load every guard eBPF program into this kernel's verifier, attaching nothing; exit non-zero on any rejection |
-| `--verifier-only` | `false` | With `--check`: skip the BPF-LSM activation check (CI hosts that build BPF-LSM in without enabling it). A pass then says the programs verify, not that the host enforces |
-| `--lockdown` | `false` | Force-lock every encryption root in the config and exit. The systemd unit runs it as `ExecStopPost`, after every exit (clean stop, crash, SIGKILL, startup timeout) |
 | `--pprof <addr>` | none | Serve `net/http/pprof` on a loopback address for profiling |
 | `--serve[=host:port]` | off | Mirror the TUI to a browser |
+
+The flags `daemon --check`, `--verifier-only`, `--lockdown` and `--genkey` are aliases of the
+subcommands and stay listed in `--help`: installed systemd units, `scripts/install.sh` and
+`check-compatibility.sh` run binaries of other versions with them.
 
 The config format is covered in [Daemon configuration](daemon-config.md).
 
@@ -74,7 +85,7 @@ it up). On shutdown, keys are removed in two passes while the guards still deny 
 hooks detach only after every vault is keyless.
 
 A hard `SIGKILL` can't be caught, but the guards' LSM links are pinned under `/sys/fs/bpf`, so the
-trees stay enforced until `ExecStopPost` (`daemon --lockdown`) locks the vaults.
+trees stay enforced until `ExecStopPost` (`daemon lockdown`) locks the vaults.
 
 A wrong or old master key fails immediately with "invalid wrapping key". The daemon never silently
 generates a new one.
@@ -132,7 +143,7 @@ are listed under `[inspectors]`, see [Daemon configuration](daemon-config.md#pro
 ## Related
 
 - [Daemon configuration](daemon-config.md): the config file.
-- [Binary trust](binary-trust.md): binary updates, the ledger, `trust-binaries`, launch scan.
+- [Binary trust](binary-trust.md): binary updates, the ledger, `trust`, launch scan.
 - [Self-updating apps and the catalog](catalog.md): catalog refresh.
 - [edit-protected](edit-protected.md): editing protected files while the daemon runs, and the
   live control socket.

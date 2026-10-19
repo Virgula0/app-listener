@@ -15,7 +15,7 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
-// startConfig is `edit-protected --edit-config`: fetch daemon.conf, edit it here, review the diff;
+// startConfig is `edit-protected config`: fetch daemon.conf, edit it here, review the diff;
 // the daemon writes it only while it still holds what was fetched, and reloads.
 func (p *protectedPage) startConfig() {
 	if p.hello != nil && !p.hello.Live {

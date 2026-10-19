@@ -538,7 +538,7 @@ func materializeLibDirs(cfg *Config, g *watchGroup) {
 			continue
 		}
 		// A shared runtime tree may be named by several sections (one app, several config
-		// locations; `install --diff-catalog` appending a second section). Guarding it once is
+		// locations; `install catalog diff` appending a second section). Guarding it once is
 		// enough, so a repeat is a no-op, not a duplicate-watch-path error that would take the
 		// daemon down. Only merge into another lib_dir: a lib_dir naming an already-guarded real
 		// (whitelist-mode, possibly encrypted) resource must NOT fold into it (it would widen a

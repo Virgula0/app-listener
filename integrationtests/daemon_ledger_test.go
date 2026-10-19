@@ -47,14 +47,14 @@ func (s *IntegrationSuite) awaitReadAs(c testcontainers.Container, bin string) b
 }
 
 func (s *IntegrationSuite) trustBinaries(c testcontainers.Container, args ...string) string {
-	code, out := s.exec(c, append([]string{"/app-listener", "trust-binaries"}, args...))
-	s.Require().Equalf(0, code, "trust-binaries %v: %s", args, out)
+	code, out := s.exec(c, append([]string{"/app-listener", "trust"}, args...))
+	s.Require().Equalf(0, code, "trust %v: %s", args, out)
 	return out
 }
 
 // Nothing guards a whitelisted path while the daemon is stopped: a binary replaced meanwhile, in a
 // home (root's) or a user-owned dir outside /home, is refused at the next start until
-// `trust-binaries` confirms it, and the confirmation persists. A root-placed one needs none.
+// `trust` confirms it, and the confirmation persists. A root-placed one needs none.
 func (s *IntegrationSuite) TestDaemon_Ledger_BinaryReplacedWhileStoppedRefusedUntilConfirmed() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -108,17 +108,17 @@ need_encryption: false
 	s.Require().NotContainsf(out, ledgerMarker, "the user's replacement was admitted unconfirmed: %s", out)
 	s.assertNeverStolen(c, inHome, secret, ledgerMarker)
 
-	list := s.trustBinaries(c, "--list")
-	s.Require().Containsf(list, inHome, "trust-binaries --list must show the refused binaries: %s", list)
+	list := s.trustBinaries(c, "list")
+	s.Require().Containsf(list, inHome, "trust list must show the refused binaries: %s", list)
 	s.Require().Contains(list, userDir)
 	s.Require().NotContains(list, sysBin)
 	out = s.trustBinaries(c, "--yes")
-	s.Require().Containsf(out, "confirmed", "trust-binaries --yes: %s", out)
+	s.Require().Containsf(out, "confirmed", "trust --yes: %s", out)
 	for _, b := range []string{inHome, userDir} {
 		ok, out := s.awaitStolen(c, b, secret, ledgerMarker, 60*time.Second)
-		s.Require().Truef(ok, "%s not admitted after trust-binaries: %s\ndaemon log:\n%s", b, out, s.readDaemonLog(c))
+		s.Require().Truef(ok, "%s not admitted after trust: %s\ndaemon log:\n%s", b, out, s.readDaemonLog(c))
 	}
-	s.Require().Contains(s.trustBinaries(c, "--list"), "No refused binaries", "confirmed rows must leave the list")
+	s.Require().Contains(s.trustBinaries(c, "list"), "No refused binaries", "confirmed rows must leave the list")
 
 	s.restartUnconfirmed(c, config, nil)
 	s.Require().NotContainsf(s.readDaemonLog(c), unconfirmed, "the confirmation did not persist across a restart")

@@ -23,7 +23,7 @@ import (
 // maxConfigBytes bounds a PUT body.
 const maxConfigBytes = 4 << 20
 
-// configEditor applies `edit-protected --edit-config`: write daemon.conf in place, run the
+// configEditor applies `edit-protected config`: write daemon.conf in place, run the
 // in-process reload, and on a failed reload put the previous bytes back, so the file keeps
 // describing the configuration that is still running.
 type configEditor struct {
@@ -50,7 +50,7 @@ func (e *configEditor) apply(base, next []byte) error {
 	if err := swapFile(e.path, base, next); err != nil {
 		return err
 	}
-	log.Warnf("daemon: control: %s replaced via edit-protected --edit-config — reloading", e.path)
+	log.Warnf("daemon: control: %s replaced via edit-protected config — reloading", e.path)
 	if _, err := e.reload(); err != nil {
 		if rerr := swapFile(e.path, next, base); rerr != nil {
 			log.Errorf("daemon: control: restoring %s after a failed reload: %v", e.path, rerr)

@@ -543,7 +543,7 @@ func TestApplyKeepsConfirmedLedgerVerdict(t *testing.T) {
 	if ledger.rows["/usr/bin/git"] != confirmed {
 		t.Fatal("a recording must never re-confirm a line the ledger holds for other content")
 	}
-	if !slices.ContainsFunc(out.Notes, func(n string) bool { return strings.Contains(n, "trust-binaries") }) {
+	if !slices.ContainsFunc(out.Notes, func(n string) bool { return strings.Contains(n, "trust") }) {
 		t.Fatalf("notes = %v", out.Notes)
 	}
 }

@@ -70,55 +70,21 @@ var yesFlag bool
 var channelFlag string
 
 func init() {
-	UpdateCmd.Flags().BoolVar(&yesFlag, "yes", false,
-		"update without the changelog viewer and confirmation prompts (a changed daemon unit is accepted, its diff logged)")
-	UpdateCmd.Flags().StringVar(&channelFlag, "channel", channelStable,
-		"release channel to track: stable or pre-release")
+	UpdateCmd.Flags().BoolVarP(&yesFlag, "yes", "y", false,
+		"Don't show the changelog or ask (scripts; a changed daemon unit is accepted, its diff logged)")
+	UpdateCmd.Flags().StringVar(&channelFlag, "channel", channelStable, "Release channel: stable or pre-release")
 }
 
 var UpdateCmd = &cobra.Command{
 	Use:   "update",
-	Short: "Self-update from the latest GitHub release of the selected channel",
-	Long: `Root-only self-updater for the daemon mode.
-
-The command checks the latest release of the selected --channel (stable
-or pre-release, default stable), compares it with the version embedded
-in the installed binary at /usr/local/sbin/app-listener, and when a
-newer one exists:
-
-  1. downloads this architecture's release binary (linux/amd64 or
-     linux/arm64) and its sha256 checksum
-  2. verifies the Ed25519 signature of the checksum against the public key
-     compiled into this binary (certificates/app-listener-release.pub),
-     then the checksum against the downloaded binary, and the
-     GitHub-provided asset digest when present — a failed verification
-     aborts the update
-  3. shows the changelog in a TUI viewer, covering every release of the
-     channel between the installed version and the new one, and asks for
-     confirmation before anything is changed
-  4. compares the daemon's systemd unit the new release ships with the
-     installed one and, when they differ, shows the diff and asks whether
-     to replace it with the shipped unit as is (local edits, e.g.
-     install --allow-metadata-output or --pprof, are not carried over)
-  5. replaces the installed binary atomically (and the unit, if accepted)
-  6. restarts the systemd daemon (it is stopped first so the watch
-     directories are verified locked again before the new binary starts)
-  7. when the desktop build is installed (/usr/local/sbin/app-listener-gui,
-     deployed by the GUI's installer), replaces it with the release's,
-     downloaded and verified with the binary in steps 1-2; a release
-     without one leaves it in place with a warning. When the daemon is
-     already up to date, an installed desktop build of another version is
-     brought to the daemon's release
-
-The stable channel tracks non-pre-release releases (vX.Y.Z tags); the
-pre-release channel tracks the pre-YYYYMMDD-<sha> builds produced by the
-release workflow.
-
-When stdin is not a terminal the command aborts without updating; use
---yes to update without the viewer and the prompts (for scripts and
-cron jobs; a changed daemon unit is then accepted and its diff logged).
-The repository is fixed: only releases of the signing
-repository are accepted.`,
+	Short: "Update the installed binaries to the latest signed release",
+	Long: `Update /usr/local/sbin/app-listener (and app-listener-gui, when installed) to the
+latest release of --channel. The download is checked against the release's
+Ed25519 signature first; the changelog and a changed daemon unit are shown and
+asked before anything changes, then the daemon is restarted. Without a
+terminal it refuses unless --yes.`,
+	Example: `  sudo app-listener update
+  sudo app-listener update --channel pre-release`,
 	Args: cobra.NoArgs,
 	RunE: runUpdate,
 }

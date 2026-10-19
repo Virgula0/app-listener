@@ -33,7 +33,7 @@ func runLiveEdit() error {
 		return err
 	}
 	defer session.End()
-	session.timeout = timeoutSession
+	session.timeout = idleTimeout
 
 	resources, err := session.Authenticate(password)
 	if err != nil {
@@ -53,9 +53,9 @@ func runLiveEdit() error {
 	}
 
 	log.Infof("editing %s LIVE — the daemon keeps guarding it; write access is granted only for this session "+
-		"and revoked after %s without input", chosen, timeoutSession)
+		"and revoked after %s without input", chosen, idleTimeout)
 	_, ended := session.Watch()
-	byDaemon, err := tui.RunFileEditorSession(chosen, session.Pinger(pingInterval(timeoutSession)), ended)
+	byDaemon, err := tui.RunFileEditorSession(chosen, session.Pinger(pingInterval(idleTimeout)), ended)
 	if err != nil {
 		return fmt.Errorf("edit %s: %w", chosen, err)
 	}
@@ -72,11 +72,11 @@ func runLiveEdit() error {
 // chooseResource honors --resource when given (validating it against the
 // daemon's list), otherwise prompts.
 func chooseResource(resources []string) (string, error) {
-	if len(resourceFlags) > 0 {
-		if slices.Contains(resources, resourceFlags[0]) {
-			return resourceFlags[0], nil
+	if resourceFlag != "" {
+		if slices.Contains(resources, resourceFlag) {
+			return resourceFlag, nil
 		}
-		return "", fmt.Errorf("%s is not a guarded directory in the running daemon", resourceFlags[0])
+		return "", fmt.Errorf("%s is not a guarded directory in the running daemon", resourceFlag)
 	}
 	if len(resources) == 1 {
 		log.Infof("only one guarded directory: %s", resources[0])
@@ -99,26 +99,22 @@ func chooseResource(resources []string) (string, error) {
 	return chosen, nil
 }
 
-// runNonInteractiveLivePut performs one authenticated live write without any
-// TUI: content from --content-file or stdin, password from the environment.
-func runNonInteractiveLivePut() error {
-	if len(resourceFlags) == 0 {
-		return errors.New("--put requires --resource")
-	}
-	resource := resourceFlags[0]
+// runPut performs one authenticated live write without any TUI: content from --from or stdin,
+// password from the environment.
+func runPut(dest string) error {
+	resource := resourceFlag
 	password := os.Getenv(editPasswordEnv)
 	if password == "" {
-		return fmt.Errorf("$%s is empty — set it to the edit-protected password for non-interactive --put", editPasswordEnv)
+		return fmt.Errorf("$%s is empty — set it to the edit-protected password for edit-protected put", editPasswordEnv)
 	}
 
-	dest := putFlag
 	if !filepath.IsAbs(dest) {
 		dest = filepath.Join(resource, dest)
 	}
 	// Lexical containment is only a first gate; writeWithin re-checks every component with
 	// O_NOFOLLOW so a symlink in the tree can't redirect the write outside the guarded resource.
 	if !within(resource, dest) {
-		return fmt.Errorf("--put target %s is outside the resource %s", dest, resource)
+		return fmt.Errorf("put target %s is outside the resource %s", dest, resource)
 	}
 	content, err := readPutContent()
 	if err != nil {
@@ -130,7 +126,7 @@ func runNonInteractiveLivePut() error {
 		return err
 	}
 	defer session.End()
-	session.timeout = timeoutSession
+	session.timeout = idleTimeout
 
 	resources, err := session.Authenticate(password)
 	if err != nil {
@@ -155,12 +151,12 @@ func runNonInteractiveLivePut() error {
 }
 
 func readPutContent() ([]byte, error) {
-	if contentFileFlag != "" {
-		return os.ReadFile(contentFileFlag)
+	if fromFlag != "" {
+		return os.ReadFile(fromFlag)
 	}
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		return nil, fmt.Errorf("reading --put content from stdin: %w", err)
+		return nil, fmt.Errorf("reading the put content from stdin: %w", err)
 	}
 	return data, nil
 }

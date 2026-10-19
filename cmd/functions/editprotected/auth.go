@@ -43,7 +43,7 @@ const (
 )
 
 // Origin records how the password was set: by the installer or by `edit-protected
-// --set-password`. Informational only.
+// password`. Informational only.
 type Origin string
 
 const (
@@ -287,7 +287,7 @@ func MigrateLegacyHash() error {
 		return fmt.Errorf("%w: %s removed, the password in %s stays", importErr, legacyHashPath, ledgerPath)
 	}
 	return fmt.Errorf("%w: %s removed and no edit-protected password is set: stop the daemon and "+
-		"run `app-listener edit-protected --set-password`", importErr, legacyHashPath)
+		"run `app-listener edit-protected password`", importErr, legacyHashPath)
 }
 
 func importLegacyHash() error {

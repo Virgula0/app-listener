@@ -105,3 +105,58 @@ func showErrorDialog(err error, win fyne.Window) {
 func showForm(title, confirm, dismiss string, items []*widget.FormItem, callback func(bool), win fyne.Window) {
 	showDialog(dialog.NewForm(title, confirm, dismiss, items, callback, win), win)
 }
+
+// handCursor is the pointing hand over an enabled control, the arrow over a disabled one.
+func handCursor(disabled bool) desktop.Cursor {
+	if disabled {
+		return desktop.DefaultCursor
+	}
+	return desktop.PointerCursor
+}
+
+// handCheck, handRadioGroup, handCheckGroup and handSelect are fyne's widgets with the pointing
+// hand, which fyne gives only to buttons and links. Every control the GUI builds uses them.
+type handCheck struct{ widget.Check }
+
+func newCheck(label string, changed func(bool)) *handCheck {
+	c := &handCheck{}
+	c.Text, c.OnChanged = label, changed
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *handCheck) Cursor() desktop.Cursor { return handCursor(c.Disabled()) }
+
+type handRadioGroup struct{ widget.RadioGroup }
+
+func newRadioGroup(options []string, changed func(string)) *handRadioGroup {
+	r := &handRadioGroup{}
+	r.Options, r.OnChanged = options, changed
+	r.ExtendBaseWidget(r)
+	return r
+}
+
+func (r *handRadioGroup) Cursor() desktop.Cursor { return handCursor(r.Disabled()) }
+
+type handCheckGroup struct{ widget.CheckGroup }
+
+func newCheckGroup(options []string, changed func([]string)) *handCheckGroup {
+	g := &handCheckGroup{}
+	g.Options, g.OnChanged = options, changed
+	g.ExtendBaseWidget(g)
+	return g
+}
+
+func (g *handCheckGroup) Cursor() desktop.Cursor { return handCursor(g.Disabled()) }
+
+type handSelect struct{ widget.Select }
+
+func newSelect(options []string, changed func(string)) *handSelect {
+	s := &handSelect{}
+	s.Options, s.OnChanged = options, changed
+	s.PlaceHolder = "(Select one)"
+	s.ExtendBaseWidget(s)
+	return s
+}
+
+func (s *handSelect) Cursor() desktop.Cursor { return handCursor(s.Disabled()) }

@@ -29,13 +29,25 @@ type ServeConfig struct {
 	Password string
 }
 
+// FileEventList and NetEventList name the -e values in help texts.
+const (
+	FileEventList = "OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD"
+	NetEventList  = "CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN"
+)
+
 // AddServeFlags adds the browser TUI flags to commands that expose a TUI.
 func AddServeFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
-	flags.String("serve", "", "Serve the TUI in a browser at host:port (default when omitted: 127.0.0.1:9999)")
+	flags.String("serve", "", "Also mirror the TUI read-only to a browser at host:port (bare --serve: "+
+		defaultServeAddress+"; needs --user and --password)")
 	flags.Lookup("serve").NoOptDefVal = defaultServeAddress
-	flags.String("user", "", "HTTP Basic Auth username (requires --serve and --password)")
-	flags.String("password", "", "HTTP Basic Auth password (requires --serve and --user)")
+	flags.String("user", "", "HTTP Basic Auth username for --serve")
+	flags.String("password", "", "HTTP Basic Auth password for --serve")
+}
+
+// AddHeadlessFlag adds --headless, which the root's --verbose check reads by name.
+func AddHeadlessFlag(cmd *cobra.Command, v *bool) {
+	cmd.Flags().BoolVar(v, "headless", false, "Print events to stderr instead of the TUI (scripts, services)")
 }
 
 // ParseServeFlags validates flags shared by the five monitoring and guarding modes.
@@ -76,11 +88,8 @@ func validateEnabledServe(cmd *cobra.Command, config ServeConfig) error {
 	if requestedBoolFlag(cmd, "headless") {
 		return errors.New("--serve and --headless are mutually exclusive")
 	}
-	if requestedBoolFlag(cmd, "gui") {
-		return errors.New("--serve and --gui are mutually exclusive")
-	}
-	if requestedBoolFlag(cmd, "genkey") {
-		return errors.New("--serve is not available with --genkey")
+	if requestedBoolFlag(cmd, "genkey") || requestedBoolFlag(cmd, "check") || requestedBoolFlag(cmd, "lockdown") {
+		return errors.New("--serve only applies when the daemon runs")
 	}
 	if requestedBoolFlag(cmd, "blocked-only") {
 		return errors.New("--blocked-only is only available with --headless")
@@ -265,7 +274,7 @@ func CheckEBPF() error {
 }
 
 // CheckBPFLSM verifies the active LSM stack includes BPF LSM. Required by every LSM-hook mode
-// (guard, network-guard, daemon); kprobe-based monitor and network-monitor must not call it.
+// (guard, network guard, daemon); kprobe-based monitor and network monitor must not call it.
 func CheckBPFLSM() error {
 	if err := ebpf.CheckBPFLSM(); err != nil {
 		log.Errorf("BPF LSM check failed: %v", err)

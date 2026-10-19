@@ -38,7 +38,7 @@ func startBackend() (backendLink, error) {
 	return c, nil
 }
 
-// sessionTimeouts are the live idle timeouts offered (`--timeout-session`).
+// sessionTimeouts are the live idle timeouts offered (`--idle-timeout`).
 var sessionTimeouts = []struct {
 	label string
 	d     time.Duration
@@ -68,13 +68,13 @@ type protectedPage struct {
 	probErr error
 
 	modeT, pwT, daemonT *statusTile
-	timeout             *widget.Select
+	timeout             *handSelect
 	actions             []*handButton
 	pwBox               *fyne.Container
-	// editNote/editBox: why an offline edit is refused (a daemon runs without its control socket).
-	editNote *widget.Label
-	editBox  *fyne.Container
-	editBtn  *handButton
+	// edit is the Edit card's gate: an offline edit is refused while a daemon runs without its control
+	// socket. live are the cards that need the live daemon.
+	edit actionGate
+	live []*actionGate
 }
 
 func newProtectedPage(s *shell) *protectedPage { return &protectedPage{s: s} }
@@ -87,26 +87,25 @@ func (p *protectedPage) view() fyne.CanvasObject {
 	for i, t := range sessionTimeouts {
 		labels[i] = t.label
 	}
-	p.timeout = widget.NewSelect(labels, nil)
+	p.timeout = newSelect(labels, nil)
 	p.timeout.Selected = "30 minutes"
 	p.pwBox = container.NewVBox()
-	p.editNote = warnText()
 
 	cards := newAdaptiveGrid(2,
-		p.actionCard("lock-simple-open", theme.ColorNamePrimary, "Edit protected files",
+		p.actionCard(&p.edit, "lock-simple-open", theme.ColorNamePrimary, "Edit protected files",
 			"Open one guarded directory in a two-pane editor. Live: the daemon grants write access to that "+
 				"directory for this session only. Offline (daemon stopped): it is unlocked with the master key "+
-				"and locked again when you close the editor.", p.startEdit, p.editNote),
-		p.actionCard("arrows-left-right", colorInfo, "Temporary access",
+				"and locked again when you close the editor.", p.startEdit),
+		p.actionCard(p.liveGate(), "arrows-left-right", colorInfo, "Temporary access",
 			"Let other binaries reach guarded directories (admit) or deny whitelisted ones, until you stop it. "+
-				"Live mode only.", p.startForward, nil),
-		p.actionCard("sliders-horizontal", colorInfo, "Daemon configuration",
+				"Live mode only.", p.startForward),
+		p.actionCard(p.liveGate(), "sliders-horizontal", colorInfo, "Daemon configuration",
 			"Edit the running daemon's daemon.conf: you review the diff, then the daemon writes and reloads it. "+
-				"A configuration that fails to reload is not kept. Live mode only.", p.startConfig, nil),
-		p.actionCard("circle-fill", theme.ColorNameError, "Record access",
+				"A configuration that fails to reload is not kept. Live mode only.", p.startConfig),
+		p.actionCard(p.liveGate(), "circle-fill", theme.ColorNameError, "Record access",
 			"Guard new paths by learning who uses them: record every access while you use your applications, "+
 				"approve the binaries and libraries, optionally encrypt, and the daemon adds the sections and "+
-				"reloads. Live mode only.", p.startRecord, nil),
+				"reloads. Live mode only.", p.startRecord),
 	)
 	timeoutCard := newPanel(container.NewVBox(
 		hfill(boldLabel("Live session idle timeout"), p.timeout),
@@ -131,21 +130,25 @@ func (p *protectedPage) view() fyne.CanvasObject {
 	return p.stack
 }
 
-// actionCard builds a workflow card; note (nil = none) is its refusal hint, set by renderEditGate.
-func (p *protectedPage) actionCard(iconName string, c fyne.ThemeColorName, title, desc string, run func(),
-	note *widget.Label) fyne.CanvasObject {
+// liveGate adds a gate for a card that needs the live daemon.
+func (p *protectedPage) liveGate() *actionGate {
+	g := &actionGate{}
+	p.live = append(p.live, g)
+	return g
+}
+
+// actionCard builds a workflow card into gate, whose note renderEditGate sets.
+func (p *protectedPage) actionCard(gate *actionGate, iconName string, c fyne.ThemeColorName, title, desc string,
+	run func()) fyne.CanvasObject {
 	open := newButton("Start", icon("caret-right"), run)
 	open.IconPlacement = widget.ButtonIconTrailingText
 	open.Importance = widget.LowImportance
 	p.actions = append(p.actions, open)
-	box := container.NewVBox(newIconTile(iconName, c, 48),
-		widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), mutedText(desc))
-	if note != nil {
-		box.Add(note)
-		p.editBox, p.editBtn = box, open
-	}
-	box.Add(container.NewHBox(open))
-	return newPanel(box)
+	gate.btn, gate.note = open, warnText()
+	gate.box = container.NewVBox(newIconTile(iconName, c, 48),
+		widget.NewLabelWithStyle(title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), mutedText(desc),
+		gate.note, container.NewHBox(open))
+	return newPanel(gate.box)
 }
 
 // offlineRefused: the offline flow applies but a daemon runs, which the backend refuses.
@@ -153,19 +156,26 @@ func (p *protectedPage) offlineRefused() bool {
 	return p.probErr == nil && p.hello != nil && !p.hello.Live && p.pw != nil && p.pw.DaemonRunning
 }
 
-// renderEditGate disables Edit while only the refused offline flow is left.
+// renderEditGate disables Edit while only the refused offline flow is left, and the live-only cards
+// unless the daemon is live.
 func (p *protectedPage) renderEditGate() {
 	note := ""
 	if p.offlineRefused() {
 		note = daemonStopNote(true, false) + " Or give it a password and restart it to edit live."
 	}
-	setWarn(p.editNote, note)
-	if note == "" {
-		p.editBtn.Enable()
-	} else {
-		p.editBtn.Disable()
+	p.edit.set(note)
+	note = ""
+	switch {
+	case p.probErr != nil:
+		note = "Unavailable: see Edit mode above."
+	case p.hello == nil:
+		note = "Checking the daemon…"
+	case !p.hello.Live:
+		note = "Needs the daemon running with a password: start it on the Daemon page."
 	}
-	p.editBox.Refresh()
+	for _, g := range p.live {
+		g.set(note)
+	}
 }
 
 // show swaps the page body; session views get the overview's right inset (clear of the scroll bar).
@@ -266,7 +276,7 @@ func (p *protectedPage) begin(then func(link backendLink)) {
 		return
 	}
 	if p.s.running() {
-		showInformation("A run is in progress", "Wait for the installer or updater run to finish.", p.s.win)
+		showInformation("A run is in progress", "Wait for the running installer, updater or daemon run to finish.", p.s.win)
 		return
 	}
 	if active := p.s.activeGuards(); len(active) > 0 {
@@ -352,7 +362,7 @@ func (p *protectedPage) pickOne(title, question string, resources []string, ok f
 		ok(resources[0])
 		return
 	}
-	radio := widget.NewRadioGroup(resources, nil)
+	radio := newRadioGroup(resources, nil)
 	radio.Required = true
 	radio.SetSelected(resources[0])
 	d := dialog.NewCustomConfirm(title, "Open", "Cancel", scrollable(promptBody(question, "", radio)),
@@ -368,10 +378,10 @@ func (p *protectedPage) pickOne(title, question string, resources []string, ok f
 
 // pickMany asks which resources a forward grant covers.
 func (p *protectedPage) pickMany(title string, resources []string, ok func([]string)) {
-	checks := make([]*widget.Check, len(resources))
+	checks := make([]*handCheck, len(resources))
 	list := container.NewVBox()
 	for i, r := range resources {
-		checks[i] = widget.NewCheck(r, nil)
+		checks[i] = newCheck(r, nil)
 		list.Add(checks[i])
 	}
 	if len(checks) == 1 {

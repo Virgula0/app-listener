@@ -506,7 +506,7 @@ var (
 func (s *IntegrationSuite) startMonitorStd(c testcontainers.Container, watchDir string, extraFlags ...string) {
 	flags := strings.Join(extraFlags, " ")
 	monitorLogPath = fmt.Sprintf("/tmp/monitor-%d.log", time.Now().UnixNano())
-	cmd := fmt.Sprintf("nohup /app-listener monitor -w %s --headless %s > %s 2>&1 &", watchDir, flags, monitorLogPath)
+	cmd := fmt.Sprintf("nohup /app-listener monitor %s --headless %s > %s 2>&1 &", watchDir, flags, monitorLogPath)
 	monitorPID = s.capturePID(c, cmd)
 
 	_, ok := s.waitForMonitorStd(c, "monitor started", 15*time.Second)

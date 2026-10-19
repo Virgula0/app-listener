@@ -25,19 +25,11 @@ var (
 )
 
 var NetworkMonitorCmd = &cobra.Command{
-	Use:   "network-monitor <binary1> [binary2 ...]",
-	Short: "Monitor network operations of specific binaries using eBPF",
-	Long: `Monitor network operations (TCP, UDP, ICMP, DNS, etc.) of one or more
-binary executables using eBPF tracepoints.
-
-Positional arguments are paths to binary executables to watch.
-Only network events originating from those binaries are shown.
-
-Examples:
-  app-listener network-monitor /usr/bin/bash
-  app-listener network-monitor /usr/bin/curl /usr/bin/wget
-  app-listener network-monitor /usr/bin/tcpdump --headless
-  app-listener network-monitor /usr/sbin/nginx -e CONNECT,ACCEPT,DNS`,
+	Use:   "monitor BINARY...",
+	Short: "Show the network operations of binaries (observe only)",
+	Long:  `Show the network operations (TCP, UDP, DNS, ...) of the listed binaries.`,
+	Example: `  sudo app-listener network monitor /usr/bin/curl /usr/bin/wget
+  sudo app-listener network monitor /usr/sbin/nginx -e CONNECT,ACCEPT,DNS`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runNetworkMonitor,
 }
@@ -45,9 +37,8 @@ Examples:
 func init() {
 	common.AddServeFlags(NetworkMonitorCmd)
 	NetworkMonitorCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
-		"Event types to monitor (comma-separated: CONNECT,ACCEPT,SEND,RECV,CLOSE,DNS,BIND,LISTEN; default: all)")
-	NetworkMonitorCmd.Flags().BoolVarP(&headless, "headless", "", false,
-		"Run without TUI, print events to stderr (for testing/scripting)")
+		"Event types to show: "+common.NetEventList+" (default all)")
+	common.AddHeadlessFlag(NetworkMonitorCmd, &headless)
 }
 
 func runNetworkMonitor(cmd *cobra.Command, args []string) error {

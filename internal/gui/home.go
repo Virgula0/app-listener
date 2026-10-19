@@ -100,7 +100,7 @@ func (h *homePage) windowCard() fyne.CanvasObject {
 	if s.wm.Tiling() {
 		detail = "Detected " + s.wm.Kind.String() + ". Unchecking it tiles the window again."
 	}
-	float := widget.NewCheck("Open as a floating window on tiling window managers", func(on bool) {
+	float := newCheck("Open as a floating window on tiling window managers", func(on bool) {
 		s.app.Preferences().SetBool(prefFloatTiling, on)
 		s.setFloating(on)
 	})
@@ -141,6 +141,6 @@ func (h *homePage) applyStatus(st sysStatus) {
 	if st.daemon {
 		h.daemon.set(true, "running", "The protection daemon is enforcing its configuration.", theme.ColorNameSuccess)
 	} else {
-		h.daemon.set(true, "stopped", "No daemon is running. Use Install to set one up.", theme.ColorNameWarning)
+		h.daemon.set(true, "stopped", "No daemon is running: start it on the Daemon page, or set one up with Install.", theme.ColorNameWarning)
 	}
 }

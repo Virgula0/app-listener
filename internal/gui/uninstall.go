@@ -18,7 +18,7 @@ import (
 // uninstallCard is the Install page's `uninstall` entry. It runs on the page's run view, so it
 // excludes installer and updater runs like they exclude each other.
 type uninstallCard struct {
-	keepGUI, deleteKey *widget.Check
+	keepGUI, deleteKey *handCheck
 	btn                *handButton
 	note               *widget.Label
 	box                *fyne.Container
@@ -26,8 +26,8 @@ type uninstallCard struct {
 
 func (p *installPage) uninstallCard() fyne.CanvasObject {
 	u := &p.uninst
-	u.keepGUI = widget.NewCheck("Keep the desktop build (app-listener-gui)", nil)
-	u.deleteKey = widget.NewCheck("Also delete the fscrypt master key", nil)
+	u.keepGUI = newCheck("Keep the desktop build (app-listener-gui)", nil)
+	u.deleteKey = newCheck("Also delete the fscrypt master key", nil)
 	u.btn = newButton("Uninstall", icon("trash"), p.confirmUninstall)
 	u.btn.Importance = widget.DangerImportance
 	u.note = warnText()
@@ -57,8 +57,8 @@ const outsideSystemdNote = "A daemon process runs outside systemd: stop it first
 func daemonStopNote(unit, proc bool) string {
 	switch {
 	case unit:
-		return "The daemon is running: stop it first (sudo systemctl stop " + systemd.DaemonServiceName +
-			"). Stopping it locks its folders again."
+		return "The daemon is running: stop it first on the Daemon page (or sudo systemctl stop " +
+			systemd.DaemonServiceName + "). Stopping it locks its folders again."
 	case proc:
 		return outsideSystemdNote
 	}

@@ -11,7 +11,7 @@ import (
 )
 
 // socketStore is recorder.Store over the control socket: one authenticated connection per call,
-// as --edit-config makes them.
+// as `config` makes them.
 type socketStore struct{ password string }
 
 func (s socketStore) Fetch() ([]byte, error) { return fetchConfig(s.password) }
@@ -33,7 +33,7 @@ func (s socketStore) Guarded() ([]string, error) {
 	return session.Authenticate(s.password)
 }
 
-// recordFlow is `--edit-config --record` shared by the TUI and the GUI backend. Nothing touches a
+// recordFlow is `config record` shared by the TUI and the GUI backend. Nothing touches a
 // caller-named path before newRecordFlow has authenticated: this binary keeps a root READ baseline
 // on every guarded tree.
 type recordFlow struct {
@@ -95,7 +95,7 @@ func (f *recordFlow) encryptBlockers() map[string]string {
 	out := map[string]string{}
 	for _, t := range f.targets {
 		if t.Existing != nil {
-			out[t.Path] = "it is already in daemon.conf: change its need_encryption with --edit-config"
+			out[t.Path] = "it is already in daemon.conf: change its need_encryption with edit-protected config"
 			continue
 		}
 		out[t.Path] = encryptBlocker(vault, t.Path)

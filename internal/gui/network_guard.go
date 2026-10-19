@@ -22,18 +22,18 @@ var netModeHelp = map[workbench.GuardMode]string{
 	workbench.GuardBlacklist: "The executables below are cut off the network. Every other program is allowed.",
 }
 
-// netGuardTab edits the network guard: network-guard's -w/-b, --auto-infra, --unsafe,
+// netGuardTab edits the network guard: `network guard`'s -w/-b, --auto-infra, --unsafe,
 // --no-throttle and -e.
 type netGuardTab struct {
 	p    *networkPage
 	root fyne.CanvasObject
 	ed   *policyEditor
 
-	autoInfra *widget.Check
-	unsafe    *widget.Check
-	throttle  *widget.Check
+	autoInfra *handCheck
+	unsafe    *handCheck
+	throttle  *handCheck
 	events    []ebpf.NetEventType
-	eventsBox *widget.CheckGroup
+	eventsBox *handCheckGroup
 }
 
 func newNetGuardTab(p *networkPage) *netGuardTab {
@@ -46,9 +46,9 @@ func newNetGuardTab(p *networkPage) *netGuardTab {
 		revert:  g.refresh,
 	})
 	onCheck := func(bool) { g.ed.changed() }
-	g.autoInfra = widget.NewCheck("Keep network daemons online", onCheck)
-	g.unsafe = widget.NewCheck("Block local sockets too", onCheck)
-	g.throttle = widget.NewCheck("Rate-limit events", onCheck)
+	g.autoInfra = newCheck("Keep network daemons online", onCheck)
+	g.unsafe = newCheck("Block local sockets too", onCheck)
+	g.throttle = newCheck("Rate-limit events", onCheck)
 	g.eventsBox = newNetEventChecks(nil, func(t []ebpf.NetEventType) { g.events = t; g.ed.changed() })
 	g.eventsBox.Horizontal = false
 	opts := newPanel(container.NewVBox(boldLabel("Options"),
@@ -77,7 +77,7 @@ func (g *netGuardTab) draft() workbench.NetPolicy {
 }
 
 // syncOptions enables the whitelist-only options for a whitelist draft and clears them otherwise,
-// as network-guard refuses them with -b.
+// as `network guard` refuses them with -b.
 func (g *netGuardTab) syncOptions() {
 	if g.autoInfra == nil {
 		return // still being built

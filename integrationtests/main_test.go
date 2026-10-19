@@ -44,7 +44,7 @@ var hostInfraBindPaths = []string{
 }
 
 // infraContainerPaths returns the container-side path for each bind-mounted
-// host infra binary, used to build the network-guard allowlist/blocklist flag.
+// host infra binary, used to build the network guard allowlist/blocklist flag.
 func infraContainerPaths() []string {
 	out := make([]string, 0, len(hostInfraBindPaths))
 	for _, p := range hostInfraBindPaths {

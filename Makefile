@@ -108,7 +108,7 @@ build-image:
 	docker build -t $(BUILD_IMAGE) -f docker/builder.Dockerfile .
 .PHONY: build-image
 
-# GUI=1 links the fyne desktop window opened by `--gui` (~20 MiB larger
+# GUI=1 builds the fyne desktop window instead (app-listener-gui; ~20 MiB larger
 # binary, X11/OpenGL deps). Off by default: the daemon and the other
 # subcommands share this binary and must not carry a GUI toolkit.
 GUI ?=
@@ -229,11 +229,11 @@ run-guard:
 .PHONY: run-guard
 
 run-networkmonitor:
-	CGO_ENABLED=1 go run ./... network-monitor $(ARGS)
+	CGO_ENABLED=1 go run ./... network monitor $(ARGS)
 .PHONY: run-networkmonitor
 
 run-networkguard:
-	CGO_ENABLED=1 go run ./... network-guard $(ARGS)
+	CGO_ENABLED=1 go run ./... network guard $(ARGS)
 .PHONY: run-networkguard
 
 lint:

@@ -65,7 +65,7 @@ type DaemonUseCase interface {
 	// revoke restores the read-only baseline; idempotent.
 	GrantEditAccess(resourcePath string) (revoke func() error, err error)
 	// GrantTemporaryAccess applies rule to binaryPaths on every listed resource for an
-	// authenticated `edit-protected --forward` session; shares GrantEditAccess's one-at-a-time slot.
+	// authenticated `edit-protected forward` session; shares GrantEditAccess's one-at-a-time slot.
 	// journal is called with the allow rows before any write, and with nil once they are revoked.
 	GrantTemporaryAccess(resourcePaths, binaryPaths []string, rule guard.TempRule,
 		journal func([]guard.GuardResInodeKey) error) (*TemporaryAccess, error)

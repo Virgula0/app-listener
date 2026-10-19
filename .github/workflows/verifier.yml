@@ -1,7 +1,7 @@
 name: Verifier gate
 
 # Loads every guard eBPF program into the runner kernel's verifier (tools/bpfstats, then the
-# binary's own `daemon --check`) and fails on any rejection, an over-budget program included
+# binary's own `daemon check`) and fails on any rejection, an over-budget program included
 # (E2BIG). The PR base's objects are built with the same pinned clang and measured alongside, so
 # the summary shows each program's change in verifier cost.
 #
@@ -118,6 +118,6 @@ jobs:
           sudo sh -c 'cat /tmp/bpfstats-*.log 2>/dev/null' || true
           exit "$status"
 
-      - name: daemon --check (verifier only)
+      - name: daemon check (verifier only)
         working-directory: head
-        run: sudo ./build/linux/app-listener daemon --check --verifier-only
+        run: sudo ./build/linux/app-listener daemon check --verifier-only

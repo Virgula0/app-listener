@@ -59,8 +59,8 @@ attaches at the level that fits its job:
 | Level | Modes | What it gives |
 |---|---|---|
 | **kprobes** | `monitor` | Observes all I/O regardless of the syscall path (io_uring, splice, sendfile, mmap) plus metadata ops (chmod, truncate, stat, access, readlink, mknod). |
-| **LSM hooks** | `guard`, `network-guard`, `daemon` | The only kernel mechanism that can **deny**. About 30 hooks cover open, read/write, mmap, unlink/rename/symlink/link/mkdir/rmdir/mknod, attributes, stat/access/readlink, mount, btrfs copy ioctls, ptrace and exec. |
-| **tracepoints / kretprobes** | `network-monitor` | TCP, UDP and DNS operations. |
+| **LSM hooks** | `guard`, `network guard`, `daemon` | The only kernel mechanism that can **deny**. About 30 hooks cover open, read/write, mmap, unlink/rename/symlink/link/mkdir/rmdir/mknod, attributes, stat/access/readlink, mount, btrfs copy ioctls, ptrace and exec. |
+| **tracepoints / kretprobes** | `network monitor` | TCP, UDP and DNS operations. |
 
 Because enforcement happens in the kernel, it applies to every way of reaching a file: a plain
 `open`, io_uring, `open_by_handle_at`, `copy_file_range`, raw block devices, hard links, renames
@@ -105,10 +105,9 @@ Every mode has three presentations:
 - **TUI** (default). Quit with `q` or `Ctrl+C`.
 - **`--headless`**: no TUI, one line per event on stderr, with a stable prefix per mode that
   scripts and the integration tests parse: `EVENT|` (monitor), `GUARD|` (guard), `NETEVENT|`
-  (network-monitor), `NETGUARD|` (network-guard), `DAEMON ...` (daemon; journald under systemd).
-- **`--gui`**: the desktop window, in builds made with `make build GUI=1`, opened by
-  `app-listener --gui` without a subcommand (with one, the subcommand runs and `--gui` is
-  ignored); see [Desktop GUI](gui.md).
+  (network monitor), `NETGUARD|` (network guard), `DAEMON ...` (daemon; journald under systemd).
+- **The desktop window**: the separate `app-listener-gui` build (`make build GUI=1`), started
+  with `sudo app-listener-gui`; see [Desktop GUI](gui.md).
 
 ### Global flags
 
@@ -116,7 +115,9 @@ Every mode has three presentations:
 |---|---|
 | `-v, --verbose <0..4>` | Verbosity of the headless stream and `--dump-log`: `0` errors only, `1` essential, `2` current display, `3` plus internal details, `4` everything. Requires `--headless`. |
 | `--dump-log <file>` | Mirror every log line into this file as plain text (asks before overwriting). |
-| `--gui` | Open the [desktop GUI](gui.md) when given without a subcommand; every other flag is ignored (`-tags gui` build). With a subcommand, `--gui` is ignored. |
+
+A flag that became a subcommand (`edit-protected --forward`, `install --binary-only`, ...) is
+refused with the command to use instead.
 
 ## Watching from a browser: `--serve`
 
@@ -124,11 +125,11 @@ Any mode can mirror its TUI into a browser:
 
 ```bash
 sudo app-listener guard /secret -w /usr/bin/cat --serve                 # 127.0.0.1:9999
-sudo app-listener monitor -w /tmp --serve=0.0.0.0:8080 --user me --password s3cret
+sudo app-listener monitor /tmp --serve=0.0.0.0:8080 --user me --password s3cret
 ```
 
 - The local TUI keeps running; the same event stream is shared **read-only** over WebSockets.
 - Binds to loopback (`127.0.0.1:9999`) unless you give an address.
-- `--user` and `--password` add HTTP Basic Auth and must be given together.
+- `--user` and `--password` (HTTP Basic Auth) are required, and must not be empty.
 - No TLS. Put a reverse proxy in front when binding off-loopback.
-- Mutually exclusive with `--headless`. `--gui` ignores it.
+- Mutually exclusive with `--headless`.

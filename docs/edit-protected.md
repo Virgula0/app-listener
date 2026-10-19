@@ -5,13 +5,25 @@ is the supported way to change a protected file, to give another program tempora
 change the daemon's own config.
 
 ```bash
-sudo app-listener edit-protected                        # live if the daemon runs, else offline
-sudo app-listener edit-protected --set-password         # change the password (asks the current one)
-sudo app-listener edit-protected --forward -w <bin> [-e EVENTS]   # temporary access for another binary
-sudo app-listener edit-protected --timeout-session 10m  # revoke a live session after 10 idle minutes
-sudo app-listener edit-protected --edit-config          # edit the running daemon.conf; saving reloads it
-sudo app-listener edit-protected --edit-config --record ~/work/secrets   # learn who uses a path, then guard it (or extend its section)
+sudo app-listener edit-protected                     # live if the daemon runs, else offline
+sudo app-listener edit-protected forward -w <bin>    # temporary access for another binary
+sudo app-listener edit-protected config              # edit the running daemon.conf; saving reloads it
+sudo app-listener edit-protected config record PATH  # learn who uses PATH, then guard it
+sudo app-listener edit-protected put FILE -r DIR     # write one file, no editor (scripts)
+sudo app-listener edit-protected password            # change the password
 ```
+
+| Command | Flags | Mode |
+|---|---|---|
+| `edit-protected` | `-r, --resource DIR` (skip the picker), `--idle-timeout` (default `30m`) | live or offline |
+| `edit-protected forward` | `-w BIN` or `-b BIN` (repeatable, one of them required), `-e EVENTS`, `-r, --resource DIR` (repeatable), `-y, --yes`, `--idle-timeout` | live |
+| `edit-protected config` | `--from FILE` (replace without the editor) | live |
+| `edit-protected config record PATH...` | | live |
+| `edit-protected put FILE` | `-r, --resource DIR` (required), `--from FILE` (default: stdin), `--idle-timeout` | live |
+| `edit-protected password` | | either |
+
+The live-only commands fail with the daemon stopped (or without a password configured): there is
+no control socket to talk to.
 
 It opens the directory in a two-pane editor, the file tree on the left. `Ctrl+S` saves
 atomically. Binaries, symlinks and files over 2 MiB are refused.
@@ -22,9 +34,9 @@ underlined. The open file stays in the editor while you browse the tree, and `Es
 A click selects a tree row and a second click opens it; a click in the editor places the cursor.
 
 The desktop window's Protected workspace offers the same actions; see [gui.md](gui.md#protected).
-It drives this binary through `edit-protected --backend`, a hidden mode that speaks JSON lines on
+It drives this binary through `edit-protected --backend`, a flag that speaks JSON lines on
 stdin/stdout. That mode is the window's channel, not for direct use: it refuses a terminal and any
-other flag, and asks the daemon for nothing the modes above can't.
+other flag, and asks the daemon for nothing the commands above can't.
 
 ## Offline and live mode
 
@@ -40,7 +52,7 @@ The mode is chosen automatically.
   4. you edit, and the grant is dropped.
 
 An unauthenticated caller learns **nothing** about which directories are protected. Grants are
-one at a time and are revoked on disconnect, on a SIGHUP reload, or after `--timeout-session`
+one at a time and are revoked on disconnect, on a SIGHUP reload, or after `--idle-timeout`
 (default `30m`, up to `24h`; e.g. `10m`, `45s`) without activity. Every editor keypress resets
 that timer. 5 wrong passwords lock every password check for a minute (see below).
 
@@ -54,38 +66,39 @@ journal like `fscrypt.key`: only the app-listener binary can read or write them.
 the database has no password yet) and removed. It is removed even when it can't be imported (a
 malformed record, an unreadable database), since nothing seals it: the daemon then logs a
 CRITICAL error, and with no password left you set one with the daemon stopped
-(`edit-protected --set-password`).
+(`edit-protected password`).
 
 With a password configured, the daemon opens `/run/app-listener-daemon.control` (`0600`). It
 accepts only root peers whose executable is the app-listener binary itself.
 
-`--set-password` changes the password; it can't be removed. It asks the current password first:
+`edit-protected password` changes the password; it can't be removed. It asks the current password first:
 with the daemon running, the daemon checks it (`AUTH`) and stores the new one itself; with the
 daemon stopped, it is checked locally. Every check, the daemon's and the local one, draws on the
 same budget kept in the database: 5 wrong passwords lock all of them for a minute, and restarting
 the daemon doesn't reset it. A forgotten password is replaced by reinstalling: `uninstall` keeping
 the folders encrypted and the master key, then `install` (the wizard refuses while a completed
-installation is recorded). An install older than the mandatory password has none: `--set-password`
+installation is recorded). An install older than the mandatory password has none: `edit-protected password`
 sets the first one with the daemon stopped (it refuses while the daemon runs).
 
 ### Non-interactive writes
 
 ```bash
 echo "new contents" | sudo APP_LISTENER_EDIT_PASSWORD=... \
-  app-listener edit-protected --resource /home/alice/.ssh --put config
+  app-listener edit-protected put config --resource /home/alice/.ssh
 ```
 
-`--put <file>` writes a file inside `--resource` from `--content-file` or stdin, authenticating
-with `$APP_LISTENER_EDIT_PASSWORD`.
+`put FILE` writes `FILE` (absolute, or relative to `--resource`) inside `--resource`, from `--from`
+or stdin, authenticating with `$APP_LISTENER_EDIT_PASSWORD`. `--resource` is required: the
+guarded directories are disclosed only after authentication, so the command can't work it out.
 
-## Temporary access for other programs: `--forward`
+## Temporary access for other programs: `forward`
 
 Live mode only. Opens no editor: it gives *other* binaries temporary access to the guarded
 directories you pick, with `guard`'s `-w`/`-b`/`-e` syntax.
 
 ```bash
 # let graphify (a uv-managed python script) create its skill under a guarded ~/.claude
-sudo app-listener edit-protected --forward \
+sudo app-listener edit-protected forward \
   -w ~/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/bin/python3.12 \
   -e OPEN,READ,STAT,MKDIR,WRITE
 ```
@@ -98,7 +111,7 @@ sudo app-listener edit-protected --forward \
   directories, allowed and denied, in the same view as `guard`. Without a terminal they're printed
   as `GUARD|` lines.
 - The access lasts until you quit (`q` or `Ctrl+C`). It is also revoked when the client dies, on
-  a daemon reload, when a granted binary's content changes on disk, or after `--timeout-session`
+  a daemon reload, when a granted binary's content changes on disk, or after `--idle-timeout`
   with neither a granted binary touching the directories nor a keypress.
 
 Before admitting a binary, know that:
@@ -121,14 +134,14 @@ Before admitting a binary, know that:
   whitelisted on a resource untouched, and `-b` leaves one that isn't untouched. The daemon's own
   binary, inspectors and tamper-demoted binaries are refused.
 - If the daemon is killed mid-grant, its pinned guards keep enforcing *with* the temporary
-  allows. `daemon --lockdown` (`ExecStopPost`) and the next start strip them using
+  allows. `daemon lockdown` (`ExecStopPost`) and the next start strip them using
   `/etc/app-listener/temp-grants.json`, which is written before any allow.
 
 ## Editing the daemon config
 
 ```bash
-sudo app-listener edit-protected --edit-config
-sudo APP_LISTENER_EDIT_PASSWORD=... app-listener edit-protected --edit-config --content-file new.conf
+sudo app-listener edit-protected config
+sudo APP_LISTENER_EDIT_PASSWORD=... app-listener edit-protected config --from new.conf
 ```
 
 Live mode only, same password. Opens the running daemon's `daemon.conf` in the editor. `Ctrl+S`
@@ -141,16 +154,16 @@ like `systemctl reload`.
 - If the file changed while you were editing, nothing is overwritten.
 - Refused while a grant session is active.
 - Binaries added this way are vetted like any reload: one that isn't root-placed still needs
-  [`trust-binaries`](binary-trust.md#trust-binaries).
+  [`trust`](binary-trust.md#trust).
 
-### Recording a new path: `--record`
+### Recording a new path: `config record`
 
 ```bash
-sudo app-listener edit-protected --edit-config --record ~/work/secrets --record ~/.config/tool/token
+sudo app-listener edit-protected config record ~/work/secrets ~/.config/tool/token
 ```
 
 Guarding a new directory or file needs its whitelist: the programs that legitimately use it.
-`--record` learns it, like AppArmor's complain mode. Live mode only, same password, and the paths
+`config record` learns it, like AppArmor's complain mode. Live mode only, same password, and the paths
 are checked only after the password is accepted.
 
 1. **Record.** Every access to the paths is recorded (nothing is denied) until you press `Ctrl+C`,
@@ -182,7 +195,7 @@ How the recording stays safe:
   keyed per applet.
 - A program you placed yourself is recorded in the [binary ledger](binary-trust.md) with the
   content seen while recording, so the reload admits exactly that file. A program the ledger
-  already knows keeps its verdict: if its content changed since, it still needs `trust-binaries`.
+  already knows keeps its verdict: if its content changed since, it still needs `trust`.
 - Refused paths: system trees (`/usr`, `/proc`, `/etc/app-listener`, ...), whole roots such as
   `/home` or a user's whole home, symbolic links, files with more than one hard link, migration
   copies, and anything inside or around a path the daemon already guards or another recorded path
@@ -200,20 +213,20 @@ page and again in the review). Then:
 - Every existing line stays as written; only the approved programs the section doesn't list yet are
   added, after its last whitelist line. A program already whitelisted for every path it touched is
   listed as such and can't be selected. One whose line restricts its events but that was seen doing
-  more gets a note: widen that line with `--edit-config`.
+  more gets a note: widen that line with `edit-protected config`.
 - The guard keeps running while you record, so a program the section doesn't whitelist is denied
   and seen only up to its first refused operation (usually the open). Restricting it to the events
   it was seen doing would miss what it never got to do: prefer every event for it, or record again
   once it is whitelisted.
 - In a `watch:` group the whitelist is shared: a line added for one path reaches the group's other
   paths too, and the warning names them.
-- Encryption is not offered for such a path: change its `need_encryption` with `--edit-config`.
+- Encryption is not offered for such a path: change its `need_encryption` with `edit-protected config`.
 - Selecting nothing new applies nothing. Paths around or inside a guarded path, a `lib_dir`, or a
   group's encryption root are still refused.
 
 ## Editor keys
 
-The editors (edit-protected, `--edit-config`, the installer's config step) and the
+The editors (edit-protected, `edit-protected config`, the installer's config step) and the
 diff/changelog viewers open at the first line.
 
 | Key | Action |

@@ -46,7 +46,7 @@ with RAM.
 
 ```bash
 sudo make deploy
-docker exec -it app-listener app-listener monitor -w /tmp
+docker exec -it app-listener app-listener monitor /tmp
 ```
 
 `make deploy` builds the binary inside Docker, on the toolchain image (`docker/builder.Dockerfile`),

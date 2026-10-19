@@ -13,7 +13,7 @@ type Options struct {
 	Uninstall UninstallHooks
 }
 
-// InstallMode is an installer entry point (the wizard or one maintenance flag of `install`).
+// InstallMode is an installer entry point (the wizard or one `install` subcommand).
 type InstallMode int
 
 const (

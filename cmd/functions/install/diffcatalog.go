@@ -9,20 +9,46 @@ import (
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
 	inst "github.com/Virgula0/app-listener/internal/install"
+	"github.com/Virgula0/app-listener/internal/protected"
 	"github.com/Virgula0/app-listener/internal/systemd"
+	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
 // runDiffCatalog is the incremental counterpart of the full wizard: compares the catalog with the
 // installed daemon.conf and offers to protect and encrypt every discoverable critical directory not
 // already guarded. Existing sections stay byte-for-byte intact; selected sections are appended and
-// the normal pipeline (verify encryption -> ask -> migrate -> deploy -> (re)start) runs on the
-// merged config. Requires a previous installation; interactive.
+// the normal pipeline (verify encryption -> ask -> migrate -> deploy) runs on the merged config.
+// It needs the daemon stopped (a new section may need an in-place fscrypt migration) and asks at
+// the end whether to start it. Requires a previous installation; interactive.
 func runDiffCatalog() error {
-	prevCfg, mergedText, mergedCfg, proceed, err := collectDiffAdditions()
-	if err != nil || !proceed {
+	if err := protected.RequireDaemonStopped(); err != nil {
 		return err
 	}
-	return applyDiffAdditions(prevCfg, mergedText, mergedCfg)
+	prevCfg, mergedText, mergedCfg, proceed, err := collectDiffAdditions()
+	if err == nil && proceed {
+		err = applyDiffAdditions(prevCfg, mergedText, mergedCfg)
+	}
+	if err != nil {
+		return err
+	}
+	return offerDaemonStart()
+}
+
+// offerDaemonStart asks to start (and enable) a stopped daemon on the installed config.
+func offerDaemonStart() error {
+	if systemd.IsDaemonActive() || !systemd.DaemonUnitInstalled() {
+		return nil
+	}
+	start, err := wizard.ConfirmOnce("The daemon is stopped: its folders stay locked until it runs. Start it now?",
+		"Start the daemon")
+	if err != nil {
+		return err
+	}
+	if !start {
+		log.Infof("daemon left stopped — start it with: sudo systemctl start %s", systemd.DaemonServiceName)
+		return nil
+	}
+	return systemd.EnableAndVerify(false)
 }
 
 // collectDiffAdditions reads the installed config, discovers catalog directories missing from it,
@@ -71,47 +97,34 @@ func collectDiffAdditions() (prevCfg *daemonconfig.Config, mergedText string, me
 	return cfg, text, parsed, true, nil
 }
 
-// applyDiffAdditions runs the encrypt + deploy half on the merged config. The daemon is stopped for
-// the whole cycle (a new section may need an in-place fscrypt migration) and restored on the
-// existing config if the user aborts before deploy.
+// applyDiffAdditions runs the encrypt + deploy half on the merged config, with the daemon stopped
+// (runDiffCatalog): an abort before deploy leaves daemon.conf untouched.
 func applyDiffAdditions(prevCfg *daemonconfig.Config, mergedText string, mergedCfg *daemonconfig.Config) error {
-	wasActive := systemd.IsDaemonActive()
-	if stopErr := systemd.StopDaemonIfRunning(); stopErr != nil {
-		return stopErr
+	if err := ensureMasterKey(); err != nil {
+		return err
 	}
-
-	if keyErr := ensureMasterKey(); keyErr != nil {
-		return restoreDaemonAfterDiffAbort(wasActive, keyErr)
+	sshUsers, err := askSSHAgentUsers(addedResources(prevCfg, mergedCfg))
+	if err == nil {
+		err = addKeysToAgent(sshUsers)
 	}
-
-	sshUsers, sshErr := askSSHAgentUsers(addedResources(prevCfg, mergedCfg))
-	if sshErr == nil {
-		sshErr = addKeysToAgent(sshUsers)
+	if err != nil {
+		return err
 	}
-	if sshErr != nil {
-		return restoreDaemonAfterDiffAbort(wasActive, sshErr)
+	bunUsers, err := askBunTmpdirUsers(mergedCfg)
+	if err != nil {
+		return err
 	}
-
-	bunUsers, bunErr := askBunTmpdirUsers(mergedCfg)
-	if bunErr != nil {
-		return restoreDaemonAfterDiffAbort(wasActive, bunErr)
+	securedText, err := secureResources(fscrypt.New(), mergedText, mergedCfg)
+	if err != nil {
+		return err
 	}
-
-	vault := fscrypt.New()
-	securedText, secErr := secureResources(vault, mergedText, mergedCfg)
-	if secErr != nil {
-		return restoreDaemonAfterDiffAbort(wasActive, secErr)
+	// deployFiles writes the config only after ConfirmOverwrite and runs the eBPF preflight; it never
+	// touches the edit-protected password (an existing hash stays, sealed again once the daemon runs).
+	if _, err := deployFiles(securedText, sshUsers, bunUsers, ""); err != nil {
+		return err
 	}
-
-	// deploy writes the config only after ConfirmOverwrite, runs the eBPF preflight, and (re)starts
-	// the daemon; its failure modes already leave a documented state, so they surface as-is.
-	// --diff-catalog never touches the edit-protected password (an existing hash stays and is
-	// self-guarded again by the restarted daemon).
-	if deployErr := deploy(securedText, sshUsers, bunUsers, ""); deployErr != nil {
-		return deployErr
-	}
-	if cleanErr := cleanOrphanedFscrypt(mergedCfg); cleanErr != nil {
-		return cleanErr
+	if err := cleanOrphanedFscrypt(mergedCfg); err != nil {
+		return err
 	}
 	return cleanupBackups(mergedCfg)
 }
@@ -183,16 +196,4 @@ func appendSectionsAndEdit(oldText string, picked []inst.Candidate) (string, *da
 	return runConfigEditor(
 		"app-listener daemon.conf — new sections appended, review and save (Ctrl+S)",
 		merged, prev)
-}
-
-// restoreDaemonAfterDiffAbort restarts the daemon on the existing config when the run is aborted
-// after the daemon was stopped, then returns the original cause.
-func restoreDaemonAfterDiffAbort(wasActive bool, cause error) error {
-	if wasActive {
-		log.Warn("catalog diff aborted — restarting the daemon on the existing config ...")
-		if e := deliverReload(false); e != nil {
-			log.Errorf("could not restart the daemon (%v) — run: sudo systemctl start %s", e, systemd.DaemonServiceName)
-		}
-	}
-	return cause
 }

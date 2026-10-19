@@ -3,7 +3,7 @@
 // start or reload otherwise trusts whatever sits at a whitelisted path, and nothing guards those
 // paths while the daemon is not running (issue #80): a binary whose hash is not recorded is
 // admitted only when the daemon can prove where it came from (cmd/functions/daemon binvet.go), else
-// it waits for `app-listener trust-binaries`.
+// it waits for `app-listener trust`.
 package binledger
 
 import (
@@ -35,7 +35,7 @@ const (
 	SourceBootstrap Source = "bootstrap"
 	SourceUpdater   Source = "updater"
 	SourceConfirmed Source = "confirmed"
-	// SourceRecorded: `edit-protected --record` saw this content run and the operator approved it.
+	// SourceRecorded: `edit-protected config record` saw this content run and the operator approved it.
 	SourceRecorded Source = "recorded"
 )
 
@@ -230,7 +230,7 @@ func (l *Ledger) Forget(line string, sum [32]byte, src Source) error {
 	return err
 }
 
-// AddPending records a refused binary for `trust-binaries` to show.
+// AddPending records a refused binary for `trust` to show.
 func (l *Ledger) AddPending(p *Pending) error {
 	_, err := l.db.ExecContext(context.Background(), `INSERT OR REPLACE INTO pending (line, resolved, sha256, resources, seen_at) VALUES (?, ?, ?, ?, ?)`,
 		p.Line, p.Resolved, p.SHA256[:], p.Resources, p.SeenAt.Unix())

@@ -1,43 +1,41 @@
 package editprotected
 
-import "testing"
+import (
+	"strings"
+	"testing"
 
-func TestValidateForwardFlags(t *testing.T) {
+	"github.com/spf13/pflag"
+)
+
+// TestForwardFlagSurface checks the rules that hold before root or the daemon are needed.
+func TestForwardFlagSurface(t *testing.T) {
 	reset := func() {
-		forwardFlag, yesFlag, setPasswordFlag = false, false, false
-		whitelistFlags, blacklistFlags, eventsFlags = nil, nil, nil
-		putFlag = ""
+		whitelistFlags, blacklistFlags, eventsFlags, forwardResources = nil, nil, nil, nil
+		EditProtectedCmd.SetArgs(nil)
+		for _, c := range EditProtectedCmd.Commands() {
+			c.Flags().VisitAll(func(f *pflag.Flag) { f.Changed = false })
+		}
 	}
 	t.Cleanup(reset)
 	cases := []struct {
 		name string
-		set  func()
-		ok   bool
+		args []string
+		want string
 	}{
-		{"no flags", func() {}, true},
-		{"-w without --forward", func() { whitelistFlags = []string{"/bin/x"} }, false},
-		{"-e without --forward", func() { eventsFlags = []string{"OPEN"} }, false},
-		{"--forward alone", func() { forwardFlag = true }, false},
-		{"--forward -w", func() { forwardFlag, whitelistFlags = true, []string{"/bin/x"} }, true},
-		{"--forward -b -e", func() {
-			forwardFlag, blacklistFlags, eventsFlags = true, []string{"/bin/x"}, []string{"write"}
-		}, true},
-		{"--forward -w -b", func() {
-			forwardFlag, whitelistFlags, blacklistFlags = true, []string{"/bin/x"}, []string{"/bin/y"}
-		}, false},
-		{"--forward bad -e", func() {
-			forwardFlag, whitelistFlags, eventsFlags = true, []string{"/bin/x"}, []string{"EXEC"}
-		}, false},
-		{"--forward --put", func() { forwardFlag, whitelistFlags, putFlag = true, []string{"/bin/x"}, "f" }, false},
-		{"--forward --set-password", func() {
-			forwardFlag, whitelistFlags, setPasswordFlag = true, []string{"/bin/x"}, true
-		}, false},
+		{"no binaries", []string{"forward"}, "at least one of the flags"},
+		{"-w and -b", []string{"forward", "-w", "/bin/x", "-b", "/bin/y"}, "none of the others"},
+		{"bad -e", []string{"forward", "-w", "/bin/x", "-e", "EXEC"}, "unknown event type"},
+		{"-w outside forward", []string{"-w", "/bin/x"}, "unknown shorthand flag"},
+		{"put without --resource", []string{"put", "f"}, `"resource" not set`},
+		{"record without paths", []string{"config", "record"}, "requires at least 1 arg"},
 	}
 	for _, c := range cases {
 		reset()
-		c.set()
-		if err := validateForwardFlags(); (err == nil) != c.ok {
-			t.Errorf("%s: err = %v, want ok=%v", c.name, err, c.ok)
+		EditProtectedCmd.SetArgs(c.args)
+		EditProtectedCmd.SilenceUsage, EditProtectedCmd.SilenceErrors = true, true
+		err := EditProtectedCmd.Execute()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want %q", c.name, err, c.want)
 		}
 	}
 }

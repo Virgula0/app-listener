@@ -32,54 +32,19 @@ var keepGUIFlag bool
 
 func init() {
 	UninstallCmd.Flags().BoolVar(&deleteKeyFlag, "delete-key", false,
-		"Also delete the fscrypt master key at /etc/app-listener/fscrypt.key after the uninstall (kept by default: without it still-encrypted directories can never be unlocked again)")
+		"Also delete the fscrypt master key (without it, directories left encrypted can never be unlocked)")
 	UninstallCmd.Flags().BoolVar(&keepGUIFlag, "keep-gui", false,
 		"Keep the desktop build (/usr/local/sbin/app-listener-gui) and its PATH symlink")
 }
 
 var UninstallCmd = &cobra.Command{
 	Use:   "uninstall",
-	Short: "Interactive uninstaller: revert the daemon installation (fscrypt + systemd)",
-	Long: `Interactive, root-only uninstaller for the daemon mode.
-
-The wizard reverts everything the installer installed:
-
-  0. fatally refuses while the daemon is running: an active systemd unit or
-     a daemon process running outside systemd must be stopped manually
-     first
-  1. re-scans the catalog (the current daemon.conf is deliberately NOT
-     used) and detects which directories are actually encrypted with fscrypt
-  2. verifies the master key against every encrypted directory: a directory
-     that does not unlock with the master key is a fatal error, because
-     removing the daemon (and possibly the key with --delete-key) would
-     lock it forever
-  3. asks per directory whether its fscrypt encryption must be permanently
-     removed (default: no) and decrypts the confirmed ones in place with a
-     progress bar: an encrypted directory is only removed after the
-     plaintext copy completed, so a failure leaves it untouched
-  4. cleans the orphaned fscrypt metadata left behind by the decrypted
-     directories (still-encrypted directories keep their metadata)
-  5. reverts the installed systemd unit, the boot-time catalog-refresh unit
-     and pacman/apt hooks an earlier version left, binary, PATH symlink,
-     the desktop build (app-listener-gui) and config, and — after a final
-     confirmation (default: no) and only for units whose content matches
-     the bundled sample — the per-user
-     ssh-agent systemd units and the SSH_AUTH_SOCK / AddKeysToAgent blocks
-     the installer added to the users' shell startup files and ~/.ssh/config
-  6. deletes the fscrypt master key ONLY when --delete-key is passed; the
-     default keeps it, because without it every still-encrypted directory
-     can never be unlocked again (with directories still encrypted, it
-     asks once more first, default: keep the key)
-  7. asks whether to delete the migration backups (.app_listener.backup):
-     the found ones are listed (all preselected) and, after one
-     confirmation, removed — they are plain unencrypted copies, so keeping
-     them is harmless but usually pointless once the daemon is gone
-
-To move a backup back over its directory instead of deleting it, use
-'app-listener install --restore-backups'.
-
-Aborting (Esc) any step cancels the uninstall; completed steps stay
-completed.`,
+	Short: "Remove the install: decrypt the directories you pick, remove the service",
+	Long: `Revert what install did. Refused while the daemon runs. It re-scans the catalog
+for encrypted directories, checks each unlocks with the master key, decrypts
+the ones you pick, then removes the service, binaries and config, and offers
+to remove the ssh-agent setup and the migration backups. The master key is
+kept unless --delete-key.`,
 	Args: cobra.NoArgs,
 	RunE: runUninstall,
 }

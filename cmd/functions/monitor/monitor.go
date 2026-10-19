@@ -21,7 +21,6 @@ import (
 )
 
 var (
-	watchPaths []string
 	eventsFlag []string
 
 	recursive bool
@@ -30,36 +29,24 @@ var (
 )
 
 var MonitorCmd = &cobra.Command{
-	Use:   "monitor",
-	Short: "Monitor files/directories for file system events",
-	Long: `Monitor one or more files or directories for file system events using eBPF.
-
-Use -w/--watch (repeatable) to specify paths to monitor.
-Accepts directories (to monitor all files within) or single files.
-When monitoring a file, only events for that specific file are shown.
-
-Examples:
-  app-listener monitor -w /tmp
-  app-listener monitor -w /var/log --recursive
-  app-listener monitor -w /home --recursive --depth 3
-  app-listener monitor -w /path/to/file.txt
-  app-listener monitor -w /dir1 -w /dir2 -w /path/to/file`,
-	Args: cobra.NoArgs,
+	Use:   "monitor PATH...",
+	Short: "Show file system events on files or directories (observe only)",
+	Long: `Show the file system events on each PATH (a directory, or a single file), with
+the process behind them. Nothing is blocked: use guard for that.`,
+	Example: `  sudo app-listener monitor /tmp
+  sudo app-listener monitor /home/alice --recursive --depth 3
+  sudo app-listener monitor /etc/passwd /var/log -e OPEN,WRITE`,
+	Args: cobra.MinimumNArgs(1),
 	RunE: runMonitor,
 }
 
 func init() {
 	common.AddServeFlags(MonitorCmd)
-	MonitorCmd.Flags().StringSliceVarP(&watchPaths, "watch", "w", nil,
-		"Path to monitor (repeatable, required)")
-	MonitorCmd.Flags().BoolVarP(&recursive, "recursive", "r", false,
-		"Monitor directory recursively (default: false)")
-	MonitorCmd.Flags().IntVarP(&depth, "depth", "d", 0,
-		"Maximum directory depth (requires --recursive) (default: 0)")
-	MonitorCmd.Flags().BoolVarP(&headless, "headless", "", false,
-		"Run without TUI, print events to stderr (for testing/scripting)")
-	MonitorCmd.Flags().StringSliceVarP(&eventsFlag, "events", "e", nil,
-		"Event types to monitor (comma-separated: OPEN,READ,WRITE,DELETE,RENAME,SYMLINK,HARDLINK,MKDIR,MMAP,ATTR,STAT,MKNOD; default: all)")
+	f := MonitorCmd.Flags()
+	f.BoolVarP(&recursive, "recursive", "r", false, "Include subdirectories")
+	f.IntVarP(&depth, "depth", "d", 0, "With --recursive: maximum directory depth (0 = unlimited)")
+	common.AddHeadlessFlag(MonitorCmd, &headless)
+	f.StringSliceVarP(&eventsFlag, "events", "e", nil, "Event types to show: "+common.FileEventList+" (default all)")
 }
 
 func runMonitor(cmd *cobra.Command, args []string) error {
@@ -68,7 +55,7 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	rawTargets, ebpfTargets, err := prepareMonitorTargets()
+	rawTargets, ebpfTargets, err := prepareMonitorTargets(args)
 	if err != nil {
 		return err
 	}
@@ -119,15 +106,11 @@ func runMonitor(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// prepareMonitorTargets validates and resolves the --watch paths into eBPF
-// targets, warning about flags that single files silently ignore.
-func prepareMonitorTargets() ([]common.RawTarget, []ebpf.Target, error) {
-	if len(watchPaths) == 0 {
-		return nil, nil, errors.New("at least one -w/--watch path is required")
-	}
-
+// prepareMonitorTargets validates and resolves the paths into eBPF targets, warning about flags
+// that single files silently ignore.
+func prepareMonitorTargets(watchPaths []string) ([]common.RawTarget, []ebpf.Target, error) {
 	if depth > 0 && !recursive {
-		return nil, nil, errors.New("--depth requires --recursive flag")
+		return nil, nil, errors.New("--depth requires --recursive")
 	}
 
 	rawTargets, err := common.ResolveTargets(watchPaths)

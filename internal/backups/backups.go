@@ -1,6 +1,6 @@
 // Package backups handles the .app_listener.backup copies left after an fscrypt migration:
 // discovery across the catalog and installed daemon.conf, interactive multi-select, delete/restore
-// over the vault. Shared by `install --restore-backups`/`--delete-post-backups`, the install
+// over the vault. Shared by `install backups restore`/`install backups delete`, the install
 // post-step and `uninstall`.
 package backups
 

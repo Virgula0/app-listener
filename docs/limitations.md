@@ -45,7 +45,7 @@ least-privilege hint.
 ## Already-running processes
 
 - Processes started before a guard are judged once from `/proc`; code injected into them earlier
-  can't be seen. Restart whitelisted apps after starting `network-guard -w`.
+  can't be seen. Restart whitelisted apps after starting `network guard -w`.
 - Multicall applets started before a guard have no attested applet and are denied until they exec
   again ([details](binary-trust.md#multicall-binaries)).
 - A process started before its binary was replaced keeps its access.

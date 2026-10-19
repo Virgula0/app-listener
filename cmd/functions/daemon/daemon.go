@@ -70,7 +70,7 @@ func newPinGeneration() string {
 // daemonSelfBaselineEvents is the root-gated self mask every config/ephemeral guard registers its
 // own binary under (guard.WithSelfAllowBinary): enough for directory-based fscrypt (kernel-keyring
 // ops) and a file-vault's "already locked" read fast path, never write. Single definition so all
-// construction sites and `daemon --lockdown` (which widens from exactly this baseline and restores
+// construction sites and `daemon lockdown` (which widens from exactly this baseline and restores
 // it) can't drift.
 var daemonSelfBaselineEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat}
 
@@ -98,90 +98,72 @@ var (
 
 var DaemonCmd = &cobra.Command{
 	Use:   "daemon",
-	Short: "Protect encrypted (or not) directories with a whitelist daemon (fscrypt + eBPF LSM)",
-	Long: `Run the ssh-guard style daemon on top of the guard's eBPF LSM engine.
+	Short: "Run the daemon that guards the directories of daemon.conf (fscrypt + eBPF LSM)",
+	Long: `Run the daemon: each [watch <dir>] section of the config admits only its listed
+binaries, and encrypted directories are unlocked only while their guard is
+attached. SIGHUP reloads the config; a broken one keeps the running config.
 
-Each [watch <dir>] section in the config file protects one directory:
-only the listed binaries may access it (whitelist mode, recursive by
-default), optionally restricted to specific event types. Resources are
-expected to be encrypted with fscrypt unless need_encryption: false is
-set; encrypted resources are unlocked at startup and locked again on
-shutdown while the guards remain attached, so there is never an
-unprotected window. A SIGTERM/SIGINT that arrives mid-startup (before the
-run loop is up) is caught: startup finishes its in-flight unlock/attach,
-then the same secure lockdown runs. A hard SIGKILL cannot be caught, but
-the guard's LSM links are pinned to /sys/fs/bpf, so the guarded trees stay
-enforced after the process dies; the systemd unit's ExecStopPost
-(app-listener daemon --lockdown) then removes the vault keys, and the next
-start retires the stale pins once its own guards are attached.
-
-The config file is resolved in this order:
-  1. the --config flag, if given
-  2. /etc/app-listener/daemon.conf, if present
-  3. daemon-samples/daemon.conf in the working directory
-
-With --headless, events are printed to stderr (captured by journald when
-run as a systemd service), like ssh-guard's syslog output. Lines carry a
-syslog priority marker (<4> warning, <6> info), so journald colors denied
-events in yellow exactly like ssh-guard. With --blocked-only, only
-denied (blocked) attempts are printed; allowed events are suppressed.
-With --no-log-metadata-blocks, denied metadata-only process inspections
-(op=PTRACE mode=READ) are not printed at all; without it they are printed
-once per caller/target pair and folded into one DAEMON DENIED-REPEAT
-summary per minute.
-The guard itself never changes behavior — filtering is purely presentational.
-
-SIGHUP reloads the configuration: every resource's binary whitelist is
-recomputed by inode and applied atomically — new guards attach before the
-old ones detach, so protection is never dropped. A malformed configuration
-keeps the previous one running.
-
-Updates need no reload and no hook. A root-owned whitelisted binary that a
-package manager replaces (temp file + rename) is re-admitted as soon as the
-daemon sees it, if the new file is root-owned in a root-owned directory; so
-is a new root-owned match of the catalog's absolute patterns. A new app
-version below a home directory (Discord, Steam, Claude) is admitted by the
-catalog refresh the daemon runs at startup and whenever it sees a binary
-written below a catalog pattern: daemon.conf is rewritten (only if it still
-holds the configuration the daemon runs) and reloaded in-process, logged as
-"DAEMON catalog-refresh resource=... admitted=... dropped=...". A process
-started from a binary before it was replaced keeps its access, a reload
-included; re-running the replaced image (held fd, /proc/<pid>/exe) does not.`,
+The config is --config, else /etc/app-listener/daemon.conf, else
+daemon-samples/daemon.conf in the working directory. The systemd unit runs it
+with --headless (events to the journal).`,
+	Example: `  sudo app-listener daemon --headless --blocked-only
+  sudo app-listener daemon check
+  sudo app-listener daemon lockdown`,
 	Args: cobra.NoArgs,
 	RunE: runDaemon,
 }
 
+var checkCmd = &cobra.Command{
+	Use:   "check",
+	Short: "Load every guard eBPF program into this kernel's verifier, attaching nothing",
+	Long: `Check the BPF-LSM prerequisites and load every guard eBPF program into this
+kernel's verifier, then exit 0 (all accepted) or non-zero. Nothing is attached
+or changed. The installer runs it on the deployed binary before enabling the
+service.`,
+	Args: cobra.NoArgs,
+	RunE: func(*cobra.Command, []string) error { return runBPFCheck() },
+}
+
+var lockdownCmd = &cobra.Command{
+	Use:   "lockdown",
+	Short: "Lock every encryption root of the config and exit",
+	Long: `Lock every encryption root of the config and exit. The systemd unit runs it as
+ExecStopPost after every exit (stop, crash, SIGKILL), so a daemon that died
+before its own lockdown never leaves a vault unlocked.`,
+	Args: cobra.NoArgs,
+	Run:  func(*cobra.Command, []string) { runLockdown() },
+}
+
+var genkeyCmd = &cobra.Command{
+	Use:   "genkey",
+	Short: "Generate the fscrypt master key (asks before replacing one)",
+	Args:  cobra.NoArgs,
+	RunE:  func(*cobra.Command, []string) error { return runGenKey() },
+}
+
 func init() {
 	common.AddServeFlags(DaemonCmd)
-	DaemonCmd.Flags().StringVarP(&configFlag, "config", "", "",
-		"Path to the daemon config file (default: /etc/app-listener/daemon.conf, then daemon-samples/daemon.conf)")
-	DaemonCmd.Flags().BoolVarP(&headless, "headless", "", false,
-		"Run without TUI, print events to stderr (for testing/scripting)")
-	DaemonCmd.Flags().BoolVarP(&blockedOnly, "blocked-only", "", false,
-		"Only print blocked (denied) events, skip allowed ones (headless only)")
-	DaemonCmd.Flags().BoolVarP(&noLogMetadataBlocks, "no-log-metadata-blocks", "", false,
-		"Do not log metadata-only process inspections that were denied (op=PTRACE mode=READ: another process "+
-			"reading /proc/<pid> metadata of one holding guarded secrets — desktop services like the compositor, "+
-			"audio server and portal do this constantly). They are still DENIED; only the log line is dropped. "+
-			"Memory access (mode=ATTACH), /proc/<pid>/mem and every file denial are always logged (headless only)")
-	DaemonCmd.Flags().BoolVarP(&genKeyFlag, "genkey", "", false,
-		"Generate the fscrypt master key file and exit")
-	DaemonCmd.Flags().BoolVarP(&checkFlag, "check", "", false,
-		"Preflight: verify the BPF-LSM prerequisites and load every guard eBPF program "+
-			"into this kernel's verifier, then exit 0 (all accepted) or non-zero (any rejected). "+
-			"Attaches nothing, changes nothing. The installer runs this against the deployed "+
-			"binary before enabling the service, so a kernel whose verifier rejects a guard "+
-			"program fails the install cleanly instead of crash-looping (or panicking) the daemon.")
-	DaemonCmd.Flags().BoolVarP(&verifierOnly, "verifier-only", "", false,
-		"With --check: skip the BPF-LSM activation check and only load the guard programs into the "+
-			"verifier. For CI hosts that compile BPF-LSM in without enabling it (lsm= boot parameter); "+
-			"never a sign that this host can enforce.")
-	DaemonCmd.Flags().BoolVarP(&lockdownFlag, "lockdown", "", false,
-		"Force-lock every encryption root in the config and exit. Wired into the systemd unit as ExecStopPost: "+
-			"systemd runs it after every exit (clean stop, crash, SIGKILL, startup timeout), so a daemon that died "+
-			"before its own lockdown finished never leaves a vault unlocked.")
-	DaemonCmd.Flags().StringVarP(&pprofAddr, "pprof", "", "",
-		"Serve net/http/pprof on this loopback address for profiling (e.g. 127.0.0.1:6060). Refused on non-loopback addresses. Off by default.")
+	DaemonCmd.PersistentFlags().StringVar(&configFlag, "config", "",
+		"Daemon config file (default: /etc/app-listener/daemon.conf, then daemon-samples/daemon.conf)")
+	f := DaemonCmd.Flags()
+	f.BoolVar(&headless, "headless", false, "Print events to stderr instead of the TUI (the systemd unit's mode)")
+	f.BoolVar(&blockedOnly, "blocked-only", false, "Print only denied events (headless only)")
+	f.BoolVar(&noLogMetadataBlocks, "no-log-metadata-blocks", false,
+		"Don't log denied metadata-only process inspections (op=PTRACE mode=READ); still denied (headless only)")
+	f.StringVar(&pprofAddr, "pprof", "", "Serve net/http/pprof on this loopback address, e.g. 127.0.0.1:6060")
+
+	// The pre-subcommand spellings: a binary of another version runs them (an installed unit's
+	// ExecStopPost during `update`, install.sh and check-compatibility.sh against a release, the
+	// installer against the installed binary). Never remove them.
+	f.BoolVar(&genKeyFlag, "genkey", false, "Alias of the genkey subcommand")
+	f.BoolVar(&checkFlag, "check", false, "Alias of the check subcommand")
+	f.BoolVar(&lockdownFlag, "lockdown", false, "Alias of the lockdown subcommand (the installed unit's ExecStopPost runs it)")
+	f.BoolVar(&verifierOnly, "verifier-only", false, "With --check: alias of check --verifier-only")
+
+	checkCmd.Flags().BoolVar(&verifierOnly, "verifier-only", false,
+		"Skip the BPF-LSM activation check (CI hosts with BPF-LSM built in but not enabled); "+
+			"a pass then says nothing about enforcement on this host")
+	DaemonCmd.AddCommand(checkCmd, lockdownCmd, genkeyCmd)
 }
 
 // startPprof serves the Go profiler on loopback only (opt-in --pprof), e.g. `go tool pprof
@@ -220,7 +202,7 @@ func startPprof(addr string) {
 //   - SIGTERM/SIGINT: otherwise a signal during startup kills the process with no deferred Stop,
 //     leaving unlocked vault keys provisioned until ExecStopPost (guards are pinned, so trees stay
 //     enforced).
-//   - SIGHUP: a reload (`edit-protected --edit-config`, `install --refresh-catalog-only`) can arrive
+//   - SIGHUP: a reload (`edit-protected config`, `install catalog refresh`) can arrive
 //     seconds after start; SIGHUP's default is to terminate, so it would kill the daemon
 //     mid-startup.
 //
@@ -237,7 +219,7 @@ func catchLifecycleSignals() (termSig, hup chan os.Signal, stop func()) {
 	}
 }
 
-// runOneShotMode runs --genkey, --check or --lockdown, which exit without starting the daemon.
+// runOneShotMode runs the --genkey, --check and --lockdown spellings of the subcommands.
 func runOneShotMode() (bool, error) {
 	switch {
 	case genKeyFlag:
@@ -311,10 +293,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	events := mergeDaemonEvents(d.Events(), sg.Events())
 
-	// Record this run's config-guard pin generation for `daemon --lockdown` (pinstate.go).
+	// Record this run's config-guard pin generation for `daemon lockdown` (pinstate.go).
 	// Best-effort.
 	if pinErr := writePinState(pin); pinErr != nil {
-		log.Warnf("daemon: could not record pin state (%v) — `daemon --lockdown` will not be able to widen "+
+		log.Warnf("daemon: could not record pin state (%v) — `daemon lockdown` will not be able to widen "+
 			"self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 	}
 
@@ -549,10 +531,10 @@ func makeReloadHandler(d usecase.DaemonUseCase, configPath string, vault *fscryp
 		if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{liveGen: true, pin.gen: true}); cleanErr != nil {
 			log.Warnf("daemon: could not sweep stale guard pins after reload: %v", cleanErr)
 		}
-		// The reload minted a fresh config-guard generation: record it, or `daemon --lockdown`
+		// The reload minted a fresh config-guard generation: record it, or `daemon lockdown`
 		// would recover the pre-reload generation whose pins the commit just removed.
 		if pinErr := writePinState(pinCfg{base: pin.base, gen: liveGen}); pinErr != nil {
-			log.Warnf("daemon: could not record pin state after reload (%v) — `daemon --lockdown` will not be "+
+			log.Warnf("daemon: could not record pin state after reload (%v) — `daemon lockdown` will not be "+
 				"able to widen self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 		}
 		reloaded(cfg)
@@ -634,7 +616,7 @@ func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinC
 	stripTempJournal("daemon", pin.base)
 	relockStaleVaults(cfg, vault, pin.base)
 
-	// Retire pins a killed predecessor left. relockStaleVaults (and ExecStopPost --lockdown)
+	// Retire pins a killed predecessor left. relockStaleVaults (and ExecStopPost `daemon lockdown`)
 	// already locked any vault they were the last guard for, so removing them exposes only
 	// encrypted data. Must precede this run's fscrypt use: a stale guard pinned by an OLDER binary
 	// would deny this process's unlock/lock ioctls.
@@ -736,7 +718,7 @@ func (p *pendingGroupUnlock) lockRoots(vault *fscrypt.Vault) {
 // unlockPendingGroupRoots unlocks the vault of every PathPending grouped resource so buildGuards
 // can resolve real sub-path inodes. Each root is unlocked UNDER an ephemeral recursive self-only
 // guard attached first (denies every reader but the root daemon; same discipline as the running
-// daemon and --refresh-catalog-only). Returns an empty tracker when nothing is pending. reloading:
+// daemon and `install catalog refresh`). Returns an empty tracker when nothing is pending. reloading:
 // a root already unlocked belongs to the running config and is never recorded for lock-back.
 func unlockPendingGroupRoots(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinCfg, reloading bool) (*pendingGroupUnlock, error) {
 	seen := make(map[string]bool)
@@ -913,8 +895,8 @@ func lockRootRecovering(vault *fscrypt.Vault, root, resourcePath, pinBase string
 // relockStaleVaults runs before the daemon unlocks anything: a root already provisioned means the
 // PREVIOUS daemon exited without locking it (SIGKILL, OOM, power loss). Its pinned guards may still
 // enforce but the key is stale, so lock it back before re-provisioning. Best-effort and loud, never
-// fatal (aborting would leave it unlocked longer). ExecStopPost --lockdown usually did this
-// already; this covers --lockdown being killed mid-widen or never run, via the same
+// fatal (aborting would leave it unlocked longer). ExecStopPost `daemon lockdown` usually did this
+// already; this covers the lockdown being killed mid-widen or never run, via the same
 // recoverPinState/lockRootRecovering path.
 func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault, pinBase string) {
 	rec := recoverPinState("daemon")
@@ -945,7 +927,7 @@ func relockStaleVaults(cfg *daemonconfig.Config, vault *fscrypt.Vault, pinBase s
 	}
 }
 
-// runBPFCheck is `daemon --check`: verifies the BPF-LSM stack is active and every guard eBPF
+// runBPFCheck is `daemon check`: verifies the BPF-LSM stack is active and every guard eBPF
 // program passes THIS kernel's verifier, attaching nothing. `install` runs it on the deployed
 // binary before enabling the service, so a verifier rejection fails the install cleanly instead of
 // at runtime.
@@ -971,7 +953,7 @@ func runBPFCheck() error {
 	return nil
 }
 
-// runGenKey implements --genkey: creates the master key, asking the operator first if one exists
+// runGenKey implements `daemon genkey`: creates the master key, asking the operator first if one exists
 // (regenerating invalidates every fscrypt directory using it).
 func runGenKey() error {
 	exists, err := fscrypt.MasterKeyExists()

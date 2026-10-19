@@ -52,7 +52,7 @@ const (
 	OpConfigPut     = "config_put"
 	OpPasswordState = "password_state"
 	OpSetPassword   = "set_password"
-	// The record workflow (`--edit-config --record`): start on the given paths, poll status, stop
+	// The record workflow (`edit-protected config record`): start on the given paths, poll status, stop
 	// (classified recording), plan a selection (daemon.conf diff), apply the last plan, then delete
 	// the plaintext backups it left.
 	OpRecordStart        = "record_start"
@@ -180,7 +180,7 @@ type User struct {
 	GID  int    `json:"gid"`
 }
 
-// BinaryCheck is what `--forward -w` confirms before admitting a binary.
+// BinaryCheck is what `forward -w` confirms before admitting a binary.
 type BinaryCheck struct {
 	Path         string   `json:"path"`
 	SystemPlaced bool     `json:"system_placed"`

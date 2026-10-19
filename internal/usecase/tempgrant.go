@@ -88,7 +88,7 @@ func (d *daemonUseCase) GrantTemporaryAccess(resourcePaths, binaryPaths []string
 				g.SetEventTap(nil)
 			}
 			rerr = revokeTempGrants(grants)
-			// A failed revoke keeps the journal: `daemon --lockdown` strips what is left.
+			// A failed revoke keeps the journal: `daemon lockdown` strips what is left.
 			if rerr == nil && len(rows) > 0 {
 				rerr = journal(nil)
 			}

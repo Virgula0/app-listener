@@ -62,7 +62,7 @@ func (s *shell) setFloating(on bool) {
 			err = sess.Tile(ctx, win)
 		}
 		if err != nil {
-			log.Warnf("--gui: could not change the window's floating state on %s: %v", sess.Kind, err)
+			log.Warnf("gui: could not change the window's floating state on %s: %v", sess.Kind, err)
 		}
 	}()
 }

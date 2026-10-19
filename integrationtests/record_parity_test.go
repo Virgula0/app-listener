@@ -36,7 +36,7 @@ const (
 )
 
 // The recorder and the guard agree on every operation: each op, run by its own copy of recordops
-// (its own inode, so its mask is that op's alone), is recorded, and the daemon.conf --record would
+// (its own inode, so its mask is that op's alone), is recorded, and the daemon.conf `config record` would
 // write (Classify → Plan → Render, masks on) must then admit the same op. A negative control runs
 // another copy with the recorded mask minus the op's key event, which the guard must deny by
 // exactly that event: it pins the key table to the guard's real semantics, so a guard change that

@@ -47,7 +47,7 @@ func GenerateConf(sections []Section, blocks []LibraryBlock) string {
 }
 
 // GenerateSections renders just the [watch ...] blocks (no file header, each preceded by a blank
-// line), for appending to an existing daemon.conf (install --diff-catalog). Every generated path is
+// line), for appending to an existing daemon.conf (install catalog diff). Every generated path is
 // double-quoted: catalog paths contain spaces (Steam/Proton's "Proton - Experimental") and quoting
 // is the only unambiguous form the parser accepts.
 func GenerateSections(sections []Section) string {

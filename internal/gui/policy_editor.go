@@ -34,7 +34,7 @@ type policyEditor struct {
 	hooks policyHooks
 	mode  workbench.GuardMode
 
-	modes    *widget.RadioGroup
+	modes    *handRadioGroup
 	help     *widget.Label
 	bins     *binaryList
 	enforced *widget.Label
@@ -45,7 +45,7 @@ type policyEditor struct {
 
 func newPolicyEditor(s *shell, hooks policyHooks) *policyEditor {
 	e := &policyEditor{shell: s, hooks: hooks}
-	e.modes = widget.NewRadioGroup(modeLabels, func(label string) {
+	e.modes = newRadioGroup(modeLabels, func(label string) {
 		if e.syncing {
 			return
 		}

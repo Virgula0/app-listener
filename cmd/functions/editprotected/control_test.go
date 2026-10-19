@@ -75,20 +75,3 @@ func TestLiveSessionConfigAndPut(t *testing.T) {
 		t.Fatalf("PutConfig err = %v, want the daemon's refusal", err)
 	}
 }
-
-func TestValidateFlagsEditConfig(t *testing.T) {
-	t.Cleanup(func() { editConfigFlag, forwardFlag, whitelistFlags, resourceFlags = false, false, nil, nil })
-	timeoutSession = SessionTimeoutDefault
-	editConfigFlag = true
-	if err := validateFlags(); err != nil {
-		t.Fatalf("--edit-config alone: %v", err)
-	}
-	forwardFlag, whitelistFlags = true, []string{"/bin/x"}
-	if err := validateFlags(); err == nil {
-		t.Fatal("--edit-config --forward accepted")
-	}
-	forwardFlag, whitelistFlags, resourceFlags = false, nil, []string{"/r"}
-	if err := validateFlags(); err == nil {
-		t.Fatal("--edit-config --resource accepted")
-	}
-}

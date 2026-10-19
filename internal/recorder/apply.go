@@ -172,7 +172,7 @@ func (a *applier) pin(bins []PlannedBinary) ([]PlannedBinary, []string, error) {
 		}
 		if sum, ok, lerr := a.ledger.Lookup(b.Line); lerr == nil && ok && sum != b.SHA256 {
 			notes = append(notes, fmt.Sprintf("%s: the ledger confirms other content for this line, so the "+
-				"daemon admits it only once `app-listener trust-binaries` confirms the current file", b.Line))
+				"daemon admits it only once `app-listener trust` confirms the current file", b.Line))
 		}
 	}
 	return pinned, notes, nil
@@ -209,7 +209,7 @@ func (a *applier) rollback(cause error, encrypted []string, pinned []PlannedBina
 	for i := len(encrypted) - 1; i >= 0; i-- {
 		if err := a.vault.RestoreBackup(encrypted[i]); err != nil {
 			errs = append(errs, fmt.Errorf("restoring %s from %s%s: %w — restore it with `app-listener install "+
-				"--restore-backups`", encrypted[i], encrypted[i], fscrypt.BackupSuffix, err))
+				"install backups restore`", encrypted[i], encrypted[i], fscrypt.BackupSuffix, err))
 		}
 	}
 	for _, b := range pinned {

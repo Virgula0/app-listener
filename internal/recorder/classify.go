@@ -326,7 +326,7 @@ func noteWhitelisted(b *Binary, targets []Target) {
 		b.Whitelisted = append(b.Whitelisted, t.Path)
 		if extra := beyondEvents(b.Ops, t.Existing.Allow[i].Events); len(extra) > 0 {
 			b.Notes = append(b.Notes, fmt.Sprintf("already whitelisted for %s with events %s, but seen doing %s "+
-				"too (denied): widen its line with --edit-config if it needs them", t.Path,
+				"too (denied): widen its line with edit-protected config if it needs them", t.Path,
 				strings.Join(t.Existing.Allow[i].Events, ","), strings.Join(extra, ",")))
 		}
 	}

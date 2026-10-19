@@ -149,9 +149,9 @@ else
 		fail "kernel $KERNEL_RELEASE is too old — monitor needs >= 5.8 (BPF ring buffer)"
 	fi
 	if version_at_least "5.10" "$KVER"; then
-		pass "kernel $KERNEL_RELEASE (>= 5.10, network-guard)"
+		pass "kernel $KERNEL_RELEASE (>= 5.10, network guard)"
 	else
-		fail "kernel $KERNEL_RELEASE < 5.10 — network-guard needs BPF-LSM bpf_link"
+		fail "kernel $KERNEL_RELEASE < 5.10 — network guard needs BPF-LSM bpf_link"
 	fi
 	if version_at_least "5.17" "$KVER"; then
 		pass "kernel $KERNEL_RELEASE (>= 5.17, guard / daemon)"
@@ -161,7 +161,7 @@ else
 	version_at_least "6.2" "$KVER" || warn "kernel < 6.2 — the file_truncate LSM hook is unavailable (ftruncate on a pre-opened fd is not denied; path truncate still is)"
 	# BPF-LSM programs attach through the BPF trampoline, which arm64 gained only in 6.0.
 	if [ "$HOST_ARCH" = aarch64 ] && ! version_at_least "6.0" "$KVER"; then
-		fail "kernel $KERNEL_RELEASE < 6.0 on aarch64 — no arm64 BPF trampoline, so the guard / daemon / network-guard LSM programs cannot attach"
+		fail "kernel $KERNEL_RELEASE < 6.0 on aarch64 — no arm64 BPF trampoline, so the guard / daemon / network guard LSM programs cannot attach"
 	fi
 fi
 
@@ -190,7 +190,7 @@ if [ -z "$CONFIG_SOURCE" ]; then
 else
 	require_config CONFIG_BPF_SYSCALL     "eBPF core"                              fail
 	require_config CONFIG_DEBUG_INFO_BTF  "CO-RE BTF"                              fail
-	require_config CONFIG_BPF_LSM         "guard / network-guard / daemon"        fail
+	require_config CONFIG_BPF_LSM         "guard / network guard / daemon"        fail
 	require_config CONFIG_KPROBES         "monitor (VFS kprobes)"                 fail
 	require_config CONFIG_BPF_EVENTS      "attaching BPF to kprobes/tracepoints"  fail
 	require_config CONFIG_SECURITY_PATH   "path-based LSM hooks (unlink/rename/mkdir/symlink/…)"  warn
@@ -199,7 +199,7 @@ fi
 fi  # BINARY_ONLY
 
 ##############################################################################
-section "BPF LSM activation (guard / network-guard / daemon)"
+section "BPF LSM activation (guard / network guard / daemon)"
 ##############################################################################
 
 lsm_list=""
@@ -244,6 +244,7 @@ elif [ "$BPF_LSM_ACTIVE" -ne 1 ]; then
 elif [ "$(id -u)" -ne 0 ]; then
 	warn "guard eBPF probe skipped — re-run as root to load the programs into the verifier"
 else
+	# `daemon --check`, not `daemon check`: the spelling every release accepts.
 	if probe_out="$("$CHECK_BINARY" daemon --check 2>&1)"; then
 		pass "every guard eBPF program is accepted by this kernel's verifier"
 	else

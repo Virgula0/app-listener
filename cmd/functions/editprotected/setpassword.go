@@ -13,7 +13,7 @@ import (
 // authorizeFirstTimeSetPassword gates creating the FIRST edit-protected password (the transition
 // from "no password" to "live mode armed"), for installs older than the mandatory install-time
 // password. The daemon seals binaries.db so no non-daemon binary can write it, but that check is
-// per-binary, not per-caller: `edit-protected --set-password` IS the daemon binary, so absent this gate any root process could arm live mode on a running
+// per-binary, not per-caller: `edit-protected password` IS the daemon binary, so absent this gate any root process could arm live mode on a running
 // production daemon (whose vaults are unlocked) with no interaction and no proof of ownership, then
 // read every protected resource through the control socket. The audited bootstrap for the first
 // password is `install`; refuse the first-time CLI set while the daemon is running and point there.

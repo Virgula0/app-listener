@@ -27,7 +27,7 @@ import (
 //   - or the ledger was never initialized (first start after an upgrade), or the install wizard
 //     just added the line (binledger.Grant): recorded on that start only.
 //
-// Anything else is refused and listed for `app-listener trust-binaries`. A refused binary gains no
+// Anything else is refused and listed for `app-listener trust`. A refused binary gains no
 // updater or reserved-name writer rights either (SetBinaryResolver): with them it could write a new
 // inode at a confirmed path and have it admitted by provenance.
 type binaryVetter struct {
@@ -63,7 +63,7 @@ func newBinaryVetter(l *binledger.Ledger, out io.Writer) (*binaryVetter, error) 
 	if !initialized {
 		log.Warnf("daemon: the binary ledger %s is new: recording every whitelisted binary found now as "+
 			"confirmed (one time). From the next start, a binary that changed while the daemon was not "+
-			"running is refused until `app-listener trust-binaries` confirms it", binledger.DefaultPath)
+			"running is refused until `app-listener trust` confirms it", binledger.DefaultPath)
 	}
 	return &binaryVetter{ledger: l, out: out, bootstrap: !initialized}, nil
 }
@@ -235,7 +235,7 @@ func (v *binaryVetter) refuse(res *daemonconfig.Resource, line, resolved string,
 		log.Errorf("daemon: recording unconfirmed binary %s: %v", logging.SanitizeText(line), err)
 	}
 	fmt.Fprintf(v.out, "%sDAEMON binary-unconfirmed  resource=%s  path=%s  reason=%s  sha256=%x  — refused; "+
-		"confirm it with `sudo app-listener trust-binaries` if you installed or updated it\n", syslogWarning,
+		"confirm it with `sudo app-listener trust` if you installed or updated it\n", syslogWarning,
 		logging.SanitizeText(res.Path), logging.SanitizeText(line), reason, hash)
 }
 

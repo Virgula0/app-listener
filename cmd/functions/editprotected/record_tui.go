@@ -22,12 +22,12 @@ import (
 	"github.com/Virgula0/app-listener/internal/wizard"
 )
 
-// runRecord is `--edit-config --record <path>...`: record which binaries use the paths, review
+// runRecord is `edit-protected config record <path>...`: record which binaries use the paths, review
 // them, optionally encrypt the paths, then add (or extend) their sections in the running daemon's
 // daemon.conf.
-func runRecord() error {
+func runRecord(paths []string) error {
 	if !term.IsTerminal(os.Stdin.Fd()) {
-		return errors.New("--record needs a terminal: it records until you stop it, then asks you to review")
+		return errors.New("config record needs a terminal: it records until you stop it, then asks you to review")
 	}
 	password := os.Getenv(editPasswordEnv)
 	if password == "" {
@@ -36,7 +36,7 @@ func runRecord() error {
 			return err
 		}
 	}
-	flow, err := newRecordFlow(password, recordFlags)
+	flow, err := newRecordFlow(password, paths)
 	if err != nil {
 		return err
 	}
@@ -257,7 +257,7 @@ func reviewRecording(flow *recordFlow, rec *recorder.Recording) (recorder.Select
 		empty, cerr := wizard.Confirm(wizard.Question{
 			Title: "No binary selected: guard the new paths with an empty whitelist?",
 			Description: "Every access to them would be denied until you edit the section " +
-				"(edit-protected --edit-config).",
+				"(edit-protected config).",
 			Affirmative: "Guard, deny all", Negative: "Cancel",
 		})
 		if cerr != nil || !empty {
@@ -436,7 +436,7 @@ func offerBackupDeletion(flow *recordFlow, out *recorder.Outcome) error {
 			return err
 		}
 		if !remove {
-			log.Warnf("kept %s: delete it later with `app-listener install --delete-post-backups`", b)
+			log.Warnf("kept %s: delete it later with `app-listener install backups delete`", b)
 			continue
 		}
 		if err := flow.deleteBackup(b); err != nil {

@@ -19,17 +19,17 @@ import (
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
-// forwardEvents are the event types a temporary rule may name (`--forward -e`).
+// forwardEvents are the event types a temporary rule may name (`edit-protected forward -e`).
 var forwardEvents = []string{"OPEN", "READ", "WRITE", "DELETE", "RENAME", "SYMLINK", "HARDLINK", "MKDIR", "MMAP",
 	"ATTR", "STAT", "MKNOD"}
 
-// forwardForm is the setup of `edit-protected --forward -w/-b [-e]`.
+// forwardForm is the setup of `edit-protected forward -w/-b [-e]`.
 type forwardForm struct {
 	p      *protectedPage
 	bins   []string
 	list   *fyne.Container
 	path   *widget.Entry
-	rule   *widget.RadioGroup
+	rule   *handRadioGroup
 	events *checkGrid
 }
 
@@ -48,7 +48,7 @@ func (p *protectedPage) startForward() {
 	f.path = widget.NewEntry()
 	f.path.SetPlaceHolder("/usr/bin/vim")
 	f.path.OnSubmitted = func(string) { f.addTyped() }
-	f.rule = widget.NewRadioGroup([]string{ruleAdmit, ruleDeny}, nil)
+	f.rule = newRadioGroup([]string{ruleAdmit, ruleDeny}, nil)
 	f.rule.Required = true
 	f.rule.SetSelected(ruleAdmit)
 	f.events = newCheckGrid(forwardEvents)

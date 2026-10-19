@@ -21,31 +21,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/tui"
 )
 
-// validateForwardFlags enforces the --forward flag surface: -w/-b/-e/--yes only with it, -w xor -b
-// required with it, and no editor or password flags alongside.
-func validateForwardFlags() error {
-	if !forwardFlag {
-		if len(whitelistFlags)+len(blacklistFlags)+len(eventsFlags) > 0 || yesFlag {
-			return errors.New("-w, -b, -e and --yes work only with --forward")
-		}
-		return nil
-	}
-	if err := validateForwardRule(); err != nil {
-		return err
-	}
-	if putFlag != "" || contentFileFlag != "" || setPasswordFlag {
-		return errors.New("--forward can't be combined with --put, --content-file or --set-password")
-	}
-	return nil
-}
-
-func validateForwardRule() error {
-	switch {
-	case len(whitelistFlags) > 0 && len(blacklistFlags) > 0:
-		return errors.New("--whitelist and --blacklist are mutually exclusive")
-	case len(whitelistFlags) == 0 && len(blacklistFlags) == 0:
-		return errors.New("--forward needs binaries: -w <binary> to admit or -b <binary> to deny")
-	}
+func validateForwardEvents() error {
 	_, err := common.ParseEventsFlag(eventsFlags)
 	return err
 }
@@ -67,7 +43,7 @@ func forwardBinaries() ([]string, error) {
 	return out, nil
 }
 
-// runForward is the --forward flow: confirm risky binaries, authenticate (before any protected
+// runForward is the forward flow: confirm risky binaries, authenticate (before any protected
 // path is shown), pick resources, activate the grant, and hold it until the operator or the daemon
 // ends it.
 func runForward() error {
@@ -93,7 +69,7 @@ func runForward() error {
 		return err
 	}
 	defer session.End()
-	session.timeout = timeoutSession
+	session.timeout = idleTimeout
 
 	resources, err := session.Authenticate(password)
 	if err != nil {
@@ -117,7 +93,7 @@ func runForward() error {
 	}
 	log.Warnf("temporary access active: %s %s on %s (events %s) — revoked at exit, or after %s "+
 		"without activity", strings.Join(bins, ", "), verb, strings.Join(chosen, ", "), eventsLabel(),
-		timeoutSession)
+		idleTimeout)
 	return holdForward(session, chosen, bins, allow)
 }
 
@@ -188,15 +164,15 @@ func forwardCheck(path string) (systemPlaced bool, runtimes []string, err error)
 	return b.SystemPlaced, b.RuntimeNames(), nil
 }
 
-// chooseResources honors --resource (each must be in the daemon's list), otherwise asks.
+// chooseResources honors forward --resource (each must be in the daemon's list), otherwise asks.
 func chooseResources(resources []string) ([]string, error) {
-	if len(resourceFlags) > 0 {
-		for _, r := range resourceFlags {
+	if len(forwardResources) > 0 {
+		for _, r := range forwardResources {
 			if !slices.Contains(resources, r) {
 				return nil, fmt.Errorf("%s is not a guarded directory in the running daemon", r)
 			}
 		}
-		return resourceFlags, nil
+		return forwardResources, nil
 	}
 	if len(resources) == 1 {
 		log.Infof("only one guarded directory: %s", resources[0])
@@ -239,7 +215,7 @@ func holdForward(session *liveSession, resources, bins []string, allow bool) err
 			mode = guard.ModeWhitelist
 		}
 		model := tui.NewGuardModel(events, strings.Join(resources, ", "), mode, displayEntries(bins))
-		byDaemon, err := tui.RunSession(model, session.Pinger(pingInterval(timeoutSession)), ended)
+		byDaemon, err := tui.RunSession(model, session.Pinger(pingInterval(idleTimeout)), ended)
 		if err != nil {
 			return err
 		}

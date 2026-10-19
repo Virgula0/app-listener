@@ -46,7 +46,7 @@ func tcpServer(port string) {
 	}
 	fd := connFD(conn)
 	// Use sendto/recvfrom so the sendmsg/sendto and recvfrom/recvmsg
-	// tracepoints in network-monitor fire (plain write(2) is not traced).
+	// tracepoints of network monitor fire (plain write(2) is not traced).
 	_ = unix.Sendto(fd, []byte("ok\n"), 0, nil)
 	buf := make([]byte, 64)
 	_, _, _ = unix.Recvfrom(fd, buf, 0)

@@ -7,6 +7,6 @@ package gui
 // toolkit. Callers of Run must check it first.
 const Available = false
 
-// Run is unreachable in the default build (the --gui entry checks Available and errors out); it
+// Run is unreachable in the default build (cmd.Execute runs the window only when Available); it
 // exists only so the package compiles without the `gui` tag.
 func Run(*Options) error { return nil }

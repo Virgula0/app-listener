@@ -1,7 +1,6 @@
-// Package trustbinaries implements `app-listener trust-binaries`: review and confirm the
-// whitelisted binaries the daemon refused because their content is not the one recorded for their
-// whitelist line (issue #80).
-package trustbinaries
+// Package trust implements `app-listener trust`: review and confirm the whitelisted binaries the
+// daemon refused because their content is not the one recorded for their whitelist line (issue #80).
+package trust
 
 import (
 	"errors"
@@ -27,26 +26,47 @@ var (
 	noReload bool
 )
 
-// TrustBinariesCmd lists the binaries the daemon refused and records the confirmed ones.
-var TrustBinariesCmd = &cobra.Command{
-	Use:   "trust-binaries [path...]",
-	Short: "Confirm whitelisted binaries the daemon refused (changed or new while it was not running)",
-	Long: `The daemon records the content hash of every whitelisted binary it admits. A binary whose
-content differs from the recorded one, or a new whitelist line, is refused unless only root could
-have placed it or the app's own updater created it while the daemon ran: nothing guards those
-paths while the daemon is stopped, booting or being reinstalled.
+// TrustCmd reviews the binaries the daemon refused and records the confirmed ones.
+var TrustCmd = &cobra.Command{
+	Use:   "trust",
+	Short: "Confirm whitelisted binaries the daemon refused (changed or new while it was stopped)",
+	Long: `The daemon records the content hash of every whitelisted binary it admits. One
+whose content differs, or a new whitelist line, is refused unless only root
+could have placed it or the app's own updater wrote it while the daemon ran.
 
-Without arguments, lists the refused binaries and asks to confirm each one. With paths, confirms
-those whitelist lines as they are now (e.g. a line you added to daemon.conf by hand). A running
-daemon is reloaded afterwards so confirmed binaries are admitted.`,
+This lists the refused binaries and asks to confirm each; a running daemon is
+then reloaded so the confirmed ones are admitted.`,
+	Example: `  sudo app-listener trust
+  sudo app-listener trust list
+  sudo app-listener trust add /home/alice/.local/bin/tool`,
+	Args: cobra.NoArgs,
 	RunE: run,
 }
 
+var listCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List the refused binaries without confirming any",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		listOnly = true
+		return run(cmd, args)
+	},
+}
+
+var addCmd = &cobra.Command{
+	Use:   "add PATH...",
+	Short: "Confirm whitelist lines as they are now (e.g. one you added to daemon.conf by hand)",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  run,
+}
+
 func init() {
-	TrustBinariesCmd.Flags().BoolVar(&listOnly, "list", false, "Only list the refused binaries")
-	TrustBinariesCmd.Flags().BoolVar(&yesAll, "yes", false, "Confirm every listed binary without asking")
-	TrustBinariesCmd.Flags().BoolVar(&noReload, "no-reload", false,
-		"Don't reload a running daemon afterwards (confirmed binaries are admitted at its next reload)")
+	for _, c := range []*cobra.Command{TrustCmd, addCmd} {
+		c.Flags().BoolVarP(&yesAll, "yes", "y", false, "Confirm every binary without asking")
+		c.Flags().BoolVar(&noReload, "no-reload", false,
+			"Don't reload a running daemon (confirmed binaries are admitted at its next reload)")
+	}
+	TrustCmd.AddCommand(listCmd, addCmd)
 }
 
 type candidate struct {
@@ -57,7 +77,7 @@ type candidate struct {
 
 func run(cmd *cobra.Command, args []string) error {
 	if os.Geteuid() != 0 {
-		return errors.New("trust-binaries must run as root")
+		return errors.New("trust must be run as root: sudo app-listener trust")
 	}
 	if _, err := os.Stat(filepath.Dir(binledger.DefaultPath)); err != nil {
 		return fmt.Errorf("no %s: is the daemon installed? (%w)", filepath.Dir(binledger.DefaultPath), err)
@@ -93,7 +113,7 @@ func run(cmd *cobra.Command, args []string) error {
 }
 
 // confirmAll describes each candidate and records the ones confirmed (all with --yes, none with
-// --list), returning how many.
+// `trust list`), returning how many.
 func confirmAll(out io.Writer, l *binledger.Ledger, cands []candidate) (int, error) {
 	confirmed := 0
 	for i := range cands {

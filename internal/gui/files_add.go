@@ -32,7 +32,7 @@ func (p *filesPage) addTarget() {
 	depth.SetText("0")
 	depthHint := mutedText("0 = every level")
 	depthHint.Wrapping = fyne.TextWrapOff
-	recursive := widget.NewCheck("Include subfolders", func(on bool) {
+	recursive := newCheck("Include subfolders", func(on bool) {
 		if on {
 			depth.Enable()
 		} else {

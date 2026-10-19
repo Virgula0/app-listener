@@ -4,7 +4,7 @@ The daemon reads `/etc/app-listener/daemon.conf`. The install wizard writes it f
 [catalog](catalog.md); this page is for reading it or editing it by hand. The fully commented
 template is [`daemon-samples/daemon.conf`](../daemon-samples/daemon.conf).
 
-To change the config of a running daemon, prefer `sudo app-listener edit-protected --edit-config`
+To change the config of a running daemon, prefer `sudo app-listener edit-protected config`
 ([edit-protected](edit-protected.md#editing-the-daemon-config)): the file is self-guarded, and that
 path validates the new config by reloading it and puts the old one back if the reload fails.
 
@@ -163,5 +163,5 @@ max_inodes: 65536
 detach, and a malformed config keeps the previous one running. A reload never drops a guarded
 resource (stop, edit and start for that), except a `lib_dir` whose directory its writer deleted
 (an app's old version dir after an update), which it drops as a restart would. Binaries added by hand are vetted
-like any other: one that isn't root-placed needs `sudo app-listener trust-binaries`
-([Binary trust](binary-trust.md#trust-binaries)).
+like any other: one that isn't root-placed needs `sudo app-listener trust`
+([Binary trust](binary-trust.md#trust)).
