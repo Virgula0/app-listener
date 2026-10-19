@@ -45,6 +45,9 @@ jobs:
   build:
     needs: meta
     uses: ./.github/workflows/_build-release.yml
+    # A called job's environment secrets resolve empty unless the caller passes them; `sign`
+    # then reads the `release` environment's copy, which takes precedence.
+    secrets: inherit
     with:
       version: ${{ needs.meta.outputs.tag }}
       ref: ${{ github.sha }}

@@ -17,7 +17,8 @@ name: Build & sign release assets
 # third-party actions, any of which could read a secret from a later step on the
 # same runner. `sign` runs on a fresh runner with only GitHub's own actions, and
 # reads RELEASE_SIGNING_KEY from the `release` environment (required reviewer,
-# main / v* only), so a pushed workflow can't read it without approval.
+# main / v* only), so a pushed workflow can't read it without approval. Callers
+# must use `secrets: inherit`, or the environment secret resolves empty.
 
 on:
   workflow_call:
@@ -188,8 +189,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${SIGNING_KEY:-}" ]; then
-            # A repository secret is not visible here: the called workflow gets no caller secrets.
-            echo "::error::RELEASE_SIGNING_KEY is not set as a secret of the 'release' environment (a repository secret of that name is not passed to this job)"
+            # Empty also when a caller omits `secrets: inherit`: environment secrets need it too.
+            echo "::error::RELEASE_SIGNING_KEY is empty: set it in the 'release' environment and call this workflow with secrets: inherit"
             exit 1
           fi
           key="$RUNNER_TEMP/app-listener-signing-key.pem"
