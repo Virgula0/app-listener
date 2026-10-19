@@ -1482,6 +1482,48 @@ func (s *IntegrationSuite) TestGuard_Bypass_PtraceRace() {
 	s.stopGuard(c)
 }
 
+// ptrace_seize is the SEIZE-after-normal-exec sibling of ptrace_race. The victim execs the
+// whitelisted binary UNTRACED and runs to a ready barrier before the tracer attaches, so this does
+// not exercise bprm_check_security's traced-exec gate (no exec happens under trace). It exercises
+// the taint-at-exec invariant instead: execing a whitelisted image taints the process immediately,
+// so by the time the non-whitelisted tracer PTRACE_SEIZEs, the victim is already tainted and
+// ptrace_access_check denies the attach. Two copies with distinct inodes separate identities:
+//   - /exploits/seize_victim is whitelisted (-w);
+//   - /exploits/seize_tracer (NOT whitelisted) forks the victim, lets it exec normally, waits for
+//     its ready-file, then SEIZEs and dumps the heap with PTRACE_PEEKDATA.
+//
+// Vulnerable: the seize is allowed and the dump succeeds (SECRET_DUMP|SUCCESS, exit 0). Fixed: the
+// seize is denied (exit 3), no dump.
+func (s *IntegrationSuite) TestGuard_Bypass_PtraceSeizePostExec() {
+	c := s.guardContainer()
+	// pooled: terminated at suite end
+
+	s.exec(c, []string{"mkdir", "-p", "/protected", "/exploits"})
+	// Must exist before the guard starts: files created afterwards are
+	// not in the BPF inode map and would not be protected.
+	s.exec(c, []string{"sh", "-c", "echo 'TOP-SECRET-CONTENT' > /protected/secret && chmod 755 /protected && chmod 644 /protected/secret"})
+
+	victimHostPath := absPath("./exploits/ptrace_seize")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, victimHostPath, "/exploits/seize_victim", 0755), "copy seize_victim")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, victimHostPath, "/exploits/seize_tracer", 0755), "copy seize_tracer")
+
+	// Only the victim copy is whitelisted; the tracer copy keeps a distinct
+	// inode and must never gain allow rights.
+	s.startGuardStd(c, "/protected", "-w", "/exploits/seize_victim")
+
+	code, out := s.exec(c, []string{"sh", "-c",
+		"rm -f /tmp/seize_addr* /tmp/seize_go /tmp/seize_done /tmp/seize_ready; " +
+			"timeout 60 /exploits/seize_tracer tracer /exploits/seize_victim " +
+			"/protected/secret /tmp/seize_addr /tmp/seize_go /tmp/seize_done /tmp/seize_ready"})
+	s.T().Logf("tracer exit=%d out=%q", code, out)
+
+	s.Require().NotEqualf(0, code, "ptrace SEIZE of an already-tainted whitelisted victim must be blocked")
+	s.Require().NotContains(out, "SECRET_DUMP|SUCCESS",
+		"tracer exfiltrated guarded content from the victim heap: %s", out)
+
+	s.stopGuard(c)
+}
+
 // Bypass: in-place whitelisted binary replacement. The whitelist is keyed by exe inode, so an
 // attacker who can write a whitelisted binary OUTSIDE the guarded tree (`cat payload > /tmp/app`,
 // same inode) makes the payload inherit the entry. swap_benign is the whitelisted placeholder,
