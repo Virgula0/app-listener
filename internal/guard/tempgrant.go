@@ -80,7 +80,8 @@ func (b *TempBinary) RuntimeNames() []string {
 	for _, c := range []struct {
 		bit  uint8
 		name string
-	}{{trustedNode, "Node"}, {trustedElectron, "Electron"}, {trustedChromium, "Chromium"}, {trustedJVM, "JVM"}} {
+	}{{trustedNode, "Node"}, {trustedElectron, "Electron"}, {trustedChromium, "Chromium"}, {trustedJVM, "JVM"},
+		{trustedBun, "Bun"}} {
 		if b.Runtime&c.bit != 0 {
 			out = append(out, c.name)
 		}

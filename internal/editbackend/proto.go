@@ -15,11 +15,13 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Virgula0/app-listener/internal/recorder"
 )
 
 // Proto is the wire version; both sides refuse a mismatch (GUI and installed binary of different
 // releases).
-const Proto = 2
+const Proto = 3
 
 // MaxLine bounds one JSON line: a write's content (base64, up to MaxWriteBytes) plus framing.
 const MaxLine = 8 << 20
@@ -50,6 +52,15 @@ const (
 	OpConfigPut     = "config_put"
 	OpPasswordState = "password_state"
 	OpSetPassword   = "set_password"
+	// The record workflow (`--edit-config --record`): start on the given paths, poll status, stop
+	// (classified recording), plan a selection (daemon.conf diff), apply the last plan, then delete
+	// the plaintext backups it left.
+	OpRecordStart        = "record_start"
+	OpRecordStatus       = "record_status"
+	OpRecordStop         = "record_stop"
+	OpRecordPlan         = "record_plan"
+	OpRecordApply        = "record_apply"
+	OpRecordDeleteBackup = "record_delete_backup"
 )
 
 // Kinds of backend messages: a reply to one request, or an unsolicited event.
@@ -59,6 +70,8 @@ const (
 	KindEvent = "event"
 	// KindEnded: the daemon ended the session (idle timeout, reload, a granted binary changed).
 	KindEnded = "ended"
+	// KindProgress reports a long step of record_apply (an encryption's copy).
+	KindProgress = "progress"
 )
 
 // Request is one GUI -> backend message. Paths are relative to the opened resource ("." = itself).
@@ -81,6 +94,8 @@ type Request struct {
 	Binaries    []string `json:"binaries,omitempty"`
 	Allow       bool     `json:"allow,omitempty"`
 	Events      []string `json:"events,omitempty"`
+	// Selection is record_plan's choice among the recording's binaries, libraries and paths.
+	Selection *recorder.Selection `json:"selection,omitempty"`
 }
 
 // Message is one backend -> GUI message.
@@ -104,6 +119,24 @@ type Message struct {
 	Event      *Event        `json:"event,omitempty"`
 	// Stale: a config_put found daemon.conf changed since Base; Data is the current file.
 	Stale bool `json:"stale,omitempty"`
+	// Base is the daemon.conf a record_plan diff is against (Data is the new file).
+	Base []byte `json:"base,omitempty"`
+
+	// RecordTargets are record_start's validated paths, each with the section it already has.
+	RecordTargets  []recorder.Target   `json:"record_targets,omitempty"`
+	RecordProgress *recorder.Progress  `json:"record_progress,omitempty"`
+	Recording      *recorder.Recording `json:"recording,omitempty"`
+	// EncryptBlockers maps each recorded path to why it can't be encrypted live ("" = it can).
+	EncryptBlockers map[string]string `json:"encrypt_blockers,omitempty"`
+	// Backups are the plaintext migration copies a record_apply left.
+	Backups  []string  `json:"backups,omitempty"`
+	Progress *Progress `json:"progress,omitempty"`
+}
+
+// Progress is one KindProgress update.
+type Progress struct {
+	Step     string  `json:"step"`
+	Fraction float64 `json:"fraction"`
 }
 
 // Hello is the backend's mode report, the same decision `edit-protected` makes from its flags.

@@ -29,6 +29,8 @@
 #define PROT_WRITE 0x2    // mmap prot
 #define MAP_SHARED 0x1    // mmap flags
 
+#include "prctl_gate.h"
+
 // guard_config[0] modes: 0/1 = blacklist/whitelist. GUARD_MODE_READONLY (2): every process may
 // READ, only whitelisted binaries may modify (write, truncate, rename, unlink, chmod, mkdir, mknod,
 // xattr, writable mmap, mount-over). For /etc/app-listener (world-readable daemon.conf).
@@ -2352,6 +2354,13 @@ static __always_inline int current_is_inspector(void)
 	if (bpf_map_lookup_elem(&trust_code_suspect, &tgid))
 		return 0;
 	return !exe_refused((struct task_struct *)bpf_get_current_task(), &ik);
+}
+
+// guard_task_prctl: this guard's identity IS mm->exe_file; see prctl_gate.h.
+SEC("lsm/task_prctl")
+int guard_task_prctl(unsigned long long *ctx)
+{
+	return prctl_gate(ctx);
 }
 
 // Block ptrace/process_vm_readv/writev against any tainted process (one holding guarded content in

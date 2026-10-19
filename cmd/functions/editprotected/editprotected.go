@@ -33,6 +33,7 @@ var (
 	yesFlag         bool
 	timeoutSession  time.Duration
 	editConfigFlag  bool
+	recordFlags     []string
 	backendFlag     bool
 )
 
@@ -67,6 +68,15 @@ new secret, a freshly dropped executable).
 password): saving shows the diff, then the daemon writes it and reloads. If the
 reload fails, the daemon keeps the current configuration, restores the file,
 and you can edit again. --content-file <file> replaces it without the editor.
+
+--edit-config --record <path> (repeatable) adds new guarded paths by learning who
+uses them: it records every access to the paths, keyed by the executable's
+inode, until you stop it, lists the binaries (and the libraries they load) for
+you to approve, can encrypt the paths first, then adds one section per path and
+reloads the daemon. A path daemon.conf already guards is extended instead: its
+current whitelist is shown and kept, and only new lines are added (the guard
+keeps denying the rest while recording). Anything that touched the paths while
+recording is listed, malware included: approve only what you ran on purpose.
 
 Use --set-password to change the edit-protected password: it asks the
 current one first (checked by the running daemon, or with the daemon stopped
@@ -119,6 +129,9 @@ func init() {
 	EditProtectedCmd.Flags().BoolVar(&editConfigFlag, "edit-config", false,
 		"Edit the running daemon's daemon.conf (live mode): saving reloads it; a configuration that fails to "+
 			"reload is not kept (with --content-file: replace it non-interactively)")
+	EditProtectedCmd.Flags().StringArrayVar(&recordFlags, "record", nil,
+		"With --edit-config: record which binaries use this new path (repeatable), then add it to daemon.conf "+
+			"with the binaries you approve")
 	EditProtectedCmd.Flags().BoolVar(&yesFlag, "yes", false,
 		"With --forward: don't ask before admitting a binary that isn't root-placed (required without a terminal)")
 	EditProtectedCmd.Flags().BoolVar(&backendFlag, "backend", false,
@@ -138,6 +151,9 @@ func validateFlags() error {
 	}
 	if editConfigFlag && (forwardFlag || putFlag != "" || setPasswordFlag || len(resourceFlags) > 0) {
 		return errors.New("--edit-config can't be combined with --forward, --put, --resource or --set-password")
+	}
+	if len(recordFlags) > 0 && (!editConfigFlag || contentFileFlag != "") {
+		return errors.New("--record needs --edit-config, without --content-file")
 	}
 	return nil
 }

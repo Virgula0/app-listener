@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sync"
 	"syscall"
@@ -32,6 +33,9 @@ const (
 	// is vetted).
 	OpaqueMulticall
 )
+
+// uutilsMulticallName is the name a uutils build dispatches on argv[1] under (`coreutils head`).
+const uutilsMulticallName = "coreutils"
 
 // MulticallNameMax bounds an applet name, NUL included: the kernel's name key (guard.bpf.c).
 const MulticallNameMax = 16
@@ -198,13 +202,20 @@ func rootPlacedFile(f *os.File) bool {
 // set (Ubuntu ships sha3sum links that run sum). Run through /proc/self/fd so uutils takes the applet
 // from argv[0] (`coreutils` = argv[1] dispatch), as nobody with an empty environment.
 func listUutilsApplets(f *os.File) ([]string, error) {
+	g, err := coreutilsLink(f)
+	if err != nil {
+		return nil, err
+	}
+	if g != f {
+		defer g.Close()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/proc/self/fd/3", "--list")
-	cmd.Args[0] = "coreutils"
+	cmd.Args[0] = uutilsMulticallName
 	cmd.Env = []string{}
 	cmd.Dir = "/"
-	cmd.ExtraFiles = []*os.File{f}
+	cmd.ExtraFiles = []*os.File{g}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: 65534, Gid: 65534, NoSetGroups: false},
 		Setsid:     true,
@@ -231,10 +242,39 @@ func listUutilsApplets(f *os.File) ([]string, error) {
 	return applets, nil
 }
 
+// coreutilsLink is f when it was reached through a `coreutils` name, else a root-placed `coreutils`
+// link of f's inode (f's directory, /usr/bin, /bin), else f. Ubuntu's uutils (require-utility-to-
+// be-invoked-at-matching-path) exits unless argv[0] is the name /proc/self/exe was reached through,
+// so `--list` through an applet link fails there; upstream builds list through any name.
+func coreutilsLink(f *os.File) (*os.File, error) {
+	resolved, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	if filepath.Base(resolved) == uutilsMulticallName {
+		return f, nil
+	}
+	dev, ino, err := StatFile(f)
+	if err != nil {
+		return nil, err
+	}
+	for _, dir := range []string{filepath.Dir(resolved), "/usr/bin", "/bin"} {
+		g, oerr := OpenSystemPlaced(filepath.Join(dir, uutilsMulticallName))
+		if oerr != nil {
+			continue
+		}
+		if d, i, serr := StatFile(g); serr == nil && d == dev && i == ino {
+			return g, nil
+		}
+		g.Close()
+	}
+	return f, nil
+}
+
 // validAppletName: what the kernel can match (fits its key, no path separator) and a name uutils
 // dispatches on as-is (no '.': file_stem would cut it).
 func validAppletName(name string) bool {
-	if name == "" || len(name) >= MulticallNameMax || name == "coreutils" {
+	if name == "" || len(name) >= MulticallNameMax || name == uutilsMulticallName {
 		return false
 	}
 	for _, c := range []byte(name) {

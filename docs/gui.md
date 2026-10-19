@@ -180,6 +180,7 @@ and the password's state.
 | Edit protected files | `edit-protected` |
 | Temporary access | `edit-protected --forward -w/-b [-e]` |
 | Daemon configuration | `edit-protected --edit-config` |
+| Record access | `edit-protected --edit-config --record <path>` |
 | Change the password (asks the current one; it can't be removed) | `--set-password` |
 | Live session idle timeout | `--timeout-session` (5 minutes to 4 hours) |
 
@@ -206,6 +207,18 @@ idle timeout, or a reload.
 shows the diff and, once confirmed, the daemon writes and reloads it. If the file changed
 meanwhile, nothing is written and the next review diffs against the current file. A configuration
 that fails to reload is not kept.
+
+**Record access** takes the new directories and files to guard (typed, or picked with **Folder...**
+and **File...**), then the password; the paths are sent only after it is accepted. The page then
+shows the elapsed time and the latest accesses until **Stop**. The review lists the programs that
+touched the paths (root-placed ones checked), the libraries they need allowed (unchecked), whether
+to restrict each program to the operations it was seen doing, and the paths to encrypt (a path
+that can't be encrypted says why). **Review** shows the `daemon.conf` diff; once confirmed, the
+paths are encrypted, the daemon reloads, and each plaintext backup is offered for deletion. A path
+`daemon.conf` already guards is extended instead: the recording page and the review warn about it
+and show its current whitelist (**ALREADY IN DAEMON.CONF**), programs it already whitelists are listed
+under **ALREADY WHITELISTED** and can't be checked, and encryption isn't offered for it. The rules are
+the terminal's; see [edit-protected.md](edit-protected.md#recording-a-new-path---record).
 
 One session runs at a time, and none while an installer or updater run is in progress or a guard
 runs in this window (it would deny the backend's reads and writes). Closing the window during a

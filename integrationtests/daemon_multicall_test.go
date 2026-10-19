@@ -479,8 +479,10 @@ func multicallBypasses() []mcBypass {
 	return []mcBypass{
 		// Positive controls.
 		{label: "head link (control)", run: headLink + " --version", admit: true},
-		{label: "symlink head->cat (control)", setup: "ln -sf " + catLink + " /usr/local/bin/head",
-			run: "/usr/local/bin/head --version", admit: true}, // same inode, attested head: identity is the name, not the path
+		// Same inode under another path, attested head: identity is the name, not the path. A hard
+		// link, not a symlink to the cat link: Ubuntu's uutils refuses an argv[0] /proc/self/exe disagrees with.
+		{label: "hard link head elsewhere (control)", setup: "ln -f " + uutilsMulticall + " /usr/local/bin/head",
+			run: "/usr/local/bin/head --version", admit: true},
 		{label: "gnuhead own inode (control)", run: "/usr/bin/gnuhead --version", admit: true},
 
 		// exec -a: argv[0] forced (via a nested bash, whose exec replaces it), so argv[0] disagrees
@@ -636,13 +638,17 @@ func (s *IntegrationSuite) TestDaemon_Multicall_UpgradeKeepsAppletIdentity() {
 	s.Require().Equal([]bool{true, false}, s.mcLanded(c, dir, head, cat), "baseline: head admitted, cat not")
 
 	old := s.inodeOf(c, uutilsDir+"/head")
-	upgrade := "set -e; cd " + uutilsDir + "; cp -p head .new; for f in *; do " +
-		`[ "$(stat -c %i "$f")" = "` + old + `" ] || continue; ln -f .new ".tmp-$f"; mv -f ".tmp-$f" "$f"; done; rm .new`
+	// /usr/bin/coreutils too, as dpkg does: it is the name the new build's applets are listed through.
+	upgrade := "set -e; cd " + uutilsDir + "; cp -p head .new; for f in * " + uutilsMulticall + "; do " +
+		`[ "$(stat -c %i "$f")" = "` + old + `" ] || continue; t="$(dirname "$f")/.tmp-$(basename "$f")"; ` +
+		`ln -f .new "$t"; mv -f "$t" "$f"; done; rm .new`
 	code, out := s.exec(c, []string{"bash", "-c", upgrade + " 2>&1"})
 	s.Require().Equalf(0, code, "the upgrade: %s", out)
 	s.Require().NotEqual(old, s.inodeOf(c, uutilsDir+"/head"), "fixture: the upgrade must make a new inode")
 	s.Require().Equal(s.inodeOf(c, uutilsDir+"/head"), s.inodeOf(c, uutilsDir+"/cat"),
 		"fixture: the applets must share the new inode")
+	s.Require().Equal(s.inodeOf(c, uutilsDir+"/head"), s.inodeOf(c, uutilsMulticall),
+		"fixture: the upgrade must move "+uutilsMulticall+" too")
 
 	// Each denial schedules a re-sync; the re-admission needs no reload.
 	var got []bool

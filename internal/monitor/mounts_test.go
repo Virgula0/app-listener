@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+	"golang.org/x/sys/unix"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
@@ -130,4 +131,41 @@ func (s *mountsUnitTest) TestFilterEventSymlinkRelativeBody() {
 	s.Require().True(m.filterEvent(ev, &ebpf.BpfEvent{Dev: tmpfsDev}))
 	s.Require().Equal("/tmp/watch/lnk", ev.Path)
 	s.Require().Equal("/tmp/target", ev.Dest)
+}
+
+// An executable is named only through an inode match: a pid reused by another program names nothing.
+func (s *mountsUnitTest) TestExeOfNamesOnlyTheReportedInode() {
+	m := s.newMonitor()
+	m.exes = map[exeKey]string{}
+	dev, ino, err := ebpf.StatInode("/proc/self/exe")
+	s.Require().NoError(err)
+	want, err := os.Readlink("/proc/self/exe")
+	s.Require().NoError(err)
+	pid := uint32(os.Getpid())
+	s.Require().Empty(m.exeOf(pid, dev, ino+1))
+	s.Require().Empty(m.exeOf(pid, 0, 0))
+	s.Require().Equal(want, m.exeOf(pid, dev, ino))
+	s.Require().Equal(want, m.exes[exeKey{dev, ino}], "cached for after the process exited")
+}
+
+func (s *mountsUnitTest) TestExecEventsNameExecutablesAndApplets() {
+	m := s.newMonitor()
+	m.exes, m.execs = map[exeKey]string{}, map[uint32]string{}
+	ev := &ebpf.FileEvent{PID: 42, Path: "/bin/tool", Dest: "/tmp/watch/link", ExeDev: 5, ExeIno: 6}
+	m.noteExec(ev, &ebpf.BpfEvent{Dev: tmpfsDev})
+	s.Require().Equal("/tmp/bin/tool", m.exes[exeKey{5, 6}])
+	s.Require().Equal("/tmp/watch/link", m.execs[42])
+}
+
+func (s *mountsUnitTest) TestExecMappingsPassOnlyWhenAsked() {
+	m := s.newMonitor()
+	lib := &ebpf.FileEvent{Type: ebpf.EventMmap, Prot: unix.PROT_READ | unix.PROT_EXEC, Path: "/usr/lib/libc.so.6"}
+	kernel := &ebpf.BpfEvent{Dev: rootDev}
+	s.Require().False(m.isExecMapping(lib, kernel))
+	m.RecordExecMappings(true)
+	s.Require().True(m.isExecMapping(lib, kernel))
+	data := *lib
+	data.Prot = unix.PROT_READ
+	s.Require().False(m.isExecMapping(&data, kernel), "a data mapping is not a library load")
+	s.Require().False(m.isExecMapping(lib, &ebpf.BpfEvent{}), "the fd-named tracepoint twin is not used")
 }

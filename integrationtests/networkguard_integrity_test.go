@@ -210,3 +210,30 @@ echo MOUNTED`
 		s.stopNetGuard(c)
 	}
 }
+
+// TestNetworkGuard_Bypass_PrctlExeFileSwap: the network-guard -w variant of
+// TestDaemon_Bypass_PrctlExeFileSwap, with no daemon (whose guard would gate prctl for it). A non
+// whitelisted process repoints its exe_file at the whitelisted probe via prctl(PR_SET_MM) and
+// connects; netg_task_prctl refuses the swap, so the connect is judged on its own inode.
+func (s *IntegrationSuite) TestNetworkGuard_Bypass_PrctlExeFileSwap() {
+	c := s.netIntegrityContainer()
+	swap := netIntDir + "/prctl_exe_swap"
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/prctl_exe_swap"), swap, 0o755),
+		"copy prctl_exe_swap")
+	s.requireDistinctExes(c, swap, netIntProbe)
+	s.startNetworkGuardStd(c, "-w", guardBinaryFlag(netIntProbe))
+	defer s.stopNetGuard(c)
+
+	const dst = " tcp:127.0.0.1:1"
+	s.Require().Contains(s.netIntRun(c, netIntProbe+" connect"+netIntDst), "rc=ECONNREFUSED",
+		"baseline: the whitelisted probe connects")
+	s.Require().Contains(s.netIntRun(c, swap+" --noswap "+netIntProbe+dst), "rc=EPERM",
+		"baseline: the non-whitelisted exploit is refused")
+
+	out := s.netIntRun(c, swap+" "+netIntProbe+dst)
+	s.T().Logf("prctl exe-swap vs network guard:\n%s", out)
+	s.Require().Containsf(out, "rc=EPERM",
+		"an exe_file swap via prctl(PR_SET_MM) borrowed the whitelisted probe's network access:\n%s\nlog tail:\n%s",
+		out, netGuardTail(s.readNetGuardLog(c)))
+	s.Require().NotContains(out, "SWAP|PR_SET_MM", "netg_task_prctl did not refuse the swap")
+}

@@ -93,3 +93,39 @@ func TestLinesKeyOnLinkAndIncludePending(t *testing.T) {
 		t.Fatalf("Lines = %v, want %v", got, want)
 	}
 }
+
+func TestLedgerRecordIfAbsentKeepsExistingVerdict(t *testing.T) {
+	l, err := Open(filepath.Join(t.TempDir(), "binaries.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	const line = "/home/u/.local/bin/app"
+	confirmed, recorded := [32]byte{1}, [32]byte{2}
+	if err := l.Record(line, confirmed, SourceConfirmed); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := l.RecordIfAbsent(line, recorded, SourceRecorded); err != nil || ok {
+		t.Fatalf("RecordIfAbsent over a confirmed line = %v, %v", ok, err)
+	}
+	if got, _, _ := l.Lookup(line); got != confirmed {
+		t.Fatalf("confirmed hash replaced by %x", got)
+	}
+	if err := l.Forget(line, recorded, SourceRecorded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := l.Lookup(line); !ok {
+		t.Fatal("Forget removed a row it did not write")
+	}
+
+	const fresh = "/home/u/.local/bin/other"
+	if ok, err := l.RecordIfAbsent(fresh, recorded, SourceRecorded); err != nil || !ok {
+		t.Fatalf("RecordIfAbsent on a new line = %v, %v", ok, err)
+	}
+	if err := l.Forget(fresh, recorded, SourceRecorded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := l.Lookup(fresh); ok {
+		t.Fatal("Forget kept the row it wrote")
+	}
+}

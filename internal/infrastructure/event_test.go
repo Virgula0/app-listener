@@ -79,6 +79,10 @@ func (s *eventUnitTest) TestBpfEventToFileEvent() {
 		Comm: comm,
 		Path: path,
 		Dest: dest,
+
+		ExeDev: 259<<20 | 2,
+		ExeIno: 4242,
+		Prot:   5,
 	}
 
 	fe := be.ToFileEvent()
@@ -91,6 +95,9 @@ func (s *eventUnitTest) TestBpfEventToFileEvent() {
 	s.Require().Equal("test-proc", fe.Comm)
 	s.Require().Equal("/tmp/test.txt", fe.Path)
 	s.Require().Equal("/tmp/test2.txt", fe.Dest)
+	s.Require().Equal(uint64(259<<20|2), fe.ExeDev)
+	s.Require().Equal(uint64(4242), fe.ExeIno)
+	s.Require().Equal(uint32(5), fe.Prot)
 }
 
 func (s *eventUnitTest) TestBpfEventToFileEventZeroValue() {

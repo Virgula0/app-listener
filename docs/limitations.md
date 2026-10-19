@@ -14,7 +14,8 @@ binary with arguments of its choosing gets whatever that binary prints.
 - Whitelist only what needs the resource.
 - Prefer apps that keep secrets in a running agent.
 - Never whitelist a general tool: a shell, an interpreter (`node`, `python`, `java`), `git`, `cp`,
-  `curl`, ... reads the resource on behalf of any script. The installer and the daemon warn about
+  `curl`, a file reader or encoder (`cat`, `dd`, `head`, `base64`, `sed`, `grep`, `openssl`, `nc`),
+  an editor, ... reads the resource on behalf of any script. The installer and the daemon warn about
   every resource that whitelists one.
 
 ## Interpreters and JITs

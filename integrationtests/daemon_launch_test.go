@@ -1,6 +1,9 @@
 package integrationtests
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/testcontainers/testcontainers-go"
@@ -126,6 +129,104 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 
 	// The mark is the process's, never the binary's: a clean exec after them is judged afresh.
 	assertClean("after the risky launches")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+const (
+	launchBunProbe = "/opt/rt/bin/bunapp"
+	launchBunReal  = "/opt/rt/bin/bunreal"
+	launchBunEvil  = "/tmp/evil.js"
+)
+
+// bunRealApp compiles, on the host, a `bun build --compile` app that prints STOLEN|<content> of the
+// file `read <path>` names. "" when bun is not on PATH or the build fails: the probe still covers the
+// rules. The baseline target fetches Bun's official runtime: a distro bun (Arch's) compiling for its
+// own target embeds itself, linked to the host's ICU, which the test image lacks.
+func (s *IntegrationSuite) bunRealApp() string {
+	bun, err := exec.LookPath("bun")
+	if err != nil {
+		s.T().Log("bun not on PATH: skipping the real Bun-compiled app")
+		return ""
+	}
+	dir := s.T().TempDir()
+	src := filepath.Join(dir, "app.js")
+	s.Require().NoError(os.WriteFile(src, []byte(`const [verb, p] = process.argv.slice(2);
+if (verb === "read") {
+  try { console.log("STOLEN|" + require("fs").readFileSync(p, "utf8")); }
+  catch (e) { console.log("DENIED|" + e.code); }
+}
+`), 0o644))
+	out := filepath.Join(dir, "bunreal")
+	b, err := exec.Command(bun, "build", "--compile", "--target=bun-linux-x64-baseline", src, //nolint:gosec // test fixture
+		"--outfile", out).CombinedOutput()
+	if err != nil {
+		s.T().Logf("bun build --compile failed (offline?), skipping the real Bun-compiled app: %v\n%s", err, b)
+		return ""
+	}
+	return out
+}
+
+// A Bun exe (a runtime or a `bun build --compile` app: opencode, the native claude) ignores
+// NODE_OPTIONS and hands argv to its script, but BUN_BE_BUN=1 turns it into the bun CLI and
+// BUN_OPTIONS/the inspector variables load its caller's code into it. Whitelisted, it must read
+// nothing below the secret when launched with them, and keep reading when launched cleanly.
+func (s *IntegrationSuite) TestDaemon_LaunchScan_BunRuntimeEnv() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"mkdir", "-p", "/exploits", "/opt/rt/bin"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_bun"), launchBunProbe, 0o755),
+		"copy launch_probe_bun (run make -C integrationtests/exploits)")
+	whitelist := launchBunProbe
+	real := s.bunRealApp()
+	if real != "" {
+		s.Require().NoError(c.CopyFileToContainer(s.ctx, real, launchBunReal, 0o755), "copy the Bun-compiled app")
+		whitelist += "\n" + launchBunReal
+	}
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
+		"' > " + launchSecret + " && printf '%s' 'try { console.log(\"STOLEN|\" + " +
+		"require(\"fs\").readFileSync(\"" + launchSecret + "\", \"utf8\")) } catch (e) { console.log(\"DENIED|\" + e.code) }' > " +
+		launchBunEvil + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+whitelist)
+
+	bins := []string{launchBunProbe}
+	if real != "" {
+		bins = append(bins, launchBunReal)
+	}
+	for _, bin := range bins {
+		clean := []launchCase{{"a clean launch", "", bin, nil}, {"a Bun tmpdir", "BUN_TMPDIR=/tmp", bin, nil}}
+		if bin == launchBunProbe {
+			// The Bun class alone judges no Node knob. A real Bun image also carries Node's markers
+			// (NODE_OPTIONS), so it is judged as Node too: stricter, never looser.
+			clean = append(clean, launchCase{"NODE_OPTIONS", "NODE_OPTIONS='--require /tmp/x.js'", bin, nil},
+				launchCase{"Node flags", "", bin, []string{"--print", "--inspect"}})
+		}
+		for _, lc := range clean {
+			out := s.launch(c, lc, "read", launchSecret)
+			s.Require().Containsf(out, "STOLEN|"+launchMarker, "%s with %s must read its resource: %s\ndaemon log:\n%s",
+				bin, lc.what, out, s.readDaemonLog(c))
+		}
+		for _, lc := range []launchCase{
+			{"BUN_BE_BUN", "BUN_BE_BUN=1", bin, nil},
+			{"BUN_OPTIONS --preload", "BUN_OPTIONS='--preload " + launchBunEvil + "'", bin, nil},
+			{"BUN_INSPECT", "BUN_INSPECT=ws://127.0.0.1:1/x", bin, nil},
+			{"BUN_INSPECT_PRELOAD", "BUN_INSPECT_PRELOAD=" + launchBunEvil, bin, nil},
+		} {
+			out := s.launch(c, lc, "read", launchSecret)
+			s.Require().NotContainsf(out, launchMarker, "%s launched with %s read its resource: %s\ndaemon log:\n%s",
+				bin, lc.what, out, s.readDaemonLog(c))
+		}
+	}
+	if real != "" {
+		// The attack itself: BUN_BE_BUN=1 makes the whitelisted app evaluate its caller's script.
+		_, out := s.exec(c, []string{"sh", "-c", "BUN_BE_BUN=1 " + launchBunReal + " " + launchBunEvil + " 2>&1"})
+		s.T().Logf("BUN_BE_BUN=1 %s %s: %s", launchBunReal, launchBunEvil, out)
+		s.Require().NotContainsf(out, launchMarker, "BUN_BE_BUN ran the caller's script as the whitelisted app: %s", out)
+		s.Require().Containsf(out, "DENIED|", "the caller's script must have run and been refused: %s", out)
+	}
+	s.requireDenialLogged(c, "LAUNCH", "secret")
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

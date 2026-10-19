@@ -17,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/Virgula0/app-listener/internal/editbackend"
+	"github.com/Virgula0/app-listener/internal/recorder"
 )
 
 // fakeLink answers the backend protocol from memory and records every request.
@@ -182,5 +183,32 @@ func TestForwardRefusesOwnExecutable(t *testing.T) {
 	f.submit()
 	if slices.Contains(link.ops(), editbackend.OpForwardCheck) || p.link != nil {
 		t.Fatalf("own executable reached the backend: %v", link.ops())
+	}
+}
+
+func TestRecordReviewExtendsAnExistingSection(t *testing.T) {
+	link := newFakeLink(true)
+	_, p := protectedShell(t, link)
+	ssh, fresh := "/home/alice/.ssh", "/home/alice/.config/tool"
+	rec := &recorder.Recording{
+		Targets: []recorder.Target{{Path: ssh, IsDir: true, Existing: &recorder.Existing{Section: ssh,
+			Allow: []recorder.ExistingRule{{Line: "/usr/bin/ssh"}}}}, {Path: fresh, IsDir: true}},
+		Binaries: []recorder.Binary{
+			{Line: "/usr/bin/ssh", Exe: "/usr/bin/ssh", Targets: []string{ssh}, Whitelisted: []string{ssh}},
+			{Line: "/usr/bin/git", Exe: "/usr/bin/git", Targets: []string{ssh, fresh}, Suggested: true},
+		},
+	}
+	r := newRecordReview(p, link, rec, map[string]string{ssh: "already in daemon.conf"})
+	if r.bins["/usr/bin/ssh"] != nil || r.bins["/usr/bin/git"] == nil {
+		t.Fatalf("only a binary with a line to add is selectable: %v", r.bins)
+	}
+	if r.encrypt[ssh] != nil || r.encrypt[fresh] == nil {
+		t.Fatalf("encryption is offered for new paths only: %v", r.encrypt)
+	}
+	if sel := r.selection(); !slices.Equal(sel.Binaries, []string{"/usr/bin/git"}) {
+		t.Fatalf("selection = %+v", sel)
+	}
+	if notices := existingNotices(rec.Targets); len(notices) != 2 {
+		t.Fatalf("one warning and the current whitelist per existing target: %d objects", len(notices))
 	}
 }

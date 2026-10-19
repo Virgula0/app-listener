@@ -88,6 +88,7 @@ func launchModel(classes uint8, argv, env []string) bool {
 func TestLaunchRulesJudgeRuntimes(t *testing.T) {
 	electron := trustedNode | trustedChromium
 	generic := electron | trustedElectron
+	bunApp := trustedBun
 	for _, c := range []struct {
 		name    string
 		classes uint8
@@ -154,6 +155,15 @@ func TestLaunchRulesJudgeRuntimes(t *testing.T) {
 		{"node env file", electron, []string{"node", "--env-file=/tmp/.env"}, nil, true},
 		{"node repl module", electron, []string{"node"}, []string{"NODE_REPL_EXTERNAL_MODULE=/tmp/m.js"}, true},
 		{"logging to a file", electron, []string{"code", "--enable-logging=file", "--log-file=/tmp/l"}, nil, false},
+		{"bun app, plain", bunApp, []string{"opencode", "--print", "-e", "x"}, []string{"HOME=/h"}, false},
+		{"bun app, be bun", bunApp, []string{"opencode", "-e", "x"}, []string{"BUN_BE_BUN=1"}, true},
+		{"bun app, be bun empty", bunApp, []string{"opencode"}, []string{"BUN_BE_BUN="}, true},
+		{"bun app, options preload", bunApp, []string{"claude"}, []string{"BUN_OPTIONS=--preload /tmp/x.js"}, true},
+		{"bun app, inspector", bunApp, []string{"claude"}, []string{"BUN_INSPECT=ws://127.0.0.1:1/x"}, true},
+		{"bun app, inspector preload", bunApp, []string{"claude"}, []string{"BUN_INSPECT_PRELOAD=/tmp/x.js"}, true},
+		{"bun app, transpiler cache", bunApp, []string{"claude"}, []string{"BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/c"}, true},
+		{"bun app, tmpdir", bunApp, []string{"opencode"}, []string{"BUN_TMPDIR=/h/.cache/bun-tmp"}, false},
+		{"node ignores bun env", electron, []string{"code"}, []string{"BUN_BE_BUN=1"}, false},
 	} {
 		if got := launchModel(c.classes, c.argv, c.env); got != c.risky {
 			t.Errorf("%s: risky = %v, want %v", c.name, got, c.risky)
@@ -266,6 +276,7 @@ func TestResolveTempBinaryClassesRuntime(t *testing.T) {
 	}{
 		{"code", "ELF\x00NODE_OPTIONS\x00", trustedNode, []string{"Node"}},
 		{"chrome", "ELF\x00remote-debugging-port\x00", trustedChromium, []string{"Chromium"}},
+		{"opencode", "ELF\x00BUN_BE_BUN\x00BUN_INSPECT\x00", trustedBun, []string{"Bun"}},
 		{"tool", "ELF plain", 0, nil},
 	} {
 		p := filepath.Join(dir, tc.name)

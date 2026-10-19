@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -117,6 +119,16 @@ func (s *monitorUnitTest) TestMatchesFilterNonRecursive() {
 			s.Require().Equal(tt.expected, result)
 		})
 	}
+}
+
+func (s *monitorUnitTest) TestMatchesFilterIntoTargetByDest() {
+	m := &Monitor{targets: dirTarget("/watch"), recursive: true}
+	for _, typ := range []ebpf.EventType{ebpf.EventRename, ebpf.EventHardlink} {
+		s.Require().True(m.matchesFilter(&ebpf.FileEvent{Type: typ, Path: "/other/f", Dest: "/watch/f"}), typ.String())
+		s.Require().False(m.matchesFilter(&ebpf.FileEvent{Type: typ, Path: "/other/f", Dest: "/other/g"}), typ.String())
+	}
+	// A symlink's Dest is its body: naming a target doesn't touch it.
+	s.Require().False(m.matchesFilter(&ebpf.FileEvent{Type: ebpf.EventSymlink, Path: "/other/l", Dest: "/watch/f"}))
 }
 
 func (s *monitorUnitTest) TestMatchesFilterRecursiveNoDepth() {
@@ -308,6 +320,37 @@ func (s *monitorUnitTest) TestCheckHardlinkByInode() {
 			s.Require().Equal(tt.expected, m.hardlinkByInode(tt.dev, tt.ino, tt.path))
 		})
 	}
+}
+
+// A watched name that left the target (renamed out, or unlinked and its inode number reused by a
+// new file outside) shares no file with the event path any more.
+func (s *monitorUnitTest) TestCheckHardlinkByInode_WatchedNameGone() {
+	dir := s.T().TempDir()
+	watchedDir := filepath.Join(dir, "watched")
+	s.Require().NoError(os.Mkdir(watchedDir, 0755))
+	moved, deleted := filepath.Join(watchedDir, "moved"), filepath.Join(watchedDir, "deleted")
+	s.Require().NoError(os.WriteFile(moved, []byte("data"), 0644))
+	s.Require().NoError(os.WriteFile(deleted, []byte("data"), 0644))
+
+	m := &Monitor{
+		targets:     dirTarget(watchedDir),
+		watchInodes: make(map[uint64][]watchedInode),
+		mounts:      newMountTable(),
+	}
+	m.populateWatchInodes()
+
+	outside := filepath.Join(dir, "outside")
+	movedDev, movedIno := s.kernelIdentity(m, moved)
+	s.Require().NoError(os.Rename(moved, outside))
+	s.Require().Equal("", m.hardlinkByInode(movedDev, movedIno, outside), "renamed out of the target")
+
+	_, deletedIno := s.kernelIdentity(m, deleted)
+	s.Require().NoError(os.Remove(deleted))
+	fresh := filepath.Join(dir, "fresh")
+	s.Require().NoError(os.WriteFile(fresh, []byte("x"), 0644))
+	freshDev, freshIno := s.kernelIdentity(m, fresh)
+	m.watchInodes[freshIno] = m.watchInodes[deletedIno]
+	s.Require().Equal("", m.hardlinkByInode(freshDev, freshIno, fresh), "unlinked, inode number reused")
 }
 
 func (s *monitorUnitTest) TestCheckHardlinkByInodeNoInodes() {
@@ -642,5 +685,18 @@ func (s *monitorUnitTest) TestMatchesFilterMkdirNewDirRecursive() {
 			result := m.matchesFilter(ev)
 			s.Require().Equal(tt.expected, result)
 		})
+	}
+}
+
+// Every event must come from reserve_event: a probe reserving the ring buffer itself leaves exe_dev,
+// exe_ino and prot as stale ring-buffer bytes, and the recorder keys accessors on them.
+func TestEveryEventReservedWithIdentity(t *testing.T) {
+	_, self, _, _ := runtime.Caller(0) // other tests chdir away
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(self), "bpf", "monitor.bpf.c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(src), "bpf_ringbuf_reserve("); n != 1 {
+		t.Fatalf("monitor.bpf.c reserves the ring buffer in %d places; only reserve_event may", n)
 	}
 }

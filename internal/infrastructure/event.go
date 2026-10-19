@@ -66,6 +66,17 @@ type FileEvent struct {
 	Path      string
 	Dest      string
 	Timestamp int64
+	// ExeDev/ExeIno is the acting process's executable as the kernel saw it (dev encoded like a
+	// guard key), 0/0 for kernel threads; Exe is the path the monitor resolved for that inode, ""
+	// when it could not. Identity is ExeDev/ExeIno: Exe and Comm are display only.
+	ExeDev uint64
+	ExeIno uint64
+	Exe    string
+	// ExecName is the path the process was exec'd by (bprm->filename) when the monitor saw that
+	// exec, else "": it names a multicall's applet.
+	ExecName string
+	// Prot is an MMAP event's protection (unix.PROT_*); 0 for every other event.
+	Prot uint32
 }
 
 type BpfEvent struct {
@@ -80,14 +91,19 @@ type BpfEvent struct {
 	Dest [256]byte
 	// Dev is the walked dentry's kernel s_dev (MAJOR<<20|MINOR, as mountinfo prints it); 0 when
 	// Path/Dest are user strings. Kernel paths are relative to that superblock's root.
-	Dev  uint32
-	Mode uint32
-	Ino  uint64
+	Dev    uint32
+	Mode   uint32
+	Ino    uint64
+	ExeDev uint64
+	ExeIno uint64
+	Prot   uint32
+	Pad2   uint32
 }
 
 // BpfEventSize is BpfEvent's wire size as laid out by the BPF side: 6 x u32 header, the three
-// fixed byte arrays, then dev/mode/ino. Keep in sync with C struct event {} in monitor.bpf.c.
-const BpfEventSize = 6*4 + 16 + 256 + 256 + 4 + 4 + 8
+// fixed byte arrays, dev/mode/ino, exe_dev/exe_ino, prot/pad2. Keep in sync with C struct event {}
+// in monitor.bpf.c.
+const BpfEventSize = 6*4 + 16 + 256 + 256 + 4 + 4 + 8 + 8 + 8 + 4 + 4
 
 // DecodeBpfEvent fills e from a raw ring-buffer record without reflection or a per-record
 // bytes.Reader (binary.Read does both, which adds up on the monitor's unfiltered VFS firehose).
@@ -108,6 +124,10 @@ func DecodeBpfEvent(raw []byte, e *BpfEvent) bool {
 	e.Dev = binary.LittleEndian.Uint32(raw[552:556])
 	e.Mode = binary.LittleEndian.Uint32(raw[556:560])
 	e.Ino = binary.LittleEndian.Uint64(raw[560:568])
+	e.ExeDev = binary.LittleEndian.Uint64(raw[568:576])
+	e.ExeIno = binary.LittleEndian.Uint64(raw[576:584])
+	e.Prot = binary.LittleEndian.Uint32(raw[584:588])
+	e.Pad2 = binary.LittleEndian.Uint32(raw[588:592])
 	return true
 }
 
@@ -121,6 +141,10 @@ func (e *BpfEvent) ToFileEvent() FileEvent {
 		Comm: Cstr(e.Comm[:]),
 		Path: Cstr(e.Path[:]),
 		Dest: Cstr(e.Dest[:]),
+
+		ExeDev: e.ExeDev,
+		ExeIno: e.ExeIno,
+		Prot:   e.Prot,
 	}
 }
 

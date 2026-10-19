@@ -18,35 +18,36 @@ import (
 // the normal pipeline (verify encryption -> ask -> migrate -> deploy -> (re)start) runs on the
 // merged config. Requires a previous installation; interactive.
 func runDiffCatalog() error {
-	mergedText, mergedCfg, proceed, err := collectDiffAdditions()
+	prevCfg, mergedText, mergedCfg, proceed, err := collectDiffAdditions()
 	if err != nil || !proceed {
 		return err
 	}
-	return applyDiffAdditions(mergedText, mergedCfg)
+	return applyDiffAdditions(prevCfg, mergedText, mergedCfg)
 }
 
 // collectDiffAdditions reads the installed config, discovers catalog directories missing from it,
-// runs the picker and editor, and returns the merged text + parsed config. proceed=false (nil
-// error) when there's nothing to add or nothing selected.
-func collectDiffAdditions() (mergedText string, mergedCfg *daemonconfig.Config, proceed bool, err error) {
+// runs the picker and editor, and returns the installed config plus the merged text + parsed config.
+// proceed=false (nil error) when there's nothing to add or nothing selected.
+func collectDiffAdditions() (prevCfg *daemonconfig.Config, mergedText string, mergedCfg *daemonconfig.Config,
+	proceed bool, err error) {
 	oldBytes, readErr := os.ReadFile(systemd.SystemConfigPath)
 	if readErr != nil {
-		return "", nil, false, fmt.Errorf("no previous installation found — run `sudo app-listener install` first: %w", readErr)
+		return nil, "", nil, false, fmt.Errorf("no previous installation found — run `sudo app-listener install` first: %w", readErr)
 	}
 	cfg, loadErr := daemonconfig.Load(systemd.SystemConfigPath)
 	if loadErr != nil {
-		return "", nil, false, fmt.Errorf("parsing the installed configuration: %w", loadErr)
+		return nil, "", nil, false, fmt.Errorf("parsing the installed configuration: %w", loadErr)
 	}
 
 	users, usersErr := inst.ListUsers()
 	if usersErr != nil {
-		return "", nil, false, fmt.Errorf("listing users: %w", usersErr)
+		return nil, "", nil, false, fmt.Errorf("listing users: %w", usersErr)
 	}
 
 	fresh := uncoveredCandidates(cfg, users)
 	if len(fresh) == 0 {
 		log.Info("catalog diff: every discoverable critical directory is already in daemon.conf — nothing to add")
-		return "", nil, false, nil
+		return nil, "", nil, false, nil
 	}
 	log.Infof("catalog diff: %d critical path(s) discovered that are not in daemon.conf", len(fresh))
 
@@ -55,25 +56,25 @@ func collectDiffAdditions() (mergedText string, mergedCfg *daemonconfig.Config, 
 		"These exist on the host but are not in the current daemon.conf. All are preselected. "+
 			"Selected paths are appended to the config and encrypted like a fresh install.")
 	if pickErr != nil {
-		return "", nil, false, pickErr
+		return nil, "", nil, false, pickErr
 	}
 	if len(picked) == 0 {
 		log.Info("catalog diff: nothing selected — daemon.conf unchanged")
-		return "", nil, false, nil
+		return nil, "", nil, false, nil
 	}
 
 	text, parsed, editErr := appendSectionsAndEdit(string(oldBytes), picked)
 	if editErr != nil {
-		return "", nil, false, editErr
+		return nil, "", nil, false, editErr
 	}
 	inst.WarnGeneralTools(parsed)
-	return text, parsed, true, nil
+	return cfg, text, parsed, true, nil
 }
 
 // applyDiffAdditions runs the encrypt + deploy half on the merged config. The daemon is stopped for
 // the whole cycle (a new section may need an in-place fscrypt migration) and restored on the
 // existing config if the user aborts before deploy.
-func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error {
+func applyDiffAdditions(prevCfg *daemonconfig.Config, mergedText string, mergedCfg *daemonconfig.Config) error {
 	wasActive := systemd.IsDaemonActive()
 	if stopErr := systemd.StopDaemonIfRunning(); stopErr != nil {
 		return stopErr
@@ -83,7 +84,7 @@ func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error
 		return restoreDaemonAfterDiffAbort(wasActive, keyErr)
 	}
 
-	sshUsers, sshErr := askSSHAgentUsers(mergedCfg)
+	sshUsers, sshErr := askSSHAgentUsers(addedResources(prevCfg, mergedCfg))
 	if sshErr == nil {
 		sshErr = addKeysToAgent(sshUsers)
 	}
@@ -113,6 +114,20 @@ func applyDiffAdditions(mergedText string, mergedCfg *daemonconfig.Config) error
 		return cleanErr
 	}
 	return cleanupBackups(mergedCfg)
+}
+
+// addedResources returns merged's resources prev doesn't cover. The ssh-agent setup must only see
+// a ~/.ssh this run guards for the first time: an already-guarded one is encrypted and, with the
+// daemon stopped, locked, so editing its ~/.ssh/config fails with ENOKEY and aborts the run.
+func addedResources(prev, merged *daemonconfig.Config) *daemonconfig.Config {
+	covered := configPaths(prev)
+	out := &daemonconfig.Config{}
+	for i := range merged.Resources {
+		if !pathCovered(merged.Resources[i].Path, covered) {
+			out.Resources = append(out.Resources, merged.Resources[i])
+		}
+	}
+	return out
 }
 
 // configPaths returns every path a config resource occupies: the watch path

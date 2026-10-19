@@ -61,6 +61,9 @@ These must attach or the guard refuses to start:
 - `inode_unlink`, `inode_rename`, `bprm_committed_creds` and the `sched_process_fork` tracepoint
   (replaced-binary tracking)
 - the `sched_process_exec` tracepoint (launch scan of whitelisted runtimes)
+- `file_ioctl`, `file_ioctl_compat` (btrfs copy ioctls)
+- `task_prctl` (refuses `prctl(PR_SET_MM)` rewrites of a process's executable, which would borrow
+  another binary's identity); `network-guard` requires it too
 
 Every other LSM hook is best-effort: a kernel that lacks one logs a warning and keeps enforcing the
 rest.

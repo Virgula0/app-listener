@@ -35,6 +35,8 @@ const (
 	SourceBootstrap Source = "bootstrap"
 	SourceUpdater   Source = "updater"
 	SourceConfirmed Source = "confirmed"
+	// SourceRecorded: `edit-protected --record` saw this content run and the operator approved it.
+	SourceRecorded Source = "recorded"
 )
 
 // Pending is a binary the daemon refused because its hash is not recorded for its line.
@@ -195,6 +197,37 @@ func (l *Ledger) Record(line string, sum [32]byte, src Source) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// RecordIfAbsent records sum for line only when the ledger has no hash for it yet, reporting
+// whether it did: a line confirmed for other content keeps that verdict.
+func (l *Ledger) RecordIfAbsent(line string, sum [32]byte, src Source) (bool, error) {
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	res, err := tx.ExecContext(context.Background(), `INSERT OR IGNORE INTO binaries (line, sha256, source, updated_at) VALUES (?, ?, ?, ?)`,
+		line, sum[:], string(src), time.Now().Unix())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	if _, err := tx.ExecContext(context.Background(), `DELETE FROM pending WHERE line = ?`, line); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// Forget removes line's row only while it still holds sum from src (compare-and-swap): a hash
+// recorded since by anyone else stays.
+func (l *Ledger) Forget(line string, sum [32]byte, src Source) error {
+	_, err := l.db.ExecContext(context.Background(), `DELETE FROM binaries WHERE line = ? AND sha256 = ? AND source = ?`,
+		line, sum[:], string(src))
+	return err
 }
 
 // AddPending records a refused binary for `trust-binaries` to show.

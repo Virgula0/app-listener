@@ -185,7 +185,7 @@ func (c *Client) readMessages(r io.Reader) {
 			default: // sent once by the backend
 			}
 			continue
-		case KindEvent:
+		case KindEvent, KindProgress:
 			select {
 			case c.events <- m:
 			default: // a slow display drops events, never stalls the reader
@@ -247,7 +247,7 @@ func (c *Client) Call(req *Request) (Message, error) {
 	return m, nil
 }
 
-// Events streams a FORWARD grant's events.
+// Events streams a FORWARD grant's events and record_apply's progress.
 func (c *Client) Events() <-chan Message { return c.events }
 
 // Ended yields the reason once the daemon ended the session (idle timeout, reload, a granted
