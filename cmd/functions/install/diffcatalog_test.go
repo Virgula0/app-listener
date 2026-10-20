@@ -9,26 +9,6 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
-func TestPathCovered(t *testing.T) {
-	covered := []string{"/home/u/.ssh", "/home/u/.config/discord", ""}
-	cases := []struct {
-		path string
-		want bool
-	}{
-		{"/home/u/.ssh", true},                          // exact
-		{"/home/u/.ssh/keys", true},                     // inside a covered root
-		{"/home/u", true},                               // parent of a covered root — would overlap
-		{"/home/u/.config/discord/Local Storage", true}, // inside grouped root
-		{"/home/u/.gnupg", false},                       // unrelated
-		{"/home/u/.sshd", false},                        // prefix but not a path component
-	}
-	for _, c := range cases {
-		if got := pathCovered(c.path, covered); got != c.want {
-			t.Errorf("pathCovered(%q) = %v, want %v", c.path, got, c.want)
-		}
-	}
-}
-
 // TestUncoveredCandidates: a catalog directory already in the config is not
 // proposed; one that exists on disk but is absent from the config is.
 func TestUncoveredCandidates(t *testing.T) {

@@ -316,6 +316,7 @@ load it.
 | Protect new catalog folders | `install catalog diff` | no |
 | Restore backups | `install backups restore` | no |
 | Delete backups | `install backups delete` | no |
+| Install facultatives | `install facultatives` | no |
 
 **Also install the desktop build (app-listener-gui)** (on by default) installs the staged
 release's desktop build once the wizard completes. Unchecked, the wizard installs only the daemon.
@@ -365,6 +366,10 @@ app-listener-daemon`), which locks its folders again. Uninstall never stops the 
 then each encrypted folder is asked about (decrypt permanently, or keep encrypted), and the
 per-user ssh-agent setup and the backup cleanup ask as in the terminal. Removing the desktop build
 deletes `/usr/local/sbin/app-listener-gui`; the open window keeps running until you close it.
+
+The **Remove facultatives** card next to it runs `uninstall facultatives`: it lists the optional
+per-user setup the installer added and removes only the ones you pick. It works with the daemon
+running (see [facultatives](installation.md#facultatives)).
 
 ## Daemon
 

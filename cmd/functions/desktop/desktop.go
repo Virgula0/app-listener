@@ -29,7 +29,8 @@ func Run() error {
 	return gui.Run(&gui.Options{Version: constants.Version, Release: releaseBuild(), Install: installHooks(),
 		Update: gui.UpdateHooks{Run: update.RunWith, Latest: update.Latest},
 		Uninstall: gui.UninstallHooks{Run: func(ui wizard.UI, req gui.UninstallRequest) error {
-			return uninstall.RunWith(ui, uninstall.Request{DeleteKey: req.DeleteKey, KeepGUI: req.KeepGUI})
+			return uninstall.RunWith(ui, uninstall.Request{DeleteKey: req.DeleteKey, KeepGUI: req.KeepGUI,
+				Facultatives: req.Facultatives})
 		}}})
 }
 
@@ -54,6 +55,7 @@ var installModes = map[gui.InstallMode]install.Mode{
 	gui.InstallDiffCatalog:    install.ModeDiffCatalog,
 	gui.InstallRestoreBackups: install.ModeRestoreBackups,
 	gui.InstallDeleteBackups:  install.ModeDeleteBackups,
+	gui.InstallFacultatives:   install.ModeFacultatives,
 }
 
 func installHooks() gui.InstallHooks {

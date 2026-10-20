@@ -133,22 +133,12 @@ func applyDiffAdditions(prevCfg *daemonconfig.Config, mergedText string, mergedC
 // a ~/.ssh this run guards for the first time: an already-guarded one is encrypted and, with the
 // daemon stopped, locked, so editing its ~/.ssh/config fails with ENOKEY and aborts the run.
 func addedResources(prev, merged *daemonconfig.Config) *daemonconfig.Config {
-	covered := configPaths(prev)
+	covered := inst.CoveredPaths(prev)
 	out := &daemonconfig.Config{}
 	for i := range merged.Resources {
-		if !pathCovered(merged.Resources[i].Path, covered) {
+		if !inst.PathCovered(merged.Resources[i].Path, covered) {
 			out.Resources = append(out.Resources, merged.Resources[i])
 		}
-	}
-	return out
-}
-
-// configPaths returns every path a config resource occupies: the watch path
-// and its encryption root (equal unless the section is a grouped watch).
-func configPaths(cfg *daemonconfig.Config) []string {
-	out := make([]string, 0, len(cfg.Resources)*2)
-	for i := range cfg.Resources {
-		out = append(out, cfg.Resources[i].Path, cfg.Resources[i].EncryptionRootOrPath())
 	}
 	return out
 }
@@ -156,29 +146,15 @@ func configPaths(cfg *daemonconfig.Config) []string {
 // uncoveredCandidates returns catalog candidates whose path is neither a configured watch
 // path/encryption root nor nested with one (either direction): what a diff would propose adding.
 func uncoveredCandidates(cfg *daemonconfig.Config, users []inst.User) []inst.Candidate {
-	covered := configPaths(cfg)
+	covered := inst.CoveredPaths(cfg)
 	all := inst.DiscoverForUsers(users)
 	var fresh []inst.Candidate
 	for i := range all {
-		if !pathCovered(all[i].Path, covered) {
+		if !inst.PathCovered(all[i].Path, covered) {
 			fresh = append(fresh, all[i])
 		}
 	}
 	return fresh
-}
-
-// pathCovered: p is already protected by a config path: equal, inside, or a parent of it (a new
-// parent watch would overlap an existing guarded tree).
-func pathCovered(p string, covered []string) bool {
-	for _, cv := range covered {
-		if cv == "" {
-			continue
-		}
-		if p == cv || isInsidePath(p, cv) || isInsidePath(cv, p) {
-			return true
-		}
-	}
-	return false
 }
 
 // appendSectionsAndEdit appends the generated sections verbatim to the existing config and opens

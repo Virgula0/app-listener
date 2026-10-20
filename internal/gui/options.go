@@ -22,6 +22,7 @@ const (
 	InstallDiffCatalog
 	InstallRestoreBackups
 	InstallDeleteBackups
+	InstallFacultatives
 )
 
 // InstallRequest is one installer run; Binary is the verified headless build to deploy, GUIBinary
@@ -54,9 +55,10 @@ type InstallHooks struct {
 	InstalledGUIVersion func() string
 }
 
-// UninstallRequest is one uninstall: `uninstall --delete-key`, `--keep-gui`.
+// UninstallRequest is one uninstall: `uninstall --delete-key`, `--keep-gui`; Facultatives is
+// `uninstall facultatives` instead.
 type UninstallRequest struct {
-	DeleteKey, KeepGUI bool
+	DeleteKey, KeepGUI, Facultatives bool
 }
 
 // UninstallHooks is the uninstaller the Install page drives (cmd/functions/uninstall).

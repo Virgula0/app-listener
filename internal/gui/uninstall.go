@@ -51,6 +51,22 @@ func (p *installPage) uninstallCard() fyne.CanvasObject {
 	return newPanel(u.box)
 }
 
+// facultativesCard is `uninstall facultatives`, which works with the daemon running.
+func (p *installPage) facultativesCard() fyne.CanvasObject {
+	btn := newButton("Remove facultatives", icon("broom"),
+		func() { p.startUninstall(UninstallRequest{Facultatives: true}) })
+	flag := widget.NewLabel("uninstall facultatives")
+	flag.TextStyle = fyne.TextStyle{Monospace: true}
+	flag.Importance = widget.LowImportance
+	flag.SizeName = theme.SizeNameCaptionText
+	head := container.NewBorder(nil, nil, newIconTile("broom", theme.ColorNameWarning, 40), nil,
+		container.NewVBox(boldLabel("Remove facultatives"), flag))
+	return newPanel(container.NewBorder(container.NewVBox(head,
+		mutedText("Lists the optional per-user setup the installer added (the ssh-agent unit and its "+
+			"SSH_AUTH_SOCK block, the Bun launcher wrappers) and removes only the ones you pick. The rest "+
+			"of the install stays, and the daemon keeps running.")), container.NewHBox(btn), nil, nil))
+}
+
 const outsideSystemdNote = "A daemon process runs outside systemd: stop it first."
 
 // daemonStopNote is why an action that needs the daemon stopped is refused ("" = none runs).
@@ -109,7 +125,7 @@ func (p *installPage) startUninstall(req UninstallRequest) {
 			return errors.New("the uninstaller is not available in this build")
 		}
 		return run(ui, req)
-	}, nil) {
+	}, nil) && !req.Facultatives {
 		p.uninst.btn.Disable()
 	}
 }

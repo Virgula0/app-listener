@@ -22,6 +22,7 @@ const (
 	ModeDiffCatalog         // install catalog diff
 	ModeRestoreBackups      // install backups restore
 	ModeDeleteBackups       // install backups delete
+	ModeFacultatives        // install facultatives
 )
 
 // Request is one GUI run.
@@ -96,6 +97,8 @@ func RunWith(ui wizard.UI, req Request) error {
 		return restoreBackups()
 	case ModeDeleteBackups:
 		return deletePostBackups()
+	case ModeFacultatives:
+		return runFacultatives()
 	}
 	return fmt.Errorf("unknown installer mode %d", req.Mode)
 }

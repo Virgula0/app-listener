@@ -7,7 +7,7 @@ import (
 )
 
 func TestEveryInstallModeMapped(t *testing.T) {
-	for m := gui.InstallWizard; m <= gui.InstallDeleteBackups; m++ {
+	for m := gui.InstallWizard; m <= gui.InstallFacultatives; m++ {
 		if _, ok := installModes[m]; !ok {
 			t.Errorf("gui.InstallMode %d has no installer mode", m)
 		}
