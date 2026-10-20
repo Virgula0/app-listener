@@ -35,8 +35,8 @@ func screen(m *fileEditModel) []string {
 func screenCell(t *testing.T, m *fileEditModel, needle string) (x, y int) {
 	t.Helper()
 	for y, row := range screen(m) {
-		if i := strings.Index(row, needle); i >= 0 {
-			return ansi.StringWidth(row[:i]), y
+		if before, _, ok := strings.Cut(row, needle); ok {
+			return ansi.StringWidth(before), y
 		}
 	}
 	t.Fatalf("%q not on screen:\n%s", needle, ansi.Strip(m.View()))

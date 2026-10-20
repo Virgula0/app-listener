@@ -104,10 +104,7 @@ func StopDaemonIfRunning() error {
 			return fmt.Errorf("stopping %s: %w", DaemonServiceName, err)
 		}
 		log.Infof("daemon stopped")
-		if err := VerifyInstalledResourcesLocked(); err != nil {
-			return err
-		}
-		return nil
+		return VerifyInstalledResourcesLocked()
 	}
 	pids, err := protected.FindDaemonProcesses("/proc")
 	if err != nil {

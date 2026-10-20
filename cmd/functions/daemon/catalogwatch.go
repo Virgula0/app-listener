@@ -3,6 +3,7 @@ package daemon
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -205,10 +206,8 @@ func (s *watchSet) watch(dir string, pos watchPos, temp bool) bool {
 		d.expires = time.Time{}
 		s.temps--
 	}
-	for _, have := range d.pos {
-		if have == pos {
-			return true
-		}
+	if slices.Contains(d.pos, pos) {
+		return true
 	}
 	d.pos = append(d.pos, pos)
 	return true

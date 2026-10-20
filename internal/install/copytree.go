@@ -14,8 +14,10 @@ import (
 	"github.com/Virgula0/app-listener/internal/safeio"
 )
 
-// CopyTree recursively copies src into dst, preserving permissions, ownership and mtimes. Symlinks
-// are recreated; sockets, FIFOs and device nodes are skipped.
+// CopyTreeWithProgress recursively copies src into dst, preserving permissions, ownership and
+// mtimes, calling onBytes after every regular file (bytes copied so far, total to copy); a nil
+// onBytes skips the pre-measurement walk and all reporting. Symlinks are recreated; sockets, FIFOs
+// and device nodes are skipped.
 //
 // Symlink-safe: the fscrypt migration runs this as root, copying a user's tree back into a
 // freshly-created vault while no guard is attached, so the destination's owner (the unprivileged
@@ -23,12 +25,6 @@ import (
 // step goes through a parent dir fd with *at syscalls: entries are created O_EXCL|O_NOFOLLOW, meta
 // is applied on the descriptor, and a directory's own ownership is set only AFTER its subtree is
 // fully copied (so the user never owns a destination directory while root is still writing into it).
-func CopyTree(src, dst string) error {
-	return CopyTreeWithProgress(src, dst, nil)
-}
-
-// CopyTreeWithProgress is CopyTree plus onBytes after every regular file (bytes copied so far,
-// total to copy); a nil onBytes skips the pre-measurement walk and all reporting.
 func CopyTreeWithProgress(src, dst string, onBytes func(copied, total int64)) error {
 	var total int64
 	if onBytes != nil {

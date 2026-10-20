@@ -156,7 +156,7 @@ func udpRecvLoop(port, waitFile string) error {
 	waitForMarker(waitFile)
 
 	buf := make([]byte, 1024)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_, _, _ = unix.Recvfrom(sock, buf, unix.MSG_DONTWAIT)
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -179,7 +179,7 @@ func udpSendLoop(host, port, waitFile string, intervalMs int) {
 	// few datagrams so the blocked SEND events are logged.
 	waitForMarker(waitFile)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_ = unix.Sendto(fd, []byte("hello\n"), 0, nil)
 		time.Sleep(time.Duration(intervalMs) * time.Millisecond)
 	}

@@ -3,6 +3,8 @@ package install
 import (
 	"fmt"
 	"strings"
+
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 )
 
 // LibraryBlock is one `[libraries "<name>"]` block: the library-trust directives of ONE
@@ -73,22 +75,9 @@ func GenerateLibraryBlocks(blocks []LibraryBlock) string {
 	return b.String()
 }
 
-// parseLibrariesHeaderName returns the name of a `[libraries ...]` header
-// line, mirroring the daemon parser (bare, unquoted and quoted forms).
+// parseLibrariesHeaderName returns the name of a `[libraries ...]` header line, as the daemon reads it.
 func parseLibrariesHeaderName(line string) (string, bool) {
-	t := strings.TrimSpace(line)
-	if !strings.HasPrefix(t, "[libraries") || !strings.HasSuffix(t, "]") {
-		return "", false
-	}
-	rest := strings.TrimSuffix(strings.TrimPrefix(t, "[libraries"), "]")
-	if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
-		return "", false
-	}
-	rest = strings.TrimSpace(rest)
-	if len(rest) >= 2 && rest[0] == '"' && rest[len(rest)-1] == '"' {
-		rest = rest[1 : len(rest)-1]
-	}
-	return rest, true
+	return daemonconfig.ParseLibrariesSection(strings.TrimSpace(line))
 }
 
 // EnsureLibraryBlock merges block into confText: appended if no `[libraries <name>]` header exists,
@@ -176,11 +165,11 @@ func PruneLibraryBlock(confText, name string, stale func(keyword, path string) b
 // parseLibDirLine splits a trimmed lib_dir / lib_binary line as the daemon parser reads it.
 func parseLibDirLine(t string) (keyword, path string, ok bool) {
 	for _, d := range [...]string{"lib_dir", "lib_binary"} {
-		rest, found := strings.CutPrefix(t, d)
-		if !found || rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
+		rest, found := daemonconfig.CutDirective(t, d)
+		if !found {
 			continue
 		}
-		path = unquotePath(strings.TrimSpace(strings.TrimPrefix(rest, ":")))
+		path = daemonconfig.UnquotePath(rest)
 		if path == "" || strings.Contains(path, `"`) {
 			return "", "", false
 		}
@@ -212,12 +201,6 @@ func RemoveSectionLibDirectives(confText, path string, drop []string) (string, e
 		result = append(result, l)
 	}
 	return strings.Join(result, "\n"), nil
-}
-
-// IsLibraryDirective: a trimmed config line is a library-trust directive (allow_lib, lib_dir,
-// lib_binary): section structure, never a whitelist entry.
-func IsLibraryDirective(trimmed string) bool {
-	return isLibDirectiveText(trimmed)
 }
 
 // InsertSectionsBeforeLibraries adds rendered watch sections before the first [libraries] block (or

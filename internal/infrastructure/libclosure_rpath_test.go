@@ -11,7 +11,7 @@ import (
 
 // RUNPATH=$ORIGIN often points into a user-writable $HOME dir: a library planted there must be
 // refused (warnUntrustedLibs), never classed as system-trusted.
-func TestResolveLibraryClosureRejectsUserWritableOriginDir(t *testing.T) {
+func TestLibraryClosureRejectsUserWritableOriginDir(t *testing.T) {
 	gcc, err := exec.LookPath("gcc")
 	if err != nil {
 		t.Skip("gcc not available")

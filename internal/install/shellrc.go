@@ -127,57 +127,33 @@ func EnsureAddKeysToAgent(u User) (path string, changed bool, err error) {
 // always, others only when present). Idempotent; a file that already sets SSH_AUTH_SOCK itself is
 // left alone. Returns the files modified.
 func EnsureSSHAgentEnv(u User) ([]string, error) {
-	var changed []string
-	for _, t := range rcTargets(u) {
-		ok, err := ensureRCBlock(&t, u)
-		if err != nil {
-			return changed, fmt.Errorf("%s: %w", t.Path, err)
-		}
-		if ok {
-			changed = append(changed, t.Path)
-		}
-	}
-	return changed, nil
+	return applyRC(rcTargets(u), u, ensureRCBlock)
 }
 
 // RemoveSSHAgentEnv strips the blocks EnsureSSHAgentEnv and EnsureAddKeysToAgent added from every
 // startup file and ~/.ssh/config of u. Returns the files modified.
 func RemoveSSHAgentEnv(u User) ([]string, error) {
-	var changed []string
-	for _, t := range append(rcTargets(u), sshConfigTarget(u)) {
-		ok, err := removeRCBlock(&t, u)
-		if err != nil {
-			return changed, fmt.Errorf("%s: %w", t.Path, err)
-		}
-		if ok {
-			changed = append(changed, t.Path)
-		}
-	}
-	return changed, nil
+	return applyRC(append(rcTargets(u), sshConfigTarget(u)), u, removeRCBlock)
 }
 
 // EnsureBunLauncherEnv appends the Bun launcher wrappers to u's shell startup files (login shell's
 // always, others only when present). Idempotent. Returns the files modified.
 func EnsureBunLauncherEnv(u User, launchers []string) ([]string, error) {
-	var changed []string
-	for _, t := range bunTargets(u, launchers) {
-		ok, err := ensureRCBlock(&t, u)
-		if err != nil {
-			return changed, fmt.Errorf("%s: %w", t.Path, err)
-		}
-		if ok {
-			changed = append(changed, t.Path)
-		}
-	}
-	return changed, nil
+	return applyRC(bunTargets(u, launchers), u, ensureRCBlock)
 }
 
 // RemoveBunLauncherEnv strips the Bun launcher block EnsureBunLauncherEnv added from every startup
 // file of u. Returns the files modified.
 func RemoveBunLauncherEnv(u User) ([]string, error) {
+	return applyRC(bunTargets(u, nil), u, removeRCBlock)
+}
+
+// applyRC runs op (ensureRCBlock / removeRCBlock) on every target, stopping at the first error.
+// Returns the files modified.
+func applyRC(targets []rcTarget, u User, op func(*rcTarget, User) (bool, error)) ([]string, error) {
 	var changed []string
-	for _, t := range bunTargets(u, nil) {
-		ok, err := removeRCBlock(&t, u)
+	for _, t := range targets {
+		ok, err := op(&t, u)
 		if err != nil {
 			return changed, fmt.Errorf("%s: %w", t.Path, err)
 		}
@@ -320,7 +296,7 @@ func stripRCBlocks(text, begin, end string, prepend bool) (string, error) {
 // setsKeyword reports whether any non-comment line mentions keyword (case-insensitive).
 func setsKeyword(text, keyword string) bool {
 	keyword = strings.ToLower(keyword)
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		line = strings.ToLower(strings.TrimSpace(line))
 		if !strings.HasPrefix(line, "#") && strings.Contains(line, keyword) {
 			return true

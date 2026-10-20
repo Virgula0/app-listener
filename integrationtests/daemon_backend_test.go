@@ -30,7 +30,7 @@ func (s *IntegrationSuite) runBackend(c testcontainers.Container, script string)
 		"timeout 60 /app-listener edit-protected --backend < /tmp/backend.in 2>/tmp/backend.err; echo EXIT=$?"})
 	s.Require().Equalf(0, code, "backend: %s", out)
 	replies := map[uint64]editbackend.Message{}
-	for _, l := range strings.Split(out, "\n") {
+	for l := range strings.SplitSeq(out, "\n") {
 		var m editbackend.Message
 		if strings.HasPrefix(l, "{") && json.Unmarshal([]byte(l), &m) == nil && m.Kind == editbackend.KindReply {
 			replies[m.ID] = m

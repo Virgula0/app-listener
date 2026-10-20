@@ -212,7 +212,7 @@ func parseParityRecording(out string) (rcs map[string]string, masks map[string][
 	rcs, masks = map[string]string{}, map[string][]string{}
 	var conf []string
 	inConfig := false
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		switch f := strings.Fields(line); {
 		case line == "CONFIG-BEGIN":
 			inConfig = true

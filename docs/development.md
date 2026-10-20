@@ -15,7 +15,7 @@ Contributor-oriented notes (architecture, the BPF verifier budget, test conventi
 | `make check-compatibility` | Static host check: can it run app-listener? |
 | `make test` | Unit tests |
 | `make test-integration` | Docker integration and bypass suite (rootful Docker) |
-| `make lint` | golangci-lint |
+| `make lint` | golangci-lint (default and GUI build), then `tools/codecheck`: dead code under every build tag set, unused symbols, duplicate bodies, forwarding wrappers. Accepted hits go in `tools/codecheck/allow.txt` with a reason (run `make generate` first) |
 | `make vuln` | govulncheck over the module (`GUI=1` scans the GUI build; run `make generate` first) |
 | `make pprof` | Save CPU, heap, allocation and goroutine profiles of a daemon started with `--pprof` |
 | `make clean` | Remove build artifacts |

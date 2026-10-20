@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,10 +43,10 @@ type Monitor struct {
 	paths  *pathCache
 	mounts *mountTable
 
-	// exes names executables by inode (readLoop only): filled from exec events, which outlive a
+	// exes names executables by inode (readEvent only): filled from exec events, which outlive a
 	// short-lived process, and from /proc/<pid>/exe when the exec predates the monitor.
 	exes map[exeKey]string
-	// execs is the name each pid was last exec'd by (bprm->filename, absolute; readLoop only): a
+	// execs is the name each pid was last exec'd by (bprm->filename, absolute; readEvent only): a
 	// uutils multicall's applet is chosen by it, so its identity is (inode, name).
 	execs map[uint32]string
 	// execMaps passes code mappings of any file (libraries), not only of targets.
@@ -274,28 +275,8 @@ func (m *Monitor) Start() error {
 		paths[i] = t.Path
 	}
 	log.Infof("monitor started \u2014 watching: %s", strings.Join(paths, ", "))
-	go m.readLoop(rd)
+	go ebpf.PumpRingbuf(rd, m.readEvent, m.events, m.done)
 	return nil
-}
-
-func (m *Monitor) readLoop(rd *ringbuf.Reader) {
-	defer rd.Close()
-
-	for {
-		ev, ok := m.readEvent(rd)
-		if !ok {
-			return
-		}
-		if ev == nil {
-			continue
-		}
-
-		select {
-		case m.events <- *ev:
-		case <-m.done:
-			return
-		}
-	}
 }
 
 func (m *Monitor) readEvent(rd *ringbuf.Reader) (*ebpf.FileEvent, bool) {
@@ -607,12 +588,7 @@ func (m *Monitor) matchRecursiveDepth(path, dir string) bool {
 
 func (m *Monitor) eventTypeAllowed(et ebpf.EventType) bool {
 	types := m.eventTypes.Load().([]ebpf.EventType)
-	for _, allowed := range types {
-		if et == allowed {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(types, et)
 }
 
 func (m *Monitor) isWithinDir(path, dir string) bool {

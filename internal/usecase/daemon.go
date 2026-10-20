@@ -114,16 +114,10 @@ func NewDaemonUseCase(resources []daemonconfig.Resource, vault repository.Vault,
 	}, nil
 }
 
-// concurrencyLimit bounds a resource-indexed fan-out to core count and never more than the work
-// (avoids a thundering herd of tree walks/BPF syscalls).
-func concurrencyLimit(n int) int {
-	if n < 1 {
-		return 1
-	}
-	if lim := runtime.NumCPU(); lim < n {
-		return lim
-	}
-	return n
+// ConcurrencyLimit bounds a resource-indexed fan-out to core count and never more than the work
+// (avoids a thundering herd of tree walks/BPF syscalls, CPU-heavy verifier loads).
+func ConcurrencyLimit(n int) int {
+	return max(1, min(n, runtime.NumCPU()))
 }
 
 // unlockRoots unlocks every root via unlockOne with bounded concurrency. Safe because: (1) roots is
@@ -140,7 +134,7 @@ func unlockRoots(roots []string, unlockOne func(root string) error) error {
 	}
 	errs := make([]error, len(roots))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, concurrencyLimit(len(roots)))
+	sem := make(chan struct{}, ConcurrencyLimit(len(roots)))
 	for i, root := range roots {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -187,13 +181,13 @@ func (d *daemonUseCase) prepareOneGuard(i int) error {
 	return nil
 }
 
-// prepareAndStartGuards fans prepareOneGuard out across guards (bounded by concurrencyLimit) and
+// prepareAndStartGuards fans prepareOneGuard out across guards (bounded by ConcurrencyLimit) and
 // waits for all.
 func (d *daemonUseCase) prepareAndStartGuards() error {
 	n := len(d.guards)
 	errs := make([]error, n)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, concurrencyLimit(n))
+	sem := make(chan struct{}, ConcurrencyLimit(n))
 	for i := range n {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -862,7 +856,7 @@ func (d *daemonUseCase) lockUntilAllKeyless(resources []daemonconfig.Resource, g
 // error keeps it in rollbackReload's pending set so the bounded retry budget's exhaustion
 // orphans (keeps attached) rather than stops that guard.
 func (d *daemonUseCase) lockWithRetry(resources []daemonconfig.Resource, guards []repository.GuardRepository, path string) error {
-	for i := 0; i < maxLockRetries; i++ {
+	for range maxLockRetries {
 		err := vaultOpOnRoot(resources, guards, path, func() error { return d.vault.Lock(path, true) })
 		if err == nil || errors.Is(err, repository.ErrKeyMissing) {
 			log.Infof("daemon: locked fscrypt directory fully: %s", path)

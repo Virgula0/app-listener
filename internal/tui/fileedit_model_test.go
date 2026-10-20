@@ -189,7 +189,7 @@ func TestFileEditPaneGeometry(t *testing.T) {
 
 	// The rendered tree block is padded to exactly leftW so the layout does
 	// not collapse to the longest filename.
-	for _, line := range strings.Split(strings.TrimRight(m.renderTree(m.leftW, m.paneHeight()), "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(m.renderTree(m.leftW, m.paneHeight()), "\n"), "\n") {
 		if lw := lipgloss.Width(line); lw != m.leftW {
 			t.Fatalf("tree line width = %d, want leftW %d (%q)", lw, m.leftW, line)
 		}
@@ -252,7 +252,7 @@ func abs(n int) int {
 
 func maxLineWidth(view string) int {
 	w := 0
-	for _, line := range strings.Split(view, "\n") {
+	for line := range strings.SplitSeq(view, "\n") {
 		if lw := lipgloss.Width(line); lw > w {
 			w = lw
 		}

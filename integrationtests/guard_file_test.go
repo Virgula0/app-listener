@@ -324,7 +324,7 @@ printf 'LOOPDEV=%s\n' "$LOOP"
 `
 	code, out := s.exec(c, []string{"sh", "-c", setup})
 	loopDev := ""
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if strings.HasPrefix(ln, "LOOPDEV=/dev/loop") {
 			loopDev = strings.TrimPrefix(ln, "LOOPDEV=")

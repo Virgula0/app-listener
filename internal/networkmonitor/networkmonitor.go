@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -110,7 +110,7 @@ func NewNetworkMonitor(binaries []BinaryEntry) (*NetworkMonitor, error) {
 	}
 
 	log.Infof("network monitor created \u2014 %d/%d probes/tracepoints attached, watching: %s",
-		probes, len(attachments), binariesSummary(binaries))
+		probes, len(attachments), ebpf.BinariesSummary(binaries))
 	return m, nil
 }
 
@@ -230,28 +230,8 @@ func (m *NetworkMonitor) Start() error {
 	}
 
 	log.Infof("network monitor started \u2014 watching %d binaries", len(m.binaries))
-	go m.readLoop(rd)
+	go ebpf.PumpRingbuf(rd, m.readEvent, m.events, m.done)
 	return nil
-}
-
-func (m *NetworkMonitor) readLoop(rd *ringbuf.Reader) {
-	defer rd.Close()
-
-	for {
-		ev, ok := m.readEvent(rd)
-		if !ok {
-			return
-		}
-		if ev == nil {
-			continue
-		}
-
-		select {
-		case m.events <- *ev:
-		case <-m.done:
-			return
-		}
-	}
 }
 
 func (m *NetworkMonitor) readEvent(rd *ringbuf.Reader) (*ebpf.NetEvent, bool) {
@@ -264,24 +244,7 @@ func (m *NetworkMonitor) readEvent(rd *ringbuf.Reader) (*ebpf.NetEvent, bool) {
 		return nil, true
 	}
 
-	var be struct {
-		PID      uint32
-		UID      uint32
-		GID      uint32
-		Type     uint32
-		Proto    uint32
-		Size     uint32
-		FD       uint32
-		AF       uint32
-		Saddr    [4]uint32
-		Daddr    [4]uint32
-		Sport    uint16
-		Dport    uint16
-		Comm     [16]byte
-		TID      uint32
-		NetNS    uint64
-		CgroupID uint64
-	}
+	var be ebpf.NetRecord
 	if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &be); err != nil {
 		log.Errorf("decode net event: %v", err)
 		return nil, true
@@ -291,23 +254,7 @@ func (m *NetworkMonitor) readEvent(rd *ringbuf.Reader) (*ebpf.NetEvent, bool) {
 		return nil, true
 	}
 
-	ev := ebpf.NetEvent{
-		PID:       be.PID,
-		TID:       be.TID,
-		UID:       be.UID,
-		GID:       be.GID,
-		Type:      ebpf.NetEventType(be.Type),
-		Protocol:  be.Proto,
-		Size:      be.Size,
-		FD:        be.FD,
-		Comm:      ebpf.Cstr(be.Comm[:]),
-		NetNS:     be.NetNS,
-		CgroupID:  be.CgroupID,
-		Timestamp: time.Now().UnixNano(),
-	}
-
-	ev.SrcAddr = ebpf.FormatAddr(be.AF, be.Saddr[:], be.Sport)
-	ev.DstAddr = ebpf.FormatAddr(be.AF, be.Daddr[:], be.Dport)
+	ev := be.Event()
 
 	if !m.eventTypeAllowed(ev.Type) {
 		return nil, true
@@ -318,12 +265,7 @@ func (m *NetworkMonitor) readEvent(rd *ringbuf.Reader) (*ebpf.NetEvent, bool) {
 
 func (m *NetworkMonitor) eventTypeAllowed(et ebpf.NetEventType) bool {
 	types := m.eventTypes.Load().([]ebpf.NetEventType)
-	for _, allowed := range types {
-		if et == allowed {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(types, et)
 }
 
 func (m *NetworkMonitor) Stop() {
@@ -345,6 +287,3 @@ func (m *NetworkMonitor) cleanup() {
 	m.links = nil
 	m.objs.Close()
 }
-
-// binariesSummary delegates to the shared implementation in infrastructure.
-var binariesSummary = ebpf.BinariesSummary

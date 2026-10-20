@@ -33,7 +33,7 @@ func Read() (*Stats, error) {
 }
 
 func parseStatus(data string, s *Stats) {
-	for _, line := range strings.Split(data, "\n") {
+	for line := range strings.SplitSeq(data, "\n") {
 		switch {
 		case strings.HasPrefix(line, "VmRSS:"):
 			s.RSS = parseKBValue(line)

@@ -503,10 +503,9 @@ func verifyCollection(spec *cilium.CollectionSpec) error {
 	coll, err := cilium.NewCollection(spec)
 	if err != nil {
 		// Dump the FULL verifier log (%+v) to a file; the wrapped error is truncated.
-		var ve *cilium.VerifierError
-		if errors.As(err, &ve) {
+		if ve, ok := errors.AsType[*cilium.VerifierError](err); ok {
 			const logPath = "/tmp/app-listener-verifier.log"
-			if werr := os.WriteFile(logPath, []byte(fmt.Sprintf("%+v\n", ve)), 0o600); werr == nil {
+			if werr := os.WriteFile(logPath, fmt.Appendf(nil, "%+v\n", ve), 0o600); werr == nil {
 				log.Errorf("full verifier log written to %s (read with sudo)", logPath)
 			}
 			// Echo the log tail (where the rejection happens) to the terminal/journal.
@@ -735,15 +734,14 @@ func (g *Guard) unpinSelfMaps() {
 	}
 }
 
-// guardLSMHooks lists the LSM programs to attach; ioctlCompat adds file_ioctl_compat (see guardSpec).
-func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []struct {
+type lsmHook struct {
 	prog *cilium.Program
 	hook string
-} {
-	hooks := []struct {
-		prog *cilium.Program
-		hook string
-	}{
+}
+
+// guardLSMHooks lists the LSM programs to attach; ioctlCompat adds file_ioctl_compat (see guardSpec).
+func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []lsmHook {
+	hooks := []lsmHook{
 		{o.GuardFileOpen, "file_open"},
 		{o.GuardFilePermission, "file_permission"},
 		{o.GuardFileTruncate, "file_truncate"},
@@ -775,10 +773,7 @@ func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []struct {
 		{o.GuardFileIoctl, "file_ioctl"},
 	}
 	if ioctlCompat {
-		hooks = append(hooks, struct {
-			prog *cilium.Program
-			hook string
-		}{o.GuardFileIoctlCompat, "file_ioctl_compat"})
+		hooks = append(hooks, lsmHook{o.GuardFileIoctlCompat, "file_ioctl_compat"})
 	}
 	return hooks
 }
@@ -1260,9 +1255,7 @@ func (g *Guard) retryDeferredBinaries(resolved []BinaryEntry, resolvedEvents map
 	if g.exeEvents == nil {
 		g.exeEvents = make(map[string][]ebpf.EventType)
 	}
-	for path, types := range resolvedEvents {
-		g.exeEvents[path] = types
-	}
+	maps.Copy(g.exeEvents, resolvedEvents)
 	maps.Copy(g.links, links)
 	// Pin the freshly resolved binaries so in-place replacement detection covers them.
 	if g.binaryVerifyStates != nil {
@@ -1297,9 +1290,7 @@ func (g *Guard) reSyncBinaries(shared bool) (int, error) {
 	g.mu.Lock()
 	binaries := append([]BinaryEntry(nil), g.binaries...)
 	exeEvents := make(map[string][]ebpf.EventType, len(g.exeEvents))
-	for path, types := range g.exeEvents {
-		exeEvents[path] = types
-	}
+	maps.Copy(exeEvents, g.exeEvents)
 	g.mu.Unlock()
 
 	var changed int
@@ -2265,9 +2256,7 @@ func (g *Guard) verifyBinaryHashLoop() {
 func (g *Guard) verifyBinaryHashesOnce() {
 	g.mu.Lock()
 	states := make(map[string]*binaryVerifyState, len(g.binaryVerifyStates))
-	for canonical, st := range g.binaryVerifyStates {
-		states[canonical] = st
-	}
+	maps.Copy(states, g.binaryVerifyStates)
 	g.mu.Unlock()
 
 	for canonical, st := range states {
@@ -2700,11 +2689,6 @@ func (e *bpfGuardEvent) toFileEvent() ebpf.FileEvent {
 		Path: ebpf.Cstr(e.Path[:]),
 		Dest: ebpf.Cstr(e.Dest[:]),
 	}
-}
-
-// BinariesSummary formats the whitelist entries for log lines.
-func BinariesSummary(binaries []BinaryEntry) string {
-	return ebpf.BinariesSummary(binaries)
 }
 
 // resKey scopes an executable's inode to this resource: a binary whitelisted for one resource must

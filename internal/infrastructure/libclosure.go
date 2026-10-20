@@ -87,26 +87,21 @@ func rootOwnedInode(path string) error {
 	return nil
 }
 
-// ResolveLibraryClosure returns the absolute paths of every shared object a dynamically linked
-// binary loads at startup, by STATIC analysis only: the program interpreter (ld-linux*.so) plus the
+// LibraryClosure returns the absolute paths of every shared object a dynamically linked binary
+// loads at startup, by STATIC analysis only: the program interpreter (ld-linux*.so) plus the
 // transitive DT_NEEDED closure. It never runs the target (unlike ldd), so it's safe on any
 // whitelisted binary.
 //
 // Deliberately NOT complete: dlopen'd libraries (NSS, gconv, GL drivers, plugins) are invisible
-// here. Only members passing rootOwnedSafe are returned, i.e. those the kernel system-trusts.
+// here. trusted holds only members passing rootOwnedSafe, i.e. those the kernel system-trusts;
+// rejected holds the others, with why. The daemon uses only the refusals, to warn: trust_mmap may
+// still accept them (guarded tree, reserved name). Paths are unresolved, so never feed them to a
+// path-keyed trust decision.
 //
 // Empty closure, no error, for: a statically linked binary (no INTERP/dynamic section); a script
 // (#!), which runs as its interpreter, a separate binary resolved on its own; an ELF for an
 // architecture this machine can't run natively (Steam ships pressure-vessel-arm64 for FEX), whose
 // interpreter isn't on the host.
-func ResolveLibraryClosure(binaryPath string) ([]string, error) {
-	trusted, _, err := LibraryClosure(binaryPath)
-	return trusted, err
-}
-
-// LibraryClosure is ResolveLibraryClosure plus the members that fail rootOwnedSafe, with why. The
-// daemon uses only the refusals, to warn: trust_mmap may still accept them (guarded tree, reserved
-// name). Paths are unresolved, so never feed them to a path-keyed trust decision.
 func LibraryClosure(binaryPath string) (trusted []string, rejected map[string]error, err error) {
 	if isScript(binaryPath) {
 		return nil, nil, nil
@@ -217,7 +212,7 @@ func searchDirs(objPath string, f *elf.File) []string {
 			continue
 		}
 		for _, v := range vals {
-			for _, d := range strings.Split(v, ":") {
+			for d := range strings.SplitSeq(v, ":") {
 				d = strings.ReplaceAll(d, "$ORIGIN", origin)
 				d = strings.ReplaceAll(d, "${ORIGIN}", origin)
 				if d != "" {
@@ -351,7 +346,7 @@ func LdSoPreloadPaths() ([]string, error) {
 		return nil, err
 	}
 	var paths []string
-	for _, field := range strings.Fields(string(data)) {
+	for field := range strings.FieldsSeq(string(data)) {
 		if strings.HasPrefix(field, "#") {
 			break
 		}

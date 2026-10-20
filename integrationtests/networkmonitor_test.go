@@ -18,12 +18,11 @@ type netMonitorEvent struct {
 
 func parseNetMonitorEvents(logContent string) []netMonitorEvent {
 	var events []netMonitorEvent
-	for _, line := range strings.Split(logContent, "\n") {
-		idx := strings.Index(line, "NETEVENT|")
-		if idx < 0 {
+	for line := range strings.SplitSeq(logContent, "\n") {
+		_, rest, ok := strings.Cut(line, "NETEVENT|")
+		if !ok {
 			continue
 		}
-		rest := line[idx+len("NETEVENT|"):]
 		parts := strings.SplitN(rest, "|", 10)
 		if len(parts) < 10 {
 			continue

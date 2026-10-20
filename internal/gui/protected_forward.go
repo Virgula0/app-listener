@@ -5,6 +5,7 @@ package gui
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -96,29 +97,34 @@ func (f *forwardForm) add(p string) {
 		showInformation("Binary", p+" is not an absolute path.", f.p.s.win)
 		return
 	}
-	for _, b := range f.bins {
-		if b == p {
-			return
-		}
+	if slices.Contains(f.bins, p) {
+		return
 	}
 	f.bins = append(f.bins, p)
 	f.refreshList()
 }
 
 func (f *forwardForm) refreshList() {
-	f.list.Objects = nil
-	if len(f.bins) == 0 {
-		f.list.Add(mutedText("No binaries yet: type a path or browse for one."))
+	fillRemovableList(f.list, &f.bins, "terminal-window", "No binaries yet: type a path or browse for one.",
+		f.refreshList)
+}
+
+// fillRemovableList rebuilds list with one row per item, each with a button removing it from
+// *items and calling refresh; empty is shown when there are none.
+func fillRemovableList(list *fyne.Container, items *[]string, iconName, empty string, refresh func()) {
+	list.Objects = nil
+	if len(*items) == 0 {
+		list.Add(mutedText(empty))
 	}
-	for i, b := range f.bins {
+	for i, item := range *items {
 		rm := newButton("", icon("x"), func() {
-			f.bins = append(f.bins[:i], f.bins[i+1:]...)
-			f.refreshList()
+			*items = append((*items)[:i], (*items)[i+1:]...)
+			refresh()
 		})
 		rm.Importance = widget.LowImportance
-		f.list.Add(container.NewBorder(nil, nil, newIconTile("terminal-window", colorMuted, 26), rm, selectable(b)))
+		list.Add(container.NewBorder(nil, nil, newIconTile(iconName, colorMuted, 26), rm, selectable(item)))
 	}
-	f.list.Refresh()
+	list.Refresh()
 }
 
 // isOwnExecutable: admitting this window's own binary would hand the GUI build, with every

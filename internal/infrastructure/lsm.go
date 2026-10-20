@@ -24,7 +24,7 @@ func bpfLsmListed(file string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("cannot read %s (is securityfs mounted?): %w", file, err)
 	}
-	for _, lsm := range strings.Split(strings.TrimSpace(string(data)), ",") {
+	for lsm := range strings.SplitSeq(strings.TrimSpace(string(data)), ",") {
 		if strings.TrimSpace(lsm) == "bpf" {
 			return true, nil
 		}

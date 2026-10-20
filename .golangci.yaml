@@ -5,11 +5,13 @@ linters:
   default: none
   enable:
     - bodyclose
+    - canonicalheader
     - copyloopvar
     - dogsled
     - dupl
     - dupword
     - errcheck
+    - exptostd
     - funlen
     - gocognit
     - goconst
@@ -20,20 +22,27 @@ linters:
     - govet
     - importas
     - ineffassign
+    - intrange
     - makezero
+    - mirror
     - misspell
+    - modernize
     - nakedret
     - nilerr
     - noctx
     - nolintlint
+    - perfsprint
     - prealloc
+    - predeclared
     - protogetter
     - reassign
+    - revive
     - staticcheck
     - unconvert
     - unparam
     - unused
     - usestdlibvars
+    - wastedassign
   settings:
     dogsled:
       max-blank-identifiers: 3
@@ -98,6 +107,23 @@ linters:
       require-explanation: false
       require-specific: false
       allow-unused: false
+    perfsprint:
+      strconcat: false
+      errorf: false
+    revive:
+      rules:
+        - name: bool-literal-in-expr
+        - name: early-return
+        - name: empty-block
+        - name: identical-branches
+        - name: if-return
+        - name: indent-error-flow
+        - name: redundant-import-alias
+        - name: superfluous-else
+        - name: unconditional-recursion
+        - name: unnecessary-stmt
+        - name: unreachable-code
+        - name: useless-break
   exclusions:
     generated: lax
     presets:

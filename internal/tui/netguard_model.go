@@ -10,7 +10,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Virgula0/app-listener/internal/networkguard"
-	"github.com/Virgula0/app-listener/internal/procstats"
 )
 
 const maxNetGuardEvents = 500
@@ -56,13 +55,10 @@ type netGuardModel struct {
 	mode      networkguard.Mode
 	binaries  []networkguard.BinaryEntry
 	startTime time.Time
-	eventID   int
 	blocked   int
 	allowed   int
 
-	lastStats    *procstats.Stats
-	prevEventID  int
-	eventsPerSec float64
+	eventRate
 }
 
 func NewNetGuardModel(events <-chan networkguard.NetGuardEvent, mode networkguard.Mode, binaries []networkguard.BinaryEntry) tea.Model {
@@ -136,14 +132,7 @@ func (m *netGuardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.allowed++
 		}
 
-		m.lines = append(m.lines, netGuardEventLine{
-			event: ev,
-			line:  m.formatEvent(&ev),
-		})
-
-		if len(m.lines) > maxNetGuardEvents {
-			m.lines = m.lines[len(m.lines)-maxNetGuardEvents:]
-		}
+		m.lines = appendCapped(m.lines, netGuardEventLine{event: ev, line: m.formatEvent(&ev)}, maxNetGuardEvents)
 
 		m.renderContent()
 		m.viewport.GotoBottom()
@@ -152,13 +141,7 @@ func (m *netGuardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case netGuardStatsMsg:
-		s, err := procstats.Read()
-		if err == nil {
-			eventsDelta := m.eventID - m.prevEventID
-			m.eventsPerSec = float64(eventsDelta) / 3.0
-			m.prevEventID = m.eventID
-			m.lastStats = s
-		}
+		m.sample(3)
 
 		cmd := m.waitForStats()
 		return m, cmd
@@ -171,7 +154,7 @@ func (m *netGuardModel) formatEvent(ev *networkguard.NetGuardEvent) string {
 	style := netTypeStyles[ev.Type]
 	eventName := style.Render(ev.Type.String())
 
-	status := ""
+	var status string
 	if ev.Blocked {
 		status = netGuardBlockedStyle.Render(" BLOCKED")
 	} else {

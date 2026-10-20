@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	cilium "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -501,29 +500,9 @@ func (g *NetGuard) Start() error {
 		unsafeLabel = " [UNSAFE]"
 	}
 	log.Infof("network guard started (mode=%s%s) \u2014 %d binaries", modeLabel, unsafeLabel, len(g.binaries))
-	go g.readLoop(rd)
+	go ebpf.PumpRingbuf(rd, g.readEvent, g.events, g.done)
 	go g.watchDegraded(g.done)
 	return nil
-}
-
-func (g *NetGuard) readLoop(rd *ringbuf.Reader) {
-	defer rd.Close()
-
-	for {
-		ev, ok := g.readEvent(rd)
-		if !ok {
-			return
-		}
-		if ev == nil {
-			continue
-		}
-
-		select {
-		case g.events <- *ev:
-		case <-g.done:
-			return
-		}
-	}
 }
 
 func (g *NetGuard) readEvent(rd *ringbuf.Reader) (*NetGuardEvent, bool) {
@@ -537,24 +516,9 @@ func (g *NetGuard) readEvent(rd *ringbuf.Reader) (*NetGuardEvent, bool) {
 	}
 
 	var be struct {
-		PID      uint32
-		UID      uint32
-		GID      uint32
-		Type     uint32
-		Proto    uint32
-		Size     uint32
-		FD       uint32
-		AF       uint32
-		Saddr    [4]uint32
-		Daddr    [4]uint32
-		Sport    uint16
-		Dport    uint16
-		Comm     [16]byte
-		TID      uint32
-		NetNS    uint64
-		CgroupID uint64
-		Blocked  uint32
-		Reason   uint32
+		ebpf.NetRecord
+		Blocked uint32
+		Reason  uint32
 	}
 	if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &be); err != nil {
 		log.Errorf("decode net guard event: %v", err)
@@ -566,24 +530,9 @@ func (g *NetGuard) readEvent(rd *ringbuf.Reader) (*NetGuardEvent, bool) {
 	}
 
 	ev := NetGuardEvent{
-		NetEvent: ebpf.NetEvent{
-			PID:      be.PID,
-			TID:      be.TID,
-			UID:      be.UID,
-			GID:      be.GID,
-			Type:     ebpf.NetEventType(be.Type),
-			Protocol: be.Proto,
-			Size:     be.Size,
-			FD:       be.FD,
-			Comm:     ebpf.Cstr(be.Comm[:]),
-			NetNS:    be.NetNS,
-			CgroupID: be.CgroupID,
-			// Stamp once at ingestion: dual TUI consumers (local and
-			// browser) must display the same time for the same event.
-			Timestamp: time.Now().UnixNano(),
-		},
-		Blocked: be.Blocked != 0,
-		Reason:  reasonText(be.Reason),
+		NetEvent: be.Event(),
+		Blocked:  be.Blocked != 0,
+		Reason:   reasonText(be.Reason),
 	}
 	switch ev.Type {
 	case ebpf.NetPtrace:
@@ -591,9 +540,6 @@ func (g *NetGuard) readEvent(rd *ringbuf.Reader) (*NetGuardEvent, bool) {
 	case ebpf.NetTracedExec:
 		ev.Reason = fmt.Sprintf("tracer=%d", be.FD)
 	}
-
-	ev.SrcAddr = ebpf.FormatAddr(be.AF, be.Saddr[:], be.Sport)
-	ev.DstAddr = ebpf.FormatAddr(be.AF, be.Daddr[:], be.Dport)
 
 	return &ev, true
 }

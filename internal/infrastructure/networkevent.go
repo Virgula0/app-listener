@@ -2,9 +2,11 @@ package ebpf
 
 import (
 	"encoding/binary"
-	"fmt"
+	"math/bits"
 	"net"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type NetEventType int
@@ -97,9 +99,10 @@ func NetEventTypes() []NetEventType {
 	}
 }
 
-type NetBpfEvent struct {
+// NetRecord is the ringbuf layout of networkmonitor.bpf.c's struct net_event, which is also the
+// prefix of networkguard.bpf.c's struct net_guard_event. Field order must match the C structs.
+type NetRecord struct {
 	PID      uint32
-	TID      uint32
 	UID      uint32
 	GID      uint32
 	Type     uint32
@@ -112,32 +115,36 @@ type NetBpfEvent struct {
 	Sport    uint16
 	Dport    uint16
 	Comm     [16]byte
+	TID      uint32
 	NetNS    uint64
 	CgroupID uint64
 }
 
-func (e *NetBpfEvent) ToNetEvent() NetEvent {
+// Event converts r, stamping it once at ingestion: dual TUI consumers (local and browser) must
+// display the same time for the same event.
+func (r *NetRecord) Event() NetEvent {
 	return NetEvent{
-		PID:      e.PID,
-		TID:      e.TID,
-		UID:      e.UID,
-		GID:      e.GID,
-		Type:     NetEventType(e.Type),
-		Protocol: e.Proto,
-		Size:     e.Size,
-		FD:       e.FD,
-		Comm:     Cstr(e.Comm[:]),
-		SrcAddr:  FormatAddr(e.AF, e.Saddr[:], e.Sport),
-		DstAddr:  FormatAddr(e.AF, e.Daddr[:], e.Dport),
-		NetNS:    e.NetNS,
-		CgroupID: e.CgroupID,
+		PID:       r.PID,
+		TID:       r.TID,
+		UID:       r.UID,
+		GID:       r.GID,
+		Type:      NetEventType(r.Type),
+		Protocol:  r.Proto,
+		Size:      r.Size,
+		FD:        r.FD,
+		Comm:      Cstr(r.Comm[:]),
+		SrcAddr:   FormatAddr(r.AF, r.Saddr[:], r.Sport),
+		DstAddr:   FormatAddr(r.AF, r.Daddr[:], r.Dport),
+		NetNS:     r.NetNS,
+		CgroupID:  r.CgroupID,
+		Timestamp: time.Now().UnixNano(),
 	}
 }
 
+// Ntohs byte-swaps a port the BPF side copied in network order (both release arches are
+// little-endian).
 func Ntohs(v uint16) uint16 {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, v)
-	return binary.LittleEndian.Uint16(b)
+	return bits.ReverseBytes16(v)
 }
 
 func FormatAddr(af uint32, ip []uint32, port uint16) string {
@@ -165,7 +172,7 @@ func FormatAddr(af uint32, ip []uint32, port uint16) string {
 
 	if port != 0 {
 		buf.WriteString(":")
-		buf.WriteString(fmt.Sprintf("%d", Ntohs(port)))
+		buf.WriteString(strconv.FormatUint(uint64(Ntohs(port)), 10))
 	}
 	return buf.String()
 }

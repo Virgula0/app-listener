@@ -89,19 +89,8 @@ func (f *recordForm) add(path string) {
 }
 
 func (f *recordForm) refreshList() {
-	f.list.Objects = nil
-	if len(f.paths) == 0 {
-		f.list.Add(mutedText("No paths yet: type one or browse for a folder or file."))
-	}
-	for i, path := range f.paths {
-		rm := newButton("", icon("x"), func() {
-			f.paths = append(f.paths[:i], f.paths[i+1:]...)
-			f.refreshList()
-		})
-		rm.Importance = widget.LowImportance
-		f.list.Add(container.NewBorder(nil, nil, newIconTile("folder", colorMuted, 26), rm, selectable(path)))
-	}
-	f.list.Refresh()
+	fillRemovableList(f.list, &f.paths, "folder", "No paths yet: type one or browse for a folder or file.",
+		f.refreshList)
 }
 
 // submit sends the paths only after AUTH: the backend validates and watches them as the daemon's
@@ -311,50 +300,12 @@ type recordReview struct {
 func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording, blockers map[string]string) *recordReview {
 	r := &recordReview{p: p, link: link, rec: rec, bins: map[string]*handCheck{}, libs: map[string]*handCheck{},
 		encrypt: map[string]*handCheck{}, status: mutedText("")}
-	binBox, refused, covered, libBox := container.NewVBox(), container.NewVBox(), container.NewVBox(), container.NewVBox()
-	for i := range rec.Binaries {
-		b := &rec.Binaries[i]
-		if !b.Admissible() {
-			refused.Add(binaryCard(b, nil))
-			continue
-		}
-		if b.Covered() {
-			covered.Add(binaryCard(b, nil))
-			continue
-		}
-		c := newCheck(logging.SanitizeText(b.Line), nil)
-		c.Checked = b.Suggested
-		r.bins[b.Line] = c
-		binBox.Add(binaryCard(b, c))
-		for _, l := range b.Libs {
-			if l.Problem != "" || r.libs[l.Path] != nil {
-				continue
-			}
-			lc := newCheck(logging.SanitizeText(l.Path), nil)
-			r.libs[l.Path] = lc
-			libBox.Add(container.NewVBox(lc, mutedText("loaded by "+logging.SanitizeText(b.Line))))
-		}
-	}
+	binBox, refused, covered, libBox := r.binaryChecks()
 	if len(r.bins) == 0 {
 		binBox.Add(mutedText("No binary to add: applying guards the new paths with an empty whitelist " +
 			"(every access denied); the existing sections stay as they are."))
 	}
-	encBox := container.NewVBox()
-	for _, t := range rec.Targets {
-		if t.Existing != nil {
-			continue
-		}
-		c := newCheck("Encrypt "+t.Path+" at rest", nil)
-		if why := blockers[t.Path]; why != "" {
-			c.Disable()
-			encBox.Add(container.NewVBox(c, mutedText("Guarded unencrypted: "+why)))
-		} else {
-			c.Checked = true
-			encBox.Add(container.NewVBox(c, mutedText("Moved to "+t.Path+fscrypt.BackupSuffix+", re-created "+
-				"encrypted and locked; the reload attaches its guard, then unlocks it.")))
-		}
-		r.encrypt[t.Path] = c
-	}
+	encBox := r.encryptChecks(blockers)
 	r.masks = newCheck("Restrict each binary to the events it was seen doing", nil)
 	review := newButton("Review changes", icon("check"), r.review)
 	review.Importance = widget.HighImportance
@@ -389,6 +340,54 @@ func newRecordReview(p *protectedPage, link backendLink, rec *recorder.Recording
 	parts = append(parts, container.NewHBox(discard, review), r.status)
 	r.root = newFadeVScroll(newGapVBox(parts...))
 	return r
+}
+
+func (r *recordReview) binaryChecks() (binBox, refused, covered, libBox *fyne.Container) {
+	binBox, refused, covered, libBox = container.NewVBox(), container.NewVBox(), container.NewVBox(), container.NewVBox()
+	for i := range r.rec.Binaries {
+		b := &r.rec.Binaries[i]
+		if !b.Admissible() {
+			refused.Add(binaryCard(b, nil))
+			continue
+		}
+		if b.Covered() {
+			covered.Add(binaryCard(b, nil))
+			continue
+		}
+		c := newCheck(logging.SanitizeText(b.Line), nil)
+		c.Checked = b.Suggested
+		r.bins[b.Line] = c
+		binBox.Add(binaryCard(b, c))
+		for _, l := range b.Libs {
+			if l.Problem != "" || r.libs[l.Path] != nil {
+				continue
+			}
+			lc := newCheck(logging.SanitizeText(l.Path), nil)
+			r.libs[l.Path] = lc
+			libBox.Add(container.NewVBox(lc, mutedText("loaded by "+logging.SanitizeText(b.Line))))
+		}
+	}
+	return binBox, refused, covered, libBox
+}
+
+func (r *recordReview) encryptChecks(blockers map[string]string) *fyne.Container {
+	box := container.NewVBox()
+	for _, t := range r.rec.Targets {
+		if t.Existing != nil {
+			continue
+		}
+		c := newCheck("Encrypt "+t.Path+" at rest", nil)
+		if why := blockers[t.Path]; why != "" {
+			c.Disable()
+			box.Add(container.NewVBox(c, mutedText("Guarded unencrypted: "+why)))
+		} else {
+			c.Checked = true
+			box.Add(container.NewVBox(c, mutedText("Moved to "+t.Path+fscrypt.BackupSuffix+", re-created "+
+				"encrypted and locked; the reload attaches its guard, then unlocks it.")))
+		}
+		r.encrypt[t.Path] = c
+	}
+	return box
 }
 
 // binaryCard describes one recorded executable; check is nil for one that can't be added.

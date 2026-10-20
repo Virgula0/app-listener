@@ -3,9 +3,6 @@ package monitor
 import (
 	"errors"
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
@@ -127,21 +124,10 @@ func prepareMonitorTargets(watchPaths []string) ([]common.RawTarget, []ebpf.Targ
 }
 
 func runHeadless(uc usecase.MonitorUseCase) {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-
-	for {
-		select {
-		case ev, ok := <-uc.Events():
-			if !ok {
-				return
-			}
-			log.Infof("EVENT|%s|%s|%s|%d|%s|%d",
-				ev.Type.String(), logging.SanitizeText(ev.Comm), logging.SanitizeText(ev.Path), ev.PID, logging.SanitizeText(ev.Dest), ev.FD)
-		case <-sig:
-			return
-		}
-	}
+	common.DrainUntilSignal(uc.Events(), func(ev *ebpf.FileEvent) {
+		log.Infof("EVENT|%s|%s|%s|%d|%s|%d",
+			ev.Type.String(), logging.SanitizeText(ev.Comm), logging.SanitizeText(ev.Path), ev.PID, logging.SanitizeText(ev.Dest), ev.FD)
+	})
 }
 
 func runTUI(uc usecase.MonitorUseCase, paths []string, recursive bool, depth int) error {

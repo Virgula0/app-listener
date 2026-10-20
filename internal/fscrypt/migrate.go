@@ -488,10 +488,7 @@ func unlockForRemoval(path string) error {
 		return err
 	}
 	defer func() { _ = lockAndDeprovision(policy, nil) }()
-	if err := policy.Provision(); err != nil {
-		return err
-	}
-	return nil
+	return policy.Provision()
 }
 
 // applyRawKeyPolicy protects the (empty) path with a fresh policy wrapped by a raw-key protector
@@ -567,7 +564,7 @@ func lockAndDeprovision(policy *actions.Policy, protector *actions.Protector) er
 	if protector != nil {
 		_ = protector.Lock()
 	}
-	for i := 0; i < maxDeprovisionRetries; i++ {
+	for range maxDeprovisionRetries {
 		err := policy.Deprovision(true)
 		switch {
 		case err == nil:

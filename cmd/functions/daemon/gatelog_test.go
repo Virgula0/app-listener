@@ -39,7 +39,7 @@ func TestGateLogLimiterFoldsReadRepeats(t *testing.T) {
 	if !l.Admit(&ev) {
 		t.Fatal("the first occurrence must be logged in full")
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if l.Admit(&ev) {
 			t.Fatalf("repeat %d must be folded", i)
 		}
@@ -76,7 +76,7 @@ func TestGateLogLimiterNeverFoldsWhatMatters(t *testing.T) {
 		gateEvent("TRACED_EXEC", "pid=1 comm=gdb"),
 		fileDenial,
 	} {
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			if !l.Admit(&ev) {
 				t.Fatalf("%s %q must never be folded (occurrence %d)", ev.Event.Process, ev.Event.Path, i)
 			}
@@ -138,7 +138,7 @@ func TestGateLogLimiterFlushesOnShutdown(t *testing.T) {
 func TestNoLogMetadataBlocks(t *testing.T) {
 	l, now := testLimiter()
 	meta := gateEvent("PTRACE", "pid=10 comm=steam mode=READ")
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if admitEvent(l, &meta, true) {
 			t.Fatalf("metadata-only denial %d must not be logged", i)
 		}

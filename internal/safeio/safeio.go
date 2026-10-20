@@ -25,26 +25,7 @@ var ErrSymlink = errors.New("refusing to operate through a symlink")
 // closed and the returned fd replaces it; on error dirFD is returned unchanged for the caller to
 // close.
 func DescendNoFollow(dirFD int, comps []string, createDirs bool, dirPerm os.FileMode) (int, error) {
-	for _, comp := range comps {
-		if comp == "" || comp == "." || comp == ".." {
-			return dirFD, fmt.Errorf("illegal path component %q", comp)
-		}
-		if createDirs {
-			if mkErr := unix.Mkdirat(dirFD, comp, uint32(dirPerm)); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
-				return dirFD, fmt.Errorf("creating %q: %w", comp, mkErr)
-			}
-		}
-		next, err := unix.Openat(dirFD, comp, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
-				return dirFD, fmt.Errorf("%w: component %q", ErrSymlink, comp)
-			}
-			return dirFD, fmt.Errorf("descending into %q: %w", comp, err)
-		}
-		_ = unix.Close(dirFD)
-		dirFD = next
-	}
-	return dirFD, nil
+	return descend(dirFD, comps, createDirs, dirPerm, -1, -1)
 }
 
 // DescendCreateOwned is DescendNoFollow that also chowns each directory it CREATES to uid/gid
@@ -52,22 +33,25 @@ func DescendNoFollow(dirFD int, comps []string, createDirs bool, dirPerm os.File
 // made 0755. Use it to build a path under a user's home as root without following a symlink the user
 // planted at any parent component.
 func DescendCreateOwned(dirFD int, comps []string, uid, gid int) (int, error) {
+	return descend(dirFD, comps, true, 0o755, uid, gid)
+}
+
+// descend is DescendNoFollow, chowning each directory it creates when uid and gid are both >= 0.
+func descend(dirFD int, comps []string, createDirs bool, dirPerm os.FileMode, uid, gid int) (int, error) {
 	for _, comp := range comps {
 		if comp == "" || comp == "." || comp == ".." {
 			return dirFD, fmt.Errorf("illegal path component %q", comp)
 		}
 		created := false
-		if mkErr := unix.Mkdirat(dirFD, comp, 0o755); mkErr == nil {
-			created = true
-		} else if !errors.Is(mkErr, unix.EEXIST) {
-			return dirFD, fmt.Errorf("creating %q: %w", comp, mkErr)
-		}
-		next, err := unix.Openat(dirFD, comp, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
-				return dirFD, fmt.Errorf("%w: component %q", ErrSymlink, comp)
+		if createDirs {
+			var err error
+			if created, err = mkdirAt(dirFD, comp, dirPerm); err != nil {
+				return dirFD, err
 			}
-			return dirFD, fmt.Errorf("descending into %q: %w", comp, err)
+		}
+		next, err := openDirNoFollow(dirFD, comp)
+		if err != nil {
+			return dirFD, err
 		}
 		_ = unix.Close(dirFD)
 		dirFD = next
@@ -80,17 +64,28 @@ func DescendCreateOwned(dirFD int, comps []string, uid, gid int) (int, error) {
 	return dirFD, nil
 }
 
-// RefuseExistingSymlink errors (ErrSymlink) when name under dirFD already exists as a symlink. A
-// missing name is fine.
-func RefuseExistingSymlink(dirFD int, name string) error {
-	var st unix.Stat_t
-	switch err := unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); {
-	case err == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK:
-		return fmt.Errorf("%w: %s", ErrSymlink, name)
-	case err != nil && !errors.Is(err, unix.ENOENT):
-		return fmt.Errorf("checking %s: %w", name, err)
+// mkdirAt creates comp under dirFD; created is false when it already existed.
+func mkdirAt(dirFD int, comp string, perm os.FileMode) (created bool, err error) {
+	switch mkErr := unix.Mkdirat(dirFD, comp, uint32(perm)); {
+	case mkErr == nil:
+		return true, nil
+	case errors.Is(mkErr, unix.EEXIST):
+		return false, nil
+	default:
+		return false, fmt.Errorf("creating %q: %w", comp, mkErr)
 	}
-	return nil
+}
+
+// openDirNoFollow opens directory comp under dirFD, refusing a symlink or non-directory (ErrSymlink).
+func openDirNoFollow(dirFD int, comp string) (int, error) {
+	next, err := unix.Openat(dirFD, comp, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
+			return -1, fmt.Errorf("%w: component %q", ErrSymlink, comp)
+		}
+		return -1, fmt.Errorf("descending into %q: %w", comp, err)
+	}
+	return next, nil
 }
 
 // CreateExclNoFollow creates name under dirFD with O_CREAT|O_EXCL|O_NOFOLLOW (O_RDWR, so the caller

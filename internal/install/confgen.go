@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 )
 
 // Section is one [watch <path>] block of the generated config.
@@ -244,8 +246,7 @@ func isWatchDirectiveText(t string) bool {
 // write-protection that makes its libraries trustworthy).
 func isLibDirectiveText(t string) bool {
 	for _, d := range [...]string{"allow_lib", "lib_dir", "lib_binary"} {
-		rest, ok := strings.CutPrefix(t, d)
-		if ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t' || rest[0] == ':') {
+		if _, ok := daemonconfig.CutDirective(t, d); ok {
 			return true
 		}
 	}
@@ -276,7 +277,7 @@ func ParseSectionHeaderPath(line string) (path string, ok bool) {
 	if !strings.HasPrefix(t, "[watch ") || !strings.HasSuffix(t, "]") {
 		return "", false
 	}
-	return unquotePath(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(t, "[watch "), "]"))), true
+	return daemonconfig.UnquotePath(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(t, "[watch "), "]"))), true
 }
 
 // ConfSafePath reports whether path can be written as a quoted daemon.conf path. The format has
@@ -291,14 +292,6 @@ func ConfSafePath(path string) bool {
 // hand-written configs). Callers pass ConfSafePath paths only.
 func quotePath(path string) string {
 	return `"` + path + `"`
-}
-
-// unquotePath strips a surrounding pair of double quotes from s, if present.
-func unquotePath(s string) string {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1]
-	}
-	return s
 }
 
 // findSectionEnd returns the index of the first line of the next section

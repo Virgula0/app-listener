@@ -1,0 +1,31 @@
+# Findings codecheck accepts: check<TAB>file:Name, one per line, a reason above each group.
+# An entry codecheck no longer reports fails the run too: delete it.
+
+# iota zero values / BPF ABI mirrors: their position gives the next constants their values.
+unused	internal/guard/tempgrant.go:maskKeep
+unused	internal/guard/trust.go:trustLibload
+
+# fyne hover one-liners on three distinct widget types; a shared embed buys nothing.
+samebody	internal/gui/nav.go:navItem.MouseIn
+samebody	internal/gui/tabs.go:tabButton.MouseIn
+samebody	internal/gui/widgets.go:clickPanel.MouseIn
+samebody	internal/gui/nav.go:navItem.MouseOut
+samebody	internal/gui/tabs.go:tabButton.MouseOut
+samebody	internal/gui/widgets.go:clickPanel.MouseOut
+
+# Same lifecycle on separate engines (own BPF objects); merging means a shared base type.
+samebody	internal/networkguard/networkguard.go:NetGuard.Stop
+samebody	internal/networkmonitor/networkmonitor.go:NetworkMonitor.Stop
+samebody	internal/monitor/monitor.go:Monitor.cleanup
+samebody	internal/networkmonitor/networkmonitor.go:NetworkMonitor.cleanup
+samebody	internal/workbench/files.go:FileTarget.LastError
+samebody	internal/workbench/network.go:Network.LastError
+
+# Wrappers whose name carries the intent at the call site, or the package's API over a private
+# shared engine.
+thin	internal/guard/inspectors.go:SetInspectors
+thin	internal/gui/app.go:scrollable
+thin	internal/infrastructure/networkevent.go:Ntohs
+thin	internal/tui/eventline.go:sanitizeTerminalText
+thin	internal/tui/network_model.go:formatAddr
+thin	internal/workbench/activity.go:Ingested

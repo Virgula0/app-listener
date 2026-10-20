@@ -2,6 +2,7 @@ package install
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -21,19 +22,15 @@ func ResolveCatalogEntry(resourcePath string, users []User) (*CandidateDir, *Use
 // nil. System entries yield the zero user.
 func catalogEntryMatch(entry *CandidateDir, users []User, match func(catalogPath string) bool) *User {
 	if entry.IsSystem() {
-		for _, p := range entry.PathsFor("", "") {
-			if match(p) {
-				return &User{}
-			}
+		if slices.ContainsFunc(entry.PathsFor("", ""), match) {
+			return &User{}
 		}
 		return nil
 	}
 	for j := range users {
 		u := &users[j]
-		for _, p := range entry.PathsFor(u.Home, u.Name) {
-			if match(p) {
-				return u
-			}
+		if slices.ContainsFunc(entry.PathsFor(u.Home, u.Name), match) {
+			return u
 		}
 	}
 	return nil

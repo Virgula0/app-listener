@@ -143,16 +143,6 @@ func TestNetEventTypeString(t *testing.T) {
 	}
 }
 
-func TestBinariesSummary(t *testing.T) {
-	entries := []BinaryEntry{
-		{Path: "/usr/bin/test", Hash: [32]byte{0x01, 0x02}},
-	}
-	summary := binariesSummary(entries)
-	if summary == "" {
-		t.Error("expected non-empty summary")
-	}
-}
-
 func TestStatInodeKey(t *testing.T) {
 	ik, err := statInodeKey("/proc/self/exe")
 	if err != nil {

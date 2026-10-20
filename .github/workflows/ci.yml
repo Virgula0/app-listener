@@ -37,6 +37,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # make lint also runs tools/codecheck (own module) and deadcode@DEADCODE_VERSION.
+          cache-dependency-path: |
+            go.sum
+            tools/codecheck/go.sum
 
       # Generated eBPF bindings are no longer committed (issue #45: a stale
       # object shipped in a release and crashed a newer kernel). Regenerate

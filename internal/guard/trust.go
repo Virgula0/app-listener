@@ -551,8 +551,8 @@ func (t *TrustGuard) detachLinks() {
 }
 
 func cStr(b []byte) string {
-	if i := bytes.IndexByte(b, 0); i >= 0 {
-		return string(b[:i])
+	if before, _, ok := bytes.Cut(b, []byte{0}); ok {
+		return string(before)
 	}
 	return string(b)
 }

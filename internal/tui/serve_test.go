@@ -257,12 +257,12 @@ func TestEventFanoutDuplicatesInOrderAndCloses(t *testing.T) {
 	source := make(chan int, 8)
 	fan := NewEventFanout(source)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		source <- i
 	}
 	close(source)
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		local, ok := <-fan.Local()
 		if !ok || local != i {
 			t.Fatalf("local[%d] = %d, ok = %t", i, local, ok)
@@ -297,7 +297,7 @@ func TestEventFanoutStopClosesOutputs(t *testing.T) {
 func TestEventFanoutDropOldestUnderPressure(t *testing.T) {
 	const total = fanoutBuffer + 10
 	source := make(chan int, total)
-	for i := 0; i < total; i++ {
+	for i := range total {
 		source <- i
 	}
 	close(source)
@@ -353,7 +353,7 @@ func TestViewsFitReportedTerminalSize(t *testing.T) {
 	fileEvents := make(chan ebpf.FileEvent, 8)
 	fileModel := NewModel(fileEvents, []string{longPath}, true, 3).(*model)
 	fileModel.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		ev := ebpf.FileEvent{
 			Timestamp: time.Now().UnixNano(), Type: ebpf.EventRename, PID: 1,
 			Comm: longBinary, Path: longPath, Dest: longPath,
@@ -367,7 +367,7 @@ func TestViewsFitReportedTerminalSize(t *testing.T) {
 	guardModel := NewGuardModel(guardEvents, longPath, guard.ModeWhitelist,
 		[]guard.BinaryEntry{{Path: longBinary}}).(*guardModel)
 	guardModel.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		ev := guard.GuardEvent{
 			FileEvent: ebpf.FileEvent{
 				Timestamp: time.Now().UnixNano(), Type: ebpf.EventOpen, PID: 1,
@@ -383,7 +383,7 @@ func TestViewsFitReportedTerminalSize(t *testing.T) {
 	netEvents := make(chan ebpf.NetEvent, 8)
 	netModel := NewNetModel(netEvents, []ebpf.BinaryEntry{{Path: longBinary}}).(*netModel)
 	netModel.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		ev := ebpf.NetEvent{
 			Timestamp: time.Now().UnixNano(), Type: ebpf.NetConnect, PID: 1,
 			Comm: longBinary, SrcAddr: "10.0.0.1:1", DstAddr: strings.Repeat("a", 90),
@@ -397,7 +397,7 @@ func TestViewsFitReportedTerminalSize(t *testing.T) {
 	netGuardModel := NewNetGuardModel(netGuardEvents, networkguard.ModeWhitelist,
 		[]networkguard.BinaryEntry{{Path: longBinary}}).(*netGuardModel)
 	netGuardModel.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	for i := 0; i < 40; i++ {
+	for range 40 {
 		ev := networkguard.NetGuardEvent{
 			NetEvent: ebpf.NetEvent{
 				Timestamp: time.Now().UnixNano(), Type: ebpf.NetConnect, PID: 1,
@@ -416,7 +416,7 @@ func TestViewsFitReportedTerminalSize(t *testing.T) {
 		{Path: "/r2", Binaries: 1},
 	}).(*daemonModel)
 	daemonModel.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		ev := usecase.DaemonEvent{
 			Resource: longPath,
 			Event: guard.GuardEvent{

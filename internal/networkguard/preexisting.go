@@ -254,7 +254,7 @@ func isTraced(proc string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		if v, ok := strings.CutPrefix(line, "TracerPid:"); ok {
 			return strings.TrimSpace(v) != "0", nil
 		}
@@ -264,7 +264,7 @@ func isTraced(proc string) (bool, error) {
 
 // loaderEnv mirrors env_loader: LD_PRELOAD or LD_AUDIT set to a non-empty value.
 func loaderEnv(environ []byte) bool {
-	for _, kv := range bytes.Split(environ, []byte{0}) {
+	for kv := range bytes.SplitSeq(environ, []byte{0}) {
 		for _, name := range []string{"LD_PRELOAD=", "LD_AUDIT="} {
 			if v, ok := bytes.CutPrefix(kv, []byte(name)); ok && len(v) > 0 {
 				return true
@@ -286,7 +286,7 @@ func readMountDevs(path string) (map[uint64]mountDev, error) {
 		return nil, err
 	}
 	out := make(map[uint64]mountDev)
-	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
 		f := strings.Fields(line)
 		sep := -1
 		for i, x := range f {

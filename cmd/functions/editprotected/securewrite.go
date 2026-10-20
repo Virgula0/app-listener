@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Virgula0/app-listener/internal/safeio"
 )
 
 // writeWithin writes data to dest (mode 0600) so it resolves strictly inside root without
@@ -42,9 +44,9 @@ func writeWithin(root, dest string, data []byte) (err error) {
 	}
 	defer func() { _ = unix.Close(dirFD) }()
 
-	dirFD, err = descendNoFollow(dirFD, parts[:len(parts)-1], root, dest)
+	dirFD, err = safeio.DescendNoFollow(dirFD, parts[:len(parts)-1], true, 0o700)
 	if err != nil {
-		return err
+		return fmt.Errorf("writing %s under %s: %w", dest, root, err)
 	}
 	if symErr := refuseExistingSymlink(dirFD, name, dest); symErr != nil {
 		return symErr
@@ -85,31 +87,6 @@ func atomicWriteAt(dirFD int, name, dest string, data []byte) error {
 		return fmt.Errorf("installing %s: %w", dest, err)
 	}
 	return nil
-}
-
-// descendNoFollow opens each component in comps relative to dirFD with O_NOFOLLOW, creating missing
-// directories (0700), and returns the last directory's fd. A symlink component is refused. The
-// returned fd is always the deepest one held (or the input on early error), so one deferred Close
-// covers both paths.
-func descendNoFollow(dirFD int, comps []string, root, dest string) (int, error) {
-	for _, comp := range comps {
-		if comp == "" || comp == "." || comp == ".." {
-			return dirFD, fmt.Errorf("illegal path component %q in %s", comp, dest)
-		}
-		if mkErr := unix.Mkdirat(dirFD, comp, 0o700); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
-			return dirFD, fmt.Errorf("creating %s under %s: %w", comp, root, mkErr)
-		}
-		next, descErr := unix.Openat(dirFD, comp, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if descErr != nil {
-			if errors.Is(descErr, unix.ELOOP) || errors.Is(descErr, unix.ENOTDIR) {
-				return dirFD, fmt.Errorf("refusing to write %s: component %q is a symlink or not a directory", dest, comp)
-			}
-			return dirFD, fmt.Errorf("descending into %s: %w", comp, descErr)
-		}
-		_ = unix.Close(dirFD)
-		dirFD = next
-	}
-	return dirFD, nil
 }
 
 func writeAndSync(fd int, data []byte) error {

@@ -37,13 +37,13 @@ func TestCopyTreeRefusesPlantedDestinationSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := CopyTree(src, dst)
+	err := CopyTreeWithProgress(src, dst, nil)
 
 	if got, rerr := os.ReadFile(victim); rerr != nil || string(got) != "VICTIM" {
 		t.Fatalf("migration wrote through a planted destination symlink: victim = %q (err %v)", got, rerr)
 	}
 	if err == nil {
-		t.Fatal("CopyTree followed a planted destination symlink; expected a refusal")
+		t.Fatal("CopyTreeWithProgress followed a planted destination symlink; expected a refusal")
 	}
 }
 
@@ -89,7 +89,7 @@ func TestCopyTreeSourceSwappedAfterClassification(t *testing.T) {
 				}
 			}
 
-			_ = CopyTree(src, dst)
+			_ = CopyTreeWithProgress(src, dst, nil)
 
 			_ = filepath.WalkDir(dst, func(p string, d os.DirEntry, err error) error {
 				if err != nil || d.IsDir() || d.Type()&os.ModeSymlink != 0 {

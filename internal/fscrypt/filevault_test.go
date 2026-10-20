@@ -115,7 +115,7 @@ func TestSealFileVaultNoncesNeverRepeat(t *testing.T) {
 	plaintext := []byte("same plaintext every time")
 
 	seen := map[string]bool{}
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		record, err := sealFileVault(subkey, plaintext)
 		if err != nil {
 			t.Fatalf("sealFileVault: %v", err)

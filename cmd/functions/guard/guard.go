@@ -136,20 +136,7 @@ func resolveGuardConfig() (guard.Mode, []guard.BinaryEntry, error) {
 }
 
 func runGuardHeadless(uc usecase.GuardUseCase) {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-
-	for {
-		select {
-		case ev, ok := <-uc.Events():
-			if !ok {
-				return
-			}
-			log.Info(HeadlessLine(&ev))
-		case <-sig:
-			return
-		}
-	}
+	common.DrainUntilSignal(uc.Events(), func(ev *guard.GuardEvent) { log.Info(HeadlessLine(ev)) })
 }
 
 // HeadlessLine is ev in the stable GUARD| format --headless prints (the integration tests parse it).

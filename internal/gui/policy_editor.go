@@ -4,6 +4,7 @@ package gui
 
 import (
 	"slices"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -146,10 +147,7 @@ func confirmWarnings(s *shell, title string, warnings []string, ok func()) {
 		ok()
 		return
 	}
-	msg := ""
-	for _, w := range warnings {
-		msg += "• " + w + "\n"
-	}
+	msg := "• " + strings.Join(warnings, "\n• ") + "\n"
 	showConfirm(title, msg+"\nApply anyway?", func(yes bool) {
 		if yes {
 			ok()

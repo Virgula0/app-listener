@@ -8,7 +8,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/Virgula0/app-listener/internal/procstats"
 	"github.com/Virgula0/app-listener/internal/usecase"
 )
 
@@ -49,13 +48,10 @@ type daemonModel struct {
 
 	resources []DaemonResourceInfo
 	startTime time.Time
-	eventID   int
 	blocked   int
 	allowed   int
 
-	lastStats    *procstats.Stats
-	prevEventID  int
-	eventsPerSec float64
+	eventRate
 }
 
 func NewDaemonModel(events <-chan usecase.DaemonEvent, resources []DaemonResourceInfo) tea.Model {
@@ -109,7 +105,7 @@ func (m *daemonModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenForDaemonEvents(m.events)
 
 	case daemonStatsMsg:
-		m.updateDaemonStats()
+		m.sample(1)
 		m.renderDaemonViewport()
 
 		return m, tickDaemonStats()
@@ -128,18 +124,6 @@ func (m *daemonModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *daemonModel) updateDaemonStats() {
-	s, err := procstats.Read()
-	if err != nil {
-		return
-	}
-
-	eventsDelta := m.eventID - m.prevEventID
-	m.eventsPerSec = float64(eventsDelta)
-	m.prevEventID = m.eventID
-	m.lastStats = s
-}
-
 func (m *daemonModel) addDaemonEvent(ev *usecase.DaemonEvent) {
 	m.eventID++
 
@@ -153,20 +137,11 @@ func (m *daemonModel) addDaemonEvent(ev *usecase.DaemonEvent) {
 		daemonPathStyle.Render(sanitizeTerminalText(ev.Resource)),
 		formatGuardEventLine(&ev.Event))
 
-	m.lines = append(m.lines, daemonEventLine{event: *ev, line: line})
-	if len(m.lines) > maxDaemonEvents {
-		m.lines = m.lines[len(m.lines)-maxDaemonEvents:]
-	}
+	m.lines = appendCapped(m.lines, daemonEventLine{event: *ev, line: line}, maxDaemonEvents)
 }
 
 func (m *daemonModel) renderDaemonViewport() {
-	lines := make([]string, len(m.lines))
-	for i := range m.lines {
-		lines[i] = m.lines[i].line
-	}
-
-	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	m.viewport.SetContent(content)
+	setLines(&m.viewport, m.lines, func(l daemonEventLine) string { return l.line })
 }
 
 func (m *daemonModel) View() string {

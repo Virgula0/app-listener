@@ -285,33 +285,27 @@ func CheckBPFLSM() error {
 }
 
 func ParseEventsFlag(eventsFlag []string) ([]ebpf.EventType, error) {
-	if len(eventsFlag) == 0 {
-		return ebpf.EventTypes(), nil
-	}
-
-	var parsed []ebpf.EventType
-	for _, s := range eventsFlag {
-		et, ok := ebpf.ParseEventType(strings.TrimSpace(s))
-		if !ok {
-			return nil, fmt.Errorf("unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD; for network mode: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS)", s)
-		}
-		parsed = append(parsed, et)
-	}
-	return parsed, nil
+	return parseTypesFlag(eventsFlag, ebpf.EventTypes, ebpf.ParseEventType,
+		"unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD; for network mode: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS)")
 }
 
 // ParseNetEventsFlag parses the network --events flag; an empty list means
 // every network event type.
 func ParseNetEventsFlag(netEventsFlag []string) ([]ebpf.NetEventType, error) {
-	if len(netEventsFlag) == 0 {
-		return ebpf.NetEventTypes(), nil
-	}
+	return parseTypesFlag(netEventsFlag, ebpf.NetEventTypes, ebpf.ParseNetEventType,
+		"unknown network event type %q (valid: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS, BIND, LISTEN)")
+}
 
-	var parsed []ebpf.NetEventType
-	for _, s := range netEventsFlag {
-		et, ok := ebpf.ParseNetEventType(strings.TrimSpace(s))
+// parseTypesFlag parses an --events list; empty means all(). unknown formats the bad entry.
+func parseTypesFlag[T any](flag []string, all func() []T, parse func(string) (T, bool), unknown string) ([]T, error) {
+	if len(flag) == 0 {
+		return all(), nil
+	}
+	var parsed []T
+	for _, s := range flag {
+		et, ok := parse(strings.TrimSpace(s))
 		if !ok {
-			return nil, fmt.Errorf("unknown network event type %q (valid: CONNECT, ACCEPT, SEND, RECV, CLOSE, DNS, BIND, LISTEN)", s)
+			return nil, fmt.Errorf(unknown, s)
 		}
 		parsed = append(parsed, et)
 	}

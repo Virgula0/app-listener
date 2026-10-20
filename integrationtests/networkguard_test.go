@@ -87,12 +87,11 @@ func (s *IntegrationSuite) stopNetGuard(c testcontainers.Container) {
 // netGuardBlockedEvent extracts a blocked (Blocked=true) event of the given
 // type/comm from the guard log.
 func netGuardHasBlockedEvent(logContent, expectedComm, expectedType string) bool {
-	for _, line := range strings.Split(logContent, "\n") {
-		idx := strings.Index(line, "NETGUARD|")
-		if idx < 0 {
+	for line := range strings.SplitSeq(logContent, "\n") {
+		_, rest, ok := strings.Cut(line, "NETGUARD|")
+		if !ok {
 			continue
 		}
-		rest := line[idx+len("NETGUARD|"):]
 		parts := strings.SplitN(rest, "|", 11) // 11th: the optional |<reason>
 		if len(parts) < 10 {
 			continue
@@ -123,12 +122,11 @@ func (s *IntegrationSuite) waitForNetGuardBlockedEvent(c testcontainers.Containe
 // the given type/comm appear in the guard log.
 func netGuardBlockedEventCount(logContent, comm, typ string) int {
 	count := 0
-	for _, line := range strings.Split(logContent, "\n") {
-		idx := strings.Index(line, "NETGUARD|")
-		if idx < 0 {
+	for line := range strings.SplitSeq(logContent, "\n") {
+		_, rest, ok := strings.Cut(line, "NETGUARD|")
+		if !ok {
 			continue
 		}
-		rest := line[idx+len("NETGUARD|"):]
 		parts := strings.SplitN(rest, "|", 11) // 11th: the optional |<reason>
 		if len(parts) < 10 {
 			continue
@@ -183,12 +181,11 @@ func netGuardTail(log string) string {
 func guardNetTypesForComm(logContent, comm string) []string {
 	seen := make(map[string]bool)
 	var types []string
-	for _, line := range strings.Split(logContent, "\n") {
-		idx := strings.Index(line, "NETGUARD|")
-		if idx < 0 {
+	for line := range strings.SplitSeq(logContent, "\n") {
+		_, rest, ok := strings.Cut(line, "NETGUARD|")
+		if !ok {
 			continue
 		}
-		rest := line[idx+len("NETGUARD|"):]
 		parts := strings.SplitN(rest, "|", 11) // 11th: the optional |<reason>
 		if len(parts) < 10 || parts[1] != comm || strings.TrimSpace(parts[9]) != "true" {
 			continue

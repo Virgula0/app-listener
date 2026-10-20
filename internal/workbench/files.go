@@ -375,16 +375,22 @@ func (t *FileTarget) swapGuard(next FileGuard, p Policy) {
 	if next != nil {
 		go t.pumpGuard(next.Events(), stop)
 	}
-	if prev != nil {
-		close(prevStop)
-		prev.Stop()
-	}
+	stopPumped(prev, prevStop)
 }
 
 func (t *FileTarget) setPolicy(p Policy) {
 	t.mu.Lock()
 	t.policy = p
 	t.mu.Unlock()
+}
+
+// stopPumped closes a pumped engine's stop channel, then stops the engine; nil (none) is a no-op.
+func stopPumped(e interface{ Stop() }, stop chan struct{}) {
+	if e == nil {
+		return
+	}
+	close(stop)
+	e.Stop()
 }
 
 func (t *FileTarget) close() {
@@ -399,12 +405,6 @@ func (t *FileTarget) close() {
 	mon, monStop, grd, grdStop := t.mon, t.monStop, t.grd, t.grdStop
 	t.mon, t.grd = nil, nil
 	t.mu.Unlock()
-	if grd != nil {
-		close(grdStop)
-		grd.Stop()
-	}
-	if mon != nil {
-		close(monStop)
-		mon.Stop()
-	}
+	stopPumped(grd, grdStop)
+	stopPumped(mon, monStop)
 }

@@ -39,7 +39,7 @@ var allowMetadataOutput bool
 func installUnit(name string) error {
 	dest := filepath.Join(systemd.SystemdDir, name)
 	if name != systemd.DaemonServiceName+".service" || !allowMetadataOutput {
-		return installFile(name, dest, 0o644)
+		return installFileAs(name, dest, 0o644)
 	}
 	data, err := inst.SampleContent(name)
 	if err != nil {
@@ -74,11 +74,6 @@ func installServices(sshUsers []inst.User) error {
 		}
 	}
 	return systemd.RemoveLegacyCatalogRefresh()
-}
-
-// installFile writes one embedded sample to dest unless it already exists.
-func installFile(name, dest string, mode os.FileMode) error {
-	return installFileAs(name, dest, mode)
 }
 
 // installFileAs writes the embedded sample "sample" to "dest" (whose basename

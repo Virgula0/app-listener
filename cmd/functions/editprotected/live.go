@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/charmbracelet/huh"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/tui"
@@ -78,25 +77,8 @@ func chooseResource(resources []string) (string, error) {
 		}
 		return "", fmt.Errorf("%s is not a guarded directory in the running daemon", resourceFlag)
 	}
-	if len(resources) == 1 {
-		log.Infof("only one guarded directory: %s", resources[0])
-		return resources[0], nil
-	}
-	opts := make([]huh.Option[string], 0, len(resources))
-	for _, r := range resources {
-		opts = append(opts, huh.NewOption(r, r))
-	}
-	chosen := ""
-	if err := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title("Which guarded directory do you want to edit?").
-			Description("Write access is granted to this one directory for the edit session, then revoked.").
-			Options(opts...).
-			Value(&chosen),
-	)).Run(); err != nil {
-		return "", err
-	}
-	return chosen, nil
+	return pickDir(resources, "only one guarded directory", "Which guarded directory do you want to edit?",
+		"Write access is granted to this one directory for the edit session, then revoked.")
 }
 
 // runPut performs one authenticated live write without any TUI: content from --from or stdin,

@@ -76,16 +76,6 @@ func StatInode(path string) (dev, ino uint64, err error) {
 	return KernelDev(unix.Major(s.Dev), unix.Minor(s.Dev)), s.Ino, nil
 }
 
-// LstatInode is StatInode without following a final symlink: it identifies
-// the directory entry itself rather than whatever it points at.
-func LstatInode(path string) (dev, ino uint64, err error) {
-	var s syscall.Stat_t
-	if err := syscall.Lstat(path, &s); err != nil {
-		return 0, 0, err
-	}
-	return KernelDev(unix.Major(s.Dev), unix.Minor(s.Dev)), s.Ino, nil
-}
-
 // BinaryStat is a cheap change-detection fingerprint: recompute the hash only when Size, MtimeNs or
 // CtimeNs moved (an in-place overwrite always bumps mtime and ctime; ctime can't be restored
 // without clock tampering).

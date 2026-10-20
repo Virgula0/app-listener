@@ -27,7 +27,7 @@ func TestCopyTreeRoundTrip(t *testing.T) {
 	}
 
 	dst := filepath.Join(t.TempDir(), "copy")
-	if err := CopyTree(src, dst); err != nil {
+	if err := CopyTreeWithProgress(src, dst, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -63,7 +63,7 @@ func TestCopyTreeRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCopyTreeOverwriteExistingFile verifies CopyTree replaces an existing
+// TestCopyTreeOverwriteExistingFile verifies CopyTreeWithProgress replaces an existing
 // destination file (used to reinstall the binary over a previous one).
 func TestCopyTreeOverwriteExistingFile(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "bin")
@@ -74,7 +74,7 @@ func TestCopyTreeOverwriteExistingFile(t *testing.T) {
 	if err := os.WriteFile(dst, []byte("old-binary"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := CopyTree(src, dst); err != nil {
+	if err := CopyTreeWithProgress(src, dst, nil); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(dst)

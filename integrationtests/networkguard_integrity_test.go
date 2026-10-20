@@ -45,7 +45,7 @@ func (s *IntegrationSuite) netIntRun(c testcontainers.Container, cmd string) str
 // awaitNetGuardLine polls the guard log for a line containing every needle.
 func (s *IntegrationSuite) awaitNetGuardLine(c testcontainers.Container, timeout time.Duration, needles ...string) {
 	for dl := time.Now().Add(timeout); time.Now().Before(dl); time.Sleep(250 * time.Millisecond) {
-		for _, line := range strings.Split(s.readNetGuardLog(c), "\n") {
+		for line := range strings.SplitSeq(s.readNetGuardLog(c), "\n") {
 			hit := true
 			for _, n := range needles {
 				hit = hit && strings.Contains(line, n)

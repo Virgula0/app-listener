@@ -26,7 +26,7 @@ func RelockResources(vault *fscrypt.Vault, path string) error {
 		!errors.Is(err, repository.ErrKeyBusy) && !errors.Is(err, repository.ErrKeyMissing) {
 		return err
 	}
-	for i := 0; i < maxRelockRetries; i++ {
+	for range maxRelockRetries {
 		err := vault.Lock(path, true)
 		switch {
 		case err == nil || errors.Is(err, repository.ErrKeyMissing):

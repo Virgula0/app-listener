@@ -30,8 +30,5 @@ func cleanOrphanedFscrypt(cfg *daemonconfig.Config) error {
 		paths = append(paths, r.Path, r.EncryptionRootOrPath())
 	}
 
-	if err := fscrypt.CleanOrphanedMetadata(paths); err != nil {
-		return err
-	}
-	return nil
+	return fscrypt.CleanOrphanedMetadata(paths)
 }

@@ -7,6 +7,7 @@
 package recorder
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"os"
@@ -292,7 +293,7 @@ func (r *Recorder) Stop() *Raw {
 	for k, a := range r.access {
 		raw.Accessors = append(raw.Accessors, RawAccessor{
 			Dev: k.exe.dev, Ino: k.exe.ino, ExecName: k.name, Exe: a.exe, Comms: sortedKeys(a.comms),
-			Ops: opsOf(a.ops), Targets: sortedKeys(a.targets), UIDs: sortedUIDs(a.uids), Count: a.count,
+			Ops: sortedKeys(a.ops), Targets: sortedKeys(a.targets), UIDs: sortedKeys(a.uids), Count: a.count,
 			First: a.first, Last: a.last, Libs: sortedKeys(r.maps[k.exe]),
 		})
 	}
@@ -332,26 +333,9 @@ type RawAccessor struct {
 	Libs []string
 }
 
-func sortedKeys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func sortedUIDs(m map[uint32]struct{}) []uint32 {
-	out := make([]uint32, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
-}
-
-func opsOf(m map[ebpf.EventType]struct{}) []ebpf.EventType {
-	out := make([]ebpf.EventType, 0, len(m))
+// sortedKeys returns m's keys in order; never nil, so an empty set marshals as [].
+func sortedKeys[K cmp.Ordered](m map[K]struct{}) []K {
+	out := make([]K, 0, len(m))
 	for k := range m {
 		out = append(out, k)
 	}
@@ -360,7 +344,7 @@ func opsOf(m map[ebpf.EventType]struct{}) []ebpf.EventType {
 }
 
 func opNames(m map[ebpf.EventType]struct{}) []string {
-	ops := opsOf(m)
+	ops := sortedKeys(m)
 	out := make([]string, len(ops))
 	for i, o := range ops {
 		out[i] = o.String()

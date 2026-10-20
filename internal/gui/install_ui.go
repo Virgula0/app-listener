@@ -236,7 +236,8 @@ type logHook struct{ run *runView }
 func (h *logHook) Levels() []log.Level { return log.AllLevels }
 
 func (h *logHook) Fire(e *log.Entry) error {
-	text := e.Message
+	var text strings.Builder
+	text.WriteString(e.Message)
 	if len(e.Data) > 0 {
 		keys := make([]string, 0, len(e.Data))
 		for k := range e.Data {
@@ -244,10 +245,10 @@ func (h *logHook) Fire(e *log.Entry) error {
 		}
 		slices.Sort(keys)
 		for _, k := range keys {
-			text += fmt.Sprintf(" %s=%v", k, e.Data[k])
+			fmt.Fprintf(&text, " %s=%v", k, e.Data[k])
 		}
 	}
-	line := logLine{level: e.Level, at: e.Time, text: text}
+	line := logLine{level: e.Level, at: e.Time, text: text.String()}
 	fyne.Do(func() { h.run.appendLog(line) })
 	return nil
 }

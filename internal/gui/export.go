@@ -87,7 +87,7 @@ func writeUserFile(path string, data []byte) error {
 		return err
 	}
 	var comps []string
-	for _, c := range strings.Split(filepath.Clean(dir), "/") {
+	for c := range strings.SplitSeq(filepath.Clean(dir), "/") {
 		if c != "" {
 			comps = append(comps, c)
 		}

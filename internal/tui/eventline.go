@@ -16,7 +16,7 @@ func formatGuardEventLine(ev *guard.GuardEvent) string {
 	safeEvent.Dest = sanitizeTerminalText(safeEvent.Dest)
 	ev = &safeEvent
 	ts := time.Unix(0, ev.Timestamp).Format("15:04:05.000")
-	t := formatGuardType(ev.Type)
+	t := formatType(ev.Type)
 	decision := formatDecision(ev.Blocked)
 
 	pathPart := sanitizeTerminalText(ev.Path)

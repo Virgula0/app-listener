@@ -1278,14 +1278,14 @@ func TestParseLibrariesSection(t *testing.T) {
 		`[libraries "Steam (alice)"]`: "Steam (alice)",
 		"[libraries\t\"Proton GE\"]":  "Proton GE",
 	} {
-		got, ok := parseLibrariesSection(line)
+		got, ok := ParseLibrariesSection(line)
 		if !ok || got != want {
-			t.Errorf("parseLibrariesSection(%q) = %q,%v; want %q,true", line, got, ok, want)
+			t.Errorf("ParseLibrariesSection(%q) = %q,%v; want %q,true", line, got, ok, want)
 		}
 	}
 	for _, line := range []string{`[librariesfoo]`, `[watch /x]`, `libraries`} {
-		if _, ok := parseLibrariesSection(line); ok {
-			t.Errorf("parseLibrariesSection(%q) matched; want no match", line)
+		if _, ok := ParseLibrariesSection(line); ok {
+			t.Errorf("ParseLibrariesSection(%q) matched; want no match", line)
 		}
 	}
 	// A near-miss header must still be refused as malformed, never merged

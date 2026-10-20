@@ -254,7 +254,7 @@ func (s *monitorUnitTest) TestPathCacheEvictionAndTTL() {
 		s.Fail("expired entry must be a miss")
 	}
 	// overflow clears the map
-	for i := 0; i < pathCacheMax+1; i++ {
+	for i := range pathCacheMax + 1 {
 		c.store(fmt.Sprintf("/p%d", i), pathCacheEntry{at: time.Now()})
 	}
 	s.Require().LessOrEqual(len(c.m), pathCacheMax)
@@ -571,13 +571,11 @@ func TestSetEventTypesRace(t *testing.T) {
 	m.eventTypes.Store(ebpf.EventTypes())
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for range 100 {
 			m.SetEventTypes([]ebpf.EventType{ebpf.EventOpen, ebpf.EventRead})
 		}
-	}()
+	})
 
 	for range 100 {
 		m.eventTypeAllowed(ebpf.EventOpen)
@@ -593,15 +591,13 @@ func TestEventTypeAllowedConcurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 10 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 100 {
 				_ = m.eventTypeAllowed(ebpf.EventOpen)
 				_ = m.eventTypeAllowed(ebpf.EventWrite)
 				_ = m.eventTypeAllowed(ebpf.EventMmap)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }

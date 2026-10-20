@@ -206,10 +206,10 @@ func (a *applier) put(p *Plan, base []byte, text string) ([]byte, error) {
 // rollback undoes encrypted migrations and ledger pins after cause, newest first.
 func (a *applier) rollback(cause error, encrypted []string, pinned []PlannedBinary) error {
 	var errs []error
-	for i := len(encrypted) - 1; i >= 0; i-- {
-		if err := a.vault.RestoreBackup(encrypted[i]); err != nil {
+	for _, e := range slices.Backward(encrypted) {
+		if err := a.vault.RestoreBackup(e); err != nil {
 			errs = append(errs, fmt.Errorf("restoring %s from %s%s: %w — restore it with `app-listener install "+
-				"install backups restore`", encrypted[i], encrypted[i], fscrypt.BackupSuffix, err))
+				"install backups restore`", e, e, fscrypt.BackupSuffix, err))
 		}
 	}
 	for _, b := range pinned {

@@ -90,10 +90,7 @@ func (b *bottomBar) done() {
 // renderBar builds the bar line (label, 20-block bar, percentage), truncated to the current
 // terminal width (re-queried each render, so resize-safe).
 func renderBar(label string, fraction float64) string {
-	pct := int(fraction * 100)
-	if pct > 100 {
-		pct = 100
-	}
+	pct := min(int(fraction*100), 100)
 	const blocks = 20
 	filled := blocks * pct / 100
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", blocks-filled)

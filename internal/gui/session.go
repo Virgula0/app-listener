@@ -93,7 +93,7 @@ func ancestorEnv(uid uint32) map[string]string {
 			if envErr != nil {
 				return out
 			}
-			for _, kv := range bytes.Split(environ, []byte{0}) {
+			for kv := range bytes.SplitSeq(environ, []byte{0}) {
 				k, v, ok := strings.Cut(string(kv), "=")
 				if ok && (slices.Contains(sessionVars, k) || slices.Contains(wmVars, k)) {
 					out[k] = v
@@ -112,7 +112,7 @@ func ancestorEnv(uid uint32) map[string]string {
 
 // statusField returns the first value of a /proc/<pid>/status line ("Uid:" → real uid).
 func statusField(status []byte, key string) string {
-	for _, line := range strings.Split(string(status), "\n") {
+	for line := range strings.SplitSeq(string(status), "\n") {
 		if rest, ok := strings.CutPrefix(line, key); ok {
 			if f := strings.Fields(rest); len(f) > 0 {
 				return f[0]

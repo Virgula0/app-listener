@@ -72,18 +72,6 @@ func (s *guardUnitTest) TestComputeBinaryEntryLargeFile() {
 	s.Require().Equal(sha256.Sum256(content), entry.Hash)
 }
 
-func (s *guardUnitTest) TestBinariesSummary() {
-	entries := []BinaryEntry{
-		{Path: "/usr/bin/cat", Hash: sha256.Sum256([]byte("cat-content")), Comm: "cat"},
-		{Path: "/usr/bin/dog", Hash: sha256.Sum256([]byte("dog-content")), Comm: "dog"},
-	}
-
-	summary := BinariesSummary(entries)
-	s.Require().Contains(summary, "/usr/bin/cat")
-	s.Require().Contains(summary, "/usr/bin/dog")
-	s.Require().Contains(summary, "sha256")
-}
-
 func (s *guardUnitTest) TestModeString() {
 	s.Require().Equal("whitelist", modeString(ModeWhitelist))
 	s.Require().Equal("blacklist", modeString(ModeBlacklist))
@@ -1139,9 +1127,7 @@ func (s *guardUnitTest) TestSetTrustedNeverDropsPersistentEntry() {
 	var dropped atomic.Bool
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		var v uint8
 		for {
 			select {
@@ -1154,9 +1140,9 @@ func (s *guardUnitTest) TestSetTrustedNeverDropsPersistentEntry() {
 				return
 			}
 		}
-	}()
+	})
 
-	for i := 0; i < 300; i++ {
+	for i := range 300 {
 		s.Require().NoError(tg.SetTrusted([]string{persistent, others[i%len(others)]}, nil))
 	}
 	close(stop)
