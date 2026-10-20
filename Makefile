@@ -236,8 +236,14 @@ run-networkguard:
 	CGO_ENABLED=1 go run ./... network guard $(ARGS)
 .PHONY: run-networkguard
 
+# golangci-lint for the default and the gui build, then tools/codecheck: dead code under every tag
+# set (x/tools deadcode, pinned) plus unused/duplicate/wrapper checks; accepted hits live in its
+# allow.txt. Typechecks everything, so run `make generate` first.
+DEADCODE_VERSION ?= v0.52.0
 lint:
 	@golangci-lint run
+	@golangci-lint run --build-tags gui
+	@CGO_ENABLED=1 go run -C tools/codecheck . -root ../.. -deadcode $(DEADCODE_VERSION)
 .PHONY: lint
 
 # govulncheck, pinned; `go run` fetches it into the module cache, nothing is installed. It

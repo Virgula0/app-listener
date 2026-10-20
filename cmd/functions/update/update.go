@@ -45,8 +45,9 @@ const (
 	// Only repo the updater trusts: its workflow signs assets with the key
 	// embedded in this binary, so others cannot be trusted.
 	defaultRepo = "Virgula0/app-listener"
-	// Matches pre-YYYYMMDD-<sha7> tags from the release workflow.
-	preVersionPattern = `^pre-(\d{8})-([0-9a-f]{7})$`
+	// Matches the release workflow's pre-YYYYMMDD-HHMMSS-<sha7> tags; HHMMSS is optional, since
+	// installs from releases cut before it was added run tags without it.
+	preVersionPattern = `^pre-(\d{8})(?:-\d{6})?-([0-9a-f]{7})$`
 	// Matches vX.Y.Z semver stable tags.
 	stableVersionPattern = `^v?(\d+)\.(\d+)\.(\d+)$`
 	// updateHTTPTimeout bounds a single GitHub API/download request.

@@ -102,7 +102,7 @@ func TestReadGrantRequestPassword(t *testing.T) {
 
 func TestRecordFailureLockout(t *testing.T) {
 	cs := &controlServer{}
-	for i := 0; i < maxAuthFailures-1; i++ {
+	for range maxAuthFailures - 1 {
 		cs.recordFailure()
 	}
 	if !cs.lockUntil.IsZero() {

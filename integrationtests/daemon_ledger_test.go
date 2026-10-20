@@ -28,7 +28,7 @@ func (s *IntegrationSuite) restartUnconfirmed(c testcontainers.Container, config
 
 // unconfirmedLine returns the daemon's binary-unconfirmed line for path, "" if none.
 func (s *IntegrationSuite) unconfirmedLine(c testcontainers.Container, path string) string {
-	for _, l := range strings.Split(s.readDaemonLog(c), "\n") {
+	for l := range strings.SplitSeq(s.readDaemonLog(c), "\n") {
 		if strings.Contains(l, unconfirmed) && strings.Contains(l, "path="+path+" ") {
 			return l
 		}

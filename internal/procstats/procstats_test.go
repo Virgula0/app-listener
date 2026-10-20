@@ -8,9 +8,7 @@ import (
 func TestReadConcurrentRace(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 20 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			s, err := Read()
 			if err != nil {
 				t.Logf("Read error: %v", err)
@@ -21,7 +19,7 @@ func TestReadConcurrentRace(t *testing.T) {
 			_ = s.CPUUser
 			_ = s.CPUSys
 			_ = s.NumCPU
-		}()
+		})
 	}
 	wg.Wait()
 }

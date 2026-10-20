@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"maps"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -69,9 +70,7 @@ func (c *hashCache) flush(prune bool) {
 		return
 	}
 	snapshot := make(binledger.HashCache, len(rows))
-	for k, v := range rows {
-		snapshot[k] = v
-	}
+	maps.Copy(snapshot, rows)
 	c.dirty = binledger.HashCache{}
 	c.mu.Unlock()
 

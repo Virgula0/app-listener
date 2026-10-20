@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestResolveLibraryClosure(t *testing.T) {
+func TestLibraryClosure(t *testing.T) {
 	// Resolve the closure of a known dynamically linked binary. /bin/cat (or
 	// its coreutils path) links libc and has an interpreter.
 	bin := ""
@@ -27,9 +27,9 @@ func TestResolveLibraryClosure(t *testing.T) {
 	}
 	skipWithoutHostRoot(t)
 
-	closure, err := ResolveLibraryClosure(bin)
+	closure, _, err := LibraryClosure(bin)
 	if err != nil {
-		t.Fatalf("ResolveLibraryClosure(%s): %v", bin, err)
+		t.Fatalf("LibraryClosure(%s): %v", bin, err)
 	}
 	if len(closure) == 0 {
 		t.Fatalf("empty closure for %s (expected libc + interpreter)", bin)
@@ -59,7 +59,7 @@ func TestResolveLibraryClosure(t *testing.T) {
 	}
 }
 
-func TestResolveLibraryClosureStaticIsEmpty(t *testing.T) {
+func TestLibraryClosureStaticIsEmpty(t *testing.T) {
 	// A non-ELF or static object must not error hard; craft a tiny non-ELF
 	// file and confirm elf.Open fails cleanly (error path), not a panic.
 	dir := t.TempDir()
@@ -67,7 +67,7 @@ func TestResolveLibraryClosureStaticIsEmpty(t *testing.T) {
 	if err := writeFileHelper(notELF, "not an elf"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ResolveLibraryClosure(notELF); err == nil {
+	if _, _, err := LibraryClosure(notELF); err == nil {
 		t.Errorf("expected an error opening a non-ELF file")
 	}
 }
@@ -76,24 +76,24 @@ func writeFileHelper(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
-// TestResolveLibraryClosureScript: a whitelisted script runs as its
+// TestLibraryClosureScript: a whitelisted script runs as its
 // interpreter, so it has no closure of its own — and must not be reported as
 // a broken ELF (it filled the daemon log with "bad magic number" warnings).
-func TestResolveLibraryClosureScript(t *testing.T) {
+func TestLibraryClosureScript(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "launcher.sh")
 	if err := os.WriteFile(p, []byte("#!/bin/bash\nexec true\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	libs, err := ResolveLibraryClosure(p)
+	libs, _, err := LibraryClosure(p)
 	if err != nil || len(libs) != 0 {
-		t.Fatalf("ResolveLibraryClosure(script) = %v, %v; want empty, nil", libs, err)
+		t.Fatalf("LibraryClosure(script) = %v, %v; want empty, nil", libs, err)
 	}
 }
 
-// TestResolveLibraryClosureForeignArch: an ELF for an architecture the host
+// TestLibraryClosureForeignArch: an ELF for an architecture the host
 // cannot run natively (Steam's pressure-vessel-arm64, meant for FEX) has an
 // interpreter that does not exist here — it is skipped, not warned about.
-func TestResolveLibraryClosureForeignArch(t *testing.T) {
+func TestLibraryClosureForeignArch(t *testing.T) {
 	foreign := elf.EM_AARCH64
 	if runtime.GOARCH == "arm64" {
 		foreign = elf.EM_X86_64
@@ -109,9 +109,9 @@ func TestResolveLibraryClosureForeignArch(t *testing.T) {
 	if err := os.WriteFile(p, hdr, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	libs, err := ResolveLibraryClosure(p)
+	libs, _, err := LibraryClosure(p)
 	if err != nil || len(libs) != 0 {
-		t.Fatalf("ResolveLibraryClosure(foreign ELF) = %v, %v; want empty, nil", libs, err)
+		t.Fatalf("LibraryClosure(foreign ELF) = %v, %v; want empty, nil", libs, err)
 	}
 }
 

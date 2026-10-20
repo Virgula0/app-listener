@@ -37,7 +37,7 @@ const (
 // mount that is neither nosuid nor FUSE. Any unparsable line fails the whole table.
 func vouchedDevs(mountinfo []byte) (map[uint64]struct{}, error) {
 	out := make(map[uint64]struct{})
-	for _, line := range strings.Split(strings.TrimSpace(string(mountinfo)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(mountinfo)), "\n") {
 		f := strings.Fields(line)
 		sep := slices.Index(f, "-")
 		if sep < 6 || sep+1 >= len(f) {

@@ -99,7 +99,7 @@ func TestGutterKeepsTextColumnAligned(t *testing.T) {
 	SetText(&ta, b.String())
 	view := ansi.Strip(NewHighlighter("x.txt", "").View(&ta))
 	col := -1
-	for _, row := range strings.Split(view, "\n") {
+	for row := range strings.SplitSeq(view, "\n") {
 		i := strings.Index(row, "L")
 		if i < 0 {
 			continue

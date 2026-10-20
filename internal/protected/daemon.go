@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -75,12 +76,7 @@ func isDaemonCmdline(cmdline string) bool {
 	if filepath.Base(args[0]) != "app-listener" {
 		return false
 	}
-	for _, a := range args[1:] {
-		if a == "daemon" {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(args[1:], "daemon")
 }
 
 // RequireDaemonStopped fatally refuses while a daemon runs: an active systemd unit or a daemon

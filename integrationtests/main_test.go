@@ -285,16 +285,6 @@ func (s *IntegrationSuite) requireDistinctExes(c testcontainers.Container, paths
 	s.Require().Lenf(owner, len(paths), "stat output: %s", out)
 }
 
-func (s *IntegrationSuite) logs(c testcontainers.Container) string {
-	r, err := c.Logs(s.ctx)
-	s.Require().NoError(err)
-	defer r.Close()
-
-	b, err := io.ReadAll(r)
-	s.Require().NoError(err)
-	return string(b)
-}
-
 func absPath(p string) string {
 	abs, err := filepath.Abs(p)
 	if err != nil {
@@ -336,9 +326,8 @@ func newEventTypes(oldLog, newLog string) []string {
 
 	seen := make(map[string]bool)
 	var result []string
-	for _, line := range strings.Split(tail, "\n") {
-		if idx := strings.Index(line, "EVENT|"); idx >= 0 {
-			rest := line[idx+6:]
+	for line := range strings.SplitSeq(tail, "\n") {
+		if _, rest, ok := strings.Cut(line, "EVENT|"); ok {
 			parts := strings.SplitN(rest, "|", 2)
 			if len(parts) >= 1 && parts[0] != "" && !seen[parts[0]] {
 				seen[parts[0]] = true
@@ -347,13 +336,6 @@ func newEventTypes(oldLog, newLog string) []string {
 		}
 	}
 	return result
-}
-
-// requireNewEventType asserts that the event type appears in the log delta.
-func (s *IntegrationSuite) requireNewEventType(oldLog, newLog, expected string) {
-	events := newEventTypes(oldLog, newLog)
-	s.Require().True(slices.Contains(events, expected),
-		"expected EVENT|%s in new log lines, got %v", expected, events)
 }
 
 func (s *IntegrationSuite) requireNoNewEventType(oldLog, newLog, unexpected string) {
@@ -369,10 +351,8 @@ func (s *IntegrationSuite) waitForEventType(c testcontainers.Container, oldLog s
 	for time.Now().Before(deadline) {
 		newLog := s.readMonitorLog(c)
 		events := newEventTypes(oldLog, newLog)
-		for _, evt := range events {
-			if evt == expected {
-				return newLog
-			}
+		if slices.Contains(events, expected) {
+			return newLog
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

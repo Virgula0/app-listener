@@ -11,7 +11,6 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
-	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -839,7 +838,7 @@ func runLockdown() {
 // vault ended up keyless.
 func lockOneRoot(vault *fscrypt.Vault, root string) bool {
 	const attempts = 50
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		err := vault.Lock(root, true)
 		if err == nil || errors.Is(err, repository.ErrKeyMissing) {
 			log.Infof("lockdown: %s is locked", root)
@@ -1084,23 +1083,11 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	return g, nil
 }
 
-// buildConcurrency bounds concurrent guard attaches (verifier work is CPU-heavy per guard): core
-// count, never more than the work.
-func buildConcurrency(n int) int {
-	if n < 1 {
-		return 1
-	}
-	if lim := runtime.NumCPU(); lim < n {
-		return lim
-	}
-	return n
-}
-
 // buildGuards creates one whitelist guard per resource. The daemon's own executable is registered
 // root-gated with a minimal mask (OPEN, READ) so fscrypt ioctls keep working without making it a
 // universal key.
 //
-// Guards are built concurrently (bounded by buildConcurrency); nothing here unlocks, so the
+// Guards are built concurrently (bounded by usecase.ConcurrencyLimit); nothing here unlocks, so the
 // invariant lives in the caller: it must not unlock ANY resource until buildGuards returns (every
 // guard, incl. every member of a shared-vault `watch:` group, attached). On failure every guard
 // built so far (a later resource can finish before an earlier one fails) is detached, so none stays
@@ -1122,7 +1109,7 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg, vet *binaryVette
 	errs := make([]error, len(resources))
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, buildConcurrency(len(resources)))
+	sem := make(chan struct{}, usecase.ConcurrencyLimit(len(resources)))
 	for i := range resources {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -1266,7 +1253,7 @@ func notifySystemdReady() {
 }
 
 func writePidFile() error {
-	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+	if err := os.WriteFile(pidFile, fmt.Appendf(nil, "%d\n", os.Getpid()), 0o600); err != nil {
 		return fmt.Errorf("writing pid file %s: %w", pidFile, err)
 	}
 	return nil

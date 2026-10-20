@@ -646,23 +646,31 @@ func inodeRowsOf(m *cilium.Map, resID uint32) ([]GuardInodeKey, error) {
 // batchInodeRows dedupes: a batch walk racing concurrent updates may return a key twice, and
 // releaseInodes would then delete the row it just handed back.
 func batchInodeRows(lookup inodeBatchFn, resID uint32) ([]GuardInodeKey, error) {
-	keys := make([]GuardInodeKey, inodeBatchRows)
-	vals := make([]uint32, inodeBatchRows)
 	seen := map[GuardInodeKey]struct{}{}
 	var rows []GuardInodeKey
+	err := walkInodeBatches(lookup, func(key GuardInodeKey, val uint32) {
+		rows = appendInodeRow(rows, seen, key, val, resID)
+	})
+	return rows, err
+}
+
+// walkInodeBatches calls visit on every row of a batch walk, until the end of the map.
+func walkInodeBatches(lookup inodeBatchFn, visit func(GuardInodeKey, uint32)) error {
+	keys := make([]GuardInodeKey, inodeBatchRows)
+	vals := make([]uint32, inodeBatchRows)
 	var cursor cilium.MapBatchCursor
 	for {
 		n, err := lookup(&cursor, keys, vals)
 		for i := 0; i < n && i < len(keys); i++ {
-			rows = appendInodeRow(rows, seen, keys[i], vals[i], resID)
+			visit(keys[i], vals[i])
 		}
 		switch {
 		case errors.Is(err, cilium.ErrKeyNotExist):
-			return rows, nil // end of map; n still counts this call's rows
+			return nil // end of map; n still counts this call's rows
 		case err != nil:
-			return rows, err
+			return err
 		case n == 0:
-			return rows, errors.New("batch lookup returned no rows before the end of the map")
+			return errors.New("batch lookup returned no rows before the end of the map")
 		}
 	}
 }

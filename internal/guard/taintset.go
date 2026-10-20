@@ -3,6 +3,7 @@ package guard
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -78,9 +79,7 @@ func intersectAllows(sets []map[GuardInodeKey]uint8) map[GuardInodeKey]uint8 {
 	inter := make(map[GuardInodeKey]uint8)
 	for i, set := range sets {
 		if i == 0 {
-			for k, a := range set {
-				inter[k] = a
-			}
+			maps.Copy(inter, set)
 			continue
 		}
 		for k, a := range inter {

@@ -69,10 +69,7 @@ func lexerFor(name, content string) chroma.Lexer {
 		}
 		return nil
 	}
-	if l := shebangLexer(content); l != nil {
-		return l
-	}
-	return nil
+	return shebangLexer(content)
 }
 
 // shebangLexer resolves `#!/usr/bin/env python3` / `#!/bin/bash` to the interpreter's lexer.

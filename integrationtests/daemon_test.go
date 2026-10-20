@@ -35,14 +35,13 @@ type daemonEvent struct {
 //	<6>DAEMON ALLOWED op=OPEN  comm=cat   pid=1  uid=root    resource=/p  path=/p/f
 func parseDaemonEvents(logContent string) []daemonEvent {
 	var events []daemonEvent
-	for _, line := range strings.Split(logContent, "\n") {
-		idx := strings.Index(line, "DAEMON ")
-		if idx < 0 {
+	for line := range strings.SplitSeq(logContent, "\n") {
+		if !strings.Contains(line, "DAEMON ") {
 			continue
 		}
 		denied := strings.Contains(line, "DAEMON DENIED")
 		ev := daemonEvent{Denied: denied}
-		for _, field := range strings.Fields(line) {
+		for field := range strings.FieldsSeq(line) {
 			if !strings.Contains(field, "=") {
 				continue
 			}
@@ -79,7 +78,7 @@ func (s *IntegrationSuite) startDaemon(c testcontainers.Container, config string
 // "guard started" line individually rather than stopping at the first.
 func watchPathsInConfig(config string) []string {
 	var paths []string
-	for _, line := range strings.Split(config, "\n") {
+	for line := range strings.SplitSeq(config, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
 			continue
@@ -125,7 +124,7 @@ func (s *IntegrationSuite) confirmConfigBinaries(c testcontainers.Container) {
 // configBinaryLines are the binary paths of a daemon.conf: whitelist and lib_binary lines.
 func configBinaryLines(conf string) []string {
 	var out []string
-	for _, line := range strings.Split(conf, "\n") {
+	for line := range strings.SplitSeq(conf, "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "lib_binary"))
 		line = strings.TrimSpace(strings.TrimPrefix(line, ":"))
 		switch {
@@ -867,12 +866,6 @@ func (s *IntegrationSuite) TestDaemon_RefusedReload_KeepsRemainingResourceProtec
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
-// daemonPinFiles lists the daemon's pin files under /sys/fs/bpf/app-listener.
-func (s *IntegrationSuite) daemonPinFiles(c testcontainers.Container) []string {
-	_, out := s.exec(c, []string{"sh", "-c", "ls -1 /sys/fs/bpf/app-listener 2>/dev/null || true"})
-	return strings.Fields(out)
-}
-
 // The daemon protects its own on-disk state. While it runs, /etc/app-listener is guarded
 // independent of any [watch]:
 //   - daemon.conf stays world-READABLE, but nothing except the app-listener binary may
@@ -1071,7 +1064,7 @@ printf 'LOOPDEV=%s\n' "$LOOP"
 `
 	code, out := s.exec(c, []string{"sh", "-c", setup})
 	loopDev := ""
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if strings.HasPrefix(ln, "LOOPDEV=/dev/loop") {
 			loopDev = strings.TrimPrefix(ln, "LOOPDEV=")
@@ -1328,7 +1321,7 @@ printf 'LOOPDEV=%%s\n' "$LOOP"
 `, mountPoint, mountPoint, mountPoint)
 	code, out := s.exec(c, []string{"sh", "-c", setup})
 	loopDev := ""
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if strings.HasPrefix(ln, "LOOPDEV=/dev/loop") {
 			loopDev = strings.TrimPrefix(ln, "LOOPDEV=")
@@ -2812,7 +2805,7 @@ func (s *IntegrationSuite) preload(c testcontainers.Container, bin, lib string) 
 }
 
 func (s *IntegrationSuite) requireDenialLogged(c testcontainers.Container, op, name string) {
-	for _, line := range strings.Split(s.readDaemonLog(c), "\n") {
+	for line := range strings.SplitSeq(s.readDaemonLog(c), "\n") {
 		if strings.Contains(line, "TRUST DENIED  op="+op) && strings.Contains(line, name) {
 			return
 		}

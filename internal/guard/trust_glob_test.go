@@ -54,10 +54,10 @@ func TestGlobReservationsLibTrusted(t *testing.T) {
 	}{
 		{discord, "/h/.config/discord/app/libffmpeg.so", true},
 		{discord, "/h/.config/discord/app/modules/x/libvulkan.so.1", true}, // lib* at depth
-		{discord, "/h/.config/discord/app/probe.dat", false},                // unreserved name
-		{discord, "/h/.config/other/libffmpeg.so", false},                   // outside the root
-		{"/usr/bin/ssh", "/h/.config/discord/app/libffmpeg.so", false},      // not a writer
-		{discord, "/h/steam/wineserver", false},                             // another entry's bit
+		{discord, "/h/.config/discord/app/probe.dat", false},               // unreserved name
+		{discord, "/h/.config/other/libffmpeg.so", false},                  // outside the root
+		{"/usr/bin/ssh", "/h/.config/discord/app/libffmpeg.so", false},     // not a writer
+		{discord, "/h/steam/wineserver", false},                            // another entry's bit
 	}
 	for _, c := range cases {
 		if got := r.LibTrusted(c.bin, c.lib); got != c.want {

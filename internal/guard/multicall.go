@@ -3,6 +3,7 @@ package guard
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -398,9 +399,7 @@ func withRealKeys(allows map[uint32]map[GuardInodeKey]uint8) map[uint32]map[Guar
 	out := make(map[uint32]map[GuardInodeKey]uint8, len(allows))
 	for res, set := range allows {
 		cp := make(map[GuardInodeKey]uint8, len(set))
-		for k, a := range set {
-			cp[k] = a
-		}
+		maps.Copy(cp, set)
 		for k, a := range set {
 			if k.tagged() {
 				if _, ok := cp[k.Real()]; !ok {

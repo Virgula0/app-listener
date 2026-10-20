@@ -81,7 +81,7 @@ func (g *adaptiveGrid) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	w := (size.Width - float32(g.cols-1)*gap) / float32(g.cols)
 	y := float32(0)
 	for r, h := range rowHeights(objs, g.cols) {
-		for c := 0; c < g.cols; c++ {
+		for c := range g.cols {
 			i := r*g.cols + c
 			if i >= len(objs) {
 				break

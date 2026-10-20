@@ -724,7 +724,7 @@ func homeMatchConfined(home, pattern, match string) bool {
 		return true
 	}
 	dir := home
-	for _, c := range strings.Split(filepath.Dir(rel), "/") {
+	for c := range strings.SplitSeq(filepath.Dir(rel), "/") {
 		if c == "." {
 			break
 		}

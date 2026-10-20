@@ -166,7 +166,7 @@ func dumpFullLog(name string, err error) {
 	}
 	path := fmt.Sprintf("/tmp/bpfstats-%s.log", name)
 	_ = os.Remove(path) // a previous run's copy belongs to the sudo user; sticky /tmp blocks rewriting it
-	if werr := os.WriteFile(path, []byte(fmt.Sprintf("%+v\n", ve)), 0o600); werr != nil {
+	if werr := os.WriteFile(path, fmt.Appendf(nil, "%+v\n", ve), 0o600); werr != nil {
 		fmt.Fprintf(os.Stderr, "    writing %s: %v\n", path, werr)
 		return
 	}
@@ -213,8 +213,7 @@ func chownToSudoUser(path string) {
 }
 
 func short(err error) string {
-	var ve *cilium.VerifierError
-	if errors.As(err, &ve) {
+	if ve, ok := errors.AsType[*cilium.VerifierError](err); ok {
 		return fmt.Sprintf("%v", ve)
 	}
 	s := err.Error()

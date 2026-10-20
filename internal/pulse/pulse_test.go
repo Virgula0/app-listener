@@ -18,7 +18,7 @@ func recv(s *Sub, within time.Duration) bool {
 func TestSubFiresEveryPeriod(t *testing.T) {
 	p := New(10 * time.Millisecond)
 	a, b := p.Subscribe(), p.Subscribe()
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if !recv(a, time.Second) || !recv(b, time.Second) {
 			t.Fatalf("tick %d not delivered to both subscribers", i)
 		}

@@ -11,7 +11,6 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/networkmonitor"
-	"github.com/Virgula0/app-listener/internal/procstats"
 )
 
 const maxNetEvents = 500
@@ -60,11 +59,8 @@ type netModel struct {
 
 	binaries  []networkmonitor.BinaryEntry
 	startTime time.Time
-	eventID   int
 
-	lastStats    *procstats.Stats
-	prevEventID  int
-	eventsPerSec float64
+	eventRate
 }
 
 func NewNetModel(events <-chan ebpf.NetEvent, binaries []networkmonitor.BinaryEntry) tea.Model {
@@ -116,7 +112,7 @@ func (m *netModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenForNetEvents(m.events)
 
 	case netStatsMsg:
-		m.updateNetStats()
+		m.sample(1)
 		m.renderNetViewport()
 
 		return m, tickNetStats()
@@ -133,18 +129,6 @@ func (m *netModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
-}
-
-func (m *netModel) updateNetStats() {
-	s, err := procstats.Read()
-	if err != nil {
-		return
-	}
-
-	eventsDelta := m.eventID - m.prevEventID
-	m.eventsPerSec = float64(eventsDelta)
-	m.prevEventID = m.eventID
-	m.lastStats = s
 }
 
 func (m *netModel) addNetEvent(ev *ebpf.NetEvent) {
@@ -178,17 +162,11 @@ func (m *netModel) addNetEvent(ev *ebpf.NetEvent) {
 		sizeStr,
 	)
 
-	m.lines = append(m.lines, netEventLine{event: *ev, line: line})
-	if len(m.lines) > maxNetEvents {
-		m.lines = m.lines[len(m.lines)-maxNetEvents:]
-	}
+	m.lines = appendCapped(m.lines, netEventLine{event: *ev, line: line}, maxNetEvents)
 }
 
 func formatNetType(t ebpf.NetEventType) string {
-	if s, ok := netTypeStyles[t]; ok {
-		return s.Render(fmt.Sprintf("%-8s", t.String()))
-	}
-	return fmt.Sprintf("%-8s", t.String())
+	return padStyled(netTypeStyles, t)
 }
 
 func formatNetProto(proto uint32) string {
@@ -211,13 +189,7 @@ func formatAddr(addr string) string {
 }
 
 func (m *netModel) renderNetViewport() {
-	lines := make([]string, len(m.lines))
-	for i := range m.lines {
-		lines[i] = m.lines[i].line
-	}
-
-	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	m.viewport.SetContent(content)
+	setLines(&m.viewport, m.lines, func(l netEventLine) string { return l.line })
 }
 
 func (m *netModel) View() string {

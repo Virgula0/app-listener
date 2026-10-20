@@ -6,36 +6,9 @@ import (
 )
 
 // GuardUseCase is the application service for the file system guard feature.
-type GuardUseCase interface {
-	Start() error
-	Stop()
-	Events() <-chan guard.GuardEvent
-	// PopulateInodes fills the inode map with the guarded tree; call before Start so every file is
-	// protected from attach, not just those reached lazily.
-	PopulateInodes() error
-}
-
-type guardUseCase struct {
-	repo repository.GuardRepository
-}
+type GuardUseCase = StreamUseCase[guard.GuardEvent]
 
 // NewGuardUseCase wires the guard use case to its repository implementation.
 func NewGuardUseCase(repo repository.GuardRepository) GuardUseCase {
-	return &guardUseCase{repo: repo}
-}
-
-func (u *guardUseCase) Start() error {
-	return u.repo.Start()
-}
-
-func (u *guardUseCase) Stop() {
-	u.repo.Stop()
-}
-
-func (u *guardUseCase) Events() <-chan guard.GuardEvent {
-	return u.repo.Events()
-}
-
-func (u *guardUseCase) PopulateInodes() error {
-	return u.repo.PopulateInodes()
+	return &streamUseCase[guard.GuardEvent]{repo: repo}
 }

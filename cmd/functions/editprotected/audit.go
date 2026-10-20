@@ -132,7 +132,7 @@ func auditGroupCoverage(cfg *daemonconfig.Config, resource string) []string {
 			}
 			return nil
 		}
-		head := strings.SplitN(relOrPath(self.EncryptionRoot, path), string(os.PathSeparator), 2)[0]
+		head, _, _ := strings.Cut(relOrPath(self.EncryptionRoot, path), string(os.PathSeparator))
 		if !seen[head] {
 			seen[head] = true
 			findings = append(findings, "entry "+head+" under the encryption root "+self.EncryptionRoot+

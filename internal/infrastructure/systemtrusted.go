@@ -206,7 +206,7 @@ func GlobSystemPlaced(pattern string, limit int) []string {
 		return nil
 	}
 	cands := []string{"/"}
-	for _, comp := range strings.Split(strings.TrimPrefix(filepath.Clean(pattern), "/"), "/") {
+	for comp := range strings.SplitSeq(strings.TrimPrefix(filepath.Clean(pattern), "/"), "/") {
 		var next []string
 		for _, dir := range cands {
 			if strings.ContainsAny(comp, "*?[") {

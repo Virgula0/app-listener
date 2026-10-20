@@ -85,22 +85,9 @@ func InodeOccupancy() (rows, capacity int, ok bool, err error) {
 }
 
 func countInodeRows(lookup inodeBatchFn) (int, error) {
-	keys := make([]GuardInodeKey, inodeBatchRows)
-	vals := make([]uint32, inodeBatchRows)
-	var cursor cilium.MapBatchCursor
 	rows := 0
-	for {
-		n, err := lookup(&cursor, keys, vals)
-		rows += min(n, len(keys))
-		switch {
-		case errors.Is(err, cilium.ErrKeyNotExist):
-			return rows, nil
-		case err != nil:
-			return rows, err
-		case n == 0:
-			return rows, errors.New("batch lookup returned no rows before the end of the map")
-		}
-	}
+	err := walkInodeBatches(lookup, func(GuardInodeKey, uint32) { rows++ })
+	return rows, err
 }
 
 // WarnInodeOccupancy warns when guard_inodes is past inodeWarnPercent, once per crossing.

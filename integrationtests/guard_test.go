@@ -34,12 +34,11 @@ type guardEvent struct {
 
 func parseGuardEvents(logContent string) []guardEvent {
 	var events []guardEvent
-	for _, line := range strings.Split(logContent, "\n") {
-		idx := strings.Index(line, "GUARD|")
-		if idx < 0 {
+	for line := range strings.SplitSeq(logContent, "\n") {
+		_, rest, ok := strings.Cut(line, "GUARD|")
+		if !ok {
 			continue
 		}
-		rest := line[idx+6:]
 		parts := strings.SplitN(rest, "|", 7)
 		if len(parts) < 7 {
 			continue
@@ -70,18 +69,6 @@ func guardDeltaEvents(oldLog, newLog string) []guardEvent {
 		return nil
 	}
 	return newEvents[len(oldEvents):]
-}
-
-func guardEventTypes(events []guardEvent) []string {
-	seen := make(map[string]bool)
-	var types []string
-	for _, e := range events {
-		if !seen[e.Type] {
-			seen[e.Type] = true
-			types = append(types, e.Type)
-		}
-	}
-	return types
 }
 
 // Guard-process state for the pooled container: one guard at a time, with a
@@ -1777,7 +1764,7 @@ printf 'LOOPDEV=%s\n' "$LOOP"
 `
 	code, out := s.exec(c, []string{"sh", "-c", setup})
 	loopDev := ""
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if strings.HasPrefix(ln, "LOOPDEV=/dev/loop") {
 			loopDev = strings.TrimPrefix(ln, "LOOPDEV=")
@@ -2665,7 +2652,7 @@ func (s *IntegrationSuite) TestGuard_InodeFreeEvictsOnlyDeletedFiles() {
 	// 3. The exact field failure: an unrelated, non-whitelisted `ln -sfn`
 	//    beside the root makes a temp symlink and renames it over its target.
 	//    Repeated so a reuse of the freed number is actually exercised.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		code, out = s.exec(c, []string{"sh", "-c", "ln -sfn /tmp " + dir + "/bin32 2>&1"})
 		s.Require().Equalf(0, code, "an unrelated ln -sfn beside the guarded file must not be denied (iteration %d): %s", i, out)
 	}

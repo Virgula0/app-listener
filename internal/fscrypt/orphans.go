@@ -166,8 +166,7 @@ func CleanOrphans(anchor string, livePolicies map[string]struct{}) (removedProte
 	orphanProtectors, orphanPolicies := SelectOrphans(protectors, policies, livePolicies)
 	for _, d := range orphanPolicies {
 		if err := ctx.Mount.RemovePolicy(d); err != nil {
-			var notFound *filesystem.ErrPolicyNotFound
-			if errors.As(err, &notFound) {
+			if _, ok := errors.AsType[*filesystem.ErrPolicyNotFound](err); ok {
 				continue
 			}
 			return removedProtectors, removedPolicies, fmt.Errorf("remove policy %s: %w", d, err)
@@ -176,8 +175,7 @@ func CleanOrphans(anchor string, livePolicies map[string]struct{}) (removedProte
 	}
 	for _, d := range orphanProtectors {
 		if err := ctx.Mount.RemoveProtector(d); err != nil {
-			var notFound *filesystem.ErrProtectorNotFound
-			if errors.As(err, &notFound) {
+			if _, ok := errors.AsType[*filesystem.ErrProtectorNotFound](err); ok {
 				continue
 			}
 			return removedProtectors, removedPolicies, fmt.Errorf("remove protector %s: %w", d, err)
@@ -197,8 +195,7 @@ func listProtectors(ctx *actions.Context) ([]*metadata.ProtectorData, error) {
 	for _, d := range descriptors {
 		_, data, getErr := ctx.Mount.GetProtector(d, nil)
 		if getErr != nil {
-			var notFound *filesystem.ErrProtectorNotFound
-			if errors.As(getErr, &notFound) {
+			if _, ok := errors.AsType[*filesystem.ErrProtectorNotFound](getErr); ok {
 				continue
 			}
 			return nil, fmt.Errorf("get protector %s: %w", d, getErr)
@@ -218,8 +215,7 @@ func listPolicies(ctx *actions.Context) ([]*metadata.PolicyData, error) {
 	for _, d := range descriptors {
 		data, getErr := ctx.Mount.GetPolicy(d, nil)
 		if getErr != nil {
-			var notFound *filesystem.ErrPolicyNotFound
-			if errors.As(getErr, &notFound) {
+			if _, ok := errors.AsType[*filesystem.ErrPolicyNotFound](getErr); ok {
 				continue
 			}
 			return nil, fmt.Errorf("get policy %s: %w", d, getErr)

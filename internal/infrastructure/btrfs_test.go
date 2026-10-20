@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf/btf"
+	"golang.org/x/sys/unix"
 )
 
 type fakeTypes map[string]btf.Type
@@ -113,22 +114,17 @@ func TestMountinfoDev(t *testing.T) {
 	}
 }
 
-func TestMountinfoHasFstype(t *testing.T) {
-	if ok, err := mountinfoHasFstype(strings.NewReader(mountinfoFixture), "btrfs"); err != nil || !ok {
-		t.Fatalf("btrfs not found: %v", err)
-	}
-	ext4Only := strings.SplitAfter(mountinfoFixture, "\n")[0]
-	if ok, _ := mountinfoHasFstype(strings.NewReader(ext4Only), "btrfs"); ok {
-		t.Fatal("btrfs found on an ext4-only table")
-	}
-}
-
 func TestSuperblockDevMatchesStatOffBtrfs(t *testing.T) {
 	dir := t.TempDir()
 	if on, err := OnBtrfs(dir); err != nil || on {
 		t.Skip("temp dir on btrfs")
 	}
-	got, err := SuperblockDevPath(dir)
+	fd, err := unix.Open(dir, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	got, err := SuperblockDev(fd)
 	if err != nil {
 		t.Fatal(err)
 	}

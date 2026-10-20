@@ -25,18 +25,39 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # cache-apt-pkgs runs no apt-get update on GitHub runners: from the image's stale index a
+      # superseded .deb 404s, the install fails, and the action still saves an empty cache.
+      - name: Refresh apt package lists
+        run: sudo apt-get update
+
       - name: Cache and install apt packages
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
           # golangci-lint typechecks the whole module, including the
           # fyne GUI, which needs OpenGL and X11 development headers.
           packages: pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
-          version: ubuntu-26.04-2
+          version: ubuntu-26.04-3
+
+      # A cache saved from a failed install restores nothing on every later hit: fall back to apt,
+      # and bump `version` above so the next run saves a complete cache.
+      - name: Check the GUI build headers
+        run: |
+          set -uo pipefail
+          mods="gl x11 xrandr xcursor xinerama xi xxf86vm wayland-client wayland-cursor wayland-egl xkbcommon"
+          pkg-config --exists $mods 2>/dev/null && exit 0
+          echo "::warning::the apt cache lacks GUI headers: installing them with apt (bump the cache-apt-pkgs version)"
+          set -e
+          sudo apt-get install -y --no-install-recommends pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+          pkg-config --exists $mods
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # make lint also runs tools/codecheck (own module) and deadcode@DEADCODE_VERSION.
+          cache-dependency-path: |
+            go.sum
+            tools/codecheck/go.sum
 
       # Generated eBPF bindings are no longer committed (issue #45: a stale
       # object shipped in a release and crashed a newer kernel). Regenerate
@@ -73,6 +94,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # cache-apt-pkgs runs no apt-get update on GitHub runners: from the image's stale index a
+      # superseded .deb 404s, the install fails, and the action still saves an empty cache.
+      - name: Refresh apt package lists
+        run: sudo apt-get update
+
       - name: Cache and install apt packages
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
@@ -80,7 +106,7 @@ jobs:
           # tests need a C toolchain and libc headers. The fyne GUI
           # needs OpenGL and X11 development headers to typecheck.
           packages: pkg-config gcc libc6-dev make libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
-          version: ubuntu-26.04-2
+          version: ubuntu-26.04-3
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0

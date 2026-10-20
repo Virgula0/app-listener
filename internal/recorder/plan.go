@@ -4,10 +4,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"syscall"
 
@@ -337,7 +337,7 @@ func (rec *Recording) planBinaries(p *Plan, lines []string) (map[string]*Binary,
 // sectionFor whitelists, for t, the chosen binaries that touched it and its section doesn't list.
 func sectionFor(t *Target, chosen map[string]*Binary, encrypt, masks bool) install.Section {
 	s := install.Section{Path: t.Path, Encrypt: encrypt}
-	for _, line := range sortedLines(chosen) {
+	for _, line := range slices.Sorted(maps.Keys(chosen)) {
 		b := chosen[line]
 		if !slices.Contains(b.Targets, t.Path) || t.Existing.Has(line) {
 			continue
@@ -358,15 +358,6 @@ func libOfChosen(lib string, chosen map[string]*Binary) bool {
 		}
 	}
 	return false
-}
-
-func sortedLines(m map[string]*Binary) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func dedupe(in []string) []string {

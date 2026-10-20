@@ -309,6 +309,37 @@ func TestNewerThanInstalled(t *testing.T) {
 	}
 }
 
+func TestPreVersionPattern(t *testing.T) {
+	cases := map[string]bool{
+		"pre-20261019-00eed34":        true,
+		"pre-20261019-193324-00eed34": true,
+		"pre-20261019-1933-00eed34":   false,
+		"pre-20261019-193324-":        false,
+		"pre-20261019-193324-00EED34": false,
+		"pre-test":                    false,
+		"v0.3.0":                      false,
+	}
+	for tag, want := range cases {
+		if got := preVersionRe.MatchString(tag); got != want {
+			t.Errorf("preVersionRe.MatchString(%q) = %v, want %v", tag, got, want)
+		}
+	}
+}
+
+func TestNewerThanInstalledAcrossTagFormats(t *testing.T) {
+	releases := []githubRelease{
+		{TagName: "pre-20260101-aaaaaaa", Prerelease: true, PublishedAt: "2026-01-01T10:00:00Z"},
+		{TagName: "pre-20260101-153000-bbbbbbb", Prerelease: true, PublishedAt: "2026-01-01T15:30:00Z"},
+	}
+	latest := releases[1]
+	if !newerThanInstalled("pre-20260101-aaaaaaa", &latest, releases) {
+		t.Fatal("an old-format install must update to a newer HHMMSS-tagged release")
+	}
+	if newerThanInstalled("pre-20260101-153000-bbbbbbb", &latest, releases) {
+		t.Fatal("an HHMMSS-tagged install is up to date with itself")
+	}
+}
+
 func TestNewerThanStable(t *testing.T) {
 	latest := githubRelease{TagName: "v1.2.0"}
 

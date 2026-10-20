@@ -123,31 +123,6 @@ func findMember(members []btf.Member, name string, base btf.Bits) (btf.Bits, btf
 	return 0, nil, false
 }
 
-// BtrfsMounted reports whether any btrfs filesystem is mounted in this mount namespace.
-func BtrfsMounted() (bool, error) {
-	f, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-	return mountinfoHasFstype(f, "btrfs")
-}
-
-func mountinfoHasFstype(r io.Reader, fstype string) (bool, error) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		_, after, ok := strings.Cut(sc.Text(), " - ")
-		if !ok {
-			continue
-		}
-		if f := strings.Fields(after); len(f) > 0 && f[0] == fstype {
-			return true, nil
-		}
-	}
-	return false, sc.Err()
-}
-
 // OnBtrfs reports whether path lies on btrfs (following symlinks).
 func OnBtrfs(path string) (bool, error) {
 	var fs unix.Statfs_t
@@ -195,16 +170,6 @@ func SuperblockDev(fd int) (uint64, error) {
 		return 0, err
 	}
 	return KernelDev(major, minor), nil
-}
-
-// SuperblockDevPath is SuperblockDev for path, following symlinks.
-func SuperblockDevPath(path string) (uint64, error) {
-	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return 0, &os.PathError{Op: "open", Path: path, Err: err}
-	}
-	defer func() { _ = unix.Close(fd) }()
-	return SuperblockDev(fd)
 }
 
 // mountinfoDev returns the major:minor field of mount mnt's mountinfo line.

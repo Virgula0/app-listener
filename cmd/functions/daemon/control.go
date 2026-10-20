@@ -608,7 +608,7 @@ func readForwardRequest(reader *bufio.Reader, header string) (*forwardRequest, e
 		return nil, fmt.Errorf("unknown FORWARD action %q", f[0])
 	}
 	if f[1] != "*" {
-		for _, name := range strings.Split(f[1], ",") {
+		for name := range strings.SplitSeq(f[1], ",") {
 			et, ok := ebpf.ParseEventType(name)
 			if !ok {
 				return nil, fmt.Errorf("unknown event type %q", name)

@@ -101,11 +101,8 @@ type model struct {
 	recursive bool
 	depth     int
 	startTime time.Time
-	eventID   int
 
-	lastStats    *procstats.Stats
-	prevEventID  int
-	eventsPerSec float64
+	eventRate
 }
 
 func NewModel(events <-chan ebpf.FileEvent, paths []string, recursive bool, depth int) tea.Model {
@@ -159,7 +156,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenForEvents(m.events)
 
 	case statsMsg:
-		m.updateStats()
+		m.sample(1)
 		m.renderViewport()
 
 		return m, tickStats()
@@ -176,18 +173,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
-}
-
-func (m *model) updateStats() {
-	s, err := procstats.Read()
-	if err != nil {
-		return
-	}
-
-	eventsDelta := m.eventID - m.prevEventID
-	m.eventsPerSec = float64(eventsDelta)
-	m.prevEventID = m.eventID
-	m.lastStats = s
 }
 
 func (m *model) addEvent(ev *ebpf.FileEvent) {
@@ -218,27 +203,65 @@ func (m *model) addEvent(ev *ebpf.FileEvent) {
 		extra,
 	)
 
-	m.lines = append(m.lines, eventLine{event: *ev, line: line})
-	if len(m.lines) > maxEvents {
-		m.lines = m.lines[len(m.lines)-maxEvents:]
-	}
+	m.lines = appendCapped(m.lines, eventLine{event: *ev, line: line}, maxEvents)
 }
 
 func (m *model) renderViewport() {
-	lines := make([]string, len(m.lines))
-	for i := range m.lines {
-		lines[i] = m.lines[i].line
-	}
-
-	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	m.viewport.SetContent(content)
+	setLines(&m.viewport, m.lines, func(l eventLine) string { return l.line })
 }
 
 func formatType(t ebpf.EventType) string {
-	if s, ok := typeStyles[t]; ok {
-		return s.Render(fmt.Sprintf("%-8s", t.String()))
+	return padStyled(typeStyles, t)
+}
+
+// padStyled pads t's label to 8 columns, styled when styles has it.
+func padStyled[T interface {
+	comparable
+	fmt.Stringer
+}](styles map[T]lipgloss.Style, t T) string {
+	label := fmt.Sprintf("%-8s", t.String())
+	if s, ok := styles[t]; ok {
+		return s.Render(label)
 	}
-	return fmt.Sprintf("%-8s", t.String())
+	return label
+}
+
+// eventRate tracks a model's event counter and its last stats sample for the resource bar.
+type eventRate struct {
+	eventID      int
+	prevEventID  int
+	eventsPerSec float64
+	lastStats    *procstats.Stats
+}
+
+// sample reads the process stats and the event rate over the last interval seconds; a failed read
+// keeps the previous sample.
+func (r *eventRate) sample(interval float64) {
+	s, err := procstats.Read()
+	if err != nil {
+		return
+	}
+	r.eventsPerSec = float64(r.eventID-r.prevEventID) / interval
+	r.prevEventID = r.eventID
+	r.lastStats = s
+}
+
+// appendCapped appends row, keeping only the newest limit rows.
+func appendCapped[T any](rows []T, row T, limit int) []T {
+	rows = append(rows, row)
+	if len(rows) > limit {
+		rows = rows[len(rows)-limit:]
+	}
+	return rows
+}
+
+// setLines shows each row's rendered line in vp.
+func setLines[T any](vp *viewport.Model, rows []T, line func(T) string) {
+	lines := make([]string, len(rows))
+	for i, r := range rows {
+		lines[i] = line(r)
+	}
+	vp.SetContent(lipgloss.JoinVertical(lipgloss.Left, lines...))
 }
 
 func (m *model) View() string {

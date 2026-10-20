@@ -249,7 +249,7 @@ func DeclaredPaths(raw []byte) []string {
 			continue
 		}
 		if isWatchDirective(line) {
-			p := unquotePath(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "watch:"), "watch")))
+			p := UnquotePath(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "watch:"), "watch")))
 			if p != "" {
 				out = append(out, filepath.Clean(p))
 			}
@@ -347,7 +347,7 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 // openBlock returns the group a [libraries <name>], [inspectors], [electron_apps] or [settings]
 // header opens, nil for any other line.
 func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
-	if name, ok := parseLibrariesSection(line); ok {
+	if name, ok := ParseLibrariesSection(line); ok {
 		return &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
 	}
 	switch line {
@@ -400,7 +400,7 @@ func isWatchDirective(line string) bool {
 // (the encryption root; fscrypt is vault-wide) and not duplicate the section path or another watch
 // path.
 func (g *watchGroup) addWatchPath(line string, lineNo int) error {
-	path := unquotePath(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "watch:"), "watch")))
+	path := UnquotePath(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "watch:"), "watch")))
 	if path == "" {
 		return fmt.Errorf("daemon config line %d: empty watch path", lineNo)
 	}
@@ -410,10 +410,8 @@ func (g *watchGroup) addWatchPath(line string, lineNo int) error {
 	if !isInsidePath(path, g.root) {
 		return fmt.Errorf("daemon config line %d: watch path %q must be inside the section directory %q", lineNo, path, g.root)
 	}
-	for _, existing := range g.watchPaths {
-		if existing == path {
-			return fmt.Errorf("daemon config line %d: duplicate watch path: %s", lineNo, path)
-		}
+	if slices.Contains(g.watchPaths, path) {
+		return fmt.Errorf("daemon config line %d: duplicate watch path: %s", lineNo, path)
 	}
 	g.watchPaths = append(g.watchPaths, path)
 	return nil
@@ -424,10 +422,10 @@ func isInsidePath(path, dir string) bool {
 	return path != dir && strings.HasPrefix(path+"/", dir+"/")
 }
 
-// unquotePath strips a surrounding pair of double quotes. Quoting is optional for paths without
+// UnquotePath strips a surrounding pair of double quotes. Quoting is optional for paths without
 // spaces/special characters (legacy form); otherwise required, since event types following a path
 // on the same line would be ambiguous. The installer always quotes.
-func unquotePath(s string) string {
+func UnquotePath(s string) string {
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
 		return s[1 : len(s)-1]
 	}
@@ -457,9 +455,9 @@ func splitPathAndRest(line string) (path, rest string, err error) {
 // section).
 func parsePathDirective(line string) (string, bool) {
 	for _, prefix := range []string{"path = ", "path="} {
-		if strings.HasPrefix(line, prefix) {
-			if value := strings.TrimSpace(strings.TrimPrefix(line, prefix)); value != "" {
-				return unquotePath(value), true
+		if after, ok := strings.CutPrefix(line, prefix); ok {
+			if value := strings.TrimSpace(after); value != "" {
+				return UnquotePath(value), true
 			}
 		}
 	}
@@ -714,7 +712,7 @@ func parseWatchSection(line string) (path string, isSection bool, err error) {
 	if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
 		return "", false, fmt.Errorf("malformed section header %q: expected \"[watch <path>]\"", line)
 	}
-	return unquotePath(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))), true, nil
+	return UnquotePath(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))), true, nil
 }
 
 // addResource creates a resource for watchPath, or nil for unguardable targets: missing paths,
@@ -856,18 +854,19 @@ func recordBinaryRule(rule BinaryRule, resolved, deferred *[]BinaryRule, lineNo 
 	*resolved = append(*resolved, rule)
 }
 
-// parseAllowLib recognizes `allow_lib <path>` / `allow_lib: <path>` and returns the unquoted path.
+// CutDirective recognizes `<name> <value>` / `<name>: <value>` and returns the trimmed raw value.
+// A separator is required so "/usr/bin/<name>foo" isn't mistaken for the directive.
+func CutDirective(line, name string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, name)
+	if !ok || rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
+		return "", false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(rest, ":")), true
+}
+
 func parseAllowLib(line string) (string, bool) {
-	rest, ok := strings.CutPrefix(line, "allow_lib")
-	if !ok {
-		return "", false
-	}
-	// Require a separator so "/usr/bin/allow_libfoo" isn't mistaken for the directive.
-	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
-		return "", false
-	}
-	rest = strings.TrimPrefix(rest, ":")
-	return unquotePath(strings.TrimSpace(rest)), true
+	v, ok := CutDirective(line, "allow_lib")
+	return UnquotePath(v), ok
 }
 
 // applyAllowLib records one allow_lib path on the open group, deferring it (like a binary) if not
@@ -891,18 +890,9 @@ func applyAllowLib(group *watchGroup, libPath string, lineNo int) error {
 	return nil
 }
 
-// parseLibDir recognizes `lib_dir <path>` / `lib_dir: <path>` and returns the unquoted path.
 func parseLibDir(line string) (string, bool) {
-	rest, ok := strings.CutPrefix(line, "lib_dir")
-	if !ok {
-		return "", false
-	}
-	// Require a separator so "/usr/bin/lib_dirfoo" isn't mistaken for the directive.
-	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
-		return "", false
-	}
-	rest = strings.TrimPrefix(rest, ":")
-	return unquotePath(strings.TrimSpace(rest)), true
+	v, ok := CutDirective(line, "lib_dir")
+	return UnquotePath(v), ok
 }
 
 // applyLibDir records one library directory on the open group. Unlike `watch:` it is NOT confined
@@ -915,34 +905,22 @@ func applyLibDir(group *watchGroup, dirPath string, lineNo int) error {
 		return fmt.Errorf("daemon config line %d: empty lib_dir path", lineNo)
 	}
 	dirPath = filepath.Clean(dirPath)
-	for _, existing := range group.libDirs {
-		if existing == dirPath {
-			return fmt.Errorf("daemon config line %d: duplicate lib_dir path: %s", lineNo, dirPath)
-		}
+	if slices.Contains(group.libDirs, dirPath) {
+		return fmt.Errorf("daemon config line %d: duplicate lib_dir path: %s", lineNo, dirPath)
 	}
 	group.libDirs = append(group.libDirs, dirPath)
 	return nil
 }
 
-// parseLibBinary recognizes `lib_binary <path>` / `lib_binary: <path>` and returns the raw value
-// (path plus rest).
+// parseLibBinary returns a lib_binary line's raw value (path plus rest).
 func parseLibBinary(line string) (string, bool) {
-	rest, ok := strings.CutPrefix(line, "lib_binary")
-	if !ok {
-		return "", false
-	}
-	// Require a separator so "/usr/bin/lib_binaryfoo" isn't mistaken for the directive.
-	if rest == "" || (rest[0] != ' ' && rest[0] != '\t' && rest[0] != ':') {
-		return "", false
-	}
-	rest = strings.TrimPrefix(rest, ":")
-	return strings.TrimSpace(rest), true
+	return CutDirective(line, "lib_binary")
 }
 
-// parseLibrariesSection recognizes a `[libraries]`, `[libraries <name>]` or `[libraries "<name>"]`
-// header. The name is only a label for the application; it scopes nothing but the block itself (a
-// lib_binary writes only its own block's lib_dirs).
-func parseLibrariesSection(line string) (string, bool) {
+// ParseLibrariesSection recognizes a trimmed `[libraries]`, `[libraries <name>]` or
+// `[libraries "<name>"]` header. The name is only a label for the application; it scopes nothing
+// but the block itself (a lib_binary writes only its own block's lib_dirs).
+func ParseLibrariesSection(line string) (string, bool) {
 	if !strings.HasPrefix(line, "[libraries") || !strings.HasSuffix(line, "]") {
 		return "", false
 	}
@@ -950,7 +928,7 @@ func parseLibrariesSection(line string) (string, bool) {
 	if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
 		return "", false // "[librariesfoo]": let parseWatchSection reject it
 	}
-	return unquotePath(strings.TrimSpace(rest)), true
+	return UnquotePath(strings.TrimSpace(rest)), true
 }
 
 // applyLibraryBlockDirective handles one line of a [libraries] block. Only the three library
@@ -1009,10 +987,8 @@ func applyInspector(cfg *Config, line string, lineNo int) error {
 		return fmt.Errorf("daemon config line %d: inspector %q is not an absolute path", lineNo, p)
 	}
 	p = filepath.Clean(p)
-	for _, have := range cfg.Inspectors {
-		if have == p {
-			return fmt.Errorf("daemon config line %d: duplicate inspector: %s", lineNo, p)
-		}
+	if slices.Contains(cfg.Inspectors, p) {
+		return fmt.Errorf("daemon config line %d: duplicate inspector: %s", lineNo, p)
 	}
 	if len(cfg.Inspectors) >= MaxInspectors {
 		return fmt.Errorf("daemon config line %d: more than %d inspectors", lineNo, MaxInspectors)

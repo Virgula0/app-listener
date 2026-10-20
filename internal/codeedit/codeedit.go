@@ -116,17 +116,18 @@ func column(ta *textarea.Model) int {
 // moveTo puts the cursor on (row, col). Rows are reached with CursorUp/Down, which step through
 // soft-wrapped sub-lines, so each loop stops as soon as a step makes no progress.
 func moveTo(ta *textarea.Model, row, col int) {
-	for ta.Line() < row {
+	moved := func(step func()) bool {
 		before := ta.LineInfo().RowOffset + ta.Line()<<16
-		ta.CursorDown()
-		if ta.LineInfo().RowOffset+ta.Line()<<16 == before {
+		step()
+		return ta.LineInfo().RowOffset+ta.Line()<<16 != before
+	}
+	for ta.Line() < row {
+		if !moved(ta.CursorDown) {
 			break
 		}
 	}
 	for ta.Line() > row {
-		before := ta.LineInfo().RowOffset + ta.Line()<<16
-		ta.CursorUp()
-		if ta.LineInfo().RowOffset+ta.Line()<<16 == before {
+		if !moved(ta.CursorUp) {
 			break
 		}
 	}

@@ -161,7 +161,7 @@ func (g *Guard) SnapshotSuperseded() ([]SupersededBinary, error) {
 	g.mu.Lock()
 	paths := make(map[GuardInodeKey]string, len(g.keyPaths))
 	for k, p := range g.keyPaths {
-		paths[k] = p
+		paths[k] = p //nolint:modernize // this file's `maps` locals would shadow the package
 	}
 	g.mu.Unlock()
 

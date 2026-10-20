@@ -187,7 +187,7 @@ func mountShowsSbRoot(mnt uint64) (bool, error) {
 
 func mountinfoShowsSbRoot(mountinfo []byte, mnt uint64) (bool, error) {
 	id := strconv.FormatUint(mnt, 10)
-	for _, line := range strings.Split(string(mountinfo), "\n") {
+	for line := range strings.SplitSeq(string(mountinfo), "\n") {
 		f := strings.Fields(line)
 		if len(f) > 3 && f[0] == id {
 			return f[3] == "/", nil

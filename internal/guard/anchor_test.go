@@ -6,16 +6,18 @@ import (
 	"slices"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 func keyOf(t *testing.T, path string) GuardInodeKey {
 	t.Helper()
-	dev, ino, err := ebpf.LstatInode(path)
-	if err != nil {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
 		t.Fatal(err)
 	}
-	return GuardInodeKey{Dev: dev, Ino: ino}
+	return GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}
 }
 
 func mkTree(t *testing.T) (base, secret string) {

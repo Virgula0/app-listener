@@ -133,10 +133,7 @@ func (n *Network) Watch(bins []ebpf.BinaryEntry) error {
 	prev, prevStop := n.mon, n.monStop
 	n.mon, n.monStop, n.watched = next, stop, bins
 	n.mu.Unlock()
-	if prev != nil {
-		close(prevStop)
-		prev.Stop()
-	}
+	stopPumped(prev, prevStop)
 	return nil
 }
 
@@ -374,10 +371,7 @@ func (n *Network) swapGuard(next repository.NetworkGuardRepository, p NetPolicy,
 	prev, prevStop := n.grd, n.grdStop
 	n.grd, n.grdStop, n.policy, n.extras = next, stop, p, extras
 	n.mu.Unlock()
-	if prev != nil {
-		close(prevStop)
-		prev.Stop()
-	}
+	stopPumped(prev, prevStop)
 }
 
 func (n *Network) isClosed() bool {
@@ -399,12 +393,6 @@ func (n *Network) Close() {
 	mon, monStop, grd, grdStop := n.mon, n.monStop, n.grd, n.grdStop
 	n.mon, n.grd = nil, nil
 	n.mu.Unlock()
-	if grd != nil {
-		close(grdStop)
-		grd.Stop()
-	}
-	if mon != nil {
-		close(monStop)
-		mon.Stop()
-	}
+	stopPumped(grd, grdStop)
+	stopPumped(mon, monStop)
 }

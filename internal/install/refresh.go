@@ -230,7 +230,7 @@ func ParseSectionWhitelist(confText, resourcePath string) []string {
 			inSection = ok && headerPath == resourcePath
 			continue
 		}
-		if !inSection || trimmed == "" || strings.HasPrefix(trimmed, "#") || IsLibraryDirective(trimmed) {
+		if !inSection || trimmed == "" || strings.HasPrefix(trimmed, "#") || isLibDirectiveText(trimmed) {
 			continue
 		}
 		if trimmed == "need_encryption: true" || trimmed == "need_encryption: false" ||

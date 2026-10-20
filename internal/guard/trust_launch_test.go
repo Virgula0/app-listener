@@ -72,7 +72,7 @@ func launchModel(classes uint8, argv, env []string) bool {
 			return true
 		}
 		_, value, _ := strings.Cut(e, "=")
-		for _, tok := range strings.Fields(value) {
+		for tok := range strings.FieldsSeq(value) {
 			key := name(tok, launchOpt, 0)
 			if len(key) > 4 && key[4] >= '0' && key[4] <= '9' {
 				key = key[:4]

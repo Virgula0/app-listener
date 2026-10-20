@@ -276,7 +276,7 @@ func newBinary(exe string, group []RawAccessor, v exeVerdict, targets []Target, 
 			b.Last = a.Last
 		}
 	}
-	b.Comms, b.Targets, b.UIDs = sortedKeys(comms), sortedKeys(tgts), sortedUIDs(uids)
+	b.Comms, b.Targets, b.UIDs = sortedKeys(comms), sortedKeys(tgts), sortedKeys(uids)
 	b.Ops, b.Mask = opNames(ops), maskFor(ops)
 	if v.problem == "" {
 		b.Libs, b.TrustedLibs = classifyLibs(sortedKeys(libs), exe, targets, base)

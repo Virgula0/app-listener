@@ -65,21 +65,23 @@ func runOfflineEdit() error {
 // pickEncryptedDir asks which encrypted catalog directory to open (only one vault is unlocked at a
 // time); skipped with a single candidate.
 func pickEncryptedDir(encrypted []string) (string, error) {
-	if len(encrypted) == 1 {
-		path := encrypted[0]
-		log.Infof("only one encrypted catalog directory found: %s", path)
-		return path, nil
-	}
-	opts := make([]huh.Option[string], 0, len(encrypted))
-	for _, p := range encrypted {
-		opts = append(opts, huh.NewOption(p, p))
+	return pickDir(encrypted, "only one encrypted catalog directory found",
+		"Which protected directory do you want to open?",
+		"Only one directory is unlocked at a time; it is re-locked when the editor closes.")
+}
+
+// pickDir asks which of dirs to use; a single candidate is taken without asking (logged as only).
+func pickDir(dirs []string, only, title, description string) (string, error) {
+	if len(dirs) == 1 {
+		log.Infof("%s: %s", only, dirs[0])
+		return dirs[0], nil
 	}
 	chosen := ""
 	if err := huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().
-			Title("Which protected directory do you want to open?").
-			Description("Only one directory is unlocked at a time; it is re-locked when the editor closes.").
-			Options(opts...).
+			Title(title).
+			Description(description).
+			Options(huh.NewOptions(dirs...)...).
 			Value(&chosen),
 	)).Run(); err != nil {
 		return "", err

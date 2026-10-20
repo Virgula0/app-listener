@@ -10,8 +10,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Virgula0/app-listener/internal/guard"
-	"github.com/Virgula0/app-listener/internal/infrastructure"
-	"github.com/Virgula0/app-listener/internal/procstats"
 )
 
 const maxGuardEvents = 500
@@ -61,13 +59,10 @@ type guardModel struct {
 	mode      guard.Mode
 	binaries  []guard.BinaryEntry
 	startTime time.Time
-	eventID   int
 	blocked   int
 	allowed   int
 
-	lastStats    *procstats.Stats
-	prevEventID  int
-	eventsPerSec float64
+	eventRate
 }
 
 func NewGuardModel(events <-chan guard.GuardEvent, guardPath string, mode guard.Mode, binaries []guard.BinaryEntry) tea.Model {
@@ -121,7 +116,7 @@ func (m *guardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenForGuardEvents(m.events)
 
 	case guardStatsMsg:
-		m.updateGuardStats()
+		m.sample(1)
 		m.renderGuardViewport()
 
 		return m, tickGuardStats()
@@ -140,18 +135,6 @@ func (m *guardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *guardModel) updateGuardStats() {
-	s, err := procstats.Read()
-	if err != nil {
-		return
-	}
-
-	eventsDelta := m.eventID - m.prevEventID
-	m.eventsPerSec = float64(eventsDelta)
-	m.prevEventID = m.eventID
-	m.lastStats = s
-}
-
 func (m *guardModel) addGuardEvent(ev *guard.GuardEvent) {
 	m.eventID++
 
@@ -163,10 +146,7 @@ func (m *guardModel) addGuardEvent(ev *guard.GuardEvent) {
 
 	line := formatGuardEventLine(ev)
 
-	m.lines = append(m.lines, guardEventLine{event: *ev, line: line})
-	if len(m.lines) > maxGuardEvents {
-		m.lines = m.lines[len(m.lines)-maxGuardEvents:]
-	}
+	m.lines = appendCapped(m.lines, guardEventLine{event: *ev, line: line}, maxGuardEvents)
 }
 
 func formatDecision(blocked bool) string {
@@ -176,21 +156,8 @@ func formatDecision(blocked bool) string {
 	return allowedStyle.Render("ALLOWED ")
 }
 
-func formatGuardType(t ebpf.EventType) string {
-	if s, ok := typeStyles[t]; ok {
-		return s.Render(fmt.Sprintf("%-8s", t.String()))
-	}
-	return fmt.Sprintf("%-8s", t.String())
-}
-
 func (m *guardModel) renderGuardViewport() {
-	lines := make([]string, len(m.lines))
-	for i := range m.lines {
-		lines[i] = m.lines[i].line
-	}
-
-	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	m.viewport.SetContent(content)
+	setLines(&m.viewport, m.lines, func(l guardEventLine) string { return l.line })
 }
 
 func (m *guardModel) View() string {

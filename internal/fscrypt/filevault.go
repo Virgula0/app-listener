@@ -117,26 +117,19 @@ func isRegularFileTarget(path string) bool {
 	return info.Mode().IsRegular()
 }
 
-// sealFileVaultWithMasterKey derives the subkey from the current master key, seals plaintext, and
-// wipes the subkey (NOT the caller's plaintext; callers wipe that). Shared by every mutating entry
-// point.
+// sealFileVaultWithMasterKey seals plaintext under the current master key's subkey (NOT wiping the
+// caller's plaintext; callers wipe that). Shared by every mutating entry point.
 func sealFileVaultWithMasterKey(plaintext []byte) ([]byte, error) {
-	masterKey, err := readMasterKey()
-	if err != nil {
-		return nil, err
-	}
-	defer wipe(masterKey)
-	subkey, err := deriveFileVaultSubkey(masterKey)
-	if err != nil {
-		return nil, err
-	}
-	defer wipe(subkey)
-	return sealFileVault(subkey, plaintext)
+	return withFileVaultSubkey(func(subkey []byte) ([]byte, error) { return sealFileVault(subkey, plaintext) })
 }
 
-// openFileVaultWithMasterKey derives the subkey from the current master key, opens record, and
-// wipes the subkey.
 func openFileVaultWithMasterKey(record []byte) ([]byte, error) {
+	return withFileVaultSubkey(func(subkey []byte) ([]byte, error) { return openFileVault(subkey, record) })
+}
+
+// withFileVaultSubkey runs fn with the subkey derived from the current master key, wiping both
+// keys afterwards.
+func withFileVaultSubkey(fn func(subkey []byte) ([]byte, error)) ([]byte, error) {
 	masterKey, err := readMasterKey()
 	if err != nil {
 		return nil, err
@@ -147,7 +140,7 @@ func openFileVaultWithMasterKey(record []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer wipe(subkey)
-	return openFileVault(subkey, record)
+	return fn(subkey)
 }
 
 // writeTempWithMetadata creates tmp (O_CREATE|O_EXCL, refusing to clobber an interrupted run's
@@ -165,10 +158,7 @@ func writeTempWithMetadata(tmp, src string, content []byte, srcInfo os.FileInfo)
 		if err := out.Sync(); err != nil {
 			return fmt.Errorf("sync %s: %w", tmp, err)
 		}
-		if err := stampCopyMetadata(out, src, tmp, srcInfo); err != nil {
-			return err
-		}
-		return nil
+		return stampCopyMetadata(out, src, tmp, srcInfo)
 	}(); werr != nil {
 		_ = out.Close()
 		_ = os.Remove(tmp)

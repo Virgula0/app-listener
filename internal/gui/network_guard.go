@@ -5,6 +5,7 @@ package gui
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -203,8 +204,8 @@ func (g *netGuardTab) promote(exe workbench.Exe, comm string, mode workbench.Gua
 			}
 		}
 		note := effect + " " + how
-		for _, w := range netWarnings(next) {
-			note += "\n\n• " + w
+		if ws := netWarnings(next); len(ws) > 0 {
+			note += "\n\n• " + strings.Join(ws, "\n\n• ")
 		}
 		g.p.shell.confirmExecutable(verbFor(mode), entry, exe, comm, note, func() {
 			g.applyDraft(next)

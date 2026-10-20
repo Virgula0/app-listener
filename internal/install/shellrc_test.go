@@ -29,7 +29,7 @@ func TestEnsureSSHAgentEnvAppendsOnceAndRemoveRestores(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if _, err := EnsureSSHAgentEnv(u); err != nil {
 			t.Fatal(err)
 		}
@@ -135,7 +135,7 @@ func TestEnsureAddKeysToAgentPrependsAndRemoveRestores(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte(orig), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if _, _, err := EnsureAddKeysToAgent(u); err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +204,7 @@ func TestEnsureBunLauncherEnvAppendsOnceAndRemoveRestores(t *testing.T) {
 	if err := os.WriteFile(rc, []byte(orig), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if _, err := EnsureBunLauncherEnv(u, []string{"opencode"}); err != nil {
 			t.Fatal(err)
 		}

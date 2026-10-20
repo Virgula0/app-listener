@@ -3,6 +3,7 @@ package usecase
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -212,8 +213,8 @@ func applyTempGrants(grants []guard.TemporaryGrant, rows []guard.GuardResInodeKe
 
 func revokeTempGrants(grants []guard.TemporaryGrant) error {
 	var errs []error
-	for i := len(grants) - 1; i >= 0; i-- {
-		if err := grants[i].Revoke(); err != nil {
+	for _, grant := range slices.Backward(grants) {
+		if err := grant.Revoke(); err != nil {
 			errs = append(errs, err)
 		}
 	}

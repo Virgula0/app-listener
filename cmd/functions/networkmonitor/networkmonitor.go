@@ -2,9 +2,6 @@ package networkmonitor
 
 import (
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
@@ -99,22 +96,11 @@ func runNetworkMonitor(cmd *cobra.Command, args []string) error {
 }
 
 func runHeadless(uc usecase.NetworkMonitorUseCase) {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-
-	for {
-		select {
-		case ev, ok := <-uc.Events():
-			if !ok {
-				return
-			}
-			log.Infof("NETEVENT|%s|%s|%s|%s|%s|%d|%d|%d|%d|%d",
-				ev.Type.String(), logging.SanitizeText(ev.Comm), ebpf.ProtocolString(ev.Protocol),
-				logging.SanitizeText(ev.SrcAddr), logging.SanitizeText(ev.DstAddr), ev.Size, ev.PID, ev.TID, ev.NetNS, ev.CgroupID)
-		case <-sig:
-			return
-		}
-	}
+	common.DrainUntilSignal(uc.Events(), func(ev *ebpf.NetEvent) {
+		log.Infof("NETEVENT|%s|%s|%s|%s|%s|%d|%d|%d|%d|%d",
+			ev.Type.String(), logging.SanitizeText(ev.Comm), ebpf.ProtocolString(ev.Protocol),
+			logging.SanitizeText(ev.SrcAddr), logging.SanitizeText(ev.DstAddr), ev.Size, ev.PID, ev.TID, ev.NetNS, ev.CgroupID)
+	})
 }
 
 func runTUI(uc usecase.NetworkMonitorUseCase, binaries []networkmonitor.BinaryEntry) error {
