@@ -68,7 +68,7 @@ app-listener installer
 Usage: install.sh [--channel release|prerelease]
 
   --channel   release    latest stable (non-pre-release) GitHub release [default]
-              prerelease latest pre-YYYYMMDD-<sha> build
+              prerelease latest pre-YYYYMMDD-HHMMSS-<sha> build
   -h, --help  show this help
 EOF
 }

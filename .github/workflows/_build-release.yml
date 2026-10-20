@@ -24,7 +24,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: Version string to embed via -ldflags (vX.Y.Z or pre-YYYYMMDD-sha).
+        description: Version string to embed via -ldflags (vX.Y.Z or pre-YYYYMMDD-HHMMSS-sha).
         required: true
         type: string
       ref:

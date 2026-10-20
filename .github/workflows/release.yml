@@ -1,7 +1,7 @@
 name: Release
 
 # Every push to main publishes a PRE-RELEASE: default + GUI linux/amd64 and
-# linux/arm64 binaries (version = the pre-YYYYMMDD-sha tag), signed checksums, and a
+# linux/arm64 binaries (version = the pre-YYYYMMDD-HHMMSS-sha tag), signed checksums, and a
 # generated changelog. The release title is "<constants.Version> · <tag>"
 # so the pre-releases leading to a given vX.Y.Z are easy to spot.
 # Promoting to a stable vX.Y.Z is promote-release.yml.
@@ -32,7 +32,8 @@ jobs:
         id: m
         run: |
           set -euo pipefail
-          tag="pre-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          # HHMMSS: GitHub orders same-day releases by tag name, so a bare sha shuffles them.
+          tag="pre-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}"
           target="$(sed -n 's/^var Version = "\(.*\)"$/\1/p' internal/constants/constants.go | head -n1)"
           if [ -n "$target" ]; then
             title="$target · $tag"

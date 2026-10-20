@@ -291,7 +291,7 @@ never a local file:
 |---|---|
 | This version's release (release windows only, the default there) | The headless asset of this window's own tag. |
 | Latest stable release | The newest `vX.Y.Z` release, as `update` picks it. |
-| Latest pre-release | The newest `pre-YYYYMMDD-<sha>` build of main, as `update --channel pre-release` picks it. |
+| Latest pre-release | The newest `pre-YYYYMMDD-HHMMSS-<sha>` build of main, as `update --channel pre-release` picks it. |
 
 Every download runs the checks `update` runs on each build: Ed25519 signature, signed asset name,
 checksum, GitHub digest, ELF architecture and `--version`. The headless build must be an
