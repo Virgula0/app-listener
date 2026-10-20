@@ -172,7 +172,8 @@ func (p *installPage) view() fyne.CanvasObject {
 		sectionTitle("ACTIONS"),
 		p.actionGrid(),
 		sectionTitle("UNINSTALL"),
-		container.NewGridWithColumns(2, p.uninstallCard(), p.facultativesCard()),
+		p.uninstallCard(),
+		p.facultativesCard(),
 	)))
 	root := p.mount(over, "Back to Install")
 	p.renderBinary()

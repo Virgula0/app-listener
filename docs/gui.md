@@ -367,7 +367,7 @@ then each encrypted folder is asked about (decrypt permanently, or keep encrypte
 per-user ssh-agent setup and the backup cleanup ask as in the terminal. Removing the desktop build
 deletes `/usr/local/sbin/app-listener-gui`; the open window keeps running until you close it.
 
-The **Remove facultatives** card next to it runs `uninstall facultatives`: it lists the optional
+The **Remove facultatives** card below it runs `uninstall facultatives`: it lists the optional
 per-user setup the installer added and removes only the ones you pick. It works with the daemon
 running (see [facultatives](installation.md#facultatives)).
 
