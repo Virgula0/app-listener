@@ -1,7 +1,7 @@
 # Graph Report - app-listener  (2026-10-20)
 
 ## Corpus Check
-- 505 files · ~1,723,842 words
+- 505 files · ~1,723,856 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 13 file(s) not represented in the graph (top: (none) 8, .service 2, .pub 1)
 
@@ -11,7 +11,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `2e48a33f`
+- Built from commit: `45e22f1c`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -26,7 +26,7 @@
 - IntegrationSuite
 - guardUnitTest
 - mkdirs
-- fakeGuardRepo
+- BinaryEntry
 - sync.Mutex
 - protectedPage
 - selection.go
@@ -96,7 +96,7 @@
 - time.Time
 - process_vm_readv.c
 - GuardEvent
-- BinaryEntry
+- LibraryClosure
 - gui/session.go
 - changelog.go
 - net_tester/main.go
@@ -115,7 +115,7 @@
 - Inode-based (dev:ino) executable identity
 - pulse_test.go
 - ConfinedEntry
-- parseGuardEvent
+- fakeGuardRepo
 - Well-known bypass classes
 - hashCache
 - jit_provenance.c
@@ -144,7 +144,7 @@
 - make test-integration (rootful Docker suite)
 - IntegrationSuite
 - newTestTarget
-- NewDumpHook
+- vaultfs_test.go
 - trace-app-libs.sh
 - IntegrationSuite
 - vaultfs.go
@@ -155,7 +155,7 @@
 - uninstall subcommand
 - IntegrationSuite
 - Serve
-- wm.go
+- parseGuardEvent
 - Open
 - Ledger
 - buildTrustedSet
@@ -173,15 +173,15 @@
 - backend_test.go
 - graphify-refresh.sh
 - layout.go
-- vaultfs_test.go
+- .decryptFileWithProgress
 - .populateWatchInodes
 - desktop_test.go
 - shell
 - .showSized
 - safeio.go
 - WithBottomBar
-- .decryptFileWithProgress
-- fakeDaemon
+- NewDumpHook
+- wm.go
 - Limitations
 - Troubleshooting
 - IntegrationSuite
@@ -202,30 +202,30 @@
 - Self-updating apps and the catalog
 - network-monitor: see what a program talks to
 - fileedit_symlink_test.go
-- github.com/stretchr/testify/suite.Suite
+- NewEventFanout
 - edit-protected
 - monitor: see what touches a path
 - kernel-prof.sh
 - update/update.go
 - pathCache
-- wm_test.go
+- IntegrationSuite
 - DaemonEvent
 - batchInodeRows
-- IntegrationSuite
+- fakeDaemon
 - uninstall/uninstall.go
 - Desktop GUI
 - IntegrationSuite
-- AddServeFlags
-- IntegrationSuite
+- github.com/stretchr/testify/suite.Suite
+- wm_test.go
 - .eventTypeAllowed
 - bleedLayout
-- CleanupStalePins
+- AddServeFlags
 - vouchedDevs
 - .awaitDaemonUpOrDead
-- LibraryClosure
+- IntegrationSuite
 - KernelDev
 - tempGrantSetup
-- NewEventFanout
+- CleanupStalePins
 - entryOf
 - ptrace_race.c
 - prctl_gate
@@ -310,6 +310,10 @@ Nodes (27): addErrKind, ReplacementCheck, TestWithChmodDropWriteNeedsReadOnly(),
 ### Community 9 - "mkdirs"
 Cohesion: 0.12
 Nodes (40): addSystemBinary(), catalogPatterns(), catalogWatchPlan(), newWatchPattern(), systemBinaryPatterns(), newFakeInotify(), TestWatchSetBinaryWriteTriggersNotMkdir(), TestWatchSetFloodIsCapped() (+32 more)
+
+### Community 10 - "BinaryEntry"
+Cohesion: 0.10
+Nodes (14): deferredBinary, keptEntries, BinaryEntry, TestCheckBinaryEventsReadOnlyAcceptsUnrestricted(), checkBtrfsKeys(), canonicalBinaryPath(), canonicalPaths(), confinedEntry() (+6 more)
 
 ### Community 11 - "sync.Mutex"
 Cohesion: 0.06
@@ -583,9 +587,9 @@ Nodes (6): dump_memory(), find_all_rw_regions(), find_heap(), find_victim_by_fd(
 Cohesion: 0.07
 Nodes (24): displayEntries(), holdHeadless(), HeadlessLine(), resolveGuardConfig(), runGuard(), runGuardHeadless(), runGuardTUI(), snapGuard (+16 more)
 
-### Community 81 - "BinaryEntry"
-Cohesion: 0.10
-Nodes (14): deferredBinary, keptEntries, BinaryEntry, TestCheckBinaryEventsReadOnlyAcceptsUnrestricted(), checkBtrfsKeys(), canonicalBinaryPath(), canonicalPaths(), confinedEntry() (+6 more)
+### Community 81 - "LibraryClosure"
+Cohesion: 0.07
+Nodes (29): ldConfParser, defaultLibDirs(), elfInterp(), fileExists(), hostView(), isScript(), ldConfInclude(), ldSoConfDirs() (+21 more)
 
 ### Community 82 - "gui/session.go"
 Cohesion: 0.21
@@ -658,10 +662,6 @@ Nodes (6): New(), recv(), TestSubDeliversMissedTickLate(), TestSubFiresEveryPeri
 ### Community 100 - "ConfinedEntry"
 Cohesion: 0.13
 Nodes (29): binaryVerifyState, HashStore, sharedHashEntry, ConfinedEntry(), claimHash(), hashFileShared(), hashPathShared(), HashStats() (+21 more)
-
-### Community 101 - "parseGuardEvent"
-Cohesion: 0.14
-Nodes (9): bpfGuardEvent, decodeGuardEvent(), fsGateLabel(), parseGuardEvent(), processGateLabel(), TestDecodeGuardEventMatchesBinaryRead(), TestParseGuardEventFsGateLabels(), TestParseGuardEventSuspectLabels() (+1 more)
 
 ### Community 102 - "Well-known bypass classes"
 Cohesion: 0.24
@@ -759,9 +759,9 @@ Nodes (3): IntegrationSuite, launchCase, TestClientVerifyRunsBeforeAnythingIsSen
 Cohesion: 0.22
 Nodes (17): FileEngines, NewFiles(), newTestTarget(), since(), TestAddRefusesOverlap(), TestApplyFromBlacklistFailureKeepsOldGuard(), TestApplyFromBlacklistOverlaps(), TestApplyFromWhitelistFailureReportsUnguarded() (+9 more)
 
-### Community 131 - "NewDumpHook"
-Cohesion: 0.24
-Nodes (10): applyVerbosity(), VerboseLevel, NewDumpHook(), TestDefaultVerboseMirrorsCurrentDisplay(), TestDumpHookFileIsSynced(), TestDumpHookFiltersByVerbosity(), TestDumpHookFormat(), TestVerboseToLogrus() (+2 more)
+### Community 131 - "vaultfs_test.go"
+Cohesion: 0.20
+Nodes (14): IsBinaryContent(), IsOctalMode(), ParseMode(), inodeOf(), mustRead(), mustWrite(), openRootT(), TestIsBinaryContent() (+6 more)
 
 ### Community 132 - "trace-app-libs.sh"
 Cohesion: 0.60
@@ -779,9 +779,9 @@ Nodes (4): lib_probe reserved library POC, Bun TMPDIR redirect with reserved .bu
 Cohesion: 0.08
 Nodes (29): basicAuth(), configureWebSocket(), decodeEndsAtEOF(), isInteractiveTerminal(), newServeListener(), newServeServer(), parseResize(), readResizeLoop() (+21 more)
 
-### Community 144 - "wm.go"
-Cohesion: 0.29
-Nodes (8): detectWM(), reachable(), Detect(), Session, hyprlandSocket(), i3RuntimeSocket(), socketOwnedBy(), Kind
+### Community 144 - "parseGuardEvent"
+Cohesion: 0.14
+Nodes (9): bpfGuardEvent, decodeGuardEvent(), fsGateLabel(), parseGuardEvent(), processGateLabel(), TestDecodeGuardEventMatchesBinaryRead(), TestParseGuardEventFsGateLabels(), TestParseGuardEventSuspectLabels() (+1 more)
 
 ### Community 145 - "Open"
 Cohesion: 0.16
@@ -839,9 +839,9 @@ Nodes (19): call(), editingBackend(), mustRead(), mustWrite(), newTestBackend(),
 Cohesion: 0.43
 Nodes (5): adaptiveGrid, gapVBox, cellMin(), rowHeights(), visible()
 
-### Community 163 - "vaultfs_test.go"
-Cohesion: 0.20
-Nodes (14): IsBinaryContent(), IsOctalMode(), ParseMode(), inodeOf(), mustRead(), mustWrite(), openRootT(), TestIsBinaryContent() (+6 more)
+### Community 163 - ".decryptFileWithProgress"
+Cohesion: 0.21
+Nodes (5): migrationTarget, writeTempWithMetadata(), classifyMigrationTarget(), readClassifiedFile(), stampCopyMetadata()
 
 ### Community 165 - "desktop_test.go"
 Cohesion: 0.06
@@ -863,9 +863,13 @@ Nodes (12): invokingIDs(), TestWriteUserFileRefusesSymlinks(), writeUserFile(), 
 Cohesion: 0.29
 Nodes (5): TestProgressReader(), bottomBar, newBottomBar(), renderBar(), WithBottomBar()
 
-### Community 170 - ".decryptFileWithProgress"
-Cohesion: 0.21
-Nodes (5): migrationTarget, writeTempWithMetadata(), classifyMigrationTarget(), readClassifiedFile(), stampCopyMetadata()
+### Community 170 - "NewDumpHook"
+Cohesion: 0.24
+Nodes (10): applyVerbosity(), VerboseLevel, NewDumpHook(), TestDefaultVerboseMirrorsCurrentDisplay(), TestDumpHookFileIsSynced(), TestDumpHookFiltersByVerbosity(), TestDumpHookFormat(), TestVerboseToLogrus() (+2 more)
+
+### Community 171 - "wm.go"
+Cohesion: 0.29
+Nodes (8): detectWM(), reachable(), Detect(), Session, hyprlandSocket(), i3RuntimeSocket(), socketOwnedBy(), Kind
 
 ### Community 172 - "Limitations"
 Cohesion: 0.22
@@ -939,6 +943,10 @@ Nodes (4): Events, Flags, Multicall binaries, network monitor: see what a progra
 Cohesion: 0.42
 Nodes (9): mustRead(), mustWrite(), swappedParent(), TestChmodRefusesSymlinkedParent(), TestCreateEntryRefusesPlantedSymlink(), TestCreateEntryRefusesSymlinkedParent(), TestDeleteRefusesSymlinkedParent(), TestSaveFollowsPinnedVaultNotSwappedAncestor() (+1 more)
 
+### Community 195 - "NewEventFanout"
+Cohesion: 0.24
+Nodes (5): NewEventFanout(), TestEventFanoutDropOldestUnderPressure(), TestEventFanoutDuplicatesInOrderAndCloses(), TestEventFanoutStopClosesOutputs(), EventFanout
+
 ### Community 196 - "edit-protected"
 Cohesion: 0.20
 Nodes (10): edit-protected, Editing the daemon config, Editor keys, Exit audit, Extending a path `daemon.conf` already guards, Non-interactive writes, Offline and live mode, Recording a new path: `config record` (+2 more)
@@ -954,10 +962,6 @@ Nodes (35): applyUpdate(), archAssets(), assetsFor(), channelOf(), checkUpdatePr
 ### Community 200 - "pathCache"
 Cohesion: 0.39
 Nodes (4): evalSymlinksOrEmpty(), newPathCache(), pathCache, pathCacheEntry
-
-### Community 201 - "wm_test.go"
-Cohesion: 0.67
-Nodes (8): envOf(), serve(), shortDir(), TestDetect(), TestHyprlandFloat(), TestHyprlandFloatTimesOutWithoutWindow(), TestI3Float(), uid()
 
 ### Community 202 - "DaemonEvent"
 Cohesion: 0.08
@@ -975,25 +979,21 @@ Nodes (35): TestPickEncryptedDirSingleSkipsPicker(), pickDir(), pickEncryptedDir
 Cohesion: 0.14
 Nodes (14): Actions, Daemon, Desktop GUI, File and folder pickers, Files, Home, Install, Network (+6 more)
 
-### Community 209 - "AddServeFlags"
-Cohesion: 0.36
-Nodes (8): AddHeadlessFlag(), AddServeFlags(), TestParseServeFlagsRequiresCredentials(), init(), init(), init(), init(), init()
+### Community 210 - "wm_test.go"
+Cohesion: 0.67
+Nodes (8): envOf(), serve(), shortDir(), TestDetect(), TestHyprlandFloat(), TestHyprlandFloatTimesOutWithoutWindow(), TestI3Float(), uid()
 
 ### Community 211 - ".eventTypeAllowed"
 Cohesion: 0.29
 Nodes (3): TestEventTypeAllowedConcurrent(), TestSetEventTypesBeforeStartNoRace(), TestSetEventTypesRace()
 
-### Community 213 - "CleanupStalePins"
-Cohesion: 0.33
-Nodes (6): CleanupStalePins(), foreignPinnedLink(), genOfPinFile(), TestCleanupStalePins(), TestCleanupStalePinsMissingBase(), TestGenOfPinFile()
+### Community 213 - "AddServeFlags"
+Cohesion: 0.36
+Nodes (8): AddHeadlessFlag(), AddServeFlags(), TestParseServeFlagsRequiresCredentials(), init(), init(), init(), init(), init()
 
 ### Community 214 - "vouchedDevs"
 Cohesion: 0.33
 Nodes (6): isFuseType(), parseMajorMinor(), TestParseMajorMinorMatchesStatEncoding(), TestVouchedDevs(), TestVouchedDevsFailsClosed(), vouchedDevs()
-
-### Community 216 - "LibraryClosure"
-Cohesion: 0.07
-Nodes (29): ldConfParser, defaultLibDirs(), elfInterp(), fileExists(), hostView(), isScript(), ldConfInclude(), ldSoConfDirs() (+21 more)
 
 ### Community 217 - "KernelDev"
 Cohesion: 0.10
@@ -1003,9 +1003,9 @@ Nodes (28): fdStat, BinaryStat, physicalParent(), statFD(), binaryStatOf(), bina
 Cohesion: 0.29
 Nodes (8): journalTo(), tempBinary(), tempGrantSetup(), TestGrantTemporaryAccessJournalsBeforeApplyAndClearsAfterRevoke(), TestGrantTemporaryAccessRefusals(), TestGrantTemporaryAccessRevokesOnInPlaceRewrite(), TestGrantTemporaryAccessRollsBackOnApplyFailure(), tempTrace
 
-### Community 219 - "NewEventFanout"
-Cohesion: 0.24
-Nodes (5): NewEventFanout(), TestEventFanoutDropOldestUnderPressure(), TestEventFanoutDuplicatesInOrderAndCloses(), TestEventFanoutStopClosesOutputs(), EventFanout
+### Community 219 - "CleanupStalePins"
+Cohesion: 0.33
+Nodes (6): CleanupStalePins(), foreignPinnedLink(), genOfPinFile(), TestCleanupStalePins(), TestCleanupStalePinsMissingBase(), TestGenOfPinFile()
 
 ### Community 220 - "entryOf"
 Cohesion: 0.40
@@ -1070,6 +1070,6 @@ _Questions this graph is uniquely positioned to answer:_
 - **Should `testing.T` be split into smaller, more focused modules?**
   _Cohesion score 0.01986214402321785 - nodes in this community are weakly interconnected._
 - **Why does `edit-protected` connect `edit-protected` to `README.md`?**
-  _High betweenness centrality (0.024) - this node is a cross-community bridge._
+  _High betweenness centrality (0.023) - this node is a cross-community bridge._
 - **Should `IntegrationSuite` be split into smaller, more focused modules?**
   _Cohesion score 0.08957708957708958 - nodes in this community are weakly interconnected._
