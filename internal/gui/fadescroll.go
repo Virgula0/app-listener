@@ -18,9 +18,11 @@ const (
 	fadeIn   = 120 * time.Millisecond
 	fadeHold = 900 * time.Millisecond
 	fadeOut  = 450 * time.Millisecond
-	// A glide eases wheel steps and page taps (fyne applies a notch as one 25px jump): each frame
-	// closes 1-e^(-dt/glideTau) of the gap, ~95% in 3 tau.
-	glideTau     = 40 * time.Millisecond
+	// A glide eases wheel steps and page taps: each frame closes 1-e^(-dt/glideTau) of the gap,
+	// ~95% in 3 tau. Time-based, so the speed is the same at any refresh rate.
+	glideTau = 32 * time.Millisecond
+	// wheelGain scales fyne's wheel delta (25px a notch, touchpads alike).
+	wheelGain    = float32(1.6)
 	barStrip     = float32(12) // hit area along the edge
 	barThin      = float32(5)
 	barThick     = float32(8) // hovered or dragged
@@ -84,7 +86,7 @@ func (s *fadeScroll) MinSize() fyne.Size {
 }
 
 func (s *fadeScroll) Scrolled(e *fyne.ScrollEvent) {
-	dx, dy := e.Scrolled.DX, e.Scrolled.DY
+	dx, dy := e.Scrolled.DX*wheelGain, e.Scrolled.DY*wheelGain
 	if !s.both {
 		if dy == 0 {
 			dy = dx

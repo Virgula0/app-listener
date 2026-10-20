@@ -61,8 +61,8 @@ func TestFadeScrollBothDirections(t *testing.T) {
 	s := newTestFadeScroll(t, fyne.NewSize(500, 400), true)
 	s.Scrolled(&fyne.ScrollEvent{Scrolled: fyne.NewDelta(-120, -40)})
 	settle(t, s)
-	if s.offset != fyne.NewPos(120, 40) {
-		t.Fatalf("offset %v, want (120,40)", s.offset)
+	if want := fyne.NewPos(120*wheelGain, 40*wheelGain); s.offset != want {
+		t.Fatalf("offset %v, want %v", s.offset, want)
 	}
 	if !s.v.Visible() || !s.h.Visible() {
 		t.Fatal("both bars should show when the content overflows both ways")
@@ -108,8 +108,8 @@ func TestFadeScrollWheelStepsFromGlideEnd(t *testing.T) {
 	s.target = fyne.NewPos(0, 100) // mid-glide: the view hasn't got there yet
 	s.Scrolled(&fyne.ScrollEvent{Scrolled: fyne.NewDelta(0, -25)})
 	settle(t, s)
-	if s.offset.Y != 125 || s.target.Y != 125 {
-		t.Fatalf("offset %v target %v, want 125: a step adds to the glide's end, not the view", s.offset, s.target)
+	if want := 100 + 25*wheelGain; s.offset.Y != want || s.target.Y != want {
+		t.Fatalf("offset %v target %v, want %v: a step adds to the glide's end, not the view", s.offset, s.target, want)
 	}
 }
 
