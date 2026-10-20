@@ -136,6 +136,33 @@ func RemoveSSHAgentEnv(u User) ([]string, error) {
 	return applyRC(append(rcTargets(u), sshConfigTarget(u)), u, removeRCBlock)
 }
 
+// RemoveSSHAgentShellEnv is RemoveSSHAgentEnv without ~/.ssh/config: for a guarded ~/.ssh, which
+// the installer can't edit while the daemon guards it (or reach while its vault is locked).
+func RemoveSSHAgentShellEnv(u User) ([]string, error) {
+	return applyRC(rcTargets(u), u, removeRCBlock)
+}
+
+// HasSSHAgentEnv reports whether any of u's shell startup files carries the SSH_AUTH_SOCK block.
+func HasSSHAgentEnv(u User) bool { return hasRCBlock(rcTargets(u), u) }
+
+// HasBunLauncherEnv reports whether any of u's shell startup files carries the Bun launcher block.
+func HasBunLauncherEnv(u User) bool { return hasRCBlock(bunTargets(u, nil), u) }
+
+func hasRCBlock(targets []rcTarget, u User) bool {
+	for _, t := range targets {
+		f, err := openOwnedRegular(t.Path, u.UID)
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(f)
+		_ = f.Close()
+		if err == nil && strings.Contains(string(data), t.Begin) {
+			return true
+		}
+	}
+	return false
+}
+
 // EnsureBunLauncherEnv appends the Bun launcher wrappers to u's shell startup files (login shell's
 // always, others only when present). Idempotent. Returns the files modified.
 func EnsureBunLauncherEnv(u User, launchers []string) ([]string, error) {

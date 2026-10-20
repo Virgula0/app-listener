@@ -54,9 +54,10 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 	return run(Request{DeleteKey: deleteKeyFlag, KeepGUI: keepGUIFlag})
 }
 
-// Request is one uninstall: the --delete-key and --keep-gui choices.
+// Request is one uninstall: the --delete-key and --keep-gui choices. Facultatives runs
+// `uninstall facultatives` instead, which leaves the rest of the install (and the daemon) alone.
 type Request struct {
-	DeleteKey, KeepGUI bool
+	DeleteKey, KeepGUI, Facultatives bool
 }
 
 var runMu sync.Mutex
@@ -76,6 +77,13 @@ func run(req Request) error {
 	if os.Geteuid() != 0 {
 		return errors.New("uninstall must be run as root: sudo app-listener uninstall")
 	}
+	if req.Facultatives {
+		return removeFacultatives()
+	}
+	return uninstallAll(req)
+}
+
+func uninstallAll(req Request) error {
 
 	// The daemon guards the very dirs being decrypted/deleted; refuse while
 	// it lives instead of stopping it — nothing gets re-enabled afterwards.

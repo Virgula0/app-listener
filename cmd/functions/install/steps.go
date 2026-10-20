@@ -320,11 +320,6 @@ func askEncryption(vault *fscrypt.Vault, cfgText string, cfg *daemonconfig.Confi
 	return cfgText, toEncrypt, nil
 }
 
-// isInsidePath reports whether path is a strict sub-path of dir.
-func isInsidePath(path, dir string) bool {
-	return path != dir && strings.HasPrefix(path+"/", dir+"/")
-}
-
 // refreshCatalogConfig reads the installed daemon.conf, re-expands the catalog whitelist for every
 // matched section (inst.RefreshCatalog) and shows a diff for confirmation; unmatched (user-added)
 // sections are kept verbatim. autoConfirm logs the diff and overwrites without prompting. In live

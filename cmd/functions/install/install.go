@@ -37,7 +37,8 @@ Re-run it to resume an interrupted install. A completed install is recorded and
 the wizard then refuses: use the subcommands, 'update', or 'uninstall' first.`,
 	Example: `  sudo app-listener install
   sudo app-listener install binary
-  sudo app-listener install catalog diff`,
+  sudo app-listener install catalog diff
+  sudo app-listener install facultatives`,
 	Args: cobra.NoArgs,
 	RunE: runInstall,
 }
@@ -127,7 +128,7 @@ func init() {
 
 	catalogCmd.AddCommand(catalogRefreshCmd, catalogDiffCmd)
 	backupsCmd.AddCommand(backupsRestoreCmd, backupsDeleteCmd)
-	InstallCmd.AddCommand(binaryCmd, catalogCmd, backupsCmd)
+	InstallCmd.AddCommand(binaryCmd, catalogCmd, backupsCmd, facultativesCmd)
 }
 
 func asRoot(run func() error) error {

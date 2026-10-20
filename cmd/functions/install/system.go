@@ -137,7 +137,7 @@ func askSSHAgentUsers(cfg *daemonconfig.Config) ([]inst.User, error) {
 	if err != nil {
 		return nil, err
 	}
-	covered := configPaths(cfg)
+	covered := inst.CoveredPaths(cfg)
 	var accepted []inst.User
 	for i := range users {
 		u := users[i]
@@ -145,10 +145,10 @@ func askSSHAgentUsers(cfg *daemonconfig.Config) ([]inst.User, error) {
 			continue
 		}
 		sshDir := filepath.Join(u.Home, ".ssh")
-		if !pathCovered(sshDir, covered) {
+		if !inst.PathCovered(sshDir, covered) {
 			continue
 		}
-		unitPath := filepath.Join(u.Home, ".config", "systemd", "user", "ssh-agent.service")
+		unitPath := inst.SSHAgentUnitPath(u.Home)
 		if cur, rerr := os.ReadFile(unitPath); rerr == nil && bytes.Equal(cur, sample) {
 			log.Infof("ssh-agent unit for %s already installed — keeping it", u.Name)
 			accepted = append(accepted, u)
@@ -203,7 +203,7 @@ func installSSHAgent(u inst.User) error {
 		log.Debugf("skipping ssh-agent unit for root (no interactive user session)")
 		return nil
 	}
-	unitPath := filepath.Join(u.Home, ".config", "systemd", "user", "ssh-agent.service")
+	unitPath := inst.SSHAgentUnitPath(u.Home)
 	data, err := inst.SampleContent("ssh-agent.service")
 	if err != nil {
 		return err

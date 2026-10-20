@@ -98,7 +98,7 @@ func detectSSHAgentUnits() ([]userSSHAgentUnit, error) {
 		if u.UID == 0 {
 			continue
 		}
-		path := filepath.Join(u.Home, ".config", "systemd", "user", "ssh-agent.service")
+		path := inst.SSHAgentUnitPath(u.Home)
 		if isInstallerSSHAgentUnit(sample, path) {
 			units = append(units, userSSHAgentUnit{User: *u, Path: path})
 		}
@@ -152,7 +152,7 @@ func revertSSHAgents() error {
 	}
 	for i := range users {
 		if removing[users[i].Name] || stale[users[i].Name] {
-			if err := removeSSHAgentEnv(users[i]); err != nil {
+			if err := removeSSHAgentEnv(users[i], false); err != nil {
 				return err
 			}
 		}
@@ -174,13 +174,20 @@ func revertBunLaunchers() error {
 		return err
 	}
 	for i := range users {
-		files, rmErr := inst.RemoveBunLauncherEnv(users[i])
-		for _, f := range files {
-			log.Infof("removed Bun launcher wrapper from %s", f)
+		if err := removeBunLauncherEnv(users[i]); err != nil {
+			return err
 		}
-		if rmErr != nil {
-			return fmt.Errorf("reverting Bun launchers for %s: %w", users[i].Name, rmErr)
-		}
+	}
+	return nil
+}
+
+func removeBunLauncherEnv(u inst.User) error {
+	files, err := inst.RemoveBunLauncherEnv(u)
+	for _, f := range files {
+		log.Infof("removed Bun launcher wrapper from %s", f)
+	}
+	if err != nil {
+		return fmt.Errorf("reverting Bun launchers for %s: %w", u.Name, err)
 	}
 	return nil
 }
@@ -195,7 +202,7 @@ func staleRCUsers(users []inst.User, removing map[string]bool) map[string]bool {
 		if u.UID == 0 || removing[u.Name] {
 			continue
 		}
-		unit := filepath.Join(u.Home, ".config", "systemd", "user", "ssh-agent.service")
+		unit := inst.SSHAgentUnitPath(u.Home)
 		if _, err := os.Lstat(unit); os.IsNotExist(err) {
 			stale[u.Name] = true
 		}
@@ -203,9 +210,14 @@ func staleRCUsers(users []inst.User, removing map[string]bool) map[string]bool {
 	return stale
 }
 
-// removeSSHAgentEnv strips the installer's SSH_AUTH_SOCK block from u's shell startup files.
-func removeSSHAgentEnv(u inst.User) error {
-	files, err := inst.RemoveSSHAgentEnv(u)
+// removeSSHAgentEnv strips the installer's SSH_AUTH_SOCK block from u's shell startup files and,
+// unless keepSSHConfig (a guarded ~/.ssh), its AddKeysToAgent block from ~/.ssh/config.
+func removeSSHAgentEnv(u inst.User, keepSSHConfig bool) error {
+	remove := inst.RemoveSSHAgentEnv
+	if keepSSHConfig {
+		remove = inst.RemoveSSHAgentShellEnv
+	}
+	files, err := remove(u)
 	for _, f := range files {
 		log.Infof("removed SSH_AUTH_SOCK block from %s", f)
 	}

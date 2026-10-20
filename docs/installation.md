@@ -126,6 +126,34 @@ Ordinary temp files that the app's subprocesses write there are unaffected (only
 is gated). This only works for interactive shells: a Bun app launched from a desktop menu still
 uses `/tmp`. `uninstall` removes the wrappers.
 
+### Facultatives
+
+The SSH agent and the Bun redirect above are the wizard's facultatives: optional per-user setup,
+not needed for protection. `install facultatives` installs them without the wizard:
+
+```bash
+sudo app-listener install facultatives
+sudo app-listener uninstall facultatives
+```
+
+It lists, in one multi-select, the SSH agent setup for every non-root user and the Bun redirect for
+every user with a Bun app configured or present in the home, whether or not `daemon.conf` guards
+`~/.ssh` or the app. Already installed ones are marked. Only the picked ones are installed; nothing
+else changes, and it works on a completed installation, with the daemon running or not:
+
+- **SSH agent**: the per-user unit and the `SSH_AUTH_SOCK` block, as in the wizard. When
+  `daemon.conf` guards `~/.ssh`, its `config` is left alone (the daemon denies the edit, and a
+  stopped daemon leaves the vault locked): add `AddKeysToAgent yes` with
+  [edit-protected](edit-protected.md). Otherwise `AddKeysToAgent yes` is added too.
+- **Bun redirect**: the private dir and the launcher wrappers. The daemon reserves the dir only when
+  it loads its trust set, so for a Bun app it guards, a running daemon is reloaded (`systemctl
+  reload`, not a restart).
+
+`uninstall facultatives` is the inverse: it lists the installed facultatives (an ssh-agent unit
+matching the bundled one or an `SSH_AUTH_SOCK` block, the Bun wrappers) and removes the picked ones.
+A guarded `~/.ssh/config` keeps its `AddKeysToAgent` block, the Bun dir stays (as with `uninstall`),
+and an ssh-agent already running keeps running until logout. It also works with the daemon running.
+
 ### fscrypt prerequisites
 
 Each filesystem must be initialized for fscrypt (`fscrypt setup --all-users`) and support
@@ -144,6 +172,7 @@ it aborts. Every command it may run is listed in `internal/fscrypt/prereq.go`.
 | `install catalog refresh -y, --yes` | Writes without the confirmation prompt (scripts). |
 | `install binary` | Moves the freshly built binary to the install path and recreates the PATH symlink. No wizard, config or fscrypt. If the daemon service is installed, diffs its unit against the one the new build ships (replaced only if you accept, as with [`update`](#update)) and asks whether to restart it now; a skipped restart applies the accepted unit on the next one. |
 | `install backups restore` | Undoes the fscrypt migration: lists the `.app_listener.backup` directories, and after a confirmation naming each one deletes the encrypted copies and moves the backups back. Refused while the daemon runs. |
+| `install facultatives` | Installs the optional per-user setup you pick (SSH agent, Bun redirect), for every user and whether or not `daemon.conf` guards it. No wizard; the daemon keeps running. See [Facultatives](#facultatives). |
 | `install backups delete` | Deletes the `.app_listener.backup` directories (listed, then a confirmation naming each one). Works with the daemon running: the backups sit outside every guarded tree. |
 
 `install catalog refresh` refreshes the whitelists of existing sections; `install catalog diff` adds new
@@ -207,6 +236,8 @@ sudo app-listener uninstall --keep-gui
 
 The desktop window runs the same uninstall from its Install workspace (see
 [Desktop GUI](gui.md#uninstall)).
+- `uninstall facultatives` removes only the optional per-user setup you pick, and works with the
+  daemon running (see [Facultatives](#facultatives)).
 - At the end, lists any `.app_listener.backup` migration copies and offers to delete them (all
   preselected, one confirmation). They are plain unencrypted copies and harmless to keep.
 

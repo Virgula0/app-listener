@@ -84,11 +84,16 @@ func askBunTmpdirUsers(cfg *daemonconfig.Config) ([]bunUser, error) {
 
 // bunLaunchersFor returns the launcher command names of every Bun catalog app configured for u.
 func bunLaunchersFor(cfg *daemonconfig.Config, u inst.User) []string {
+	return bunLaunchers(func(e *inst.CandidateDir) bool { return bunEntryConfigured(cfg, e, u) })
+}
+
+// bunLaunchers returns the sorted launcher command names of every Bun catalog app want accepts.
+func bunLaunchers(want func(*inst.CandidateDir) bool) []string {
 	seen := map[string]bool{}
 	var out []string
 	for i := range inst.Catalog {
 		e := &inst.Catalog[i]
-		if !e.IsBun() || !bunEntryConfigured(cfg, e, u) {
+		if !e.IsBun() || !want(e) {
 			continue
 		}
 		for _, l := range e.BunLaunchers {

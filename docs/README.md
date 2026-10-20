@@ -51,8 +51,10 @@ app-listener
 │   ├── catalog refresh [--live]        re-expand the catalog whitelists
 │   ├── catalog diff                    guard new catalog directories
 │   ├── backups restore                 undo the encryption
-│   └── backups delete
+│   ├── backups delete
+│   └── facultatives                    install optional per-user setup
 ├── uninstall
+│   └── facultatives                    remove optional per-user setup
 └── update [--channel C]
 ```
 

@@ -87,6 +87,10 @@ var installActions = []installAction{
 	{InstallDeleteBackups, "trash", theme.ColorNameError, "Delete backups", "install backups delete",
 		"Permanently delete the .app_listener.backup copies the migration kept. Works with the daemon running; " +
 			"asks before deleting.", false},
+	{InstallFacultatives, "plugs-connected", theme.ColorNamePrimary, "Install facultatives",
+		"install facultatives", "Pick the optional per-user setup to install: the ssh-agent unit, the Bun " +
+			"$TMPDIR redirect. Offered for every user, whether or not daemon.conf guards what it serves. " +
+			"The daemon keeps running.", false},
 }
 
 // installPage is the Install workspace: the headless build the daemon will run, the installer's
@@ -169,6 +173,7 @@ func (p *installPage) view() fyne.CanvasObject {
 		p.actionGrid(),
 		sectionTitle("UNINSTALL"),
 		p.uninstallCard(),
+		p.facultativesCard(),
 	)))
 	root := p.mount(over, "Back to Install")
 	p.renderBinary()
