@@ -263,7 +263,8 @@ func hfill(grow fyne.CanvasObject, rest ...fyne.CanvasObject) *fyne.Container {
 	return container.NewBorder(nil, nil, nil, container.NewHBox(rest...), grow)
 }
 
-// handButton is a widget.Button that shows the pointing-hand cursor (fyne's Button keeps the arrow).
+// handButton is a widget.Button that shows the pointing-hand cursor while enabled (fyne's Button
+// keeps the arrow).
 type handButton struct {
 	widget.Button
 }
@@ -277,4 +278,4 @@ func newButton(label string, ic fyne.Resource, tapped func()) *handButton {
 
 func newTextButton(label string, tapped func()) *handButton { return newButton(label, nil, tapped) }
 
-func (b *handButton) Cursor() desktop.Cursor { return desktop.PointerCursor }
+func (b *handButton) Cursor() desktop.Cursor { return handCursor(b.Disabled()) }

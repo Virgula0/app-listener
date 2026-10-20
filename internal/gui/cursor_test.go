@@ -100,3 +100,21 @@ func TestChoiceWidgetsPointingHand(t *testing.T) {
 		}
 	}
 }
+
+func TestHandControlsShowArrowWhenDisabled(t *testing.T) {
+	test.NewTempApp(t)
+	controls := []interface {
+		desktop.Cursorable
+		fyne.Disableable
+	}{newButton("x", nil, nil), newCheck("x", nil), newRadioGroup([]string{"a"}, nil),
+		newCheckGroup([]string{"a"}, nil), newSelect([]string{"a"}, nil)}
+	for _, c := range controls {
+		if c.Cursor() != desktop.PointerCursor {
+			t.Errorf("%T enabled: want the pointer", c)
+		}
+		c.Disable()
+		if c.Cursor() != desktop.DefaultCursor {
+			t.Errorf("%T disabled: want the arrow", c)
+		}
+	}
+}
