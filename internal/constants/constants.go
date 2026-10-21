@@ -41,4 +41,4 @@ const (
 // Version is set at release via -ldflags "-X .../constants.Version=pre-<date>-<sha>" (a var so
 // ldflags can inject). Local builds keep "dev", which the updater treats as older than any
 // pre-release.
-var Version = "v0.3.0"
+var Version = "v0.4.0"
