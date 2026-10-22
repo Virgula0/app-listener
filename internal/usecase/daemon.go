@@ -72,6 +72,10 @@ type DaemonUseCase interface {
 	// ResyncBinaries re-syncs every guard's whitelist now, admitting replaced or new system
 	// binaries (the catalog watch saw a package install).
 	ResyncBinaries()
+	// WithRuntimeAccess runs fn while the read-only lib_dir resourcePath admits the app-listener
+	// binary's (uid 0) runtime writes (GuardRepository.WithSelfRuntimeAccess). Refused while a live
+	// edit grant is active; reloads, grants and shutdown wait for fn.
+	WithRuntimeAccess(resourcePath string, fn func() error) error
 }
 
 type daemonUseCase struct {
@@ -916,6 +920,25 @@ func (d *daemonUseCase) GrantEditAccess(resourcePath string) (func() error, erro
 		return rerr
 	}
 	return revoke, nil
+}
+
+func (d *daemonUseCase) WithRuntimeAccess(resourcePath string, fn func() error) error {
+	// The read lock pins d.guards for fn: a reload stopping the guard mid-write would land the
+	// writes in a released slot.
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.stopping {
+		return errors.New("daemon: shutdown in progress")
+	}
+	if d.editGrantActive {
+		return errors.New("a live edit session holds the grant")
+	}
+	for i := range d.resources {
+		if d.resources[i].Path == resourcePath && d.resources[i].ReadOnly {
+			return d.guards[i].WithSelfRuntimeAccess(fn)
+		}
+	}
+	return fmt.Errorf("%s is not a lib_dir in the running configuration", resourcePath)
 }
 
 func (d *daemonUseCase) ResyncBinaries() {

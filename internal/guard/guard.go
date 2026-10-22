@@ -961,6 +961,23 @@ var vaultAccessEvents = []ebpf.EventType{
 // or widens, a live-edit grant. Whitelist/read-only mode only; returns fn's error, or an error if
 // no self binary is registered.
 func (g *Guard) WithSelfVaultAccess(fn func() error) error {
+	return g.withSelfMask(vaultAccessEvents, "vault", false, fn)
+}
+
+// runtimeAccessEvents lets the daemon unpack and re-pin a runtime it maintains in a read-only
+// lib_dir (internal/steamrt): editGrantEvents plus the symlinks and hard links an archive holds.
+var runtimeAccessEvents = append(append([]ebpf.EventType(nil), editGrantEvents...),
+	ebpf.EventSymlink, ebpf.EventHardlink)
+
+// WithSelfRuntimeAccess is WithSelfVaultAccess with runtimeAccessEvents. Refused while a live edit
+// grant holds the mask: restoring the baseline afterwards would end that session's access.
+func (g *Guard) WithSelfRuntimeAccess(fn func() error) error {
+	return g.withSelfMask(runtimeAccessEvents, "runtime", true, fn)
+}
+
+// withSelfMask widens the self mask to events for fn. exclusive refuses while a live edit grant
+// holds it; the vault's lock must never wait on one.
+func (g *Guard) withSelfMask(events []ebpf.EventType, what string, exclusive bool, fn func() error) error {
 	g.selfGrantMu.Lock()
 	defer g.selfGrantMu.Unlock()
 
@@ -969,15 +986,18 @@ func (g *Guard) WithSelfVaultAccess(fn func() error) error {
 	base := append([]ebpf.EventType(nil), g.selfEvents...)
 	g.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("guard %s: no self binary registered — cannot grant vault access", g.path)
+		return fmt.Errorf("guard %s: no self binary registered — cannot grant %s access", g.path, what)
+	}
+	if exclusive && g.selfGranted {
+		return fmt.Errorf("guard %s: a live edit grant is active — %s access must wait", g.path, what)
 	}
 
-	mask, err := eventMask(vaultAccessEvents)
+	mask, err := eventMask(events)
 	if err != nil {
 		return err
 	}
 	if err := g.objs().GuardExeEvents.Put(g.resKey(key), mask); err != nil {
-		return fmt.Errorf("guard %s: widening self vault mask: %w", g.path, err)
+		return fmt.Errorf("guard %s: widening self %s mask: %w", g.path, what, err)
 	}
 	defer func() {
 		var restoreErr error
@@ -991,7 +1011,7 @@ func (g *Guard) WithSelfVaultAccess(fn func() error) error {
 			restoreErr = perr
 		}
 		if restoreErr != nil {
-			log.Errorf("guard %s: restoring self baseline mask after vault access: %v — self access may be left WIDENED until the next restart", g.path, restoreErr)
+			log.Errorf("guard %s: restoring self baseline mask after %s access: %v — self access may be left WIDENED until the next restart", g.path, what, restoreErr)
 		}
 	}()
 
@@ -1279,6 +1299,22 @@ func (g *Guard) ReSyncBinaries() (int, error) { return g.reSyncBinaries(false) }
 // confined open resolved, moments ago, to the key this guard deploys is skipped (sweepShared).
 // Deferred rules, links and system matches are still re-checked fresh.
 func (g *Guard) SweepReSyncBinaries() (int, error) { return g.reSyncBinaries(true) }
+
+// resyncLive is ReSyncBinaries for a caller outside the daemon's guard lifecycle (the prune):
+// policyMu keeps Stop from releasing the slot mid-write, and a stopped guard is skipped.
+func (g *Guard) resyncLive() {
+	g.policyMu.Lock()
+	defer g.policyMu.Unlock()
+	g.mu.Lock()
+	stopped := g.stopped
+	g.mu.Unlock()
+	if stopped {
+		return
+	}
+	if _, err := g.ReSyncBinaries(); err != nil {
+		log.Warnf("guard %s: re-sync before forgetting freed binaries: %v", g.path, err)
+	}
+}
 
 func (g *Guard) reSyncBinaries(shared bool) (int, error) {
 	// Retry deferred rules first; addBinaryActions records newly resolved binaries in deployed, so the pass below skips them.

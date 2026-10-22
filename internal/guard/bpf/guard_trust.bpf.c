@@ -11,7 +11,7 @@
 //   #2 library load allowlist: a whitelisted process may map executable code only from a library a non-whitelisted process couldn't have written. A library qualifies if it is:
 //     - an explicit TRUSTED_LIB (allow_lib), or
 //     - a root-owned file in a root-only-writable directory on a superblock root mounted without nosuid in pid 1's mount namespace (system libs under /usr/lib, /opt; auto-trusted, survives package updates; see guard_vouched_devs), or
-//     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
+//     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. An exe a writer created and the daemon has not admitted yet loads it as its creator (trust_creator_libdir). This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
 //     - a #3 reserved name below its root, mapped by one of that name's writers (glob_lib_trusted).
 //   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused. A process that
 //   mapped such code before its exe was whitelisted is refused the secrets (trust_code_suspect), and
@@ -528,6 +528,27 @@ static __always_inline int mount_vouches_ownership(struct inode *inode)
 	return !died || *died <= *synced;
 }
 
+// trust_creator_libdir: the current exe is not whitelisted (yet), and its inode was created by an
+// updater holding one of a lib_dir's bits (users) and never written by another exe since
+// (guard_bin_origin). A self-updating app (Steam) execs its new binary before the daemon re-admits
+// it; its libraries must not mark the process code-suspect for life. Sound because every byte that
+// process runs is the creator's choice: the creator could have built that lib_dir's code into the
+// binary itself. Global: verified once (1M-insn budget).
+__noinline int trust_creator_libdir(__u64 users)
+{
+	if (current_exe_flags() & TRUSTED_BINARY)
+		return 0; // a whitelisted exe loads only what its own bits allow
+	struct inode_key ek = {};
+	if (!current_exe_key(&ek) || inode_on_user_mountable_fs(current_exe_inode()))
+		return 0;
+	struct bin_origin *o = bpf_map_lookup_elem(&guard_bin_origin, &ek);
+	if (!o || o->tainted)
+		return 0;
+	struct inode_key ck = o->exe;
+	__u64 *bits = bpf_map_lookup_elem(&guard_libdir_users, &ck);
+	return bits && (*bits & users);
+}
+
 // under_guarded_tree: the innermost guarded root at or above the file (guard_trusted_dirs) admits
 // the current exe. Each ancestor is keyed by its own inode_dev: a btrfs subvolume nested in the
 // tree has another key device than the root above it.
@@ -549,11 +570,14 @@ static __always_inline int under_guarded_tree(struct inode *inode, struct dentry
 			if (users) {
 				if (*users & TRUSTED_DIR_ANY)
 					return 1;
+				__u64 u = *users;
 				struct inode_key ek = {};
 				if (!current_exe_key(&ek))
 					return 0;
 				__u64 *bits = bpf_map_lookup_elem(&guard_libdir_users, &ek);
-				return bits && (*bits & *users);
+				if (bits && (*bits & u))
+					return 1;
+				return trust_creator_libdir(u);
 			}
 		}
 		struct dentry *parent;
@@ -1627,6 +1651,8 @@ int trust_inode_free(unsigned long long *ctx)
 	bpf_probe_read_kernel(&nlink, sizeof(nlink), &inode->i_nlink);
 	if (nlink != 0 || !fill_inode_key(inode, &k))
 		return 0;
+	// A reused number must not inherit provenance: mknod(S_IFREG) creates without FMODE_CREATED.
+	bpf_map_delete_elem(&guard_bin_origin, &k);
 	exe_note_freed(&k, bpf_map_lookup_elem(&guard_trusted_files, &k) != NULL);
 	return 0;
 }

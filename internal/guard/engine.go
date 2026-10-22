@@ -941,17 +941,32 @@ func (e *engine) forgetExe(exe GuardInodeKey) error {
 	if err == nil {
 		err = deleteInoKeys(e.objs.GuardExeEvents, exe)
 	}
+	guards := e.guardsLocked()
+	e.mu.Unlock()
+	for _, g := range guards {
+		g.forgetExe(exe)
+	}
+	return err
+}
+
+func (e *engine) guardsLocked() []*Guard {
 	var guards []*Guard
 	for _, g := range &e.slots {
 		if g != nil {
 			guards = append(guards, g)
 		}
 	}
+	return guards
+}
+
+// resyncGuards re-syncs every live guard (Guard.resyncLive).
+func (e *engine) resyncGuards() {
+	e.mu.Lock()
+	guards := e.guardsLocked()
 	e.mu.Unlock()
 	for _, g := range guards {
-		g.forgetExe(exe)
+		g.resyncLive()
 	}
-	return err
 }
 
 // forgetResource drops res from the cross-resource views when its guard goes away.

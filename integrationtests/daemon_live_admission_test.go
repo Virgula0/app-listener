@@ -231,6 +231,138 @@ rename("/tmp/apps/app.new", "/tmp/apps/app") or die "rename $!\n"; print "UPDATE
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// A self-updating app frees its old inode, the creator of the replacement, as soon as it restarts
+// (Steam). One guard re-syncs on a denial while the creator's updater row lives; a sibling that
+// only re-syncs after the prune drops that row must still admit the replacement: the prune re-syncs
+// every guard first. The app sits in a user-owned dir, so only updater provenance can admit it.
+//
+// The update starts right after a sweep tick (a probe only the sweep re-admits): the sweep pulse
+// starts after the prune ticker, so the update's prune lands before the sibling's next sweep.
+func (s *IntegrationSuite) TestDaemon_LiveAdmission_SiblingJudgesAfterCreatorPrune() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.copySwapFixtures(c)
+
+	const (
+		marker = "TOP-SECRET-CREATOR-PRUNE-5A27"
+		app    = "/opt/uapp/app"
+		probe  = "/usr/local/bin/probe"
+	)
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /opt/uapp && chown 65534:65534 /opt/uapp" +
+		" && for r in r0 r1 r2; do mkdir -p /$r && printf '" + marker + "' > /$r/secret; done && cp " +
+		swapReaderPath + " " + probe + " && " + nobodyRun + "cp /usr/bin/perl " + app + " && echo READY"})
+	s.Require().Truef(code == 0 && strings.Contains(out, "READY"), "setup: %s", out)
+	s.startDaemon(c, "[watch /r0]\nneed_encryption: false\n"+probe+"\n\n[watch /r1]\nneed_encryption: false\n"+app+
+		"\n\n[watch /r2]\nneed_encryption: false\n"+app)
+
+	read := func(res string) string {
+		_, out := s.exec(c, []string{"sh", "-c", nobodyRun + app + fmt.Sprintf(
+			` -e 'open(F, "<", "/%s/secret") or die "DENIED $!\n"; print "STOLEN|", <F>' 2>&1`, res)})
+		return out
+	}
+	for _, res := range []string{"r1", "r2"} {
+		s.Require().Containsf(read(res), "STOLEN|"+marker, "baseline /%s", res)
+	}
+
+	// The probe's old inode stays open (never freed: no prune re-sync) and unlink + link() leaves the
+	// catalog watch nothing to trigger on, so only a sweep re-admits the new one.
+	s.exec(c, []string{"sh", "-c", "nohup sh -c 'exec 3<" + probe + "; sleep 600' >/dev/null 2>&1 &"})
+	code, out = s.exec(c, []string{"sh", "-c", "cp " + swapReaderPath + " /usr/local/bin/.probe.new && " +
+		"printf x >> /usr/local/bin/.probe.new && " +
+		`perl -e 'unlink "` + probe + `"; link "/usr/local/bin/.probe.new", "` + probe + `" or die "link: $!\n"' && ` +
+		"rm /usr/local/bin/.probe.new 2>&1"})
+	s.Require().Equalf(0, code, "the probe swap: %s", out)
+	s.Require().Truef(s.awaitLogCount(c, "guard /r0: re-synced 1 binary inode(s)", 1, staleRootSweepPollTimeout),
+		"no sweep tick seen; daemon log:\n%s", s.readDaemonLog(c))
+
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + ` -e '
+open(I, "<", "/usr/bin/perl") or die "read $!\n"; binmode I;
+open(O, ">", "/opt/uapp/app.new") or die "create $!\n"; binmode O;
+{ local $/; print O <I>; } close O or die "close $!\n";
+chmod 0755, "/opt/uapp/app.new" or die "chmod $!\n";
+rename("/opt/uapp/app.new", "/opt/uapp/app") or die "rename $!\n"; print "UPDATED\n"' 2>&1`})
+	s.Require().Containsf(out, "UPDATED", "the app must update itself: %s", out)
+
+	// A denial re-syncs /r1 alone, while the creator's updater row lives. Repeated: the sweep tick
+	// just seen restarted every guard's resyncMinInterval throttle.
+	s.Require().Eventuallyf(func() bool {
+		s.exec(c, []string{"sh", "-c", "cat /r1/secret >/dev/null 2>&1; true"})
+		return strings.Contains(s.readDaemonLog(c), "guard /r1: re-synced 1 binary inode(s)")
+	}, 10*time.Second, time.Second, "/r1 did not re-admit the update before the prune; daemon log:\n%s",
+		s.readDaemonLog(c))
+	s.Require().NotContains(s.readDaemonLog(c), "guard /r2: re-synced",
+		"fixture: /r2 must not have judged the replacement before the prune")
+
+	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 40*time.Second),
+		"the creator was never pruned; daemon log:\n%s", s.readDaemonLog(c))
+	daemonLog := s.readDaemonLog(c)
+	before := strings.Index(daemonLog, "re-syncing every guard before forgetting")
+	judged := strings.Index(daemonLog, "guard /r2: re-synced 1 binary inode(s)")
+	forgot := strings.Index(daemonLog, "forgot freed binary inode")
+	s.Require().Truef(before >= 0 && before < judged && judged < forgot,
+		"/r2 must be judged by the prune's re-sync, before the creator's rows go; daemon log:\n%s", daemonLog)
+	s.Require().Containsf(read("r2"), "STOLEN|"+marker, "/r2 lost its app; daemon log:\n%s", s.readDaemonLog(c))
+	s.Require().NotContains(s.readDaemonLog(c), "not re-admitted", "no guard may refuse the updater's inode")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'sleep 600'; pkill -f 'app-listener daemon' || true"})
+}
+
+// updateExecScripts: upd.pl is the app updating itself (rename over its path, as Steam does) and
+// exec'ing the new inode at once, before any re-sync admits it, to run child.pl: dlopen ARGV[0],
+// then read /r/secret until it is admitted.
+const updateExecScripts = `cat > /tmp/upd.pl <<'PL'
+open(I, "<", "/usr/bin/perl") or die "read $!\n"; binmode I;
+open(O, ">", "/opt/uapp/app.new") or die "create $!\n"; binmode O;
+{ local $/; print O <I>; } close O or die "close $!\n";
+chmod 0755, "/opt/uapp/app.new" or die "chmod $!\n";
+rename("/opt/uapp/app.new", "/opt/uapp/app") or die "rename $!\n";
+exec {"/opt/uapp/app"} "/opt/uapp/app", "/tmp/child.pl", $ARGV[0] or die "exec $!\n";
+PL
+cat > /tmp/child.pl <<'PL'
+require DynaLoader;
+DynaLoader::dl_load_file($ARGV[0], 0) or die "dlopen: " . DynaLoader::dl_error() . "\n";
+for (1..30) { if (open(F, "<", "/r/secret")) { print "STOLEN|", <F>, "\n"; exit 0 } sleep 1 }
+print "NEVER $!\n";
+PL
+chmod 644 /tmp/upd.pl /tmp/child.pl`
+
+// A self-updating app (Steam) execs its new binary before the daemon re-admits it, and that process
+// loads its lib_dir's libraries at once. It runs only code the creator chose, so it must not stay
+// code-suspect once admitted. A library from outside the creator's lib_dirs still marks it.
+func (s *IntegrationSuite) TestDaemon_LiveAdmission_UpdatedExecLoadsLibDirBeforeAdmission() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const (
+		marker = "TOP-SECRET-EXEC-BEFORE-ADMIT-3C18"
+		app    = "/opt/uapp/app"
+	)
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /r /opt/uapp /tmp/u && printf '" + marker +
+		"' > /r/secret && chown 65534:65534 /opt/uapp /tmp/u && " + nobodyRun + "sh -c 'cp /usr/bin/perl " + app +
+		" && mkdir /opt/uapp/lib && cp -L /usr/lib/x86_64-linux-gnu/libz.so.1 /opt/uapp/lib/ && " +
+		"cp -L /usr/lib/x86_64-linux-gnu/libz.so.1 /tmp/u/' && " + updateExecScripts + " && echo READY 2>&1"})
+	s.Require().Truef(code == 0 && strings.Contains(out, "READY"), "setup: %s", out)
+	s.startDaemon(c, "[watch /r]\nneed_encryption: false\n"+app+"\nlib_dir /opt/uapp/lib")
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/child.pl /opt/uapp/lib/libz.so.1 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+marker, "baseline: the app loads its lib_dir and reads /r: %s", out)
+
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/upd.pl /opt/uapp/lib/libz.so.1 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+marker, "the updated app, started before its admission, stayed "+
+		"refused after it: %s\ndaemon log:\n%s", out, s.readDaemonLog(c))
+	s.Require().NotContains(s.readDaemonLog(c), "op=PRELOADED", "its lib_dir must not mark it code-suspect")
+
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/upd.pl /tmp/u/libz.so.1 2>&1"})
+	s.Require().Containsf(out, "NEVER", "a library outside the creator's lib_dirs must keep it code-suspect: %s", out)
+	s.Require().Truef(s.awaitLogCount(c, "guard /r: re-synced 1 binary inode(s)", 2, 10*time.Second),
+		"fixture: the second update must have been admitted; daemon log:\n%s", s.readDaemonLog(c))
+	s.Require().Contains(s.readDaemonLog(c), "op=PRELOADED")
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/child.pl /opt/uapp/lib/libz.so.1 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+marker, "control: a fresh start of the admitted update is clean: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 const (
 	relinkMarker = "TOP-SECRET-RELINK-6E2D"
 	relinkLink   = "/tmp/apps/bin/app"
