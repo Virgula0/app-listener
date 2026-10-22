@@ -100,6 +100,18 @@ func isAbsoluteCandidate(bin string) bool {
 		strings.HasPrefix(bin, "%USER%/")
 }
 
+// A runtime the daemon maintains must sit directly in one of its entry's lib_dirs: that guard's
+// writers are whose provenance admits the archive, and its grant covers the writes.
+func TestCatalogRuntimesSitInALibDir(t *testing.T) {
+	for _, c := range Catalog {
+		for _, rt := range c.Runtimes {
+			if !slices.Contains(c.LibDirRelPaths, filepath.Dir(rt)) {
+				t.Errorf("%s: runtime %s is not directly inside one of its LibDirRelPaths", c.Name, rt)
+			}
+		}
+	}
+}
+
 // TestCatalogHasWireGuardSystemEntry verifies the /etc/wireguard entry
 // from the original ssh-guard template config is present at system level.
 func TestCatalogHasWireGuardSystemEntry(t *testing.T) {

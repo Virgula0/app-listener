@@ -57,6 +57,11 @@ type CandidateDir struct {
 	// Steam login credentials in the same entry. Same %HOME%/%USER%/glob expansion as Whitelist;
 	// only regular files survive.
 	LibDirWriters []string
+	// Runtimes are home-relative Steam runtime trees (`<lib_dir>/steam-runtime`, beside the
+	// `.tar.xz` its client downloads) that the daemon unpacks and re-pins itself (internal/steamrt):
+	// steam.sh does it with mkdir/tar/ln, which a read-only lib_dir refuses. The parent must be one
+	// of LibDirRelPaths.
+	Runtimes []string
 	// ReservedLibs are %HOME% library patterns "<dir>/<name>" (name exact, prefix* or *suffix) for
 	// apps that install their own code outside every guarded tree. The name is reserved at any depth
 	// below dir for the entry's whitelisted binaries (guard_trust.bpf.c #3), which may then load such
@@ -508,6 +513,9 @@ var Catalog = []CandidateDir{
 			// The client's update staging: what it downloads here it unpacks into the dirs above.
 			".local/share/Steam/package",
 		},
+		// The scout runtime steam.sh unpacks from ubuntu12_32/steam-runtime.tar.xz after a client
+		// update, then pins (setup.sh): the daemon does both (internal/steamrt).
+		Runtimes: []string{".local/share/Steam/ubuntu12_32/steam-runtime"},
 		// pressure-vessel OWNS the runtime trees above and rewrites them every launch: it hardlinks
 		// the runtime's ~6.6k files into a fresh `var/tmp-XXXXXX`, capsule-capture-libs symlinks
 		// host GPU drivers (libvdpau_nvidia.so, Vulkan layers, libc) into `overrides/lib/*`, and
@@ -655,6 +663,15 @@ func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+// ExpandRuntimes expands Runtimes for user into absolute paths (placeholders resolved, no glob).
+func (c *CandidateDir) ExpandRuntimes(user, home string) []string {
+	out := make([]string, 0, len(c.Runtimes))
+	for _, rel := range c.Runtimes {
+		out = append(out, filepath.Join(home, expandPlaceholders(rel, user, home)))
+	}
 	return out
 }
 

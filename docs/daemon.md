@@ -140,6 +140,46 @@ read its memory or its `/proc/<pid>` metadata. Otherwise any process could read 
 out of the app that loaded it. Programs that must inspect every process (screen-sharing portals)
 are listed under `[inspectors]`, see [Daemon configuration](daemon-config.md#process-inspectors).
 
+## Steam runtime updates
+
+Steam's launcher unpacks its runtime (`ubuntu12_32/steam-runtime.tar.xz`) and runs the runtime's
+`setup.sh` with `mkdir`, `tar` and `ln`. `ubuntu12_32` is a read-only `lib_dir`, and those general
+tools are not its writers (whitelisting them would let any process plant a library there), so the
+first launch after a runtime update fails. The daemon does that job instead, within about 15
+seconds:
+
+- **Unpack.** Only when the trust guard proves Steam's own updater created both
+  `steam-runtime.tar.xz` and its `.checksum` while the daemon ran, and nothing else has written them
+  since. The archive is checked against the checksum, decompressed by `xz` running as `nobody`, and
+  extracted as the Steam user. Paths outside `steam-runtime/`, devices, FIFOs and setuid bits are
+  refused or stripped. The previous tree is kept as `steam-runtime.old`.
+- **Pin.** `setup.sh --force` runs as the Steam user in a private mount namespace, over an overlay
+  whose writable layer is a root-only tmpfs under `/run/app-listener/steamrt`. Its output is
+  committed only if it touches nothing but `pinned_libs_{32,64}` and `libcurl_compat_{32,64}`, and
+  holds only symlinks plus the `done`, `has_pins` and `system_*` records. A copied library or
+  anything else is refused (`refusing setup.sh's output`). The pins are redone when a host library
+  they point at changes; a failed run is retried after 30 minutes.
+
+Writes happen only while the daemon holds a write grant on `ubuntu12_32` for itself, which is
+refused while an `edit-protected` session is active. Start Steam again once the log reads
+`unpacked the Steam runtime update`.
+
+An archive written before the daemon started (Steam updated while the daemon was stopped) has no
+provenance and stays packed: `not proven written by Steam's updater since this daemon started`.
+Unpack it by hand with the daemon stopped:
+
+```bash
+sudo systemctl stop app-listener-daemon
+cd ~/.local/share/Steam/ubuntu12_32
+md5sum -c steam-runtime.tar.xz.checksum
+mv steam-runtime steam-runtime.old && tar -xJf steam-runtime.tar.xz
+cp steam-runtime.tar.xz.checksum steam-runtime/checksum
+./steam-runtime/setup.sh --force
+sudo systemctl start app-listener-daemon
+```
+
+Run the commands between stop and start as the Steam user, not root.
+
 ## Related
 
 - [Daemon configuration](daemon-config.md): the config file.

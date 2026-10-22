@@ -78,15 +78,93 @@ func exeGone(k GuardInodeKey) bool {
 // PruneSuperseded drops every superseded key whose inode is gone, rows first: until the mark goes,
 // a reused number is refused whatever rows it finds. A mark no resource or trusted file names any
 // more goes too.
+//
+// Every guard re-syncs before a freed key's rows go, and a key freed after that re-sync waits for
+// the next prune: a freed updater's guard_bin_updaters row is what proves the replacements it
+// created (updaterCreated), so a guard judging one after the drop would refuse it. A self-updating
+// app (Steam) frees its creator as soon as it restarts.
 func PruneSuperseded() {
 	maps, err := supersedeMaps()
 	if err != nil {
 		return
 	}
+	marks := maps[GuardMapExeSuperseded]
+	freed := freedSuperseded(marks)
+	if len(freed) == 0 {
+		pruneSuperseded(marks, nil)
+		return
+	}
+	log.Infof("guard: re-syncing every guard before forgetting %d freed binary inode(s)", len(freed))
+	sharedEngine.resyncGuards()
+	beforeForget.run()
+	pruneSuperseded(marks, freed)
+}
+
+// forgetHooks are the callbacks run at a prune about to forget freed binaries (OnBeforeForgetFreed).
+type forgetHooks struct {
+	mu  sync.Mutex
+	seq int
+	fns map[int]func()
+}
+
+var beforeForget forgetHooks
+
+// OnBeforeForgetFreed runs fn at every prune about to forget freed binaries, after the guards'
+// re-sync: the last moment a freed updater's rows still prove what it created
+// (TrustGuard.CreatedByUpdater). fn runs on the prune goroutine and delays the prune while it runs.
+func OnBeforeForgetFreed(fn func()) (remove func()) {
+	beforeForget.mu.Lock()
+	defer beforeForget.mu.Unlock()
+	if beforeForget.fns == nil {
+		beforeForget.fns = map[int]func(){}
+	}
+	beforeForget.seq++
+	id := beforeForget.seq
+	beforeForget.fns[id] = fn
+	return func() {
+		beforeForget.mu.Lock()
+		delete(beforeForget.fns, id)
+		beforeForget.mu.Unlock()
+	}
+}
+
+func (h *forgetHooks) run() {
+	h.mu.Lock()
+	fns := make([]func(), 0, len(h.fns))
+	for _, fn := range h.fns {
+		fns = append(fns, fn)
+	}
+	h.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+func freedSuperseded(marks *cilium.Map) map[GuardInodeKey]bool {
+	supersede.mu.Lock()
+	defer supersede.mu.Unlock()
+	freed := map[GuardInodeKey]bool{}
+	var k GuardInodeKey
+	var v GuardExeSupersede
+	it := marks.Iterate()
+	for it.Next(&k, &v) {
+		if v.Freed != 0 {
+			freed[k] = true
+		}
+	}
+	if err := it.Err(); err != nil {
+		log.Warnf("guard: reading superseded binaries: %v", err)
+		return nil
+	}
+	return freed
+}
+
+// pruneSuperseded drops the freed keys in resynced (every guard re-synced after their free) and the
+// unused marks.
+func pruneSuperseded(marks *cilium.Map, resynced map[GuardInodeKey]bool) {
 	supersede.mu.Lock()
 	defer supersede.mu.Unlock()
 
-	marks := maps[GuardMapExeSuperseded]
 	var gone, unused []GuardInodeKey
 	var k GuardInodeKey
 	var v GuardExeSupersede
@@ -94,7 +172,9 @@ func PruneSuperseded() {
 	for it.Next(&k, &v) {
 		switch {
 		case v.Freed != 0:
-			gone = append(gone, k)
+			if resynced[k] {
+				gone = append(gone, k)
+			}
 		case !sharedEngine.admitsExe(k) && (supersede.trust == nil || !supersede.trust.trusts(k)):
 			unused = append(unused, k)
 		}

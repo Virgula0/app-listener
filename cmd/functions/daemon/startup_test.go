@@ -35,6 +35,7 @@ func (f *fakeDaemon) GrantTemporaryAccess([]string, []string, guard.TempRule,
 	func([]guard.GuardResInodeKey) error) (*usecase.TemporaryAccess, error) {
 	return nil, errors.New("unused")
 }
+func (f *fakeDaemon) WithRuntimeAccess(string, func() error) error { return errors.New("unused") }
 
 // TestAwaitStartupOrSignalCompletes: no signal — the started daemon is passed
 // through untouched.

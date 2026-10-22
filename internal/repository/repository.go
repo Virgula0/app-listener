@@ -55,6 +55,10 @@ type GuardRepository interface {
 	// baseline. Only single-file resources need it (directory unlock/lock is pure keyring work).
 	// Distinct from GrantSelfEditAccess, the broader session-scoped grant for interactive edits.
 	WithSelfVaultAccess(fn func() error) error
+	// WithSelfRuntimeAccess widens this read-only lib_dir guard's self-access for the daemon to
+	// unpack and re-pin a runtime it maintains there (internal/steamrt), for fn only. Refused while
+	// a live edit grant holds the self mask.
+	WithSelfRuntimeAccess(fn func() error) error
 	// PlanTemporaryGrant validates an `edit-protected forward` rule against this resource's
 	// rows without writing; the caller journals the grant's allow rows, then Applies it.
 	PlanTemporaryGrant(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error)

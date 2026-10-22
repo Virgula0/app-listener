@@ -23,6 +23,11 @@ A process started before its binary was replaced keeps its access, through a rel
 Re-running the replaced image afterwards (an fd held across the update, `/proc/<pid>/exe`) does
 not, and neither does a file that later reuses the old inode number.
 
+Every resource whitelisting the path judges the new inode, even one whose app hasn't run since. A
+self-updating app such as Steam restarts as soon as it has written its update, which frees the old
+binary the update was recorded against; before forgetting a freed binary, the daemon re-syncs
+every guard, so none of them is left judging the update after its updater is gone.
+
 ## Binary ledger
 
 Nothing guards a whitelisted path while the daemon is stopped, booting or being reinstalled. So
@@ -124,7 +129,9 @@ A risky launch still runs, but the process (and its forks; an exec is judged afr
 - gets nothing else below a whitelist-mode tree either: no `stat`, directory listing or xattr.
 
 Fix: start the app without that variable or flag. A process that mapped untrusted code before its
-binary was whitelisted is refused the same way (`op=PRELOADED`).
+binary was whitelisted is refused the same way (`op=PRELOADED`). Libraries from a `lib_dir` of the
+updater that created the binary don't count: a self-updating app such as Steam starts its new binary
+before the daemon admits it, and everything that process runs is code its updater chose.
 
 Generic Electron binaries that run an app named on the command line are covered by
 [`[electron_apps]`](daemon-config.md#generic-electron-apps-electron_apps).

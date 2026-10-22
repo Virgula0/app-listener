@@ -73,5 +73,9 @@ for that app. So that a non-app process can't plant one ahead of it, the daemon 
 names for the app's own binaries, present or not: only Steam can create
 `~/.local/share/Steam/compatibilitytools.d`, not your shell or ProtonUp-Qt.
 
+Steam's scout runtime inside `ubuntu12_32` is unpacked and pinned by the daemon itself, since
+`steam.sh` does it with general tools the read-only dir refuses (see
+[Steam runtime updates](daemon.md#steam-runtime-updates)).
+
 There is no npm entry: npm runs as `node`, and whitelisting `node` would let `node -e` read the
 tree.
