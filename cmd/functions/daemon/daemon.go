@@ -316,11 +316,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
 }
 
-// startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) and the Steam
-// runtime keeper (steamruntime.go) on the reload the SIGHUP handler uses, and returns that handler.
+// startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) and the app
+// maintainers (maintain.go) on the reload the SIGHUP handler uses, and returns that handler.
 func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemonconfig.Config, vault *fscrypt.Vault,
 	pin pinCfg, control *controlManager, trust *trustManager) (reload, stop func()) {
-	keeper := startRuntimeKeeper(d, trust.tg, cfg)
+	keeper := startMaintainers(d, trust, cfg)
 	var refresher *catalogRefresher
 	reloadCfg := makeReloadHandler(d, configPath, vault, pin, control, trust, trust.vet, func(next *daemonconfig.Config) {
 		if refresher != nil {

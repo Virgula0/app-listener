@@ -124,3 +124,20 @@ func TestComputeBinaryEntryFileMatchesPath(t *testing.T) {
 		t.Fatalf("entry from the fd %+v != from the path %+v", got, want)
 	}
 }
+
+func TestRootPlacedName(t *testing.T) {
+	for _, p := range []string{"/usr/lib/libc.so.6", "/usr/lib/no-such-dir/x", "/etc/ssl/certs", "/"} {
+		if err := RootPlacedName(p); err != nil {
+			t.Errorf("RootPlacedName(%s): %v", p, err)
+		}
+	}
+	refused := []string{"/proc/self/cwd/x", "/dev/fd/3", "/tmp/x", "/usr/lib/../lib/x", "usr/lib/x"}
+	if os.Geteuid() != 0 {
+		refused = append(refused, filepath.Join(t.TempDir(), "x"), filepath.Join(t.TempDir(), "missing", "x"))
+	}
+	for _, p := range refused {
+		if err := RootPlacedName(p); err == nil {
+			t.Errorf("RootPlacedName(%s) accepted a name a user decides", p)
+		}
+	}
+}

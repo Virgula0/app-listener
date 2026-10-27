@@ -213,6 +213,16 @@ struct {
 	__type(value, __u64);
 } guard_glob_writers SEC(".maps");
 
+// guard_glob_root_writers: exe inode -> bits it may bind while running as uid 0. Holds only the
+// daemon's own binary, and only while it commits a maintainer run (cmd/functions/daemon
+// maintain.go): an app's runtime holds files named like its binaries (Steam's game-bin/steam).
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_glob_root_writers SEC(".maps");
+
 // #1 updater scoping. A bit is one set of resources (userspace assigns them): a protected file
 // carries the bits of the resources whitelisting it, an exe the bits of the resources it may update.
 // An exe may modify a protected file only when they share a bit, so a binary whitelisted for one
@@ -796,8 +806,16 @@ static __always_inline __u64 current_writer_bits(void)
 	struct inode_key k = {};
 	if (!current_exe_key(&k))
 		return 0;
+	__u64 bits = 0;
 	__u64 *v = bpf_map_lookup_elem(&guard_glob_writers, &k);
-	return v ? *v : 0;
+	if (v)
+		bits = *v;
+	if ((bpf_get_current_uid_gid() & 0xffffffff) == 0) {
+		v = bpf_map_lookup_elem(&guard_glob_root_writers, &k);
+		if (v)
+			bits |= *v;
+	}
+	return bits;
 }
 
 // trust_suspect: the current thread group is code-suspect (trust_code_suspect). It runs code its

@@ -964,10 +964,9 @@ func (g *Guard) WithSelfVaultAccess(fn func() error) error {
 	return g.withSelfMask(vaultAccessEvents, "vault", false, fn)
 }
 
-// runtimeAccessEvents lets the daemon unpack and re-pin a runtime it maintains in a read-only
-// lib_dir (internal/steamrt): editGrantEvents plus the symlinks and hard links an archive holds.
-var runtimeAccessEvents = append(append([]ebpf.EventType(nil), editGrantEvents...),
-	ebpf.EventSymlink, ebpf.EventHardlink)
+// runtimeAccessEvents lets the daemon commit a maintainer run into a read-only lib_dir
+// (internal/maintainer): editGrantEvents plus the symlinks it creates.
+var runtimeAccessEvents = append(append([]ebpf.EventType(nil), editGrantEvents...), ebpf.EventSymlink)
 
 // WithSelfRuntimeAccess is WithSelfVaultAccess with runtimeAccessEvents. Refused while a live edit
 // grant holds the mask: restoring the baseline afterwards would end that session's access.

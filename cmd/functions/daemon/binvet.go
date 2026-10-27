@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/binledger"
 	"github.com/Virgula0/app-listener/internal/constants"
@@ -46,6 +48,8 @@ type binaryVetter struct {
 	// linksByTarget: whitelist symlink lines per target, so an in-place update of a target is
 	// recorded under the line the ledger keys on.
 	linksByTarget map[string][]string
+	// scripts: this generation's maintainer script verdicts, by path (vetMaintainer).
+	scripts map[string]vetDecision
 }
 
 type vetDecision struct {
@@ -83,6 +87,7 @@ func (v *binaryVetter) begin(cfg *daemonconfig.Config) {
 	v.mu.Lock()
 	v.decided = map[string]vetDecision{}
 	v.approved = map[string]guard.GuardInodeKey{}
+	v.scripts = map[string]vetDecision{}
 	v.linksByTarget = links
 	v.mu.Unlock()
 }
@@ -192,6 +197,60 @@ func (v *binaryVetter) decide(res *daemonconfig.Resource, line, resolved string,
 	}
 	v.refuse(res, line, resolved, hash, found)
 	return false
+}
+
+// errScriptUnconfirmed: vetMaintainer refused the script (reported as binary-unconfirmed).
+var errScriptUnconfirmed = errors.New("not confirmed in the binary ledger")
+
+// vetMaintainer opens a maintainer script and judges it as decide judges a whitelist line of res
+// (whose binaries are the script's updaters): the ledger line is its path, so `trust` confirms it
+// like a binary. Nothing guards it while the daemon is stopped either. The file and the content
+// hash the ledger confirmed, only when admitted, are what the sandbox runs. A refusal is reported
+// once per content and generation.
+func (v *binaryVetter) vetMaintainer(res *daemonconfig.Resource, path string) (*os.File, [32]byte, error) {
+	f, err := ebpf.OpenConfined(path)
+	if err != nil {
+		return nil, [32]byte{}, err
+	}
+	key, hash, err := scriptIdentity(f, path)
+	if err != nil {
+		f.Close()
+		return nil, [32]byte{}, err
+	}
+	v.mu.Lock()
+	prev, seen := v.scripts[path]
+	v.mu.Unlock()
+	ok := prev.ok
+	if !seen || prev.key != key || prev.hash != hash {
+		ok = v.decide(res, path, path, f, key, hash)
+		v.mu.Lock()
+		v.scripts[path] = vetDecision{line: path, key: key, hash: hash, ok: ok}
+		v.mu.Unlock()
+	}
+	if !ok {
+		f.Close()
+		return nil, [32]byte{}, errScriptUnconfirmed
+	}
+	return f, hash, nil
+}
+
+func scriptIdentity(f *os.File, path string) (guard.GuardInodeKey, [32]byte, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return guard.GuardInodeKey{}, [32]byte{}, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return guard.GuardInodeKey{}, [32]byte{}, fmt.Errorf("%s is not a regular file", path)
+	}
+	dev, ino, err := ebpf.StatFile(f)
+	if err != nil {
+		return guard.GuardInodeKey{}, [32]byte{}, err
+	}
+	entry, err := ebpf.ComputeBinaryEntryFile(f, path)
+	if err != nil {
+		return guard.GuardInodeKey{}, [32]byte{}, err
+	}
+	return guard.GuardInodeKey{Dev: dev, Ino: ino}, entry.Hash, nil
 }
 
 // multicallAdmissible refuses a line reaching a multicall whose applets can't be told apart, or a

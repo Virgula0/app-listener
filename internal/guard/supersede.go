@@ -96,48 +96,7 @@ func PruneSuperseded() {
 	}
 	log.Infof("guard: re-syncing every guard before forgetting %d freed binary inode(s)", len(freed))
 	sharedEngine.resyncGuards()
-	beforeForget.run()
 	pruneSuperseded(marks, freed)
-}
-
-// forgetHooks are the callbacks run at a prune about to forget freed binaries (OnBeforeForgetFreed).
-type forgetHooks struct {
-	mu  sync.Mutex
-	seq int
-	fns map[int]func()
-}
-
-var beforeForget forgetHooks
-
-// OnBeforeForgetFreed runs fn at every prune about to forget freed binaries, after the guards'
-// re-sync: the last moment a freed updater's rows still prove what it created
-// (TrustGuard.CreatedByUpdater). fn runs on the prune goroutine and delays the prune while it runs.
-func OnBeforeForgetFreed(fn func()) (remove func()) {
-	beforeForget.mu.Lock()
-	defer beforeForget.mu.Unlock()
-	if beforeForget.fns == nil {
-		beforeForget.fns = map[int]func(){}
-	}
-	beforeForget.seq++
-	id := beforeForget.seq
-	beforeForget.fns[id] = fn
-	return func() {
-		beforeForget.mu.Lock()
-		delete(beforeForget.fns, id)
-		beforeForget.mu.Unlock()
-	}
-}
-
-func (h *forgetHooks) run() {
-	h.mu.Lock()
-	fns := make([]func(), 0, len(h.fns))
-	for _, fn := range h.fns {
-		fns = append(fns, fn)
-	}
-	h.mu.Unlock()
-	for _, fn := range fns {
-		fn()
-	}
 }
 
 func freedSuperseded(marks *cilium.Map) map[GuardInodeKey]bool {

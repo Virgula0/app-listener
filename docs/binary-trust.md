@@ -80,7 +80,9 @@ sudo app-listener trust add /opt/myapp/bin/myapp  # confirm a hand-added line
 ```
 
 Lists the binaries the daemon refused (line, resolved path, resource, sha256, owner, mtime) and
-asks you to confirm each.
+asks you to confirm each. An app maintainer script the daemon refused to run (Steam's `steam.sh`,
+see [App maintainers](daemon.md#app-maintainers-steam-runtime-updates)) is listed and confirmed the
+same way.
 
 | Command or flag | Description |
 |---|---|

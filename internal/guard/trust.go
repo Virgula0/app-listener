@@ -67,6 +67,8 @@ type TrustGuard struct {
 	// appsMu guards apps: the LAUNCH_APP keys in trust_launch (SetElectronApps).
 	appsMu sync.Mutex
 	apps   map[string]bool
+	// rootWriterMu serializes WithRootWriter: a nested caller must not delete the row early.
+	rootWriterMu sync.Mutex
 }
 
 // trustRows is one key's rows across guard_trusted_files and the bit maps (trustBitMaps order).

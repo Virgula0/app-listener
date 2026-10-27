@@ -57,11 +57,11 @@ type CandidateDir struct {
 	// Steam login credentials in the same entry. Same %HOME%/%USER%/glob expansion as Whitelist;
 	// only regular files survive.
 	LibDirWriters []string
-	// Runtimes are home-relative Steam runtime trees (`<lib_dir>/steam-runtime`, beside the
-	// `.tar.xz` its client downloads) that the daemon unpacks and re-pins itself (internal/steamrt):
-	// steam.sh does it with mkdir/tar/ln, which a read-only lib_dir refuses. The parent must be one
-	// of LibDirRelPaths.
-	Runtimes []string
+	// Maintainer is the home-relative launcher script that maintains the entry's lib_dirs below its
+	// directory (Steam's steam.sh unpacks and pins runtimes there with tar/mkdir/ln, which a read-only
+	// lib_dir refuses). The daemon runs it sandboxed and commits only what it validates
+	// (internal/maintainer). List it in ReservedNames too: only the app may write it.
+	Maintainer string
 	// ReservedLibs are %HOME% library patterns "<dir>/<name>" (name exact, prefix* or *suffix) for
 	// apps that install their own code outside every guarded tree. The name is reserved at any depth
 	// below dir for the entry's whitelisted binaries (guard_trust.bpf.c #3), which may then load such
@@ -512,10 +512,15 @@ var Catalog = []CandidateDir{
 			".local/share/Steam/steamapps/common/Proton*/files/lib",
 			// The client's update staging: what it downloads here it unpacks into the dirs above.
 			".local/share/Steam/package",
+			// The client UI: steamwebhelper (whitelisted) runs its JavaScript, so a same-user write
+			// here is code running with Steam's access.
+			".local/share/Steam/steamui",
 		},
-		// The scout runtime steam.sh unpacks from ubuntu12_32/steam-runtime.tar.xz after a client
-		// update, then pins (setup.sh): the daemon does both (internal/steamrt).
-		Runtimes: []string{".local/share/Steam/ubuntu12_32/steam-runtime"},
+		// steam.sh unpacks and pins the runtimes in ubuntu12_32 and steamrt64 at launch: the daemon
+		// runs it for them (internal/maintainer).
+		Maintainer: ".local/share/Steam/steam.sh",
+		// The maintainer the daemon runs: only Steam may write it (and the ledger checks it at start).
+		ReservedNames: []string{"%HOME%/.local/share/Steam/steam.sh"},
 		// pressure-vessel OWNS the runtime trees above and rewrites them every launch: it hardlinks
 		// the runtime's ~6.6k files into a fresh `var/tmp-XXXXXX`, capsule-capture-libs symlinks
 		// host GPU drivers (libvdpau_nvidia.so, Vulkan layers, libc) into `overrides/lib/*`, and
@@ -666,13 +671,12 @@ func (c *CandidateDir) ExpandLibDirs(user, home string) []string {
 	return out
 }
 
-// ExpandRuntimes expands Runtimes for user into absolute paths (placeholders resolved, no glob).
-func (c *CandidateDir) ExpandRuntimes(user, home string) []string {
-	out := make([]string, 0, len(c.Runtimes))
-	for _, rel := range c.Runtimes {
-		out = append(out, filepath.Join(home, expandPlaceholders(rel, user, home)))
+// ExpandMaintainer is Maintainer for user as an absolute path, "" when the entry has none.
+func (c *CandidateDir) ExpandMaintainer(user, home string) string {
+	if c.Maintainer == "" {
+		return ""
 	}
-	return out
+	return filepath.Join(home, expandPlaceholders(c.Maintainer, user, home))
 }
 
 // ExpandLibDirWriters expands %USER%/%HOME% in LibDirWriters, matches globs, and keeps only

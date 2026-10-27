@@ -177,10 +177,37 @@ func placedDir(fd int) error {
 	if err := unix.Fstatfs(fd, &fs); err != nil {
 		return err
 	}
-	if fs.Type == unix.FUSE_SUPER_MAGIC {
+	switch fs.Type {
+	case unix.FUSE_SUPER_MAGIC:
 		return fmt.Errorf("%s is on a FUSE filesystem", name)
+	case unix.PROC_SUPER_MAGIC:
+		// /proc/self (and /dev/fd through it) names the reader's own directories, not ours.
+		return fmt.Errorf("%s is on procfs", name)
 	}
 	return nil
+}
+
+// RootPlacedName reports whether only root decides what the clean absolute path names: the
+// directory holding it, or failing that its nearest existing ancestor, is reached as walkPlaced
+// walks and is itself placed. Whatever is there, or appears there later, root put there.
+func RootPlacedName(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("%q is not a clean absolute path", path)
+	}
+	dir := filepath.Dir(path)
+	fd, st, err := walkPlaced(dir)
+	for errors.Is(err, unix.ENOENT) && dir != "/" {
+		dir = filepath.Dir(dir)
+		fd, st, err = walkPlaced(dir)
+	}
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	return placedDir(fd)
 }
 
 func readlinkFd(fd int) (string, error) {
