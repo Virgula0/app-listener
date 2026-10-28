@@ -52,6 +52,19 @@ func supersedeMaps() (map[string]*cilium.Map, error) {
 var supersede struct {
 	mu    sync.Mutex
 	trust *TrustGuard
+	// hold: SetSupersedeHold. freedAt: when a prune first saw each freed key.
+	hold    func() bool
+	freedAt map[GuardInodeKey]time.Time
+}
+
+// SetSupersedeHold makes the prune keep freed keys while hold reports true (a catalog refresh
+// pending or running), for at most supersedeHoldMax: a version directory an updater wrote is proven
+// by its creator's guard_bin_updaters row (TrustGuard.CreatedByUpdater), and an app that deletes its
+// old version frees that creator before the refresh judges the new one. nil clears it.
+func SetSupersedeHold(hold func() bool) {
+	supersede.mu.Lock()
+	supersede.hold = hold
+	supersede.mu.Unlock()
 }
 
 func setSupersedeTrust(t *TrustGuard) {
@@ -82,14 +95,16 @@ func exeGone(k GuardInodeKey) bool {
 // Every guard re-syncs before a freed key's rows go, and a key freed after that re-sync waits for
 // the next prune: a freed updater's guard_bin_updaters row is what proves the replacements it
 // created (updaterCreated), so a guard judging one after the drop would refuse it. A self-updating
-// app (Steam) frees its creator as soon as it restarts.
+// app (Steam) frees its creator as soon as it restarts. A key also waits until an earlier prune saw
+// it freed, so the catalog watch has seen the delete, and while SetSupersedeHold holds. Keeping
+// rows longer admits nothing: the mark, which goes last, refuses a reused number.
 func PruneSuperseded() {
 	maps, err := supersedeMaps()
 	if err != nil {
 		return
 	}
 	marks := maps[GuardMapExeSuperseded]
-	freed := freedSuperseded(marks)
+	freed := freedSuperseded(marks, time.Now())
 	if len(freed) == 0 {
 		pruneSuperseded(marks, nil)
 		return
@@ -99,23 +114,50 @@ func PruneSuperseded() {
 	pruneSuperseded(marks, freed)
 }
 
-func freedSuperseded(marks *cilium.Map) map[GuardInodeKey]bool {
+// freedSuperseded lists the freed keys the prune may drop at now (see PruneSuperseded).
+func freedSuperseded(marks *cilium.Map, now time.Time) map[GuardInodeKey]bool {
+	supersede.mu.Lock()
+	hold := supersede.hold
+	supersede.mu.Unlock()
+	held := hold != nil && hold()
+
 	supersede.mu.Lock()
 	defer supersede.mu.Unlock()
-	freed := map[GuardInodeKey]bool{}
+	var keys []GuardInodeKey
 	var k GuardInodeKey
 	var v GuardExeSupersede
 	it := marks.Iterate()
 	for it.Next(&k, &v) {
 		if v.Freed != 0 {
-			freed[k] = true
+			keys = append(keys, k)
 		}
 	}
 	if err := it.Err(); err != nil {
 		log.Warnf("guard: reading superseded binaries: %v", err)
 		return nil
 	}
+	freed, seen := droppableFreed(keys, supersede.freedAt, now, held)
+	supersede.freedAt = seen
 	return freed
+}
+
+// droppableFreed picks the freed keys a prune may drop: seen freed by an earlier prune (freedAt) and
+// not held, or held past supersedeHoldMax. seen is freedAt for the next prune.
+func droppableFreed(keys []GuardInodeKey, freedAt map[GuardInodeKey]time.Time, now time.Time,
+	held bool) (drop map[GuardInodeKey]bool, seen map[GuardInodeKey]time.Time) {
+	drop = map[GuardInodeKey]bool{}
+	seen = make(map[GuardInodeKey]time.Time, len(keys))
+	for _, k := range keys {
+		at, known := freedAt[k]
+		if !known {
+			at = now
+		}
+		seen[k] = at
+		if known && (!held || now.Sub(at) >= supersedeHoldMax) {
+			drop[k] = true
+		}
+	}
+	return drop, seen
 }
 
 // pruneSuperseded drops the freed keys in resynced (every guard re-synced after their free) and the
@@ -184,19 +226,45 @@ func liftSuperseded(k GuardInodeKey) {
 	}
 }
 
-// SupersededBinary is a superseded key a guard admits, carried to its replacement across a reload.
-type SupersededBinary struct {
-	// Path is the whitelist line the key was admitted for.
-	Path    string
-	Key     GuardInodeKey
-	Action  uint8
-	Mask    uint32
-	HasMask bool
+// supersededBinary is a superseded key a guard admits, carried to its replacement across a reload.
+type supersededBinary struct {
+	// path is the whitelist line the key was admitted for.
+	path    string
+	key     GuardInodeKey
+	action  uint8
+	mask    uint32
+	hasMask bool
 }
 
-// SnapshotSuperseded lists this guard's superseded keys whose inode still exists: a process
-// exec'd before the supersede may still run it.
-func (g *Guard) SnapshotSuperseded() ([]SupersededBinary, error) {
+// inheritSuperseded admits in g, a reload's replacement whose slot is not active yet, the
+// superseded keys its reload twins admit, so a process exec'd before its binary was replaced keeps
+// its access from the first inode g claims. Read and written in one step under supersede.mu, which
+// prune holds while dropping rows: a key freed meanwhile is never carried. A key is carried only
+// while its inode exists, and only if g still whitelists its line or the line's file is gone (a
+// vanished version): a line the operator dropped while its binary is installed takes its old
+// versions with it. A failure carries less (that process is denied), never more.
+func (g *Guard) inheritSuperseded() {
+	supersede.mu.Lock()
+	defer supersede.mu.Unlock()
+	for _, twin := range sharedEngine.reloadTwins(g) {
+		for _, b := range twin.supersededLocked() {
+			if !g.carriesLine(b.path) {
+				continue
+			}
+			if err := g.carrySupersededLocked(b); err != nil {
+				log.Warnf("guard %s: superseded %s not carried (processes started before its update lose "+
+					"access): %v", g.path, b.path, err)
+				continue
+			}
+			log.Infof("guard %s: kept superseded %s (inode %d) for processes started before its update", g.path,
+				b.path, b.key.Ino)
+		}
+	}
+}
+
+// supersededLocked lists g's superseded keys whose inode still exists: a process exec'd before the
+// supersede may still run it. A row it can't read whole is left out.
+func (g *Guard) supersededLocked() []supersededBinary {
 	g.mu.Lock()
 	paths := make(map[GuardInodeKey]string, len(g.keyPaths))
 	for k, p := range g.keyPaths {
@@ -204,53 +272,44 @@ func (g *Guard) SnapshotSuperseded() ([]SupersededBinary, error) {
 	}
 	g.mu.Unlock()
 
-	var out []SupersededBinary
+	var out []supersededBinary
 	for k, p := range paths {
 		if mark, ok := supersededMark(k); !ok || mark.Freed != 0 {
 			continue
 		}
-		var action uint8
-		if err := g.objs().GuardExeActions.Lookup(g.resKey(k), &action); err != nil {
-			if errors.Is(err, cilium.ErrKeyNotExist) {
-				continue
+		b := supersededBinary{path: p, key: k}
+		if err := g.objs().GuardExeActions.Lookup(g.resKey(k), &b.action); err != nil {
+			if !errors.Is(err, cilium.ErrKeyNotExist) {
+				log.Warnf("guard %s: reading superseded %s: %v", g.path, p, err)
 			}
-			return nil, fmt.Errorf("reading superseded binary %s for %s: %w", p, g.path, err)
+			continue
 		}
-		b := SupersededBinary{Path: p, Key: k, Action: action}
-		b.HasMask = g.objs().GuardExeEvents.Lookup(g.resKey(k), &b.Mask) == nil
+		// No mask row means every event: an unreadable one must not pass for that.
+		switch err := g.objs().GuardExeEvents.Lookup(g.resKey(k), &b.mask); {
+		case err == nil:
+			b.hasMask = true
+		case !errors.Is(err, cilium.ErrKeyNotExist):
+			log.Warnf("guard %s: reading the event mask of superseded %s: %v", g.path, p, err)
+			continue
+		}
 		out = append(out, b)
 	}
-	return out, nil
+	return out
 }
 
-// RestoreSuperseded admits bins in this (fresh) guard, so an old-version process keeps its access
-// across a reload. A key is carried only while its inode exists, and only if this guard still
-// whitelists its line or the line's file is gone (a vanished version): a line the operator dropped
-// while its binary is still installed takes its old versions with it.
-func (g *Guard) RestoreSuperseded(bins []SupersededBinary) error {
-	supersede.mu.Lock()
-	defer supersede.mu.Unlock()
-	for _, b := range bins {
-		if !g.carriesLine(b.Path) {
-			continue
+// carrySupersededLocked writes b's mask before its action: an action row alone admits every event.
+func (g *Guard) carrySupersededLocked(b supersededBinary) error {
+	if b.hasMask {
+		if err := g.objs().GuardExeEvents.Put(g.resKey(b.key), b.mask); err != nil {
+			return err
 		}
-		if mark, ok := supersededMark(b.Key); !ok || mark.Freed != 0 {
-			continue
-		}
-		if err := g.putExeAction(b.Key, b.Action); err != nil {
-			return fmt.Errorf("carrying superseded %s into %s: %w", b.Path, g.path, err)
-		}
-		if b.HasMask {
-			if err := g.objs().GuardExeEvents.Put(g.resKey(b.Key), b.Mask); err != nil {
-				return fmt.Errorf("carrying the event mask of superseded %s into %s: %w", b.Path, g.path, err)
-			}
-		}
-		g.mu.Lock()
-		g.keyPaths[b.Key] = b.Path
-		g.mu.Unlock()
-		log.Infof("guard %s: kept superseded %s (inode %d) for processes started before its update", g.path,
-			b.Path, b.Key.Ino)
 	}
+	if err := g.putExeAction(b.key, b.action); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	g.keyPaths[b.key] = b.path
+	g.mu.Unlock()
 	return nil
 }
 
@@ -303,7 +362,12 @@ func (g *Guard) forgetExe(k GuardInodeKey) {
 	}
 }
 
-const supersedePruneEvery = 30 * time.Second
+const (
+	supersedePruneEvery = 30 * time.Second
+	// supersedeHoldMax caps SetSupersedeHold: a held key keeps its exe_superseded entry, and a full
+	// map refuses unlinking any whitelisted binary.
+	supersedeHoldMax = 5 * time.Minute
+)
 
 // supersedePruneLoop runs PruneSuperseded while the engine lives.
 func supersedePruneLoop(done <-chan struct{}) {

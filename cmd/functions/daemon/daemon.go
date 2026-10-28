@@ -344,7 +344,10 @@ func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemon
 		return reload, keeper.close
 	}
 	refresher.start()
+	// A refresh judges a new version by its freed creator's updater row: the prune keeps it meanwhile.
+	guard.SetSupersedeHold(refresher.refreshes.pending)
 	return reload, func() {
+		guard.SetSupersedeHold(nil)
 		refresher.stop()
 		keeper.close()
 	}

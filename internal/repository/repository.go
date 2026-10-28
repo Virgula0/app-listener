@@ -70,11 +70,6 @@ type GuardRepository interface {
 	// process_vm_readv/ptrace protection for processes that already read a guarded file.
 	SnapshotTaintedPIDs() ([]uint32, error)
 	RestoreTaintedPIDs(pids []uint32) error
-	// SnapshotSuperseded / RestoreSuperseded carry the keys of replaced binaries that processes
-	// started before the replacement still run: a reload rebuilds the whitelist from paths, which
-	// no longer name them.
-	SnapshotSuperseded() ([]guard.SupersededBinary, error)
-	RestoreSuperseded(bins []guard.SupersededBinary) error
 	// RootAnchor returns the watch root the guard is confined to and whether that inode still
 	// exists. Reload compares a kept resource's old and new anchors with it: a new root while the
 	// old one still exists means the path was re-pointed through an unguarded ancestor.

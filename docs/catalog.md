@@ -50,7 +50,8 @@ The daemon follows them:
 
 - An update written in place of the binary by the app's own updater is re-admitted directly.
 - A new version directory (Discord's `~/.config/discord/0.0.N/`) is admitted by the catalog
-  refresh as soon as the updater finishes writing the binary. No restart, no manual step.
+  refresh as soon as the updater finishes writing the binary, also when it deletes the old version
+  first. No restart, no manual step.
 - A process that creates such a directory without being one of the app's binaries can't plant the
   binary name there (the names are reserved), so nothing it does is admitted.
 

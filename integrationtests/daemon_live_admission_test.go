@@ -216,7 +216,7 @@ rename("/tmp/apps/app.new", "/tmp/apps/app") or die "rename $!\n"; print "UPDATE
 	s.Require().NotEqual(before, s.inodeOf(c, "/tmp/apps/app"), "the update must be a new inode")
 
 	// No read until the prune has forgotten the old inode: a denial would re-sync its guard first.
-	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 70*time.Second),
+	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 100*time.Second),
 		"the old inode was never pruned; daemon log:\n%s", s.readDaemonLog(c))
 	for i := 1; i <= 4; i++ {
 		deadline := time.Now().Add(45 * time.Second)
@@ -294,7 +294,7 @@ rename("/opt/uapp/app.new", "/opt/uapp/app") or die "rename $!\n"; print "UPDATE
 	s.Require().NotContains(s.readDaemonLog(c), "guard /r2: re-synced",
 		"fixture: /r2 must not have judged the replacement before the prune")
 
-	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 40*time.Second),
+	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 75*time.Second),
 		"the creator was never pruned; daemon log:\n%s", s.readDaemonLog(c))
 	daemonLog := s.readDaemonLog(c)
 	before := strings.Index(daemonLog, "re-syncing every guard before forgetting")

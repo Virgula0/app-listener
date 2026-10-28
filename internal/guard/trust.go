@@ -52,9 +52,10 @@ type TrustGuard struct {
 	links []link.Link
 	rd    *ringbuf.Reader
 	done  chan struct{}
-	// ownerByPath: UpdaterPlan.Owners, for AllowReplacement.
+	// ownerByPath: UpdaterPlan.Owners, for AllowReplacement; ownerByRes: UpdaterPlan.Resources.
 	ownerMu     sync.Mutex
 	ownerByPath map[string]uint64
+	ownerByRes  map[string]uint64
 	// binaryStat: SetBinaryResolver; nil = ebpf.StatConfined. Guarded by ownerMu.
 	binaryStat statFunc
 	// mounts: guard_vouched_devs upkeep (trust_mounts.go).

@@ -190,7 +190,7 @@ func (v *binaryVetter) decide(res *daemonconfig.Resource, line, resolved string,
 	case !found && v.takeGrant(line):
 		v.record(line, hash, binledger.SourceInstall)
 		return true
-	case trust != nil && trust.CreatedByUpdater(f, key, ownerPaths(res)):
+	case trust != nil && trust.CreatedByUpdater(f, key, res.Path, ownerPaths(res)):
 		v.record(line, hash, binledger.SourceUpdater)
 		log.Infof("daemon: admitted %s: created by its resource's updater while the daemon ran", logging.SanitizeText(line))
 		return true

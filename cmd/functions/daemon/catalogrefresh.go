@@ -104,6 +104,13 @@ func (d *debouncer) run() {
 	}
 }
 
+// pending reports a run scheduled or in progress.
+func (d *debouncer) pending() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.stopped && (!d.first.IsZero() || d.running || d.again)
+}
+
 func (d *debouncer) stop() {
 	d.mu.Lock()
 	d.stopped = true

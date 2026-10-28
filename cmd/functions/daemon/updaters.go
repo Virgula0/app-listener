@@ -39,7 +39,7 @@ func hardLinked(path string) bool {
 // updaters. Past 64 sets the rest own no bit, so nobody may modify their binaries (fail closed).
 // [libraries] allow_libs belong to no resource and get no owner either.
 func planUpdaters(cfg *daemonconfig.Config) guard.UpdaterPlan {
-	p := guard.UpdaterPlan{Owners: map[string]uint64{}, Updaters: map[string]uint64{}}
+	p := guard.UpdaterPlan{Owners: map[string]uint64{}, Updaters: map[string]uint64{}, Resources: map[string]uint64{}}
 	bitOf := map[string]uint64{}
 	for i := range cfg.Resources {
 		res := &cfg.Resources[i]
@@ -58,6 +58,7 @@ func planUpdaters(cfg *daemonconfig.Config) guard.UpdaterPlan {
 			bit = uint64(1) << len(bitOf)
 			bitOf[key] = bit
 		}
+		p.Resources[res.Path] |= bit
 		libBins := libBinaries(res)
 		for _, b := range set {
 			p.Owners[b] |= bit

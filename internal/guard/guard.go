@@ -212,7 +212,7 @@ type Guard struct {
 	// (supersede.go).
 	deployed map[string]GuardInodeKey
 	// keyPaths: every key this guard admitted from a whitelist line, to that line's path. Outlives
-	// deployed's entry, so a superseded key can be carried across a reload (SnapshotSuperseded).
+	// deployed's entry, so a superseded key can be carried across a reload (inheritSuperseded).
 	keyPaths map[GuardInodeKey]string
 	// retired: per canonical path, the deployed key forgetExe dropped once its inode was freed. A
 	// replacement re-synced after that prune is still judged against it (updaterCreated's same-dev
@@ -565,6 +565,9 @@ func NewGuard(path string, mode Mode, binaries []BinaryEntry, recursive bool, de
 		g.cleanup()
 		return nil, fmt.Errorf("populating BPF maps: %w", err)
 	}
+	// Before the slot activates and claims the root: from its first inode on, it judges processes
+	// still running a binary replaced under the guard it replaces.
+	g.inheritSuperseded()
 
 	for _, step := range g.startSteps() {
 		if err := step(); err != nil {

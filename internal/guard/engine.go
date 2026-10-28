@@ -203,6 +203,19 @@ func (e *engine) linkReloadTwinLocked(g *Guard, id uint32) {
 	}
 }
 
+// reloadTwins lists the live guards on g's root other than g: those g replaces on a reload.
+func (e *engine) reloadTwins(g *Guard) []*Guard {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []*Guard
+	for id := uint32(1); id < GuardMaxRes; id++ {
+		if o := e.slots[id]; o != nil && o != g && filepath.Clean(o.path) == filepath.Clean(g.path) {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // unlinkReloadTwinLocked drops every successor row naming id before the slot can be reused: a
 // stale row would collapse an unrelated resource's taint into id's.
 func (e *engine) unlinkReloadTwinLocked(id uint32) {

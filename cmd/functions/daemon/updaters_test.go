@@ -45,6 +45,23 @@ func TestPlanUpdaters_ScopedToOwnResources(t *testing.T) {
 	}
 }
 
+// CreatedByUpdater falls back on the resource's bit when no running line names a new version's path.
+func TestPlanUpdaters_ResourceOwnsItsBit(t *testing.T) {
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: "/a", Binaries: rules("/home/u/app/1/App")},
+		{Path: "/b", Binaries: rules("/home/u/app/1/App")},
+		{Path: "/c", Binaries: rules("/home/u/other/Other")},
+	}}
+	p := planUpdaters(cfg)
+	bit := p.Updaters["/home/u/app/1/App"]
+	if bit == 0 || p.Resources["/a"] != bit || p.Resources["/b"] != bit {
+		t.Fatalf("each resource must carry its binaries' bit: %v / %v", p.Resources, p.Updaters)
+	}
+	if p.Resources["/c"]&bit != 0 {
+		t.Errorf("another resource must not share the bit: %v", p.Resources)
+	}
+}
+
 // AllowReplacement judges a re-pointed link's new target by the link: it must own the bit.
 func TestPlanUpdaters_LinkOwnsItsResourceBit(t *testing.T) {
 	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{{Path: "/protected", Binaries: []daemonconfig.BinaryRule{
