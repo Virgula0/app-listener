@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func openConfined(t *testing.T, path string) *os.File {
@@ -122,5 +124,77 @@ func TestComputeBinaryEntryFileMatchesPath(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("entry from the fd %+v != from the path %+v", got, want)
+	}
+}
+
+// rootOnlyTree: dir, its entries and their symlink targets, and every ancestor of each, are
+// root-owned and writable by root alone. GitHub's runners make /usr/share world-writable, where
+// /etc/ssl/certs links point.
+func rootOnlyTree(dir string) bool {
+	paths := []string{dir}
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		paths = append(paths, p)
+		if d.Type()&os.ModeSymlink != 0 {
+			r, err := filepath.EvalSymlinks(p)
+			if err != nil {
+				return err
+			}
+			paths = append(paths, r)
+		}
+		return nil
+	})
+	if err != nil {
+		return false
+	}
+	for _, p := range paths {
+		for ; ; p = filepath.Dir(p) {
+			var st unix.Stat_t
+			if unix.Lstat(p, &st) != nil {
+				return false
+			}
+			if st.Mode&unix.S_IFMT != unix.S_IFLNK && rootOwnedStat(&st) != nil {
+				return false
+			}
+			if p == "/" {
+				break
+			}
+		}
+	}
+	return true
+}
+
+func TestRootPlacedName(t *testing.T) {
+	placed := []string{"/usr/lib/libc.so.6", "/usr/lib/no-such-dir/x", "/run/host/usr/lib/x"}
+	if rootOnlyTree("/etc/ssl/certs") {
+		placed = append(placed, "/etc/ssl/certs")
+	}
+	for _, p := range placed {
+		if err := RootPlacedName(p); err != nil {
+			t.Errorf("RootPlacedName(%s): %v", p, err)
+		}
+	}
+	// A directory a user fills names what they decide below it, though root decides its own name.
+	refused := []string{"/proc/self/cwd/x", "/dev/fd/3", "/tmp/x", "/usr/lib/../lib/x", "usr/lib/x",
+		"/tmp", "/var/tmp", "/dev/shm", "/", "/home/app-listener-no-such-user/x", "/run/user/4242424242/x",
+		// Where udisks2 mounts a user's image, whose files present any owner they were built with.
+		"/media/app-listener-no-such-user/x", "/run/media/app-listener-no-such-user/x", "/mnt/app-listener-no-such-mount"}
+	// A root-owned file on a nosuid mount: what a user-mounted image looks like (sysfs stands in).
+	var sys unix.Statfs_t
+	if unix.Statfs("/sys/kernel/btf/vmlinux", &sys) == nil && sys.Flags&unix.ST_NOSUID != 0 {
+		refused = append(refused, "/sys/kernel/btf/vmlinux")
+	}
+	if os.Geteuid() != 0 {
+		refused = append(refused, filepath.Join(t.TempDir(), "x"), filepath.Join(t.TempDir(), "missing", "x"))
+		if home, err := os.UserHomeDir(); err == nil {
+			refused = append(refused, home)
+		}
+	}
+	for _, p := range refused {
+		if err := RootPlacedName(p); err == nil {
+			t.Errorf("RootPlacedName(%s) accepted a name a user decides", p)
+		}
 	}
 }

@@ -21,6 +21,8 @@ type UpdaterPlan struct {
 	Owners map[string]uint64
 	// Updaters maps each exe to the bits of the resources it may update.
 	Updaters map[string]uint64
+	// Resources maps each resource's watch path to its bit.
+	Resources map[string]uint64
 }
 
 // SetUpdaters (re)applies the updater scoping. Updaters are written before owners: an owner row
@@ -35,6 +37,7 @@ func (t *TrustGuard) SetUpdaters(p UpdaterPlan) error {
 	}
 	t.ownerMu.Lock()
 	t.ownerByPath = maps.Clone(p.Owners)
+	t.ownerByRes = maps.Clone(p.Resources)
 	t.ownerMu.Unlock()
 	return nil
 }
@@ -58,13 +61,15 @@ func (t *TrustGuard) statBinary() statFunc {
 }
 
 // CreatedByUpdater reports whether nk, the inode f holds, was created since this trust guard
-// started by an updater of the resources owning ownerPaths and never write-opened by another exe
-// (guard_bin_origin): how a new whitelist line with no previous inode (a fresh version directory)
-// proves its provenance. On the updater's own filesystem only, never FUSE: a user FUSE mount serves
-// chosen inode numbers and bytes without any write-open.
-func (t *TrustGuard) CreatedByUpdater(f *os.File, nk GuardInodeKey, ownerPaths []string) bool {
+// started by an updater of resource res or of the resources owning ownerPaths, and never
+// write-opened by another exe (guard_bin_origin): how a new whitelist line with no previous inode (a
+// fresh version directory) proves its provenance. res's bit is the running plan's: an app that
+// deletes its old version before the refresh leaves none of ownerPaths in that plan. On the
+// updater's own filesystem only, never FUSE: a user FUSE mount serves chosen inode numbers and bytes
+// without any write-open.
+func (t *TrustGuard) CreatedByUpdater(f *os.File, nk GuardInodeKey, res string, ownerPaths []string) bool {
 	t.ownerMu.Lock()
-	var owner uint64
+	owner := t.ownerByRes[res]
 	for _, p := range ownerPaths {
 		owner |= t.ownerByPath[p]
 	}

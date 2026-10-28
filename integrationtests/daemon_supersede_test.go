@@ -80,6 +80,29 @@ func (s *IntegrationSuite) TestDaemon_Superseded_OldProcessKeepsAccessNewExecRef
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app/bin/app hold'; pkill -f 'app-listener daemon' || true"})
 }
 
+// The new guard takes over the tree mid-reload: an app started before its upgrade keeps reading
+// throughout, while its old image re-exec'd through a held fd stays refused throughout.
+func (s *IntegrationSuite) TestDaemon_Superseded_NoDenialDuringReload() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.startSupersedeProbe(c)
+	s.upgradeSupersedeProbe(c)
+	s.assertSupersedeSplit(c, "after the upgrade")
+
+	out := supersedeCtl + "/spin.out"
+	s.exec(c, []string{"sh", "-c", "rm -f " + out + " && touch " + supersedeCtl + "/spin"})
+	time.Sleep(500 * time.Millisecond) // the probe polls its commands every 100 ms
+	s.reloadAndAwait(c)
+	s.Require().Contains(s.readDaemonLog(c), reloadEnd, "the reload must commit")
+	got, ok := s.awaitFile(c, out, 60*time.Second)
+	s.Require().Truef(ok, "the spin never answered; daemon log:\n%s", s.readDaemonLog(c))
+	s.Require().Containsf(got, "STOLEN|"+supersedeMarker, "across the reload: %s\ndaemon log:\n%s", got,
+		s.readDaemonLog(c))
+	s.assertSupersedeSplit(c, "after a reload")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app/bin/app hold'; pkill -f 'app-listener daemon' || true"})
+}
+
 // A freed whitelisted inode's number goes to the next file created, any user's: the reused number
 // must not inherit the whitelist, neither before the daemon prunes the old key nor after.
 func (s *IntegrationSuite) TestDaemon_Bypass_ReusedInodeNumberInheritsWhitelist() {
@@ -124,7 +147,7 @@ need_encryption: false
 		s.Require().NotContainsf(out, marker, "%s: a file reusing a freed whitelisted inode number read the "+
 			"resource: %s\ndaemon log:\n%s", when, out, s.readDaemonLog(c))
 		if when == "before the prune" {
-			s.Require().Truef(s.awaitLog(c, "forgot freed binary inode "+old, 45*time.Second),
+			s.Require().Truef(s.awaitLog(c, "forgot freed binary inode "+old, 75*time.Second),
 				"the freed key was not pruned; daemon log:\n%s", s.readDaemonLog(c))
 		}
 	}

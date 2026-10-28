@@ -19,9 +19,18 @@ Binaries get replaced all the time (package upgrades, self-updating apps). The r
 - A new root-owned match of the catalog's absolute patterns (`/opt/*/jbr/bin/java`) is admitted
   the same way.
 
-A process started before its binary was replaced keeps its access, through a reload too.
+A process started before its binary was replaced keeps its access, through a reload too, without
+a gap: the reload's new guard holds the old binary's entry before it takes over the directory.
 Re-running the replaced image afterwards (an fd held across the update, `/proc/<pid>/exe`) does
 not, and neither does a file that later reuses the old inode number.
+
+Every resource whitelisting the path judges the new inode, even one whose app hasn't run since. A
+self-updating app such as Steam restarts as soon as it has written its update, which frees the old
+binary the update was recorded against; before forgetting a freed binary, the daemon re-syncs
+every guard, so none of them is left judging the update after its updater is gone. A freed binary
+is also kept for at least one 30 second prune cycle, and while a catalog refresh is pending or
+running (up to 5 minutes), so an app that deletes its old version right after writing the new one
+(Discord) still has its update judged against the updater that wrote it.
 
 ## Binary ledger
 
@@ -35,7 +44,8 @@ A binary is admitted when:
   mount without `nosuid`), or
 - its hash matches the ledger, or
 - its resource's updater created it while the daemon ran (recorded automatically, as are live
-  replacements).
+  replacements). A new version directory counts too when the old version is already gone by the
+  time the refresh adds the new one: the updater is judged by the resource, not by a path.
 
 Anything else, for example a binary changed while the daemon was not running in a home or a
 user-owned directory, or a new catalog match planted meanwhile, is refused:
@@ -75,7 +85,9 @@ sudo app-listener trust add /opt/myapp/bin/myapp  # confirm a hand-added line
 ```
 
 Lists the binaries the daemon refused (line, resolved path, resource, sha256, owner, mtime) and
-asks you to confirm each.
+asks you to confirm each. An app maintainer script the daemon refused to run (Steam's `steam.sh`,
+see [App maintainers](daemon.md#app-maintainers-steam-runtime-updates)) is listed and confirmed the
+same way.
 
 | Command or flag | Description |
 |---|---|
@@ -86,6 +98,8 @@ asks you to confirm each.
 
 Only the exact content that was refused is confirmed: a file that changed again is skipped and
 judged afresh.
+
+The desktop window's Trust page does the same (see [gui.md](gui.md#trust)).
 
 ## Launch scan
 
@@ -124,7 +138,12 @@ A risky launch still runs, but the process (and its forks; an exec is judged afr
 - gets nothing else below a whitelist-mode tree either: no `stat`, directory listing or xattr.
 
 Fix: start the app without that variable or flag. A process that mapped untrusted code before its
-binary was whitelisted is refused the same way (`op=PRELOADED`).
+binary was whitelisted is refused the same way (`op=PRELOADED`). Libraries from a `lib_dir` of the
+updater that created the binary don't count: a self-updating app such as Steam starts its new binary
+before the daemon admits it, and everything that process runs is code its updater chose. That new
+binary's launch is judged at exec too, before the daemon knows what runtime it is: by every
+runtime's rules above (so a flag only another runtime treats as risky marks it too), except the
+generic Electron app rule below.
 
 Generic Electron binaries that run an app named on the command line are covered by
 [`[electron_apps]`](daemon-config.md#generic-electron-apps-electron_apps).

@@ -100,6 +100,23 @@ func isAbsoluteCandidate(bin string) bool {
 		strings.HasPrefix(bin, "%USER%/")
 }
 
+// A maintainer must have a lib_dir of its entry below its directory (only those are committed), and
+// be a reserved name: only the app may write the script the daemon runs.
+func TestCatalogMaintainers(t *testing.T) {
+	for _, c := range Catalog {
+		if c.Maintainer == "" {
+			continue
+		}
+		root := filepath.Dir(c.Maintainer) + "/"
+		if !slices.ContainsFunc(c.LibDirRelPaths, func(d string) bool { return strings.HasPrefix(d, root) }) {
+			t.Errorf("%s: no lib_dir below the maintainer %s", c.Name, c.Maintainer)
+		}
+		if !slices.Contains(c.ReservedNames, "%HOME%/"+c.Maintainer) {
+			t.Errorf("%s: the maintainer %s is not a reserved name", c.Name, c.Maintainer)
+		}
+	}
+}
+
 // TestCatalogHasWireGuardSystemEntry verifies the /etc/wireguard entry
 // from the original ssh-guard template config is present at system level.
 func TestCatalogHasWireGuardSystemEntry(t *testing.T) {

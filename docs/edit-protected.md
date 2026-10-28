@@ -36,7 +36,8 @@ A click selects a tree row and a second click opens it; a click in the editor pl
 The desktop window's Protected workspace offers the same actions; see [gui.md](gui.md#protected).
 It drives this binary through `edit-protected --backend`, a flag that speaks JSON lines on
 stdin/stdout. That mode is the window's channel, not for direct use: it refuses a terminal and any
-other flag, and asks the daemon for nothing the commands above can't.
+other flag, and asks the daemon for nothing the commands above can't. The window's Trust page
+drives it too, for `trust` ([gui.md](gui.md#trust)).
 
 ## Offline and live mode
 

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/testcontainers/testcontainers-go"
+
+	"github.com/Virgula0/app-listener/internal/editbackend"
 )
 
 const (
@@ -281,4 +283,60 @@ echo MOUNTED`
 	s.Require().NotEmptyf(line, "a rewrite while stopped was admitted; daemon log:\n%s", s.readDaemonLog(c))
 	s.Require().Containsf(line, "sha256="+sum, "the refusal must carry the rewritten content's hash: %s", line)
 	s.assertNeverStolen(c, bin, "/protected/secret", ledgerMarker)
+}
+
+// The GUI's Trust page, driven over the backend as the window drives it: the backend reads the
+// sealed ledger, confirms only the refused content, and the reload admits it. A path named by the
+// caller is never hashed before AUTH while the daemon runs.
+func (s *IntegrationSuite) TestDaemon_Ledger_TrustThroughTheBackend() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.copySwapFixtures(c)
+	s.installFakeSystemctl(c)
+
+	const (
+		secret = "/protected/secret"
+		inHome = "/root/app/reader"
+	)
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener /root/app && printf '" +
+		ledgerMarker + "' > " + secret + " && cp " + swapReaderPath + " " + inHome + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	config := "[watch /protected]\nneed_encryption: false\n" + inHome
+	s.startDaemon(c, config)
+	s.restartUnconfirmed(c, config, func() {
+		code, out := s.exec(c, []string{"sh", "-c", "printf x >> " + inHome + " 2>&1"})
+		s.Require().Equalf(0, code, "fixture: changing while stopped: %s", out)
+	})
+	s.Require().NotEmptyf(s.unconfirmedLine(c, inHome), "not refused; daemon log:\n%s", s.readDaemonLog(c))
+	s.assertNeverStolen(c, inHome, secret, ledgerMarker)
+
+	r := s.runBackend(c, s.backendScript(
+		editbackend.Request{Op: editbackend.OpHello},
+		editbackend.Request{Op: editbackend.OpTrustList},
+	))
+	s.Require().Emptyf(r[2].Err, "trust_list: %+v\nstderr:\n%s", r[2], s.backendErr(c))
+	s.Require().Lenf(r[2].Trust, 1, "trust_list: %+v", r[2])
+	row := r[2].Trust[0]
+	s.Require().Equal(inHome, row.Line)
+	s.Require().Emptyf(row.Skip, "the refused row must be confirmable: %+v", row)
+
+	r = s.runBackend(c, s.backendScript(
+		editbackend.Request{Op: editbackend.OpHello},
+		editbackend.Request{Op: editbackend.OpTrustInspect, Binaries: []string{secret}},
+		editbackend.Request{Op: editbackend.OpTrustConfirm, Trust: []editbackend.TrustItem{
+			{Line: inHome, SHA256: strings.Repeat("0", 64)}}},
+		editbackend.Request{Op: editbackend.OpTrustConfirm, Trust: []editbackend.TrustItem{
+			{Line: inHome, SHA256: row.SHA256}}},
+	))
+	s.Require().NotEmptyf(r[2].Err, "a caller-named path hashed before AUTH while the daemon runs: %+v", r[2])
+	s.Require().Emptyf(r[2].Trust, "trust_inspect disclosed a row: %+v", r[2])
+	s.Require().Truef(r[3].TrustDone != nil && len(r[3].TrustDone.Confirmed) == 0, "other content confirmed: %+v", r[3])
+	s.Require().Truef(r[4].TrustDone != nil && len(r[4].TrustDone.Confirmed) == 1 && r[4].TrustDone.Reloaded,
+		"trust_confirm: %+v\nstderr:\n%s", r[4], s.backendErr(c))
+	ok, out := s.awaitStolen(c, inHome, secret, ledgerMarker, 60*time.Second)
+	s.Require().Truef(ok, "not admitted after the backend's confirm: %s\ndaemon log:\n%s", out, s.readDaemonLog(c))
+	s.Require().Contains(s.trustBinaries(c, "list"), "No refused binaries")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

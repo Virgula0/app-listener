@@ -4,9 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,10 +15,6 @@ import (
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
-// hostMountinfo is pid 1's mount table: the daemon's own namespace (PrivateTmp, ProtectSystem) is
-// remounted nosuid by systemd and says nothing about who mounted what.
-const hostMountinfo = "/proc/1/mountinfo"
-
 // guard_dev_seq slots — must match guard_trust.bpf.c.
 const (
 	devSeqNow  uint32 = 0
@@ -32,51 +25,6 @@ const (
 	mountResyncInterval = time.Minute
 	mountRetryInterval  = time.Second
 )
-
-// vouchedDevs returns the kernel dev (KernelDev) of every superblock in mountinfo with at least one
-// mount that is neither nosuid nor FUSE. Any unparsable line fails the whole table.
-func vouchedDevs(mountinfo []byte) (map[uint64]struct{}, error) {
-	out := make(map[uint64]struct{})
-	for line := range strings.SplitSeq(strings.TrimSpace(string(mountinfo)), "\n") {
-		f := strings.Fields(line)
-		sep := slices.Index(f, "-")
-		if sep < 6 || sep+1 >= len(f) {
-			return nil, fmt.Errorf("malformed mountinfo line %q", line)
-		}
-		dev, err := parseMajorMinor(f[2])
-		if err != nil {
-			return nil, fmt.Errorf("mountinfo line %q: %w", line, err)
-		}
-		if slices.Contains(strings.Split(f[5], ","), "nosuid") || isFuseType(f[sep+1]) {
-			continue
-		}
-		out[dev] = struct{}{}
-	}
-	if len(out) == 0 {
-		return nil, errors.New("no superblock mounted without nosuid (is / really nosuid?)")
-	}
-	return out, nil
-}
-
-func parseMajorMinor(s string) (uint64, error) {
-	maj, mnr, ok := strings.Cut(s, ":")
-	if !ok {
-		return 0, fmt.Errorf("bad device %q", s)
-	}
-	major, err := strconv.ParseUint(maj, 10, 12)
-	if err != nil {
-		return 0, fmt.Errorf("bad major in %q: %w", s, err)
-	}
-	minor, err := strconv.ParseUint(mnr, 10, 20)
-	if err != nil {
-		return 0, fmt.Errorf("bad minor in %q: %w", s, err)
-	}
-	return ebpf.KernelDev(uint32(major), uint32(minor)), nil
-}
-
-func isFuseType(fstype string) bool {
-	return fstype == "fuse" || fstype == "fuseblk" || strings.HasPrefix(fstype, "fuse.")
-}
 
 // MountVouch keeps an object's vouched-dev maps (guard_vouched_devs, guard_dead_devs,
 // guard_dev_seq; the network guard's netg_* copies) in step with pid 1's mount table: only a
@@ -105,9 +53,9 @@ func NewMountVouch(name, restart string, vouched, dead, seq *cilium.Map) *MountV
 // Open fills the vouched set from pid 1's mount table. The watch fd is opened before the first read
 // so no mount change after it goes unseen.
 func (v *MountVouch) Open() error {
-	fd, err := unix.Open(hostMountinfo, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(ebpf.HostMountinfo, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("opening %s: %w", hostMountinfo, err)
+		return fmt.Errorf("opening %s: %w", ebpf.HostMountinfo, err)
 	}
 	v.fd = fd
 	return v.Sync()
@@ -162,11 +110,11 @@ func (v *MountVouch) syncVouchedDevs() (map[uint64]struct{}, error) {
 	if err := v.seq.Lookup(devSeqLost, &lost); err != nil {
 		return nil, fmt.Errorf("reading the lost-tombstone count: %w", err)
 	}
-	data, err := os.ReadFile(hostMountinfo)
+	data, err := os.ReadFile(ebpf.HostMountinfo)
 	if err != nil {
 		return nil, err
 	}
-	devs, err := vouchedDevs(data)
+	devs, err := ebpf.VouchedDevs(data)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +172,7 @@ func (v *MountVouch) watch(stopFd int) {
 			{Fd: int32(stopFd), Events: unix.POLLIN}, //nolint:gosec // same
 		}
 		if _, err := unix.Poll(fds, int(timeout.Milliseconds())); err != nil && !errors.Is(err, unix.EINTR) {
-			v.fail(fmt.Errorf("polling %s: %w", hostMountinfo, err))
+			v.fail(fmt.Errorf("polling %s: %w", ebpf.HostMountinfo, err))
 			return
 		}
 		if fds[1].Revents != 0 {

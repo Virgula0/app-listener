@@ -23,7 +23,7 @@ import (
 func (p *protectedPage) startEdit() {
 	p.begin(func(link backendLink) {
 		if link.Hello().Live {
-			p.authenticate(link, "Edit protected files", func(resources []string) {
+			p.s.authenticate(link, "Edit protected files", p.timeoutSec(), p.finish, func(resources []string) {
 				if len(resources) == 0 {
 					p.s.showError("Edit protected files", fmt.Errorf("the daemon reports no guarded directories"))
 					p.finish()

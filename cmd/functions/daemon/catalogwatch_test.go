@@ -236,6 +236,35 @@ func TestDebouncerMinGap(t *testing.T) {
 	}
 }
 
+func TestDebouncerPendingCoversWaitAndRun(t *testing.T) {
+	release := make(chan struct{})
+	var ran atomic.Int32
+	d := &debouncer{quiet: 20 * time.Millisecond, maxWait: time.Second, minGap: 0,
+		fire: func() { ran.Add(1); <-release }}
+	defer d.stop()
+	if d.pending() {
+		t.Fatal("idle: nothing pending")
+	}
+	d.poke()
+	if !d.pending() {
+		t.Fatal("a scheduled run must count as pending")
+	}
+	for ran.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !d.pending() {
+		t.Fatal("a running run must count as pending")
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for d.pending() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if d.pending() {
+		t.Fatal("pending after the run finished")
+	}
+}
+
 func TestLogRefreshChange(t *testing.T) {
 	var b bytes.Buffer
 	logRefreshChange(&b, install.SectionChange{Section: "/h/.config/discord", Admitted: []string{"/a", "/b"}})

@@ -316,15 +316,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
 }
 
-// startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) on the reload the
-// SIGHUP handler uses, and returns that handler.
+// startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) and the app
+// maintainers (maintain.go) on the reload the SIGHUP handler uses, and returns that handler.
 func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemonconfig.Config, vault *fscrypt.Vault,
 	pin pinCfg, control *controlManager, trust *trustManager) (reload, stop func()) {
+	keeper := startMaintainers(d, trust, cfg)
 	var refresher *catalogRefresher
 	reloadCfg := makeReloadHandler(d, configPath, vault, pin, control, trust, trust.vet, func(next *daemonconfig.Config) {
 		if refresher != nil {
 			refresher.setConfig(next)
 		}
+		keeper.setConfig(next)
 	})
 	reload = func() { _, _ = reloadCfg() }
 	control.setConfigEditor(&configEditor{path: configPath, reload: reloadCfg})
@@ -339,10 +341,16 @@ func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemon
 	refresher, err := newCatalogRefresher(configPath, cfg, reloadOrNil, resync, control.sessionActive)
 	if err != nil {
 		log.Errorf("daemon: %v — new app versions wait for a reload", err)
-		return reload, func() {}
+		return reload, keeper.close
 	}
 	refresher.start()
-	return reload, refresher.stop
+	// A refresh judges a new version by its freed creator's updater row: the prune keeps it meanwhile.
+	guard.SetSupersedeHold(refresher.refreshes.pending)
+	return reload, func() {
+		guard.SetSupersedeHold(nil)
+		refresher.stop()
+		keeper.close()
+	}
 }
 
 // runDaemonUI dispatches to the presentation chosen by flags: headless stderr, browser-mirrored

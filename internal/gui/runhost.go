@@ -89,9 +89,11 @@ func (s *shell) running() bool {
 		(s.daemon != nil && s.daemon.running)
 }
 
-// sessionOpen reports an open edit-protected session: an install or update would restart the
-// daemon and swap the binary under it.
-func (s *shell) sessionOpen() bool { return s.protect != nil && s.protect.link != nil }
+// sessionOpen reports an open edit-protected session (or Trust review): an install or update would
+// restart the daemon and swap the binary under it.
+func (s *shell) sessionOpen() bool {
+	return (s.protect != nil && s.protect.link != nil) || s.trust.link != nil
+}
 
 // guardsBlocking names why no installer or updater run may start now: a guard this window runs
 // would deny it (they move and encrypt guarded folders, restart the daemon, download from GitHub)

@@ -2,6 +2,7 @@ package integrationtests
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -216,7 +217,7 @@ rename("/tmp/apps/app.new", "/tmp/apps/app") or die "rename $!\n"; print "UPDATE
 	s.Require().NotEqual(before, s.inodeOf(c, "/tmp/apps/app"), "the update must be a new inode")
 
 	// No read until the prune has forgotten the old inode: a denial would re-sync its guard first.
-	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 70*time.Second),
+	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 100*time.Second),
 		"the old inode was never pruned; daemon log:\n%s", s.readDaemonLog(c))
 	for i := 1; i <= 4; i++ {
 		deadline := time.Now().Add(45 * time.Second)
@@ -227,6 +228,214 @@ rename("/tmp/apps/app.new", "/tmp/apps/app") or die "rename $!\n"; print "UPDATE
 			"/r%d never re-admitted its updater's replacement; daemon log:\n%s", i, s.readDaemonLog(c))
 	}
 	s.Require().NotContains(s.readDaemonLog(c), "not re-admitted", "no guard may refuse the updater's inode")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A self-updating app frees its old inode, the creator of the replacement, as soon as it restarts
+// (Steam). One guard re-syncs on a denial while the creator's updater row lives; a sibling that has
+// not re-synced yet must still admit the replacement: the prune re-syncs every guard before it drops
+// that row. The app sits in a user-owned dir, so only updater provenance can admit it.
+//
+// The update starts right after a sweep tick (a probe only the sweep re-admits). A freed key goes
+// only at the second prune that sees it (droppableFreed), so the sibling's next sweep may judge it
+// first: either re-sync must, before the rows go.
+func (s *IntegrationSuite) TestDaemon_LiveAdmission_SiblingJudgesAfterCreatorPrune() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.copySwapFixtures(c)
+
+	const (
+		marker = "TOP-SECRET-CREATOR-PRUNE-5A27"
+		app    = "/opt/uapp/app"
+		probe  = "/usr/local/bin/probe"
+	)
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /opt/uapp && chown 65534:65534 /opt/uapp" +
+		" && for r in r0 r1 r2; do mkdir -p /$r && printf '" + marker + "' > /$r/secret; done && cp " +
+		swapReaderPath + " " + probe + " && " + nobodyRun + "cp /usr/bin/perl " + app + " && echo READY"})
+	s.Require().Truef(code == 0 && strings.Contains(out, "READY"), "setup: %s", out)
+	s.startDaemon(c, "[watch /r0]\nneed_encryption: false\n"+probe+"\n\n[watch /r1]\nneed_encryption: false\n"+app+
+		"\n\n[watch /r2]\nneed_encryption: false\n"+app)
+
+	read := func(res string) string {
+		_, out := s.exec(c, []string{"sh", "-c", nobodyRun + app + fmt.Sprintf(
+			` -e 'open(F, "<", "/%s/secret") or die "DENIED $!\n"; print "STOLEN|", <F>' 2>&1`, res)})
+		return out
+	}
+	for _, res := range []string{"r1", "r2"} {
+		s.Require().Containsf(read(res), "STOLEN|"+marker, "baseline /%s", res)
+	}
+
+	// The probe's old inode stays open (never freed: no prune re-sync) and unlink + link() leaves the
+	// catalog watch nothing to trigger on, so only a sweep re-admits the new one.
+	s.exec(c, []string{"sh", "-c", "nohup sh -c 'exec 3<" + probe + "; sleep 600' >/dev/null 2>&1 &"})
+	code, out = s.exec(c, []string{"sh", "-c", "cp " + swapReaderPath + " /usr/local/bin/.probe.new && " +
+		"printf x >> /usr/local/bin/.probe.new && " +
+		`perl -e 'unlink "` + probe + `"; link "/usr/local/bin/.probe.new", "` + probe + `" or die "link: $!\n"' && ` +
+		"rm /usr/local/bin/.probe.new 2>&1"})
+	s.Require().Equalf(0, code, "the probe swap: %s", out)
+	s.Require().Truef(s.awaitLogCount(c, "guard /r0: re-synced 1 binary inode(s)", 1, staleRootSweepPollTimeout),
+		"no sweep tick seen; daemon log:\n%s", s.readDaemonLog(c))
+
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + ` -e '
+open(I, "<", "/usr/bin/perl") or die "read $!\n"; binmode I;
+open(O, ">", "/opt/uapp/app.new") or die "create $!\n"; binmode O;
+{ local $/; print O <I>; } close O or die "close $!\n";
+chmod 0755, "/opt/uapp/app.new" or die "chmod $!\n";
+rename("/opt/uapp/app.new", "/opt/uapp/app") or die "rename $!\n"; print "UPDATED\n"' 2>&1`})
+	s.Require().Containsf(out, "UPDATED", "the app must update itself: %s", out)
+
+	// A denial re-syncs /r1 alone, while the creator's updater row lives. Repeated: the sweep tick
+	// just seen restarted every guard's resyncMinInterval throttle.
+	s.Require().Eventuallyf(func() bool {
+		s.exec(c, []string{"sh", "-c", "cat /r1/secret >/dev/null 2>&1; true"})
+		return strings.Contains(s.readDaemonLog(c), "guard /r1: re-synced 1 binary inode(s)")
+	}, 10*time.Second, time.Second, "/r1 did not re-admit the update before the prune; daemon log:\n%s",
+		s.readDaemonLog(c))
+	s.Require().NotContains(s.readDaemonLog(c), "guard /r2: re-synced",
+		"fixture: /r2 must not have judged the replacement before the prune")
+
+	s.Require().Truef(s.awaitLog(c, "forgot freed binary inode", 75*time.Second),
+		"the creator was never pruned; daemon log:\n%s", s.readDaemonLog(c))
+	daemonLog := s.readDaemonLog(c)
+	before := strings.Index(daemonLog, "re-syncing every guard before forgetting")
+	judged := strings.Index(daemonLog, "guard /r2: re-synced 1 binary inode(s)")
+	forgot := strings.Index(daemonLog, "forgot freed binary inode")
+	s.Require().Truef(before >= 0 && judged >= 0 && before < forgot && judged < forgot,
+		"/r2 must be judged, and the prune re-sync every guard, before the creator's rows go; daemon log:\n%s",
+		daemonLog)
+	s.Require().Containsf(read("r2"), "STOLEN|"+marker, "/r2 lost its app; daemon log:\n%s", s.readDaemonLog(c))
+	s.Require().NotContains(s.readDaemonLog(c), "not re-admitted", "no guard may refuse the updater's inode")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'sleep 600'; pkill -f 'app-listener daemon' || true"})
+}
+
+// updateExecScripts: upd.pl is the app updating itself (rename over its path, as Steam does) and
+// exec'ing the new inode at once, before any re-sync admits it, to run child.pl: dlopen ARGV[0],
+// then read /r/secret until it is admitted.
+const updateExecScripts = `cat > /tmp/upd.pl <<'PL'
+open(I, "<", "/usr/bin/perl") or die "read $!\n"; binmode I;
+open(O, ">", "/opt/uapp/app.new") or die "create $!\n"; binmode O;
+{ local $/; print O <I>; } close O or die "close $!\n";
+chmod 0755, "/opt/uapp/app.new" or die "chmod $!\n";
+rename("/opt/uapp/app.new", "/opt/uapp/app") or die "rename $!\n";
+exec {"/opt/uapp/app"} "/opt/uapp/app", "/tmp/child.pl", $ARGV[0] or die "exec $!\n";
+PL
+cat > /tmp/child.pl <<'PL'
+require DynaLoader;
+DynaLoader::dl_load_file($ARGV[0], 0) or die "dlopen: " . DynaLoader::dl_error() . "\n";
+for (1..30) { if (open(F, "<", "/r/secret")) { print "STOLEN|", <F>, "\n"; exit 0 } sleep 1 }
+print "NEVER $!\n";
+PL
+chmod 644 /tmp/upd.pl /tmp/child.pl`
+
+// A self-updating app (Steam) execs its new binary before the daemon re-admits it, and that process
+// loads its lib_dir's libraries at once. It runs only code the creator chose, so it must not stay
+// code-suspect once admitted. A library from outside the creator's lib_dirs still marks it.
+func (s *IntegrationSuite) TestDaemon_LiveAdmission_UpdatedExecLoadsLibDirBeforeAdmission() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const (
+		marker = "TOP-SECRET-EXEC-BEFORE-ADMIT-3C18"
+		app    = "/opt/uapp/app"
+	)
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /r /opt/uapp /tmp/u && printf '" + marker +
+		"' > /r/secret && chown 65534:65534 /opt/uapp /tmp/u && " + nobodyRun + "sh -c 'cp /usr/bin/perl " + app +
+		" && mkdir /opt/uapp/lib && cp -L /usr/lib/x86_64-linux-gnu/libz.so.1 /opt/uapp/lib/ && " +
+		"cp -L /usr/lib/x86_64-linux-gnu/libz.so.1 /tmp/u/' && " + updateExecScripts + " && echo READY 2>&1"})
+	s.Require().Truef(code == 0 && strings.Contains(out, "READY"), "setup: %s", out)
+	s.startDaemon(c, "[watch /r]\nneed_encryption: false\n"+app+"\nlib_dir /opt/uapp/lib")
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/child.pl /opt/uapp/lib/libz.so.1 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+marker, "baseline: the app loads its lib_dir and reads /r: %s", out)
+
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/upd.pl /opt/uapp/lib/libz.so.1 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+marker, "the updated app, started before its admission, stayed "+
+		"refused after it: %s\ndaemon log:\n%s", out, s.readDaemonLog(c))
+	s.Require().NotContains(s.readDaemonLog(c), "op=PRELOADED", "its lib_dir must not mark it code-suspect")
+
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/upd.pl /tmp/u/libz.so.1 2>&1"})
+	s.Require().Containsf(out, "NEVER", "a library outside the creator's lib_dirs must keep it code-suspect: %s", out)
+	s.Require().Truef(s.awaitLogCount(c, "guard /r: re-synced 1 binary inode(s)", 2, 10*time.Second),
+		"fixture: the second update must have been admitted; daemon log:\n%s", s.readDaemonLog(c))
+	s.Require().Contains(s.readDaemonLog(c), "op=PRELOADED")
+	_, out = s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/child.pl /opt/uapp/lib/libz.so.1 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+marker, "control: a fresh start of the admitted update is clean: %s", out)
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// updateToRuntime: the app (perl, an updater of its own path) replaces itself with launch_probe, a
+// runtime by its markers, as Steam's client writes a new steamwebhelper, and execs the new inode at
+// once with KEY=VALUE env and the rest as argv: whoever wins that race (malware watching the dir)
+// launches the runtime before any re-sync admits it.
+const updateToRuntime = `cat > /tmp/updrt.pl <<'PL'
+my ($app, @argv) = @ARGV;
+$ENV{$1} = $2 while @argv && $argv[0] =~ /^(\w+)=(.*)$/ && shift @argv;
+open(I, "<", "` + launchProbeSrc + `") or die "read $!\n"; binmode I;
+open(O, ">", "$app.new") or die "create $!\n"; binmode O;
+{ local $/; print O <I>; } close O or die "close $!\n";
+chmod 0755, "$app.new" or die "chmod $!\n";
+rename("$app.new", $app) or die "rename $!\n";
+exec {$app} $app, @argv or die "exec $!\n";
+PL
+chmod 644 /tmp/updrt.pl`
+
+// A runtime's launch is judged at exec, by the classes its inode holds then. An updated runtime
+// exec'd before its admission holds none, and loading its lib_dir no longer marks it (the creator's
+// code): started with a debugger port or ELECTRON_RUN_AS_NODE, it is its caller's code, and must
+// never read the secret once admitted. Started clean, the same race must still read it. Each update
+// after the first tends to reuse the number of the perl image freed before it, refused until the
+// prune forgets that: both rules must hold through the refusal too.
+func (s *IntegrationSuite) TestDaemon_LiveAdmission_UpdatedRuntimeLaunchJudgedBeforeAdmission() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const marker = "TOP-SECRET-RUNTIME-BEFORE-ADMIT-9D41"
+	s.exec(c, []string{"mkdir", "-p", "/exploits"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe"), launchProbeSrc, 0o755),
+		"copy launch_probe")
+	apps := []string{"/opt/uapp/clean", "/opt/uapp/debugger", "/opt/uapp/asnode", "/opt/uapp/reclean"}
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /r /opt/uapp && printf '" + marker +
+		"' > /r/secret && chown 65534:65534 /opt/uapp && " + nobodyRun + "sh -c 'for a in " + strings.Join(apps, " ") +
+		"; do cp /usr/bin/perl $a || exit 1; done && mkdir /opt/uapp/lib && " +
+		"cp -L /usr/lib/x86_64-linux-gnu/libz.so.1 /opt/uapp/lib/' && " + updateToRuntime + " && echo READY 2>&1"})
+	s.Require().Truef(code == 0 && strings.Contains(out, "READY"), "setup: %s", out)
+	s.startDaemon(c, "[watch /r]\nneed_encryption: false\n"+strings.Join(apps, "\n")+"\nlib_dir /opt/uapp/lib")
+
+	const libDirLib = "LD_PRELOAD=/opt/uapp/lib/libz.so.1"
+	run := func(app string, args ...string) string {
+		_, out := s.exec(c, []string{"sh", "-c", nobodyRun + app + " /tmp/updrt.pl " + app + " " +
+			strings.Join(args, " ") + " 2>&1"})
+		return out
+	}
+	out = run(apps[0], libDirLib, "await", "/r/secret")
+	s.Require().Containsf(out, "STOLEN|"+marker, "control: the updated runtime started clean before its admission "+
+		"must read once admitted: %s\ndaemon log:\n%s", out, s.readDaemonLog(c))
+
+	for _, tc := range []struct {
+		app  string
+		args []string
+	}{
+		{apps[1], []string{libDirLib, "await", "/r/secret", "--remote-debugging-port=9222"}},
+		{apps[2], []string{"ELECTRON_RUN_AS_NODE=1", "await", "/r/secret"}},
+	} {
+		out = run(tc.app, tc.args...)
+		s.Require().NotContainsf(out, marker, "EXPLOITED: %s, launched %v before its admission, read the secret "+
+			"once admitted: %s\ndaemon log:\n%s", tc.app, tc.args, out, s.readDaemonLog(c))
+		s.Require().Containsf(out, "NEVER", "fixture: the probe must have waited out its admission: %s", out)
+		// Not vacuous: the inode was admitted, a fresh clean start of it reads.
+		_, out = s.exec(c, []string{"sh", "-c", nobodyRun + tc.app + " read /r/secret 2>&1"})
+		s.Require().Containsf(out, "STOLEN|"+marker, "fixture: %s was never admitted: %s\ndaemon log:\n%s",
+			tc.app, out, s.readDaemonLog(c))
+		// Refused as admitted and launch-marked, not merely before its admission.
+		s.requireDenialLogged(c, "LAUNCH", "comm="+filepath.Base(tc.app)+" ")
+	}
+	out = run(apps[3], libDirLib, "await", "/r/secret")
+	s.Require().Containsf(out, "STOLEN|"+marker, "control: a clean update on a reused number must read once "+
+		"admitted: %s\ndaemon log:\n%s", out, s.readDaemonLog(c))
+	s.Require().NotContains(s.readDaemonLog(c), "op=PRELOADED", "the creator's lib_dir must mark no update")
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

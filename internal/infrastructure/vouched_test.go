@@ -1,12 +1,10 @@
-package guard
+package ebpf
 
 import (
 	"fmt"
 	"testing"
 
 	"golang.org/x/sys/unix"
-
-	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 func TestVouchedDevs(t *testing.T) {
@@ -22,20 +20,20 @@ func TestVouchedDevs(t *testing.T) {
 31 22 259:3 / /efi rw,relatime shared:36 - vfat /dev/nvme0n1p1 rw
 32 22 0:40 /x /var/tmp rw,nosuid shared:21 - tmpfs tmpfs rw
 `
-	got, err := vouchedDevs([]byte(mountinfo))
+	got, err := VouchedDevs([]byte(mountinfo))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := map[uint64]bool{
-		ebpf.KernelDev(259, 2): true,  // /
-		ebpf.KernelDev(7, 3):   true,  // snap squashfs: nodev only
-		ebpf.KernelDev(259, 3): true,  // one suid mount is enough (/efi)
-		ebpf.KernelDev(0, 21):  false, // every mount nosuid
-		ebpf.KernelDev(0, 40):  false,
-		ebpf.KernelDev(7, 4):   false, // udisks2 user image
-		ebpf.KernelDev(0, 50):  false, // FUSE, whatever the mount flags
-		ebpf.KernelDev(8, 1):   false,
-		ebpf.KernelDev(0, 51):  false,
+		KernelDev(259, 2): true,  // /
+		KernelDev(7, 3):   true,  // snap squashfs: nodev only
+		KernelDev(259, 3): true,  // one suid mount is enough (/efi)
+		KernelDev(0, 21):  false, // every mount nosuid
+		KernelDev(0, 40):  false,
+		KernelDev(7, 4):   false, // udisks2 user image
+		KernelDev(0, 50):  false, // FUSE, whatever the mount flags
+		KernelDev(8, 1):   false,
+		KernelDev(0, 51):  false,
 	}
 	for dev, vouched := range want {
 		if _, ok := got[dev]; ok != vouched {
@@ -58,23 +56,23 @@ func TestVouchedDevsFailsClosed(t *testing.T) {
 		"no fstype":      "22 1 259:2 / / rw -\n",
 		"one bad line":   "22 1 259:2 / / rw - ext4 /dev/root rw\ngarbage\n",
 	} {
-		if devs, err := vouchedDevs([]byte(mi)); err == nil {
+		if devs, err := VouchedDevs([]byte(mi)); err == nil {
 			t.Errorf("%s: vouched %v, want an error", name, devs)
 		}
 	}
 }
 
 // mountinfo prints sb->s_dev, which trust_mmap keys on; it must encode like StatInode's dev.
-func TestParseMajorMinorMatchesStatEncoding(t *testing.T) {
+func TestParseMountDevMatchesStatEncoding(t *testing.T) {
 	for _, path := range []string{"/", "/proc"} {
 		var st unix.Stat_t
 		if err := unix.Stat(path, &st); err != nil {
 			t.Fatal(err)
 		}
-		dev, err := parseMajorMinor(fmt.Sprintf("%d:%d", unix.Major(st.Dev), unix.Minor(st.Dev)))
-		want, _, serr := ebpf.StatInode(path)
-		if err != nil || serr != nil || dev != want {
-			t.Errorf("%s: parseMajorMinor = %#x (%v), StatInode dev = %#x (%v)", path, dev, err, want, serr)
+		dev, ok := parseMountDev(fmt.Sprintf("%d:%d", unix.Major(st.Dev), unix.Minor(st.Dev)))
+		want, _, serr := StatInode(path)
+		if !ok || serr != nil || uint64(dev) != want {
+			t.Errorf("%s: parseMountDev = %#x (%v), StatInode dev = %#x (%v)", path, dev, ok, want, serr)
 		}
 	}
 }

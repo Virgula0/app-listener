@@ -25,6 +25,7 @@ type fakeLink struct {
 	live   bool
 	files  map[string]string
 	reqs   []editbackend.Request
+	trust  []editbackend.TrustRow
 	events chan editbackend.Message
 	ended  chan string
 	done   chan struct{}
@@ -75,6 +76,17 @@ func (f *fakeLink) Call(req *editbackend.Request) (editbackend.Message, error) {
 	case editbackend.OpForwardCheck:
 		for _, b := range req.Binaries {
 			m.Binaries = append(m.Binaries, editbackend.BinaryCheck{Path: b, SystemPlaced: true})
+		}
+	case editbackend.OpTrustList:
+		m.Trust = f.trust
+	case editbackend.OpTrustInspect:
+		for _, b := range req.Binaries {
+			m.Trust = append(m.Trust, editbackend.TrustRow{Line: b, Resolved: b, SHA256: strings.Repeat("c", 64)})
+		}
+	case editbackend.OpTrustConfirm, editbackend.OpTrustAdd:
+		m.TrustDone = &editbackend.TrustDone{Reloaded: !req.NoReload}
+		for _, it := range req.Trust {
+			m.TrustDone.Confirmed = append(m.TrustDone.Confirmed, it.Line)
 		}
 	}
 	return m, nil

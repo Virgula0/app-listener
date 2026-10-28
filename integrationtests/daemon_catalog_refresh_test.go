@@ -57,6 +57,44 @@ func (s *IntegrationSuite) TestDaemon_CatalogRefresh_UpdaterVersionAdmittedLive(
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// The client installs a new version and deletes its own old one before the refresh runs, as Discord
+// does: no line of the running config names any binary the refresh adds, and the creator's inode is
+// freed. perl stands in for the client (dash has no unlink); the new version is dash, for readAs.
+func (s *IntegrationSuite) TestDaemon_CatalogRefresh_VersionAdmittedAfterOldVersionDeleted() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	oldDir := discordDir + "/0.0.1"
+	s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener " + discordDir + "/sentry " + oldDir + " && cp /usr/bin/perl " +
+		discordClient + " && printf '" + refreshMarker + "' > " + refreshSecret})
+	s.startDaemon(c, `[watch `+discordDir+`/sentry]
+need_encryption: false
+`+discordClient)
+	s.Require().Contains(s.readDaemonLog(c), "catalog watch:", "the catalog watch must start")
+
+	bin := discordDir + "/0.0.2/Discord"
+	code, out := s.exec(c, []string{discordClient, "-e", `
+mkdir "` + discordDir + `/0.0.2" or die "mkdir $!\n";
+open(I, "<", "/usr/bin/dash") or die "read $!\n"; binmode I;
+open(O, ">", "` + bin + `") or die "create $!\n"; binmode O;
+{ local $/; print O <I>; } close O or die "close $!\n";
+chmod 0755, "` + bin + `" or die "chmod $!\n";
+unlink "` + discordClient + `" or die "unlink $!\n";
+rmdir "` + oldDir + `" or die "rmdir $!\n"; print "UPDATED\n"`})
+	s.Require().Truef(code == 0 && strings.Contains(out, "UPDATED"), "the client must update itself: %s", out)
+
+	s.Require().Truef(s.awaitLog(c, refreshLine, 30*time.Second), "no catalog refresh ran; daemon log:\n%s",
+		s.readDaemonLog(c))
+	s.Require().Truef(s.awaitLog(c, "configuration reloaded from", 30*time.Second), "the refresh did not reload")
+	s.Require().Containsf(s.readAs(c, bin), "STOLEN|"+refreshMarker, "the new version was not admitted; daemon log:\n%s",
+		s.readDaemonLog(c))
+	s.Require().NotContains(s.readDaemonLog(c), "binary-unconfirmed", "the updater's version must need no trust")
+	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+	s.Require().Contains(conf, bin, "the refresh must persist the new version")
+	s.Require().NotContains(conf, discordClient, "the refresh must drop the deleted version")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // A non-writer's mkdir is allowed (version names are free) but planting the binary name is not,
 // and nothing it does gets a refresh to admit anything.
 func (s *IntegrationSuite) TestDaemon_CatalogRefresh_NonWriterPlantAdmitsNothing() {

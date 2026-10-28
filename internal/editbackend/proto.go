@@ -21,7 +21,7 @@ import (
 
 // Proto is the wire version; both sides refuse a mismatch (GUI and installed binary of different
 // releases).
-const Proto = 3
+const Proto = 4
 
 // MaxLine bounds one JSON line: a write's content (base64, up to MaxWriteBytes) plus framing.
 const MaxLine = 8 << 20
@@ -61,6 +61,12 @@ const (
 	OpRecordPlan         = "record_plan"
 	OpRecordApply        = "record_apply"
 	OpRecordDeleteBackup = "record_delete_backup"
+	// The trust workflow (`app-listener trust`): list and confirm the binaries the daemon refused;
+	// inspect lines typed by hand, then add the inspected ones (`trust add`).
+	OpTrustList    = "trust_list"
+	OpTrustConfirm = "trust_confirm"
+	OpTrustInspect = "trust_inspect"
+	OpTrustAdd     = "trust_add"
 )
 
 // Kinds of backend messages: a reply to one request, or an unsolicited event.
@@ -96,6 +102,9 @@ type Request struct {
 	Events      []string `json:"events,omitempty"`
 	// Selection is record_plan's choice among the recording's binaries, libraries and paths.
 	Selection *recorder.Selection `json:"selection,omitempty"`
+	// Trust is trust_confirm / trust_add's lines, each with the content the operator reviewed.
+	Trust    []TrustItem `json:"trust,omitempty"`
+	NoReload bool        `json:"no_reload,omitempty"`
 }
 
 // Message is one backend -> GUI message.
@@ -131,6 +140,9 @@ type Message struct {
 	// Backups are the plaintext migration copies a record_apply left.
 	Backups  []string  `json:"backups,omitempty"`
 	Progress *Progress `json:"progress,omitempty"`
+
+	Trust     []TrustRow `json:"trust,omitempty"`
+	TrustDone *TrustDone `json:"trust_done,omitempty"`
 }
 
 // Progress is one KindProgress update.
@@ -206,6 +218,37 @@ type Event struct {
 	Path    string    `json:"path"`
 	Dest    string    `json:"dest,omitempty"`
 	Allowed bool      `json:"allowed"`
+}
+
+// TrustItem is one line to record with the content (hex sha256) the operator reviewed.
+type TrustItem struct {
+	Line   string `json:"line"`
+	SHA256 string `json:"sha256"`
+}
+
+// TrustRow is one binary to confirm (bintrust.Row, flattened for display). SHA256 is the refused
+// content (for a line added by hand: its content when inspected).
+type TrustRow struct {
+	Line      string    `json:"line"`
+	Resolved  string    `json:"resolved"`
+	Resources string    `json:"resources"`
+	SeenAt    time.Time `json:"seen_at"`
+	SHA256    string    `json:"sha256"`
+	// Skip is why it can't be confirmed now ("" = it can).
+	Skip    string    `json:"skip,omitempty"`
+	HasStat bool      `json:"has_stat,omitempty"`
+	UID     uint32    `json:"uid"`
+	Mode    uint32    `json:"mode"`
+	ModTime time.Time `json:"mtime"`
+}
+
+// TrustDone is what trust_confirm / trust_add recorded.
+type TrustDone struct {
+	Confirmed []string `json:"confirmed,omitempty"`
+	// Skipped maps each line not recorded to why.
+	Skipped   map[string]string `json:"skipped,omitempty"`
+	Reloaded  bool              `json:"reloaded,omitempty"`
+	ReloadErr string            `json:"reload_err,omitempty"`
 }
 
 // Writer serializes messages as JSON lines.

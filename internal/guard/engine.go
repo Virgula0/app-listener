@@ -203,6 +203,19 @@ func (e *engine) linkReloadTwinLocked(g *Guard, id uint32) {
 	}
 }
 
+// reloadTwins lists the live guards on g's root other than g: those g replaces on a reload.
+func (e *engine) reloadTwins(g *Guard) []*Guard {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []*Guard
+	for id := uint32(1); id < GuardMaxRes; id++ {
+		if o := e.slots[id]; o != nil && o != g && filepath.Clean(o.path) == filepath.Clean(g.path) {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // unlinkReloadTwinLocked drops every successor row naming id before the slot can be reused: a
 // stale row would collapse an unrelated resource's taint into id's.
 func (e *engine) unlinkReloadTwinLocked(id uint32) {
@@ -941,17 +954,32 @@ func (e *engine) forgetExe(exe GuardInodeKey) error {
 	if err == nil {
 		err = deleteInoKeys(e.objs.GuardExeEvents, exe)
 	}
+	guards := e.guardsLocked()
+	e.mu.Unlock()
+	for _, g := range guards {
+		g.forgetExe(exe)
+	}
+	return err
+}
+
+func (e *engine) guardsLocked() []*Guard {
 	var guards []*Guard
 	for _, g := range &e.slots {
 		if g != nil {
 			guards = append(guards, g)
 		}
 	}
+	return guards
+}
+
+// resyncGuards re-syncs every live guard (Guard.resyncLive).
+func (e *engine) resyncGuards() {
+	e.mu.Lock()
+	guards := e.guardsLocked()
 	e.mu.Unlock()
 	for _, g := range guards {
-		g.forgetExe(exe)
+		g.resyncLive()
 	}
-	return err
 }
 
 // forgetResource drops res from the cross-resource views when its guard goes away.

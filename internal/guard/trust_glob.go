@@ -243,3 +243,26 @@ func (r GlobReservations) LibTrusted(bin, lib string) bool {
 		}
 	}
 }
+
+// WithRootWriter runs fn while this binary, as uid 0, may bind every reserved name
+// (guard_glob_root_writers). A maintainer commit writes an app's runtime, which holds files named
+// like the app's binaries; every byte it writes was validated against the lib_dir's own content.
+func (t *TrustGuard) WithRootWriter(fn func() error) error {
+	t.rootWriterMu.Lock()
+	defer t.rootWriterMu.Unlock()
+	dev, ino, err := ebpf.StatInode("/proc/self/exe")
+	if err != nil {
+		return fmt.Errorf("resolving own executable: %w", err)
+	}
+	key := GuardTrustInodeKey{Dev: dev, Ino: ino}
+	if err := t.objs.GuardGlobRootWriters.Put(key, ^uint64(0)); err != nil {
+		return fmt.Errorf("granting the reserved-name writer row: %w", err)
+	}
+	defer func() {
+		if err := t.objs.GuardGlobRootWriters.Delete(key); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+			log.Errorf("trust guard: dropping the daemon's reserved-name writer row: %v — it stays until "+
+				"the daemon restarts (root only)", err)
+		}
+	}()
+	return fn()
+}

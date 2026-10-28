@@ -11,7 +11,7 @@
 //   #2 library load allowlist: a whitelisted process may map executable code only from a library a non-whitelisted process couldn't have written. A library qualifies if it is:
 //     - an explicit TRUSTED_LIB (allow_lib), or
 //     - a root-owned file in a root-only-writable directory on a superblock root mounted without nosuid in pid 1's mount namespace (system libs under /usr/lib, /opt; auto-trusted, survives package updates; see guard_vouched_devs), or
-//     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
+//     - inside a GUARDED resource tree (only whitelisted binaries create/modify files there, so nothing can be planted). A read-only lib_dir tree is trusted only for its own writers. An exe a writer created and the daemon has not admitted yet loads it as its creator (trust_creator_libdir). This is how bundled per-launch libraries (Steam/Proton/Wine) work: guard their library dirs and they become loadable with no per-file allow_lib.
 //     - a #3 reserved name below its root, mapped by one of that name's writers (glob_lib_trusted).
 //   LD_PRELOAD of an attacker .so under /tmp or an unguarded $HOME path is refused. A process that
 //   mapped such code before its exe was whitelisted is refused the secrets (trust_code_suspect), and
@@ -212,6 +212,16 @@ struct {
 	__type(key, struct inode_key);
 	__type(value, __u64);
 } guard_glob_writers SEC(".maps");
+
+// guard_glob_root_writers: exe inode -> bits it may bind while running as uid 0. Holds only the
+// daemon's own binary, and only while it commits a maintainer run (cmd/functions/daemon
+// maintain.go): an app's runtime holds files named like its binaries (Steam's game-bin/steam).
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_glob_root_writers SEC(".maps");
 
 // #1 updater scoping. A bit is one set of resources (userspace assigns them): a protected file
 // carries the bits of the resources whitelisting it, an exe the bits of the resources it may update.
@@ -528,6 +538,39 @@ static __always_inline int mount_vouches_ownership(struct inode *inode)
 	return !died || *died <= *synced;
 }
 
+// updater_origin: the current exe's untainted guard_bin_origin row. Keyed by the raw inode, not
+// current_exe_key: a freed binary's reused number stays refused until the prune forgets it, but the
+// row is this inode's own (written at its creation, the old inode's dropped when it was freed).
+static __always_inline struct bin_origin *updater_origin(void)
+{
+	struct inode_key ek = {};
+	if (!fill_inode_key(current_exe_inode(), &ek))
+		return NULL;
+	struct bin_origin *o = bpf_map_lookup_elem(&guard_bin_origin, &ek);
+	return o && !o->tainted ? o : NULL;
+}
+
+// trust_creator_libdir: the current exe is not whitelisted (yet), and its inode was created by an
+// updater holding one of a lib_dir's bits (users) and never written by another exe since
+// (guard_bin_origin). A self-updating app (Steam) execs its new binary before the daemon re-admits
+// it; its libraries must not mark the process code-suspect for life. Sound because every byte that
+// process runs is the creator's choice: the creator could have built that lib_dir's code into the
+// binary itself, and its launch was judged as a runtime's (trust_exec_launch). Global: verified
+// once (1M-insn budget).
+__noinline int trust_creator_libdir(__u64 users)
+{
+	if (current_exe_flags() & TRUSTED_BINARY)
+		return 0; // a whitelisted exe loads only what its own bits allow
+	if (inode_on_user_mountable_fs(current_exe_inode()))
+		return 0;
+	struct bin_origin *o = updater_origin();
+	if (!o)
+		return 0;
+	struct inode_key ck = o->exe;
+	__u64 *bits = bpf_map_lookup_elem(&guard_libdir_users, &ck);
+	return bits && (*bits & users);
+}
+
 // under_guarded_tree: the innermost guarded root at or above the file (guard_trusted_dirs) admits
 // the current exe. Each ancestor is keyed by its own inode_dev: a btrfs subvolume nested in the
 // tree has another key device than the root above it.
@@ -549,11 +592,14 @@ static __always_inline int under_guarded_tree(struct inode *inode, struct dentry
 			if (users) {
 				if (*users & TRUSTED_DIR_ANY)
 					return 1;
+				__u64 u = *users;
 				struct inode_key ek = {};
 				if (!current_exe_key(&ek))
 					return 0;
 				__u64 *bits = bpf_map_lookup_elem(&guard_libdir_users, &ek);
-				return bits && (*bits & *users);
+				if (bits && (*bits & u))
+					return 1;
+				return trust_creator_libdir(u);
 			}
 		}
 		struct dentry *parent;
@@ -772,8 +818,16 @@ static __always_inline __u64 current_writer_bits(void)
 	struct inode_key k = {};
 	if (!current_exe_key(&k))
 		return 0;
+	__u64 bits = 0;
 	__u64 *v = bpf_map_lookup_elem(&guard_glob_writers, &k);
-	return v ? *v : 0;
+	if (v)
+		bits = *v;
+	if ((bpf_get_current_uid_gid() & 0xffffffff) == 0) {
+		v = bpf_map_lookup_elem(&guard_glob_root_writers, &k);
+		if (v)
+			bits |= *v;
+	}
+	return bits;
 }
 
 // trust_suspect: the current thread group is code-suspect (trust_code_suspect). It runs code its
@@ -1520,11 +1574,18 @@ static long launch_step(__u64 i, void *ctx)
 // fires after the new stack holds argv/env and before any user code runs, so nothing in the image
 // can rewrite them first (unlike /proc/<pid>/environ). bprm_committed_creds cleared the previous
 // image's mark just before. An unmarkable process is killed: the hook cannot refuse the exec.
+// The launch is never judged again: an updater-made exe not admitted yet (updater_origin) is
+// judged by every runtime's rules, as its classes are unknown, bar the generic-Electron app check
+// (any other exe's positional argv, `steam steam://...`, would mark it).
 SEC("tp_btf/sched_process_exec")
 int trust_exec_launch(unsigned long long *ctx)
 {
 	struct task_struct *p = (struct task_struct *)ctx[0];
-	__u32 classes = current_exe_flags() & TRUSTED_RUNTIMES;
+	__u8 flags = current_exe_flags();
+	__u32 classes = flags & TRUSTED_RUNTIMES;
+	int unadmitted = !classes && !(flags & TRUSTED_BINARY) && updater_origin();
+	if (unadmitted)
+		classes = TRUSTED_RUNTIMES;
 	if (!p || !classes)
 		return 0;
 	__u32 z = 0;
@@ -1543,7 +1604,7 @@ int trust_exec_launch(unsigned long long *ctx)
 	s->vpos = 0;
 	s->cont = 0;
 	s->first = 1;
-	s->app = 0;
+	s->app = unadmitted;
 	s->risky = 0;
 	s->done = 0;
 	long ret = bpf_loop(LAUNCH_STEPS, launch_step, NULL, 0);
@@ -1627,6 +1688,8 @@ int trust_inode_free(unsigned long long *ctx)
 	bpf_probe_read_kernel(&nlink, sizeof(nlink), &inode->i_nlink);
 	if (nlink != 0 || !fill_inode_key(inode, &k))
 		return 0;
+	// A reused number must not inherit provenance: mknod(S_IFREG) creates without FMODE_CREATED.
+	bpf_map_delete_elem(&guard_bin_origin, &k);
 	exe_note_freed(&k, bpf_map_lookup_elem(&guard_trusted_files, &k) != NULL);
 	return 0;
 }

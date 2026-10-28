@@ -55,6 +55,10 @@ type GuardRepository interface {
 	// baseline. Only single-file resources need it (directory unlock/lock is pure keyring work).
 	// Distinct from GrantSelfEditAccess, the broader session-scoped grant for interactive edits.
 	WithSelfVaultAccess(fn func() error) error
+	// WithSelfRuntimeAccess widens this read-only lib_dir guard's self-access for the daemon to
+	// commit a maintainer run there (internal/maintainer), for fn only. Refused while
+	// a live edit grant holds the self mask.
+	WithSelfRuntimeAccess(fn func() error) error
 	// PlanTemporaryGrant validates an `edit-protected forward` rule against this resource's
 	// rows without writing; the caller journals the grant's allow rows, then Applies it.
 	PlanTemporaryGrant(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error)
@@ -66,11 +70,6 @@ type GuardRepository interface {
 	// process_vm_readv/ptrace protection for processes that already read a guarded file.
 	SnapshotTaintedPIDs() ([]uint32, error)
 	RestoreTaintedPIDs(pids []uint32) error
-	// SnapshotSuperseded / RestoreSuperseded carry the keys of replaced binaries that processes
-	// started before the replacement still run: a reload rebuilds the whitelist from paths, which
-	// no longer name them.
-	SnapshotSuperseded() ([]guard.SupersededBinary, error)
-	RestoreSuperseded(bins []guard.SupersededBinary) error
 	// RootAnchor returns the watch root the guard is confined to and whether that inode still
 	// exists. Reload compares a kept resource's old and new anchors with it: a new root while the
 	// old one still exists means the path was re-pointed through an unguarded ancestor.

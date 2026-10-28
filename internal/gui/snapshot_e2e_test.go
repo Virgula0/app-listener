@@ -58,6 +58,7 @@ func TestSnapshots(t *testing.T) {
 		ne := &snapNet{}
 		s.network = workbench.NewNetwork(ne.engines())
 		snapLink := newFakeLink(true)
+		snapLink.trust = snapTrustRows()
 		s.startBackend = func() (backendLink, error) { return snapLink, nil }
 		w.SetContent(s.view())
 		w.Resize(fyne.NewSize(1280, 820))
@@ -419,7 +420,7 @@ func snapProtected(t *testing.T, s *shell, link *fakeLink, prefix string) {
 	save(t, prefix+"Overview.png", s.win)
 
 	p.link = link
-	p.authenticate(link, "Edit protected files", func([]string) {})
+	p.s.authenticate(link, "Edit protected files", p.timeoutSec(), p.finish, func([]string) {})
 	save(t, prefix+"Password.png", s.win)
 	s.win.Canvas().Overlays().Top().Hide()
 
@@ -454,4 +455,16 @@ func snapProtected(t *testing.T, s *shell, link *fakeLink, prefix string) {
 	p.show(cv.root)
 	save(t, prefix+"Config.png", s.win)
 	p.show(p.over)
+}
+
+func snapTrustRows() []editbackend.TrustRow {
+	seen := time.Date(2026, 10, 28, 9, 12, 0, 0, time.UTC)
+	return []editbackend.TrustRow{
+		{Line: "/home/alice/.local/bin/gh", Resolved: "/home/alice/.local/bin/gh", Resources: "/home/alice/.config/gh",
+			SeenAt: seen, SHA256: "9f2c4e1b7a0d3c58e6f1a2b4c7d9e0f3a5b8c1d4e7f0a3b6c9d2e5f8a1b4c7d0", HasStat: true,
+			UID: 1000, Mode: 0o755, ModTime: seen.Add(-time.Hour)},
+		{Line: "/opt/discord/Discord", Resolved: "/opt/discord/Discord", Resources: "/home/alice/.config/discord",
+			SeenAt: seen.Add(time.Minute), SHA256: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+			Skip: "changed again since the daemon refused it (now 77aa…): reload the daemon to have it judged again"},
+	}
 }

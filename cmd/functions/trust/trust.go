@@ -7,14 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/binledger"
-	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/bintrust"
 	"github.com/Virgula0/app-listener/internal/logging"
 	"github.com/Virgula0/app-listener/internal/systemd"
 	"github.com/Virgula0/app-listener/internal/wizard"
@@ -69,20 +67,11 @@ func init() {
 	TrustCmd.AddCommand(listCmd, addCmd)
 }
 
-type candidate struct {
-	binledger.Pending
-	current [32]byte
-	readErr error
-}
-
 func run(cmd *cobra.Command, args []string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("trust must be run as root: sudo app-listener trust")
 	}
-	if _, err := os.Stat(filepath.Dir(binledger.DefaultPath)); err != nil {
-		return fmt.Errorf("no %s: is the daemon installed? (%w)", filepath.Dir(binledger.DefaultPath), err)
-	}
-	l, err := binledger.Open(binledger.DefaultPath)
+	l, err := bintrust.OpenLedger()
 	if err != nil {
 		return err
 	}
@@ -97,7 +86,7 @@ func run(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(out, "No refused binaries: nothing to confirm.")
 		return nil
 	}
-	confirmed, err := confirmAll(out, l, cands)
+	confirmed, err := confirmAll(out, l, cands, len(args) > 0)
 	if err != nil {
 		return err
 	}
@@ -114,12 +103,16 @@ func run(cmd *cobra.Command, args []string) error {
 
 // confirmAll describes each candidate and records the ones confirmed (all with --yes, none with
 // `trust list`), returning how many.
-func confirmAll(out io.Writer, l *binledger.Ledger, cands []candidate) (int, error) {
+func confirmAll(out io.Writer, l *binledger.Ledger, cands []bintrust.Row, given bool) (int, error) {
 	confirmed := 0
 	for i := range cands {
 		c := &cands[i]
 		describe(out, c)
-		if listOnly || !confirmable(out, c) {
+		if listOnly {
+			continue
+		}
+		if why := c.Skip(); why != "" {
+			fmt.Fprintf(out, "  %s: skipped\n", why)
 			continue
 		}
 		ok := yesAll
@@ -132,7 +125,7 @@ func confirmAll(out io.Writer, l *binledger.Ledger, cands []candidate) (int, err
 		if !ok {
 			continue
 		}
-		if err := l.Record(c.Line, c.current, binledger.SourceConfirmed); err != nil {
+		if err := record(l, c, given); err != nil {
 			return confirmed, fmt.Errorf("recording %s: %w", c.Line, err)
 		}
 		confirmed++
@@ -141,42 +134,27 @@ func confirmAll(out io.Writer, l *binledger.Ledger, cands []candidate) (int, err
 	return confirmed, nil
 }
 
+// record stores the hash shown; a refused row only while the daemon's refusal still names it.
+func record(l *binledger.Ledger, c *bintrust.Row, given bool) error {
+	if given {
+		return l.Record(c.Line, c.Current, binledger.SourceConfirmed)
+	}
+	ok, err := l.ConfirmPending(c.Line, c.Current)
+	if err == nil && !ok {
+		err = errors.New("the daemon refused other content for it meanwhile: run trust again")
+	}
+	return err
+}
+
 // candidates are the ledger's pending rows, or the given lines as they are now.
-func candidates(l *binledger.Ledger, args []string) ([]candidate, error) {
-	var pend []binledger.Pending
-	if len(args) == 0 {
-		var err error
-		if pend, err = l.ListPending(); err != nil {
-			return nil, err
-		}
+func candidates(l *binledger.Ledger, args []string) ([]bintrust.Row, error) {
+	if len(args) > 0 {
+		return bintrust.Given(args, "(given on the command line)"), nil
 	}
-	for _, a := range args {
-		pend = append(pend, binledger.Pending{Line: a, Resolved: a, Resources: "(given on the command line)",
-			SeenAt: time.Now()})
-	}
-	out := make([]candidate, 0, len(pend))
-	for _, p := range pend {
-		c := candidate{Pending: p}
-		c.current, c.readErr = hashNow(p.Line)
-		if len(args) > 0 {
-			c.SHA256 = c.current
-		}
-		out = append(out, c)
-	}
-	return out, nil
+	return bintrust.Pending(l)
 }
 
-func hashNow(path string) ([32]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	defer f.Close()
-	e, err := ebpf.ComputeBinaryEntryFile(f, path)
-	return e.Hash, err
-}
-
-func describe(w io.Writer, c *candidate) {
+func describe(w io.Writer, c *bintrust.Row) {
 	fmt.Fprintf(w, "\n%s\n", logging.SanitizeText(c.Line))
 	if c.Resolved != c.Line {
 		fmt.Fprintf(w, "  resolves to: %s\n", logging.SanitizeText(c.Resolved))
@@ -184,24 +162,8 @@ func describe(w io.Writer, c *candidate) {
 	fmt.Fprintf(w, "  resource:    %s\n", logging.SanitizeText(c.Resources))
 	fmt.Fprintf(w, "  refused at:  %s\n", c.SeenAt.Format(time.RFC3339))
 	fmt.Fprintf(w, "  sha256:      %x\n", c.SHA256)
-	var st unix.Stat_t
-	if unix.Stat(c.Line, &st) == nil {
+	if st := c.Stat; st != nil {
 		fmt.Fprintf(w, "  owner uid:   %d   mode: %o   modified: %s\n", st.Uid, st.Mode&0o7777,
 			time.Unix(st.Mtim.Sec, 0).Format(time.RFC3339))
 	}
-}
-
-// confirmable: only the content the daemon refused is confirmed. A file that changed again since is
-// judged afresh by the next reload instead.
-func confirmable(w io.Writer, c *candidate) bool {
-	switch {
-	case c.readErr != nil:
-		fmt.Fprintf(w, "  cannot read it now (%v): skipped\n", c.readErr)
-		return false
-	case c.current != c.SHA256:
-		fmt.Fprintf(w, "  changed again since the daemon refused it (now %x): skipped — reload the daemon "+
-			"to have it judged again\n", c.current)
-		return false
-	}
-	return true
 }

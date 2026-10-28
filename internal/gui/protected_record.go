@@ -103,7 +103,7 @@ func (f *recordForm) submit() {
 	}
 	paths := append([]string(nil), f.paths...)
 	p.begin(func(link backendLink) {
-		p.authenticate(link, "Record access", func([]string) {
+		p.s.authenticate(link, "Record access", p.timeoutSec(), p.finish, func([]string) {
 			var m editbackend.Message
 			var err error
 			p.s.background(func() {

@@ -140,6 +140,77 @@ read its memory or its `/proc/<pid>` metadata. Otherwise any process could read 
 out of the app that loaded it. Programs that must inspect every process (screen-sharing portals)
 are listed under `[inspectors]`, see [Daemon configuration](daemon-config.md#process-inspectors).
 
+## App maintainers (Steam runtime updates)
+
+Steam's launcher, `~/.local/share/Steam/steam.sh`, unpacks and pins its runtimes inside
+`ubuntu12_32` and `steamrt64` with `tar`, `mkdir` and `ln`. Those are read-only `lib_dir`s, and
+general tools are not their writers (whitelisting them would let any process plant a library
+there), so the launch after a runtime update fails. The daemon runs Valve's own `steam.sh` for it,
+unmodified, and keeps only what it can validate. Nothing about what the script does is built into
+app-listener: a new Steam version needs no new app-listener.
+
+**When.** At start and reload, within about 15 seconds of an entry being created, removed or
+renamed directly in one of Steam's lib_dirs (Steam wrote an update), and every 30 minutes (the pins
+follow host library upgrades). Never while a Steam binary runs. A failed run is retried after 30
+minutes, or sooner once the lib_dirs change again.
+
+**Which script.** Only the `steam.sh` the binary ledger confirms, like a whitelisted binary:
+recorded when Steam's updater writes it while the daemon runs, or by `install`, or confirmed with
+[`trust`](binary-trust.md#trust). It is a reserved name, so only Steam's binaries can write it
+while the daemon runs. A `steam.sh` changed while the daemon was stopped is not run:
+
+```
+daemon: .../steam.sh was not run: it is not confirmed in the binary ledger; confirm it with `sudo app-listener trust` if Steam updated it
+```
+
+**How it runs.** The script runs as the Steam user in private mount, pid, IPC and network
+namespaces, with a clean environment and no new privileges. It sees an empty private home holding
+only the Steam directory, plus private `/tmp` and `/run/user/<uid>`: it reaches none of the user's
+other files or sockets, and whatever it writes outside the Steam directory is discarded. The
+`steam.sh` it runs is a root-owned copy of the file the ledger checked, refused unless its sha256
+still matches, bound over its path whatever the path names by then.
+Steam's own binaries (`steam`, `steamwebhelper`, ...) are replaced with `true` inside the sandbox,
+so the script does its maintenance and then "starts" nothing. Everything it writes lands in an
+overlay whose writable layer is root-only, under `/var/lib/app-listener/maintain`. That directory
+must not be on overlayfs itself (a container's root, a live system): the kernel refuses an overlay's
+writable layer there, and every run fails until it is moved to a real filesystem or a tmpfs.
+
+**What is kept.** Only changes below Steam's lib_dirs that are on the same filesystem as
+`steam.sh`, and only when every one passes:
+
+- directories and deletions are kept;
+- a symlink is kept only if it leads, through every hop as the tree will be after the commit, into
+  one of Steam's lib_dirs, or to a name only root decides, outside every user home and not under
+  `/proc`: a root-owned file no one else may write, a directory only root can fill all the way
+  down (at most 4096 entries; `/etc/ssl/certs` passes, `/tmp` or a home does not), on a
+  filesystem mounted at least once without `nosuid` and not FUSE (a user's udisks2 image presents
+  any owner its author wrote), or a missing name in a directory only root can write that is not
+  one root later creates for a user (a new home beside `/home/*`, `/run/user/<uid>`). Nothing at
+  or below `/media`, `/run/media` or `/mnt` passes, existing or not: a user's own filesystem may
+  be mounted there. A `..` may only lead a target
+  (`../lib/libfoo.so`). Same-uid malware can write the overlay while `steam.sh` runs (through
+  `/proc/<pid>/cwd`), so a symlink out to the user's files would hand Steam's whitelisted
+  binaries content no lib_dir vouches for;
+- a regular file is kept only if its exact content is already in that lib_dir, as a file or as a
+  member of a tar archive there (plain, gzip, bzip2, xz or zstd; `xz` and `zstd` run as `nobody`),
+  or it is a path record of at most 4 KiB: lines that are empty or an absolute path of letters,
+  digits and `/._+@~:,-` only (what `setup.sh` records about the pins), written without exec bits;
+- setuid, setgid and sticky bits are dropped; devices, FIFOs and sockets refuse the run;
+- nothing may replace a whitelisted binary of any resource, or a directory above one.
+
+Otherwise nothing is committed. Files are written from what was validated, never re-read from
+the overlay afterwards, and owned by the Steam user. Writes happen only while the daemon holds a
+write grant on that lib_dir and a reserved-name writer row for its own binary as root (the runtime
+holds files named like Steam's binaries, such as `game-bin/steam`). The grant is refused while an
+`edit-protected` session is active. The log then reads:
+
+```
+daemon: committed N change(s) .../steam.sh made to its lib_dirs; start Steam again if it failed to start
+```
+
+The first launch after a runtime update still fails, because `steam.sh` runs again right away and
+its own writes are refused. Start Steam again once that line appears.
+
 ## Related
 
 - [Daemon configuration](daemon-config.md): the config file.

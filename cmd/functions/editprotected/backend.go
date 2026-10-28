@@ -47,6 +47,7 @@ const (
 	stRecording                      // a recording runs (record_start)
 	stRecorded                       // stopped: review, plan, apply
 	stApplied                        // applied: only its backups may be deleted
+	stTrusting                       // trust_inspect ran: add the inspected lines
 	stDone                           // only end
 )
 
@@ -82,6 +83,11 @@ var backendOps = map[string]backendOp{
 	editbackend.OpRecordPlan:         {[]backendState{stRecorded}, (*backend).recordPlan},
 	editbackend.OpRecordApply:        {[]backendState{stRecorded}, (*backend).recordApply},
 	editbackend.OpRecordDeleteBackup: {[]backendState{stApplied}, (*backend).recordDeleteBackup},
+
+	editbackend.OpTrustList:    {[]backendState{stNew}, (*backend).trustList},
+	editbackend.OpTrustConfirm: {[]backendState{stNew}, (*backend).trustConfirm},
+	editbackend.OpTrustInspect: {[]backendState{stNew, stAuthed, stTrusting}, (*backend).trustInspect},
+	editbackend.OpTrustAdd:     {[]backendState{stTrusting}, (*backend).trustAdd},
 }
 
 // errSessionEnded: the daemon revoked the live grant; nothing more is written.
@@ -107,6 +113,8 @@ type backend struct {
 	vault     *vaultfs.Vault
 	fsVault   *fscrypt.Vault // offline: the unlocked vault to re-lock
 	record    *recordFlow
+	// inspected are the lines the last trust_inspect showed: trust_add records only those.
+	inspected []string
 	ended     atomic.Bool
 	// closing: our own cleanup closes the connection, which is not the daemon ending it.
 	closing   atomic.Bool

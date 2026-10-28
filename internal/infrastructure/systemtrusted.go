@@ -3,6 +3,7 @@ package ebpf
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,6 +36,10 @@ func OpenSystemPlaced(path string) (*os.File, error) {
 }
 
 func systemFileStat(f *os.File, st *unix.Stat_t) error {
+	return placedFileStat(int(f.Fd()), st)
+}
+
+func placedFileStat(fd int, st *unix.Stat_t) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return errors.New("is not a regular file")
 	}
@@ -42,7 +47,7 @@ func systemFileStat(f *os.File, st *unix.Stat_t) error {
 		return err
 	}
 	var fs unix.Statfs_t
-	if err := unix.Fstatfs(int(f.Fd()), &fs); err != nil {
+	if err := unix.Fstatfs(fd, &fs); err != nil {
 		return err
 	}
 	if fs.Type == unix.FUSE_SUPER_MAGIC {
@@ -54,12 +59,33 @@ func systemFileStat(f *os.File, st *unix.Stat_t) error {
 // walkPlaced resolves path for OpenSystemPlaced, expanding symlinks by hand; it returns the final
 // fd and its stat.
 func walkPlaced(path string) (int, *unix.Stat_t, error) {
-	if !filepath.IsAbs(path) {
-		return -1, nil, fmt.Errorf("%s is not an absolute path", path)
-	}
-	w := &placedWalk{path: path, dir: -1, comps: strings.Split(path, "/")}
-	if err := w.restart(); err != nil {
+	w := &placedWalk{path: path, dir: -1}
+	fd, err := w.run()
+	if err != nil {
 		return -1, nil, err
+	}
+	return fd, &w.st, nil
+}
+
+// placedWalk is walkPlaced's state: dir is the placed directory names are looked up in, st the
+// stat of the last inode reached, comps the names still to resolve. missing is the physical path
+// of the name a failed lookup did not find, every symlink hop before it resolved.
+type placedWalk struct {
+	path    string
+	dir     int
+	st      unix.Stat_t
+	comps   []string
+	hops    int
+	missing string
+}
+
+func (w *placedWalk) run() (int, error) {
+	if !filepath.IsAbs(w.path) {
+		return -1, fmt.Errorf("%s is not an absolute path", w.path)
+	}
+	w.comps = strings.Split(w.path, "/")
+	if err := w.restart(); err != nil {
+		return -1, err
 	}
 	for len(w.comps) > 0 {
 		c := w.comps[0]
@@ -70,23 +96,13 @@ func walkPlaced(path string) (int, *unix.Stat_t, error) {
 		fd, done, err := w.step(c)
 		if err != nil {
 			unix.Close(w.dir)
-			return -1, nil, err
+			return -1, err
 		}
 		if done {
-			return fd, &w.st, nil
+			return fd, nil
 		}
 	}
-	return w.dir, &w.st, nil
-}
-
-// placedWalk is walkPlaced's state: dir is the placed directory names are looked up in, st the
-// stat of the last inode reached, comps the names still to resolve.
-type placedWalk struct {
-	path  string
-	dir   int
-	st    unix.Stat_t
-	comps []string
-	hops  int
+	return w.dir, nil
 }
 
 func (w *placedWalk) restart() error {
@@ -112,6 +128,11 @@ func (w *placedWalk) step(c string) (fd int, done bool, err error) {
 		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS}
 	next, err := unix.Openat2(w.dir, c, &how)
 	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			if dir, e := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", w.dir)); e == nil {
+				w.missing = filepath.Join(dir, c)
+			}
+		}
 		return -1, false, &os.PathError{Op: "open", Path: w.path, Err: err}
 	}
 	if err = unix.Fstat(next, &w.st); err != nil {
@@ -177,8 +198,171 @@ func placedDir(fd int) error {
 	if err := unix.Fstatfs(fd, &fs); err != nil {
 		return err
 	}
-	if fs.Type == unix.FUSE_SUPER_MAGIC {
+	switch fs.Type {
+	case unix.FUSE_SUPER_MAGIC:
 		return fmt.Errorf("%s is on a FUSE filesystem", name)
+	case unix.PROC_SUPER_MAGIC:
+		// /proc/self (and /dev/fd through it) names the reader's own directories, not ours.
+		return fmt.Errorf("%s is on procfs", name)
+	}
+	return nil
+}
+
+// RootPlacedName reports whether only root decides what the clean absolute path names, now and
+// later, as walkPlaced walks it (every symlink hop judged). An existing target is a root-owned file
+// no one else may write, or a directory only root fills all the way down (placedTree), on a mount
+// root vouches for (VouchedDevs): what a symlink to it reaches below is never judged again. A
+// missing one is looked up in a placed directory and is not a name root creates for a user or
+// where a user's media is mounted (userAssignable, userMountable).
+func RootPlacedName(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("%q is not a clean absolute path", path)
+	}
+	if userMountable(path) {
+		return fmt.Errorf("%s is where a user's own filesystem may be mounted", path)
+	}
+	w := &placedWalk{path: path, dir: -1}
+	fd, err := w.run()
+	switch {
+	case err == nil:
+		defer unix.Close(fd)
+		return placedTarget(fd, &w.st, path)
+	case !errors.Is(err, unix.ENOENT):
+		return err
+	case w.missing == "":
+		return fmt.Errorf("%s: where the lookup failed is unknown: %w", path, err)
+	case userAssignable(w.missing):
+		return fmt.Errorf("%s: %s is a name root creates for a user", path, w.missing)
+	case userMountable(w.missing):
+		return fmt.Errorf("%s: %s is where a user's own filesystem may be mounted", path, w.missing)
+	}
+	return nil
+}
+
+// placedTarget judges RootPlacedName's existing target fd. A tree is vouched at its top only:
+// placedEntry never crosses into a mount below.
+func placedTarget(fd int, st *unix.Stat_t, path string) error {
+	j := &treeJudge{}
+	var err error
+	if j.devs, err = hostVouchedDevs(); err != nil {
+		return err
+	}
+	if err := vouchedFd(fd, j.devs); err != nil {
+		return fmt.Errorf("%s %w", path, err)
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		return placedTree(fd, j)
+	}
+	if err := placedFileStat(fd, st); err != nil {
+		return fmt.Errorf("%s %w", path, err)
+	}
+	return nil
+}
+
+// userAssignable: a missing name root creates for a user later: a home beside the users' homes
+// (useradd) or a /run/user/<uid> (logind).
+func userAssignable(p string) bool {
+	dir := filepath.Dir(p)
+	if dir == "/home" || dir == "/run/user" {
+		return true
+	}
+	homesMu.RLock()
+	defer homesMu.RUnlock()
+	for _, h := range userHomes {
+		if filepath.Dir(h) == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// userMountable: p is at or below where udisks2 mounts a user's media (/media, /run/media) or fstab
+// "user" mounts conventionally go (/mnt). A filesystem mounted there later presents any owner its
+// author wrote, over whatever the name holds now.
+func userMountable(p string) bool {
+	for _, root := range []string{"/media", "/run/media", "/mnt"} {
+		if _, ok := PathUnder(p, root); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// treeJudge is placedTree's state: n counts the entries judged, at most maxPlacedDirEntries (a tree
+// too large to judge is refused); devs are the superblocks root vouches for.
+type treeJudge struct {
+	n    int
+	devs map[uint64]struct{}
+}
+
+// placedTree: directory fd and everything below it only root decides. A symlink below must end, as
+// OpenSystemPlaced walks it, on a placed regular file on a vouched mount; mounts below are not
+// crossed.
+func placedTree(fd int, j *treeJudge) error {
+	if err := placedDir(fd); err != nil {
+		return err
+	}
+	name, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return err
+	}
+	d, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	names, err := d.Readdirnames(maxPlacedDirEntries + 1 - j.n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	for _, c := range names {
+		j.n++
+		if j.n > maxPlacedDirEntries {
+			return fmt.Errorf("%s holds over %d entries: too many to judge", name, maxPlacedDirEntries)
+		}
+		if err := placedEntry(fd, name, c, j); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func placedEntry(dir int, dirName, c string, j *treeJudge) error {
+	how := unix.OpenHow{Flags: unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV}
+	fd, err := unix.Openat2(dir, c, &how)
+	if err != nil {
+		return &os.PathError{Op: "open", Path: filepath.Join(dirName, c), Err: err}
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	p := filepath.Join(dirName, c)
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		return placedTree(fd, j)
+	case unix.S_IFLNK:
+		target, err := readlinkFd(fd)
+		if err != nil {
+			return err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(dirName, target) // dirName is physical: the lexical ".." is the kernel's
+		}
+		f, err := OpenSystemPlaced(target)
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		defer f.Close()
+		if err := vouchedFd(int(f.Fd()), j.devs); err != nil {
+			return fmt.Errorf("%s: %s %w", p, target, err)
+		}
+		return nil
+	}
+	if err := placedFileStat(fd, &st); err != nil {
+		return fmt.Errorf("%s %w", p, err)
 	}
 	return nil
 }

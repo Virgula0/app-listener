@@ -253,8 +253,23 @@ func (m *trustManager) afterUnlock(cfg *daemonconfig.Config) error {
 	if err := m.tg.SetElectronApps(cfg.ElectronApps); err != nil {
 		return trustStartupError(err)
 	}
+	m.vetMaintainers(cfg)
 	m.vet.endBootstrap()
 	return nil
+}
+
+// vetMaintainers judges each maintainer script (maintain.go) while the ledger's one-time bootstrap
+// and the install's grants still apply, as the whitelist was.
+func (m *trustManager) vetMaintainers(cfg *daemonconfig.Config) {
+	users, err := install.ListUsers()
+	if err != nil {
+		return // the maintainer keeper reports it
+	}
+	for _, a := range maintainedApps(cfg, users) {
+		if f, _, err := m.vet.vetMaintainer(a.owner, a.Script); err == nil {
+			f.Close()
+		}
+	}
 }
 
 // applyInspectors grants cfg's [inspectors] after the trusted set made them TRUSTED_BINARY.

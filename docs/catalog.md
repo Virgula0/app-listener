@@ -50,7 +50,8 @@ The daemon follows them:
 
 - An update written in place of the binary by the app's own updater is re-admitted directly.
 - A new version directory (Discord's `~/.config/discord/0.0.N/`) is admitted by the catalog
-  refresh as soon as the updater finishes writing the binary. No restart, no manual step.
+  refresh as soon as the updater finishes writing the binary, also when it deletes the old version
+  first. No restart, no manual step.
 - A process that creates such a directory without being one of the app's binaries can't plant the
   binary name there (the names are reserved), so nothing it does is admitted.
 
@@ -68,10 +69,15 @@ are reserved names only Discord's binaries may write, so no other process can ma
 updater install chosen code.
 
 The refresh also adopts an app's fixed library dirs as read-only `lib_dir`s once they exist
-(Steam's `ubuntu12_*`, `linux*`, `steamrt64`, `compatibilitytools.d`) and trusts their libraries
-for that app. So that a non-app process can't plant one ahead of it, the daemon reserves those dir
+(Steam's `ubuntu12_*`, `linux*`, `steamrt64`, `compatibilitytools.d`, and `steamui`, the
+JavaScript `steamwebhelper` runs) and trusts their libraries for that app. So that a non-app process can't plant one ahead of it, the daemon reserves those dir
 names for the app's own binaries, present or not: only Steam can create
 `~/.local/share/Steam/compatibilitytools.d`, not your shell or ProtonUp-Qt.
+
+`steam.sh` unpacks and pins Steam's runtimes inside those dirs with general tools the read-only
+dirs refuse, so the daemon runs it sandboxed and commits only what it validates (see
+[App maintainers](daemon.md#app-maintainers-steam-runtime-updates)). It is a reserved name too:
+only Steam's binaries may write it.
 
 There is no npm entry: npm runs as `node`, and whitelisting `node` would let `node -e` read the
 tree.

@@ -102,7 +102,10 @@ every change to enforcement paths as security-sensitive:
   before AUTH: this binary has a root READ baseline on guarded trees), password only over the pipe
   (never argv/env, no line breaks), file ops only through `internal/vaultfs` (shared with the TUI),
   EOF = end (revoke / re-lock). The GUI process never opens a protected path or the control socket
-  and never gets a guard row; it refuses to `forward -w` its own exe.
+  and never gets a guard row; it refuses to `forward -w` its own exe. The Trust page uses it for
+  `trust` (`backendtrust.go`, core `internal/bintrust`): `trust_list`/`trust_confirm` run pre-AUTH
+  because they open only ledger-named lines; `trust_inspect`/`trust_add` take caller-named paths, so
+  only after AUTH or with the daemon stopped, and record only inspected lines whose hash still matches.
 - **The daemon self-protects.** It guards its own `/etc/app-listener` config + fscrypt
   key + `binaries.db` (password hash) (`selfguards.go`) and drops to `guard.ModeReadOnly` where appropriate — keep those
   guarantees intact.

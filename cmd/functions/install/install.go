@@ -577,12 +577,16 @@ func deployFiles(cfgText string, sshUsers []inst.User, bunUsers []bunUser, editP
 	return configChanged, grantNewBinaries(cfgText)
 }
 
-// grantNewBinaries lets the daemon's next start record every whitelist line the ledger doesn't
-// know yet (binledger.Grant): choosing a section in this wizard is the confirmation. Lines already
-// recorded keep their hash, so a binary that changed while the daemon was stopped for this install
-// still needs `trust`.
+// grantNewBinaries lets the daemon's next start record every whitelist line, and every catalog
+// maintainer script the config makes it run, that the ledger doesn't know yet (binledger.Grant):
+// choosing a section in this wizard is the confirmation. Lines already recorded keep their hash, so
+// a binary that changed while the daemon was stopped for this install still needs `trust`.
 func grantNewBinaries(cfgText string) error {
 	cfg, err := daemonconfig.Parse([]byte(cfgText))
+	if err != nil {
+		return err
+	}
+	users, err := inst.ListUsers()
 	if err != nil {
 		return err
 	}
@@ -591,7 +595,11 @@ func grantNewBinaries(cfgText string) error {
 		return fmt.Errorf("opening the binary ledger: %w", err)
 	}
 	defer l.Close()
-	for _, line := range binledger.Lines(cfg) {
+	lines := binledger.Lines(cfg)
+	for _, m := range inst.Maintainers(cfg, users) {
+		lines = append(lines, m.Script)
+	}
+	for _, line := range lines {
 		if _, found, err := l.Lookup(line); err != nil {
 			return err
 		} else if found {

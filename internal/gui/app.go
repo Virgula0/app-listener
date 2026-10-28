@@ -41,6 +41,7 @@ const (
 	pageUpdate
 	pageInstall
 	pageDaemon
+	pageTrust
 )
 
 type pageDef struct {
@@ -55,6 +56,7 @@ var pageDefs = []pageDef{
 	{pageFiles, "folders", "Files", "Monitor folders and files, then guard them with a whitelist or blacklist"},
 	{pageNetwork, "globe-hemisphere-west", "Network", "Watch binaries' network activity and enforce a network guard"},
 	{pageProtected, "lock-simple", "Protected", "Edit protected directories, grant temporary access, edit the daemon's configuration"},
+	{pageTrust, "shield-check", "Trust", "Confirm whitelisted binaries the daemon refused because their content changed or is new"},
 	{pageUpdate, "arrow-clockwise", "Update", "Update the installed daemon to the latest signed release"},
 	{pageInstall, "download-simple", "Install", "Set up the protection daemon"},
 	{pageDaemon, "pulse", "Daemon", "Start or stop the protection daemon with systemctl"},
@@ -81,6 +83,7 @@ type shell struct {
 	install  *installPage
 	update   *updatePage
 	protect  *protectedPage
+	trust    *trustPage
 	daemon   *daemonPage
 	// startBackend runs the installed binary's edit-protected backend (a fake in tests).
 	startBackend func() (backendLink, error)
@@ -150,19 +153,29 @@ func Run(opts *Options) (err error) {
 		func(fyne.Shortcut) { s.focusSearch() })
 
 	s.reprobe()
+	s.trust.probe()
 	s.checkForUpdate()
 	s.every(time.Second, s.updateStats)
 	s.every(6*time.Hour, s.checkForUpdate)
 	w.ShowAndRun()
-	if s.protect != nil && s.protect.link != nil {
-		s.protect.link.Close() // narrows a live grant, re-locks an offline vault
-	}
+	s.closeBackends()
 	s.network.Close()
 	s.files.Close()
 	if s.install != nil {
 		s.install.cleanup()
 	}
 	return nil
+}
+
+// closeBackends ends the open edit-protected backends: a live grant is narrowed, an offline vault
+// re-locked.
+func (s *shell) closeBackends() {
+	if s.protect != nil && s.protect.link != nil {
+		s.protect.link.Close()
+	}
+	if s.trust.link != nil {
+		s.trust.link.Close()
+	}
 }
 
 // confirmClose asks before quitting mid-run: the installer or updater would stop between two steps,
@@ -247,6 +260,7 @@ func newShell(a fyne.App, w fyne.Window, opts *Options) *shell {
 	s.subtitle.Wrapping = fyne.TextWrapOff
 	s.subtitle.Truncation = fyne.TextTruncateEllipsis
 	s.home = newHomePage(s)
+	s.trust = newTrustPage(s)
 	s.startBackend = startBackend
 	s.files = workbench.NewFiles(workbench.RealFileEngines())
 	s.network = workbench.NewNetwork(workbench.RealNetEngines())
@@ -384,6 +398,8 @@ func (s *shell) build(id pageID) fyne.CanvasObject {
 	case pageDaemon:
 		s.daemon = newDaemonPage(s)
 		return s.daemon.view()
+	case pageTrust:
+		return s.trust.view()
 	default:
 		s.install = newInstallPage(s)
 		return s.install.view()
@@ -398,6 +414,8 @@ func (s *shell) refreshPage(id pageID) {
 		s.install.refreshStatus()
 	case id == pageProtected && s.protect != nil:
 		s.protect.probe()
+	case id == pageTrust:
+		s.trust.probe()
 	case id == pageDaemon && s.daemon != nil && !s.daemon.running:
 		s.daemon.refresh()
 	}
@@ -412,6 +430,7 @@ func (s *shell) daemonChanged() {
 	if s.protect != nil {
 		s.protect.probe()
 	}
+	s.trust.probe()
 	if s.daemon != nil && !s.daemon.running {
 		s.daemon.refresh()
 	}

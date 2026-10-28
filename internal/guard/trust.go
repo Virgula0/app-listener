@@ -52,9 +52,10 @@ type TrustGuard struct {
 	links []link.Link
 	rd    *ringbuf.Reader
 	done  chan struct{}
-	// ownerByPath: UpdaterPlan.Owners, for AllowReplacement.
+	// ownerByPath: UpdaterPlan.Owners, for AllowReplacement; ownerByRes: UpdaterPlan.Resources.
 	ownerMu     sync.Mutex
 	ownerByPath map[string]uint64
+	ownerByRes  map[string]uint64
 	// binaryStat: SetBinaryResolver; nil = ebpf.StatConfined. Guarded by ownerMu.
 	binaryStat statFunc
 	// mounts: guard_vouched_devs upkeep (trust_mounts.go).
@@ -67,6 +68,8 @@ type TrustGuard struct {
 	// appsMu guards apps: the LAUNCH_APP keys in trust_launch (SetElectronApps).
 	appsMu sync.Mutex
 	apps   map[string]bool
+	// rootWriterMu serializes WithRootWriter: a nested caller must not delete the row early.
+	rootWriterMu sync.Mutex
 }
 
 // trustRows is one key's rows across guard_trusted_files and the bit maps (trustBitMaps order).
