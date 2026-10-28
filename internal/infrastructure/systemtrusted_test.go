@@ -127,8 +127,51 @@ func TestComputeBinaryEntryFileMatchesPath(t *testing.T) {
 	}
 }
 
+// rootOnlyTree: dir, its entries and their symlink targets, and every ancestor of each, are
+// root-owned and writable by root alone. GitHub's runners make /usr/share world-writable, where
+// /etc/ssl/certs links point.
+func rootOnlyTree(dir string) bool {
+	paths := []string{dir}
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		paths = append(paths, p)
+		if d.Type()&os.ModeSymlink != 0 {
+			r, err := filepath.EvalSymlinks(p)
+			if err != nil {
+				return err
+			}
+			paths = append(paths, r)
+		}
+		return nil
+	})
+	if err != nil {
+		return false
+	}
+	for _, p := range paths {
+		for ; ; p = filepath.Dir(p) {
+			var st unix.Stat_t
+			if unix.Lstat(p, &st) != nil {
+				return false
+			}
+			if st.Mode&unix.S_IFMT != unix.S_IFLNK && rootOwnedStat(&st) != nil {
+				return false
+			}
+			if p == "/" {
+				break
+			}
+		}
+	}
+	return true
+}
+
 func TestRootPlacedName(t *testing.T) {
-	for _, p := range []string{"/usr/lib/libc.so.6", "/usr/lib/no-such-dir/x", "/etc/ssl/certs", "/run/host/usr/lib/x"} {
+	placed := []string{"/usr/lib/libc.so.6", "/usr/lib/no-such-dir/x", "/run/host/usr/lib/x"}
+	if rootOnlyTree("/etc/ssl/certs") {
+		placed = append(placed, "/etc/ssl/certs")
+	}
+	for _, p := range placed {
 		if err := RootPlacedName(p); err != nil {
 			t.Errorf("RootPlacedName(%s): %v", p, err)
 		}

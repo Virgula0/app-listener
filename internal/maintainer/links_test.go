@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 // linkFixture: lib_dirs lib and ui below a user-owned root, the user's own files beside them, and
@@ -45,8 +47,9 @@ func TestCheckLinksAccepts(t *testing.T) {
 			t.Errorf("%s (%s) refused: %v", why, target, err)
 		}
 	}
-	// The runtime's usr/lib/ssl/certs: a directory only root fills, all the way down.
-	if _, err := os.Stat("/etc/ssl/certs"); err == nil {
+	// The runtime's usr/lib/ssl/certs: a directory only root fills, all the way down, where the
+	// host keeps it so (not on GitHub's runners: their /usr/share is world-writable).
+	if ebpf.RootPlacedName("/etc/ssl/certs") == nil {
 		if err := checkLink(t, libs, lib, "rt/ssl/certs", "/etc/ssl/certs"); err != nil {
 			t.Errorf("a root-only system directory refused: %v", err)
 		}
