@@ -65,6 +65,7 @@ folder picker picks the folder shown. The path field above takes a typed absolut
 | Files | `monitor` and `guard`, on several folders or files side by side. |
 | Network | `network monitor` and `network guard`. |
 | Protected | `edit-protected`: edit, temporary access, daemon config, password. |
+| Trust | `trust`, `trust list` and `trust add`: confirm the binaries the daemon refused. |
 | Update | `update`, from the stable or the pre-release channel. |
 | Install | `install`: the wizard and its subcommands. |
 | Daemon | `systemctl start` / `stop app-listener-daemon`, with the unit's state and journal. |
@@ -229,6 +230,36 @@ the window dies, the backend sees its pipe close and does the same.
 
 The window shows the files it edits: on X11 any program in your session can read the window or
 type into it. Prefer a Wayland session when editing secrets.
+
+## Trust
+
+The Trust page is `app-listener trust`. The binary ledger (`/etc/app-listener/binaries.db`) is
+readable only by the daemon's own binary, so the page runs the installed headless binary
+(`edit-protected --backend`, checked as on the [Protected](#protected) page) to read and write it;
+the window only shows the rows. The sidebar shows a dot on **Trust** while the daemon refuses any
+binary; the window checks at start, when the page opens, and after a run or an edit-protected
+workflow (which may reload the daemon).
+
+| Action | CLI equivalent |
+|---|---|
+| The list of refused binaries | `trust list` |
+| **Trust selected** (**Select all** checks every row) | `trust` (`--yes`) |
+| **Reload a running daemon afterwards** unchecked | `--no-reload` |
+| **Trust a line by hand** | `trust add PATH...` |
+
+Each refused binary shows its whitelist line, the path it resolves to, the resource, when it was
+refused, the refused content's sha256, and the file's owner, mode and modification time. A file
+that can't be read, or changed again since the daemon refused it, can't be checked: the row says
+why, and the next reload judges it afresh. **Trust selected** lists the binaries and asks first.
+A binary is recorded only while the daemon's refusal still names the content shown and the file
+still holds it; anything else is listed as not recorded, with the reason.
+
+**Trust a line by hand** takes absolute paths (typed, or picked with **Browse...**), for a line you
+added to `daemon.conf` yourself. While the daemon runs it asks for the edit-protected password
+first, since hashing a path you name reads it with the daemon's binary; with the daemon stopped it
+doesn't. It then shows each file's sha256, owner, mode and modification time and asks to trust
+them; a file whose content changed since is not recorded. A daemon running without its control
+socket refuses it: stop the daemon, or use `sudo app-listener trust add`.
 
 ## Update
 

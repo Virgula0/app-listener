@@ -25,7 +25,7 @@ func (p *protectedPage) startConfig() {
 		return
 	}
 	p.begin(func(link backendLink) {
-		p.authenticate(link, "Daemon configuration", func([]string) {
+		p.s.authenticate(link, "Daemon configuration", p.timeoutSec(), p.finish, func([]string) {
 			var m editbackend.Message
 			var err error
 			p.s.background(func() { m, err = link.Call(&editbackend.Request{Op: editbackend.OpConfigGet}) }, func() {

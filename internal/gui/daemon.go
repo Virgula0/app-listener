@@ -143,7 +143,7 @@ func (d *daemonPage) gateNote() string {
 	case daemonEUID() != 0:
 		return "systemctl needs root: restart the window with sudo."
 	case !d.loaded:
-		return "Checking the daemon…"
+		return checkingDaemon
 	case !st.installed:
 		return "No daemon unit is installed: set it up on the Install page."
 	case st.active != unitActive && st.proc:

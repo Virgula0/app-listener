@@ -99,6 +99,8 @@ same way.
 Only the exact content that was refused is confirmed: a file that changed again is skipped and
 judged afresh.
 
+The desktop window's Trust page does the same (see [gui.md](gui.md#trust)).
+
 ## Launch scan
 
 Identity is the executable, so `ELECTRON_RUN_AS_NODE=1 code -e ...` or

@@ -170,7 +170,7 @@ func (f *forwardForm) submit() {
 	bins := append([]string(nil), f.bins...)
 	// The backend checks binaries only after AUTH: checking opens them as the daemon's binary.
 	p.begin(func(link backendLink) {
-		p.authenticate(link, "Temporary access", func(resources []string) {
+		p.s.authenticate(link, "Temporary access", p.timeoutSec(), p.finish, func(resources []string) {
 			var m editbackend.Message
 			var err error
 			p.s.background(func() {

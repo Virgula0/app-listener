@@ -129,3 +129,35 @@ func TestLedgerRecordIfAbsentKeepsExistingVerdict(t *testing.T) {
 		t.Fatal("Forget kept the row it wrote")
 	}
 }
+
+func TestLedgerConfirmPendingOnlyTheRefusedContent(t *testing.T) {
+	l, err := Open(filepath.Join(t.TempDir(), "binaries.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	const line = "/home/u/.local/bin/app"
+	refused, other := [32]byte{1}, [32]byte{2}
+	if err := l.AddPending(&Pending{Line: line, Resolved: line, SHA256: refused, Resources: "/r",
+		SeenAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := l.ConfirmPending(line, other); err != nil || ok {
+		t.Fatalf("ConfirmPending of other content = %v, %v", ok, err)
+	}
+	if _, ok, _ := l.Lookup(line); ok {
+		t.Fatal("other content recorded")
+	}
+	if ok, err := l.ConfirmPending(line, refused); err != nil || !ok {
+		t.Fatalf("ConfirmPending of the refused content = %v, %v", ok, err)
+	}
+	if got, ok, _ := l.Lookup(line); !ok || got != refused {
+		t.Fatalf("lookup = %x %v", got, ok)
+	}
+	if p, _ := l.ListPending(); len(p) != 0 {
+		t.Fatalf("pending left: %+v", p)
+	}
+	if ok, err := l.ConfirmPending(line, refused); err != nil || ok {
+		t.Fatalf("ConfirmPending without a pending row = %v, %v", ok, err)
+	}
+}

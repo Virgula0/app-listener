@@ -38,6 +38,9 @@ func startBackend() (backendLink, error) {
 	return c, nil
 }
 
+// checkingDaemon is an action's note while its page's probe runs.
+const checkingDaemon = "Checking the daemon…"
+
 // sessionTimeouts are the live idle timeouts offered (`--idle-timeout`).
 var sessionTimeouts = []struct {
 	label string
@@ -169,7 +172,7 @@ func (p *protectedPage) renderEditGate() {
 	case p.probErr != nil:
 		note = "Unavailable: see Edit mode above."
 	case p.hello == nil:
-		note = "Checking the daemon…"
+		note = checkingDaemon
 	case !p.hello.Live:
 		note = "Needs the daemon running with a password: start it on the Daemon page."
 	}
@@ -271,8 +274,8 @@ func originLabel(origin string) string {
 // begin starts a workflow's backend unless another run or session is open; then runs on the UI
 // goroutine with it.
 func (p *protectedPage) begin(then func(link backendLink)) {
-	if p.link != nil {
-		showInformation("A session is open", "Finish the open edit-protected session first.", p.s.win)
+	if p.link != nil || p.s.trust.link != nil {
+		showInformation("A session is open", "Finish the open edit-protected session or Trust review first.", p.s.win)
 		return
 	}
 	if p.s.running() {
@@ -313,47 +316,50 @@ func (p *protectedPage) finish() {
 	if link == nil {
 		return
 	}
-	p.s.background(link.Close, p.probe)
+	// A configuration change or record apply reloads the daemon, which may refuse binaries anew.
+	p.s.background(link.Close, func() { p.probe(); p.s.trust.probe() })
 }
 
-// authenticate asks for the password (before any protected path is shown) and AUTHs; a refusal asks
-// again, as many times as the operator retries (the daemon rate-limits and locks out).
-func (p *protectedPage) authenticate(link backendLink, title string, ok func(resources []string)) {
+// authenticate asks for the password (before any protected path is shown) and AUTHs link; a refusal
+// asks again, as many times as the operator retries (the daemon rate-limits and locks out). cancel
+// runs when the operator gives up or the backend exits.
+func (s *shell) authenticate(link backendLink, title string, timeoutSec int64, cancel func(),
+	ok func(resources []string)) {
 	entry := widget.NewPasswordEntry()
 	body := promptBody("Edit-protected password", "The daemon checks it before it shows any protected path. "+
 		"Five wrong passwords in a row lock live mode for a minute.", entry)
 	d := dialog.NewCustomConfirm(title, "Unlock", "Cancel", body, func(confirm bool) {
 		if !confirm {
-			p.finish()
+			cancel()
 			return
 		}
 		pw := entry.Text
 		var m editbackend.Message
 		var err error
-		p.s.background(func() {
-			m, err = link.Call(&editbackend.Request{Op: editbackend.OpAuth, Password: pw, TimeoutSec: p.timeoutSec()})
+		s.background(func() {
+			m, err = link.Call(&editbackend.Request{Op: editbackend.OpAuth, Password: pw, TimeoutSec: timeoutSec})
 		}, func() {
 			if errors.Is(err, editbackend.ErrClosed) {
-				p.s.showError(title, err)
-				p.finish()
+				s.showError(title, err)
+				cancel()
 				return
 			}
 			if err != nil {
 				showCustomConfirm(title, "Try again", "Cancel", mutedText(err.Error()), func(again bool) {
 					if again {
-						p.authenticate(link, title, ok)
+						s.authenticate(link, title, timeoutSec, cancel, ok)
 					} else {
-						p.finish()
+						cancel()
 					}
-				}, p.s.win)
+				}, s.win)
 				return
 			}
 			ok(m.Resources)
 		})
-	}, p.s.win)
+	}, s.win)
 	entry.OnSubmitted = func(string) { d.Confirm() }
-	p.s.showSized(d, fyne.NewSize(560, 240))
-	p.s.win.Canvas().Focus(entry)
+	s.showSized(d, fyne.NewSize(560, 240))
+	s.win.Canvas().Focus(entry)
 }
 
 // pickOne asks which resource to open; a single one is taken as is.

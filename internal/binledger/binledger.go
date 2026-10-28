@@ -259,6 +259,28 @@ func (l *Ledger) ListPending() ([]Pending, error) {
 	return out, rows.Err()
 }
 
+// ConfirmPending records sum as line's confirmed content only while line's pending row still holds
+// sum (compare-and-swap), reporting whether it did: a refusal of other content since stays pending.
+func (l *Ledger) ConfirmPending(line string, sum [32]byte) (bool, error) {
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	res, err := tx.ExecContext(context.Background(), `DELETE FROM pending WHERE line = ? AND sha256 = ?`, line, sum[:])
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return false, err
+	}
+	if _, err := tx.ExecContext(context.Background(), `INSERT OR REPLACE INTO binaries (line, sha256, source, updated_at) VALUES (?, ?, ?, ?)`,
+		line, sum[:], string(SourceConfirmed), time.Now().Unix()); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // DropPending removes line's pending row (declined, or no longer configured).
 func (l *Ledger) DropPending(line string) error {
 	_, err := l.db.ExecContext(context.Background(), `DELETE FROM pending WHERE line = ?`, line)
