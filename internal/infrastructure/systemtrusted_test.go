@@ -126,14 +126,19 @@ func TestComputeBinaryEntryFileMatchesPath(t *testing.T) {
 }
 
 func TestRootPlacedName(t *testing.T) {
-	for _, p := range []string{"/usr/lib/libc.so.6", "/usr/lib/no-such-dir/x", "/etc/ssl/certs", "/"} {
+	for _, p := range []string{"/usr/lib/libc.so.6", "/usr/lib/no-such-dir/x", "/etc/ssl/certs", "/run/host/usr/lib/x"} {
 		if err := RootPlacedName(p); err != nil {
 			t.Errorf("RootPlacedName(%s): %v", p, err)
 		}
 	}
-	refused := []string{"/proc/self/cwd/x", "/dev/fd/3", "/tmp/x", "/usr/lib/../lib/x", "usr/lib/x"}
+	// A directory a user fills names what they decide below it, though root decides its own name.
+	refused := []string{"/proc/self/cwd/x", "/dev/fd/3", "/tmp/x", "/usr/lib/../lib/x", "usr/lib/x",
+		"/tmp", "/var/tmp", "/dev/shm", "/", "/home/app-listener-no-such-user/x", "/run/user/4242424242/x"}
 	if os.Geteuid() != 0 {
 		refused = append(refused, filepath.Join(t.TempDir(), "x"), filepath.Join(t.TempDir(), "missing", "x"))
+		if home, err := os.UserHomeDir(); err == nil {
+			refused = append(refused, home)
+		}
 	}
 	for _, p := range refused {
 		if err := RootPlacedName(p); err == nil {

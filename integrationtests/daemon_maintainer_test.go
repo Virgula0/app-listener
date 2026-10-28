@@ -164,35 +164,48 @@ func (s *IntegrationSuite) TestDaemon_Maintainer_RunsSteamShSandboxed() {
 }
 
 const (
-	plantedLink = steamLibDir + "/planted.js"
-	evilJS      = "/home/ubuntu/.cache/evil.js"
-	plantedPid  = "/var/tmp/planted"
+	evilJS     = "/home/ubuntu/.cache/evil.js"
+	plantedPid = "/var/tmp/planted"
 )
 
 // overlayPlanter is same-uid malware outside the sandbox: the run's processes are dumpable after
 // setpriv's exec, and their pid namespace hides nothing from the host's /proc, so /proc/<pid>/cwd
-// (the Steam root, inside the run's overlay) is theirs to write. It plants a symlink from the
-// lib_dir to its own file and records the pid it went through.
-const overlayPlanter = `mkdir -p /home/ubuntu/.cache && echo 'steal()' > ` + evilJS + `
+// (the Steam root, inside the run's overlay) is theirs to write. It plants the symlink
+// ubuntu12_32/<name> -> target and records the pid it went through.
+func overlayPlanter(name, target string) string {
+	return `mkdir -p /home/ubuntu/.cache && echo 'steal()' > ` + evilJS + `
 end=$(($(date +%s) + 150))
 while [ "$(date +%s)" -lt "$end" ]; do
 	for d in /proc/[0-9]*; do
-		if ln -s ` + evilJS + ` "$d/cwd/ubuntu12_32/planted.js" 2>/dev/null; then
+		if ln -s ` + target + ` "$d/cwd/ubuntu12_32/` + name + `" 2>/dev/null; then
 			echo "${d#/proc/}" > ` + plantedPid + `; exit 0
 		fi
 	done
 done`
+}
 
 // Whatever writes the run's overlay may be hostile: malware of the same uid reaches it through
 // /proc/<pid>/cwd while steam.sh runs. A symlink it plants there must not be committed: the lib_dir
-// name would hand the whitelisted client the user's file. steam.sh sleeps as long as a real
-// runtime unpack takes, the window the racer needs.
+// name would hand the whitelisted client the user's file. A link to a directory a user fills is
+// the same hole one level down (steamui/libraries/*.js is looked up through it, never judged),
+// though root decides the directory's own name. steam.sh sleeps as long as a real runtime unpack
+// takes, the window the racer needs.
 func (s *IntegrationSuite) TestDaemon_Maintainer_RefusesPlantedSymlink() {
+	for _, tc := range []struct{ name, link, target string }{
+		{"user file", "planted.js", evilJS},
+		{"user home", "libraries", "/home/ubuntu"},
+		{"world-writable dir", "libraries", "/tmp"},
+	} {
+		s.Run(tc.name, func() { s.plantedSymlinkRefused(tc.link, tc.target) })
+	}
+}
+
+func (s *IntegrationSuite) plantedSymlinkRefused(link, target string) {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
 	conf := s.steamFixture(c, strings.Replace(fakeSteamSh, "\nexec ", "\nsleep 6\nexec ", 1), false)
 
-	code, out := s.exec(c, []string{"sh", "-c", "nohup " + steamUser + "sh -c " + shQuote(overlayPlanter) +
+	code, out := s.exec(c, []string{"sh", "-c", "nohup " + steamUser + "sh -c " + shQuote(overlayPlanter(link, target)) +
 		" >/var/tmp/planter.log 2>&1 &"})
 	s.Require().Equalf(0, code, "starting the racer: %s", out)
 	s.startDaemon(c, conf)
@@ -207,10 +220,10 @@ func (s *IntegrationSuite) TestDaemon_Maintainer_RefusesPlantedSymlink() {
 			break
 		}
 	}
-	_, out = s.exec(c, []string{"sh", "-c", "readlink " + plantedLink + " || echo MISSING"})
+	_, out = s.exec(c, []string{"sh", "-c", "readlink " + steamLibDir + "/" + link + " || echo MISSING"})
 	s.Require().Equalf("MISSING", strings.TrimSpace(out),
-		"EXPLOITED: the daemon committed the racer's symlink from the lib_dir to the user's file; daemon log:\n%s", log)
-	s.Require().Containsf(log, "refusing the run's changes to "+steamLibDir+": planted.js",
+		"EXPLOITED: the daemon committed the racer's symlink from the lib_dir to %s; daemon log:\n%s", target, log)
+	s.Require().Containsf(log, "refusing the run's changes to "+steamLibDir+": "+link,
 		"the run holding the planted symlink must be refused; daemon log:\n%s", log)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})

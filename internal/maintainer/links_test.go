@@ -39,9 +39,16 @@ func TestCheckLinksAccepts(t *testing.T) {
 		filepath.Join(lib, "rt", "not-yet"):                    "a name only the app may create",
 		"/usr/lib/x86_64-linux-gnu/libc.so.6":                  "a system library",
 		"/usr/lib/app-listener-missing/libc.so.6":              "a missing name in a root-only directory",
+		"/run/host/usr/lib/libGL.so.1":                         "a name only the container runtime binds",
 	} {
 		if err := checkLink(t, libs, lib, "rt/pins/link", target); err != nil {
 			t.Errorf("%s (%s) refused: %v", why, target, err)
+		}
+	}
+	// The runtime's usr/lib/ssl/certs: a directory only root fills, all the way down.
+	if _, err := os.Stat("/etc/ssl/certs"); err == nil {
+		if err := checkLink(t, libs, lib, "rt/ssl/certs", "/etc/ssl/certs"); err != nil {
+			t.Errorf("a root-only system directory refused: %v", err)
 		}
 	}
 }
@@ -61,12 +68,34 @@ func TestCheckLinksRefusesUserFiles(t *testing.T) {
 		"/dev/shm/evil.js":          "a world-writable directory",
 		filepath.Join(lib, "loop"):  "a loop",
 		filepath.Join(lib, "hop/x"): "through a planned symlink out",
+		// Directories a user fills, in a directory only root decides: what is looked up through
+		// the link (steamui/libraries/*.js) is never judged again.
+		"/tmp":     "a world-writable directory itself",
+		"/var/tmp": "a world-writable directory itself",
+		"/dev/shm": "a world-writable directory itself",
+		"/home/app-listener-no-such-user/evil.js": "a home useradd would hand a user",
+		"/run/user/4242424242/evil.js":            "a runtime dir logind would hand a user",
 	} {
 		hop := op{kind: opLink, rel: "hop", target: filepath.Join(root, "cache")}
 		loop := op{kind: opLink, rel: "loop", target: "loop"}
 		if err := checkLink(t, libs, lib, "x.js", target, hop, loop); err == nil {
 			t.Errorf("%s (%s) accepted", why, target)
 		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && os.Geteuid() != 0 {
+		if err := checkLink(t, libs, lib, "libraries", home); err == nil {
+			t.Errorf("a link to the user's home (%s) accepted", home)
+		}
+	}
+}
+
+// Each target is judged by itself: a sibling name root decides vouches for none beside it.
+func TestCheckLinksJudgesEachTarget(t *testing.T) {
+	_, libs := linkFixture(t)
+	lib := libs[0]
+	ops := []op{{kind: opLink, rel: "ok", target: "/app-listener-no-such-dir"}, {kind: opLink, rel: "bad", target: "/tmp"}}
+	if err := newLinkView(libs, []libPlan{{dir: lib, ops: ops}}).checkLinks(&libPlan{dir: lib, ops: ops}); err == nil {
+		t.Error("a link to /tmp accepted after one to a missing name beside it")
 	}
 }
 

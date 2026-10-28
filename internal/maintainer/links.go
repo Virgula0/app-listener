@@ -28,7 +28,7 @@ const (
 type linkView struct {
 	libs []string
 	ops  map[string]*op // by absolute path; a replaced lib_dir root under the lib_dir's own
-	// placed caches ebpf.RootPlacedName by directory: a runtime's links share a few targets.
+	// placed caches ebpf.RootPlacedName by target: the verdict is the name's own, not its directory's.
 	placed map[string]error
 }
 
@@ -141,11 +141,10 @@ func (v *linkView) libOf(p string) string {
 }
 
 func (v *linkView) rootPlaced(p string) error {
-	dir := path.Dir(p)
-	err, ok := v.placed[dir]
+	err, ok := v.placed[p]
 	if !ok {
 		err = ebpf.RootPlacedName(p)
-		v.placed[dir] = err
+		v.placed[p] = err
 	}
 	if err != nil {
 		return fmt.Errorf("it leads outside the lib_dirs to %s, a name root does not decide: %w", p, err)

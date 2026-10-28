@@ -3,6 +3,7 @@ package ebpf
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,6 +36,10 @@ func OpenSystemPlaced(path string) (*os.File, error) {
 }
 
 func systemFileStat(f *os.File, st *unix.Stat_t) error {
+	return placedFileStat(int(f.Fd()), st)
+}
+
+func placedFileStat(fd int, st *unix.Stat_t) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return errors.New("is not a regular file")
 	}
@@ -42,7 +47,7 @@ func systemFileStat(f *os.File, st *unix.Stat_t) error {
 		return err
 	}
 	var fs unix.Statfs_t
-	if err := unix.Fstatfs(int(f.Fd()), &fs); err != nil {
+	if err := unix.Fstatfs(fd, &fs); err != nil {
 		return err
 	}
 	if fs.Type == unix.FUSE_SUPER_MAGIC {
@@ -54,12 +59,33 @@ func systemFileStat(f *os.File, st *unix.Stat_t) error {
 // walkPlaced resolves path for OpenSystemPlaced, expanding symlinks by hand; it returns the final
 // fd and its stat.
 func walkPlaced(path string) (int, *unix.Stat_t, error) {
-	if !filepath.IsAbs(path) {
-		return -1, nil, fmt.Errorf("%s is not an absolute path", path)
-	}
-	w := &placedWalk{path: path, dir: -1, comps: strings.Split(path, "/")}
-	if err := w.restart(); err != nil {
+	w := &placedWalk{path: path, dir: -1}
+	fd, err := w.run()
+	if err != nil {
 		return -1, nil, err
+	}
+	return fd, &w.st, nil
+}
+
+// placedWalk is walkPlaced's state: dir is the placed directory names are looked up in, st the
+// stat of the last inode reached, comps the names still to resolve. missing is the physical path
+// of the name a failed lookup did not find, every symlink hop before it resolved.
+type placedWalk struct {
+	path    string
+	dir     int
+	st      unix.Stat_t
+	comps   []string
+	hops    int
+	missing string
+}
+
+func (w *placedWalk) run() (int, error) {
+	if !filepath.IsAbs(w.path) {
+		return -1, fmt.Errorf("%s is not an absolute path", w.path)
+	}
+	w.comps = strings.Split(w.path, "/")
+	if err := w.restart(); err != nil {
+		return -1, err
 	}
 	for len(w.comps) > 0 {
 		c := w.comps[0]
@@ -70,23 +96,13 @@ func walkPlaced(path string) (int, *unix.Stat_t, error) {
 		fd, done, err := w.step(c)
 		if err != nil {
 			unix.Close(w.dir)
-			return -1, nil, err
+			return -1, err
 		}
 		if done {
-			return fd, &w.st, nil
+			return fd, nil
 		}
 	}
-	return w.dir, &w.st, nil
-}
-
-// placedWalk is walkPlaced's state: dir is the placed directory names are looked up in, st the
-// stat of the last inode reached, comps the names still to resolve.
-type placedWalk struct {
-	path  string
-	dir   int
-	st    unix.Stat_t
-	comps []string
-	hops  int
+	return w.dir, nil
 }
 
 func (w *placedWalk) restart() error {
@@ -112,6 +128,11 @@ func (w *placedWalk) step(c string) (fd int, done bool, err error) {
 		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS}
 	next, err := unix.Openat2(w.dir, c, &how)
 	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			if dir, e := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", w.dir)); e == nil {
+				w.missing = filepath.Join(dir, c)
+			}
+		}
 		return -1, false, &os.PathError{Op: "open", Path: w.path, Err: err}
 	}
 	if err = unix.Fstat(next, &w.st); err != nil {
@@ -187,27 +208,121 @@ func placedDir(fd int) error {
 	return nil
 }
 
-// RootPlacedName reports whether only root decides what the clean absolute path names: the
-// directory holding it, or failing that its nearest existing ancestor, is reached as walkPlaced
-// walks and is itself placed. Whatever is there, or appears there later, root put there.
+// RootPlacedName reports whether only root decides what the clean absolute path names, now and
+// later, as walkPlaced walks it (every symlink hop judged). An existing target is a root-owned file
+// no one else may write, or a directory only root fills all the way down (placedTree): what a
+// symlink to it reaches below is never judged again. A missing one is looked up in a placed
+// directory and is not a name root creates for a user (userAssignable).
 func RootPlacedName(path string) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("%q is not a clean absolute path", path)
 	}
-	dir := filepath.Dir(path)
-	fd, st, err := walkPlaced(dir)
-	for errors.Is(err, unix.ENOENT) && dir != "/" {
-		dir = filepath.Dir(dir)
-		fd, st, err = walkPlaced(dir)
+	w := &placedWalk{path: path, dir: -1}
+	fd, err := w.run()
+	switch {
+	case err == nil:
+		defer unix.Close(fd)
+		if w.st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			n := 0
+			return placedTree(fd, &n)
+		}
+		if ferr := placedFileStat(fd, &w.st); ferr != nil {
+			return fmt.Errorf("%s %w", path, ferr)
+		}
+		return nil
+	case !errors.Is(err, unix.ENOENT):
+		return err
+	case w.missing == "":
+		return fmt.Errorf("%s: where the lookup failed is unknown: %w", path, err)
+	case userAssignable(w.missing):
+		return fmt.Errorf("%s: %s is a name root creates for a user", path, w.missing)
 	}
+	return nil
+}
+
+// userAssignable: a missing name root creates for a user later: a home beside the users' homes
+// (useradd) or a /run/user/<uid> (logind).
+func userAssignable(p string) bool {
+	dir := filepath.Dir(p)
+	if dir == "/home" || dir == "/run/user" {
+		return true
+	}
+	homesMu.RLock()
+	defer homesMu.RUnlock()
+	for _, h := range userHomes {
+		if filepath.Dir(h) == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// placedTree: directory fd and everything below it only root decides. n counts the entries judged,
+// at most maxPlacedDirEntries: a tree too large to judge is refused. A symlink below must end, as
+// OpenSystemPlaced walks it, on a placed regular file; mounts below are not crossed.
+func placedTree(fd int, n *int) error {
+	if err := placedDir(fd); err != nil {
+		return err
+	}
+	name, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return fmt.Errorf("%s is not a directory", dir)
+	d, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return err
 	}
-	return placedDir(fd)
+	defer d.Close()
+	names, err := d.Readdirnames(maxPlacedDirEntries + 1 - *n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	for _, c := range names {
+		*n++
+		if *n > maxPlacedDirEntries {
+			return fmt.Errorf("%s holds over %d entries: too many to judge", name, maxPlacedDirEntries)
+		}
+		if err := placedEntry(fd, name, c, n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func placedEntry(dir int, dirName, c string, n *int) error {
+	how := unix.OpenHow{Flags: unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV}
+	fd, err := unix.Openat2(dir, c, &how)
+	if err != nil {
+		return &os.PathError{Op: "open", Path: filepath.Join(dirName, c), Err: err}
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	p := filepath.Join(dirName, c)
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		return placedTree(fd, n)
+	case unix.S_IFLNK:
+		target, err := readlinkFd(fd)
+		if err != nil {
+			return err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(dirName, target) // dirName is physical: the lexical ".." is the kernel's
+		}
+		f, err := OpenSystemPlaced(target)
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		return f.Close()
+	}
+	if err := placedFileStat(fd, &st); err != nil {
+		return fmt.Errorf("%s %w", p, err)
+	}
+	return nil
 }
 
 func readlinkFd(fd int) (string, error) {

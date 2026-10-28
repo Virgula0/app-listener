@@ -138,7 +138,10 @@ A risky launch still runs, but the process (and its forks; an exec is judged afr
 Fix: start the app without that variable or flag. A process that mapped untrusted code before its
 binary was whitelisted is refused the same way (`op=PRELOADED`). Libraries from a `lib_dir` of the
 updater that created the binary don't count: a self-updating app such as Steam starts its new binary
-before the daemon admits it, and everything that process runs is code its updater chose.
+before the daemon admits it, and everything that process runs is code its updater chose. That new
+binary's launch is judged at exec too, before the daemon knows what runtime it is: by every
+runtime's rules above (so a flag only another runtime treats as risky marks it too), except the
+generic Electron app rule below.
 
 Generic Electron binaries that run an app named on the command line are covered by
 [`[electron_apps]`](daemon-config.md#generic-electron-apps-electron_apps).
