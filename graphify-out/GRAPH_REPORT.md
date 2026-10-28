@@ -11,7 +11,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `0ac50459`
+- Built from commit: `1648a17c`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -49,7 +49,7 @@
 - github.com/charmbracelet/bubbletea.Cmd
 - MonitorRepository
 - binaryList
-- EventType
+- BinaryEntry
 - picker
 - fscrypt/orphans.go
 - IntegrationSuite
@@ -88,7 +88,7 @@
 - liveSession
 - editView
 - .refreshOnce
-- FileEvent
+- EventType
 - string
 - bpfstats/main.go
 - CandidateDir
@@ -100,14 +100,14 @@
 - op
 - Candidate
 - updatePage
-- runGuard
 - Monitor
+- newTestTarget
 - planUpdaters
 - dialLiveSession
 - daemon mode (fscrypt + whitelist lifecycle)
 - FORWARD temporary -w/-b whitelist grants
-- .populateWatchInodes
-- newTestTarget
+- sync.Mutex
+- FileEvent
 - prctl_exe_swap.c
 - NetGuard
 - check-compatibility.sh
@@ -166,8 +166,8 @@
 - options.go
 - IntegrationSuite
 - buildOneGuard
-- fakeDaemon
-- sync.Mutex
+- runGuard
+- .populateWatchInodes
 - runView
 - Installation
 - backend_test.go
@@ -178,7 +178,7 @@
 - BinaryStat
 - feed.go
 - shell
-- BinaryEntry
+- fakeDaemon
 - watchSet
 - WithBottomBar
 - Run
@@ -207,9 +207,9 @@
 - edit-protected
 - NewEventFanout
 - kernel-prof.sh
-- testLimiter
-- pathCache
 - github.com/stretchr/testify/suite.Suite
+- pathCache
+- testLimiter
 - DaemonEvent
 - Daemon configuration
 - NetGuardEvent
@@ -228,12 +228,12 @@
 - WithSuspectsFrom
 - ParseEventsFlag
 - IntegrationSuite
+- links_test.go
 - ResolvePinBase
 - Vault
 - recordForm
 - supersede_probe.c
 - inspector_probe.c
-- links_test.go
 - github.com/Virgula0/app-listener/tools/codecheck
 - ValidateTargets
 - taint_victim.c
@@ -404,9 +404,9 @@ Nodes (13): MonitorRepository, NewGuardUseCase(), NewMonitorUseCase(), NewNetwor
 Cohesion: 0.10
 Nodes (14): binaryList, netGuardTab, policyEditor, policyHooks, policyTab, newBinaryList(), newPolicyTab(), verbFor() (+6 more)
 
-### Community 33 - "EventType"
-Cohesion: 0.12
-Nodes (13): BpfEvent, EventType, eventUnitTest, parseEvents(), TestAddBinaryActionsRefusesBeforeWriting(), specFromForm(), specSummary(), Cstr() (+5 more)
+### Community 33 - "BinaryEntry"
+Cohesion: 0.07
+Nodes (20): deferredBinary, keptEntries, BinaryEntry, TestCheckBinaryEventsReadOnlyAcceptsUnrestricted(), TestCheckBinaryEventsReadOnlyRejectsRestriction(), canonicalBinaryPath(), confinedEntry(), eventMask() (+12 more)
 
 ### Community 34 - "picker"
 Cohesion: 0.08
@@ -544,9 +544,9 @@ Nodes (8): codeEntry, editView, Entry, fileSize(), joinRel(), newCodeEntry(), ne
 Cohesion: 0.43
 Nodes (6): sameConfig(), discordRefreshFixture(), TestRefreshOnceAppliesAndReloads(), TestRefreshOnceKeepsOperatorLinesAndSkipsNoOps(), TestRefreshOnceRestoresTheFileWhenTheReloadFails(), TestRefreshOnceSkipsAConfigChangedSinceLoad()
 
-### Community 72 - "FileEvent"
-Cohesion: 0.16
-Nodes (5): snapMonitor, FileEvent, newFakeMonitorRepo(), fakeSource, fakeMonitorRepo
+### Community 72 - "EventType"
+Cohesion: 0.12
+Nodes (13): BpfEvent, EventType, eventUnitTest, parseEvents(), TestAddBinaryActionsRefusesBeforeWriting(), specFromForm(), specSummary(), Cstr() (+5 more)
 
 ### Community 73 - "string"
 Cohesion: 0.09
@@ -592,13 +592,13 @@ Nodes (34): appendSectionsAndEdit(), collectDiffAdditions(), TestUncoveredCandid
 Cohesion: 0.26
 Nodes (5): latestRelease, updatePage, newUpdatePage(), boolIndex(), isPreRelease()
 
-### Community 84 - "runGuard"
-Cohesion: 0.22
-Nodes (10): DrainUntilSignal(), displayEntries(), resolveGuardConfig(), runGuard(), runGuardHeadless(), runGuardTUI(), runHeadless(), runHeadless() (+2 more)
-
-### Community 86 - "Monitor"
+### Community 84 - "Monitor"
 Cohesion: 0.18
 Nodes (4): NewMonitor(), putBtrfsLayout(), Monitor, watchedInode
+
+### Community 86 - "newTestTarget"
+Cohesion: 0.24
+Nodes (15): NewFiles(), newTestTarget(), since(), TestAddRefusesOverlap(), TestApplyFromBlacklistFailureKeepsOldGuard(), TestApplyFromBlacklistOverlaps(), TestApplyFromWhitelistFailureReportsUnguarded(), TestApplyFromWhitelistStopsFirst() (+7 more)
 
 ### Community 87 - "planUpdaters"
 Cohesion: 0.14
@@ -616,9 +616,13 @@ Nodes (10): Daemon catalog refresh (catalogrefresh.go / catalogwatch.go), exe_su
 Cohesion: 0.21
 Nodes (9): CONFIG post-AUTH daemon.conf editing (configedit.go), FORWARD temporary -w/-b whitelist grants, Daemon self-key (GUARD_ALLOW_ROOT) bypass, swap_benign / swap_reader in-place binary swap POC, edit-protected --edit-config, edit-protected subcommand, edit-protected live mode, edit-protected --forward (+1 more)
 
-### Community 92 - "newTestTarget"
-Cohesion: 0.24
-Nodes (15): NewFiles(), newTestTarget(), since(), TestAddRefusesOverlap(), TestApplyFromBlacklistFailureKeepsOldGuard(), TestApplyFromBlacklistOverlaps(), TestApplyFromWhitelistFailureReportsUnguarded(), TestApplyFromWhitelistStopsFirst() (+7 more)
+### Community 91 - "sync.Mutex"
+Cohesion: 0.18
+Nodes (7): fyneLogFilter, newActivity(), TestRingKeepsNewest(), Counts, newRing(), activity, ring
+
+### Community 92 - "FileEvent"
+Cohesion: 0.16
+Nodes (5): snapMonitor, FileEvent, newFakeMonitorRepo(), fakeSource, fakeMonitorRepo
 
 ### Community 93 - "prctl_exe_swap.c"
 Cohesion: 0.18
@@ -808,9 +812,9 @@ Nodes (11): installHooks(), staged(), InstallMode, InstallRequest, Options, Unin
 Cohesion: 0.07
 Nodes (39): buildOneGuard(), eventFilterOptions(), TestEventFilterOptions(), newSelfGuards(), selfProtectSpecs(), startSelfGuard(), startSelfGuards(), lockVaultFully() (+31 more)
 
-### Community 156 - "sync.Mutex"
-Cohesion: 0.18
-Nodes (7): fyneLogFilter, newActivity(), TestRingKeepsNewest(), Counts, newRing(), activity, ring
+### Community 155 - "runGuard"
+Cohesion: 0.22
+Nodes (10): DrainUntilSignal(), displayEntries(), resolveGuardConfig(), runGuard(), runGuardHeadless(), runGuardTUI(), runHeadless(), runHeadless() (+2 more)
 
 ### Community 157 - "runView"
 Cohesion: 0.06
@@ -843,10 +847,6 @@ Nodes (43): actionBar, cell, column, counterStrip, dataTable, eventFeed, feedAct
 ### Community 166 - "shell"
 Cohesion: 0.05
 Nodes (56): fakeLink, pageDef, pageID, reel, resizeWatch, shell, sizedDialog, snapEngines (+48 more)
-
-### Community 167 - "BinaryEntry"
-Cohesion: 0.07
-Nodes (20): deferredBinary, keptEntries, BinaryEntry, TestCheckBinaryEventsReadOnlyAcceptsUnrestricted(), TestCheckBinaryEventsReadOnlyRejectsRestriction(), canonicalBinaryPath(), confinedEntry(), eventMask() (+12 more)
 
 ### Community 168 - "watchSet"
 Cohesion: 0.15
@@ -948,13 +948,13 @@ Nodes (10): edit-protected, Editing the daemon config, Editor keys, Exit audit, 
 Cohesion: 0.24
 Nodes (5): NewEventFanout(), TestEventFanoutDropOldestUnderPressure(), TestEventFanoutDuplicatesInOrderAndCloses(), TestEventFanoutStopClosesOutputs(), EventFanout
 
-### Community 199 - "testLimiter"
-Cohesion: 0.43
-Nodes (8): gateEvent(), TestGateLogLimiterFlushesOnShutdown(), TestGateLogLimiterFoldsAcrossThreadsAndPids(), TestGateLogLimiterFoldsReadRepeats(), TestGateLogLimiterKeysOnTarget(), TestGateLogLimiterNeverFoldsWhatMatters(), testLimiter(), TestNoLogMetadataBlocks()
-
 ### Community 200 - "pathCache"
 Cohesion: 0.39
 Nodes (4): evalSymlinksOrEmpty(), newPathCache(), pathCache, pathCacheEntry
+
+### Community 201 - "testLimiter"
+Cohesion: 0.43
+Nodes (8): gateEvent(), TestGateLogLimiterFlushesOnShutdown(), TestGateLogLimiterFoldsAcrossThreadsAndPids(), TestGateLogLimiterFoldsReadRepeats(), TestGateLogLimiterKeysOnTarget(), TestGateLogLimiterNeverFoldsWhatMatters(), testLimiter(), TestNoLogMetadataBlocks()
 
 ### Community 202 - "DaemonEvent"
 Cohesion: 0.12
@@ -1012,7 +1012,11 @@ Nodes (3): WithSuspectsFrom(), netguardHarness, Option
 Cohesion: 0.33
 Nodes (4): ParseEventsFlag(), ParseNetEventsFlag(), parseTypesFlag(), validateForwardEvents()
 
-### Community 221 - "ResolvePinBase"
+### Community 221 - "links_test.go"
+Cohesion: 0.54
+Nodes (7): newLinkView(), checkLink(), linkFixture(), TestCheckLinksAccepts(), TestCheckLinksJudgesEachTarget(), TestCheckLinksRefusesUserFiles(), TestCheckLinksSeesThePlannedTree()
+
+### Community 222 - "ResolvePinBase"
 Cohesion: 0.50
 Nodes (5): dirIsRootOwnedSafe(), isBpffs(), mountBpffs(), ResolvePinBase(), TestDirIsRootOwnedSafe()
 
@@ -1023,10 +1027,6 @@ Nodes (6): answer(), main(), read_ok(), read_secret(), run_child(), spin()
 ### Community 227 - "inspector_probe.c"
 Cohesion: 0.56
 Nodes (8): check_attach(), check_exe(), check_mem(), check_root(), check_vmread(), main(), report(), traced_exec()
-
-### Community 229 - "links_test.go"
-Cohesion: 0.54
-Nodes (7): newLinkView(), checkLink(), linkFixture(), TestCheckLinksAccepts(), TestCheckLinksJudgesEachTarget(), TestCheckLinksRefusesUserFiles(), TestCheckLinksSeesThePlannedTree()
 
 ### Community 232 - "ValidateTargets"
 Cohesion: 0.10
@@ -1052,7 +1052,7 @@ Nodes (3): Events, Flags, monitor: see what touches a path
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Guard` connect `Guard` to `go_pkg_strings`, `TrustGuard`, `GuardInodeKey`, `time.Duration`, `controlServer`, `ConfinedEntry`, `guardUnitTest`, `BinaryEntry`, `os.File`, `GuardEvent`, `time.Time`, `daemonconfig.go`, `SanitizeText`, `buildOneGuard`, `fakeDaemon`, `sync.Mutex`?**
+- **Why does `Guard` connect `Guard` to `go_pkg_strings`, `BinaryEntry`, `TrustGuard`, `GuardInodeKey`, `time.Duration`, `controlServer`, `fakeDaemon`, `guardUnitTest`, `ConfinedEntry`, `os.File`, `GuardEvent`, `time.Time`, `daemonconfig.go`, `SanitizeText`, `buildOneGuard`, `sync.Mutex`?**
   _High betweenness centrality (0.038) - this node is a cross-community bridge._
 - **What connects `github.com/Virgula0/app-listener`, `IntegrationSuite`, `IntegrationSuite` to the rest of the system?**
   _33 weakly-connected nodes found - possible documentation gaps or missing edges._
