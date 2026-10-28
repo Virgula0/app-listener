@@ -182,9 +182,12 @@ writable layer there, and every run fails until it is moved to a real filesystem
 - a symlink is kept only if it leads, through every hop as the tree will be after the commit, into
   one of Steam's lib_dirs, or to a name only root decides, outside every user home and not under
   `/proc`: a root-owned file no one else may write, a directory only root can fill all the way
-  down (at most 4096 entries; `/etc/ssl/certs` passes, `/tmp` or a home does not), or a missing
-  name in a directory only root can write that is not one root later creates for a user (a new
-  home beside `/home/*`, `/run/user/<uid>`). A `..` may only lead a target
+  down (at most 4096 entries; `/etc/ssl/certs` passes, `/tmp` or a home does not), on a
+  filesystem mounted at least once without `nosuid` and not FUSE (a user's udisks2 image presents
+  any owner its author wrote), or a missing name in a directory only root can write that is not
+  one root later creates for a user (a new home beside `/home/*`, `/run/user/<uid>`). Nothing at
+  or below `/media`, `/run/media` or `/mnt` passes, existing or not: a user's own filesystem may
+  be mounted there. A `..` may only lead a target
   (`../lib/libfoo.so`). Same-uid malware can write the overlay while `steam.sh` runs (through
   `/proc/<pid>/cwd`), so a symlink out to the user's files would hand Steam's whitelisted
   binaries content no lib_dir vouches for;

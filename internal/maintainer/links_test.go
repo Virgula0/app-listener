@@ -75,6 +75,8 @@ func TestCheckLinksRefusesUserFiles(t *testing.T) {
 		"/dev/shm": "a world-writable directory itself",
 		"/home/app-listener-no-such-user/evil.js": "a home useradd would hand a user",
 		"/run/user/4242424242/evil.js":            "a runtime dir logind would hand a user",
+		"/media/app-listener-no-such-user/evil":   "where udisks2 mounts a user's image",
+		"/run/media/app-listener-no-such-user/x":  "where udisks2 mounts a user's image",
 	} {
 		hop := op{kind: opLink, rel: "hop", target: filepath.Join(root, "cache")}
 		loop := op{kind: opLink, rel: "loop", target: "loop"}

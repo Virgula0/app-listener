@@ -2,12 +2,18 @@ package ebpf
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 )
+
+// HostMountinfo is pid 1's mount table: the daemon's own namespace (PrivateTmp, ProtectSystem) is
+// remounted nosuid by systemd and says nothing about who mounted what.
+const HostMountinfo = "/proc/1/mountinfo"
 
 // MountInfo is one /proc/self/mountinfo line. BPF dentry walks stop at the superblock root, so
 // their paths are relative to the filesystem, not to "/": MountPath maps one through a mount.
@@ -99,6 +105,58 @@ func ParseMountinfo(r io.Reader) ([]MountInfo, error) {
 		})
 	}
 	return mounts, sc.Err()
+}
+
+// VouchedDevs returns the kernel dev (KernelDev) of every superblock in mountinfo with at least one
+// mount that is neither nosuid nor FUSE: only there does root vouch for the ownership bits a file
+// presents (a user's udisks2 image or FUSE server claims any owner). Any unparsable line fails the
+// whole table.
+func VouchedDevs(mountinfo []byte) (map[uint64]struct{}, error) {
+	out := make(map[uint64]struct{})
+	for line := range strings.SplitSeq(strings.TrimSpace(string(mountinfo)), "\n") {
+		f := strings.Fields(line)
+		sep := slices.Index(f, "-")
+		if sep < 6 || sep+1 >= len(f) {
+			return nil, fmt.Errorf("malformed mountinfo line %q", line)
+		}
+		dev, ok := parseMountDev(f[2])
+		if !ok {
+			return nil, fmt.Errorf("mountinfo line %q: bad device", line)
+		}
+		if slices.Contains(strings.Split(f[5], ","), "nosuid") || isFuseType(f[sep+1]) {
+			continue
+		}
+		out[uint64(dev)] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no superblock mounted without nosuid (is / really nosuid?)")
+	}
+	return out, nil
+}
+
+func isFuseType(fstype string) bool {
+	return fstype == "fuse" || fstype == "fuseblk" || strings.HasPrefix(fstype, "fuse.")
+}
+
+// hostVouchedDevs is VouchedDevs of HostMountinfo.
+func hostVouchedDevs() (map[uint64]struct{}, error) {
+	data, err := os.ReadFile(HostMountinfo)
+	if err != nil {
+		return nil, err
+	}
+	return VouchedDevs(data)
+}
+
+// vouchedFd: fd's superblock (SuperblockDev: not st_dev on btrfs) is one of devs.
+func vouchedFd(fd int, devs map[uint64]struct{}) error {
+	dev, err := SuperblockDev(fd)
+	if err != nil {
+		return err
+	}
+	if _, ok := devs[dev]; !ok {
+		return errors.New("is on a mount root does not vouch for (nosuid or FUSE: a user's image or server)")
+	}
+	return nil
 }
 
 // parseMountDev parses "major:minor" into the kernel dev_t (12-bit major, 20-bit minor).

@@ -210,32 +210,51 @@ func placedDir(fd int) error {
 
 // RootPlacedName reports whether only root decides what the clean absolute path names, now and
 // later, as walkPlaced walks it (every symlink hop judged). An existing target is a root-owned file
-// no one else may write, or a directory only root fills all the way down (placedTree): what a
-// symlink to it reaches below is never judged again. A missing one is looked up in a placed
-// directory and is not a name root creates for a user (userAssignable).
+// no one else may write, or a directory only root fills all the way down (placedTree), on a mount
+// root vouches for (VouchedDevs): what a symlink to it reaches below is never judged again. A
+// missing one is looked up in a placed directory and is not a name root creates for a user or
+// where a user's media is mounted (userAssignable, userMountable).
 func RootPlacedName(path string) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("%q is not a clean absolute path", path)
+	}
+	if userMountable(path) {
+		return fmt.Errorf("%s is where a user's own filesystem may be mounted", path)
 	}
 	w := &placedWalk{path: path, dir: -1}
 	fd, err := w.run()
 	switch {
 	case err == nil:
 		defer unix.Close(fd)
-		if w.st.Mode&unix.S_IFMT == unix.S_IFDIR {
-			n := 0
-			return placedTree(fd, &n)
-		}
-		if ferr := placedFileStat(fd, &w.st); ferr != nil {
-			return fmt.Errorf("%s %w", path, ferr)
-		}
-		return nil
+		return placedTarget(fd, &w.st, path)
 	case !errors.Is(err, unix.ENOENT):
 		return err
 	case w.missing == "":
 		return fmt.Errorf("%s: where the lookup failed is unknown: %w", path, err)
 	case userAssignable(w.missing):
 		return fmt.Errorf("%s: %s is a name root creates for a user", path, w.missing)
+	case userMountable(w.missing):
+		return fmt.Errorf("%s: %s is where a user's own filesystem may be mounted", path, w.missing)
+	}
+	return nil
+}
+
+// placedTarget judges RootPlacedName's existing target fd. A tree is vouched at its top only:
+// placedEntry never crosses into a mount below.
+func placedTarget(fd int, st *unix.Stat_t, path string) error {
+	j := &treeJudge{}
+	var err error
+	if j.devs, err = hostVouchedDevs(); err != nil {
+		return err
+	}
+	if err := vouchedFd(fd, j.devs); err != nil {
+		return fmt.Errorf("%s %w", path, err)
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		return placedTree(fd, j)
+	}
+	if err := placedFileStat(fd, st); err != nil {
+		return fmt.Errorf("%s %w", path, err)
 	}
 	return nil
 }
@@ -257,10 +276,29 @@ func userAssignable(p string) bool {
 	return false
 }
 
-// placedTree: directory fd and everything below it only root decides. n counts the entries judged,
-// at most maxPlacedDirEntries: a tree too large to judge is refused. A symlink below must end, as
-// OpenSystemPlaced walks it, on a placed regular file; mounts below are not crossed.
-func placedTree(fd int, n *int) error {
+// userMountable: p is at or below where udisks2 mounts a user's media (/media, /run/media) or fstab
+// "user" mounts conventionally go (/mnt). A filesystem mounted there later presents any owner its
+// author wrote, over whatever the name holds now.
+func userMountable(p string) bool {
+	for _, root := range []string{"/media", "/run/media", "/mnt"} {
+		if _, ok := PathUnder(p, root); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// treeJudge is placedTree's state: n counts the entries judged, at most maxPlacedDirEntries (a tree
+// too large to judge is refused); devs are the superblocks root vouches for.
+type treeJudge struct {
+	n    int
+	devs map[uint64]struct{}
+}
+
+// placedTree: directory fd and everything below it only root decides. A symlink below must end, as
+// OpenSystemPlaced walks it, on a placed regular file on a vouched mount; mounts below are not
+// crossed.
+func placedTree(fd int, j *treeJudge) error {
 	if err := placedDir(fd); err != nil {
 		return err
 	}
@@ -273,23 +311,23 @@ func placedTree(fd int, n *int) error {
 		return err
 	}
 	defer d.Close()
-	names, err := d.Readdirnames(maxPlacedDirEntries + 1 - *n)
+	names, err := d.Readdirnames(maxPlacedDirEntries + 1 - j.n)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
 	for _, c := range names {
-		*n++
-		if *n > maxPlacedDirEntries {
+		j.n++
+		if j.n > maxPlacedDirEntries {
 			return fmt.Errorf("%s holds over %d entries: too many to judge", name, maxPlacedDirEntries)
 		}
-		if err := placedEntry(fd, name, c, n); err != nil {
+		if err := placedEntry(fd, name, c, j); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func placedEntry(dir int, dirName, c string, n *int) error {
+func placedEntry(dir int, dirName, c string, j *treeJudge) error {
 	how := unix.OpenHow{Flags: unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC,
 		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV}
 	fd, err := unix.Openat2(dir, c, &how)
@@ -304,7 +342,7 @@ func placedEntry(dir int, dirName, c string, n *int) error {
 	p := filepath.Join(dirName, c)
 	switch st.Mode & unix.S_IFMT {
 	case unix.S_IFDIR:
-		return placedTree(fd, n)
+		return placedTree(fd, j)
 	case unix.S_IFLNK:
 		target, err := readlinkFd(fd)
 		if err != nil {
@@ -317,7 +355,11 @@ func placedEntry(dir int, dirName, c string, n *int) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
-		return f.Close()
+		defer f.Close()
+		if err := vouchedFd(int(f.Fd()), j.devs); err != nil {
+			return fmt.Errorf("%s: %s %w", p, target, err)
+		}
+		return nil
 	}
 	if err := placedFileStat(fd, &st); err != nil {
 		return fmt.Errorf("%s %w", p, err)

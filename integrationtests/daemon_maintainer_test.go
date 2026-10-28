@@ -184,26 +184,54 @@ while [ "$(date +%s)" -lt "$end" ]; do
 done`
 }
 
+// userImage is the user's own ext4 image, every file root-owned as its author wrote it, mounted at
+// /media/ubuntu/EVIL as udisks2 mounts one for an active-session user (nosuid,nodev). Built as
+// nobody; only the mount runs as root, standing in for udisksd.
+const userImage = `set -e
+rm -rf /tmp/u && mkdir -p /tmp/u/tree && echo 'steal()' > '/tmp/u/tree/libraries~00299a408.js'
+chmod 755 /tmp/u/tree && chmod 644 /tmp/u/tree/*.js && chown -R 65534:65534 /tmp/u
+` + nobodyRun + `env PATH=/usr/sbin:/usr/bin:/sbin:/bin sh -ec '
+cd /tmp/u && dd if=/dev/zero of=img bs=1M count=8 status=none
+mkfs.ext4 -q -F -E root_owner=0:0 -d tree img
+debugfs -w -R "sif /libraries~00299a408.js uid 0" img >/dev/null 2>&1
+debugfs -w -R "sif /libraries~00299a408.js gid 0" img >/dev/null 2>&1'
+for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+mkdir -p /media/ubuntu/EVIL
+mount -o nosuid,nodev "$(losetup -f --show /tmp/u/img)" /media/ubuntu/EVIL
+stat -c 'owner=%u:%g' /media/ubuntu/EVIL '/media/ubuntu/EVIL/libraries~00299a408.js' | sort -u
+echo READY`
+
 // Whatever writes the run's overlay may be hostile: malware of the same uid reaches it through
 // /proc/<pid>/cwd while steam.sh runs. A symlink it plants there must not be committed: the lib_dir
 // name would hand the whitelisted client the user's file. A link to a directory a user fills is
 // the same hole one level down (steamui/libraries/*.js is looked up through it, never judged),
-// though root decides the directory's own name. steam.sh sleeps as long as a real runtime unpack
-// takes, the window the racer needs.
+// though root decides the directory's own name. So is a root-owned tree on the user's own mounted
+// image, or the name where udisks2 would mount one later. steam.sh sleeps as long as a real runtime
+// unpack takes, the window the racer needs.
 func (s *IntegrationSuite) TestDaemon_Maintainer_RefusesPlantedSymlink() {
-	for _, tc := range []struct{ name, link, target string }{
-		{"user file", "planted.js", evilJS},
-		{"user home", "libraries", "/home/ubuntu"},
-		{"world-writable dir", "libraries", "/tmp"},
+	for _, tc := range []struct{ name, link, target, setup string }{
+		{"user file", "planted.js", evilJS, ""},
+		{"user home", "libraries", "/home/ubuntu", ""},
+		{"world-writable dir", "libraries", "/tmp", ""},
+		{"user-mounted image", "libraries", "/media/ubuntu/EVIL", userImage},
+		{"user mount point", "libraries", "/media/ubuntu/EVIL", ""},
 	} {
-		s.Run(tc.name, func() { s.plantedSymlinkRefused(tc.link, tc.target) })
+		s.Run(tc.name, func() { s.plantedSymlinkRefused(tc.link, tc.target, tc.setup) })
 	}
 }
 
-func (s *IntegrationSuite) plantedSymlinkRefused(link, target string) {
+func (s *IntegrationSuite) plantedSymlinkRefused(link, target, setup string) {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
 	conf := s.steamFixture(c, strings.Replace(fakeSteamSh, "\nexec ", "\nsleep 6\nexec ", 1), false)
+	if setup != "" {
+		code, out := s.exec(c, []string{"sh", "-c", setup})
+		if code != 0 || !strings.Contains(out, "READY") {
+			s.T().Skipf("unprivileged image build / loop mount unavailable here (exit %d): %s", code, out)
+		}
+		defer s.exec(c, []string{"sh", "-c", "umount /media/ubuntu/EVIL 2>/dev/null; losetup -j /tmp/u/img | cut -d: -f1 | xargs -r losetup -d; true"})
+		s.Require().Containsf(out, "owner=0:0\nREADY", "the image's tree must present as root-owned: %s", out)
+	}
 
 	code, out := s.exec(c, []string{"sh", "-c", "nohup " + steamUser + "sh -c " + shQuote(overlayPlanter(link, target)) +
 		" >/var/tmp/planter.log 2>&1 &"})

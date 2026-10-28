@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func openConfined(t *testing.T, path string) *os.File {
@@ -133,7 +135,14 @@ func TestRootPlacedName(t *testing.T) {
 	}
 	// A directory a user fills names what they decide below it, though root decides its own name.
 	refused := []string{"/proc/self/cwd/x", "/dev/fd/3", "/tmp/x", "/usr/lib/../lib/x", "usr/lib/x",
-		"/tmp", "/var/tmp", "/dev/shm", "/", "/home/app-listener-no-such-user/x", "/run/user/4242424242/x"}
+		"/tmp", "/var/tmp", "/dev/shm", "/", "/home/app-listener-no-such-user/x", "/run/user/4242424242/x",
+		// Where udisks2 mounts a user's image, whose files present any owner they were built with.
+		"/media/app-listener-no-such-user/x", "/run/media/app-listener-no-such-user/x", "/mnt/app-listener-no-such-mount"}
+	// A root-owned file on a nosuid mount: what a user-mounted image looks like (sysfs stands in).
+	var sys unix.Statfs_t
+	if unix.Statfs("/sys/kernel/btf/vmlinux", &sys) == nil && sys.Flags&unix.ST_NOSUID != 0 {
+		refused = append(refused, "/sys/kernel/btf/vmlinux")
+	}
 	if os.Geteuid() != 0 {
 		refused = append(refused, filepath.Join(t.TempDir(), "x"), filepath.Join(t.TempDir(), "missing", "x"))
 		if home, err := os.UserHomeDir(); err == nil {
