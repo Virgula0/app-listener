@@ -1,17 +1,17 @@
 # Graph Report - app-listener  (2026-10-29)
 
 ## Corpus Check
-- 534 files · ~1,754,051 words
+- 534 files · ~1,754,639 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 13 file(s) not represented in the graph (top: (none) 8, .service 2, .pub 1)
 
 ## Summary
-- 6939 nodes · 30800 edges · 238 communities (201 shown, 37 thin omitted)
-- Extraction: 91% EXTRACTED · 9% INFERRED · 0% AMBIGUOUS · INFERRED: 2863 edges (avg confidence: 0.85)
+- 6941 nodes · 30809 edges · 249 communities (208 shown, 41 thin omitted)
+- Extraction: 91% EXTRACTED · 9% INFERRED · 0% AMBIGUOUS · INFERRED: 2865 edges (avg confidence: 0.85)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `721bb35a`
+- Built from commit: `524efbd1`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -29,7 +29,7 @@
 - tempGrantSetup
 - New
 - protectedPage
-- os.File
+- GuardInodeKey
 - daemonconfig.go
 - root.go
 - IntegrationSuite
@@ -39,76 +39,77 @@
 - networkmonitor.bpf.c
 - usecase/daemon_test.go
 - Resource
-- auth_test.go
-- trustManager
+- auth.go
+- buildTrustedSet
 - guard.bpf.c
 - TrustGuard
-- find_test.go
-- sync.Mutex
+- changelog.go
+- FileTarget
 - golang.org/x/sys/unix.Stat_t
 - github.com/charmbracelet/bubbletea.Cmd
 - TestMonitorUseCaseLifecycle
-- policyEditor
+- binaryList
 - Guard
 - picker
-- SelectOrphans
+- orphans_test.go
 - IntegrationSuite
 - Message
 - controlServer
 - .posAt
-- go_pkg_os
+- runDaemon
 - IntegrationSuite
 - absPath
 - monitorUnitTest
-- BinaryEntry
+- go_pkg_strings
 - fileedit_model_test.go
 - EventType
 - stdio
-- update/update.go
+- update_test.go
 - fadeScroll
-- vaultfs_test.go
+- Vault
 - editView
 - Client
-- Config
-- hashCache
-- applier
-- github.com/spf13/cobra.Command
+- watchGroup
+- SanitizeText
+- .apply
+- NewDumpHook
 - mutedText
-- GuardInodeKey
+- engine
 - guardModel
 - audit.go
 - Recorder
-- exe_supersede.h
-- installPage
+- inode_dev
+- systemd.go
 - UI
 - unix_connect.c
-- wm_test.go
+- wm.go
 - IntegrationSuite
-- User
+- Config
 - liveSession
-- DaemonUseCase
+- .showSized
 - RefreshSection
 - pickfs.go
 - fcntl
 - bpfstats/main.go
-- CandidateDir
+- globBuilder
 - codecheck/main.go
-- fakeGuardRepo
-- update_test.go
-- process_vm_readv.c
 - GuardEvent
-- op
-- KernelDev
+- BinaryEntry
+- process_vm_readv.c
+- parseGuardEvent
+- maintainer/plan.go
+- LibraryClosure
 - rcUser
 - Monitor
-- newTestTarget
-- os.FileMode
+- journal
+- ListUsers
+- removeFacultatives
 - GenerateConf
 - daemon mode (fscrypt + whitelist lifecycle)
 - FORWARD temporary -w/-b whitelist grants
 - runView
-- Candidate
-- netinject.c
+- CandidateDir
+- prctl_exe_swap.c
 - NetGuard
 - check-compatibility.sh
 - BPF verifier 1M-insn complexity budget
@@ -117,33 +118,33 @@
 - ConfinedEntry
 - pinstate.go
 - Well-known bypass classes
-- NetEventType
+- NetGuardEvent
 - jit_provenance.c
-- ptrace_seize.c
+- inspector_probe.c
 - recordops.c
-- openFileVaultWithMasterKey
+- os.FileInfo
 - Build & sign release assets (reusable workflow)
 - btrfsLayoutFrom
-- Finder
-- mountTable
-- New
+- update/update.go
+- github.com/stretchr/testify/suite.Suite
+- codeedit.go
 - recordFlow
 - IntegrationSuite
-- recoverFileInPlace
+- makeReloadHandler
 - newTestVetter
 - IntegrationSuite
 - IntegrationSuite
 - Regenerate eBPF bindings in pinned builder image
 - .TestRecord_GuardParity
-- .apply
+- KernelDev
 - WebSocket /ws client
-- launch_probe.c
+- Selection
 - install.sh
 - mc_tag.h
 - .filterEvent
 - make test-integration (rootful Docker suite)
 - IntegrationSuite
-- backend.go
+- go_pkg_os
 - updatePage
 - trace-app-libs.sh
 - IntegrationSuite
@@ -156,40 +157,39 @@
 - catalogRefresher
 - serve.go
 - NetworkMonitor
-- gui/session.go
+- .populateWatchInodes
 - Ledger
-- runOfflineEdit
-- go_pkg_strings
-- githubRelease
-- readGrantRequest
+- runBackend
+- expandPlaceholders
+- .TestReconcileInodesEvictsStale
+- DumpHook
 - fakeStore
 - github.com/charmbracelet/bubbles/textarea.Model
 - IntegrationSuite
 - buildOneGuard
 - runNetworkGuard
 - planUpdaters
-- NetworkMonitorRepository
+- gui/session.go
 - Installation
 - backend_test.go
 - graphify-refresh.sh
-- layout.go
-- gui.go
+- .Layout
+- restore.go
 - IntegrationSuite
-- time.Time
-- feed.go
+- NetEventType
+- networkPage
 - shell
-- binaryList
+- cursor.go
 - watchSet
-- WithBottomBar
-- Vault
-- downloadFile
+- githubRelease
+- deploy
 - Limitations
 - net_tester/main.go
 - IntegrationSuite
 - compileGlobNames
-- lockAndDeprovision
-- NewEventFanout
-- runMonitor
+- safeio.go
+- vaultfs_test.go
+- RawTarget
 - TestMain
 - Compatibility
 - How it works
@@ -205,53 +205,64 @@
 - Binary
 - dialog_test.go
 - edit-protected
-- changelog_test.go
+- github.com/spf13/cobra.Command
 - kernel-prof.sh
 - CopyTreeWithProgress
 - pathCache
 - .FilterExistingWhitelist
-- DaemonEvent
+- time.Time
 - Daemon configuration
 - fileedit_symlink_test.go
-- NetGuardEvent
+- hashCache
 - Desktop GUI
 - IntegrationSuite
-- WithSuspectsFrom
-- mustSubkey
+- logLine
+- daemon: permanent protection with encryption at rest
 - .eventTypeAllowed
-- configedit_test.go
-- inode_dev.h
+- Active
+- netinject.c
 - procstats.go
 - .awaitDaemonUpOrDead
-- bpfLsmListed
+- NetworkMonitorRepository
 - VouchedDevs
-- io.Writer
-- resolveFilesystemPrereqs
-- shQuote
-- .exeKeys
-- CleanupStalePins
-- launchKey
-- newBinary
+- sync.Mutex
+- unit.go
+- IntegrationSuite
+- openBunTmp
+- changelog_test.go
+- AddServeFlags
+- Existing
 - supersede_probe.c
-- checkRunningBinaryMatchesInstalled
-- inspector_probe.c
-- Choice
+- Prereq
+- BinaryStat
+- logGrid
+- configedit_test.go
 - github.com/Virgula0/app-listener/tools/codecheck
-- Vault
-- Plan
-- taint_victim.c
+- loadDaemonConfig
+- FetchLatest
+- vaultfs.go
+- prctl_gate
+- WithBottomBar
 - Troubleshooting
-- appTheme
+- mountTable
+- IntegrationSuite
+- parsePasswd
 - bleedLayout
+- ptrace_seize.c
+- Execute
+- headless/headless.go
+- monitor: see what touches a path
+- downloadFile
+- .exeKeys
+- .runEditorHarness
 - TestCleanRel
-- monitor.md
 
 ## God Nodes (most connected - your core abstractions)
 1. `Guard` - 123 edges
 2. `Config` - 118 edges
 3. `GuardInodeKey` - 103 edges
 4. `shell` - 97 edges
-5. `absPath()` - 90 edges
+5. `absPath()` - 91 edges
 6. `Load()` - 90 edges
 7. `IntegrationSuite` - 83 edges
 8. `fileEditModel` - 77 edges
@@ -267,37 +278,37 @@
   integrationtests/exploits/README.md → README.md
 - `swap_benign / swap_reader in-place binary swap POC` --semantically_similar_to--> `Binary ledger (/etc/app-listener/binaries.db)`  [INFERRED] [semantically similar]
   integrationtests/exploits/README.md → README.md
-- `runConfigEditor()` --calls--> `EditText()`  [INFERRED]
-  cmd/functions/install/steps.go → internal/install/editor.go
+- `certifyInstall()` --calls--> `InstallCertPath()`  [EXTRACTED]
+  cmd/functions/install/install.go → internal/protected/installcert.go
 
 ## Import Cycles
 - None detected.
 
-## Communities (238 total, 37 thin omitted)
+## Communities (249 total, 41 thin omitted)
 
 ### Community 0 - "daemon/daemon.go"
-Cohesion: 0.16
-Nodes (45): discoverInfra(), tempJournalRow, classCacheKey, launchRule, MulticallError, trustEvent, btrfsIoctlFsInfoArgs, ciliumVersion (+37 more)
+Cohesion: 0.17
+Nodes (28): tempJournalRow, classCacheKey, launchRule, MulticallError, trustEvent, btrfsIoctlFsInfoArgs, ciliumVersion, multicallCacheKey (+20 more)
 
 ### Community 1 - "testing.T"
 Cohesion: 0.02
-Nodes (149): plantBun(), TestOpenBunTmp_KeepsVettedDir(), newTestSession(), TestRunSessionIdleTimeoutResetsOnPing(), TestRunSessionStreamsEventsAsActivity(), TestDaemonSelfBaselineEventsNeverWrites(), TestGroupUnlockSelfEventsIsBaselinePlusMknod(), TestEveryInstallModeMapped() (+141 more)
+Nodes (163): plantBun(), TestOpenBunTmp_KeepsVettedDir(), newTestSession(), TestRunSessionIdleTimeoutResetsOnPing(), TestRunSessionStreamsEventsAsActivity(), awaitStartupOrSignal(), TestDaemonSelfBaselineEventsNeverWrites(), TestGroupUnlockSelfEventsIsBaselinePlusMknod() (+155 more)
 
 ### Community 2 - "IntegrationSuite"
 Cohesion: 0.09
-Nodes (9): configBinaryLines(), IntegrationSuite, parseDaemonEvents(), probeExeAs(), procGateMatrix(), procReadProbe(), rawExec(), watchPathsInConfig() (+1 more)
+Nodes (10): configBinaryLines(), IntegrationSuite, parseDaemonEvents(), probeExeAs(), procGateMatrix(), procReadProbe(), rawExec(), shQuote() (+2 more)
 
 ### Community 3 - "Vault"
-Cohesion: 0.16
-Nodes (15): lockOneRoot(), lockRootRecovering(), relockStaleVaults(), isFileVaultCiphertext(), isRegularFileTarget(), Vault, hasEncryptionPolicy(), isLockedRegularFileErr() (+7 more)
+Cohesion: 0.13
+Nodes (18): deprovisionKind, isFileVaultCiphertext(), isRegularFileTarget(), classifyDeprovision(), classifyDeprovisionErr(), Vault, hasEncryptionPolicy(), isLockedRegularFileErr() (+10 more)
 
 ### Community 4 - "daemonconfig_test.go"
 Cohesion: 0.07
-Nodes (80): Load(), ResolvePendingPaths(), hasBinary(), hasPendingBinary(), TestElectronAppsBlockParsed(), TestElectronAppsBlockRejectsMalformedLines(), TestEncryptionGroupsSkipsLibDirs(), TestInspectorsBlockBounded() (+72 more)
+Nodes (77): Load(), ResolvePendingPaths(), hasBinary(), hasPendingBinary(), TestElectronAppsBlockParsed(), TestElectronAppsBlockRejectsMalformedLines(), TestEncryptionGroupsSkipsLibDirs(), TestInspectorsBlockBounded() (+69 more)
 
 ### Community 5 - "networkguard.bpf.c"
-Cohesion: 0.09
-Nodes (51): prctl_gate(), guard_task_prctl(), admit_refusal(), check_watched(), code_vouched(), emit_event(), emit_gate(), env_loader() (+43 more)
+Cohesion: 0.10
+Nodes (48): admit_refusal(), check_watched(), code_vouched(), emit_event(), emit_gate(), env_loader(), env_step(), exe_inode_of() (+40 more)
 
 ### Community 6 - "monitor.bpf.c"
 Cohesion: 0.11
@@ -308,48 +319,48 @@ Cohesion: 0.16
 Nodes (7): netMonitorEvent, IntegrationSuite, fmtEvents(), IntegrationSuite, netMonitorDeltaEvents(), netMonitorHasTypes(), parseNetMonitorEvents()
 
 ### Community 8 - "guardUnitTest"
-Cohesion: 0.06
-Nodes (24): addErrKind, ReplacementCheck, classifyAddErr(), guardModeKey(), addRecorder(), copySelf(), guardUnitTest, runTool() (+16 more)
+Cohesion: 0.05
+Nodes (27): addErrKind, ReplacementCheck, classifyAddErr(), guardModeKey(), addRecorder(), copySelf(), guardUnitTest, runTool() (+19 more)
 
 ### Community 9 - "mkdirs"
-Cohesion: 0.13
-Nodes (36): newWatchPattern(), newFakeInotify(), TestWatchSetBinaryWriteTriggersNotMkdir(), TestWatchSetFloodIsCapped(), TestWatchSetLibDirAppearanceTriggers(), TestWatchSetMissingRootWatchesDeepestAncestor(), TestWatchSetOverflowRescansAndRebuilds(), TestWatchSetSymlinkCreateTriggers() (+28 more)
+Cohesion: 0.14
+Nodes (35): newWatchPattern(), newFakeInotify(), TestWatchSetBinaryWriteTriggersNotMkdir(), TestWatchSetFloodIsCapped(), TestWatchSetLibDirAppearanceTriggers(), TestWatchSetMissingRootWatchesDeepestAncestor(), TestWatchSetOverflowRescansAndRebuilds(), TestWatchSetSymlinkCreateTriggers() (+27 more)
 
 ### Community 10 - "tempGrantSetup"
-Cohesion: 0.21
-Nodes (10): tempJournalRows(), journalTo(), tempBinary(), tempGrantSetup(), TestGrantTemporaryAccessJournalsBeforeApplyAndClearsAfterRevoke(), TestGrantTemporaryAccessRefusals(), TestGrantTemporaryAccessRevokesOnInPlaceRewrite(), TestGrantTemporaryAccessRollsBackOnApplyFailure() (+2 more)
+Cohesion: 0.25
+Nodes (9): journalTo(), tempBinary(), tempGrantSetup(), TestGrantTemporaryAccessJournalsBeforeApplyAndClearsAfterRevoke(), TestGrantTemporaryAccessRefusals(), TestGrantTemporaryAccessRevokesOnInPlaceRewrite(), TestGrantTemporaryAccessRollsBackOnApplyFailure(), fakeTempGrant (+1 more)
 
 ### Community 11 - "New"
-Cohesion: 0.19
-Nodes (19): looksLikeFileVaultRecord(), TestIsEncryptedDispatchesToFileVaultForRegularFiles(), TestIsProvisionedForFile(), TestLockUnlockFileInPlaceIdempotent(), TestUnlockFileInPlaceWrongKeyFails(), TestUnlockLockFileInPlacePreservesInode(), TestUnlockLockFileInPlaceRoundTrip(), TestVaultUnlockLockDispatchForRegularFile() (+11 more)
+Cohesion: 0.07
+Nodes (51): decryptDirectories(), TestDecryptDirectoriesEmpty(), classifyRegularFileTarget(), clearRecovery(), deriveFileVaultSubkey(), EnsureRecoverySidecarPlaceholder(), fileVaultRecoverPath(), looksLikeFileVaultRecord() (+43 more)
 
 ### Community 12 - "protectedPage"
-Cohesion: 0.04
-Nodes (32): backendLink, checkGrid, configView, forwardForm, forwardView, installUI, protectedPage, recordReview (+24 more)
-
-### Community 13 - "os.File"
 Cohesion: 0.05
-Nodes (65): multicallAdmissible(), newBinaryVetter(), openBinaryVetter(), ownerPaths(), scriptIdentity(), setConfinedHomes(), startTrustGuard(), trustStartupError() (+57 more)
+Nodes (24): backendLink, configView, forwardForm, forwardView, protectedPage, recordForm, recordView, trustPage (+16 more)
+
+### Community 13 - "GuardInodeKey"
+Cohesion: 0.03
+Nodes (94): scriptIdentity(), checkFreshDir(), openDirNoFollow(), renewDir(), setConfinedHomes(), VettedInode, Multicall, MulticallKind (+86 more)
 
 ### Community 14 - "daemonconfig.go"
-Cohesion: 0.35
+Cohesion: 0.36
 Nodes (6): recordTick, rejectSymlinkedComponents(), validateWatchTarget(), isAbsoluteCandidate(), TestCatalogSanity(), hint
 
 ### Community 15 - "root.go"
 Cohesion: 0.10
-Nodes (15): releaseBuild(), Run(), closeDumpFile(), Execute(), initLogger(), postRun(), InstallMode, InstallRequest (+7 more)
+Nodes (12): releaseBuild(), Run(), TestEveryInstallModeMapped(), closeDumpFile(), postRun(), stageItem, stageState, textAnswer (+4 more)
 
 ### Community 16 - "IntegrationSuite"
-Cohesion: 0.11
-Nodes (6): eventsForPath(), IntegrationSuite, guardDeltaEvents(), le64HexKey(), parseGuardEvents(), guardEvent
+Cohesion: 0.10
+Nodes (8): attrOpCase, eventsForPath(), IntegrationSuite, guardDeltaEvents(), le64HexKey(), parseGuardEvents(), guardEvent, guardExploitTest
 
 ### Community 17 - "guard_trust.bpf.c"
 Cohesion: 0.09
-Nodes (60): caller_updates(), current_exe_flags(), current_exe_inode(), current_exe_key(), current_writer_bits(), dentry_is_dir(), dentry_parent(), deny_if_protected() (+52 more)
+Nodes (57): caller_updates(), current_exe_flags(), current_exe_inode(), current_exe_key(), current_writer_bits(), dentry_is_dir(), dentry_parent(), deny_if_protected() (+49 more)
 
 ### Community 18 - "navItem"
-Cohesion: 0.03
-Nodes (18): binaryRow, clickPanel, iconTile, iconTileRenderer, navItem, navItemRenderer, panelRenderer, pill (+10 more)
+Cohesion: 0.04
+Nodes (15): clickPanel, iconTileRenderer, navItem, navItemRenderer, panelRenderer, pillRenderer, tabBar, tabButton (+7 more)
 
 ### Community 19 - "fileEditModel"
 Cohesion: 0.08
@@ -365,259 +376,255 @@ Nodes (48): NewDaemonUseCase(), partitionEncryptionRoots(), newFakeVault(), reso
 
 ### Community 22 - "Resource"
 Cohesion: 0.07
-Nodes (7): fakeDaemon, Resource, GuardRepository, encryptionRootOf(), uniqueEncryptionRoots(), vaultOpForGuard(), vaultOpOnRoot()
+Nodes (10): Resource, GuardRepository, Vault, ConcurrencyLimit(), encryptionRootOf(), DaemonUseCase, uniqueEncryptionRoots(), unlockRoots() (+2 more)
 
-### Community 23 - "auth_test.go"
-Cohesion: 0.12
-Nodes (41): CheckPassword(), Hash(), HashConfigured(), importLegacyHash(), LoadHash(), MigrateLegacyHash(), openLedger(), OriginOf() (+33 more)
+### Community 23 - "auth.go"
+Cohesion: 0.13
+Nodes (40): CheckPassword(), Hash(), HashConfigured(), importLegacyHash(), LoadHash(), MigrateLegacyHash(), openLedger(), OriginOf() (+32 more)
 
-### Community 24 - "trustManager"
-Cohesion: 0.09
-Nodes (30): fileID(), openBunTmp(), TestOpenBunTmp_ReplacesUnvettedDir(), TestOpenBunTmp_SymlinkReplacedTargetUntouched(), makeReloadHandler(), noteReloadedSettings(), startCatalogRefresh(), inspectorPaths() (+22 more)
+### Community 24 - "buildTrustedSet"
+Cohesion: 0.21
+Nodes (13): inspectorPaths(), TestInspectorPathsOnlyRootPlaced(), buildTrustedSet(), TestBuildTrustedSetExcludesLibraryClosure(), closureRejections(), inGuardedTree(), keys(), TestWarnUntrustedLibs_OnlyWhatTheKernelRefuses() (+5 more)
 
 ### Community 25 - "guard.bpf.c"
 Cohesion: 0.08
-Nodes (79): exe_refused(), inode_dev(), add_inode_to_guard(), btrfs_copy_gate(), check_and_emit_args(), chmod_only_drops_write(), code_suspect(), count_degrade() (+71 more)
+Nodes (76): exe_refused(), add_inode_to_guard(), btrfs_copy_gate(), check_and_emit_args(), chmod_only_drops_write(), code_suspect(), count_degrade(), current_is_inspector() (+68 more)
 
 ### Community 26 - "TrustGuard"
 Cohesion: 0.06
-Nodes (24): lsmHook, trustHook, trustRows, deleteResKeys(), guardLSMHooks(), TestGuardLSMHooksIoctlCompatOnlyWhenPresent(), TestUnixSocketHooksAreRequired(), dropSupersededLocked() (+16 more)
+Nodes (18): tempGrant, tempMaskOp, tempRow, trustHook, trustRows, deleteResKeys(), setSupersedeTrust(), liveTrust() (+10 more)
 
-### Community 27 - "find_test.go"
-Cohesion: 0.21
-Nodes (18): NewFinder(), findEditor(), keys(), TestFinderLeavesSaveToHost(), TestFinderReadOnlyIgnoresReplace(), TestFinderReplace(), TestFinderReplaceWithSupersetTerminates(), TestFinderSearchAllMarksEveryMatch() (+10 more)
-
-### Community 28 - "sync.Mutex"
-Cohesion: 0.04
-Nodes (31): refusedReplacements, TestRefusedReplacements_ReportsEachInodeOnce(), specFromForm(), guardPill(), netGuardPill(), NetworkGuardRepository, newActivity(), Files (+23 more)
+### Community 28 - "FileTarget"
+Cohesion: 0.13
+Nodes (9): guardPill(), FileSpec, FileTarget, Policy, newFileTarget(), NormalizeSpec(), overlaps(), stopPumped() (+1 more)
 
 ### Community 29 - "golang.org/x/sys/unix.Stat_t"
-Cohesion: 0.12
-Nodes (22): placedWalk, treeJudge, confineBelow(), inUserHome(), vouchedFd(), GlobSystemPlaced(), placedDir(), placedEntry() (+14 more)
+Cohesion: 0.11
+Nodes (25): placedWalk, treeJudge, mountinfoDev(), SuperblockDev(), TestMountinfoDev(), confineBelow(), inUserHome(), vouchedFd() (+17 more)
 
 ### Community 30 - "github.com/charmbracelet/bubbletea.Cmd"
-Cohesion: 0.08
-Nodes (19): recordTickCmd(), recordModel, listenForDaemonEvents(), tickDaemonStats(), listenForGuardEvents(), tickGuardStats(), syncViewport(), listenForNetEvents() (+11 more)
+Cohesion: 0.07
+Nodes (16): recordTickCmd(), recordModel, diffModel, editorModel, listenForDaemonEvents(), tickDaemonStats(), renderBullets(), TestNoticeViewFitsAndPlacesOKLast() (+8 more)
 
 ### Community 31 - "TestMonitorUseCaseLifecycle"
 Cohesion: 0.18
 Nodes (12): NewGuardUseCase(), NewMonitorUseCase(), NewNetworkGuardUseCase(), newFakeNetworkGuardRepo(), TestGuardUseCaseLifecycle(), TestGuardUseCaseStartError(), TestMonitorUseCaseLifecycle(), TestMonitorUseCaseStartError() (+4 more)
 
-### Community 32 - "policyEditor"
-Cohesion: 0.07
-Nodes (22): handCheckGroup, handRadioGroup, handSelect, netGuardTab, policyEditor, policyHooks, policyTab, handCursor() (+14 more)
+### Community 32 - "binaryList"
+Cohesion: 0.10
+Nodes (13): binaryList, netGuardTab, policyEditor, policyHooks, policyTab, newBinaryList(), newPolicyTab(), verbFor() (+5 more)
 
 ### Community 33 - "Guard"
-Cohesion: 0.06
-Nodes (20): lockVaultFully(), unlockUnderGuard(), vaultOpUnderGuard(), vaultScan(), exeRow, rootHandle, supersededBinary, tempGrant (+12 more)
+Cohesion: 0.05
+Nodes (19): binaryVerifyState, deferredBinary, exeRow, rootHandle, supersededBinary, openRoot(), TestCheckBinaryEventsReadOnlyAcceptsUnrestricted(), SharedPinDegraded() (+11 more)
 
 ### Community 34 - "picker"
-Cohesion: 0.15
-Nodes (5): keyEntry, picker, errText(), isFindShortcut(), newKeyEntry()
+Cohesion: 0.14
+Nodes (6): keyEntry, picker, errText(), isFindShortcut(), newKeyEntry(), newPickRow()
 
-### Community 35 - "SelectOrphans"
-Cohesion: 0.20
-Nodes (17): modifiedContextWithSource(), appProtectorSet(), CleanOrphans(), isAppProtector(), listPolicies(), listProtectors(), orphanedPolicies(), orphanedProtectors() (+9 more)
+### Community 35 - "orphans_test.go"
+Cohesion: 0.18
+Nodes (20): modifiedContextWithSource(), appProtectorSet(), CleanOrphanedMetadata(), CleanOrphans(), isAppProtector(), listPolicies(), listProtectors(), LivePolicyDescriptors() (+12 more)
 
 ### Community 37 - "Message"
 Cohesion: 0.09
-Nodes (13): checkSecret(), checkTrustLine(), trustRows(), TestLiveSessionWatchAndPinger(), File, TrustItem, backend, backendOp (+5 more)
+Nodes (13): checkSecret(), checkTrustLine(), trustRows(), File, TrustItem, backend, backendOp, backendState (+5 more)
 
 ### Community 38 - "controlServer"
-Cohesion: 0.17
-Nodes (7): readClientLines(), streamEvents(), TestEditControlSessionEndIdempotent(), TestRecordFailureLockout(), controlServer, editControlSession, grantRequest
+Cohesion: 0.10
+Nodes (22): readConfigPut(), TestReadGrantRequestConfig(), readAuthRequest(), readBareRequest(), readClientLines(), readForwardRequest(), readGrantRequest(), readPathLines() (+14 more)
 
 ### Community 39 - ".posAt"
-Cohesion: 0.11
-Nodes (14): lineStyles, viewportState, fg(), baseStyle(), gutterLabel(), lineLen(), markStyle(), repeatSpaces() (+6 more)
+Cohesion: 0.10
+Nodes (15): lineStyles, viewportState, fg(), TestDaemonConfTokens(), TestTokenizeKeepsLineCount(), tokenClassOf(), baseStyle(), gutterLabel() (+7 more)
 
-### Community 40 - "go_pkg_os"
+### Community 40 - "runDaemon"
 Cohesion: 0.08
-Nodes (21): atomicWriteAt(), refuseExistingSymlink(), TestWriteWithin_PlainFile(), TestWriteWithin_RefusesSymlinkDirComponent(), TestWriteWithin_RefusesSymlinkTarget(), TestWriteWithin_RejectsEscape(), writeAndSync(), writeWithin() (+13 more)
+Nodes (37): CheckBPFLSM(), backingDeviceUnion(), buildGuards(), catchLifecycleSignals(), configureDaemonLogging(), lockOneRoot(), lockRootRecovering(), newPinGeneration() (+29 more)
 
 ### Community 41 - "IntegrationSuite"
 Cohesion: 0.07
 Nodes (14): decodeMulticall(), IntegrationSuite, multicallBypasses(), multicallConfig(), uutilsStrays(), vettedGroupIndex(), exploitTest, IntegrationSuite (+6 more)
 
 ### Community 42 - "absPath"
-Cohesion: 0.07
-Nodes (6): IntegrationSuite, IntegrationSuite, IntegrationSuite, IntegrationSuite, IntegrationSuite, absPath()
-
-### Community 43 - "monitorUnitTest"
-Cohesion: 0.15
-Nodes (4): sameInode(), dirTarget(), newMountTable(), monitorUnitTest
-
-### Community 44 - "BinaryEntry"
 Cohesion: 0.06
-Nodes (29): deferredBinary, keptEntries, snapEngines, BinaryEntry, TestCheckBinaryEventsReadOnlyAcceptsUnrestricted(), TestCheckBinaryEventsReadOnlyRejectsRestriction(), TestWithChmodDropWriteNeedsReadOnly(), checkBtrfsKeys() (+21 more)
+Nodes (7): IntegrationSuite, IntegrationSuite, IntegrationSuite, inNosuidNamespace(), IntegrationSuite, IntegrationSuite, absPath()
+
+### Community 44 - "go_pkg_strings"
+Cohesion: 0.06
+Nodes (18): atomicWriteAt(), refuseExistingSymlink(), TestWriteWithin_PlainFile(), TestWriteWithin_RefusesSymlinkDirComponent(), TestWriteWithin_RefusesSymlinkTarget(), TestWriteWithin_RejectsEscape(), writeAndSync(), writeWithin() (+10 more)
 
 ### Community 45 - "fileedit_model_test.go"
-Cohesion: 0.21
+Cohesion: 0.20
 Nodes (25): newFileEditModel(), inodeOf(), maxLineWidth(), selectNamed(), TestChmodSuidEndToEnd(), TestFileChmod(), TestFileChownFlow(), TestFileCreateAndDeleteFlow() (+17 more)
 
 ### Community 46 - "EventType"
-Cohesion: 0.05
-Nodes (24): snapMonitor, BpfEvent, EventType, eventUnitTest, FileEvent, parseEvents(), TestAddBinaryActionsRefusesBeforeWriting(), specSummary() (+16 more)
+Cohesion: 0.07
+Nodes (19): snapMonitor, BpfEvent, EventType, eventUnitTest, FileEvent, parseEvents(), TestAddBinaryActionsRefusesBeforeWriting(), TestCheckBinaryEventsReadOnlyRejectsRestriction() (+11 more)
 
-### Community 48 - "update/update.go"
-Cohesion: 0.11
-Nodes (38): applyUpdate(), archAssets(), assetsFor(), channelOf(), checkUpdatePreconditions(), confirmUnit(), deploy(), deployGUI() (+30 more)
+### Community 48 - "update_test.go"
+Cohesion: 0.10
+Nodes (20): fetchReleases(), parseChecksum(), parsePublicKey(), rsaPublicKeyPEM(), signedChecksum(), TestFetchReleases(), TestFetchReleasesHTTPError(), TestFilterChannel() (+12 more)
 
 ### Community 49 - "fadeScroll"
 Cohesion: 0.06
-Nodes (27): App maintainers (Steam runtime updates), Boot ordering, Commands and flags, daemon: permanent protection with encryption at rest, Filesystem-wide gates, Lifecycle, Process inspectors and taint, Quiet metadata denials (+19 more)
+Nodes (18): appTheme, fadeBar, fadeBarRenderer, fadeScroll, fadeScrollRenderer, fadeScrollOf(), newTestFadeScroll(), settle() (+10 more)
 
-### Community 50 - "vaultfs_test.go"
-Cohesion: 0.13
-Nodes (21): DefaultNewFileMode(), IsBinaryContent(), IsOctalMode(), ParseMode(), inodeOf(), mustRead(), mustWrite(), openRootT() (+13 more)
+### Community 50 - "Vault"
+Cohesion: 0.22
+Nodes (4): Vault, Open(), WriteFileInPlace(), WriteFileKeepMeta()
 
 ### Community 51 - "editView"
-Cohesion: 0.11
-Nodes (9): codeEntry, editView, handButton, Entry, selectable(), fileSize(), joinRel(), newCodeEntry() (+1 more)
+Cohesion: 0.12
+Nodes (6): codeEntry, editView, Entry, fileSize(), joinRel(), relOf()
 
 ### Community 52 - "Client"
-Cohesion: 0.10
-Nodes (12): Client, childEnv(), launch(), Start(), verifiedBinary(), TestChildEnvIsAllowlisted(), TestHelperBackend(), TestReaderCapsLines() (+4 more)
+Cohesion: 0.09
+Nodes (13): Client, childEnv(), launch(), Start(), TestChildEnvIsAllowlisted(), TestHelperBackend(), TestReaderCapsLines(), Reader (+5 more)
 
-### Community 53 - "Config"
-Cohesion: 0.06
-Nodes (68): addedResources(), appendSectionsAndEdit(), collectDiffAdditions(), TestAddedResourcesSkipsAlreadyGuardedSSH(), TestUncoveredCandidates(), uncoveredCandidates(), runConfigEditor(), watchGroup (+60 more)
+### Community 53 - "watchGroup"
+Cohesion: 0.11
+Nodes (35): watchGroup, addResource(), applyAllowLib(), applyConfigLine(), applyDirective(), applyElectronApp(), applyInspector(), applyLibBinary() (+27 more)
 
-### Community 54 - "hashCache"
-Cohesion: 0.12
-Nodes (17): newHashCache(), ds(), TestHashCacheFlushKeepsOnlyThisRunsRows(), hashCache, fakeHashStore, BinaryStat, DurableStat, HashCache (+9 more)
+### Community 54 - "SanitizeText"
+Cohesion: 0.07
+Nodes (24): multicallAdmissible(), newBinaryVetter(), openBinaryVetter(), ownerPaths(), refreshAdmits(), TestRefreshAdmitsHomeMatchesAndRootPlacedNamesOnly(), inHome(), startTrustGuard() (+16 more)
 
-### Community 55 - "applier"
-Cohesion: 0.22
-Nodes (4): applier, ledgerOps, PlannedBinary, vaultOps
+### Community 55 - ".apply"
+Cohesion: 0.14
+Nodes (10): TestApplyKeepsConfirmedLedgerVerdict(), TestApplyPinsUserBinariesAndRetriesStale(), TestApplyRefusesUnpreparedFilesystemBeforeTouchingAnything(), TestApplyRollsBackOnRefusal(), testPlan(), applier, ledgerOps, PlannedBinary (+2 more)
 
-### Community 56 - "github.com/spf13/cobra.Command"
-Cohesion: 0.10
-Nodes (32): AddHeadlessFlag(), AddServeFlags(), credentialFlagState(), isLoopbackHost(), ParseServeFlags(), requestedBoolFlag(), validateEnabledServe(), validateServeAddress() (+24 more)
+### Community 56 - "NewDumpHook"
+Cohesion: 0.24
+Nodes (11): applyVerbosity(), VerboseLevel, BridgeStdLog(), NewDumpHook(), TestBridgeStdLog(), TestDefaultVerboseMirrorsCurrentDisplay(), TestDumpHookFileIsSynced(), TestDumpHookFiltersByVerbosity() (+3 more)
 
 ### Community 57 - "mutedText"
-Cohesion: 0.07
-Nodes (39): filesPage, multiAnswer, panel, recordForm, newLogo(), newBinaryList(), newBinaryRow(), newCheck() (+31 more)
+Cohesion: 0.05
+Nodes (48): actionGate, binaryRow, binSource, filesPage, handButton, homePage, iconTile, installAction (+40 more)
 
-### Community 58 - "GuardInodeKey"
-Cohesion: 0.03
-Nodes (53): engine, inodeBatchFn, resInfo, taintOwner, TestNearestRootClaims(), TestTieRank(), nextLabel(), TestDeliverLabelsCrossResourceProcessGates() (+45 more)
+### Community 58 - "engine"
+Cohesion: 0.04
+Nodes (30): engine, resInfo, taintOwner, TestTieRank(), nextLabel(), TestDeliverLabelsCrossResourceProcessGates(), TestSetInspectorsBounded(), pathWithin() (+22 more)
 
 ### Community 59 - "guardModel"
-Cohesion: 0.07
-Nodes (26): formatGuardEventLine(), sanitizeTerminalText(), sanitizeTerminalTexts(), formatDecision(), appendCapped(), clipToWidth(), formatResourceBar(), formatType() (+18 more)
+Cohesion: 0.06
+Nodes (34): formatGuardEventLine(), sanitizeTerminalText(), sanitizeTerminalTexts(), formatDecision(), listenForGuardEvents(), tickGuardStats(), appendCapped(), clipToWidth() (+26 more)
 
 ### Community 60 - "audit.go"
-Cohesion: 0.09
-Nodes (31): auditAfterEdit(), auditEntry(), auditFindings(), auditFindingsWithConfig(), auditGroupCoverage(), auditTree(), coveredByWatch(), findResource() (+23 more)
+Cohesion: 0.21
+Nodes (16): auditAfterEdit(), auditEntry(), auditFindings(), auditFindingsWithConfig(), auditGroupCoverage(), auditTree(), coveredByWatch(), findResource() (+8 more)
 
 ### Community 61 - "Recorder"
-Cohesion: 0.17
-Nodes (14): Target, drain(), Recorder, Target, monitorTargets(), newRecorder(), selfExe(), Start() (+6 more)
+Cohesion: 0.12
+Nodes (18): maskFor(), newBinary(), drain(), Recorder, newRecorder(), opNames(), selfExe(), sortedKeys() (+10 more)
 
-### Community 62 - "exe_supersede.h"
-Cohesion: 0.21
-Nodes (14): exe_is_superseded(), exe_last_link_key(), exe_note_freed(), exe_note_supersede(), exe_seq_now(), exe_stamp_exec(), exe_stamp_fork(), exe_stamp_free() (+6 more)
+### Community 62 - "inode_dev"
+Cohesion: 0.12
+Nodes (23): exe_is_superseded(), exe_last_link_key(), exe_note_freed(), exe_note_supersede(), exe_seq_now(), exe_stamp_exec(), exe_stamp_fork(), exe_stamp_free() (+15 more)
 
-### Community 63 - "installPage"
-Cohesion: 0.09
-Nodes (16): actionGate, binSource, handCheck, installAction, installPage, uninstallCard, UninstallHooks, UninstallRequest (+8 more)
+### Community 63 - "systemd.go"
+Cohesion: 0.06
+Nodes (63): offerDaemonStart(), runDiffCatalog(), installGUI(), needsBinary(), RunWith(), TestNeedsBinary(), TestRunWithRefusesDeployWithoutBinary(), TestRunWithRefusesNonHeadlessBinary() (+55 more)
 
 ### Community 64 - "UI"
-Cohesion: 0.09
-Nodes (18): installHooks(), staged(), RunWith(), TestConfirmUpdateRoutesToActiveUI(), TestRunWithRefusesConcurrentRun(), UpdateHooks, cancelUI, InstallHooks (+10 more)
+Cohesion: 0.13
+Nodes (15): InstallMode, InstallRequest, Options, UninstallHooks, UninstallRequest, UpdateHooks, InstallHooks, StagedRelease (+7 more)
 
 ### Community 65 - "unix_connect.c"
-Cohesion: 0.41
-Nodes (12): attack_connect(), attack_dgram(), attack_uring(), denied(), fill_addr(), handoff(), main(), read_secret() (+4 more)
+Cohesion: 0.40
+Nodes (13): attack_connect(), attack_dgram(), attack_uring(), denied(), fill_addr(), handoff(), hold(), main() (+5 more)
 
-### Community 66 - "wm_test.go"
+### Community 66 - "wm.go"
 Cohesion: 0.11
-Nodes (24): reachable(), centered(), Detect(), FitSize(), Session, hyprlandSocket(), i3RuntimeSocket(), poll() (+16 more)
+Nodes (25): detectWM(), reachable(), centered(), Detect(), FitSize(), Session, hyprlandSocket(), i3RuntimeSocket() (+17 more)
 
 ### Community 67 - "IntegrationSuite"
 Cohesion: 0.16
-Nodes (8): guardBinaryFlag(), infraContainerPaths(), IntegrationSuite, IntegrationSuite, guardNetTypesForComm(), netGuardBlockedEventCount(), netGuardHasBlockedEvent(), netGuardTail()
+Nodes (7): guardBinaryFlag(), IntegrationSuite, IntegrationSuite, guardNetTypesForComm(), netGuardBlockedEventCount(), netGuardHasBlockedEvent(), netGuardTail()
 
-### Community 68 - "User"
-Cohesion: 0.06
-Nodes (65): askBunTmpdirUsers(), bunEntryConfigured(), bunLaunchers(), bunLaunchersFor(), gatherPerUserSetup(), setupBunTmpdir(), applyDiffAdditions(), bunLaunchersOffered() (+57 more)
+### Community 68 - "Config"
+Cohesion: 0.08
+Nodes (50): resolveInspectors(), TestResolveInspectorsKeepsOnlyAdmitted(), askBunTmpdirUsers(), bunEntryConfigured(), bunLaunchers(), bunLaunchersFor(), gatherPerUserSetup(), setupBunTmpdir() (+42 more)
 
 ### Community 69 - "liveSession"
 Cohesion: 0.17
-Nodes (12): parseErr(), TestLiveSessionConfigAndPut(), chooseResources(), confirmUserPlaced(), eventsLabel(), forwardBinaries(), forwardCheck(), holdForward() (+4 more)
+Nodes (12): parseErr(), TestLiveSessionConfigAndPut(), TestLiveSessionWatchAndPinger(), chooseResources(), confirmUserPlaced(), eventsLabel(), forwardBinaries(), forwardCheck() (+4 more)
 
-### Community 70 - "DaemonUseCase"
-Cohesion: 0.12
-Nodes (6): newControlManager(), startControlManager(), startControlServer(), configEditor, controlManager, DaemonUseCase
+### Community 70 - ".showSized"
+Cohesion: 0.11
+Nodes (13): installUI, multiAnswer, sizedDialog, scrollable(), selectable(), newFadeScroll(), ask(), diffText() (+5 more)
 
 ### Community 71 - "RefreshSection"
-Cohesion: 0.08
-Nodes (31): logRefreshChange(), sameConfig(), discordRefreshFixture(), TestRefreshOnceAppliesAndReloads(), TestRefreshOnceKeepsOperatorLinesAndSkipsNoOps(), TestRefreshOnceRestoresTheFileWhenTheReloadFails(), TestRefreshOnceSkipsAConfigChangedSinceLoad(), TestLogRefreshChange() (+23 more)
+Cohesion: 0.11
+Nodes (25): logRefreshChange(), sameConfig(), discordRefreshFixture(), TestRefreshOnceAppliesAndReloads(), TestRefreshOnceKeepsOperatorLinesAndSkipsNoOps(), TestRefreshOnceRestoresTheFileWhenTheReloadFails(), TestRefreshOnceSkipsAConfigChangedSinceLoad(), TestLogRefreshChange() (+17 more)
 
 ### Community 72 - "pickfs.go"
 Cohesion: 0.21
 Nodes (15): listOpts, pickEntry, treeSearch, lstatOf(), outsideHardlinks(), TestSearchTreeFollowsNoSymlink(), plural(), entryIsDir() (+7 more)
 
 ### Community 73 - "fcntl"
-Cohesion: 0.10
-Nodes (9): main(), report(), denied(), main(), dump_via_debugfs(), main(), probe_open(), denied() (+1 more)
+Cohesion: 0.08
+Nodes (11): main(), report(), denied(), main(), dump_via_debugfs(), main(), probe_open(), hold_forever() (+3 more)
 
 ### Community 74 - "bpfstats/main.go"
 Cohesion: 0.15
 Nodes (21): guardSpec(), TestGuardSpecKeepsIoctlCompatOnlyWhereKernelHasIt(), verifyCollection(), VerifyLoad(), applyInodeCapacity(), TestApplyInodeCapacity(), InertProgram(), KernelHasFunc() (+13 more)
 
-### Community 75 - "CandidateDir"
-Cohesion: 0.08
-Nodes (24): entryWriters(), reserveChain(), symlinkTargetGlob(), TestGlobBuilder_LibBitsPerEntry(), underResource(), globBuilder, ParseGlobName(), TestParseGlobName() (+16 more)
+### Community 75 - "globBuilder"
+Cohesion: 0.19
+Nodes (10): entryWriters(), reserveChain(), symlinkTargetGlob(), TestGlobBuilder_LibBitsPerEntry(), underResource(), globBuilder, ParseGlobName(), TestGlobReservationsLibTrusted() (+2 more)
 
 ### Community 76 - "codecheck/main.go"
 Cohesion: 0.09
 Nodes (22): finding, srcFile, collect(), deadcodeRun(), deadFuncs(), eachFunc(), fail(), fieldLists() (+14 more)
 
-### Community 77 - "fakeGuardRepo"
-Cohesion: 0.06
-Nodes (21): binaryStatOf(), TempBinary, TemporaryGrant, TempRule, loadPinnedExeMaps(), planTempBlock(), ResolveTempBinary(), stripPinnedAllow() (+13 more)
+### Community 77 - "GuardEvent"
+Cohesion: 0.04
+Nodes (26): holdHeadless(), HeadlessLine(), snapGuard, TestDispatchFullChannelNeverDropsDenials(), TestDispatchWithoutAllowedEvents(), TestDispatchWithoutOwnAllowedEvents(), TestLocalizePaths(), commMatchesGuardedBinary() (+18 more)
 
-### Community 78 - "update_test.go"
-Cohesion: 0.09
-Nodes (20): fetchReleases(), parseChecksum(), parsePublicKey(), rsaPublicKeyPEM(), signedChecksum(), TestFetchReleases(), TestFetchReleasesHTTPError(), TestFilterChannel() (+12 more)
+### Community 78 - "BinaryEntry"
+Cohesion: 0.07
+Nodes (23): keptEntries, BinaryEntry, checkBtrfsKeys(), ensureBtrfsLayout(), canonicalBinaryPath(), canonicalPaths(), diffBinaries(), TestDiffBinaries() (+15 more)
 
 ### Community 79 - "process_vm_readv.c"
-Cohesion: 0.40
-Nodes (6): dump_memory(), find_all_rw_regions(), find_heap(), find_victim_by_fd(), main(), spawn_less_pty()
+Cohesion: 0.23
+Nodes (11): copy(), is_verb(), main(), read_once(), usage(), dump_memory(), find_all_rw_regions(), find_heap() (+3 more)
 
-### Community 80 - "GuardEvent"
-Cohesion: 0.08
-Nodes (18): holdHeadless(), HeadlessLine(), bpfGuardEvent, snapGuard, TestDispatchFullChannelNeverDropsDenials(), TestDispatchWithoutAllowedEvents(), TestLocalizePaths(), commMatchesGuardedBinary() (+10 more)
+### Community 80 - "parseGuardEvent"
+Cohesion: 0.25
+Nodes (9): bpfGuardEvent, decodeGuardEvent(), fsGateLabel(), parseGuardEvent(), processGateLabel(), TestDecodeGuardEventMatchesBinaryRead(), TestParseGuardEventFsGateLabels(), TestParseGuardEventSuspectLabels() (+1 more)
 
-### Community 81 - "op"
+### Community 81 - "maintainer/plan.go"
 Cohesion: 0.05
 Nodes (52): SystemTrusted(), clearExcept(), createTemp(), holds(), readlinkat(), removeDir(), ignoreNotExist(), openBeneath() (+44 more)
 
-### Community 82 - "KernelDev"
-Cohesion: 0.16
-Nodes (17): fdStat, physicalParent(), statFD(), KernelDev(), BtrfsDevices(), btrfsSysfsDevices(), TestBtrfsSysfsDevices(), codeVouched() (+9 more)
+### Community 82 - "LibraryClosure"
+Cohesion: 0.07
+Nodes (28): ldConfParser, defaultLibDirs(), elfInterp(), fileExists(), hostView(), isScript(), ldConfInclude(), ldSoConfDirs() (+20 more)
 
 ### Community 83 - "rcUser"
-Cohesion: 0.11
-Nodes (43): listFacultatives(), facultativeUser(), TestInstallSSHAgentFacultative(), TestListFacultativesIgnoresDaemonConf(), TestListFacultativesMarksGuardedSSH(), rcTarget, BunTmpDir(), TestHasRCBlocksTrackEnsureAndRemove() (+35 more)
+Cohesion: 0.12
+Nodes (41): TestRemoveSSHAgentFacultativeKeepsGuardedSSHConfig(), rcTarget, TestHasRCBlocksTrackEnsureAndRemove(), TestRemoveSSHAgentShellEnvKeepsSSHConfig(), applyRC(), bunTargets(), EnsureAddKeysToAgent(), EnsureBunLauncherEnv() (+33 more)
 
 ### Community 84 - "Monitor"
-Cohesion: 0.16
+Cohesion: 0.18
 Nodes (4): NewMonitor(), putBtrfsLayout(), Monitor, watchedInode
 
-### Community 86 - "newTestTarget"
-Cohesion: 0.22
-Nodes (17): newExeResolver(), NewFiles(), newTestTarget(), since(), TestAddRefusesOverlap(), TestApplyFromBlacklistFailureKeepsOldGuard(), TestApplyFromBlacklistOverlaps(), TestApplyFromWhitelistFailureReportsUnguarded() (+9 more)
+### Community 85 - "journal"
+Cohesion: 0.14
+Nodes (6): fakeGuard, fakeMonitor, fakeNet, fakeNetGuard, fakeNetMonitor, journal
 
-### Community 87 - "os.FileMode"
-Cohesion: 0.08
-Nodes (34): checkAndApply(), TestDaemonUnitWithMetadataOutput(), refreshCatalogConfig(), installFileAs(), installUnit(), readAtNoFollow(), upsertFile(), upsertUnitAt() (+26 more)
+### Community 86 - "ListUsers"
+Cohesion: 0.09
+Nodes (25): dialLiveSession(), applyEdit(), checkAndApply(), editAgain(), fetchConfig(), putConfig(), runEditConfig(), runOfflineEdit() (+17 more)
+
+### Community 87 - "removeFacultatives"
+Cohesion: 0.09
+Nodes (32): TestDaemonUnitWithMetadataOutput(), dupFD(), installFileAs(), installServices(), installSSHAgent(), installSSHAgentEnv(), installUnit(), TestInstallSSHAgentRefusesSymlinkedUnitDir() (+24 more)
 
 ### Community 88 - "GenerateConf"
 Cohesion: 0.05
-Nodes (57): TestDiffMergePreservesExistingAndParses(), collectFilesystemPrereqs(), askEncryption(), discordCatalogEntry(), groupedDiscordConf(), TestAskEncryptionSkipsNeedEncryptionFalse(), TestAskSSHAgentUsersNoGuardedSSH(), TestCollectFilesystemPrereqsNoPanic() (+49 more)
+Nodes (61): appendSectionsAndEdit(), TestDiffMergePreservesExistingAndParses(), collectFilesystemPrereqs(), sectionsFromCandidates(), discordCatalogEntry(), groupedDiscordConf(), TestAskEncryptionSkipsNeedEncryptionFalse(), TestAskSSHAgentUsersNoGuardedSSH() (+53 more)
 
 ### Community 89 - "daemon mode (fscrypt + whitelist lifecycle)"
 Cohesion: 0.18
@@ -628,20 +635,20 @@ Cohesion: 0.21
 Nodes (9): CONFIG post-AUTH daemon.conf editing (configedit.go), FORWARD temporary -w/-b whitelist grants, Daemon self-key (GUARD_ALLOW_ROOT) bypass, swap_benign / swap_reader in-place binary swap POC, edit-protected --edit-config, edit-protected subcommand, edit-protected live mode, edit-protected --forward (+1 more)
 
 ### Community 91 - "runView"
-Cohesion: 0.05
-Nodes (19): daemonPage, logGrid, logHook, logLine, runHost, runView, stageItem, stageState (+11 more)
+Cohesion: 0.10
+Nodes (5): daemonPage, runHost, runView, captureLogs(), orDefault()
 
-### Community 92 - "Candidate"
-Cohesion: 0.17
-Nodes (18): selectAndEditConfig(), addManualDirectories(), editConfig(), groupCandidates(), libraryBlocksFromCandidates(), pickDirectories(), pickFromCandidates(), pickUsers() (+10 more)
+### Community 92 - "CandidateDir"
+Cohesion: 0.11
+Nodes (29): nextConfig(), selectAndEditConfig(), addManualDirectories(), editConfig(), groupCandidates(), libraryBlocksFromCandidates(), pickDirectories(), pickFromCandidates() (+21 more)
 
-### Community 93 - "netinject.c"
-Cohesion: 0.12
-Nodes (15): attach_child(), await_exec(), do_connect(), errname(), main(), sleep_ms(), traceme(), do_connect() (+7 more)
+### Community 93 - "prctl_exe_swap.c"
+Cohesion: 0.16
+Nodes (8): do_connect(), errname(), main(), do_connect(), do_read(), main(), read_stat(), swap_mm_map()
 
 ### Community 95 - "NetGuard"
-Cohesion: 0.10
-Nodes (10): reasonText(), eventTypeKey(), judgePasses(), parseProcs(), TestJudgePasses(), TestParseProcs(), TestReasonText(), hook (+2 more)
+Cohesion: 0.11
+Nodes (9): lsmHook, PumpRingbuf(), judgePasses(), parseProcs(), TestJudgePasses(), TestParseProcs(), hook, NetGuard (+1 more)
 
 ### Community 96 - "check-compatibility.sh"
 Cohesion: 0.38
@@ -660,64 +667,64 @@ Cohesion: 0.15
 Nodes (13): procStats, statsSample, cpuTime(), humanBytes(), rssBytes(), New(), recv(), TestSubDeliversMissedTickLate() (+5 more)
 
 ### Community 100 - "ConfinedEntry"
-Cohesion: 0.10
-Nodes (33): binaryVerifyState, HashStore, sharedHashEntry, ConfinedEntry(), claimHash(), hashFileShared(), hashPathShared(), HashStats() (+25 more)
+Cohesion: 0.14
+Nodes (27): HashStore, sharedHashEntry, ConfinedEntry(), claimHash(), hashFileShared(), hashPathShared(), HashStats(), publishHash() (+19 more)
 
 ### Community 101 - "pinstate.go"
-Cohesion: 0.13
-Nodes (27): ensurePinStateFilePlaceholder(), ensurePlaceholder(), pinOwnerLikelyAlive(), readPinState(), recoverPinState(), pinStateInode(), TestPinOwnerLikelyAlive(), TestPinOwnerLikelyAliveDeadPID() (+19 more)
+Cohesion: 0.18
+Nodes (22): ensurePinStateFilePlaceholder(), ensurePlaceholder(), pinOwnerLikelyAlive(), readPinState(), recoverPinState(), pinStateInode(), TestPinOwnerLikelyAlive(), TestPinOwnerLikelyAliveDeadPID() (+14 more)
 
 ### Community 102 - "Well-known bypass classes"
 Cohesion: 0.24
 Nodes (9): btrfs copy-ioctl gate (file_ioctl / file_ioctl_compat), Well-known bypass classes, btrfs_search POC, io_uring POC, open_by_handle_at POC, process_vm_readv POC (remaining monitor gap), raw_block_device POC, statonly stat/statx metadata leak (+1 more)
 
-### Community 103 - "NetEventType"
-Cohesion: 0.11
-Nodes (15): snapNetMonitor, NetEvent, NetEventType, NetRecord, eventsOrAll(), FormatAddr(), NetEventTypes(), Ntohs() (+7 more)
+### Community 103 - "NetGuardEvent"
+Cohesion: 0.09
+Nodes (12): snapNetGuard, snapNetMonitor, NetEvent, NetRecord, FormatAddr(), Ntohs(), reasonText(), NetGuardEvent (+4 more)
 
 ### Community 104 - "jit_provenance.c"
 Cohesion: 0.47
 Nodes (8): copy_into(), main(), make_temp_copy(), mode_hold(), mode_memfd(), mode_passfd(), mode_self(), report_dlopen()
 
-### Community 105 - "ptrace_seize.c"
+### Community 105 - "inspector_probe.c"
 Cohesion: 0.20
-Nodes (11): main(), peek_buffer(), run_tracer(), run_victim(), wait_for_file(), main(), peek_buffer(), run_tracer() (+3 more)
+Nodes (13): check_attach(), check_exe(), check_mem(), check_root(), check_vmread(), main(), report(), traced_exec() (+5 more)
 
 ### Community 106 - "recordops.c"
 Cohesion: 0.36
 Nodes (15): fail(), fd_of(), in(), main(), op_mmap(), op_read(), op_readdir(), op_write() (+7 more)
 
-### Community 107 - "openFileVaultWithMasterKey"
-Cohesion: 0.13
-Nodes (12): entryOf(), migrationTarget, openFileVaultWithMasterKey(), sealFileVaultWithMasterKey(), withFileVaultSubkey(), writeTempWithMetadata(), classifyMigrationTarget(), readClassifiedFile() (+4 more)
+### Community 107 - "os.FileInfo"
+Cohesion: 0.17
+Nodes (7): migrationTarget, writeTempWithMetadata(), classifyMigrationTarget(), readClassifiedFile(), stampCopyMetadata(), TestCopyXattrsPreservesUserAttributes(), copyXattrs()
 
 ### Community 108 - "Build & sign release assets (reusable workflow)"
 Cohesion: 0.31
 Nodes (8): Build & sign release assets (reusable workflow), app-listener-gui best-effort build, Promote to stable release workflow, Release workflow (pre-release per push to main), Release promote flow, make check-compatibility, scripts/install.sh one-line installer, update self-update subcommand
 
 ### Community 109 - "btrfsLayoutFrom"
-Cohesion: 0.14
-Nodes (12): BtrfsLayout, fakeTypes, typeSource, ensureBtrfsLayout(), btrfsLayoutFrom(), findMember(), memberOffset(), ResolveBtrfsLayout() (+4 more)
-
-### Community 110 - "Finder"
-Cohesion: 0.16
-Nodes (9): findButton, span, findAll(), Finder, lowerRunes(), newFindInput(), overlay(), runesEqual() (+1 more)
-
-### Community 111 - "mountTable"
 Cohesion: 0.15
-Nodes (10): MountInfo, mountinfoUnitTest, TestNoteRootMountFollowsMountID(), MountByID(), ParseMountinfo(), PathUnder(), ReadMountinfo(), unescapeMountinfo() (+2 more)
+Nodes (11): BtrfsLayout, fakeTypes, typeSource, btrfsLayoutFrom(), findMember(), memberOffset(), ResolveBtrfsLayout(), btrfsTypes() (+3 more)
 
-### Community 112 - "New"
-Cohesion: 0.10
-Nodes (30): diffModel, editorModel, New(), SetText(), TestBackspaceAndDeleteRemoveAnIndentStep(), TestCursorDoesNotBlink(), TestEditKeys(), TestEnterKeepsIndentation() (+22 more)
+### Community 110 - "update/update.go"
+Cohesion: 0.15
+Nodes (17): channelOf(), checkUpdatePreconditions(), deployGUI(), InstalledGUIVersion(), InstalledVersion(), Latest(), parseVerPart(), readInstalledVersion() (+9 more)
+
+### Community 111 - "github.com/stretchr/testify/suite.Suite"
+Cohesion: 0.15
+Nodes (5): harnessSuite, mountinfoUnitTest, unescapeMountinfo(), harnessSuite, editorHarness
+
+### Community 112 - "codeedit.go"
+Cohesion: 0.12
+Nodes (39): class, classOf(), dedent(), Edit(), leadingIndent(), lines(), moveTo(), Navigate() (+31 more)
 
 ### Community 113 - "recordFlow"
-Cohesion: 0.19
-Nodes (11): encryptBlocker(), newRecordFlow(), confirmAndApply(), confirmExtend(), declined(), offerBackupDeletion(), pickEncryption(), runRecord() (+3 more)
+Cohesion: 0.16
+Nodes (15): encryptBlocker(), confirmAndApply(), confirmExtend(), declined(), offerBackupDeletion(), pickEncryption(), runRecord(), runRecordView() (+7 more)
 
-### Community 115 - "recoverFileInPlace"
-Cohesion: 0.31
-Nodes (13): classifyRegularFileTarget(), clearRecovery(), EnsureRecoverySidecarPlaceholder(), fileVaultRecoverPath(), recoverFileInPlace(), rejectSidecarSymlink(), stageRecovery(), inode() (+5 more)
+### Community 115 - "makeReloadHandler"
+Cohesion: 0.12
+Nodes (14): newControlManager(), startControlManager(), makeReloadHandler(), markReady(), noteReloadedSettings(), notifySystemdReady(), controlManager, WarnInodeOccupancy() (+6 more)
 
 ### Community 116 - "newTestVetter"
 Cohesion: 0.29
@@ -731,17 +738,17 @@ Nodes (5): CI workflow (lint + test on non-draft PRs), CI lint job (make lint), 
 Cohesion: 0.35
 Nodes (4): IntegrationSuite, parityKey(), parseParityRecording(), withoutKey()
 
-### Community 121 - ".apply"
-Cohesion: 0.18
-Nodes (11): Apply(), DeleteBackup(), Outcome, ProgressFunc, TestApplyKeepsConfirmedLedgerVerdict(), TestApplyPinsUserBinariesAndRetriesStale(), TestApplyRefusesUnpreparedFilesystemBeforeTouchingAnything(), TestApplyRollsBackOnRefusal() (+3 more)
+### Community 121 - "KernelDev"
+Cohesion: 0.15
+Nodes (17): fdStat, physicalParent(), statFD(), KernelDev(), BtrfsDevices(), btrfsSysfsDevices(), TestBtrfsSysfsDevices(), codeVouched() (+9 more)
 
 ### Community 122 - "WebSocket /ws client"
 Cohesion: 0.29
 Nodes (3): AppListener Shared Session page, WebSocket /ws client, --serve WebSocket mirroring
 
-### Community 124 - "launch_probe.c"
-Cohesion: 0.48
-Nodes (5): copy(), is_verb(), main(), read_once(), usage()
+### Community 124 - "Selection"
+Cohesion: 0.19
+Nodes (7): pos, Highlighter, lexerFor(), shebangLexer(), cursorPos(), Selection, offset()
 
 ### Community 125 - "install.sh"
 Cohesion: 0.57
@@ -759,13 +766,13 @@ Nodes (4): make test-integration (rootful Docker suite), app-listener docker-com
 Cohesion: 0.27
 Nodes (3): IntegrationSuite, launchCase, TestClientVerifyRunsBeforeAnythingIsSent()
 
-### Community 130 - "backend.go"
-Cohesion: 0.05
-Nodes (93): offerDaemonStart(), runDiffCatalog(), applyLiveRefresh(), asRoot(), buildBinaryIfNeeded(), installBinaryOnly(), markInstallComplete(), preflightDeployedBinary() (+85 more)
+### Community 130 - "go_pkg_os"
+Cohesion: 0.07
+Nodes (54): confirmMasterKeyOverwrite(), runGenKey(), asRoot(), checkInstalledMatchesSource(), checkRunningBinaryMatchesInstalled(), encryptDirectories(), ensureMasterKey(), fileSHA256() (+46 more)
 
 ### Community 131 - "updatePage"
-Cohesion: 0.23
-Nodes (7): installedBinary, latestRelease, updatePage, readInstalled(), newUpdatePage(), boolIndex(), isPreRelease()
+Cohesion: 0.20
+Nodes (9): installedBinary, latestRelease, updatePage, hashFile(), hashReader(), readInstalled(), newUpdatePage(), boolIndex() (+1 more)
 
 ### Community 132 - "trace-app-libs.sh"
 Cohesion: 0.60
@@ -780,60 +787,56 @@ Cohesion: 0.50
 Nodes (4): lib_probe reserved library POC, Bun TMPDIR redirect with reserved .bun-* name, install --diff-catalog, install TUI wizard
 
 ### Community 142 - "catalogRefresher"
-Cohesion: 0.14
-Nodes (9): drain(), newCatalogRefresher(), readEvents(), swapFile(), TestDebouncerCoalescesAndBoundsWait(), TestDebouncerMinGap(), TestDebouncerPendingCoversWaitAndRun(), catalogRefresher (+1 more)
+Cohesion: 0.12
+Nodes (11): drain(), newCatalogRefresher(), readEvents(), swapFile(), TestDebouncerCoalescesAndBoundsWait(), TestDebouncerMinGap(), TestDebouncerPendingCoversWaitAndRun(), startCatalogRefresh() (+3 more)
 
 ### Community 143 - "serve.go"
-Cohesion: 0.08
+Cohesion: 0.07
 Nodes (31): basicAuth(), configureWebSocket(), decodeEndsAtEOF(), isInteractiveTerminal(), newServeListener(), newServeServer(), parseResize(), readResizeLoop() (+23 more)
 
 ### Community 144 - "NetworkMonitor"
-Cohesion: 0.13
-Nodes (8): BinariesSummary(), TestBinariesSummary(), PumpRingbuf(), NewNetworkMonitor(), statInodeKey(), TestNetworkMonitor_NewFailure(), TestStatInodeKey(), NetworkMonitor
-
-### Community 145 - "gui/session.go"
-Cohesion: 0.19
-Nodes (15): invokingIDs(), ancestorEnv(), invokingUID(), ownedBy(), readOwnedFile(), restoreSessionEnv(), statusField(), TestOwnedByChecksTypeAndOwner() (+7 more)
+Cohesion: 0.15
+Nodes (7): BinariesSummary(), TestBinariesSummary(), NewNetworkMonitor(), statInodeKey(), TestNetworkMonitor_NewFailure(), TestStatInodeKey(), NetworkMonitor
 
 ### Community 146 - "Ledger"
 Cohesion: 0.07
-Nodes (28): candidates(), confirmAll(), describe(), record(), run(), applySchema(), Ledger, Pending (+20 more)
+Nodes (24): candidates(), confirmAll(), describe(), record(), applySchema(), Ledger, Pending, Source (+16 more)
 
-### Community 147 - "runOfflineEdit"
-Cohesion: 0.12
-Nodes (16): reserveStdout(), runBackend(), LiveModeAvailable(), requireRoot(), runEditProtected(), runLive(), TestPickEncryptedDirSingleSkipsPicker(), chooseResource() (+8 more)
+### Community 147 - "runBackend"
+Cohesion: 0.10
+Nodes (21): reserveStdout(), runBackend(), LiveModeAvailable(), requireRoot(), runEditProtected(), runLive(), TestPickEncryptedDirSingleSkipsPicker(), pingInterval() (+13 more)
 
-### Community 148 - "go_pkg_strings"
-Cohesion: 0.07
-Nodes (7): Progress, User, attrOpCase, guardExploitTest, fileID, i3Result, i3Workspace
+### Community 148 - "expandPlaceholders"
+Cohesion: 0.14
+Nodes (7): expandPlaceholders(), TestExpandWhitelist(), TestExtraWatchPathsForSkipsMissing(), LibDirGlob, TrustGlob, reservedGlobs(), splitTrustGlob()
 
-### Community 149 - "githubRelease"
-Cohesion: 0.29
-Nodes (15): changelogText(), cumulativeChangelog(), newReleaseWindow(), releasesSince(), compareStableVersions(), filterChannel(), findUpdate(), latestTime() (+7 more)
+### Community 149 - ".TestReconcileInodesEvictsStale"
+Cohesion: 0.22
+Nodes (10): inodeBatchFn, appendInodeRow(), batchInodeRows(), inodeRowsOf(), fakeBatches(), TestBatchInodeRows(), walkInodeBatches(), countInodeRows() (+2 more)
 
-### Community 150 - "readGrantRequest"
-Cohesion: 0.18
-Nodes (13): readConfigPut(), TestReadGrantRequestConfig(), readAuthRequest(), readBareRequest(), readForwardRequest(), readGrantRequest(), readPathLines(), TestReadAuthRequest() (+5 more)
+### Community 150 - "DumpHook"
+Cohesion: 0.24
+Nodes (5): logHook, formatEntry(), sortedKeys(), sortStrings(), DumpHook
 
 ### Community 152 - "github.com/charmbracelet/bubbles/textarea.Model"
-Cohesion: 0.15
-Nodes (23): class, pos, classOf(), column(), dedent(), Edit(), leadingIndent(), lines() (+15 more)
+Cohesion: 0.11
+Nodes (28): findButton, span, column(), findAll(), Finder, lowerRunes(), NewFinder(), newFindInput() (+20 more)
 
 ### Community 154 - "buildOneGuard"
 Cohesion: 0.07
-Nodes (44): backingDeviceUnion(), buildGuards(), buildOneGuard(), eventFilterOptions(), newPinGeneration(), reloadOnce(), reloadSlotsNeeded(), startGuardedDaemon() (+36 more)
+Nodes (44): buildOneGuard(), eventFilterOptions(), systemPatterns(), systemRule(), TestEventFilterOptions(), newSelfGuards(), selfProtectSpecs(), startSelfGuard() (+36 more)
 
 ### Community 155 - "runNetworkGuard"
 Cohesion: 0.07
-Nodes (41): DrainUntilSignal(), CheckBPFLSM(), CheckEBPF(), configureDaemonLogging(), confirmMasterKeyOverwrite(), loadDaemonConfig(), prepareDaemonStart(), resolveConfigPath() (+33 more)
+Nodes (34): DrainUntilSignal(), CheckEBPF(), MakeDisplayPaths(), ParseEventsFlag(), ParseNetEventsFlag(), parseTypesFlag(), validateForwardEvents(), runHeadless() (+26 more)
 
 ### Community 156 - "planUpdaters"
-Cohesion: 0.14
-Nodes (18): hardLinked(), libBinaries(), mayUpdate(), planUpdaters(), resourceBinaries(), resourceLinks(), rules(), TestGeneralToolsToWarn_HardLinkIsNoUpdaterButNoWarning() (+10 more)
+Cohesion: 0.08
+Nodes (19): hardLinked(), libBinaries(), mayUpdate(), planUpdaters(), resourceBinaries(), resourceLinks(), rules(), TestGeneralToolsToWarn_HardLinkIsNoUpdaterButNoWarning() (+11 more)
 
-### Community 157 - "NetworkMonitorRepository"
+### Community 157 - "gui/session.go"
 Cohesion: 0.18
-Nodes (4): NetworkMonitorRepository, NetworkMonitorUseCase, NewNetworkMonitorUseCase(), StreamUseCase
+Nodes (16): invokingIDs(), ancestorEnv(), invokingHome(), invokingUID(), ownedBy(), readOwnedFile(), restoreSessionEnv(), statusField() (+8 more)
 
 ### Community 158 - "Installation"
 Cohesion: 0.17
@@ -843,45 +846,41 @@ Nodes (12): Build from source, Bun-based apps (opencode), Docker, Facultatives, 
 Cohesion: 0.23
 Nodes (22): call(), editingBackend(), mustRead(), mustWrite(), newTestBackend(), TestBackendAuthRefusedOffline(), TestBackendAuthTimeoutBounds(), TestBackendChownOnlyLoginUsers() (+14 more)
 
-### Community 161 - "layout.go"
-Cohesion: 0.43
+### Community 161 - ".Layout"
+Cohesion: 0.44
 Nodes (5): adaptiveGrid, gapVBox, cellMin(), rowHeights(), visible()
 
-### Community 162 - "gui.go"
-Cohesion: 0.11
-Nodes (29): installGUI(), needsBinary(), RunWith(), TestNeedsBinary(), TestRunWithRefusesDeployWithoutBinary(), TestRunWithRefusesNonHeadlessBinary(), deletePostBackups(), listBackups() (+21 more)
+### Community 162 - "restore.go"
+Cohesion: 0.21
+Nodes (16): deletePostBackups(), listBackups(), restoreBackups(), offerBackupCleanup(), TestMovedFlagError(), movedFlagError(), Delete(), Find() (+8 more)
 
-### Community 164 - "time.Time"
-Cohesion: 0.29
-Nodes (4): LockedError, sweepID, sweepMemo, dirEntry
+### Community 164 - "NetEventType"
+Cohesion: 0.15
+Nodes (12): NetEventType, eventsOrAll(), NetEventTypes(), ParseNetEventType(), WithSuspectsFrom(), eventsetSummary(), eventTypeKey(), modeLabel() (+4 more)
 
-### Community 165 - "feed.go"
-Cohesion: 0.06
-Nodes (41): actionBar, cell, column, counterStrip, dataTable, eventFeed, feedAction, feedSpec (+33 more)
+### Community 165 - "networkPage"
+Cohesion: 0.07
+Nodes (39): actionBar, cell, column, counterStrip, dataTable, eventFeed, feedAction, feedSpec (+31 more)
 
 ### Community 166 - "shell"
 Cohesion: 0.04
-Nodes (59): anyDaemonRunning(), fakeLink, homePage, Options, pageDef, pageID, reel, resizeWatch (+51 more)
+Nodes (66): anyDaemonRunning(), fakeLink, pageDef, pageID, reel, resizeWatch, shell, snapEngines (+58 more)
 
-### Community 167 - "binaryList"
-Cohesion: 0.08
-Nodes (13): binaryList, buttonCursor, handCursors(), handCursorsOn(), newButtonCursor(), showConfirm(), showCustomConfirm(), showDialog() (+5 more)
+### Community 167 - "cursor.go"
+Cohesion: 0.07
+Nodes (27): buttonCursor, checkGrid, handCheck, handCheckGroup, handRadioGroup, handSelect, recordReview, handCursor() (+19 more)
 
 ### Community 168 - "watchSet"
-Cohesion: 0.11
-Nodes (19): refreshAdmits(), TestRefreshAdmitsHomeMatchesAndRootPlacedNamesOnly(), addSystemBinary(), catalogPatterns(), catalogWatchPlan(), inHome(), isSymlink(), newWatchSet() (+11 more)
+Cohesion: 0.13
+Nodes (15): addSystemBinary(), catalogPatterns(), catalogWatchPlan(), isSymlink(), newWatchSet(), systemBinaryPatterns(), TestCatalogWatchPlanWatchesInspectors(), fakeInotify (+7 more)
 
-### Community 169 - "WithBottomBar"
-Cohesion: 0.31
-Nodes (5): TestProgressReader(), bottomBar, newBottomBar(), renderBar(), WithBottomBar()
+### Community 169 - "githubRelease"
+Cohesion: 0.27
+Nodes (16): changelogText(), cumulativeChangelog(), newReleaseWindow(), releasesSince(), compareStableVersions(), filterChannel(), findUpdate(), latestTime() (+8 more)
 
-### Community 170 - "Vault"
+### Community 170 - "deploy"
 Cohesion: 0.18
-Nodes (6): checkFreshDir(), openDirNoFollow(), renewDir(), Vault, Open(), Unopened()
-
-### Community 171 - "downloadFile"
-Cohesion: 0.24
-Nodes (7): downloadFile(), downloadReleaseFiles(), fetchRelease(), TestDownloadFileHTTPError(), TestDownloadFileMode0700(), TestFetchReleaseByTag(), progressReader
+Nodes (18): applyUpdate(), archAssets(), assetsFor(), confirmUnit(), deploy(), downloadAndVerify(), downloadReleaseFiles(), fetchGUI() (+10 more)
 
 ### Community 172 - "Limitations"
 Cohesion: 0.20
@@ -895,17 +894,17 @@ Nodes (7): connFD(), tcpClient(), tcpServer(), tcpServerDelayed(), udpRecvLoop()
 Cohesion: 0.17
 Nodes (9): GlobChild, statFunc, compileGlobNames(), globText(), resolveBits(), resolveChildren(), statKey(), TestCompileGlobNames_RepeatedPatternOrsBits() (+1 more)
 
-### Community 176 - "lockAndDeprovision"
+### Community 176 - "safeio.go"
+Cohesion: 0.23
+Nodes (14): readAtNoFollow(), upsertUnitAt(), writeAtNoFollow(), TestWriteUserFileRefusesSymlinks(), writeUserFile(), createOwned(), AtomicWriteAt(), CreateExclNoFollow() (+6 more)
+
+### Community 177 - "vaultfs_test.go"
+Cohesion: 0.20
+Nodes (14): IsBinaryContent(), inodeOf(), mustRead(), mustWrite(), openRootT(), TestFileModeToUnixModeRoundTrip(), TestIsBinaryContent(), TestOpenVaultRefusesSymlink() (+6 more)
+
+### Community 178 - "RawTarget"
 Cohesion: 0.22
-Nodes (6): deprovisionKind, classifyDeprovision(), classifyDeprovisionErr(), isDeprovisionBusy(), isDeprovisionMissing(), lockAndDeprovision()
-
-### Community 177 - "NewEventFanout"
-Cohesion: 0.24
-Nodes (5): NewEventFanout(), TestEventFanoutDropOldestUnderPressure(), TestEventFanoutDuplicatesInOrderAndCloses(), TestEventFanoutStopClosesOutputs(), EventFanout
-
-### Community 178 - "runMonitor"
-Cohesion: 0.13
-Nodes (18): BuildEBPFTargets(), RawTarget, isSubDir(), MakeDisplayPaths(), ParseEventsFlag(), ParseNetEventsFlag(), parseTypesFlag(), pathWithinDir() (+10 more)
+Nodes (12): BuildEBPFTargets(), RawTarget, isSubDir(), pathWithinDir(), ResolveTargets(), validatePair(), ValidateTargets(), WarnIgnoredFlags() (+4 more)
 
 ### Community 179 - "TestMain"
 Cohesion: 0.50
@@ -952,8 +951,8 @@ Cohesion: 0.50
 Nodes (4): Events, Flags, Multicall binaries, network monitor: see what a program talks to
 
 ### Community 194 - "Binary"
-Cohesion: 0.18
-Nodes (16): lines(), pickBinaries(), pickLibs(), reviewRecording(), beyondEvents(), Classify(), finishBinary(), Binary (+8 more)
+Cohesion: 0.14
+Nodes (18): lines(), pickBinaries(), pickLibs(), reviewRecording(), beyondEvents(), Classify(), finishBinary(), Binary (+10 more)
 
 ### Community 195 - "dialog_test.go"
 Cohesion: 0.39
@@ -963,9 +962,9 @@ Nodes (11): pickMode, openPicker(), pickerTree(), shownNames(), TestPickerArrowH
 Cohesion: 0.20
 Nodes (10): edit-protected, Editing the daemon config, Editor keys, Exit audit, Extending a path `daemon.conf` already guards, Non-interactive writes, Offline and live mode, Recording a new path: `config record` (+2 more)
 
-### Community 197 - "changelog_test.go"
-Cohesion: 0.15
-Nodes (17): nextConfig(), newChangelogModel(), showChangelog(), rel(), tags(), TestChangelogModelOtherKeysDoNotQuit(), TestChangelogModelQuitKeys(), TestChangelogModelResize() (+9 more)
+### Community 197 - "github.com/spf13/cobra.Command"
+Cohesion: 0.25
+Nodes (13): credentialFlagState(), ServeConfig, isLoopbackHost(), ParseServeFlags(), requestedBoolFlag(), validateEnabledServe(), validateServeAddress(), TestSetupDumpLogRefusesSymlink() (+5 more)
 
 ### Community 199 - "CopyTreeWithProgress"
 Cohesion: 0.16
@@ -979,125 +978,165 @@ Nodes (4): evalSymlinksOrEmpty(), newPathCache(), pathCache, pathCacheEntry
 Cohesion: 0.10
 Nodes (20): confSafeMatch(), homeMatchConfined(), symlinkStaysInParent(), TestExpandLibDirWritersGlob(), TestFilterExistingWhitelist(), TestFilterExistingWhitelistGlob(), TestFilterExistingWhitelistMixed(), TestFilterExistingWhitelistSkipsOpaqueMulticall() (+12 more)
 
-### Community 202 - "DaemonEvent"
+### Community 202 - "time.Time"
 Cohesion: 0.08
-Nodes (43): ServeConfig, UIDResolver, NewUIDResolver(), awaitStartupOrSignal(), catchLifecycleSignals(), drainEphemeral(), markReady(), newDaemonModel() (+35 more)
+Nodes (35): LockedError, UIDResolver, NewUIDResolver(), drainEphemeral(), newDaemonModel(), runDaemonUI(), runHeadless(), runServedTUI() (+27 more)
 
 ### Community 203 - "Daemon configuration"
 Cohesion: 0.25
 Nodes (8): Daemon configuration, Daemon settings: `[settings]`, Generic Electron apps: `[electron_apps]`, Library trust: `[libraries "<name>"]`, Per-binary event masks, Reloading, Several guarded trees, one vault, Watch sections
 
 ### Community 204 - "fileedit_symlink_test.go"
-Cohesion: 0.25
-Nodes (10): mustRead(), mustWrite(), swappedParent(), TestChmodRefusesSymlinkedParent(), TestCreateEntryRefusesPlantedSymlink(), TestCreateEntryRefusesSymlinkedParent(), TestDeleteRefusesSymlinkedParent(), TestSaveFollowsPinnedVaultNotSwappedAncestor() (+2 more)
+Cohesion: 0.42
+Nodes (9): mustRead(), mustWrite(), swappedParent(), TestChmodRefusesSymlinkedParent(), TestCreateEntryRefusesPlantedSymlink(), TestCreateEntryRefusesSymlinkedParent(), TestDeleteRefusesSymlinkedParent(), TestSaveFollowsPinnedVaultNotSwappedAncestor() (+1 more)
 
-### Community 205 - "NetGuardEvent"
-Cohesion: 0.20
-Nodes (5): snapNetGuard, NetGuardEvent, protoString(), netGuardEventLine, netGuardModel
+### Community 205 - "hashCache"
+Cohesion: 0.19
+Nodes (7): newHashCache(), ds(), TestHashCacheFlushKeepsOnlyThisRunsRows(), hashCache, fakeHashStore, DurableStat, HashCache
 
 ### Community 206 - "Desktop GUI"
 Cohesion: 0.13
 Nodes (15): Actions, Daemon, Desktop GUI, File and folder pickers, Files, Home, Install, Network (+7 more)
 
-### Community 209 - "WithSuspectsFrom"
-Cohesion: 0.36
-Nodes (4): WithSuspectsFrom(), RealNetEngines(), netguardHarness, Option
+### Community 209 - "logLine"
+Cohesion: 0.25
+Nodes (5): logLine, journalLine(), TestJournalLine(), logRow(), logStyle()
 
-### Community 210 - "mustSubkey"
-Cohesion: 0.27
-Nodes (10): deriveFileVaultSubkey(), newFileVaultAEAD(), openFileVault(), sealFileVault(), mustSubkey(), TestDeriveFileVaultSubkeyDeterministicAndSeparated(), TestIsFileVaultRecordShape(), TestOpenFileVaultRejectsTampering() (+2 more)
+### Community 210 - "daemon: permanent protection with encryption at rest"
+Cohesion: 0.15
+Nodes (13): App maintainers (Steam runtime updates), Boot ordering, Commands and flags, daemon: permanent protection with encryption at rest, Filesystem-wide gates, Lifecycle, Process inspectors and taint, Quiet metadata denials (+5 more)
 
 ### Community 211 - ".eventTypeAllowed"
 Cohesion: 0.29
 Nodes (3): TestEventTypeAllowedConcurrent(), TestSetEventTypesBeforeStartNoRace(), TestSetEventTypesRace()
 
-### Community 212 - "configedit_test.go"
-Cohesion: 0.47
-Nodes (9): newTestConfigEditor(), readFile(), TestConfigEditorApply(), TestConfigEditorRefusals(), TestConfigEditorRefusesNewMulticallLine(), TestConfigEditorRestoresOnFailedReload(), TestRunConfigEditOverTheSocket(), TestRunConfigEditRefusedDuringALiveSession() (+1 more)
+### Community 212 - "Active"
+Cohesion: 0.20
+Nodes (10): showChangelog(), confirmUpdate(), isTerminal(), TestConfirmUpdateRoutesToActiveUI(), TestConfirmUpdateWithoutTerminalOrUIRefuses(), cancelUI, TestEditTextMapsUICancel(), Active() (+2 more)
 
-### Community 213 - "inode_dev.h"
-Cohesion: 0.60
-Nodes (3): ctx_ptr(), sb_dev(), guard_inode_free()
+### Community 213 - "netinject.c"
+Cohesion: 0.32
+Nodes (7): attach_child(), await_exec(), do_connect(), errname(), main(), sleep_ms(), traceme()
 
 ### Community 214 - "procstats.go"
-Cohesion: 0.30
-Nodes (9): Stats, parseKBValue(), parseStat(), parseStatus(), Read(), TestReadConcurrentRace(), TestStatsFieldsNonZero(), TestStatsValuesMonotonic() (+1 more)
+Cohesion: 0.38
+Nodes (8): Stats, parseKBValue(), parseStat(), parseStatus(), Read(), TestReadConcurrentRace(), TestStatsFieldsNonZero(), TestStatsValuesMonotonic()
 
-### Community 216 - "bpfLsmListed"
-Cohesion: 0.33
-Nodes (7): bpfLsmListed(), CheckBPFLSM(), CheckBPFLSMAt(), TestBpfLsmListed(), TestBpfLsmListedMissingFile(), TestCheckBPFLSM(), writeLSM()
+### Community 216 - "NetworkMonitorRepository"
+Cohesion: 0.18
+Nodes (4): NetworkMonitorRepository, NetworkMonitorUseCase, NewNetworkMonitorUseCase(), StreamUseCase
 
 ### Community 217 - "VouchedDevs"
 Cohesion: 0.29
 Nodes (7): hostVouchedDevs(), isFuseType(), parseMountDev(), VouchedDevs(), TestParseMountDevMatchesStatEncoding(), TestVouchedDevs(), TestVouchedDevsFailsClosed()
 
-### Community 218 - "io.Writer"
-Cohesion: 0.22
-Nodes (6): formatElapsed(), orNone(), printBinary(), printRecording(), fyneLogFilter, limitedWriter
+### Community 218 - "sync.Mutex"
+Cohesion: 0.13
+Nodes (9): refusedReplacements, fyneLogFilter, TestRefusedReplacements_ReportsEachInodeOnce(), newActivity(), TestRingKeepsNewest(), Counts, newRing(), activity (+1 more)
 
-### Community 219 - "resolveFilesystemPrereqs"
-Cohesion: 0.28
-Nodes (6): encryptDirectories(), confirmRunPrereq(), resolveFilesystemPrereqs(), harnessSuite, EnsureSystemSetup(), isKernelAtLeast54()
-
-### Community 220 - "shQuote"
-Cohesion: 0.16
-Nodes (6): IntegrationSuite, IntegrationSuite, overlayPlanter(), shQuote(), inNosuidNamespace(), IntegrationSuite
-
-### Community 222 - "CleanupStalePins"
+### Community 219 - "unit.go"
 Cohesion: 0.33
-Nodes (6): CleanupStalePins(), foreignPinnedLink(), genOfPinFile(), TestCleanupStalePins(), TestCleanupStalePinsMissingBase(), TestGenOfPinFile()
+Nodes (10): ConfirmUnitFunc, InstalledDaemonUnit(), PlanDaemonUnitUpdate(), ShippedDaemonUnit(), fakeBinary(), TestPlanDaemonUnitUpdate(), TestPlanDaemonUnitUpdateDropsLocalEdits(), TestShippedDaemonUnit() (+2 more)
 
-### Community 224 - "newBinary"
-Cohesion: 0.60
-Nodes (4): newBinary(), opNames(), sortedKeys(), RawAccessor
+### Community 221 - "openBunTmp"
+Cohesion: 0.53
+Nodes (6): fileID(), openBunTmp(), TestOpenBunTmp_ReplacesUnvettedDir(), TestOpenBunTmp_SymlinkReplacedTargetUntouched(), bunTmp, inodeID
+
+### Community 222 - "changelog_test.go"
+Cohesion: 0.25
+Nodes (10): newChangelogModel(), rel(), tags(), TestChangelogModelOtherKeysDoNotQuit(), TestChangelogModelQuitKeys(), TestChangelogModelResize(), TestChangelogText(), TestCumulativeChangelog() (+2 more)
+
+### Community 223 - "AddServeFlags"
+Cohesion: 0.36
+Nodes (8): AddHeadlessFlag(), AddServeFlags(), TestParseServeFlagsRequiresCredentials(), init(), init(), init(), init(), init()
+
+### Community 224 - "Existing"
+Cohesion: 0.18
+Nodes (8): existingSection(), guardedMatch(), overlaps(), refusedPath(), sectionFor(), validateTarget(), Existing, ExistingRule
 
 ### Community 225 - "supersede_probe.c"
 Cohesion: 0.76
 Nodes (6): answer(), main(), read_ok(), read_secret(), run_child(), spin()
 
-### Community 226 - "checkRunningBinaryMatchesInstalled"
+### Community 227 - "BinaryStat"
+Cohesion: 0.29
+Nodes (10): BinaryStat, binaryStatOf(), StatBinary(), StatBinaryFile(), durableFS(), fsidOf(), hostVouches(), StatDurable() (+2 more)
+
+### Community 229 - "configedit_test.go"
+Cohesion: 0.47
+Nodes (9): newTestConfigEditor(), readFile(), TestConfigEditorApply(), TestConfigEditorRefusals(), TestConfigEditorRefusesNewMulticallLine(), TestConfigEditorRestoresOnFailedReload(), TestRunConfigEditOverTheSocket(), TestRunConfigEditRefusedDuringALiveSession() (+1 more)
+
+### Community 231 - "loadDaemonConfig"
+Cohesion: 0.33
+Nodes (6): loadDaemonConfig(), resolveConfigPath(), TestLoadDaemonConfigEmptyResourcesIsCriticalStartup(), TestLoadDaemonConfigMissingFileIsCriticalStartup(), ConfigureInodeCapacity(), TestConfigureInodeCapacityBounds()
+
+### Community 232 - "FetchLatest"
+Cohesion: 0.33
+Nodes (9): installHooks(), staged(), FetchLatest(), fetchPair(), fetchRelease(), FetchVerified(), Release, TestFetchReleaseByTag() (+1 more)
+
+### Community 233 - "vaultfs.go"
+Cohesion: 0.22
+Nodes (8): entryOf(), DefaultNewFileMode(), FileModeToUnixMode(), IsOctalMode(), ParseMode(), TestDefaultNewFileMode(), TestIsOctalMode(), Unopened()
+
+### Community 234 - "prctl_gate"
 Cohesion: 0.40
-Nodes (5): checkInstalledMatchesSource(), checkRunningBinaryMatchesInstalled(), fileSHA256(), sameContent(), TestCheckRunningBinaryMatchesInstalled()
+Nodes (3): prctl_gate(), guard_task_prctl(), netg_task_prctl()
 
-### Community 227 - "inspector_probe.c"
-Cohesion: 0.56
-Nodes (8): check_attach(), check_exe(), check_mem(), check_root(), check_vmread(), main(), report(), traced_exec()
-
-### Community 228 - "Choice"
-Cohesion: 0.50
-Nodes (3): MultiSelectKeymap(), Choice, MultiSelect()
-
-### Community 232 - "Plan"
-Cohesion: 0.20
-Nodes (6): dedupe(), Plan, libOfChosen(), sectionFor(), Existing, ExistingRule
+### Community 235 - "WithBottomBar"
+Cohesion: 0.31
+Nodes (5): TestProgressReader(), bottomBar, newBottomBar(), renderBar(), WithBottomBar()
 
 ### Community 236 - "Troubleshooting"
 Cohesion: 0.22
 Nodes (9): A program I use is denied, After a package update replaced a binary, An app breaks and nothing is logged, Backups, Check the guard by hand, Encryption key errors, Is the daemon running and enforcing?, Snapshots or disk backups stopped working (+1 more)
 
-### Community 244 - "monitor.md"
+### Community 237 - "mountTable"
+Cohesion: 0.39
+Nodes (5): MountInfo, MountByID(), ParseMountinfo(), ReadMountinfo(), mountTable
+
+### Community 239 - "parsePasswd"
 Cohesion: 0.50
+Nodes (4): parsePasswd(), shell(), TestParsePasswd(), TestParsePasswdMalformed()
+
+### Community 241 - "ptrace_seize.c"
+Cohesion: 0.50
+Nodes (6): main(), peek_buffer(), run_tracer(), run_victim(), touch(), wait_for_file()
+
+### Community 242 - "Execute"
+Cohesion: 0.67
+Nodes (3): Execute(), initLogger(), main()
+
+### Community 243 - "headless/headless.go"
+Cohesion: 0.43
+Nodes (5): stagedBinary, stageRelease(), Check(), CheckGUI(), inspect()
+
+### Community 244 - "monitor: see what touches a path"
+Cohesion: 0.67
 Nodes (3): Events, Flags, monitor: see what touches a path
 
+### Community 245 - "downloadFile"
+Cohesion: 0.33
+Nodes (4): downloadFile(), TestDownloadFileHTTPError(), TestDownloadFileMode0700(), progressReader
+
 ## Knowledge Gaps
-- **34 isolated node(s):** `github.com/Virgula0/app-listener`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `github.com/Virgula0/app-listener/tools/codecheck` (+29 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 641 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
-- **37 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **33 isolated node(s):** `github.com/Virgula0/app-listener`, `IntegrationSuite`, `IntegrationSuite`, `github.com/Virgula0/app-listener/tools/codecheck`, `open_by_handle_at POC` (+28 more)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 640 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **41 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `absPath()` connect `absPath` to `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `TestMain`, `go_pkg_strings`, `IntegrationSuite`, `IntegrationSuite`, `.TestRecord_GuardParity`, `IntegrationSuite`?**
-  _High betweenness centrality (0.039) - this node is a cross-community bridge._
+- **Why does `absPath()` connect `absPath` to `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `IntegrationSuite`, `go_pkg_strings`, `IntegrationSuite`, `IntegrationSuite`, `TestMain`, `IntegrationSuite`, `IntegrationSuite`, `.TestRecord_GuardParity`, `IntegrationSuite`?**
+  _High betweenness centrality (0.044) - this node is a cross-community bridge._
 - **What connects `github.com/Virgula0/app-listener`, `IntegrationSuite`, `IntegrationSuite` to the rest of the system?**
-  _34 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _33 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `testing.T` be split into smaller, more focused modules?**
-  _Cohesion score 0.018196856906534328 - nodes in this community are weakly interconnected._
-- **Why does `Guard` connect `Guard` to `daemon/daemon.go`, `time.Duration`, `GuardInodeKey`, `time.Time`, `DaemonUseCase`, `ConfinedEntry`, `guardUnitTest`, `DaemonEvent`, `BinaryEntry`, `os.File`, `GuardEvent`, `Resource`, `buildOneGuard`, `sync.Mutex`?**
+  _Cohesion score 0.018644650842793258 - nodes in this community are weakly interconnected._
+- **Why does `Guard` connect `Guard` to `daemon/daemon.go`, `TrustGuard`, `engine`, `time.Duration`, `ConfinedEntry`, `runDaemon`, `guardUnitTest`, `time.Time`, `sync.Mutex`, `GuardInodeKey`, `GuardEvent`, `BinaryEntry`, `makeReloadHandler`, `.TestReconcileInodesEvictsStale`, `buildOneGuard`, `planUpdaters`?**
   _High betweenness centrality (0.028) - this node is a cross-community bridge._
 - **Should `IntegrationSuite` be split into smaller, more focused modules?**
-  _Cohesion score 0.09125085440874915 - nodes in this community are weakly interconnected._
-- **Why does `backend` connect `Message` to `backend.go`, `time.Duration`, `Vault`, `liveSession`, `Vault`, `recordFlow`, `TestCleanRel`, `runOfflineEdit`, `Client`, `Resource`, `sync.Mutex`, `backend_test.go`?**
-  _High betweenness centrality (0.019) - this node is a cross-community bridge._
-- **Should `daemonconfig_test.go` be split into smaller, more focused modules?**
-  _Cohesion score 0.06666666666666667 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.09124209124209125 - nodes in this community are weakly interconnected._
+- **Why does `backend` connect `Message` to `go_pkg_os`, `time.Duration`, `Vault`, `liveSession`, `recordFlow`, `Vault`, `runBackend`, `Client`, `TestCleanRel`, `sync.Mutex`, `planUpdaters`, `backend_test.go`?**
+  _High betweenness centrality (0.020) - this node is a cross-community bridge._
+- **Should `Vault` be split into smaller, more focused modules?**
+  _Cohesion score 0.13446969696969696 - nodes in this community are weakly interconnected._
