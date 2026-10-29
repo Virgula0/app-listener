@@ -1436,10 +1436,13 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 // guard_unix_conns marks the caller's socket with the resource it was admitted to. A connected fd
 // outlives the exe that connected (exec-inherited, SCM_RIGHTS-passed), so every later message on it
 // is judged by that mark and the exe moving it now. Never by the peer: a server closing its end
-// clears that end's path while its data is still queued for the client.
+// clears that end's path while its data is still queued for the client. The mark names the
+// resource's watch root, not its slot: a reload moves the resource to a new slot and retires (then
+// reuses) the old one, while guard_inodes' row for the root follows it.
 struct unix_conn {
-	__u32 res_id;
+	struct inode_key root;
 	__u32 set;
+	__u32 global; // reached two resources: judged by GUARD_RES_GLOBAL
 };
 
 struct {
@@ -1467,19 +1470,23 @@ static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock 
 	int ret = check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, false, res);
 	if (ret)
 		return ret;
-	if (!sk)
+	struct res_config *cfg = res_cfg(res);
+	if (!sk || !cfg)
 		return -EPERM;
 	struct unix_conn *c = bpf_sk_storage_get(&guard_unix_conns, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
 	if (!c)
 		return -EPERM;
-	// A socket that reached two resources (datagrams) answers to their intersection.
-	c->res_id = (c->set && c->res_id != res) ? GUARD_RES_GLOBAL : res;
+	if (c->set && (c->root.dev != cfg->root_dev || c->root.ino != cfg->root_ino))
+		c->global = 1;
+	c->root.dev = cfg->root_dev;
+	c->root.ino = cfg->root_ino;
 	c->set = 1;
 	return 0;
 }
 
-// judge_unix_msg judges a message on a marked socket. The peer's path is display only (read
-// unreferenced, possibly already released); allowed messages are quiet, the connect was logged.
+// judge_unix_msg judges a message on a marked socket. A root no longer in guard_inodes answers to
+// GUARD_RES_GLOBAL (fail closed). The peer's path is display only (read unreferenced, possibly
+// already released); allowed messages are quiet, the connect was logged.
 static __always_inline int judge_unix_msg(struct emit_args *ea, struct sock *sk)
 {
 	struct sock *peer = NULL;
@@ -1489,10 +1496,17 @@ static __always_inline int judge_unix_msg(struct emit_args *ea, struct sock *sk)
 	struct unix_conn *c = bpf_sk_storage_get(&guard_unix_conns, sk, 0, 0);
 	if (!c)
 		return 0;
+	__u32 res = GUARD_RES_GLOBAL;
+	if (!c->global) {
+		struct inode_key root = c->root;
+		__u32 *found = bpf_map_lookup_elem(&guard_inodes, &root);
+		if (found)
+			res = *found;
+	}
 	bpf_probe_read_kernel(&peer, sizeof(peer), &((struct unix_sock *)sk)->peer);
 	if (peer)
 		bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
-	return check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, true, c->res_id);
+	return check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, true, res);
 }
 
 SEC("lsm/file_open")

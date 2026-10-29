@@ -62,8 +62,8 @@ least-privilege hint.
 - Multicall applets started before a guard have no attested applet and are denied until they exec
   again ([details](binary-trust.md#multicall-binaries)).
 - A process started before its binary was replaced keeps its access.
-- A unix socket connection to a guarded socket made before the guard started is judged by nobody:
-  whoever holds it later can keep using it.
+- A unix socket connection to a guarded socket made before the guard started (a daemon restart
+  counts, a reload does not) is judged by nobody: whoever holds it later can keep using it.
 
 ## Side effects to expect with the daemon
 
