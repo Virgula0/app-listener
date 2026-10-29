@@ -669,12 +669,14 @@ func (g *Guard) PinDegraded() bool { return SharedPinDegraded() }
 // inode/bprm ones, a superseded binary or a reused inode number would keep its whitelist entry
 // (exe_supersede.h); without the ioctl ones, a btrfs snapshot copies a guarded tree unguarded;
 // without task_prctl, a process repoints mm->exe_file at a whitelisted inode (prctl PR_SET_MM) and
-// borrows its identity, so the guard's inode-keyed policy is bypassable.
+// borrows its identity, so the guard's inode-keyed policy is bypassable; without the AF_UNIX ones,
+// anyone can talk to an agent socket bound inside a guarded tree.
 var requiredHooks = map[string]bool{
 	"file_open": true, "file_permission": true,
 	"inode_unlink": true, "inode_rename": true, "bprm_committed_creds": true,
 	"file_ioctl": true, "file_ioctl_compat": true,
-	"task_prctl": true,
+	"task_prctl": true, "unix_stream_connect": true, "unix_may_send": true,
+	"socket_sendmsg": true, "socket_recvmsg": true,
 }
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
@@ -774,6 +776,10 @@ func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []lsmHook {
 		{o.GuardInodeUnlink, "inode_unlink"},
 		{o.GuardInodeRename, "inode_rename"},
 		{o.GuardFileIoctl, "file_ioctl"},
+		{o.GuardUnixStreamConnect, "unix_stream_connect"},
+		{o.GuardUnixMaySend, "unix_may_send"},
+		{o.GuardSocketSendmsg, "socket_sendmsg"},
+		{o.GuardSocketRecvmsg, "socket_recvmsg"},
 	}
 	if ioctlCompat {
 		hooks = append(hooks, lsmHook{o.GuardFileIoctlCompat, "file_ioctl_compat"})

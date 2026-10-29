@@ -41,7 +41,9 @@ lifecycle. Without `watch:` lines the section path itself is the guarded tree.
 
 ### Per-binary event masks
 
-Valid events: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD`.
+Valid events: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD, CONNECT`.
+`CONNECT` is connecting, sending or receiving on a unix socket bound inside the tree (an agent or RPC
+socket).
 
 Unlisted events are denied for that binary. `READ`, `WRITE` and `MMAP` imply `OPEN`.
 

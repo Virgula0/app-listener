@@ -64,6 +64,8 @@ These must attach or the guard refuses to start:
 - `file_ioctl`, `file_ioctl_compat` (btrfs copy ioctls)
 - `task_prctl` (refuses `prctl(PR_SET_MM)` rewrites of a process's executable, which would borrow
   another binary's identity); `network guard` requires it too
+- `unix_stream_connect`, `unix_may_send`, `socket_sendmsg`, `socket_recvmsg` (unix sockets bound
+  inside a guarded tree)
 
 Every other LSM hook is best-effort: a kernel that lacks one logs a warning and keeps enforcing the
 rest.

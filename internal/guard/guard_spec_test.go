@@ -30,6 +30,20 @@ func TestIoctlHooksAreRequired(t *testing.T) {
 	}
 }
 
+func TestUnixSocketHooksAreRequired(t *testing.T) {
+	var o GuardObjects
+	got := map[string]bool{}
+	for _, h := range guardLSMHooks(&o, false) {
+		got[h.hook] = true
+	}
+	for _, h := range []string{"unix_stream_connect", "unix_may_send", "socket_sendmsg", "socket_recvmsg"} {
+		if !got[h] || !requiredHooks[h] {
+			t.Fatalf("%s attached=%v required=%v: agent sockets in a guarded tree would be reachable",
+				h, got[h], requiredHooks[h])
+		}
+	}
+}
+
 func TestGuardSpecKeepsIoctlCompatOnlyWhereKernelHasIt(t *testing.T) {
 	spec, compat, err := guardSpec()
 	if err != nil {

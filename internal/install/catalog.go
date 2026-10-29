@@ -102,11 +102,11 @@ func (c *CandidateDir) IsSystem() bool { return len(c.AbsPaths) > 0 }
 var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPaths: []string{".ssh"},
-		// ssh needs WRITE (known_hosts rotation); sshd and helpers (sshd-auth/-session,
-		// sftp-server) only READ authorized_keys; keysign/pkcs11/cleanup helpers are inert. git
-		// excluded: it reads keys.
+		// ssh needs WRITE (known_hosts rotation), MKNOD + CONNECT (binding / reaching a ControlMaster
+		// socket here); sshd and helpers (sshd-auth/-session, sftp-server) only READ authorized_keys;
+		// keysign/pkcs11/cleanup helpers are inert. git excluded: it reads keys.
 		Whitelist: map[string][]string{
-			"/usr/bin/ssh":                         {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK"},
+			"/usr/bin/ssh":                         {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK", "MKNOD", "CONNECT"},
 			"/usr/bin/ssh-add":                     nil,
 			"/usr/bin/ssh-agent":                   nil,
 			"/usr/bin/ssh-keygen":                  nil,
@@ -129,9 +129,11 @@ var Catalog = []CandidateDir{
 			"/usr/lib/openssh/ssh-session-cleanup": nil,
 		}},
 	{Name: "GNU Privacy Guard keyring", RelPaths: []string{".gnupg"},
+		// Without /run/user, gpg-agent's sockets (S.gpg-agent.ssh too) live here: ssh may connect.
 		Whitelist: map[string][]string{
 			"/usr/bin/gpg": nil, "/usr/bin/gpg-agent": nil,
 			"/usr/bin/gpgconf": nil, "/usr/bin/gpg-connect-agent": nil,
+			"/usr/bin/ssh": {"CONNECT"}, "/usr/bin/ssh-add": {"CONNECT"},
 		}},
 
 	// --- AI coding agents and CLI tools ----------------------------------------
@@ -303,7 +305,9 @@ var Catalog = []CandidateDir{
 	{Name: "Bitwarden", RelPaths: []string{".config/Bitwarden"},
 		Whitelist: map[string][]string{"/usr/bin/bitwarden": nil, "/usr/local/bin/bitwarden": nil}},
 	{Name: "1Password", RelPaths: []string{".1password"},
-		Whitelist: map[string][]string{"/usr/bin/1password": nil, "/usr/bin/op": nil, "/usr/local/bin/op": nil}},
+		// ssh and ssh-add only talk to the SSH agent socket (IdentityAgent ~/.1password/agent.sock).
+		Whitelist: map[string][]string{"/usr/bin/1password": nil, "/usr/bin/op": nil, "/usr/local/bin/op": nil,
+			"/usr/bin/ssh": {"CONNECT"}, "/usr/bin/ssh-add": {"CONNECT"}}},
 	{Name: "age keys", RelPaths: []string{".config/age"},
 		Whitelist: map[string][]string{"/usr/bin/age": nil, "/usr/bin/age-keygen": nil}},
 	{Name: "KeePassXC", RelPaths: []string{".local/share/keepassxc"},

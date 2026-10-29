@@ -69,6 +69,7 @@ enum event_type {
 	EVENT_ATTR,
 	EVENT_STAT,
 	EVENT_MKNOD,
+	EVENT_CONNECT,
 };
 
 struct guard_event {
@@ -1427,6 +1428,73 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 		add_inode_to_guard(parent_inode, found_res);
 }
 
+// AF_UNIX connect/sendto finds the listener by inode: no file_open, file_permission or
+// inode_getattr runs, so a socket bound inside a guarded tree (an agent or RPC socket) is judged
+// as CONNECT by the unix_* and socket_* hooks. The judged dentry is the listener's own bound path
+// (unix_sock.path), so a symlink or hardlink to the socket can't move it out of the tree.
+//
+// guard_unix_conns marks the caller's socket with the resource it was admitted to. A connected fd
+// outlives the exe that connected (exec-inherited, SCM_RIGHTS-passed), so every later message on it
+// is judged by that mark and the exe moving it now. Never by the peer: a server closing its end
+// clears that end's path while its data is still queued for the client.
+struct unix_conn {
+	__u32 res_id;
+	__u32 set;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct unix_conn);
+} guard_unix_conns SEC(".maps");
+
+// judge_unix_connect judges sk reaching peer's bound socket and marks sk on admission. Unmarkable =
+// denied: an unmarked connection's messages would go unjudged.
+static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock *sk, struct sock *peer)
+{
+	__u32 res = GUARD_RES_NONE;
+	struct dentry *dentry = NULL;
+	struct inode *inode = NULL;
+	if (!peer)
+		return 0;
+	bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
+	if (!dentry)
+		return 0;
+	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
+	if (off_guarded_fs(dentry, inode) || !is_guarded_access(dentry, inode, &res))
+		return 0;
+	int ret = check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, false, res);
+	if (ret)
+		return ret;
+	if (!sk)
+		return -EPERM;
+	struct unix_conn *c = bpf_sk_storage_get(&guard_unix_conns, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!c)
+		return -EPERM;
+	// A socket that reached two resources (datagrams) answers to their intersection.
+	c->res_id = (c->set && c->res_id != res) ? GUARD_RES_GLOBAL : res;
+	c->set = 1;
+	return 0;
+}
+
+// judge_unix_msg judges a message on a marked socket. The peer's path is display only (read
+// unreferenced, possibly already released); allowed messages are quiet, the connect was logged.
+static __always_inline int judge_unix_msg(struct emit_args *ea, struct sock *sk)
+{
+	struct sock *peer = NULL;
+	struct dentry *dentry = NULL;
+	if (!sk)
+		return 0;
+	struct unix_conn *c = bpf_sk_storage_get(&guard_unix_conns, sk, 0, 0);
+	if (!c)
+		return 0;
+	bpf_probe_read_kernel(&peer, sizeof(peer), &((struct unix_sock *)sk)->peer);
+	if (peer)
+		bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
+	return check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, true, c->res_id);
+}
+
 SEC("lsm/file_open")
 int guard_file_open(unsigned long long *ctx)
 {
@@ -1594,6 +1662,12 @@ int guard_file_permission(unsigned long long *ctx)
 
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+
+	// splice/sendfile from a socket (sock_splice_read) never reach socket_recvmsg; only
+	// rw_verify_area's file_permission sees them.
+	struct socket *sock = bpf_sock_from_file(file);
+	if (sock)
+		return judge_unix_msg(ea, sock->sk);
 
 	if (off_guarded_fs(dentry, inode) || !is_guarded_access(dentry, inode, &res))
 		return 0;
@@ -2295,6 +2369,42 @@ int guard_inode_listxattr(unsigned long long *ctx)
 		return check_and_emit(EVENT_STAT, dentry, NULL, false, NULL, false, false, res);
 
 	return 0;
+}
+
+SEC("lsm/unix_stream_connect")
+int guard_unix_stream_connect(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	return judge_unix_connect(&ea_buf, (struct sock *)ctx[0], (struct sock *)ctx[1]);
+}
+
+// Every datagram send, connected or not (seqpacket goes through unix_stream_connect).
+SEC("lsm/unix_may_send")
+int guard_unix_may_send(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct socket *sock = (struct socket *)ctx[0];
+	struct socket *other = (struct socket *)ctx[1];
+	struct sock *peer = NULL;
+	if (other)
+		bpf_probe_read_kernel(&peer, sizeof(peer), &other->sk);
+	return judge_unix_connect(&ea_buf, sock->sk, peer);
+}
+
+SEC("lsm/socket_sendmsg")
+int guard_socket_sendmsg(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct socket *sock = (struct socket *)ctx[0];
+	return judge_unix_msg(&ea_buf, sock->sk);
+}
+
+SEC("lsm/socket_recvmsg")
+int guard_socket_recvmsg(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct socket *sock = (struct socket *)ctx[0];
+	return judge_unix_msg(&ea_buf, sock->sk);
 }
 
 // No inode_permission hook: its (inode, mask) context has no dentry, so a map hit can't be confined

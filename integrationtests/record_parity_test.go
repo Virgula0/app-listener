@@ -23,12 +23,13 @@ var parityOps = []struct{ op, key string }{
 	{"getxattr", "STAT"}, {"listxattr", "STAT"}, {"stat", "STAT"}, {"readlink", "STAT"},
 	{"splice_in", "READ"}, {"splice_out", "WRITE"}, {"sendfile_in", "READ"}, {"sendfile_out", "WRITE"},
 	{"cfr_in", "READ"}, {"cfr_out", "WRITE"},
+	{"unix_connect", "CONNECT"}, {"unix_sendto", "CONNECT"},
 }
 
 // parityReadOnly ops never write under the target: a WRITE in their mask is over-proposed. Earlier
 // ops unlink files there, so a new file outside may reuse a watched inode number.
 var parityReadOnly = []string{"open", "read", "readv", "pread", "readdir", "mmap_read", "stat",
-	"getxattr", "listxattr", "readlink", "splice_in", "sendfile_in", "cfr_in"}
+	"getxattr", "listxattr", "readlink", "splice_in", "sendfile_in", "cfr_in", "unix_connect", "unix_sendto"}
 
 const (
 	parityRec = "/rec"    // the recorded, then guarded, tree: one subdirectory per op

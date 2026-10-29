@@ -18,6 +18,19 @@ binary with arguments of its choosing gets whatever that binary prints.
   an editor, ... reads the resource on behalf of any script. The installer and the daemon warn about
   every resource that whitelists one.
 
+## Unix sockets
+
+A unix socket bound inside a guarded tree (an SSH agent or ControlMaster socket in `~/.ssh`,
+`~/.1password/agent.sock`, Core Lightning's `lightning-rpc`) is guarded like a file: connecting,
+sending a datagram, or sending and receiving on a connection handed to another program counts as
+`CONNECT`, judged by the program doing it. A daemon.conf line with an explicit event list needs
+`CONNECT` for a program that talks to such a socket. What stays outside:
+
+- **Sockets outside the tree.** Most agents listen in `/run/user/<uid>` (`ssh-agent`, `gpg-agent`)
+  or on the session bus (the Secret Service keyring that `gh`, Copilot CLI, Gemini CLI, JetBrains
+  IDEs and `git`'s libsecret helper keep tokens in). Any of your programs can ask them.
+- **Abstract sockets** have no file and are never judged.
+
 ## Interpreters and JITs
 
 A whitelisted interpreter runs whatever script its caller passes, and a JIT inside a whitelisted
@@ -49,6 +62,8 @@ least-privilege hint.
 - Multicall applets started before a guard have no attested applet and are denied until they exec
   again ([details](binary-trust.md#multicall-binaries)).
 - A process started before its binary was replaced keeps its access.
+- A unix socket connection to a guarded socket made before the guard started is judged by nobody:
+  whoever holds it later can keep using it.
 
 ## Side effects to expect with the daemon
 
