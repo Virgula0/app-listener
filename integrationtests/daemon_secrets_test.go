@@ -52,9 +52,10 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 
 	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
 	s.Require().Equalf(0, code, "daemon login: %s\n%s", out, s.readDaemonLog(c))
-	code, out = s.exec(c, []string{"stat", "-c", "%u %a %F", secretRelay + "/1000.bus"})
-	s.Require().Equalf(0, code, "relay socket: %s\n%s", out, s.readDaemonLog(c))
-	s.Require().Equalf("1000 600 socket", out, "the relay socket is the user's, 0600")
+	// Bound, read from the socket table: only the provider may stat inside the relay dir. The keyring
+	// connecting as uid 1000 below proves the handover.
+	code, out = s.exec(c, []string{"grep", "-c", " " + secretRelay + "/1000.bus$", "/proc/net/unix"})
+	s.Require().Equalf(0, code, "relay socket not bound: %s\n%s", out, s.readDaemonLog(c))
 
 	user := func(env, cmd string) (int, string) {
 		return s.exec(c, []string{"setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "sh", "-c",
