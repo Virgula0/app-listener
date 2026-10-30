@@ -21,6 +21,16 @@ const (
 	propAttributes = "org.freedesktop.Secret.Item.Attributes"
 )
 
+// openCalls pass undecided: {interface, member}, member "" for the whole interface (a call always
+// names its member).
+var openCalls = map[[2]string]bool{
+	{ifaceSession, "Close"}:                     true,
+	{ifacePrompt, "Prompt"}:                     true,
+	{ifacePrompt, "Dismiss"}:                    true,
+	{"org.freedesktop.DBus.Introspectable", ""}: true,
+	{"org.freedesktop.DBus.Peer", ""}:           true,
+}
+
 type verdictKind int
 
 const (
@@ -48,38 +58,14 @@ func classify(m *dbus.Message) verdict {
 	iface := header[string](m, dbus.FieldInterface)
 	member := header[string](m, dbus.FieldMember)
 	path := header[dbus.ObjectPath](m, dbus.FieldPath)
+	if member != "" && (openCalls[[2]string{iface, member}] || openCalls[[2]string{iface, ""}]) {
+		return verdict{kind: allow}
+	}
 	switch iface {
 	case ifaceService:
-		switch member {
-		case "OpenSession", "SearchItems", "Unlock", "Lock", "LockService", "ReadAlias", "CreateCollection":
-			return verdict{kind: allow}
-		case "GetSecrets":
-			items, ok := arg[[]dbus.ObjectPath](m, 0)
-			if !ok {
-				return verdict{kind: refuse}
-			}
-			return verdict{kind: gated, op: ebpf.EventRead, items: items}
-		case "SetAlias", "ChangeLock":
-			return verdict{kind: needManager}
-		}
+		return classifyService(m, member)
 	case ifaceCollection:
-		switch member {
-		case "SearchItems":
-			return verdict{kind: allow}
-		case "CreateItem":
-			props, ok := arg[map[string]dbus.Variant](m, 0)
-			if !ok {
-				return verdict{kind: refuse}
-			}
-			attrs, ok := attributesOf(props[propAttributes])
-			if !ok {
-				return verdict{kind: refuse}
-			}
-			// replace=true overwrites the item with these attributes: the same scopes decide.
-			return verdict{kind: gated, op: ebpf.EventWrite, attrs: []map[string]string{attrs}}
-		case "Delete":
-			return verdict{kind: needManager}
-		}
+		return classifyCollection(m, member)
 	case ifaceItem:
 		switch member {
 		case "GetSecret":
@@ -89,21 +75,48 @@ func classify(m *dbus.Message) verdict {
 		case "Delete":
 			return verdict{kind: gated, op: ebpf.EventDelete, items: []dbus.ObjectPath{path}}
 		}
-	case ifaceSession:
-		if member == "Close" {
-			return verdict{kind: allow}
-		}
-	case ifacePrompt:
-		if member == "Prompt" || member == "Dismiss" {
-			return verdict{kind: allow}
-		}
 	case ifaceProps:
 		return classifyProps(m, member, path)
-	case "org.freedesktop.DBus.Introspectable", "org.freedesktop.DBus.Peer":
-		return verdict{kind: allow}
 	case ifacePrompterCallback:
 		return verdict{kind: needPrompter}
 	case ifaceGuiltRidden:
+		return verdict{kind: needManager}
+	}
+	return verdict{kind: refuse}
+}
+
+func classifyService(m *dbus.Message, member string) verdict {
+	switch member {
+	case "OpenSession", "SearchItems", "Unlock", "Lock", "LockService", "ReadAlias", "CreateCollection":
+		return verdict{kind: allow}
+	case "GetSecrets":
+		items, ok := arg[[]dbus.ObjectPath](m, 0)
+		if !ok {
+			return verdict{kind: refuse}
+		}
+		return verdict{kind: gated, op: ebpf.EventRead, items: items}
+	case "SetAlias", "ChangeLock":
+		return verdict{kind: needManager}
+	}
+	return verdict{kind: refuse}
+}
+
+func classifyCollection(m *dbus.Message, member string) verdict {
+	switch member {
+	case "SearchItems":
+		return verdict{kind: allow}
+	case "CreateItem":
+		props, ok := arg[map[string]dbus.Variant](m, 0)
+		if !ok {
+			return verdict{kind: refuse}
+		}
+		attrs, ok := attributesOf(props[propAttributes])
+		if !ok {
+			return verdict{kind: refuse}
+		}
+		// replace=true overwrites the item with these attributes: the same scopes decide.
+		return verdict{kind: gated, op: ebpf.EventWrite, attrs: []map[string]string{attrs}}
+	case "Delete":
 		return verdict{kind: needManager}
 	}
 	return verdict{kind: refuse}

@@ -26,13 +26,13 @@ func readFrame(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	var order binary.ByteOrder
-	switch hdr[0] {
+	switch endian := hdr[0]; endian {
 	case 'l':
 		order = binary.LittleEndian
 	case 'B':
 		order = binary.BigEndian
 	default:
-		return nil, fmt.Errorf("bad endianness byte %#x", hdr[0])
+		return nil, fmt.Errorf("bad endianness byte %#x", endian)
 	}
 	body := uint64(order.Uint32(hdr[4:8]))
 	fields := uint64(order.Uint32(hdr[12:16]))
@@ -73,6 +73,47 @@ func encodeWithSerial(m *dbus.Message, serial uint32) ([]byte, error) {
 	return raw, nil
 }
 
+const saslRejected = "REJECTED EXTERNAL\r\n"
+
+// saslServer is serverAuth's state: id is the hex uid EXTERNAL must name.
+type saslServer struct {
+	id, ok      string
+	authed      bool
+	waitingData bool
+}
+
+// step answers one client line; begin reports an authenticated BEGIN.
+func (s *saslServer) step(line string) (reply string, begin bool) {
+	cmd, arg, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
+	switch {
+	case cmd == "AUTH" && strings.HasPrefix(arg, "EXTERNAL"):
+		return s.answer(strings.TrimSpace(strings.TrimPrefix(arg, "EXTERNAL")), true), false
+	case cmd == "AUTH" || cmd == "CANCEL":
+		s.authed, s.waitingData = false, false
+		return saslRejected, false
+	case cmd == "DATA" && s.waitingData:
+		s.waitingData = false
+		return s.answer(arg, false), false
+	case cmd == "BEGIN" && s.authed:
+		return "", true
+	}
+	return "ERROR\r\n", false
+}
+
+// answer judges the identity an AUTH (initial response, may ask for DATA) or a DATA line gave; an
+// empty DATA means "the uid you see", which SO_PEERCRED already checked.
+func (s *saslServer) answer(id string, initial bool) string {
+	switch {
+	case id == "" && initial:
+		s.waitingData = true
+		return "DATA\r\n"
+	case id == "" || id == s.id:
+		s.authed = true
+		return s.ok
+	}
+	return saslRejected
+}
+
 // serverAuth is the bus side of the SASL handshake with the provider: EXTERNAL only, as uid (already
 // checked by SO_PEERCRED), no fd passing. It returns the reader positioned at the first message.
 func serverAuth(rw io.ReadWriter, uid uint32) (*bufio.Reader, error) {
@@ -80,41 +121,21 @@ func serverAuth(rw io.ReadWriter, uid uint32) (*bufio.Reader, error) {
 	if b, err := br.ReadByte(); err != nil || b != 0 {
 		return nil, fmt.Errorf("sasl: missing initial NUL byte")
 	}
-	want := hex.EncodeToString([]byte(strconv.FormatUint(uint64(uid), 10)))
 	guid := make([]byte, 16)
 	if _, err := rand.Read(guid); err != nil {
 		return nil, err
 	}
-	authed := false
-	waitingData := false
+	s := saslServer{
+		id: hex.EncodeToString([]byte(strconv.FormatUint(uint64(uid), 10))),
+		ok: "OK " + hex.EncodeToString(guid) + "\r\n",
+	}
 	for range 16 {
 		line, err := br.ReadString('\n')
 		if err != nil {
 			return nil, fmt.Errorf("sasl: %w", err)
 		}
-		cmd, arg, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
-		reply := "ERROR\r\n"
-		switch {
-		case cmd == "AUTH" && strings.HasPrefix(arg, "EXTERNAL"):
-			id := strings.TrimSpace(strings.TrimPrefix(arg, "EXTERNAL"))
-			switch {
-			case id == "":
-				waitingData, reply = true, "DATA\r\n"
-			case id == want:
-				authed, reply = true, "OK "+hex.EncodeToString(guid)+"\r\n"
-			default:
-				reply = "REJECTED EXTERNAL\r\n"
-			}
-		case cmd == "AUTH" || cmd == "CANCEL":
-			authed, waitingData, reply = false, false, "REJECTED EXTERNAL\r\n"
-		case cmd == "DATA" && waitingData:
-			waitingData = false
-			if arg == "" || arg == want {
-				authed, reply = true, "OK "+hex.EncodeToString(guid)+"\r\n"
-			} else {
-				reply = "REJECTED EXTERNAL\r\n"
-			}
-		case cmd == "BEGIN" && authed:
+		reply, begin := s.step(line)
+		if begin {
 			return br, nil
 		}
 		if _, err := io.WriteString(rw, reply); err != nil {

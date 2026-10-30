@@ -24,6 +24,14 @@ import (
 var secretRelaySelfEvents = append(append([]ebpf.EventType(nil), daemonSelfBaselineEvents...),
 	ebpf.EventMknod, ebpf.EventAttr, ebpf.EventDelete)
 
+// selfEventsFor is r's guard's self mask.
+func selfEventsFor(r *daemonconfig.Resource) []ebpf.EventType {
+	if r.SecretRelay {
+		return secretRelaySelfEvents
+	}
+	return daemonSelfBaselineEvents
+}
+
 // ensureSecretAnchors makes each [secret] scope's anchor and the relay dir before their guards claim
 // them. /run/app-listener is 0755 so a provider can reach the relay dir; the anchor dirs stay 0700.
 func ensureSecretAnchors(cfg *daemonconfig.Config) error {
@@ -221,8 +229,8 @@ func (s *secretGates) startLocked(uid uint32) {
 		return
 	}
 	sock := daemonconfig.SecretRelaySocket(uid)
-	if err := os.Remove(sock); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Errorf("secret gate %d: removing a stale %s: %v", uid, sock, err)
+	if rmErr := os.Remove(sock); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		log.Errorf("secret gate %d: removing a stale %s: %v", uid, sock, rmErr)
 	}
 	g, err := secretgate.Listen(uid, gid, sock, runDir+"/bus", &s.judge)
 	if err != nil {

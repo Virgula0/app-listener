@@ -496,7 +496,8 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("%w: config %s contains no [watch] sections", constants.ErrCriticalStartup, configPath)
 	}
-	if err := ensurePortAnchors(cfg); err == nil {
+	err = ensurePortAnchors(cfg)
+	if err == nil {
 		err = ensureSecretAnchors(cfg)
 	}
 	if err != nil {
@@ -1082,16 +1083,12 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		mode = guard.ModeReadOnly
 	}
 
-	selfEvents := daemonSelfBaselineEvents
-	if r.SecretRelay {
-		selfEvents = secretRelaySelfEvents
-	}
 	opts := []guard.GuardOption{
 		guard.WithBinaryEvents(events),
 		guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
 		// Root-gated self access with the minimal event set the fscrypt lifecycle needs; non-root
 		// executors of this binary stay denied (self-key bypass regression test).
-		guard.WithSelfAllowBinary(self, selfEvents),
+		guard.WithSelfAllowBinary(self, selfEventsFor(r)),
 		// Pin LSM links so a SIGKILL leaves the tree enforced until ExecStopPost locks the vault.
 		guard.WithPinning(pin.prefix(r.Path)),
 		guard.WithBackingDevices(deviceSet),

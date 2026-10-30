@@ -192,31 +192,16 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 // by default, and the catalog entry's grouped extra watch sub-paths.
 func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
-	portAt := map[uint16]int{}
-	secretAt := map[string]int{}
+	sharedAt := map[string]int{}
 	for i := range candidates {
 		c := &candidates[i]
-		if c.Port != 0 {
-			// One section per port: several users' (and entries') binaries share it.
-			at, seen := portAt[c.Port]
+		if key, fresh, ok := sharedSection(c); ok {
+			// One section per port or secret scope: several users' (and entries') binaries share it.
+			at, seen := sharedAt[key]
 			if !seen {
 				at = len(sections)
-				portAt[c.Port] = at
-				sections = append(sections, inst.Section{Port: c.Port})
-			}
-			for _, rule := range c.FilterExistingWhitelist() {
-				if !slices.ContainsFunc(sections[at].Allow, func(r inst.BinaryRule) bool { return r.Path == rule.Path }) {
-					sections[at].Allow = append(sections[at].Allow, rule)
-				}
-			}
-			continue
-		}
-		if c.Entry.IsSecret() {
-			at, seen := secretAt[c.Entry.Secret]
-			if !seen {
-				at = len(sections)
-				secretAt[c.Entry.Secret] = at
-				sections = append(sections, inst.Section{Secret: c.Entry.Secret, SecretMatches: c.Entry.SecretMatches})
+				sharedAt[key] = at
+				sections = append(sections, fresh)
 			}
 			for _, rule := range c.FilterExistingWhitelist() {
 				if !slices.ContainsFunc(sections[at].Allow, func(r inst.BinaryRule) bool { return r.Path == rule.Path }) {
@@ -234,6 +219,17 @@ func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 		})
 	}
 	return sections
+}
+
+// sharedSection is the section a port or secret candidate merges into, keyed; ok false for others.
+func sharedSection(c *inst.Candidate) (key string, s inst.Section, ok bool) {
+	switch {
+	case c.Port != 0:
+		return fmt.Sprintf("port %d", c.Port), inst.Section{Port: c.Port}, true
+	case c.Entry.IsSecret():
+		return "secret " + c.Entry.Secret, inst.Section{Secret: c.Entry.Secret, SecretMatches: c.Entry.SecretMatches}, true
+	}
+	return "", inst.Section{}, false
 }
 
 // libraryBlocksFromCandidates returns one [libraries] block per catalog entry and user, in

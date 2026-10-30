@@ -343,32 +343,8 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 		return nil
 	}
 	g := *group
-	if g.libraryBlock {
-		return applyLibraryBlockDirective(g, line, lineNo)
-	}
-	if g.inspectorsBlock {
-		return applyInspector(cfg, line, lineNo)
-	}
-	if g.electronAppsBlock {
-		return applyElectronApp(cfg, line, lineNo)
-	}
-	if g.launchRulesBlock {
-		return applyLaunchRule(cfg, line, lineNo)
-	}
-	if g.settingsBlock {
-		return applySetting(cfg, line, lineNo)
-	}
-	if g.secretServiceBlock {
-		return applySecretService(cfg, line, lineNo)
-	}
-	if g.secret != "" {
-		if m, ok, err := parseSecretMatch(line); ok {
-			if err != nil {
-				return fmt.Errorf("daemon config line %d: %w", lineNo, err)
-			}
-			g.secretMatches = append(g.secretMatches, m)
-			return nil
-		}
+	if handled, err := applyBlockLine(cfg, g, line, lineNo); handled {
+		return err
 	}
 	if handled, err := applyAnyGroupDirective(g, line, lineNo); handled {
 		return err
@@ -389,6 +365,33 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 		return nil
 	}
 	return applyDirective(g, line, lineNo)
+}
+
+// applyBlockLine applies a line of a named block or a [secret] section's `match` line.
+func applyBlockLine(cfg *Config, g *watchGroup, line string, lineNo int) (bool, error) {
+	switch {
+	case g.libraryBlock:
+		return true, applyLibraryBlockDirective(g, line, lineNo)
+	case g.inspectorsBlock:
+		return true, applyInspector(cfg, line, lineNo)
+	case g.electronAppsBlock:
+		return true, applyElectronApp(cfg, line, lineNo)
+	case g.launchRulesBlock:
+		return true, applyLaunchRule(cfg, line, lineNo)
+	case g.settingsBlock:
+		return true, applySetting(cfg, line, lineNo)
+	case g.secretServiceBlock:
+		return true, applySecretService(cfg, line, lineNo)
+	case g.secret != "":
+		m, ok, err := parseSecretMatch(line)
+		if ok && err == nil {
+			g.secretMatches = append(g.secretMatches, m)
+		} else if err != nil {
+			err = fmt.Errorf("daemon config line %d: %w", lineNo, err)
+		}
+		return ok, err
+	}
+	return false, nil
 }
 
 // openHeader switches to the group a block, [secret] or [port] header opens; false for any other line.

@@ -18,8 +18,8 @@ import (
 // against it. The provider reaches the user bus only through the daemon's relay socket in
 // SecretRelayDir, a resource whose only CONNECT binary is the provider.
 const (
-	SecretAnchorDir = "/run/app-listener/secret-scopes"
-	SecretRelayDir  = "/run/app-listener/secret-relay"
+	SecretAnchorDir = "/run/app-listener/secret-scopes" //nolint:gosec // a path, not a credential
+	SecretRelayDir  = "/run/app-listener/secret-relay"  //nolint:gosec // a path, not a credential
 )
 
 // Anchored reports whether r is a daemon-made root (a port's or secret scope's anchor, the secret relay
@@ -120,7 +120,7 @@ func parseSecretMatch(line string) (SecretMatch, bool, error) {
 		return nil, false, nil
 	}
 	m := SecretMatch{}
-	for _, pair := range strings.Fields(rest) {
+	for pair := range strings.FieldsSeq(rest) {
 		k, v, found := strings.Cut(pair, "=")
 		if !found || k == "" || v == "" || v == "*" {
 			return nil, true, fmt.Errorf("match: %q is not key=value (a bare * would match every item)", pair)
@@ -148,15 +148,8 @@ func materializeSecretGroup(cfg *Config, g *watchGroup) error {
 	if len(g.secretMatches) == 0 {
 		return fmt.Errorf("daemon config line %d: secret section %q has no `match` line", g.lineNo, g.secret)
 	}
-	for _, rules := range [][]BinaryRule{g.binaries, g.pending} {
-		for _, b := range rules {
-			for _, e := range b.Events {
-				if e != ebpf.EventRead && e != ebpf.EventWrite && e != ebpf.EventDelete {
-					return fmt.Errorf("daemon config line %d: %s %s: a secret section's events are READ, "+
-						"WRITE and DELETE", g.lineNo, b.Path, e)
-				}
-			}
-		}
+	if err := checkSecretEvents(g); err != nil {
+		return err
 	}
 	for i := range cfg.Resources {
 		if s := cfg.Resources[i].Secret; s != nil && s.Name == g.secret {
@@ -169,6 +162,18 @@ func materializeSecretGroup(cfg *Config, g *watchGroup) error {
 		Binaries:        g.binaries,
 		PendingBinaries: g.pending,
 	})
+	return nil
+}
+
+func checkSecretEvents(g *watchGroup) error {
+	for _, b := range slices.Concat(g.binaries, g.pending) {
+		for _, e := range b.Events {
+			if e != ebpf.EventRead && e != ebpf.EventWrite && e != ebpf.EventDelete {
+				return fmt.Errorf("daemon config line %d: %s %s: a secret section's events are READ, "+
+					"WRITE and DELETE", g.lineNo, b.Path, e)
+			}
+		}
+	}
 	return nil
 }
 

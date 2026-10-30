@@ -70,7 +70,7 @@ func AttestBusClient(pidfd int) (*BusClient, error) {
 		return nil, errors.New("guard engine not running")
 	}
 	var bus GuardBusConn
-	if err := objs.GuardBusConns.Lookup(pid, &bus); err != nil {
+	if objs.GuardBusConns.Lookup(pid, &bus) != nil {
 		return nil, fmt.Errorf("%w: pid %d has no recorded bus connect", ErrUnattested, pid)
 	}
 	stamp, err := execStamp(&objs, pid)
@@ -80,30 +80,8 @@ func AttestBusClient(pidfd int) (*BusClient, error) {
 	if stamp.Start != bus.Start || stamp.Seq != bus.Seq || bus.Seq == 0 {
 		return nil, fmt.Errorf("%w: pid %d exec'd after connecting to the bus", ErrUnattested, pid)
 	}
-	var st unix.Stat_t
-	if err := unix.Stat(fmt.Sprintf("/proc/%d/exe", pid), &st); err != nil {
-		return nil, fmt.Errorf("%w: pid %d exe: %v", ErrUnattested, pid, err)
-	}
-	c := &BusClient{
-		PID: pid,
-		key: GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino},
-	}
-	if err := objs.GuardMulticall.Lookup(c.key, new(uint8)); err == nil {
-		tag := mcTagNone
-		if stamp.Tag != 0 {
-			tag = stamp.Tag
-		}
-		c.key = c.key.withTag(tag)
-	} else if !errors.Is(err, cilium.ErrKeyNotExist) {
-		return nil, err
-	}
-	var sup GuardExeSupersede
-	if err := objs.ExeSuperseded.Lookup(c.key.Real(), &sup); err == nil {
-		c.refused = stamp.Seq >= sup.Seq
-	} else if !errors.Is(err, cilium.ErrKeyNotExist) {
-		return nil, err
-	}
-	if err := objs.TrustCodeSuspect.Lookup(pid, &c.suspect); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+	c, err := imageOf(&objs, pid, stamp)
+	if err != nil {
 		return nil, err
 	}
 	c.UID, c.Comm = procIdentity(pid)
@@ -114,6 +92,47 @@ func AttestBusClient(pidfd int) (*BusClient, error) {
 	// The pidfd pins the process, not its pid number: alive now = /proc/<pid> was this process.
 	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
 		return nil, fmt.Errorf("%w: pid %d gone: %v", ErrUnattested, pid, err)
+	}
+	return c, nil
+}
+
+// busClientKey is pid's exe key as the guard keys it: a multicall's carries the applet stamped at exec.
+func busClientKey(objs *GuardObjects, pid uint32, stamp GuardExecStamp) (GuardInodeKey, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(fmt.Sprintf("/proc/%d/exe", pid), &st); err != nil {
+		return GuardInodeKey{}, fmt.Errorf("%w: pid %d exe: %v", ErrUnattested, pid, err)
+	}
+	key := GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}
+	err := objs.GuardMulticall.Lookup(key, new(uint8))
+	if errors.Is(err, cilium.ErrKeyNotExist) {
+		return key, nil
+	}
+	if err != nil {
+		return GuardInodeKey{}, err
+	}
+	tag := mcTagNone
+	if stamp.Tag != 0 {
+		tag = stamp.Tag
+	}
+	return key.withTag(tag), nil
+}
+
+// imageOf is pid's image as check_and_emit_args judges it: its key, whether it is a superseded key
+// exec'd at or after the supersede, its code-suspect mark.
+func imageOf(objs *GuardObjects, pid uint32, stamp GuardExecStamp) (*BusClient, error) {
+	key, err := busClientKey(objs, pid, stamp)
+	if err != nil {
+		return nil, err
+	}
+	c := &BusClient{PID: pid, key: key}
+	var sup GuardExeSupersede
+	if err := objs.ExeSuperseded.Lookup(key.Real(), &sup); err == nil {
+		c.refused = stamp.Seq >= sup.Seq
+	} else if !errors.Is(err, cilium.ErrKeyNotExist) {
+		return nil, err
+	}
+	if err := objs.TrustCodeSuspect.Lookup(pid, &c.suspect); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+		return nil, err
 	}
 	return c, nil
 }
@@ -159,7 +178,7 @@ func (g *Guard) busDecision(c *BusClient, op ebpf.EventType) (ok, suspect bool) 
 		return false, true
 	}
 	var mask uint32
-	if err := g.objs().GuardExeEvents.Lookup(k, &mask); err == nil && op < 32 && mask&(1<<uint(op)) == 0 {
+	if g.objs().GuardExeEvents.Lookup(k, &mask) == nil && op < 32 && mask&(1<<uint(op)) == 0 { //nolint:gosec // op < 32
 		return false, false
 	}
 	return true, false
@@ -193,9 +212,8 @@ func pidfdPid(pidfd int) (uint32, error) {
 }
 
 // procIdentity is display data: the real uid and comm of pid, read racily.
-func procIdentity(pid uint32) (uint32, string) {
-	comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	var uid uint32
+func procIdentity(pid uint32) (uid uint32, comm string) {
+	raw, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 	if f, err := os.Open(fmt.Sprintf("/proc/%d/status", pid)); err == nil {
 		s := bufio.NewScanner(f)
 		for s.Scan() {
@@ -210,7 +228,7 @@ func procIdentity(pid uint32) (uint32, string) {
 		}
 		f.Close()
 	}
-	return uid, strings.TrimSpace(string(comm))
+	return uid, strings.TrimSpace(string(raw))
 }
 
 // RunsExe reports whether c runs the file keyed file (a role binary from [secret_service]) under a

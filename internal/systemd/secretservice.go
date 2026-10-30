@@ -1,6 +1,7 @@
 package systemd
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -17,9 +18,9 @@ var (
 	// through it are the Secret interfaces reachable (never by a stray provider's unique name), and
 	// no one but root monitors or eavesdrops. dbus-daemon needs the per-type eavesdrop denies: a bare
 	// eavesdrop="true" deny also refuses ordinary receives.
-	SecretBusPolicyFile = "/etc/dbus-1/session.d/app-listener-secrets.conf"
+	SecretBusPolicyFile = "/etc/dbus-1/session.d/app-listener-secrets.conf" //nolint:gosec // a path, not a credential
 	// SecretKeyringDropIn points gnome-keyring's user unit at the relay socket (%U: the user's uid).
-	SecretKeyringDropIn = "/etc/systemd/user/gnome-keyring-daemon.service.d/app-listener.conf"
+	SecretKeyringDropIn = "/etc/systemd/user/gnome-keyring-daemon.service.d/app-listener.conf" //nolint:gosec // a path, not a credential
 )
 
 var secretBusPolicy = []byte(`<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
@@ -78,7 +79,7 @@ func SyncSecretServiceFiles(on bool) (changed bool, err error) {
 
 // installFile writes body to path atomically (0644) unless it already holds it.
 func installFile(path string, body []byte) (bool, error) {
-	if cur, err := os.ReadFile(path); err == nil && string(cur) == string(body) {
+	if cur, err := os.ReadFile(path); err == nil && bytes.Equal(cur, body) {
 		return false, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

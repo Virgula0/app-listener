@@ -173,3 +173,15 @@ func TestReadFrame(t *testing.T) {
 		t.Error("accepted a bad endianness byte")
 	}
 }
+
+func TestClassifyOpenCallsExact(t *testing.T) {
+	for _, m := range []*dbus.Message{
+		call(ifacePrompt+".Prompt", "GetSecret", "/org/freedesktop/secrets/collection/login/1"),
+		call(ifaceSession, "Steal", "/s"),
+		call("org.freedesktop.DBus.Introspectable", "", "/"),
+	} {
+		if v := classify(m); v.kind != refuse {
+			t.Errorf("%v: got %+v", m, v)
+		}
+	}
+}

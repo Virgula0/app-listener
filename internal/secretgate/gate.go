@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,7 +85,8 @@ func Listen(uid, gid uint32, path, bus string, judge Judge) (*Gate, error) {
 		return nil, err
 	}
 	ln.SetUnlinkOnClose(true)
-	if err := os.Chown(path, int(uid), int(gid)); err == nil {
+	err = os.Chown(path, int(uid), int(gid))
+	if err == nil {
 		err = os.Chmod(path, 0o600)
 	}
 	if err != nil {
@@ -180,7 +182,7 @@ func (s *session) run() error {
 	if s.downR, err = serverAuth(s.down, s.g.uid); err != nil {
 		return err
 	}
-	if s.up, err = net.Dial("unix", s.g.bus); err != nil {
+	if s.up, err = (&net.Dialer{Timeout: callTimeout}).DialContext(context.Background(), "unix", s.g.bus); err != nil {
 		return err
 	}
 	if s.upR, err = clientAuth(s.up, uint32(os.Geteuid())); err != nil { //nolint:gosec // euid >= 0
@@ -203,7 +205,8 @@ func (s *session) dialControl() error {
 	if err != nil {
 		return err
 	}
-	if err := ctl.Auth(nil); err == nil {
+	err = ctl.Auth(nil)
+	if err == nil {
 		err = ctl.Hello()
 	}
 	if err == nil {
@@ -222,7 +225,7 @@ func (s *session) dialControl() error {
 			if len(sig.Body) == 3 {
 				name, _ := sig.Body[0].(string)
 				owner, _ := sig.Body[2].(string)
-				if owner == "" && len(name) > 0 && name[0] == ':' {
+				if owner == "" && strings.HasPrefix(name, ":") {
 					s.forget(name)
 				}
 			}
@@ -283,9 +286,9 @@ func (s *session) pumpDown() error {
 			}
 			continue
 		}
-		m, err := decodeFrame(frame)
-		if err != nil {
-			log.Warnf("secret gate %d: dropping an undecodable call: %v", s.g.uid, err)
+		m, decodeErr := decodeFrame(frame)
+		if decodeErr != nil {
+			log.Warnf("secret gate %d: dropping an undecodable call: %v", s.g.uid, decodeErr)
 			continue
 		}
 		s.enqueue(header[string](m, dbus.FieldSender), m, frame)

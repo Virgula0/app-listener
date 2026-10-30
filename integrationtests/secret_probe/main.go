@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -32,7 +33,7 @@ type secret struct {
 	ContentType string
 }
 
-func fail(code int, format string, a ...any) {
+func failf(code int, format string, a ...any) {
 	fmt.Printf(format+"\n", a...)
 	os.Exit(code)
 }
@@ -42,19 +43,19 @@ func refusal(what string, err error) {
 	var de dbus.Error
 	if errors.As(err, &de) && (de.Name == "org.freedesktop.DBus.Error.AccessDenied" ||
 		strings.Contains(de.Name, "NotAuthorized") || strings.Contains(de.Name, "IsDenied")) {
-		fail(1, "REFUSED %s: %v", what, err)
+		failf(1, "REFUSED %s: %v", what, err)
 	}
 	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
-		fail(1, "REFUSED %s: %v", what, err)
+		failf(1, "REFUSED %s: %v", what, err)
 	}
-	fail(3, "ERROR %s: %v", what, err)
+	failf(3, "ERROR %s: %v", what, err)
 }
 
 func busPath() string {
 	addr := os.Getenv("DBUS_SESSION_BUS_ADDRESS")
 	p, ok := strings.CutPrefix(addr, "unix:path=")
 	if !ok {
-		fail(3, "ERROR unsupported DBUS_SESSION_BUS_ADDRESS %q", addr)
+		failf(3, "ERROR unsupported DBUS_SESSION_BUS_ADDRESS %q", addr)
 	}
 	if i := strings.IndexByte(p, ','); i >= 0 {
 		p = p[:i]
@@ -82,10 +83,9 @@ func handshake(c *dbus.Conn) *dbus.Conn {
 
 // lookup opens a plain session (as go-keyring does: the secret crosses the bus in clear) and
 // returns the first unlocked item matching attr=val.
-func lookup(c *dbus.Conn, attr, val string) (dbus.ObjectPath, dbus.ObjectPath) {
+func lookup(c *dbus.Conn, attr, val string) (session, item dbus.ObjectPath) {
 	svc := c.Object(service, svcPath)
 	var out dbus.Variant
-	var session dbus.ObjectPath
 	if err := svc.Call(svcIfc+".OpenSession", 0, "plain", dbus.MakeVariant("")).Store(&out, &session); err != nil {
 		refusal("OpenSession", err)
 	}
@@ -94,7 +94,7 @@ func lookup(c *dbus.Conn, attr, val string) (dbus.ObjectPath, dbus.ObjectPath) {
 		refusal("SearchItems", err)
 	}
 	if len(unlocked) == 0 {
-		fail(3, "ERROR no unlocked item %s=%s (locked: %v)", attr, val, locked)
+		failf(3, "ERROR no unlocked item %s=%s (locked: %v)", attr, val, locked)
 	}
 	return session, unlocked[0]
 }
@@ -105,7 +105,7 @@ func get(c *dbus.Conn, attr, val string) {
 	if err := c.Object(service, item).Call("org.freedesktop.Secret.Item.GetSecret", 0, session).Store(&s); err != nil {
 		refusal("GetSecret", err)
 	}
-	fail(0, "SECRET=%s", s.Value)
+	failf(0, "SECRET=%s", s.Value)
 }
 
 func store(attr, val, value string) {
@@ -127,7 +127,7 @@ func store(attr, val, value string) {
 		Store(&item, &prompt); err != nil {
 		refusal("CreateItem", err)
 	}
-	fail(0, "STORED %s", item)
+	failf(0, "STORED %s", item)
 }
 
 // monitor becomes a bus monitor (falling back to an eavesdrop match) and reports whether needle
@@ -138,7 +138,7 @@ func monitor(needle string, secs time.Duration) {
 	if err != nil {
 		fmt.Printf("BecomeMonitor: %v\n", err)
 		if err := c.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, "eavesdrop='true'").Err; err != nil {
-			fail(1, "REFUSED eavesdrop: %v", err)
+			failf(1, "REFUSED eavesdrop: %v", err)
 		}
 	}
 	// Set only now: an eavesdrop channel also swallows method replies.
@@ -151,10 +151,10 @@ func monitor(needle string, secs time.Duration) {
 		case m := <-ch:
 			var b bytes.Buffer // the secret is an ay: search the wire form, not fmt's numbers
 			if m.EncodeTo(&b, binary.LittleEndian) == nil && bytes.Contains(b.Bytes(), []byte(needle)) {
-				fail(0, "CAPTURED %v", m)
+				failf(0, "CAPTURED %v", m)
 			}
 		case <-deadline:
-			fail(4, "NOTHING")
+			failf(4, "NOTHING")
 		}
 	}
 }
@@ -164,16 +164,16 @@ func monitor(needle string, secs time.Duration) {
 func connexec(attr, val, readerBin string, argv []string) {
 	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
-		fail(3, "ERROR socket: %v", err)
+		failf(3, "ERROR socket: %v", err)
 	}
 	if err := unix.Connect(fd, &unix.SockaddrUnix{Name: busPath()}); err != nil {
 		refusal("connect", err)
 	}
-	reader := exec.Command(readerBin, "reader", attr, val)
+	reader := exec.CommandContext(context.Background(), readerBin, "reader", attr, val)
 	reader.ExtraFiles = []*os.File{os.NewFile(uintptr(fd), "bus")}
 	reader.Stdout, reader.Stderr = os.Stdout, os.Stderr
 	if err := reader.Start(); err != nil {
-		fail(3, "ERROR reader: %v", err)
+		failf(3, "ERROR reader: %v", err)
 	}
 	execInto(argv)
 }
@@ -186,13 +186,13 @@ func sendexec(attr, val, readerBin string, argv []string) {
 	fd := connFD()
 	dup, err := unix.Dup(fd)
 	if err != nil {
-		fail(3, "ERROR dup: %v", err)
+		failf(3, "ERROR dup: %v", err)
 	}
-	reader := exec.Command(readerBin, "rawreader", "SECRET-")
+	reader := exec.CommandContext(context.Background(), readerBin, "rawreader", "SECRET-")
 	reader.ExtraFiles = []*os.File{os.NewFile(uintptr(dup), "bus")}
 	reader.Stdout, reader.Stderr = os.Stdout, os.Stderr
 	if err := reader.Start(); err != nil {
-		fail(3, "ERROR reader: %v", err)
+		failf(3, "ERROR reader: %v", err)
 	}
 	msg := &dbus.Message{
 		Type: dbus.TypeMethodCall,
@@ -207,12 +207,12 @@ func sendexec(attr, val, readerBin string, argv []string) {
 	}
 	var buf bytes.Buffer
 	if err := msg.EncodeTo(&buf, binary.LittleEndian); err != nil {
-		fail(3, "ERROR encode: %v", err)
+		failf(3, "ERROR encode: %v", err)
 	}
 	raw := buf.Bytes()
 	binary.LittleEndian.PutUint32(raw[8:12], 0x7fff0001) // header serial: godbus keeps it unexported, 0 is invalid
 	if _, err := unix.Write(fd, raw); err != nil {
-		fail(3, "ERROR write: %v", err)
+		failf(3, "ERROR write: %v", err)
 	}
 	execInto(argv)
 }
@@ -224,14 +224,14 @@ func own() {
 		refusal("RequestName", err)
 	}
 	if reply != dbus.RequestNameReplyPrimaryOwner {
-		fail(4, "NOT OWNER (reply %d)", reply)
+		failf(4, "NOT OWNER (reply %d)", reply)
 	}
-	fail(0, "OWNER")
+	failf(0, "OWNER")
 }
 
 func execInto(argv []string) {
-	err := syscall.Exec(argv[0], argv, os.Environ())
-	fail(3, "ERROR exec %s: %v", argv[0], err)
+	err := syscall.Exec(argv[0], argv, os.Environ()) //nolint:gosec // the test names what to exec
+	failf(3, "ERROR exec %s: %v", argv[0], err)
 }
 
 // reader speaks D-Bus on an inherited, unauthenticated socket (fd 3).
@@ -239,11 +239,11 @@ func reader(attr, val string) {
 	time.Sleep(500 * time.Millisecond) // let the parent exec first
 	nc, err := net.FileConn(os.NewFile(3, "bus"))
 	if err != nil {
-		fail(3, "ERROR fileconn: %v", err)
+		failf(3, "ERROR fileconn: %v", err)
 	}
 	c, err := dbus.NewConn(nc)
 	if err != nil {
-		fail(3, "ERROR newconn: %v", err)
+		failf(3, "ERROR newconn: %v", err)
 	}
 	get(handshake(c), attr, val)
 }
@@ -260,25 +260,25 @@ func rawreader(needle string) {
 		if n > 0 {
 			seen = append(seen, buf[:n]...)
 			if i := bytes.Index(seen, []byte(needle)); i >= 0 {
-				fail(0, "SECRET=%s", strings.TrimRight(string(seen[i:min(len(seen), i+64)]), "\x00"))
+				failf(0, "SECRET=%s", strings.TrimRight(string(seen[i:min(len(seen), i+64)]), "\x00"))
 			}
 			if bytes.Contains(seen, []byte("AccessDenied")) {
-				fail(1, "REFUSED GetSecret (AccessDenied)")
+				failf(1, "REFUSED GetSecret (AccessDenied)")
 			}
 		}
 		if err != nil && !errors.Is(err, unix.EAGAIN) {
-			fail(3, "ERROR read: %v", err)
+			failf(3, "ERROR read: %v", err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	fail(4, "NOTHING")
+	failf(4, "NOTHING")
 }
 
 // connFD finds the bus socket: godbus keeps its transport private.
 func connFD() int {
 	ents, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
-		fail(3, "ERROR fds: %v", err)
+		failf(3, "ERROR fds: %v", err)
 	}
 	for _, e := range ents {
 		var fd int
@@ -293,12 +293,12 @@ func connFD() int {
 			return fd
 		}
 	}
-	fail(3, "ERROR bus fd not found")
+	failf(3, "ERROR bus fd not found")
 	return -1
 }
 
 func usage() {
-	fail(3, "usage: secret_probe get|store|own|monitor|connexec|sendexec|reader|rawreader|sleep ...")
+	failf(3, "usage: secret_probe get|store|own|monitor|connexec|sendexec|reader|rawreader|sleep ...")
 }
 
 func main() {

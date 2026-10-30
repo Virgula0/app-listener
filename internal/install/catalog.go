@@ -1041,7 +1041,7 @@ func DiscoverPorts(users []User) []Candidate {
 }
 
 // SecretProvider is the Secret Service provider the catalog's secret scopes are written for.
-const SecretProvider = "/usr/bin/gnome-keyring-daemon"
+const SecretProvider = "/usr/bin/gnome-keyring-daemon" //nolint:gosec // a path, not a credential
 
 // secretRoleCandidates are gnome-keyring's prompter (gcr 3) and Seahorse, the keyring manager.
 var (

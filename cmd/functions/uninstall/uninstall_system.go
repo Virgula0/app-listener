@@ -54,17 +54,11 @@ func revertSystemFiles(keepGUI bool) error {
 		removed++
 	}
 
-	if dropped, err := systemd.RemoveLoginDropIn(); err != nil {
+	dropped, err := removeSessionHooks()
+	if err != nil {
 		return err
-	} else if dropped {
-		removed++
 	}
-	if dropped, err := systemd.SyncSecretServiceFiles(false); err != nil {
-		return err
-	} else if dropped {
-		log.Infof("removed %s and %s", systemd.SecretBusPolicyFile, systemd.SecretKeyringDropIn)
-		removed++
-	}
+	removed += dropped
 
 	// Stale runtime files from a crash that never cleaned them up.
 	if err := os.Remove("/run/app-listener-daemon.pid"); err == nil {
@@ -82,6 +76,24 @@ func revertSystemFiles(keepGUI bool) error {
 	}
 	log.Infof("reverted %d installed daemon file(s)", removed)
 	return nil
+}
+
+// removeSessionHooks removes the login drop-in and the Secret Service gate's bus policy and keyring
+// drop-in, counting what it removed.
+func removeSessionHooks() (int, error) {
+	removed := 0
+	if dropped, err := systemd.RemoveLoginDropIn(); err != nil {
+		return removed, err
+	} else if dropped {
+		removed++
+	}
+	if dropped, err := systemd.SyncSecretServiceFiles(false); err != nil {
+		return removed, err
+	} else if dropped {
+		log.Infof("removed %s and %s", systemd.SecretBusPolicyFile, systemd.SecretKeyringDropIn)
+		removed++
+	}
+	return removed, nil
 }
 
 // userSSHAgentUnit is one installed per-user ssh-agent unit (owned by the
