@@ -386,7 +386,8 @@ func (s *session) forget(name string) {
 
 func (s *session) handle(sender string, m *dbus.Message, frame []byte) {
 	v := classify(m)
-	what := fmt.Sprintf("secret-service %s.%s %s", header[string](m, dbus.FieldInterface),
+	// One token: event lines are key=value fields.
+	what := fmt.Sprintf("%s.%s:%s", header[string](m, dbus.FieldInterface),
 		header[string](m, dbus.FieldMember), header[dbus.ObjectPath](m, dbus.FieldPath))
 	ok := false
 	switch v.kind {

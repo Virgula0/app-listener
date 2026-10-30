@@ -29,6 +29,7 @@ var (
 	tuiTestAmd64Bin      string
 	netguardTestAmd64Bin string
 	recorderTestAmd64Bin string
+	secretProbeAmd64Bin  string
 )
 
 // hostInfraBindPaths are host binaries the LSM network guard blocks in whitelist mode because its
@@ -76,6 +77,7 @@ func TestMain(m *testing.M) {
 	tuiTestAmd64Bin = absPath("../build/test/tui-amd64")
 	netguardTestAmd64Bin = absPath("../build/test/networkguard-amd64")
 	recorderTestAmd64Bin = absPath("../build/test/recorder-amd64")
+	secretProbeAmd64Bin = absPath("../build/test/secret_probe-amd64")
 
 	// Daemon mode links fscrypt, which needs cgo (mlock): CGO_ENABLED=0 no longer compiles. The
 	// binary must still be static: it runs in ubuntu:latest containers whose glibc (2.39) is older
@@ -98,6 +100,14 @@ func TestMain(m *testing.M) {
 	cmdNet.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	if err := cmdNet.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build net_tester amd64 binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	cmdSecret := exec.Command("go", "build", "-o", secretProbeAmd64Bin, "./secret_probe")
+	cmdSecret.Stderr = os.Stderr
+	cmdSecret.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+	if err := cmdSecret.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build secret_probe amd64 binary: %v\n", err)
 		os.Exit(1)
 	}
 
