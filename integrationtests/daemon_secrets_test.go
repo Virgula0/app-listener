@@ -16,9 +16,9 @@ const (
 
 // A [secret gh] scope: gnome-keyring reaches the user bus only through the daemon's relay, and every
 // call touching a gh item needs a caller the scope admits, attested by the pidfd the bus took at
-// connect. The probes cover the item calls, owning the name, monitoring, exec after connecting or
-// after sending, a send on a socket another process connected, a fake keyring on the relay, and the
-// pkcs11 socket.
+// connect. The probes cover the item calls, a replace matching by a subset, owning the name,
+// monitoring, exec after connecting or after sending, a send on a socket another process connected, a
+// fake keyring on the relay, and the pkcs11 socket.
 func (s *IntegrationSuite) TestDaemon_SecretService() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -94,6 +94,15 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		code, out := user("", "/exploits/secret_probe store service other SECRET-other && "+
 			"/exploits/secret_probe get service other")
 		s.Require().Equalf(0, code, "an unscoped item must stay usable: %s", out)
+	})
+
+	s.T().Run("replace", func(*testing.T) {
+		// replace=true picks the item by a subset of its attributes: {user: alice} and {} reach gh's.
+		refused("attacker replace by a subset", "/exploits/secret_probe replace ok user alice", "WRITE", "secret_probe")
+		refused("attacker replace by no attributes", "/exploits/secret_probe replace ok", "WRITE", "secret_probe")
+		refused("attacker replace with a failing secret", "/exploits/secret_probe replace fail user alice",
+			"WRITE", "secret_probe")
+		ok("whitelisted get after the replaces", "/exploits/secret_probe_ok get service gh:github.com")
 	})
 
 	s.T().Run("bus", func(*testing.T) {

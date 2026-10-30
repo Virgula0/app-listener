@@ -114,8 +114,10 @@ A `[secret <name>]` section is a scope: the items it covers and the binaries tha
 - **Binary lines** take `READ` (get the secret), `WRITE` (create or change an item, its secret,
   label or attributes) and `DELETE`, or no event list for all three.
 - An item that several scopes cover needs every scope's admission. Changing an item's attributes
-  is judged under its old and new ones, so an item can't be moved out of a scope. An item no scope
-  covers stays as open as the keyring keeps it.
+  is judged under its old and new ones, so an item can't be moved out of a scope. Creating an item
+  that replaces existing ones (the keyring picks them by a subset of their attributes) is judged
+  under the scopes of every item it could replace. An item no scope covers stays as open as the
+  keyring keeps it.
 - The name is lowercase letters, digits, `.`, `_` and `-`. The daemon keeps one root-owned anchor
   file per scope in `/run/app-listener/secret-scopes`; its events name that path and the call.
 

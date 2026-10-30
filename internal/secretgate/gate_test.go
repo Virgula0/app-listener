@@ -86,6 +86,26 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestClassifyCreateItemReplace(t *testing.T) {
+	const coll = dbus.ObjectPath("/org/freedesktop/secrets/aliases/default")
+	secret := struct {
+		S dbus.ObjectPath
+		P []byte
+		V []byte
+		C string
+	}{"/s", nil, nil, "text/plain"}
+	props := map[string]dbus.Variant{}
+	if v := classify(call(ifaceCollection, "CreateItem", coll, props, secret, true)); v.kind != gated || v.replaceIn != coll {
+		t.Errorf("replace: got %+v, want the collection searched", v)
+	}
+	if v := classify(call(ifaceCollection, "CreateItem", coll, props, secret, false)); v.kind != gated || v.replaceIn != "" {
+		t.Errorf("no replace: got %+v", v)
+	}
+	if v := classify(call(ifaceCollection, "CreateItem", coll, props, secret)); v.kind != refuse {
+		t.Errorf("no replace arg: got %+v, want refuse", v)
+	}
+}
+
 func TestSASL(t *testing.T) {
 	for name, client := range map[string]string{
 		"initial response": "\x00AUTH EXTERNAL 31303030\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\nlnext",

@@ -43,12 +43,14 @@ const (
 )
 
 // verdict is what classify decides from the message alone. For gated, items are the item paths
-// whose current attributes decide, attrs the attribute sets the call would give an item.
+// whose current attributes decide, attrs the attribute sets the call would give an item, replaceIn
+// the collection whose items matching attrs[0] the call would overwrite.
 type verdict struct {
-	kind  verdictKind
-	op    ebpf.EventType
-	items []dbus.ObjectPath
-	attrs []map[string]string
+	kind      verdictKind
+	op        ebpf.EventType
+	items     []dbus.ObjectPath
+	attrs     []map[string]string
+	replaceIn dbus.ObjectPath
 }
 
 // classify maps a method call to the keyring onto the gatekeeper's policy. Anything not listed is
@@ -65,7 +67,7 @@ func classify(m *dbus.Message) verdict {
 	case ifaceService:
 		return classifyService(m, member)
 	case ifaceCollection:
-		return classifyCollection(m, member)
+		return classifyCollection(m, member, path)
 	case ifaceItem:
 		switch member {
 		case "GetSecret":
@@ -101,7 +103,7 @@ func classifyService(m *dbus.Message, member string) verdict {
 	return verdict{kind: refuse}
 }
 
-func classifyCollection(m *dbus.Message, member string) verdict {
+func classifyCollection(m *dbus.Message, member string, path dbus.ObjectPath) verdict {
 	switch member {
 	case "SearchItems":
 		return verdict{kind: allow}
@@ -111,11 +113,17 @@ func classifyCollection(m *dbus.Message, member string) verdict {
 			return verdict{kind: refuse}
 		}
 		attrs, ok := attributesOf(props[propAttributes])
-		if !ok {
+		replace, okReplace := arg[bool](m, 2)
+		if !ok || !okReplace {
 			return verdict{kind: refuse}
 		}
-		// replace=true overwrites the item with these attributes: the same scopes decide.
-		return verdict{kind: gated, op: ebpf.EventWrite, attrs: []map[string]string{attrs}}
+		v := verdict{kind: gated, op: ebpf.EventWrite, attrs: []map[string]string{attrs}}
+		// replace=true rewrites the first item whose attributes include these (a subset: {} matches
+		// any), attributes before secret, kept if the secret fails: that item's scopes decide too.
+		if replace {
+			v.replaceIn = path
+		}
+		return v
 	case "Delete":
 		return verdict{kind: needManager}
 	}

@@ -154,15 +154,19 @@ func (g *Gate) Close() {
 }
 
 type session struct {
-	g      *Gate
-	down   *net.UnixConn
-	downR  *bufio.Reader
-	downMu sync.Mutex
-	up     net.Conn
-	upR    *bufio.Reader
-	upMu   sync.Mutex
-	ctl    *dbus.Conn
-	serial atomic.Uint32
+	g       *Gate
+	down    *net.UnixConn
+	downR   *bufio.Reader
+	downMu  sync.Mutex
+	up      net.Conn
+	upR     *bufio.Reader
+	upMu    sync.Mutex
+	ctl     *dbus.Conn
+	ctlName string
+	serial  atomic.Uint32
+	// fwdMu orders forwarded calls around a replacing CreateItem: held exclusively from its search
+	// to its forward, so the keyring replaces the items the search found (it answers in order).
+	fwdMu sync.RWMutex
 
 	mu     sync.Mutex
 	queues map[string]*senderQueue
@@ -217,7 +221,7 @@ func (s *session) dialControl() error {
 		ctl.Close()
 		return err
 	}
-	s.ctl = ctl
+	s.ctl, s.ctlName = ctl, ctl.Names()[0]
 	sigs := make(chan *dbus.Signal, 64)
 	ctl.Signal(sigs)
 	go func() {
@@ -392,26 +396,15 @@ func (s *session) handle(sender string, m *dbus.Message, frame []byte) {
 	// One token: event lines are key=value fields.
 	what := fmt.Sprintf("%s.%s:%s", header[string](m, dbus.FieldInterface),
 		header[string](m, dbus.FieldMember), header[dbus.ObjectPath](m, dbus.FieldPath))
-	ok := false
-	switch v.kind {
-	case allow:
-		ok = true
-	case needManager, needPrompter:
-		role := RoleManager
-		if v.kind == needPrompter {
-			role = RolePrompter
-		}
-		if c, err := s.attest(sender); err == nil {
-			ok = s.g.judge.InRole(role, c, what)
-		} else {
-			log.Warnf("secret gate %d: refused %s from %s: %v", s.g.uid, what, sender, err)
-		}
-	case gated:
-		ok = s.admitGated(sender, v, what)
-	default:
-		log.Warnf("secret gate %d: refused %s from %s: not a call the gate relays", s.g.uid, what, sender)
+	switch {
+	case v.replaceIn != "":
+		s.fwdMu.Lock()
+		defer s.fwdMu.Unlock()
+	case sender != s.ctlName: // the gate's own lookups run inside the exclusive hold
+		s.fwdMu.RLock()
+		defer s.fwdMu.RUnlock()
 	}
-	if !ok {
+	if !s.decide(sender, &v, what) {
 		s.deny(m, "refused by app-listener")
 		return
 	}
@@ -420,10 +413,32 @@ func (s *session) handle(sender string, m *dbus.Message, frame []byte) {
 	}
 }
 
+func (s *session) decide(sender string, v *verdict, what string) bool {
+	switch v.kind {
+	case allow:
+		return true
+	case needManager, needPrompter:
+		role := RoleManager
+		if v.kind == needPrompter {
+			role = RolePrompter
+		}
+		c, err := s.attest(sender)
+		if err != nil {
+			log.Warnf("secret gate %d: refused %s from %s: %v", s.g.uid, what, sender, err)
+			return false
+		}
+		return s.g.judge.InRole(role, c, what)
+	case gated:
+		return s.admitGated(sender, v, what)
+	}
+	log.Warnf("secret gate %d: refused %s from %s: not a call the gate relays", s.g.uid, what, sender)
+	return false
+}
+
 // admitGated: every scope of every touched item (its current attributes, and those the call would
 // give it) must admit the caller. No scope: the item is not the gate's to protect. A lookup that fails
 // refuses (fail closed): the keyring would answer the call for an item the gate couldn't place.
-func (s *session) admitGated(sender string, v verdict, what string) bool {
+func (s *session) admitGated(sender string, v *verdict, what string) bool {
 	scopes := s.g.judge.Scopes()
 	var hit []string
 	add := func(attrs map[string]string) {
@@ -438,7 +453,16 @@ func (s *session) admitGated(sender string, v verdict, what string) bool {
 	for _, a := range v.attrs {
 		add(a)
 	}
-	for _, item := range v.items {
+	items := v.items
+	if v.replaceIn != "" {
+		found, err := s.search(v.replaceIn, v.attrs[0])
+		if err != nil {
+			log.Warnf("secret gate %d: refused %s from %s: items it would replace: %v", s.g.uid, what, sender, err)
+			return false
+		}
+		items = slices.Concat(items, found)
+	}
+	for _, item := range items {
 		attrs, err := s.attributes(item)
 		if err != nil {
 			log.Warnf("secret gate %d: refused %s from %s: attributes of %s: %v", s.g.uid, what, sender, item, err)
@@ -469,6 +493,16 @@ func (s *session) attributes(item dbus.ObjectPath) (map[string]string, error) {
 	err := s.ctl.Object("org.freedesktop.secrets", item).CallWithContext(ctx, ifaceProps+".Get", 0,
 		ifaceItem, "Attributes").Store(&attrs)
 	return attrs, err
+}
+
+// search asks the keyring which items of collection match attrs: its own matcher, the one replace uses.
+func (s *session) search(collection dbus.ObjectPath, attrs map[string]string) ([]dbus.ObjectPath, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	var items []dbus.ObjectPath
+	err := s.ctl.Object("org.freedesktop.secrets", collection).CallWithContext(ctx, ifaceCollection+".SearchItems", 0,
+		attrs).Store(&items)
+	return items, err
 }
 
 // attest resolves sender through the pidfd its bus took at connect (cached for the connection).

@@ -109,6 +109,25 @@ func get(c *dbus.Conn, attr, val string) {
 }
 
 func store(attr, val, value string) {
+	createItem("probe "+val, map[string]string{attr: val, "user": "alice"}, &secret{Value: []byte(value), ContentType: "text/plain"})
+}
+
+// replace re-creates, replace=true, whatever item includes attrs (pairs): the keyring picks it by a
+// subset match. "fail" sends a parameter a plain session rejects: the keyring has rewritten the
+// item's attributes by then and keeps them.
+func replace(mode string, pairs []string) {
+	attrs := map[string]string{}
+	for i := 0; i+1 < len(pairs); i += 2 {
+		attrs[pairs[i]] = pairs[i+1]
+	}
+	sec := secret{Value: []byte("SECRET-evil"), ContentType: "text/plain"}
+	if mode == "fail" {
+		sec.Params = []byte("x")
+	}
+	createItem("probe replace", attrs, &sec)
+}
+
+func createItem(label string, attrs map[string]string, sec *secret) {
 	c := dial()
 	svc := c.Object(service, svcPath)
 	var out dbus.Variant
@@ -118,12 +137,12 @@ func store(attr, val, value string) {
 	}
 	coll := dbus.ObjectPath("/org/freedesktop/secrets/aliases/default")
 	props := map[string]dbus.Variant{
-		"org.freedesktop.Secret.Item.Label":      dbus.MakeVariant("probe " + val),
-		"org.freedesktop.Secret.Item.Attributes": dbus.MakeVariant(map[string]string{attr: val}),
+		"org.freedesktop.Secret.Item.Label":      dbus.MakeVariant(label),
+		"org.freedesktop.Secret.Item.Attributes": dbus.MakeVariant(attrs),
 	}
-	sec := secret{Session: session, Value: []byte(value), ContentType: "text/plain"}
+	sec.Session = session
 	var item, prompt dbus.ObjectPath
-	if err := c.Object(service, coll).Call("org.freedesktop.Secret.Collection.CreateItem", 0, props, sec, true).
+	if err := c.Object(service, coll).Call("org.freedesktop.Secret.Collection.CreateItem", 0, props, *sec, true).
 		Store(&item, &prompt); err != nil {
 		refusal("CreateItem", err)
 	}
@@ -330,7 +349,7 @@ func connFD() int {
 }
 
 func usage() {
-	failf(3, "usage: secret_probe get|store|own|monitor|connexec|sendexec|lend|reader|rawget|rawreader|sleep ...")
+	failf(3, "usage: secret_probe get|store|replace|own|monitor|connexec|sendexec|lend|reader|rawget|rawreader|sleep ...")
 }
 
 func main() {
@@ -343,6 +362,8 @@ func main() {
 		get(dial(), a[0], a[1])
 	case "store":
 		store(a[0], a[1], a[2])
+	case "replace":
+		replace(a[0], a[1:])
 	case "own":
 		own()
 	case "monitor":
