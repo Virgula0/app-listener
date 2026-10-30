@@ -28,9 +28,8 @@ sending a datagram, or sending and receiving on a connection handed to another p
 
 - **Sockets outside the tree.** Agents in `/run/user/<uid>` are guarded only through a
   [runtime section](daemon-config.md#runtime-sections): the catalog has one for `gpg-agent` and one
-  for the installer's `ssh-agent`. An agent you start elsewhere, and the session bus (the Secret
-  Service keyring that `gh`, Copilot CLI, Gemini CLI, JetBrains IDEs and `git`'s libsecret helper
-  keep tokens in), can be asked by any of your programs.
+  for the installer's `ssh-agent`. An agent you start elsewhere, and the session bus, can be asked
+  by any of your programs (see below).
 - **Impersonating a guarded agent.** The programs allowed to create sockets in a runtime directory
   can be run by any of your programs: the agents themselves, and systemd's user manager, which binds
   the GnuPG socket units and takes orders from `systemctl --user` and `systemd-run --user`. With the
@@ -40,6 +39,29 @@ sending a datagram, or sending and receiving on a connection handed to another p
 - **Logins with no daemon running.** A runtime directory created then (by the agent's own unit) is
   guarded once the daemon starts, but may already hold sockets bound by any program.
 - **Abstract sockets** have no file and are never judged.
+
+## Secrets served over IPC
+
+The guard judges who opens a file or a guarded socket. A program that serves secrets on request
+over a channel the guard doesn't see answers whoever asks:
+
+- **The keyring.** The Secret Service (GNOME keyring, KDE Wallet, KeePassXC) is reached over the
+  session bus, so any of your programs can read an unlocked collection. `gh`, Copilot CLI, Gemini CLI,
+  JetBrains IDEs, Zed, ProtonVPN, `docker` with a `secretservice` helper and `git`'s libsecret helper
+  keep tokens there. Prefer file storage inside a guarded tree where the app offers it
+  (`gh auth login --insecure-storage`), or let KeePassXC serve the Secret Service with "Confirm when
+  passwords are retrieved by clients" on, so every read asks you first.
+- **Agents as oracles.** A guarded agent socket stops other programs from connecting, but a
+  whitelisted client run by malware still asks on its behalf: `ssh-add -L`, `ssh` signing to a host
+  of the attacker's choice, `gpg --decrypt`. `git credential fill`, run by anyone, prints what your
+  credential helper (`store`, `cache`, libsecret, Git Credential Manager, `gh auth git-credential`)
+  hands back.
+- **Local servers.** A service on a loopback port (`bitcoind` RPC on 8332, `ollama` on 11434, `adb`
+  on 5037, `opencode serve`) answers any local client that has its credential, or any client when it
+  has none. The guard doesn't judge TCP connections to them.
+- **The display.** Under X11, any client can read the clipboard, other windows' contents and
+  keystrokes. Wayland compositors isolate clients, but the clipboard is still shared. Neither is in
+  scope.
 
 ## Interpreters and JITs
 

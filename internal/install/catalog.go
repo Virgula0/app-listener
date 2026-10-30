@@ -182,7 +182,9 @@ var Catalog = []CandidateDir{
 		}},
 
 	// --- AI coding agents and CLI tools ----------------------------------------
-	{Name: "opencode", RelPaths: []string{".config/opencode"},
+	// opencode 2 keeps provider credentials in .local/share/opencode/opencode.db. Its snapshots there
+	// run git, which is never whitelisted (it would print the db): snapshots fail while guarded.
+	{Name: "opencode", RelPaths: []string{".config/opencode", ".local/share/opencode"},
 		Whitelist: map[string][]string{
 			"/usr/local/bin/opencode": nil, "/usr/bin/opencode": nil,
 			"%HOME%/.local/bin/opencode": nil,
@@ -215,6 +217,13 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{
 			"/usr/bin/cursor": nil, "/usr/local/bin/cursor": nil,
 			"%HOME%/.local/bin/cursor": nil,
+		}},
+	// Copilot CLI keeps its token in the keyring, in config.json only when you choose plaintext.
+	// The VS Code extension writes ide/ lock files here for /ide; whitelist code for that.
+	{Name: "GitHub Copilot CLI", RelPaths: []string{".copilot"},
+		Whitelist: map[string][]string{
+			"/usr/bin/copilot": nil, "/usr/local/bin/copilot": nil,
+			"%HOME%/.local/bin/copilot": nil,
 		}},
 	{Name: "GitHub Copilot", RelPaths: []string{".config/github-copilot"},
 		Whitelist: map[string][]string{
@@ -308,8 +317,8 @@ var Catalog = []CandidateDir{
 	{Name: "AWS credentials", RelPaths: []string{".aws"},
 		Whitelist: map[string][]string{"/usr/bin/aws": nil}},
 	{Name: "Google Cloud SDK", RelPaths: []string{".config/gcloud"},
-		// Python launchers: the exe is the interpreter (not whitelisted), so both entries are
-		// inert; documentation only.
+		// Python launchers: the exe is the interpreter, so these lines never match (the daemon warns)
+		// and gcloud itself is denied. Kept: dropping a section's only lines fails `catalog refresh`.
 		Whitelist: map[string][]string{"/usr/bin/gcloud": nil, "/usr/bin/gsutil": nil}},
 	{Name: "Kubernetes kubeconfig", RelPaths: []string{".kube"},
 		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil,
@@ -329,6 +338,7 @@ var Catalog = []CandidateDir{
 			"/home/linuxbrew/.linuxbrew/bin/gh": nil,
 			"/snap/bin/gh":                      nil,
 		}},
+	// A Python app: its lines never match (see Google Cloud SDK).
 	{Name: "Azure CLI", RelPaths: []string{".azure", ".config/azure"},
 		Whitelist: map[string][]string{"/usr/bin/az": nil}},
 	{Name: "rclone config", RelPaths: []string{".config/rclone"},
@@ -336,15 +346,17 @@ var Catalog = []CandidateDir{
 	{Name: "Ollama config", RelPaths: []string{".ollama"},
 		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
 	// No npm entry: npm runs as node, and whitelisting node lets `node -e` read the tree (issue #79).
-	// pip is a #!/usr/bin/python script (inert like gcloud); documentation only.
+	// pip is a #!/usr/bin/python script (never matches, like gcloud).
 	{Name: "pip config", RelPaths: []string{".config/pip"},
 		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
 	{Name: "Git config directory", RelPaths: []string{".config/git"},
 		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 
 	// --- Password managers and secrets -------------------------------------------
+	// pass is a bash script, so its line would never match: gpg does the reads, while the `tree`,
+	// `git` and `mkdir` it runs are denied.
 	{Name: "password-store (pass)", RelPaths: []string{".password-store"},
-		Whitelist: map[string][]string{"/usr/bin/pass": nil, "/usr/bin/gpg": nil}},
+		Whitelist: map[string][]string{"/usr/bin/gpg": nil}},
 	{Name: "gopass", RelPaths: []string{".local/share/gopass"},
 		Whitelist: map[string][]string{"/usr/bin/gopass": nil}},
 	{Name: "Bitwarden", RelPaths: []string{".config/Bitwarden"},
@@ -362,18 +374,22 @@ var Catalog = []CandidateDir{
 	{Name: "Chezmoi state", RelPaths: []string{".local/share/chezmoi"},
 		Whitelist: map[string][]string{"/usr/bin/chezmoi": nil}},
 
-	// --- Legacy dot-config files --------------------------------------------------
-	// No single-file entries: the daemon guards directories only (non-dir paths are skipped at
-	// load), so e.g. ~/.netrc would be silently dropped (same for Steam's ssfn files).
-
 	// --- Wallets and crypto -------------------------------------------------------
 	// Surface only once the wallet is installed. Solana keeps its keypair as a plaintext id.json.
 	{Name: "Bitcoin Core", RelPaths: []string{".bitcoin/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil, "/usr/bin/bitcoin-tx": nil}},
 	{Name: "Litecoin Core", RelPaths: []string{".litecoin/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil}},
+	// The RPC cookie grants every RPC (spending from an unlocked wallet). By default it is written to
+	// the datadir root as .cookie.tmp then renamed, outside any guarded tree: these entries appear
+	// once you create rpc/ and set `rpccookiefile=rpc/.cookie` (docs/catalog.md).
+	{Name: "Bitcoin Core RPC cookie", RelPaths: []string{".bitcoin/rpc"},
+		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil}},
+	{Name: "Litecoin Core RPC cookie", RelPaths: []string{".litecoin/rpc"},
+		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil, "/usr/bin/litecoin-cli": nil}},
 	{Name: "Monero", RelPaths: []string{".bitmonero/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/monero-wallet-gui": nil, "/usr/bin/monero-wallet-cli": nil, "/usr/bin/monerod": nil}},
+	// A Python app: its lines never match (see Google Cloud SDK).
 	{Name: "Electrum", RelPaths: []string{".electrum"},
 		Whitelist: map[string][]string{"/usr/bin/electrum": nil, "/usr/local/bin/electrum": nil}},
 	{Name: "Sparrow", RelPaths: []string{".sparrow"},
@@ -406,12 +422,14 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/nordvpn": nil}},
 	{Name: "Mullvad VPN config", RelPaths: []string{".config/mullvad"},
 		Whitelist: map[string][]string{"/usr/bin/mullvad": nil}},
+	// A Python app: its lines never match (see Google Cloud SDK).
 	{Name: "ProtonVPN config", RelPaths: []string{".config/protonvpn"},
 		Whitelist: map[string][]string{"/usr/bin/protonvpn": nil, "/usr/bin/protonvpn-cli": nil}},
 	{Name: "OpenVPN config", RelPaths: []string{".config/openvpn"},
 		Whitelist: map[string][]string{"/usr/bin/openvpn": nil}},
 	{Name: "WireGuard config (per-user)", RelPaths: []string{".config/wireguard"},
-		Whitelist: map[string][]string{"/usr/bin/wg": nil, "/usr/bin/wg-quick": nil}},
+		// wg-quick is a bash script (never matches); wg reads the config.
+		Whitelist: map[string][]string{"/usr/bin/wg": nil}},
 
 	// --- Browsers and messaging -----------------------------------------------------
 	// Browser binaries are shell wrappers, so the whitelist matches the executed ELF under /usr/lib

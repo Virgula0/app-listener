@@ -9,18 +9,52 @@ each, and offers the ones that exist on your host. It covers, among others:
 - **Keys and credentials:** SSH, GnuPG (and the `ssh-agent` and `gpg-agent` sockets in
   `/run/user/<uid>`, guarded as [runtime sections](daemon-config.md#runtime-sections)), age, AWS, Google Cloud, Azure, Kubernetes, Docker,
   GitHub CLI, adb keys, rclone, pip, Git
-- **AI agents and editors:** Claude Code, Gemini CLI, opencode, Codeium, Cursor, GitHub Copilot,
-  VS Code (and Insiders, server, VSCodium), JetBrains IDEs, Zed, Sublime Text
+- **AI agents and editors:** Claude Code, Gemini CLI, opencode, Codeium, Cursor, GitHub Copilot
+  (and Copilot CLI), VS Code (and Insiders, server, VSCodium), JetBrains IDEs, Zed, Sublime Text
 - **API and database clients:** Insomnia, Postman, DBeaver
 - **Password managers:** pass, gopass, Bitwarden, 1Password, KeePassXC, GNOME keyring, KDE Wallet
 - **Browsers:** Firefox, Chrome, Chromium, Brave
 - **Messaging and apps:** Discord, Telegram, Signal, Element, Steam
 - **VPNs:** NordVPN, Mullvad, ProtonVPN, OpenVPN, WireGuard
-- **Crypto wallets:** Bitcoin Core, Litecoin Core, Monero, Electrum, Sparrow, Wasabi, Ledger Live,
+- **Crypto wallets:** Bitcoin Core and Litecoin Core (wallets and RPC cookie), Monero, Electrum, Sparrow, Wasabi, Ledger Live,
   Trezor Suite, Exodus, Solana CLI, geth, LND, Core Lightning, Foundry
 
 The catalog narrows each watch to the sensitive subtrees, so apps that update themselves inside
 their own config directory keep working (see below).
+
+### What an entry can't cover
+
+- **Tokens in the keyring.** These apps keep their main token in the Secret Service keyring by
+  default, so their entry protects only the files: `gh`, Copilot CLI, Gemini CLI, JetBrains IDEs, Zed,
+  ProtonVPN, and anything stored in the GNOME keyring or KDE Wallet. Any of your programs can ask
+  the keyring ([Secrets served over IPC](limitations.md#secrets-served-over-ipc)). The installer
+  says when `gh` or `docker` could keep the token in their guarded file instead
+  (`gh auth login --insecure-storage`; no `credsStore` in `~/.docker/config.json`), and names your
+  git credential helper.
+- **Script launchers.** A `#!` script runs as its interpreter, so a whitelist line naming one never
+  matches, and the app is denied like any other program. Google Cloud SDK, Azure CLI, pip, Electrum
+  and ProtonVPN are Python apps: their entries lock the directory against everyone, the app included,
+  unless you whitelist an ELF they end up running. Never whitelist the interpreter. The installer and
+  the daemon warn about every script line.
+- **opencode snapshots.** opencode 2 keeps provider credentials in
+  `~/.local/share/opencode/opencode.db`, which the entry guards. opencode runs `git` on its snapshot
+  repositories in the same directory, and `git` is never whitelisted (it would print the database), so
+  snapshots fail while the directory is guarded.
+- **Cursor logins.** The Cursor entry guards `~/.cursor` (MCP and extension config). The IDE keeps
+  its login in `~/.config/Cursor/User/globalStorage/state.vscdb` and `cursor-agent` in
+  `~/.config/cursor/auth.json`; neither is in the catalog. Add a section for them yourself,
+  whitelisting the executable that actually runs, not a launcher script. `cursor-agent` runs on a
+  bundled `node`, which is an interpreter: whitelisting it admits any script.
+- **Copilot CLI `/ide`.** The VS Code Copilot extension writes lock files to `~/.copilot/ide`.
+  Whitelist the VS Code binary on `~/.copilot` for that integration.
+- **Bitcoin and Litecoin RPC cookie.** The cookie grants every RPC call, including spending from an
+  unlocked wallet. By default the node writes it to the datadir root, outside any guarded tree, as
+  `.cookie.tmp`, then renames it. To guard it, create `~/.bitcoin/rpc` (`~/.litecoin/rpc`), add
+  `rpccookiefile=rpc/.cookie` to the node's config, and run `sudo app-listener install catalog diff`:
+  the "RPC cookie" entry whitelists the node, its GUI and its CLI. Whitelist there any other RPC client
+  that reads the cookie (electrs, LND, Core Lightning's `bcli` runs `bitcoin-cli`), not on
+  `wallets`. The node's config file stays writable, so malware can add an `rpcauth` login of its own
+  and wait for a restart.
 
 To add catalog directories that appeared after you installed (a newly installed app), run
 `sudo app-listener install catalog diff`.

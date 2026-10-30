@@ -124,10 +124,6 @@ func upsertFile(path, label string, data []byte, mode os.FileMode, uid int) erro
 	return nil
 }
 
-// askSSHAgentUsers returns the users to set the ssh-agent up for: non-root users whose ~/.ssh is
-// guarded by cfg, after one question per user (naming user and unit path). A user whose matching
-// unit is already installed is included without asking. Asked before encryption, because the
-// ~/.ssh/config edit must land in the tree that gets migrated.
 // agentSocketNote says who may use a key the agent holds.
 func agentSocketNote(cfg *daemonconfig.Config, u inst.User) string {
 	if inst.SSHAgentSocketGuarded(cfg, u) {
@@ -137,6 +133,10 @@ func agentSocketNote(cfg *daemonconfig.Config, u inst.User) string {
 	return "(a loaded key can be used through the agent socket by any process of that user)"
 }
 
+// askSSHAgentUsers returns the users to set the ssh-agent up for: non-root users whose ~/.ssh is
+// guarded by cfg, after one question per user (naming user and unit path). A user whose matching
+// unit is already installed is included without asking. Asked before encryption, because the
+// ~/.ssh/config edit must land in the tree that gets migrated.
 func askSSHAgentUsers(cfg *daemonconfig.Config) ([]inst.User, error) {
 	users, err := inst.ListUsers()
 	if err != nil {

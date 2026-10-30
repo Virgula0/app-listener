@@ -93,7 +93,7 @@ func collectDiffAdditions() (prevCfg *daemonconfig.Config, mergedText string, me
 	if editErr != nil {
 		return nil, "", nil, false, editErr
 	}
-	inst.WarnGeneralTools(parsed)
+	inst.WarnWhitelistLines(parsed)
 	return cfg, text, parsed, true, nil
 }
 
