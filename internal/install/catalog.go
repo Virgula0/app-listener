@@ -4,6 +4,7 @@
 package install
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,6 +28,11 @@ type CandidateDir struct {
 	// AbsPaths are system-level locations (e.g. "/etc/wireguard"), probed once regardless of users.
 	// Same multi-location semantics as RelPaths.
 	AbsPaths []string
+	// RuntimeDir names one directory in each user's /run/user/<uid> (an agent's sockets), guarded as
+	// a `runtime: true` section the daemon makes at that user's login. Offered for a user whose home
+	// holds RuntimeIf. Set instead of RelPaths/AbsPaths.
+	RuntimeDir string
+	RuntimeIf  string
 	// Whitelist maps binary paths to allowed events (nil = all, emitted bare; else "<path>
 	// EV1,EV2"); matched by inode. Keep it minimal: each entry is a potential privilege-escalation
 	// path while the directory is unlocked. Shared (union) across an entry's RelPaths.
@@ -97,6 +103,14 @@ func (c *CandidateDir) IsBun() bool { return len(c.BunLaunchers) > 0 }
 // IsSystem reports a system-level (AbsPaths) entry, probed once regardless of users.
 func (c *CandidateDir) IsSystem() bool { return len(c.AbsPaths) > 0 }
 
+// IsRuntime reports a RuntimeDir entry.
+func (c *CandidateDir) IsRuntime() bool { return c.RuntimeDir != "" }
+
+// RuntimePath is u's RuntimeDir.
+func (c *CandidateDir) RuntimePath(u User) string {
+	return fmt.Sprintf("/run/user/%d/%s", u.UID, c.RuntimeDir)
+}
+
 // Catalog is the master list of critical directories probed per selected user; missing paths are
 // simply not proposed.
 var Catalog = []CandidateDir{
@@ -134,6 +148,37 @@ var Catalog = []CandidateDir{
 			"/usr/bin/gpg": nil, "/usr/bin/gpg-agent": nil,
 			"/usr/bin/gpgconf": nil, "/usr/bin/gpg-connect-agent": nil,
 			"/usr/bin/ssh": {"CONNECT"}, "/usr/bin/ssh-add": {"CONNECT"},
+		}},
+	// Agent sockets in /run/user/<uid>: without a guard there, any of the user's programs can ask
+	// the agent to sign or decrypt. Nothing may DELETE that could remove the root (a crafted user
+	// unit's RuntimeDirectory= has systemd rm -rf it, gpgconf --remove-socketdir rmdirs it); the
+	// daemon's sentinel keeps an rm -d from emptying it.
+	{Name: "GnuPG agent sockets", RuntimeDir: "gnupg", RuntimeIf: ".gnupg",
+		// The agents bind and remove their own sockets; systemd's user manager binds the socket
+		// units'. A non-default GNUPGHOME gets a d.<hash> subdir (MKDIR).
+		Whitelist: map[string][]string{
+			"/usr/lib/systemd/systemd":   {"MKNOD", "STAT"},
+			"/usr/bin/gpg-agent":         {"MKNOD", "DELETE", "MKDIR", "CONNECT", "STAT"},
+			"/usr/bin/dirmngr":           {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/lib/gnupg/keyboxd":     {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/libexec/keyboxd":       {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/lib/gnupg/scdaemon":    {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/libexec/scdaemon":      {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/bin/gpgconf":           {"MKDIR", "CONNECT", "STAT"},
+			"/usr/bin/gpg":               {"MKDIR", "CONNECT", "STAT"},
+			"/usr/bin/gpgsm":             {"CONNECT", "STAT"},
+			"/usr/bin/gpg-connect-agent": {"CONNECT", "STAT"},
+			"/usr/bin/ssh":               {"CONNECT", "STAT"},
+			"/usr/bin/ssh-add":           {"CONNECT", "STAT"},
+		}},
+	{Name: "SSH agent socket", RuntimeDir: SSHAgentRuntimeDir, RuntimeIf: ".ssh",
+		// The installer's ssh-agent unit binds socket here; rm clears one a killed agent left.
+		Whitelist: map[string][]string{
+			"/usr/bin/ssh-agent":  {"MKNOD", "DELETE", "STAT"},
+			"/usr/bin/rm":         {"DELETE", "STAT"},
+			"/usr/bin/ssh":        {"CONNECT", "STAT"},
+			"/usr/bin/ssh-add":    {"CONNECT", "STAT"},
+			"/usr/bin/ssh-keygen": {"CONNECT", "STAT"},
 		}},
 
 	// --- AI coding agents and CLI tools ----------------------------------------
@@ -824,6 +869,25 @@ func Discover(user User) []Candidate {
 		for _, path := range entry.PathsFor(home, user.Name) {
 			if _, err := os.Lstat(path); err == nil {
 				out = append(out, Candidate{User: user, Entry: *entry, Path: path})
+			}
+		}
+	}
+	return out
+}
+
+// DiscoverRuntime proposes each RuntimeDir entry for every user whose home holds its RuntimeIf.
+// Kept out of Discover: those directories exist only while the user is logged in and are never
+// encrypted, so no fscrypt scan may address them.
+func DiscoverRuntime(users []User) []Candidate {
+	var out []Candidate
+	for _, u := range users {
+		for i := range Catalog {
+			entry := &Catalog[i]
+			if !entry.IsRuntime() {
+				continue
+			}
+			if _, err := os.Lstat(filepath.Join(u.Home, entry.RuntimeIf)); err == nil {
+				out = append(out, Candidate{User: u, Entry: *entry, Path: entry.RuntimePath(u)})
 			}
 		}
 	}

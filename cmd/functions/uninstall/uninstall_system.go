@@ -1,7 +1,6 @@
 package uninstall
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,6 +54,12 @@ func revertSystemFiles(keepGUI bool) error {
 		removed++
 	}
 
+	if dropped, err := systemd.RemoveLoginDropIn(); err != nil {
+		return err
+	} else if dropped {
+		removed++
+	}
+
 	// Stale runtime files from a crash that never cleaned them up.
 	if err := os.Remove("/run/app-listener-daemon.pid"); err == nil {
 		log.Info("removed stale /run/app-listener-daemon.pid")
@@ -81,13 +86,10 @@ type userSSHAgentUnit struct {
 }
 
 // detectSSHAgentUnits finds per-user ssh-agent units the installer deployed:
-// ~/.config/systemd/user/ssh-agent.service whose content matches the bundled sample. Root is
-// skipped (never installed for it); a differing unit isn't ours and is never touched.
+// ~/.config/systemd/user/ssh-agent.service whose content matches a bundled unit (this release's or
+// an earlier one's). Root is skipped (never installed for it); a differing unit isn't ours and is
+// never touched.
 func detectSSHAgentUnits() ([]userSSHAgentUnit, error) {
-	sample, err := inst.SampleContent("ssh-agent.service")
-	if err != nil {
-		return nil, err
-	}
 	users, err := inst.ListUsers()
 	if err != nil {
 		return nil, err
@@ -99,21 +101,18 @@ func detectSSHAgentUnits() ([]userSSHAgentUnit, error) {
 			continue
 		}
 		path := inst.SSHAgentUnitPath(u.Home)
-		if isInstallerSSHAgentUnit(sample, path) {
+		if isInstallerSSHAgentUnit(path) {
 			units = append(units, userSSHAgentUnit{User: *u, Path: path})
 		}
 	}
 	return units, nil
 }
 
-// isInstallerSSHAgentUnit: the unit at path matches the bundled sample. A missing or modified unit
-// isn't ours; the user's own unit is never touched.
-func isInstallerSSHAgentUnit(sample []byte, path string) bool {
+// isInstallerSSHAgentUnit: the unit at path is one the installer deployed. A missing or modified
+// unit isn't ours; the user's own unit is never touched.
+func isInstallerSSHAgentUnit(path string) bool {
 	data, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	return bytes.Equal(data, sample)
+	return err == nil && inst.IsInstallerSSHAgentUnit(data)
 }
 
 // revertSSHAgents reverts the installer's per-user ssh-agent setup: one TUI confirmation (default

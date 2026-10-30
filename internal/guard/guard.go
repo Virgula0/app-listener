@@ -983,6 +983,14 @@ func (g *Guard) WithSelfRuntimeAccess(fn func() error) error {
 	return g.withSelfMask(runtimeAccessEvents, "runtime", true, fn)
 }
 
+// ownerAccessEvents lets the daemon hand a runtime directory it made to its user (fchown).
+var ownerAccessEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat, ebpf.EventAttr}
+
+// WithSelfOwnerAccess is WithSelfRuntimeAccess with ownerAccessEvents.
+func (g *Guard) WithSelfOwnerAccess(fn func() error) error {
+	return g.withSelfMask(ownerAccessEvents, "owner", true, fn)
+}
+
 // withSelfMask widens the self mask to events for fn. exclusive refuses while a live edit grant
 // holds it; the vault's lock must never wait on one.
 func (g *Guard) withSelfMask(events []ebpf.EventType, what string, exclusive bool, fn func() error) error {

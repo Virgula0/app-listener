@@ -33,6 +33,26 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 - **`need_encryption: true`** (the default) requires the directory to already carry an fscrypt
   policy; otherwise the daemon refuses to start. Use `false` for a resource you only want guarded.
 
+### Runtime sections
+
+```ini
+[watch /run/user/1000/gnupg]
+runtime: true
+/usr/bin/gpg-agent MKNOD,DELETE,MKDIR,CONNECT,STAT
+/usr/bin/gpg MKDIR,CONNECT,STAT
+need_encryption: false
+```
+
+Agents listen on sockets in `/run/user/<uid>`, which exists only while that user is logged in.
+`runtime: true` marks a section naming one directory directly in it. The daemon makes the directory
+at the user's login and guards it before any of the user's processes start
+([details](daemon.md#runtime-sections-at-login)); while the user is logged out the section is
+listed but guards nothing. A runtime section is never encrypted (`need_encryption: true` is
+refused) and takes only binary lines: no `watch:`, `lib_dir` or `allow_lib`.
+
+Give every line an explicit event list, and `DELETE` only to a program that removes its own
+sockets: a program a caller can steer into `rmdir` would let the directory be recreated unguarded.
+
 ### Several guarded trees, one vault
 
 `watch: <path>` lines inside a section turn the section path into the **encryption root** and each

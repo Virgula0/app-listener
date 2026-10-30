@@ -299,7 +299,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			"self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 	}
 
-	markReady()
+	login := markReadyWithLogin(d, cfg)
 
 	if err := writePidFile(); err != nil {
 		return err
@@ -311,7 +311,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	control := startControlManager(d)
 	defer control.close()
 
-	reload, stopRefresh := startCatalogRefresh(d, configPath, cfg, vault, pin, control, trust)
+	reload, stopRefresh := startCatalogRefresh(d, configPath, cfg, vault, pin, control, trust, login)
 	defer stopRefresh()
 	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
 }
@@ -319,7 +319,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 // startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) and the app
 // maintainers (maintain.go) on the reload the SIGHUP handler uses, and returns that handler.
 func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemonconfig.Config, vault *fscrypt.Vault,
-	pin pinCfg, control *controlManager, trust *trustManager) (reload, stop func()) {
+	pin pinCfg, control *controlManager, trust *trustManager, login *loginServer) (reload, stop func()) {
 	keeper := startMaintainers(d, trust, cfg)
 	var refresher *catalogRefresher
 	reloadCfg := makeReloadHandler(d, configPath, vault, pin, control, trust, trust.vet, func(next *daemonconfig.Config) {
@@ -327,8 +327,12 @@ func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemon
 			refresher.setConfig(next)
 		}
 		keeper.setConfig(next)
+		login.setConfig(next)
 	})
 	reload = func() { _, _ = reloadCfg() }
+	if login != nil {
+		login.setReload(reloadCfg)
+	}
 	control.setConfigEditor(&configEditor{path: configPath, reload: reloadCfg})
 	resync := func() {
 		d.ResyncBinaries()
@@ -341,12 +345,16 @@ func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemon
 	refresher, err := newCatalogRefresher(configPath, cfg, reloadOrNil, resync, control.sessionActive)
 	if err != nil {
 		log.Errorf("daemon: %v — new app versions wait for a reload", err)
-		return reload, keeper.close
+		return reload, func() {
+			login.close()
+			keeper.close()
+		}
 	}
 	refresher.start()
 	// A refresh judges a new version by its freed creator's updater row: the prune keeps it meanwhile.
 	guard.SetSupersedeHold(refresher.refreshes.pending)
 	return reload, func() {
+		login.close()
 		guard.SetSupersedeHold(nil)
 		refresher.stop()
 		keeper.close()
@@ -1227,6 +1235,17 @@ func eventFilterOptions() []guard.GuardOption {
 }
 
 var processStart = time.Now()
+
+// markReadyWithLogin opens the login socket, then marks the daemon ready: a login ordered after the
+// unit that finds no socket means no daemon. Closed by startCatalogRefresh's stop.
+func markReadyWithLogin(d usecase.DaemonUseCase, cfg *daemonconfig.Config) *loginServer {
+	login, err := startLoginServer(d, cfg)
+	if err != nil {
+		log.Errorf("daemon: CRITICAL: %v — runtime sections stay unguarded at every login", err)
+	}
+	markReady()
+	return login
+}
 
 // markReady tells systemd the guards are up, then returns the startup peak (catalog, ELF closures,
 // populate: well above the steady-state heap) to the OS now rather than over the scavenger's

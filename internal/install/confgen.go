@@ -13,6 +13,8 @@ type Section struct {
 	Path    string
 	Allow   []BinaryRule // whitelisted binaries and their event restrictions
 	Encrypt bool
+	// Runtime emits `runtime: true` (a CandidateDir.RuntimeDir; Encrypt must be false).
+	Runtime bool
 	// ExtraWatchPaths turns the section into an encryption GROUP: the section path stays the
 	// fscrypt root (its need_encryption governs the group) and each extra path is its own guarded
 	// tree sharing the whitelist, emitted as `watch: <path>`. For self-updating apps whose update
@@ -59,6 +61,9 @@ func GenerateSections(sections []Section) string {
 		b.WriteString("\n[watch ")
 		b.WriteString(quotePath(s.Path))
 		b.WriteString("]\n\n")
+		if s.Runtime {
+			b.WriteString("runtime: true\n")
+		}
 		for _, w := range s.ExtraWatchPaths {
 			b.WriteString("watch: ")
 			b.WriteString(quotePath(w))

@@ -10,9 +10,8 @@ import (
 	inst "github.com/Virgula0/app-listener/internal/install"
 )
 
-// TestIsInstallerSSHAgentUnit verifies that only a unit whose content
-// matches the bundled sample is recognized as installer-installed: a
-// missing file and a modified unit are not ours.
+// TestIsInstallerSSHAgentUnit verifies that a unit matching the bundled sample is recognized as
+// installer-installed: a missing file and a modified unit are not ours.
 func TestIsInstallerSSHAgentUnit(t *testing.T) {
 	sample, err := inst.SampleContent("ssh-agent.service")
 	if err != nil {
@@ -39,7 +38,7 @@ func TestIsInstallerSSHAgentUnit(t *testing.T) {
 		{"missing unit is not ours", filepath.Join(dir, "nope"), false},
 	}
 	for _, c := range cases {
-		if got := isInstallerSSHAgentUnit(sample, c.path); got != c.want {
+		if got := isInstallerSSHAgentUnit(c.path); got != c.want {
 			t.Errorf("%s: isInstallerSSHAgentUnit = %v, want %v", c.name, got, c.want)
 		}
 	}

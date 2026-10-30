@@ -58,15 +58,11 @@ func removeFacultatives() error {
 	if err != nil {
 		return err
 	}
-	sample, err := inst.SampleContent("ssh-agent.service")
-	if err != nil {
-		return err
-	}
 	covered := inst.CoveredPaths(cfg)
 	var items []installedFacultative
 	for i := range users {
 		u := users[i]
-		unit := u.UID != 0 && isInstallerSSHAgentUnit(sample, inst.SSHAgentUnitPath(u.Home))
+		unit := u.UID != 0 && isInstallerSSHAgentUnit(inst.SSHAgentUnitPath(u.Home))
 		if unit || (u.UID != 0 && inst.HasSSHAgentEnv(u)) {
 			items = append(items, installedFacultative{user: u, unit: unit,
 				sshGuarded: inst.PathCovered(filepath.Join(u.Home, ".ssh"), covered)})

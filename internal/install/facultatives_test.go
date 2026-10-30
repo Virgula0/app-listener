@@ -84,3 +84,30 @@ func TestRemoveSSHAgentShellEnvKeepsSSHConfig(t *testing.T) {
 		t.Fatalf("~/.ssh/config must be untouched: %q, %v", data, err)
 	}
 }
+
+// An earlier release's unit stays ours (uninstall removes it, facultatives offers the upgrade); the
+// bundled one binds inside ~/.ssh, never the unguarded runtime dir.
+func TestIsInstallerSSHAgentUnit(t *testing.T) {
+	sample, err := SampleContent("ssh-agent.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		data string
+		want bool
+	}{
+		{"bundled", string(sample), true},
+		{"earlier release", legacySSHAgentUnit, true},
+		{"modified", "# custom\n" + string(sample), false},
+		{"empty", "", false},
+	} {
+		if got := IsInstallerSSHAgentUnit([]byte(c.data)); got != c.want {
+			t.Errorf("%s: IsInstallerSSHAgentUnit = %v, want %v", c.name, got, c.want)
+		}
+	}
+	// The runtime catalog entry guards exactly this directory.
+	if !strings.Contains(string(sample), "-a %t/ssh-agent/socket") {
+		t.Fatalf("the bundled ssh-agent must bind in the guarded %%t/ssh-agent:\n%s", sample)
+	}
+}

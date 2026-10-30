@@ -59,6 +59,9 @@ type GuardRepository interface {
 	// commit a maintainer run there (internal/maintainer), for fn only. Refused while
 	// a live edit grant holds the self mask.
 	WithSelfRuntimeAccess(fn func() error) error
+	// WithSelfOwnerAccess lets the daemon chown this runtime resource's root to its user, for fn
+	// only. Refused while a live edit grant holds the self mask.
+	WithSelfOwnerAccess(fn func() error) error
 	// PlanTemporaryGrant validates an `edit-protected forward` rule against this resource's
 	// rows without writing; the caller journals the grant's allow rows, then Applies it.
 	PlanTemporaryGrant(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error)

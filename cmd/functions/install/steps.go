@@ -102,7 +102,7 @@ func groupCandidates(cands []inst.Candidate) []catalogGroup {
 // pickDirectories probes the catalog for every selected user (plus system entries) and asks which
 // found directories to protect. All preselected.
 func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
-	candidates := inst.DiscoverForUsers(users)
+	candidates := append(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users)...)
 	if len(candidates) == 0 {
 		log.Warn("no catalog directories found for the selected users — you can still add directories manually")
 		return nil, nil
@@ -195,7 +195,8 @@ func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 		sections = append(sections, inst.Section{
 			Path:            c.Path,
 			Allow:           c.FilterExistingWhitelist(),
-			Encrypt:         true,
+			Encrypt:         !c.Entry.IsRuntime(),
+			Runtime:         c.Entry.IsRuntime(),
 			ExtraWatchPaths: c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name),
 		})
 	}

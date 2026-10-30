@@ -26,9 +26,19 @@ sending a datagram, or sending and receiving on a connection handed to another p
 `CONNECT`, judged by the program doing it. A daemon.conf line with an explicit event list needs
 `CONNECT` for a program that talks to such a socket. What stays outside:
 
-- **Sockets outside the tree.** Most agents listen in `/run/user/<uid>` (`ssh-agent`, `gpg-agent`)
-  or on the session bus (the Secret Service keyring that `gh`, Copilot CLI, Gemini CLI, JetBrains
-  IDEs and `git`'s libsecret helper keep tokens in). Any of your programs can ask them.
+- **Sockets outside the tree.** Agents in `/run/user/<uid>` are guarded only through a
+  [runtime section](daemon-config.md#runtime-sections): the catalog has one for `gpg-agent` and one
+  for the installer's `ssh-agent`. An agent you start elsewhere, and the session bus (the Secret
+  Service keyring that `gh`, Copilot CLI, Gemini CLI, JetBrains IDEs and `git`'s libsecret helper
+  keep tokens in), can be asked by any of your programs.
+- **Impersonating a guarded agent.** The programs allowed to create sockets in a runtime directory
+  can be run by any of your programs: the agents themselves, and systemd's user manager, which binds
+  the GnuPG socket units and takes orders from `systemctl --user` and `systemd-run --user`. With the
+  real agent stopped and its socket gone, a program can have one of them listen at the agent's name
+  for it. Clients then talk to that listener: it gets no key, but can show its own passphrase
+  prompt.
+- **Logins with no daemon running.** A runtime directory created then (by the agent's own unit) is
+  guarded once the daemon starts, but may already hold sockets bound by any program.
 - **Abstract sockets** have no file and are never judged.
 
 ## Interpreters and JITs

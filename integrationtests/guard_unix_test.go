@@ -120,3 +120,84 @@ func (s *IntegrationSuite) TestDaemon_UnixConnectMarkSurvivesReload() {
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'unix_connect' 2>/dev/null; pkill -f 'app-listener daemon' || true"})
 }
+
+// A runtime section (/run/user/<uid>/ssh-agent) exists only while its user is logged in: `daemon
+// login` makes it root-owned, guards it, then hands it to the user; `daemon logout` drops it once
+// the mount is gone, and the next login guards the fresh mount's directory.
+func (s *IntegrationSuite) TestDaemon_RuntimeSectionLogin() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	code, out := s.exec(c, []string{"sh", "-c", "command -v ssh-agent >/dev/null 2>&1 || " +
+		"(timeout 120 apt-get update -qq && timeout 120 apt-get install -y -qq --no-install-recommends openssh-client >/dev/null)"})
+	if code != 0 {
+		s.T().Skipf("openssh-client unavailable: %s", out)
+	}
+	const dir = "/run/user/1000/ssh-agent"
+	const sock = dir + "/socket"
+	mount := "mkdir -p /run/user/1000 && mount -t tmpfs -o mode=0700,uid=1000,gid=1000 tmpfs /run/user/1000"
+	code, out = s.exec(c, []string{"sh", "-c", "(id -u 1000 >/dev/null 2>&1 || useradd -u 1000 -m u1000) && " +
+		"mkdir -p /watch /etc/app-listener && cp /usr/bin/ssh-add /tmp/ssh-add && " + mount})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	asUser := func(cmd string) (int, string) {
+		return s.exec(c, []string{"setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "sh", "-c", cmd})
+	}
+
+	const always = "[watch /watch]\nneed_encryption: false\n/usr/bin/true\n"
+	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + always +
+		"\n[watch " + dir + "]\nruntime: true\n/usr/bin/ssh-agent MKNOD,DELETE,STAT\n/usr/bin/rm DELETE,STAT\n" +
+		"/usr/bin/ssh-add CONNECT,STAT\n/usr/bin/stat STAT\nneed_encryption: false\nEOF"})
+	s.launchDaemon(c)
+	s.awaitDaemonUp(c, always) // the runtime section guards nothing before the login
+	// Probes inside the guarded root go through the whitelisted stat: sh's `test` is denied STAT.
+	isSock := "[ \"$(stat -c %F " + sock + ")\" = socket ]"
+
+	login := func() {
+		code, out := s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
+		s.Require().Equalf(0, code, "daemon login: %s\n%s", out, s.readDaemonLog(c))
+		code, out = s.exec(c, []string{"stat", "-c", "%u %a", dir, dir + "/.app-listener/README"})
+		s.Require().Equalf(0, code, "stat: %s", out)
+		s.Require().Equalf("1000 700\n0 444", out, "the dir goes to the user, the sentinel stays root's")
+	}
+	login()
+
+	code, out = asUser("(nohup /usr/bin/ssh-agent -D -a " + sock + " >/tmp/agent.log 2>&1 &) && " +
+		"for i in $(seq 50); do " + isSock + " 2>/dev/null && exit 0; sleep 0.1; done; cat /tmp/agent.log; exit 1")
+	s.Require().Equalf(0, code, "ssh-agent could not bind in the runtime dir: %s", out)
+	code, out = asUser("SSH_AUTH_SOCK=" + sock + " /usr/bin/ssh-add -l 2>&1")
+	s.Require().Equalf(1, code, "whitelisted ssh-add must reach the agent (exit 1 = no identities): %s", out)
+	code, out = asUser("SSH_AUTH_SOCK=" + sock + " timeout 10 /tmp/ssh-add -l 2>&1")
+	s.Require().Equalf(2, code, "a non-whitelisted ssh-add reached the agent (exit 2 = can't connect): %s", out)
+	s.Require().Containsf(out, "not permitted", "want the guard's EPERM: %s", out)
+	denied := false
+	for _, e := range parseDaemonEvents(s.readDaemonLog(c)) {
+		denied = denied || (e.Denied && e.Op == "CONNECT" && e.Comm == "ssh-add")
+	}
+	s.Require().Truef(denied, "no DAEMON DENIED op=CONNECT for the copied ssh-add:\n%s", s.readDaemonLog(c))
+
+	// rm may clear a killed agent's socket, never the root: the sentinel keeps it non-empty.
+	code, out = asUser("pkill -9 ssh-agent; sleep 0.2; " + isSock + " && rm -f " + sock +
+		" && stat " + sock + " 2>&1 | grep -q 'No such file'")
+	s.Require().Equalf(0, code, "rm must clear the stale socket: %s", out)
+	asUser("rm -rf " + dir + "/.app-listener; rm -d " + dir + "; true")
+	code, out = s.exec(c, []string{"stat", "-c", "%F", dir + "/.app-listener/README"})
+	s.Require().Equalf(0, code, "a whitelisted rm emptied or removed the guarded root: %s", out)
+
+	code, out = s.exec(c, []string{"sh", "-c", "umount /run/user/1000 && /app-listener daemon logout 1000"})
+	s.Require().Equalf(0, code, "logout: %s", out)
+	s.Require().NotContainsf(s.readDaemonLog(c), reloadRefused, "logout reload refused:\n%s", s.readDaemonLog(c))
+	code, out = s.exec(c, []string{"sh", "-c", mount})
+	s.Require().Equalf(0, code, "remount: %s", out)
+	// A process of the user that beat the daemon to the fresh mount may have planted listeners.
+	code, out = asUser("mkdir -m 0700 " + dir)
+	s.Require().Equalf(0, code, "pre-creating: %s", out)
+	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
+	s.Require().NotEqualf(0, code, "a runtime dir made before the daemon must fail the login: %s", out)
+	s.exec(c, []string{"rmdir", dir})
+	login()
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
+	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
+	s.Require().Equalf(0, code, "with no daemon running a login goes ahead: %s", out)
+}

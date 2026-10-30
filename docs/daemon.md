@@ -28,8 +28,10 @@ You rarely run it by hand: `install` deploys it as the `app-listener-daemon` sys
 | `daemon check [--verifier-only]` | Check BPF-LSM is active and load every guard eBPF program into this kernel's verifier, attaching nothing; exit non-zero on any rejection. `--verifier-only` skips the BPF-LSM activation check (CI hosts that build BPF-LSM in without enabling it): a pass then says the programs verify, not that the host enforces |
 | `daemon lockdown` | Force-lock every encryption root in the config and exit. The systemd unit runs it as `ExecStopPost`, after every exit (clean stop, crash, SIGKILL, startup timeout) |
 | `daemon genkey` | Generate `/etc/app-listener/fscrypt.key` and exit (regenerating asks for confirmation) |
+| `daemon login <uid>` | Ask the running daemon to make and guard that user's [runtime sections](#runtime-sections-at-login); exit 0 with no daemon running, non-zero when it refused or timed out (75 s) |
+| `daemon logout <uid>` | Ask the running daemon to drop that user's runtime sections once their directory is gone; never fails |
 
-`--config <path>` applies to all four. Config resolution order: this flag, then
+`--config <path>` applies to `daemon`, `check`, `lockdown` and `genkey`. Config resolution order: this flag, then
 `/etc/app-listener/daemon.conf`, then `daemon-samples/daemon.conf`.
 
 Flags of `daemon` itself:
@@ -68,6 +70,38 @@ The unit is `Type=notify` and ordered
 lingering user managers, cron and `at` jobs wait until every guard is attached (`READY=1`), so no
 user code runs while the whitelisted paths are unguarded. This is ordering only: a failed daemon
 start does not lock users out.
+
+### Runtime sections at login
+
+A [runtime section](daemon-config.md#runtime-sections) guards a directory in `/run/user/<uid>`,
+which systemd mounts at the user's first login (`user-runtime-dir@<uid>.service`) and removes at
+the last logout. The installer adds a drop-in,
+`/etc/systemd/system/user-runtime-dir@.service.d/app-listener.conf`, that runs
+`app-listener daemon login <uid>` right after the mount and `daemon logout <uid>` after the
+unmount. Both talk to the daemon over `/run/app-listener-daemon.login` (root only, and only this
+binary).
+
+At login the daemon:
+
+1. creates each missing runtime directory as root, mode 0700, so the user can't enter it yet, with
+   a root-owned `.app-listener/` inside that keeps it non-empty: no whitelisted program with
+   `DELETE` can then remove the guarded directory and let it be recreated unguarded;
+2. reloads, so a guard anchors on that directory;
+3. checks that the guard holds the very directory it made, then hands it to the user (`chown`).
+
+Only then does `user@<uid>.service` start the user's processes. If any step fails, the login
+fails. If no daemon is running, the login goes ahead with nothing guarded there. The drop-in is
+ordered after the daemon unit, so a login during the daemon's start waits for it.
+
+The mount is fresh at login, so a runtime directory already in it was made by one of the user's
+processes before the daemon, and may hold its listeners: the daemon refuses it and the login fails
+(remove the directory and log in again). Only a directory a running guard already holds is
+accepted. A directory present when the daemon itself starts (the user logged in while no daemon
+ran) is guarded as found, and may hold sockets bound before the guard.
+
+At logout the directory is gone with its mount, and the daemon reloads to drop the resource. Like
+any reload, a login or logout that adds or drops a runtime section ends a live `edit-protected`
+session.
 
 ### Reload (`systemctl reload`)
 

@@ -3,6 +3,7 @@ package usecase
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"runtime"
 	"sync"
@@ -76,6 +77,9 @@ type DaemonUseCase interface {
 	// binary's (uid 0) runtime writes (GuardRepository.WithSelfRuntimeAccess). Refused while a live
 	// edit grant is active; reloads, grants and shutdown wait for fn.
 	WithRuntimeAccess(resourcePath string, fn func() error) error
+	// WithRuntimeRoot runs fn with the anchored root of the runtime resource resourcePath while
+	// the app-listener binary (uid 0) may chown it (GuardRepository.WithSelfOwnerAccess).
+	WithRuntimeRoot(resourcePath string, fn func(root guard.GuardInodeKey) error) error
 }
 
 type daemonUseCase struct {
@@ -516,7 +520,7 @@ func (d *daemonUseCase) refuseRemovedResources(resources []daemonconfig.Resource
 		if err != nil {
 			return fmt.Errorf("reload refused: %w", err)
 		}
-		if !released {
+		if !released && !runtimeReleased(&d.resources[i]) {
 			removed = append(removed, d.resources[i].Path)
 		}
 	}
@@ -540,6 +544,17 @@ func (d *daemonUseCase) libDirReleased(i int) (bool, error) {
 	return !alive, nil
 }
 
+// runtimeReleased reports a runtime resource whose directory is gone: its user logged out and the
+// /run/user/<uid> mount went with it (its root can't be removed while guarded, see the sentinel in
+// cmd/functions/daemon/runtime.go). An unmount frees no inode with nlink 0, so the anchor stays set.
+func runtimeReleased(r *daemonconfig.Resource) bool {
+	if !r.Runtime {
+		return false
+	}
+	_, err := os.Lstat(r.Path)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
 // refuseMovedRoots refuses a reload whose guard for a kept resource anchored on a different root
 // while the old root still exists: the path was re-pointed through an unguarded ancestor, and
 // committing would guard the new target and leave the real tree unguarded. A deleted root (anchor
@@ -547,7 +562,9 @@ func (d *daemonUseCase) libDirReleased(i int) (bool, error) {
 func (d *daemonUseCase) refuseMovedRoots(resources []daemonconfig.Resource, guards []repository.GuardRepository, oldByPath map[string]int) error {
 	for i := range resources {
 		oi, kept := oldByPath[resources[i].Path]
-		if !kept {
+		// A runtime root's ancestors are root's and its user's mount (only root can re-point those),
+		// and the root can't be moved while guarded: a new anchor is a new login's mount.
+		if !kept || resources[i].Runtime {
 			continue
 		}
 		oldKey, alive, err := d.guards[oi].RootAnchor()
@@ -911,6 +928,28 @@ func (d *daemonUseCase) WithRuntimeAccess(resourcePath string, fn func() error) 
 		}
 	}
 	return fmt.Errorf("%s is not a lib_dir in the running configuration", resourcePath)
+}
+
+func (d *daemonUseCase) WithRuntimeRoot(resourcePath string, fn func(root guard.GuardInodeKey) error) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.stopping {
+		return errors.New("daemon: shutdown in progress")
+	}
+	for i := range d.resources {
+		if d.resources[i].Path != resourcePath || !d.resources[i].Runtime {
+			continue
+		}
+		root, alive, err := d.guards[i].RootAnchor()
+		if err != nil {
+			return err
+		}
+		if !alive {
+			return fmt.Errorf("the guarded root of %s is gone", resourcePath)
+		}
+		return d.guards[i].WithSelfOwnerAccess(func() error { return fn(root) })
+	}
+	return fmt.Errorf("%s is not a runtime resource in the running configuration", resourcePath)
 }
 
 func (d *daemonUseCase) ResyncBinaries() {

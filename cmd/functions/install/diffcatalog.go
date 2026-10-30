@@ -147,7 +147,7 @@ func addedResources(prev, merged *daemonconfig.Config) *daemonconfig.Config {
 // path/encryption root nor nested with one (either direction): what a diff would propose adding.
 func uncoveredCandidates(cfg *daemonconfig.Config, users []inst.User) []inst.Candidate {
 	covered := inst.CoveredPaths(cfg)
-	all := inst.DiscoverForUsers(users)
+	all := append(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users)...)
 	var fresh []inst.Candidate
 	for i := range all {
 		if !inst.PathCovered(all[i].Path, covered) {

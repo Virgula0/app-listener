@@ -36,7 +36,9 @@ app-listener
 ├── daemon                              run the daemon               daemon.md
 │   ├── check [--verifier-only]         load the eBPF into the verifier
 │   ├── lockdown                        lock every vault and exit
-│   └── genkey                          create the fscrypt master key
+│   ├── genkey                          create the fscrypt master key
+│   ├── login UID                       guard a user's runtime sections at login
+│   └── logout UID                      drop them once the user logged out
 ├── edit-protected                      edit a protected directory   edit-protected.md
 │   ├── forward (-w BIN | -b BIN)...    temporary access for other binaries
 │   ├── config [--from FILE]            edit the running daemon.conf

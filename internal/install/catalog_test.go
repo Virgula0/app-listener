@@ -10,7 +10,7 @@ import (
 )
 
 // TestCatalogSanity verifies the master list is well-formed: every entry
-// has a name, exactly one non-empty of RelPaths/AbsPaths, absolute
+// has a name, exactly one non-empty of RelPaths/AbsPaths/RuntimeDir, absolute
 // whitelist binaries, WatchRelPaths only with a single RelPaths entry, and
 // no two entries probe the same path.
 func TestCatalogSanity(t *testing.T) {
@@ -19,9 +19,18 @@ func TestCatalogSanity(t *testing.T) {
 		if entry.Name == "" {
 			t.Errorf("entry with empty name: %+v", entry)
 		}
-		rel, abs := len(entry.RelPaths), len(entry.AbsPaths)
-		if (rel == 0) == (abs == 0) {
-			t.Errorf("entry %q must set exactly one of RelPaths or AbsPaths (non-empty)", entry.Name)
+		set := 0
+		for _, n := range []int{len(entry.RelPaths), len(entry.AbsPaths), len(entry.RuntimeDir)} {
+			if n > 0 {
+				set++
+			}
+		}
+		if set != 1 {
+			t.Errorf("entry %q must set exactly one of RelPaths, AbsPaths or RuntimeDir", entry.Name)
+		}
+		if entry.IsRuntime() && (entry.RuntimeIf == "" || filepath.IsAbs(entry.RuntimeIf) ||
+			strings.Contains(entry.RuntimeDir, "/")) {
+			t.Errorf("entry %q: RuntimeDir must be one name and RuntimeIf home-relative", entry.Name)
 		}
 		for _, p := range entry.RelPaths {
 			if p == "" || filepath.IsAbs(p) {
@@ -203,6 +212,26 @@ func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	}
 	if events := entry.Whitelist["/usr/bin/ssh"]; !slices.Equal(events, []string{"READ", "WRITE", "DELETE", "RENAME", "HARDLINK", "MKNOD", "CONNECT"}) {
 		t.Errorf("/usr/bin/ssh must be READ,WRITE,DELETE,RENAME,HARDLINK,MKNOD,CONNECT, got %v", events)
+	}
+}
+
+// TestRuntimeEntriesNeverDeleteRoot: a DELETE grant to a binary a caller can steer into removing
+// the runtime root (rmdir) would let the user recreate it unguarded.
+func TestRuntimeEntriesNeverDeleteRoot(t *testing.T) {
+	for _, e := range Catalog {
+		if !e.IsRuntime() {
+			continue
+		}
+		for _, bin := range []string{"/usr/lib/systemd/systemd", "/usr/bin/gpgconf", "/usr/bin/rmdir", "/usr/bin/mkdir"} {
+			if slices.Contains(e.Whitelist[bin], "DELETE") {
+				t.Errorf("%s: %s must not get DELETE", e.Name, bin)
+			}
+		}
+		for bin, events := range e.Whitelist {
+			if events == nil {
+				t.Errorf("%s: %s needs an explicit event list", e.Name, bin)
+			}
+		}
 	}
 }
 

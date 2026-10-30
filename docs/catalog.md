@@ -6,7 +6,8 @@ The install wizard doesn't ask you to know where every app keeps its secrets. It
 catalog (`internal/install/catalog.go`) of sensitive directories with a ready-made whitelist for
 each, and offers the ones that exist on your host. It covers, among others:
 
-- **Keys and credentials:** SSH, GnuPG, age, AWS, Google Cloud, Azure, Kubernetes, Docker,
+- **Keys and credentials:** SSH, GnuPG (and the `ssh-agent` and `gpg-agent` sockets in
+  `/run/user/<uid>`, guarded as [runtime sections](daemon-config.md#runtime-sections)), age, AWS, Google Cloud, Azure, Kubernetes, Docker,
   GitHub CLI, adb keys, rclone, pip, Git
 - **AI agents and editors:** Claude Code, Gemini CLI, opencode, Codeium, Cursor, GitHub Copilot,
   VS Code (and Insiders, server, VSCodium), JetBrains IDEs, Zed, Sublime Text
