@@ -66,11 +66,12 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		">/tmp/bus.log 2>&1 &) && for i in $(seq 50); do [ -S /run/user/1000/bus ] && exit 0; sleep 0.1; done; "+
 		"cat /tmp/bus.log; exit 1")
 	s.Require().Equalf(0, code, "session bus: %s", out)
-	code, out = user("DBUS_SESSION_BUS_ADDRESS=unix:path="+secretRelay+"/1000.bus",
-		"(echo -n hunter2 | nohup gnome-keyring-daemon --foreground --unlock --components=pkcs11,secrets "+
-			"--control-directory="+keyringDir+" >/tmp/gk.log 2>&1 &); "+
-			"for i in $(seq 100); do /exploits/secret_probe_ok store service gh:github.com "+ghToken+
-			" >/tmp/store.log 2>&1 && exit 0; sleep 0.2; done; cat /tmp/store.log /tmp/gk.log; exit 1")
+	// Only the keyring dials the relay; the apps use the user bus.
+	code, out = user("", "(echo -n hunter2 | DBUS_SESSION_BUS_ADDRESS=unix:path="+secretRelay+"/1000.bus "+
+		"nohup gnome-keyring-daemon --foreground --unlock --components=pkcs11,secrets "+
+		"--control-directory="+keyringDir+" >/tmp/gk.log 2>&1 &); "+
+		"for i in $(seq 100); do /exploits/secret_probe_ok store service gh:github.com "+ghToken+
+		" >/tmp/store.log 2>&1 && exit 0; sleep 0.2; done; cat /tmp/store.log /tmp/gk.log; exit 1")
 	s.Require().Equalf(0, code, "the whitelisted app could not store through the relay: %s\n%s", out, s.readDaemonLog(c))
 
 	ok := func(what, cmd string) {
