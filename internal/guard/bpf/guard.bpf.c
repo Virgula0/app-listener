@@ -1783,6 +1783,8 @@ int guard_mmap_file(unsigned long long *ctx)
 	return 0;
 }
 
+static __noinline int note_bus_send(struct sock *sk); // the session-bus section below
+
 SEC("lsm/file_permission")
 int guard_file_permission(unsigned long long *ctx)
 {
@@ -1809,10 +1811,14 @@ int guard_file_permission(unsigned long long *ctx)
 	bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
 
 	// splice/sendfile from a socket (sock_splice_read) never reach socket_recvmsg; only
-	// rw_verify_area's file_permission sees them.
+	// rw_verify_area's file_permission sees them, and splice/sendfile/io_uring writes to one.
 	struct socket *sock = bpf_sock_from_file(file);
-	if (sock)
-		return judge_conn_use(ea, sock->sk);
+	if (sock) {
+		struct sock *sk = sock->sk;
+		if (mask & MAY_WRITE)
+			note_bus_send(sk);
+		return judge_conn_use(ea, sk);
+	}
 
 	if (off_guarded_fs(dentry, inode) || !is_guarded_access(dentry, inode, &res))
 		return 0;
@@ -2524,6 +2530,8 @@ int guard_inode_listxattr(unsigned long long *ctx)
 struct bus_conn {
 	__u64 seq;
 	__u64 start;
+	__u32 foreign; // another process sent on one of its bus sockets: never attested again
+	__u32 pad;
 };
 
 struct {
@@ -2540,7 +2548,46 @@ struct {
 	__type(value, struct bus_conn);
 } guard_bus_conns SEC(".maps");
 
-static __always_inline void note_bus_connect(struct sock *peer)
+// guard_bus_socks marks each socket connected to a registered bus with the process that connected it.
+// The bus credits whatever is sent on it to that process, so a send by any other (an inherited or
+// SCM_RIGHTS-passed fd) marks the owner's row foreign before the message is queued.
+struct bus_owner {
+	__u32 tgid;
+	__u32 pad;
+	__u64 start;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct bus_owner);
+} guard_bus_socks SEC(".maps");
+
+// note_bus_send runs before every send on a socket; out of line, so its branches don't fork the
+// caller's judge_conn_use.
+static __noinline int note_bus_send(struct sock *sk)
+{
+	if (!sk)
+		return 0;
+	struct bus_owner *o = bpf_sk_storage_get(&guard_bus_socks, sk, 0, 0);
+	if (!o)
+		return 0;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u32 owner = o->tgid;
+	__u64 start = o->start;
+	if (owner == tgid && start == leader_start(task))
+		return 0;
+	struct bus_conn *bc = bpf_map_lookup_elem(&guard_bus_conns, &owner);
+	if (bc && bc->start == start)
+		bc->foreign = 1;
+	return 0;
+}
+
+// note_bus_connect records sk's connect to peer when peer is a registered `bus`. A socket that can't
+// be marked leaves the row unrecorded: refused.
+static __always_inline void note_bus_connect(struct sock *sk, struct sock *peer)
 {
 	struct dentry *dentry = NULL, *parent = NULL;
 	struct inode *dir = NULL;
@@ -2571,6 +2618,13 @@ static __always_inline void note_bus_connect(struct sock *peer)
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	struct bus_conn v = {};
 	v.start = leader_start(task);
+	struct bus_owner *o = sk ? bpf_sk_storage_get(&guard_bus_socks, sk, 0, BPF_SK_STORAGE_GET_F_CREATE) : NULL;
+	if (!o) {
+		bpf_map_delete_elem(&guard_bus_conns, &tgid);
+		return;
+	}
+	o->tgid = tgid;
+	o->start = v.start;
 	struct bus_conn *cur = bpf_map_lookup_elem(&guard_bus_conns, &tgid);
 	if (cur && cur->start == v.start)
 		return; // keep this process's first connect
@@ -2583,7 +2637,7 @@ SEC("lsm/unix_stream_connect")
 int guard_unix_stream_connect(unsigned long long *ctx)
 {
 	struct emit_args ea_buf = {};
-	note_bus_connect((struct sock *)ctx[1]);
+	note_bus_connect((struct sock *)ctx[0], (struct sock *)ctx[1]);
 	return judge_unix_connect(&ea_buf, (struct sock *)ctx[0], (struct sock *)ctx[1]);
 }
 
@@ -2630,6 +2684,7 @@ int guard_socket_sendmsg(unsigned long long *ctx)
 	__u32 res = name ? port_connect_res(sock, sk, name, namelen) : GUARD_RES_NONE;
 	if (res != GUARD_RES_NONE)
 		return admit_port(&ea_buf, sk, res, EVENT_CONNECT);
+	note_bus_send(sk);
 	return judge_conn_use(&ea_buf, sk);
 }
 

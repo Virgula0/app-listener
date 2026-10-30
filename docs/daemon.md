@@ -120,7 +120,8 @@ Every method call to the keyring passes the gate first. Calls it doesn't know ar
 writing or deleting an item a [secret scope](daemon-config.md#secret-service-sections) covers needs
 a caller that scope's whitelist admits. The caller is the process the bus reports for the
 connection, checked by inode like any guard decision, and refused if it ran another program since it
-connected to the bus. Each decision is logged like a guard event, under the scope's anchor.
+connected to the bus, or if another process ever sent on one of its bus connections (an inherited or
+passed socket: the bus would credit that process's calls to it). Each decision is logged like a guard event, under the scope's anchor.
 
 Both files are written to match the configuration at every start and reload, kept when the daemon
 stops (the keyring then can't reach the bus, so the Secret Service is off rather than unguarded) and

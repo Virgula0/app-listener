@@ -17,7 +17,8 @@ const (
 // A [secret gh] scope: gnome-keyring reaches the user bus only through the daemon's relay, and every
 // call touching a gh item needs a caller the scope admits, attested by the pidfd the bus took at
 // connect. The probes cover the item calls, owning the name, monitoring, exec after connecting or
-// after sending, a fake keyring on the relay, and the pkcs11 socket.
+// after sending, a send on a socket another process connected, a fake keyring on the relay, and the
+// pkcs11 socket.
 func (s *IntegrationSuite) TestDaemon_SecretService() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -112,6 +113,14 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		code, out = user("", "/exploits/secret_probe sendexec service gh:github.com /exploits/secret_probe "+
 			"/exploits/secret_probe_ok sleep 6s")
 		s.Require().NotContainsf(out, ghToken, "a call sent before exec'ing the app leaked (exit %d): %s", code, out)
+	})
+
+	s.T().Run("foreign sender", func(*testing.T) {
+		// The app lends its bus socket: the bus credits the borrower's call to the app.
+		code, out := user("", "/exploits/secret_probe_ok lend service gh:github.com /exploits/secret_probe")
+		s.Require().NotContainsf(out, ghToken, "a call sent on the app's lent socket leaked: %s", out)
+		s.Require().Equalf(1, code, "want the gate's refusal: %s\n%s", out, s.readDaemonLog(c))
+		ok("the app on a fresh process after a lend", "/exploits/secret_probe_ok get service gh:github.com")
 	})
 
 	s.T().Run("fake keyring", func(*testing.T) {

@@ -55,8 +55,8 @@ func UnregisterBusDir(key GuardInodeKey) {
 }
 
 // AttestBusClient resolves pidfd (GetConnectionCredentials' ProcessFD). ErrUnattested when the process
-// exec'd since its first connect to a registered bus (the connection may be another image's), made it
-// before the guard recorded it, or is gone. The exe is read between two equal exec stamps, so it is
+// exec'd since its first connect to a registered bus (the connection may be another image's), another
+// process sent on one of its bus sockets, it connected before the guard recorded it, or is gone. The exe is read between two equal exec stamps, so it is
 // the image the bus row vouches for.
 func AttestBusClient(pidfd int) (*BusClient, error) {
 	pid, err := pidfdPid(pidfd)
@@ -79,6 +79,9 @@ func AttestBusClient(pidfd int) (*BusClient, error) {
 	}
 	if stamp.Start != bus.Start || stamp.Seq != bus.Seq || bus.Seq == 0 {
 		return nil, fmt.Errorf("%w: pid %d exec'd after connecting to the bus", ErrUnattested, pid)
+	}
+	if bus.Foreign != 0 {
+		return nil, fmt.Errorf("%w: another process sent on a bus connection of pid %d", ErrUnattested, pid)
 	}
 	c, err := imageOf(&objs, pid, stamp)
 	if err != nil {

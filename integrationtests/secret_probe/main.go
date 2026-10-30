@@ -194,6 +194,12 @@ func sendexec(attr, val, readerBin string, argv []string) {
 	if err := reader.Start(); err != nil {
 		failf(3, "ERROR reader: %v", err)
 	}
+	writeGetSecret(fd, item, session)
+	execInto(argv)
+}
+
+// writeGetSecret sends Item.GetSecret raw on fd.
+func writeGetSecret(fd int, item, session dbus.ObjectPath) {
 	msg := &dbus.Message{
 		Type: dbus.TypeMethodCall,
 		Headers: map[dbus.HeaderField]dbus.Variant{
@@ -214,7 +220,33 @@ func sendexec(attr, val, readerBin string, argv []string) {
 	if _, err := unix.Write(fd, raw); err != nil {
 		failf(3, "ERROR write: %v", err)
 	}
-	execInto(argv)
+}
+
+// lend opens a session and finds the item on its own connection, hands a dup of the socket to
+// readerBin, drops its own handle and stays alive: the bus credits the reader's sends to this process.
+func lend(attr, val, readerBin string) {
+	c := dial()
+	session, item := lookup(c, attr, val)
+	dup, err := unix.Dup(connFD())
+	if err != nil {
+		failf(3, "ERROR dup: %v", err)
+	}
+	reader := exec.CommandContext(context.Background(), readerBin, "rawget", string(item), string(session)) //nolint:gosec // the test names the reader
+	reader.ExtraFiles = []*os.File{os.NewFile(uintptr(dup), "bus")}
+	reader.Stdout, reader.Stderr = os.Stdout, os.Stderr
+	if err := reader.Start(); err != nil {
+		failf(3, "ERROR reader: %v", err)
+	}
+	c.Close() // its reader would take the reply; the socket stays open through the dup
+	_ = reader.Wait()
+	os.Exit(reader.ProcessState.ExitCode())
+}
+
+// rawget sends GetSecret on an inherited bus socket (fd 3) and reads the answer.
+func rawget(item, session string) {
+	time.Sleep(500 * time.Millisecond) // let the lender drop its handle
+	writeGetSecret(3, dbus.ObjectPath(item), dbus.ObjectPath(session))
+	rawreader("SECRET-")
 }
 
 // own asks the bus for the Secret Service name: whoever owns it receives every app's secrets.
@@ -298,7 +330,7 @@ func connFD() int {
 }
 
 func usage() {
-	failf(3, "usage: secret_probe get|store|own|monitor|connexec|sendexec|reader|rawreader|sleep ...")
+	failf(3, "usage: secret_probe get|store|own|monitor|connexec|sendexec|lend|reader|rawget|rawreader|sleep ...")
 }
 
 func main() {
@@ -322,6 +354,10 @@ func main() {
 		sendexec(a[0], a[1], a[2], a[3:])
 	case "reader":
 		reader(a[0], a[1])
+	case "lend":
+		lend(a[0], a[1], a[2])
+	case "rawget":
+		rawget(a[0], a[1])
 	case "rawreader":
 		rawreader(a[0])
 	case "sleep":
