@@ -82,6 +82,43 @@ lines, with `CONNECT`, `MKNOD` or no event list.
 The daemon keeps one root-owned anchor file per port in `/run/app-listener/ports` (`tcp-<n>`); its
 events name that path. Removing a port section and reloading stops guarding the port.
 
+### Secret Service sections
+
+```ini
+[secret_service]
+provider /usr/bin/gnome-keyring-daemon
+prompter /usr/libexec/gcr-prompter
+manager /usr/bin/seahorse
+
+[secret gh]
+match service=gh:*
+/usr/bin/gh
+```
+
+Apps such as `gh` keep their token in the Secret Service (the keyring), which any of your programs
+can ask for over the session bus. With a `[secret_service]` block the keyring reaches the bus only
+through the daemon: every call that reads, writes or deletes an item is judged before the keyring
+sees it ([how](daemon.md#the-secret-service-gate)).
+
+`[secret_service]` names the keyring daemon (`provider`, gnome-keyring is the one supported), the
+program that shows its password dialogs (`prompter`) and the programs that may manage the keyring as
+a whole (`manager`: delete a collection, set an alias, change the master password). Prompter and
+manager lines must name root-owned binaries.
+
+A `[secret <name>]` section is a scope: the items it covers and the binaries that may use them.
+
+- **`match key=value ...`** covers an item whose attributes have every listed value; a value
+  ending in `*` matches any attribute starting with the rest. A section takes one or more `match`
+  lines and covers an item any of them matches. `secret-tool search --all <key> <value>` shows an
+  item's attributes.
+- **Binary lines** take `READ` (get the secret), `WRITE` (create or change an item, its secret,
+  label or attributes) and `DELETE`, or no event list for all three.
+- An item that several scopes cover needs every scope's admission. Changing an item's attributes
+  is judged under its old and new ones, so an item can't be moved out of a scope. An item no scope
+  covers stays as open as the keyring keeps it.
+- The name is lowercase letters, digits, `.`, `_` and `-`. The daemon keeps one root-owned anchor
+  file per scope in `/run/app-listener/secret-scopes`; its events name that path and the call.
+
 ### Several guarded trees, one vault
 
 `watch: <path>` lines inside a section turn the section path into the **encryption root** and each

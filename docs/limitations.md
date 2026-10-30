@@ -52,7 +52,9 @@ over a channel the guard doesn't see answers whoever asks:
 - **The keyring.** The Secret Service (GNOME keyring, KDE Wallet, KeePassXC) is reached over the
   session bus, so any of your programs can read an unlocked collection. `gh`, Copilot CLI, Gemini CLI,
   JetBrains IDEs, Zed, ProtonVPN, `docker` with a `secretservice` helper and `git`'s libsecret helper
-  keep tokens there. Prefer file storage inside a guarded tree where the app offers it
+  keep tokens there. With gnome-keyring, [secret scopes](daemon-config.md#secret-service-sections)
+  restrict the items they cover to their whitelists, with the limits below. Elsewhere, prefer file
+  storage inside a guarded tree where the app offers it
   (`gh auth login --insecure-storage`), or let KeePassXC serve the Secret Service with "Confirm when
   passwords are retrieved by clients" on, so every read asks you first.
 - **Agents as oracles.** A guarded agent socket stops other programs from connecting, but a
@@ -60,6 +62,18 @@ over a channel the guard doesn't see answers whoever asks:
   of the attacker's choice, `gpg --decrypt`. `git credential fill`, run by anyone, prints what your
   credential helper (`store`, `cache`, libsecret, Git Credential Manager, `gh auth git-credential`)
   hands back.
+- **Secret scopes.** The gate covers gnome-keyring's Secret Service only:
+  - items no scope covers stay open to every program, as do item labels and attributes;
+  - a whitelisted program run by malware still asks on its behalf (`gh auth token`);
+  - programs connected to the bus before the daemon started (or before it first installed its bus
+    policy) are refused every scoped item until restarted;
+  - the keyring must be started by its user unit (`gnome-keyring-daemon.service`): one started some
+    other way (D-Bus activation outside systemd, a PAM `auto_start`) can't own the Secret Service
+    name, so secrets are unavailable;
+  - `dbus-monitor` and `busctl monitor` stop working for your user;
+  - gnome-keyring's control and pkcs11 sockets in `/run/user/<uid>/keyring` bypass the bus: guard
+    them with the catalog's runtime section, which a browser loading the keyring's PKCS#11 module
+    then can't use.
 - **Local servers.** A service on a loopback port (`bitcoind` RPC on 8332, `ollama` on 11434, `adb`
   on 5037, `opencode serve`) answers any local client that has its credential, or any client when it
   has none, unless a [port section](daemon-config.md#port-sections) guards the port. Even then:

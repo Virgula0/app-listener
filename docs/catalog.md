@@ -18,6 +18,9 @@ each, and offers the ones that exist on your host. It covers, among others:
 - **VPNs:** NordVPN, Mullvad, ProtonVPN, OpenVPN, WireGuard
 - **Crypto wallets:** Bitcoin Core and Litecoin Core (wallets and RPC cookie), Monero, Electrum, Sparrow, Wasabi, Ledger Live,
   Trezor Suite, Exodus, Solana CLI, geth, LND, Core Lightning, Foundry
+- **Keyring items** ([secret scopes](daemon-config.md#secret-service-sections)): the `gh` token,
+  `git`'s libsecret credentials and the Chrome and Chromium Safe Storage keys, plus gnome-keyring's
+  sockets as a runtime section. Offered when gnome-keyring and one of the binaries are installed.
 - **Loopback services** ([port sections](daemon-config.md#port-sections)): Bitcoin Core and
   Litecoin Core RPC (mainnet, testnet3 and regtest ports), the `adb` server, the Ollama API,
   `opencode serve`. Offered when one of their binaries is installed.
@@ -30,7 +33,9 @@ their own config directory keep working (see below).
 - **Tokens in the keyring.** These apps keep their main token in the Secret Service keyring by
   default, so their entry protects only the files: `gh`, Copilot CLI, Gemini CLI, JetBrains IDEs, Zed,
   ProtonVPN, and anything stored in the GNOME keyring or KDE Wallet. Any of your programs can ask
-  the keyring ([Secrets served over IPC](limitations.md#secrets-served-over-ipc)). The installer
+  the keyring ([Secrets served over IPC](limitations.md#secrets-served-over-ipc)) unless a secret
+  scope covers the item: the catalog has scopes for `gh`, git and Chromium browsers only, on
+  gnome-keyring. `install catalog refresh` leaves secret sections as written. The installer
   says when `gh` or `docker` could keep the token in their guarded file instead
   (`gh auth login --insecure-storage`; no `credsStore` in `~/.docker/config.json`), and names your
   git credential helper.

@@ -103,6 +103,29 @@ At logout the directory is gone with its mount, and the daemon reloads to drop t
 any reload, a login or logout that adds or drops a runtime section ends a live `edit-protected`
 session.
 
+### The Secret Service gate
+
+With a [`[secret_service]` block](daemon-config.md#secret-service-sections) the daemon:
+
+- installs a session bus policy (`/etc/dbus-1/session.d/app-listener-secrets.conf`) under which
+  only root may own `org.freedesktop.secrets` or monitor the bus, and the Secret Service interfaces
+  are reachable only through that name;
+- installs a drop-in (`/etc/systemd/user/gnome-keyring-daemon.service.d/app-listener.conf`) that
+  points gnome-keyring at a relay socket, `/run/app-listener/secret-relay/<uid>.bus`, guarded so
+  only the provider may connect;
+- at each login, before the user's processes start, registers `/run/user/<uid>` with the guard and
+  opens that user's relay. It reaches the real bus as root for the keyring.
+
+Every method call to the keyring passes the gate first. Calls it doesn't know are refused; reading,
+writing or deleting an item a [secret scope](daemon-config.md#secret-service-sections) covers needs
+a caller that scope's whitelist admits. The caller is the process the bus reports for the
+connection, checked by inode like any guard decision, and refused if it ran another program since it
+connected to the bus. Each decision is logged like a guard event, under the scope's anchor.
+
+Both files are written to match the configuration at every start and reload, kept when the daemon
+stops (the keyring then can't reach the bus, so the Secret Service is off rather than unguarded) and
+removed by `uninstall`. Users logged in when they are first installed must log in again.
+
 ### Reload (`systemctl reload`)
 
 ```bash

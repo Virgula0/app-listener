@@ -65,8 +65,8 @@ The desktop window is the separate `app-listener-gui` binary: `sudo app-listener
 ## The daemon in depth
 
 - [Daemon](daemon.md): flags, lifecycle, boot ordering, reloads, encryption, filesystem-wide gates.
-- [Daemon configuration](daemon-config.md): `daemon.conf` grammar, event masks, `[electron_apps]`,
-  `[launch_rules]`, `[inspectors]`.
+- [Daemon configuration](daemon-config.md): `daemon.conf` grammar, event masks, `[port]` and
+  `[secret]` sections, `[electron_apps]`, `[launch_rules]`, `[inspectors]`.
 - [Binary trust](binary-trust.md): how whitelisted binaries stay trustworthy across updates, the
   binary ledger, `trust`, launch scan, launch rules, multicall binaries.
 - [Self-updating apps and the catalog](catalog.md): the built-in list of sensitive directories and
