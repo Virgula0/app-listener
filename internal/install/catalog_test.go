@@ -12,7 +12,7 @@ import (
 )
 
 // TestCatalogSanity verifies the master list is well-formed: every entry
-// has a name, exactly one non-empty of RelPaths/AbsPaths/RuntimeDir/Ports, absolute
+// has a name, exactly one non-empty of RelPaths/AbsPaths/RuntimeDir/Ports/Secret, absolute
 // whitelist binaries, WatchRelPaths only with a single RelPaths entry, and
 // no two entries probe the same path.
 func TestCatalogSanity(t *testing.T) {
@@ -22,13 +22,13 @@ func TestCatalogSanity(t *testing.T) {
 			t.Errorf("entry with empty name: %+v", entry)
 		}
 		set := 0
-		for _, n := range []int{len(entry.RelPaths), len(entry.AbsPaths), len(entry.RuntimeDir), len(entry.Ports)} {
+		for _, n := range []int{len(entry.RelPaths), len(entry.AbsPaths), len(entry.RuntimeDir), len(entry.Ports), len(entry.Secret)} {
 			if n > 0 {
 				set++
 			}
 		}
 		if set != 1 {
-			t.Errorf("entry %q must set exactly one of RelPaths, AbsPaths, RuntimeDir or Ports", entry.Name)
+			t.Errorf("entry %q must set exactly one of RelPaths, AbsPaths, RuntimeDir, Ports or Secret", entry.Name)
 		}
 		for _, p := range entry.Ports {
 			if p >= 32768 {

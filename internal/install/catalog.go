@@ -38,6 +38,12 @@ type CandidateDir struct {
 	// section: MKNOD for the binaries that serve it, CONNECT for its clients. Offered for a user
 	// with one of the Whitelist binaries. Set instead of RelPaths/AbsPaths.
 	Ports []uint16
+	// Secret names a `[secret <name>]` scope: the Secret Service items matching one of SecretMatches
+	// (`key=value ...`, a value may end in '*'), usable only by Whitelist (READ, WRITE, DELETE). Offered
+	// with gnome-keyring installed, for a user with one of the Whitelist binaries. Set instead of
+	// RelPaths/AbsPaths.
+	Secret        string
+	SecretMatches []string
 	// Whitelist maps binary paths to allowed events (nil = all, emitted bare; else "<path>
 	// EV1,EV2"); matched by inode. Keep it minimal: each entry is a potential privilege-escalation
 	// path while the directory is unlocked. Shared (union) across an entry's RelPaths.
@@ -107,6 +113,9 @@ func (c *CandidateDir) IsBun() bool { return len(c.BunLaunchers) > 0 }
 
 // IsSystem reports a system-level (AbsPaths) entry, probed once regardless of users.
 func (c *CandidateDir) IsSystem() bool { return len(c.AbsPaths) > 0 }
+
+// IsSecret reports a Secret entry.
+func (c *CandidateDir) IsSecret() bool { return c.Secret != "" }
 
 // IsRuntime reports a RuntimeDir entry.
 func (c *CandidateDir) IsRuntime() bool { return c.RuntimeDir != "" }
@@ -184,6 +193,44 @@ var Catalog = []CandidateDir{
 			"/usr/bin/ssh":        {"CONNECT", "STAT"},
 			"/usr/bin/ssh-add":    {"CONNECT", "STAT"},
 			"/usr/bin/ssh-keygen": {"CONNECT", "STAT"},
+		}},
+	// gnome-keyring's control and pkcs11 sockets: pkcs11 hands any client every stored secret
+	// (pkcs11-tool --read-object), past the Secret Service gate. The user manager binds the socket
+	// unit's control socket; login programs' pam_gnome_keyring unlocks the keyring through it.
+	{Name: "GNOME Keyring sockets", RuntimeDir: "keyring", RuntimeIf: ".local/share/keyrings",
+		Whitelist: map[string][]string{
+			SecretProvider:                               {"MKNOD", "DELETE", "ATTR", "CONNECT", "STAT"},
+			"/usr/lib/systemd/systemd":                   {"MKNOD", "ATTR", "STAT"},
+			"/usr/bin/login":                             {"CONNECT", "STAT"},
+			"/usr/lib/gdm-session-worker":                {"CONNECT", "STAT"},
+			"/usr/libexec/gdm-session-worker":            {"CONNECT", "STAT"},
+			"/usr/lib/sddm/sddm-helper":                  {"CONNECT", "STAT"},
+			"/usr/lib/x86_64-linux-gnu/sddm/sddm-helper": {"CONNECT", "STAT"},
+			"/usr/sbin/lightdm":                          {"CONNECT", "STAT"},
+			"/usr/bin/lightdm":                           {"CONNECT", "STAT"},
+		}},
+	// Secret Service items, judged by the daemon's gate in front of gnome-keyring ([secret_service]).
+	// gh (go-keyring) stores its token as service=gh:<host>, in clear text over the bus.
+	{Name: "GitHub CLI token (keyring)", Secret: "gh", SecretMatches: []string{"service=gh:*"},
+		Whitelist: map[string][]string{
+			"/usr/bin/gh": nil, "/usr/local/bin/gh": nil, "%HOME%/.local/bin/gh": nil,
+			"/home/linuxbrew/.linuxbrew/bin/gh": nil,
+		}},
+	{Name: "git credentials (libsecret)", Secret: "git-credential-libsecret",
+		SecretMatches: []string{"xdg:schema=org.git.Password"},
+		Whitelist: map[string][]string{
+			"/usr/lib/git-core/git-credential-libsecret":                               nil,
+			"/usr/libexec/git-core/git-credential-libsecret":                           nil,
+			"/usr/share/doc/git/contrib/credential/libsecret/git-credential-libsecret": nil,
+		}},
+	// The key that encrypts a Chromium profile's cookies and passwords (os_crypt).
+	{Name: "Google Chrome Safe Storage", Secret: "chrome-safe-storage",
+		SecretMatches: []string{"xdg:schema=chrome_libsecret_os_crypt_password* application=chrome"},
+		Whitelist:     map[string][]string{"/opt/google/chrome/chrome": nil}},
+	{Name: "Chromium Safe Storage", Secret: "chromium-safe-storage",
+		SecretMatches: []string{"xdg:schema=chrome_libsecret_os_crypt_password* application=chromium"},
+		Whitelist: map[string][]string{
+			"/usr/lib/chromium/chromium": nil, "/usr/lib/chromium/chrome": nil,
 		}},
 
 	// --- AI coding agents and CLI tools ----------------------------------------
@@ -919,10 +966,13 @@ type Candidate struct {
 	Port uint16
 }
 
-// Label names the candidate in a picker: its path, or tcp/<port>.
+// Label names the candidate in a picker: its path, tcp/<port> or secret <name>.
 func (c *Candidate) Label() string {
 	if c.Port != 0 {
 		return fmt.Sprintf("tcp/%d", c.Port)
+	}
+	if c.Entry.IsSecret() {
+		return "secret " + c.Entry.Secret
 	}
 	return c.Path
 }
@@ -988,6 +1038,58 @@ func DiscoverPorts(users []User) []Candidate {
 		}
 	}
 	return out
+}
+
+// SecretProvider is the Secret Service provider the catalog's secret scopes are written for.
+const SecretProvider = "/usr/bin/gnome-keyring-daemon"
+
+// secretRoleCandidates are gnome-keyring's prompter (gcr 3) and Seahorse, the keyring manager.
+var (
+	secretPrompters = []string{"/usr/libexec/gcr-prompter", "/usr/lib/gcr-prompter"}
+	secretManagers  = []string{"/usr/bin/seahorse"}
+)
+
+// DiscoverSecrets proposes each Secret entry for every user with one of its binaries, when
+// gnome-keyring is installed. Candidates of one scope become one section.
+func DiscoverSecrets(users []User) []Candidate {
+	if _, err := os.Stat(SecretProvider); err != nil {
+		return nil
+	}
+	var out []Candidate
+	for i := range Catalog {
+		entry := &Catalog[i]
+		if !entry.IsSecret() {
+			continue
+		}
+		for _, u := range users {
+			c := Candidate{User: u, Entry: *entry, Path: daemonconfig.SecretAnchor(entry.Secret)}
+			if len(c.FilterExistingWhitelist()) > 0 {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// SecretServiceBlock renders the [secret_service] block for the catalog's provider: its prompter
+// and manager lines name only binaries installed here.
+func SecretServiceBlock() string {
+	var b strings.Builder
+	b.WriteString("\n# The Secret Service gate: gnome-keyring reaches the session bus only through the\n")
+	b.WriteString("# daemon, which judges every call touching a [secret] scope's items.\n")
+	b.WriteString("[secret_service]\n\n")
+	fmt.Fprintf(&b, "provider %s\n", SecretProvider)
+	for _, role := range []struct {
+		kw    string
+		paths []string
+	}{{"prompter", secretPrompters}, {"manager", secretManagers}} {
+		for _, p := range role.paths {
+			if _, err := os.Stat(p); err == nil {
+				fmt.Fprintf(&b, "%s %s\n", role.kw, p)
+			}
+		}
+	}
+	return b.String()
 }
 
 // DiscoverSystem probes the system-level (AbsPaths) entries, user-independent.

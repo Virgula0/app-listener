@@ -103,7 +103,8 @@ func groupCandidates(cands []inst.Candidate) []catalogGroup {
 // pickDirectories probes the catalog for every selected user (plus system entries) and asks which
 // found directories to protect. All preselected.
 func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
-	candidates := slices.Concat(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users), inst.DiscoverPorts(users))
+	candidates := slices.Concat(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users), inst.DiscoverPorts(users),
+		inst.DiscoverSecrets(users))
 	if len(candidates) == 0 {
 		log.Warn("no catalog directories found for the selected users — you can still add directories manually")
 		return nil, nil
@@ -192,6 +193,7 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
 	portAt := map[uint16]int{}
+	secretAt := map[string]int{}
 	for i := range candidates {
 		c := &candidates[i]
 		if c.Port != 0 {
@@ -201,6 +203,20 @@ func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 				at = len(sections)
 				portAt[c.Port] = at
 				sections = append(sections, inst.Section{Port: c.Port})
+			}
+			for _, rule := range c.FilterExistingWhitelist() {
+				if !slices.ContainsFunc(sections[at].Allow, func(r inst.BinaryRule) bool { return r.Path == rule.Path }) {
+					sections[at].Allow = append(sections[at].Allow, rule)
+				}
+			}
+			continue
+		}
+		if c.Entry.IsSecret() {
+			at, seen := secretAt[c.Entry.Secret]
+			if !seen {
+				at = len(sections)
+				secretAt[c.Entry.Secret] = at
+				sections = append(sections, inst.Section{Secret: c.Entry.Secret, SecretMatches: c.Entry.SecretMatches})
 			}
 			for _, rule := range c.FilterExistingWhitelist() {
 				if !slices.ContainsFunc(sections[at].Allow, func(r inst.BinaryRule) bool { return r.Path == rule.Path }) {

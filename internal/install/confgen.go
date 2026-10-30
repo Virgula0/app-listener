@@ -17,6 +17,9 @@ type Section struct {
 	Runtime bool
 	// Port emits a `[port tcp/<n>]` section instead (Path and Encrypt unused).
 	Port uint16
+	// Secret emits a `[secret <name>]` section with SecretMatches as `match` lines instead.
+	Secret        string
+	SecretMatches []string
 	// ExtraWatchPaths turns the section into an encryption GROUP: the section path stays the
 	// fscrypt root (its need_encryption governs the group) and each extra path is its own guarded
 	// tree sharing the whitelist, emitted as `watch: <path>`. For self-updating apps whose update
@@ -49,7 +52,22 @@ func GenerateConf(sections []Section, blocks []LibraryBlock) string {
 	b.WriteString("# for the full syntax documentation.\n")
 	b.WriteString(GenerateSections(sections))
 	b.WriteString(GenerateLibraryBlocks(blocks))
-	return b.String()
+	return EnsureSecretServiceBlock(b.String())
+}
+
+// EnsureSecretServiceBlock appends the catalog's [secret_service] block to a config with a
+// [secret] section and none.
+func EnsureSecretServiceBlock(confText string) string {
+	hasScope, hasBlock := false, false
+	for line := range strings.SplitSeq(confText, "\n") {
+		line = strings.TrimSpace(line)
+		hasScope = hasScope || strings.HasPrefix(line, "[secret ")
+		hasBlock = hasBlock || line == "[secret_service]"
+	}
+	if !hasScope || hasBlock {
+		return confText
+	}
+	return strings.TrimRight(confText, "\n") + "\n" + SecretServiceBlock()
 }
 
 // GenerateSections renders just the [watch ...] blocks (no file header, each preceded by a blank
@@ -62,6 +80,14 @@ func GenerateSections(sections []Section) string {
 		s := &sections[i]
 		if s.Port != 0 {
 			fmt.Fprintf(&b, "\n[port tcp/%d]\n\n", s.Port)
+			writeAllow(&b, s.Allow)
+			continue
+		}
+		if s.Secret != "" {
+			fmt.Fprintf(&b, "\n[secret %s]\n\n", s.Secret)
+			for _, m := range s.SecretMatches {
+				fmt.Fprintf(&b, "match %s\n", m)
+			}
 			writeAllow(&b, s.Allow)
 			continue
 		}
