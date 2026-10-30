@@ -352,6 +352,7 @@ func (m *trustManager) applyTrustSet(cfg *daemonconfig.Config, binaries, libs []
 	if err := tg.SetGuardedDirs(dirs); err != nil {
 		return fmt.Errorf("recording guarded roots: %w", err)
 	}
+	tg.SetLaunchRules(launchRulesByPath(cfg))
 	if err := tg.SetTrusted(binaries, libs); err != nil {
 		return fmt.Errorf("loading the trusted set: %w", err)
 	}

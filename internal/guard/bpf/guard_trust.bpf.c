@@ -68,6 +68,9 @@
 #define TRUST_PLANT 2      // a non-writer tried to bind a reserved glob name
 #define TRUST_SUSPECT 3    // a code-suspect process of a whitelisted exe opened a guarded file
 #define TRUST_LAUNCH 4     // the same, marked for its launch env/argv (trust_launch)
+#define TRUST_ARGV 5       // the same, marked by one of its exe's argv/env rules (trust_argv)
+#define TRUST_ARGV_MATCH 6 // a launch matched a deny rule: marked (path: the completing word)
+#define TRUST_ARGV_WARN 7  // a launch matched a warn rule: logged only
 
 struct inode_key {
 	__u64 dev;
@@ -351,6 +354,55 @@ struct {
 	__type(value, struct launch_rule);
 } trust_launch SEC(".maps");
 
+// trust_argv: per-binary argv/env rules (issue #113), a tripwire: a whitelisted CLI started with words
+// that print or spend its secret (`gh auth token`) is marked code-suspect (SUSPECT_ARGV). An ARGV_WORD
+// entry's value has bit rule*ARGV_WORDS+pos set for each rule word it is; a rule matches once its
+// words appear in argv in order, others between (unanchored: a global flag taking a separate value
+// would shift any anchor). A word starting with '-' is compared up to '='. An ARGV_ENV entry matches
+// when the variable is set (value ARGV_DENY or ARGV_WARN). Filled by userspace (guard/trust_argv.go).
+#define ARGV_RULES 16
+#define ARGV_WORDS 4
+#define ARGV_WORD 1
+#define ARGV_ENV 2
+#define ARGV_DENY 1
+#define ARGV_WARN 2
+
+struct argv_key {
+	__u32 set;
+	__u32 kind;
+	char name[LAUNCH_KEY];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct argv_key);
+	__type(value, __u64);
+} trust_argv SEC(".maps");
+
+// trust_argv_sets[set]: each rule's word count, 4 bits per rule (0: none), and the rules that only
+// log. Written before any guard_bin_rules row names the set, never changed after.
+struct argv_set {
+	__u64 lens;
+	__u64 warn;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1024);
+	__type(key, __u32);
+	__type(value, struct argv_set);
+} trust_argv_sets SEC(".maps");
+
+// guard_bin_rules[exe]: the trust_argv set of a whitelisted binary that has rules. A row like
+// guard_bin_owner's (trustBitMaps): a replacement admitted for the binary inherits it.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_bin_rules SEC(".maps");
+
 // launch_scan is trust_exec_launch's walk over the new image's argv and env strings, one bpf_loop
 // step at a time (kept in a per-CPU map: the callback re-reads it, see symlink_scan_step).
 struct launch_scan {
@@ -366,7 +418,15 @@ struct launch_scan {
 	__u32 app;     // a generic Electron's app argument judged
 	__u32 risky;
 	__u32 done;
+	__u32 rules;    // the exe has a trust_argv set
+	__u32 set;
+	__u32 argv_hit; // a deny rule matched
+	__u32 pad;
+	__u64 lens;     // trust_argv_sets[set]
+	__u64 warn;
+	__u8 prog[ARGV_RULES]; // each rule's words seen so far
 	struct launch_key key;
+	struct argv_key akey;
 	char buf[LAUNCH_BUF];
 };
 
@@ -1054,7 +1114,7 @@ __noinline int trust_suspect_denied(__u64 dir, int change)
 	__u8 *why = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
 	if (!why)
 		return 0;
-	__u32 kind = *why == SUSPECT_LAUNCH ? TRUST_LAUNCH : TRUST_SUSPECT;
+	__u32 kind = *why == SUSPECT_LAUNCH ? TRUST_LAUNCH : *why == SUSPECT_ARGV ? TRUST_ARGV : TRUST_SUSPECT;
 	int root = guarded_root_kind(dentry);
 	if (root != ROOT_SECRET && !(root == ROOT_CODE && change))
 		return 0;
@@ -1504,6 +1564,72 @@ static __always_inline long launch_token(struct launch_scan *s)
 	return 0;
 }
 
+// argv_rule_at reads buf's word (a flag or an ENV name up to '=') into s->akey and looks it up. A word
+// too long for the key matches nothing.
+static __noinline __u64 *argv_rule_at(struct launch_scan *s, __u32 kind)
+{
+	int done = 0;
+	int cut = kind == ARGV_ENV || s->buf[0] == '-';
+	s->akey.set = s->set;
+	s->akey.kind = kind;
+	for (int j = 0; j < LAUNCH_KEY; j++) {
+		char c = 0;
+		if (!done) {
+			c = s->buf[j];
+			if (c == 0 || (c == '=' && cut)) {
+				done = 1;
+				c = 0;
+			}
+		}
+		s->akey.name[j] = c;
+	}
+	if (!done)
+		return NULL;
+	return bpf_map_lookup_elem(&trust_argv, &s->akey);
+}
+
+// argv_matched reports a matched rule: a deny marks the launch (argv_hit), a warn is only logged.
+// The event's path is the word that completed it.
+static __always_inline void argv_matched(struct launch_scan *s, int warn)
+{
+	if (!warn)
+		s->argv_hit = 1;
+	struct trust_event *e = bpf_ringbuf_reserve(&trust_rb, sizeof(*e), 0);
+	if (!e)
+		return;
+	e->pid = bpf_get_current_pid_tgid() >> 32;
+	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+	e->kind = warn ? TRUST_ARGV_WARN : TRUST_ARGV_MATCH;
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	bpf_probe_read_kernel_str(e->path, LAUNCH_KEY, s->akey.name);
+	bpf_ringbuf_submit(e, 0);
+}
+
+// argv_word advances every rule whose next word buf is.
+static __noinline void argv_word(struct launch_scan *s)
+{
+	__u64 *m = argv_rule_at(s, ARGV_WORD);
+	if (!m)
+		return;
+	__u64 mask = *m;
+	for (int i = 0; i < ARGV_RULES; i++) {
+		__u32 len = (s->lens >> (i * 4)) & 0xf;
+		__u32 p = s->prog[i];
+		if (!len || p >= len || p >= ARGV_WORDS || !(mask & (1ULL << (i * ARGV_WORDS + p))))
+			continue;
+		s->prog[i] = p + 1;
+		if (p + 1 == len)
+			argv_matched(s, (s->warn >> i) & 1);
+	}
+}
+
+static __noinline void argv_env(struct launch_scan *s)
+{
+	__u64 *m = argv_rule_at(s, ARGV_ENV);
+	if (m)
+		argv_matched(s, *m == ARGV_WARN);
+}
+
 // launch_step reads the next argv/env string (or judges a token of the last one). Strings longer
 // than the buffer are read in pieces; only a piece starting a string is judged, and a value to
 // tokenize must fit whole. Any read failure is risky (fail closed).
@@ -1534,6 +1660,18 @@ static long launch_step(__u64 i, void *ctx)
 		s->first = 0;
 		return 0;
 	}
+	if (s->rules) {
+		if (argv)
+			argv_word(s);
+		else
+			argv_env(s);
+		if (s->argv_hit) {
+			s->done = 1;
+			return 1;
+		}
+	}
+	if (!s->classes)
+		return 0;
 	struct launch_rule *r;
 	if (argv && (s->classes & TRUSTED_ELECTRON) && !s->app && s->buf[0] != '-') {
 		s->app = 1;
@@ -1576,22 +1714,44 @@ static long launch_step(__u64 i, void *ctx)
 // image's mark just before. An unmarkable process is killed: the hook cannot refuse the exec.
 // The launch is never judged again: an updater-made exe not admitted yet (updater_origin) is
 // judged by every runtime's rules, as its classes are unknown, bar the generic-Electron app check
-// (any other exe's positional argv, `steam steam://...`, would mark it).
+// (any other exe's positional argv, `steam steam://...`, would mark it). A whitelisted binary with
+// argv/env rules (guard_bin_rules) is scanned too, and a matched deny rule marks it SUSPECT_ARGV.
 SEC("tp_btf/sched_process_exec")
 int trust_exec_launch(unsigned long long *ctx)
 {
 	struct task_struct *p = (struct task_struct *)ctx[0];
-	__u8 flags = current_exe_flags();
+	struct inode_key k = {};
+	__u8 flags = 0;
+	__u64 *set = NULL;
+	if (current_exe_key(&k)) {
+		__u8 *f = bpf_map_lookup_elem(&guard_trusted_files, &k);
+		flags = f ? *f : 0;
+		if (flags & TRUSTED_BINARY)
+			set = bpf_map_lookup_elem(&guard_bin_rules, &k);
+	}
 	__u32 classes = flags & TRUSTED_RUNTIMES;
 	int unadmitted = !classes && !(flags & TRUSTED_BINARY) && updater_origin();
 	if (unadmitted)
 		classes = TRUSTED_RUNTIMES;
-	if (!p || !classes)
+	if (!p || (!classes && !set))
 		return 0;
 	__u32 z = 0;
 	struct launch_scan *s = bpf_map_lookup_elem(&trust_launch_scan, &z);
 	if (!s)
 		return 0;
+	s->rules = 0;
+	s->argv_hit = 0;
+	__builtin_memset(s->prog, 0, sizeof(s->prog));
+	if (set) {
+		__u32 id = *set;
+		struct argv_set *as = bpf_map_lookup_elem(&trust_argv_sets, &id);
+		if (as) {
+			s->rules = 1;
+			s->set = id;
+			s->lens = as->lens;
+			s->warn = as->warn;
+		}
+	}
 	struct mm_struct *mm = BPF_CORE_READ(p, mm);
 	if (!mm)
 		return 0;
@@ -1609,10 +1769,11 @@ int trust_exec_launch(unsigned long long *ctx)
 	s->done = 0;
 	long ret = bpf_loop(LAUNCH_STEPS, launch_step, NULL, 0);
 	s = bpf_map_lookup_elem(&trust_launch_scan, &z);
-	if (s && ret >= 0 && s->done && !s->risky)
+	int clean = s && ret >= 0 && s->done && !s->risky;
+	if (clean && !s->argv_hit)
 		return 0;
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
-	__u8 v = SUSPECT_LAUNCH;
+	__u8 v = clean ? SUSPECT_ARGV : SUSPECT_LAUNCH;
 	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
 		bpf_send_signal(9); // SIGKILL
 	return 0;

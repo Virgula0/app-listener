@@ -362,3 +362,64 @@ need_encryption: false
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
+
+// A whitelisted CLI started with words one of its launch rules names (built in by basename, or a
+// [launch_rules] line) is refused its secret; started otherwise it keeps reading. A warn rule only
+// logs, and only a Go binary is judged on SSL_CERT_FILE. Rule sets must survive a reload.
+func (s *IntegrationSuite) TestDaemon_LaunchRules() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const gh, tool, goread = "/opt/rt/bin/gh", "/opt/rt/bin/tool", "/opt/rt/bin/goread"
+	s.exec(c, []string{"mkdir", "-p", "/exploits", "/opt/rt/bin"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_plain"), gh, 0o755),
+		"copy launch_probe_plain (run make -C integrationtests/exploits)")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, goread, 0o755))
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
+		"' > " + launchSecret + " && cp " + gh + " " + tool + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[launch_rules]\ndeny_args "+tool+" export --all\nwarn_env "+tool+" NOTE_ME\n\n"+
+		"[watch /protected]\nneed_encryption: false\n"+gh+"\n"+tool+"\n"+goread)
+
+	run := func(cmd string) string {
+		_, out := s.exec(c, []string{"sh", "-c", cmd + " 2>&1"})
+		return out
+	}
+	check := func(when string) {
+		for what, cmd := range map[string]string{
+			"a clean launch":                gh + " read " + launchSecret,
+			"a partial rule":                gh + " auth status read " + launchSecret,
+			"a warn rule":                   gh + " auth git-credential read " + launchSecret,
+			"rule words out of order":       gh + " token auth read " + launchSecret,
+			"another binary's built-in":     tool + " auth token read " + launchSecret,
+			"a warn env rule":               "NOTE_ME=1 " + tool + " read " + launchSecret,
+			"a clean Go launch":             goread + " read " + launchSecret,
+			"SSL_CERT_FILE on a non-Go exe": "SSL_CERT_FILE=/tmp/ca.pem " + gh + " read " + launchSecret,
+		} {
+			s.Require().Containsf(run(cmd), "STOLEN|"+launchMarker, "%s: %s must read its resource\ndaemon log:\n%s",
+				when, what, s.readDaemonLog(c))
+		}
+		for what, cmd := range map[string]string{
+			"words around a flag's value":  gh + " auth --hostname x token read " + launchSecret,
+			"a short flag after operands":  gh + " auth status read " + launchSecret + " -t",
+			"a long flag with a value":     gh + " auth status --show-token=1 read " + launchSecret,
+			"a [launch_rules] argv rule":   tool + " export read " + launchSecret + " --all",
+			"SSL_CERT_FILE on a Go binary": "SSL_CERT_FILE=/tmp/ca.pem " + goread + " read " + launchSecret,
+		} {
+			s.Require().NotContainsf(run(cmd), launchMarker, "%s: %s read the secret\ndaemon log:\n%s",
+				when, what, s.readDaemonLog(c))
+		}
+	}
+	check("at start")
+	s.reloadAndAwait(c)
+	check("after a reload")
+
+	log := s.readDaemonLog(c)
+	for _, want := range []string{"word=token", "word=-t", "word=--show-token", "word=--all", "word=SSL_CERT_FILE",
+		"ARGV comm=gh", "word=git-credential", "word=NOTE_ME"} {
+		s.Require().Containsf(log, want, "daemon log lacks %q:\n%s", want, log)
+	}
+	s.requireDenialLogged(c, "ARGV", "secret")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}

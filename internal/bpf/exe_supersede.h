@@ -64,6 +64,7 @@ struct {
 // exec-mapped code trust_mmap would refuse a whitelisted binary while the exe was not TRUSTED_BINARY
 // (trust_mmap judges only new mappings, so a reload whitelisting the exe would not catch it).
 // SUSPECT_LAUNCH: a runtime started with env/argv that run its caller's code (trust_exec_launch).
+// SUSPECT_ARGV: a whitelisted binary started with argv/env one of its rules names (trust_argv).
 // Either is refused every regular file below a secret root, any change below a code tree, its exe's
 // writer and updater rights (trust_suspect), guard_ptrace_access_check's inspector grant and, by the
 // guard's whitelist decision, any access below a secret (stat, readdir, xattrs).
@@ -81,6 +82,7 @@ struct {
 // trust_code_suspect values; also guard_event.reason bits 8-15 (guard.bpf.c).
 #define SUSPECT_PRELOAD 1
 #define SUSPECT_LAUNCH 2
+#define SUSPECT_ARGV 3
 
 static __always_inline __u64 leader_start(struct task_struct *task)
 {

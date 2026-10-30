@@ -38,6 +38,8 @@ type Config struct {
 	// that runs the app its argv names, /usr/lib/electronNN) may be started with. Any other is code
 	// its caller chose; root placement is the daemon's to check.
 	ElectronApps []string
+	// LaunchRules are the [launch_rules] lines (LaunchRule).
+	LaunchRules []LaunchRule
 	// RuntimePaths are the `runtime: true` section roots, present or not: the daemon creates a
 	// missing one at its user's login (`daemon login`), before any of the user's processes run.
 	RuntimePaths []string
@@ -207,6 +209,8 @@ type watchGroup struct {
 	inspectorsBlock bool
 	// electronAppsBlock marks an [electron_apps] block: one app path per line.
 	electronAppsBlock bool
+	// launchRulesBlock marks a [launch_rules] block: one LaunchRule per line.
+	launchRulesBlock bool
 	// settingsBlock marks a [settings] block: daemon-wide `key: value` lines.
 	settingsBlock bool
 	// runtime: `runtime: true`, read even in a skipped group (RuntimePaths lists it either way).
@@ -327,6 +331,9 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	if g.electronAppsBlock {
 		return applyElectronApp(cfg, line, lineNo)
 	}
+	if g.launchRulesBlock {
+		return applyLaunchRule(cfg, line, lineNo)
+	}
 	if g.settingsBlock {
 		return applySetting(cfg, line, lineNo)
 	}
@@ -384,8 +391,8 @@ func applyAnyGroupDirective(g *watchGroup, line string, lineNo int) (bool, error
 	return true, nil
 }
 
-// openBlock returns the group a [libraries <name>], [inspectors], [electron_apps] or [settings]
-// header opens, nil for any other line.
+// openBlock returns the group a [libraries <name>], [inspectors], [electron_apps], [launch_rules] or
+// [settings] header opens, nil for any other line.
 func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
 	if name, ok := ParseLibrariesSection(line); ok {
 		return &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
@@ -398,6 +405,8 @@ func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
 		return &watchGroup{inspectorsBlock: true, lineNo: lineNo}
 	case "[electron_apps]":
 		return &watchGroup{electronAppsBlock: true, lineNo: lineNo}
+	case "[launch_rules]":
+		return &watchGroup{launchRulesBlock: true, lineNo: lineNo}
 	case "[settings]":
 		return &watchGroup{settingsBlock: true, lineNo: lineNo}
 	}
@@ -418,7 +427,7 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 
 // finalizeGroup materializes a closed group unless it was skipped.
 func finalizeGroup(cfg *Config, group *watchGroup) error {
-	if group == nil || group.inspectorsBlock || group.electronAppsBlock || group.settingsBlock {
+	if group == nil || group.inspectorsBlock || group.electronAppsBlock || group.launchRulesBlock || group.settingsBlock {
 		return nil
 	}
 	if group.runtime {

@@ -11,6 +11,10 @@ whoever runs it; many apps have a similar export, debug or "show token" command.
 authorizes which executable opens the file, not why. Any process that can run the whitelisted
 binary with arguments of its choosing gets whatever that binary prints.
 
+[Launch rules](binary-trust.md#launch-rules) refuse the secret to the known disclosure commands
+(`gh auth token`, `aws configure export-credentials`, `bitcoin-cli dumpprivkey`), but they are a
+tripwire: a CLI has more ways to print a secret than any list names.
+
 - Whitelist only what needs the resource.
 - Prefer apps that keep secrets in a running agent.
 - Never whitelist a general tool: a shell, an interpreter (`node`, `python`, `java`), `git`, `cp`,

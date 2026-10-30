@@ -64,7 +64,7 @@ type GuardEvent struct {
 	// Scope labels a process-gate denial judged for several resources: MultipleResourceLabel (the
 	// GLOBAL slot) or a taint set's paths, comma-separated. Empty: the receiving guard's own.
 	Scope string
-	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH"): it runs
+	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH", "ARGV"): it runs
 	// code its exe doesn't vouch for (trust_code_suspect). Empty otherwise.
 	Suspect string
 	// Exe is the acting process's exe inode as the kernel judged it; zero for a process gate.
@@ -114,6 +114,7 @@ const (
 	guardReasonSuspectShift = 8
 	suspectPreload          = 1
 	suspectLaunch           = 2
+	suspectArgv             = 3
 )
 
 // suspectLabel maps a reason's SUSPECT_* mark to its logged op label; "" when unmarked.
@@ -123,6 +124,8 @@ func suspectLabel(reason uint32) string {
 		return "PRELOADED"
 	case suspectLaunch:
 		return "LAUNCH"
+	case suspectArgv:
+		return "ARGV"
 	default:
 		return ""
 	}

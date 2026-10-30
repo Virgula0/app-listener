@@ -148,6 +148,31 @@ generic Electron app rule below.
 Generic Electron binaries that run an app named on the command line are covered by
 [`[electron_apps]`](daemon-config.md#generic-electron-apps-electron_apps).
 
+## Launch rules
+
+Some whitelisted CLIs print or spend their secret when asked. The launch scan also judges any
+whitelisted binary with launch rules, and a match marks the process the same way
+(`TRUST DENIED  op=ARGV`, and `op=ARGV ... word=<the matching word>` at exec). Built in, by the
+whitelisted file's name:
+
+- `gh`: `auth token`, `auth status --show-token`, `auth status -t`, `alias set`, `alias import`;
+  `auth git-credential` is only logged, since git runs it on every push.
+- `aws`: `configure export-credentials`, `configure get`.
+- `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
+  `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag (it reads the method from stdin).
+- `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,
+  `fundchannel`, `multifundchannel`, `close`, `exposesecret`.
+- Every whitelisted Go binary: `SSL_CERT_FILE` or `SSL_CERT_DIR` set, which would make it trust a
+  certificate its caller chose and send its token to that server.
+
+A rule's words match in order anywhere in the arguments, with anything between them, so a flag's
+value can't split them (`gh auth --hostname x token`). Add your own with
+[`[launch_rules]`](daemon-config.md#launch-rules-launch_rules).
+
+The rules are a tripwire. They don't see combined short flags (`-th`), aliases, a script that
+feeds the CLI its arguments another way, or a token the CLI reads from the keyring rather than a
+guarded file: with keyring storage, `gh auth token` still prints it.
+
 ## The dynamic loader
 
 `/lib64/ld-linux-x86-64.so.2 <program>` (any `ld-*.so*`, or a copy with its `DT_SONAME`) runs

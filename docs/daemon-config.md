@@ -130,6 +130,30 @@ non-switch argument names. Whitelisted, it may be started only with an app liste
 A bundled Electron (Discord, VS Code: `resources/app.asar` or `resources/app/`, no
 `default_app.asar`) ignores its arguments when choosing the app and is not judged this way.
 
+## Launch rules: `[launch_rules]`
+
+A whitelisted CLI that prints or spends its secret on request (`gh auth token`) hands it to whoever
+runs it. Launch rules mark such a launch: the process is refused every guarded secret, as a risky
+runtime launch is ([Binary trust](binary-trust.md#launch-rules)). Add your own on top of the
+built-in ones:
+
+```ini
+[launch_rules]
+deny_args /usr/bin/gh repo delete
+warn_args /usr/bin/kubectl config view --raw
+deny_env /usr/bin/kubectl HTTPS_PROXY
+```
+
+- `deny_args <binary> <word>...` marks a launch whose arguments hold the 1 to 4 words in this order,
+  anything between them. A word starting with `-` is a flag, compared up to `=`, so write it
+  without a value. Words are at most 43 bytes.
+- `deny_env <binary> <NAME>` marks a launch with that variable set.
+- `warn_args` and `warn_env` only log the match (`ARGV comm=... word=...`).
+- The binary is a whitelisted line, as written or its symlink's target; a rule naming any other
+  path does nothing and is logged. At most 16 argument rules per binary, built-ins included.
+- A rule can only refuse more: it is a tripwire, never a boundary (see
+  [Limitations](limitations.md#whitelisted-programs-that-disclose-on-request)).
+
 ## Process inspectors
 
 A process that read a protected file is *tainted*: no program outside its resource's whitelist
