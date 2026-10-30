@@ -2516,10 +2516,74 @@ int guard_inode_listxattr(unsigned long long *ctx)
 	return 0;
 }
 
+// Session buses. The secret gatekeeper (internal/secretgate) attests a caller by the pidfd its bus
+// took at connect: the process may have exec'd since, leaving a connection opened by other code under
+// a whitelisted image. guard_bus_dirs holds the /run/user/<uid> dirs the daemon registered;
+// guard_bus_conns the exec stamp of each process's FIRST connect to their `bus`, so a later exec
+// mismatches its exe_stamps row for the rest of its life. No row = unattested (refused).
+struct bus_conn {
+	__u64 seq;
+	__u64 start;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} guard_bus_dirs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, __u32); // tgid
+	__type(value, struct bus_conn);
+} guard_bus_conns SEC(".maps");
+
+static __always_inline void note_bus_connect(struct sock *peer)
+{
+	struct dentry *dentry = NULL, *parent = NULL;
+	struct inode *dir = NULL;
+	const unsigned char *name_ptr = NULL;
+	char name[4] = {};
+	if (!peer)
+		return;
+	bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
+	if (!dentry)
+		return;
+	bpf_probe_read_kernel(&name_ptr, sizeof(name_ptr), &dentry->d_name.name);
+	if (!name_ptr || bpf_probe_read_kernel(name, sizeof(name), name_ptr) ||
+	    name[0] != 'b' || name[1] != 'u' || name[2] != 's' || name[3] != '\0')
+		return;
+	bpf_probe_read_kernel(&parent, sizeof(parent), &dentry->d_parent);
+	if (!parent)
+		return;
+	bpf_probe_read_kernel(&dir, sizeof(dir), &parent->d_inode);
+	if (!dir)
+		return;
+	struct inode_key ik = {};
+	bpf_probe_read_kernel(&ik.ino, sizeof(ik.ino), &dir->i_ino);
+	ik.dev = inode_dev((__u64)dir);
+	if (!bpf_map_lookup_elem(&guard_bus_dirs, &ik))
+		return;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	struct bus_conn v = {};
+	v.start = leader_start(task);
+	struct bus_conn *cur = bpf_map_lookup_elem(&guard_bus_conns, &tgid);
+	if (cur && cur->start == v.start)
+		return; // keep this process's first connect
+	struct exec_stamp *st = bpf_map_lookup_elem(&exe_stamps, &tgid);
+	v.seq = st ? st->seq : 0; // no stamp: exec'd before the guard, never attested
+	bpf_map_update_elem(&guard_bus_conns, &tgid, &v, BPF_ANY); // full: no row, refused
+}
+
 SEC("lsm/unix_stream_connect")
 int guard_unix_stream_connect(unsigned long long *ctx)
 {
 	struct emit_args ea_buf = {};
+	note_bus_connect((struct sock *)ctx[1]);
 	return judge_unix_connect(&ea_buf, (struct sock *)ctx[0], (struct sock *)ctx[1]);
 }
 
@@ -3121,6 +3185,9 @@ int guard_task_free(unsigned long long *ctx)
 		return 0;
 
 	bpf_map_delete_elem(&guard_tainted_pids, &tgid);
+	struct bus_conn *bc = bpf_map_lookup_elem(&guard_bus_conns, &tgid);
+	if (bc && bc->start == leader_start(task))
+		bpf_map_delete_elem(&guard_bus_conns, &tgid);
 	exe_stamp_free(task, tgid);
 	return 0;
 }
