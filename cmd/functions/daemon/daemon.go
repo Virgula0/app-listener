@@ -496,7 +496,10 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("%w: config %s contains no [watch] sections", constants.ErrCriticalStartup, configPath)
 	}
-	if err := ensurePortAnchors(cfg); err != nil {
+	if err := ensurePortAnchors(cfg); err == nil {
+		err = ensureSecretAnchors(cfg)
+	}
+	if err != nil {
 		return "", nil, fmt.Errorf("%w: config %s: %w", constants.ErrCriticalStartup, configPath, err)
 	}
 	// Before the first guard loads the engine: the map is sized once per process.
@@ -589,6 +592,9 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 		return "", nil, fmt.Errorf("config contains no [watch] sections")
 	}
 	if anchorErr := ensurePortAnchors(cfg); anchorErr != nil {
+		return "", nil, anchorErr
+	}
+	if anchorErr := ensureSecretAnchors(cfg); anchorErr != nil {
 		return "", nil, anchorErr
 	}
 	// Old and new guards overlap until the commit, with the self guards still attached: refuse up
@@ -1060,8 +1066,8 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	// File-vault resources stage a crash-recovery sidecar before every unlock/lock transform, which
 	// must exist before THIS guard attaches: once live, creating a dentry beside a single-file
 	// watch root is denied (fscrypt.EnsureRecoverySidecarPlaceholder, guard_path_rename
-	// destination-parent check). No-op for directories, and a port's anchor is no vault.
-	if r.Port == 0 {
+	// destination-parent check). No-op for directories, and a daemon-made anchor is no vault.
+	if !r.Anchored() {
 		if err := fscrypt.EnsureRecoverySidecarPlaceholder(r.Path); err != nil {
 			log.Warnf("daemon: could not pre-create the recovery sidecar for %s (%v) — "+
 				"a lock/unlock interrupted by a crash may not be recoverable", r.Path, err)
@@ -1076,12 +1082,16 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		mode = guard.ModeReadOnly
 	}
 
+	selfEvents := daemonSelfBaselineEvents
+	if r.SecretRelay {
+		selfEvents = secretRelaySelfEvents
+	}
 	opts := []guard.GuardOption{
 		guard.WithBinaryEvents(events),
 		guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
 		// Root-gated self access with the minimal event set the fscrypt lifecycle needs; non-root
 		// executors of this binary stay denied (self-key bypass regression test).
-		guard.WithSelfAllowBinary(self, daemonSelfBaselineEvents),
+		guard.WithSelfAllowBinary(self, selfEvents),
 		// Pin LSM links so a SIGKILL leaves the tree enforced until ExecStopPost locks the vault.
 		guard.WithPinning(pin.prefix(r.Path)),
 		guard.WithBackingDevices(deviceSet),
@@ -1220,8 +1230,8 @@ func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
 	out := make([]uint32, 0, len(resources))
 	for i := range resources {
 		r := &resources[i]
-		if r.Port != 0 {
-			continue // a tmpfs anchor
+		if r.Anchored() {
+			continue // a daemon-made root on tmpfs
 		}
 		rdevs, err := guard.BackingDevices(r.Path)
 		if err != nil {

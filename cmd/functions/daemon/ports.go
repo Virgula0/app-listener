@@ -44,10 +44,11 @@ func ensurePortAnchors(cfg *daemonconfig.Config) error {
 				portRangePath, portReservedPath)
 		}
 	}
-	for _, dir := range []string{filepath.Dir(daemonconfig.PortAnchorDir), daemonconfig.PortAnchorDir} {
-		if err := ensureRootDir(dir); err != nil {
-			return err
-		}
+	if err := ensureRootDir(filepath.Dir(daemonconfig.PortAnchorDir), 0o755); err != nil {
+		return err
+	}
+	if err := ensureRootDir(daemonconfig.PortAnchorDir, 0o700); err != nil {
+		return err
 	}
 	for _, p := range ports {
 		if err := ensureAnchor(daemonconfig.PortAnchor(p)); err != nil {
@@ -57,16 +58,25 @@ func ensurePortAnchors(cfg *daemonconfig.Config) error {
 	return nil
 }
 
-func ensureRootDir(dir string) error {
-	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+// ensureRootDir makes dir root's with mode, or brings an existing root-owned one to it.
+func ensureRootDir(dir string, mode uint32) error {
+	if err := os.Mkdir(dir, os.FileMode(mode)); err != nil && !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", dir, err)
+	}
+	defer unix.Close(fd)
 	var st unix.Stat_t
-	if err := unix.Lstat(dir, &st); err != nil {
+	if err := unix.Fstat(fd, &st); err != nil {
 		return fmt.Errorf("checking %s: %w", dir, err)
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR || st.Uid != 0 || st.Mode&0o022 != 0 {
+	if st.Uid != 0 || st.Mode&0o022 != 0 {
 		return fmt.Errorf("%s must be a root-owned directory nobody else can write", dir)
+	}
+	if st.Mode&0o7777 != mode {
+		return unix.Fchmod(fd, mode)
 	}
 	return nil
 }
@@ -77,14 +87,14 @@ func ensureAnchor(path string) error {
 		return unix.Close(fd)
 	}
 	if !errors.Is(err, unix.EEXIST) {
-		return fmt.Errorf("creating port anchor %s: %w", path, err)
+		return fmt.Errorf("creating anchor %s: %w", path, err)
 	}
 	var st unix.Stat_t
 	if err := unix.Lstat(path, &st); err != nil {
-		return fmt.Errorf("checking port anchor %s: %w", path, err)
+		return fmt.Errorf("checking anchor %s: %w", path, err)
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Uid != 0 || st.Nlink != 1 || st.Mode&0o222 != 0 {
-		return fmt.Errorf("port anchor %s must be a root-owned read-only regular file with one link", path)
+		return fmt.Errorf("anchor %s must be a root-owned read-only regular file with one link", path)
 	}
 	return nil
 }

@@ -118,6 +118,7 @@ type loginServer struct {
 	readyOne sync.Once
 	reload   func() (*daemonconfig.Config, error)
 	cfg      atomic.Pointer[daemonconfig.Config]
+	secrets  *secretGates
 }
 
 // startLoginServer opens the socket before READY=1: the drop-in orders after the daemon unit, so a
@@ -140,7 +141,8 @@ func startLoginServer(uc usecase.DaemonUseCase, cfg *daemonconfig.Config) (*logi
 		log.Errorf("daemon: %s is missing: nothing guards the runtime sections at login — run `sudo app-listener install`",
 			systemd.LoginDropInFile)
 	}
-	s := &loginServer{ln: ln, selfDev: selfDev, selfIno: selfIno, uc: uc, ready: make(chan struct{})}
+	s := &loginServer{ln: ln, selfDev: selfDev, selfIno: selfIno, uc: uc, ready: make(chan struct{}),
+		secrets: newSecretGates(cfg)}
 	s.cfg.Store(cfg)
 	go s.acceptLoop()
 	return s, nil
@@ -156,6 +158,7 @@ func (s *loginServer) setReload(reload func() (*daemonconfig.Config, error)) {
 func (s *loginServer) setConfig(cfg *daemonconfig.Config) {
 	if s != nil && cfg != nil {
 		s.cfg.Store(cfg)
+		s.secrets.setConfig(cfg)
 	}
 }
 
@@ -165,6 +168,7 @@ func (s *loginServer) close() {
 	}
 	_ = s.ln.Close()
 	_ = os.Remove(loginSocket)
+	s.secrets.close()
 }
 
 func (s *loginServer) acceptLoop() {
@@ -236,6 +240,8 @@ type madeDir struct {
 }
 
 func (s *loginServer) login(uid uint32) error {
+	// Before user@<uid> starts: the keyring's first connect, and every bus connect, find it ready.
+	s.secrets.login(uid)
 	paths := runtimePathsFor(s.cfg.Load(), uid)
 	if len(paths) == 0 {
 		return nil
@@ -279,6 +285,7 @@ func (s *loginServer) login(uid uint32) error {
 
 // logout reloads when one of uid's runtime directories went with its mount, so the reload drops it.
 func (s *loginServer) logout(uid uint32) error {
+	s.secrets.logout(uid)
 	resources := s.uc.Resources()
 	for i := range resources {
 		r := &resources[i]
