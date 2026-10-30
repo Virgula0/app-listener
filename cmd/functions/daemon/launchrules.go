@@ -2,11 +2,13 @@ package daemon
 
 import (
 	"path/filepath"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/logging"
 )
 
@@ -51,4 +53,25 @@ func binaryLaunchRules(cfg *daemonconfig.Config, b daemonconfig.BinaryRule, used
 		}
 	}
 	return rules
+}
+
+// allowedEnv returns the built-in and allow_env NAME=/path strings whose path only root decides
+// (ebpf.RootPlacedName): a value a user can fill would let a caller pick the CA bundle again.
+func allowedEnv(cfg *daemonconfig.Config) []string {
+	var out []string
+	for _, a := range guard.BuiltinAllowedEnv() {
+		if _, p, _ := strings.Cut(a, "="); ebpf.RootPlacedName(p) == nil {
+			out = append(out, a)
+		}
+	}
+	for _, a := range cfg.AllowEnv {
+		_, p, _ := strings.Cut(a, "=")
+		if err := ebpf.RootPlacedName(p); err != nil {
+			log.Warnf("daemon: [launch_rules] allow_env %s refused, launches setting it stay marked: %v",
+				logging.SanitizeText(a), logging.SanitizeText(err.Error()))
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }

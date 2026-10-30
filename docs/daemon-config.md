@@ -142,6 +142,7 @@ built-in ones:
 deny_args /usr/bin/gh repo delete
 warn_args /usr/bin/kubectl config view --raw
 deny_env /usr/bin/kubectl HTTPS_PROXY
+allow_env SSL_CERT_FILE=/etc/corp/ca-bundle.pem
 ```
 
 - `deny_args <binary> <word>...` marks a launch whose arguments hold the 1 to 4 words in this order,
@@ -149,6 +150,12 @@ deny_env /usr/bin/kubectl HTTPS_PROXY
   without a value. Words are at most 43 bytes.
 - `deny_env <binary> <NAME>` marks a launch with that variable set.
 - `warn_args` and `warn_env` only log the match (`ARGV comm=... word=...`).
+- `allow_env <NAME>=<path>`: no env rule on `NAME` matches when the value is exactly this one
+  clean absolute path (no `:`, at most 63 bytes in all), for every binary. Use it for a corporate CA
+  bundle passed in `SSL_CERT_FILE`. The daemon accepts it only when root decides what the path
+  holds: every directory on the way and the file (or, for a directory, everything in it) root-owned
+  and writable by no one else, outside user homes, on a mount without `nosuid`. Otherwise it logs
+  `allow_env ... refused` and launches setting it stay marked.
 - The binary is a whitelisted line, as written or its symlink's target; a rule naming any other
   path does nothing and is logged. At most 16 argument rules per binary, built-ins included.
 - A rule can only refuse more: it is a tripwire, never a boundary (see

@@ -359,18 +359,21 @@ struct {
 // entry's value has bit rule*ARGV_WORDS+pos set for each rule word it is; a rule matches once its
 // words appear in argv in order, others between (unanchored: a global flag taking a separate value
 // would shift any anchor). A word starting with '-' is compared up to '='. An ARGV_ENV entry matches
-// when the variable is set (value ARGV_DENY or ARGV_WARN). Filled by userspace (guard/trust_argv.go).
+// when the variable is set (value ARGV_DENY or ARGV_WARN), unless the whole NAME=value string is an
+// ARGV_ENV_OK entry (a root-owned CA bundle). Filled by userspace (guard/trust_argv.go).
 #define ARGV_RULES 16
 #define ARGV_WORDS 4
 #define ARGV_WORD 1
 #define ARGV_ENV 2
+#define ARGV_ENV_OK 3
 #define ARGV_DENY 1
 #define ARGV_WARN 2
+#define ARGV_KEY 64
 
 struct argv_key {
 	__u32 set;
 	__u32 kind;
-	char name[LAUNCH_KEY];
+	char name[ARGV_KEY];
 };
 
 struct {
@@ -1564,15 +1567,15 @@ static __always_inline long launch_token(struct launch_scan *s)
 	return 0;
 }
 
-// argv_rule_at reads buf's word (a flag or an ENV name up to '=') into s->akey and looks it up. A word
-// too long for the key matches nothing.
+// argv_rule_at reads buf's word (a flag or an ENV name up to '=', an ENV_OK whole) into s->akey and
+// looks it up. A word too long for the key matches nothing.
 static __noinline __u64 *argv_rule_at(struct launch_scan *s, __u32 kind)
 {
 	int done = 0;
-	int cut = kind == ARGV_ENV || s->buf[0] == '-';
+	int cut = kind == ARGV_ENV || (kind == ARGV_WORD && s->buf[0] == '-');
 	s->akey.set = s->set;
 	s->akey.kind = kind;
-	for (int j = 0; j < LAUNCH_KEY; j++) {
+	for (int j = 0; j < ARGV_KEY; j++) {
 		char c = 0;
 		if (!done) {
 			c = s->buf[j];
@@ -1601,7 +1604,7 @@ static __always_inline void argv_matched(struct launch_scan *s, int warn)
 	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
 	e->kind = warn ? TRUST_ARGV_WARN : TRUST_ARGV_MATCH;
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
-	bpf_probe_read_kernel_str(e->path, LAUNCH_KEY, s->akey.name);
+	bpf_probe_read_kernel_str(e->path, ARGV_KEY, s->akey.name);
 	bpf_ringbuf_submit(e, 0);
 }
 
@@ -1623,8 +1626,12 @@ static __noinline void argv_word(struct launch_scan *s)
 	}
 }
 
+// argv_env judges an env string. ENV_OK is looked up first so the key a match reports is the NAME
+// alone: a value may be a secret.
 static __noinline void argv_env(struct launch_scan *s)
 {
+	if (argv_rule_at(s, ARGV_ENV_OK))
+		return;
 	__u64 *m = argv_rule_at(s, ARGV_ENV);
 	if (m)
 		argv_matched(s, *m == ARGV_WARN);

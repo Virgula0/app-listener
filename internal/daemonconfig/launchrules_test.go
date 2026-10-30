@@ -10,7 +10,7 @@ import (
 func TestLaunchRulesBlockParsed(t *testing.T) {
 	cfg, err := Load(writeConfig(t, "[launch_rules]\ndeny_args /usr/bin/gh repo   delete\n"+
 		"warn_args \"/opt/my tool/cli\" export --all\ndeny_env /usr/bin/kubectl HTTPS_PROXY\n"+
-		"warn_env /usr/bin/x/../kubectl KUBECONFIG\n"))
+		"warn_env /usr/bin/x/../kubectl KUBECONFIG\nallow_env SSL_CERT_FILE=/etc/corp/ca.pem\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -22,6 +22,9 @@ func TestLaunchRulesBlockParsed(t *testing.T) {
 	}
 	if !slices.EqualFunc(cfg.LaunchRules, want, LaunchRule.Same) {
 		t.Fatalf("LaunchRules = %+v", cfg.LaunchRules)
+	}
+	if !slices.Equal(cfg.AllowEnv, []string{"SSL_CERT_FILE=/etc/corp/ca.pem"}) {
+		t.Fatalf("AllowEnv = %v", cfg.AllowEnv)
 	}
 }
 
@@ -37,6 +40,13 @@ func TestLaunchRulesBlockRejectsMalformedLines(t *testing.T) {
 		"bad env name":      "deny_env /usr/bin/gh 1PROXY",
 		"env with value":    "deny_env /usr/bin/gh A=b",
 		"duplicate":         "deny_args /usr/bin/gh auth token\ndeny_args /usr/bin/gh auth token",
+		"allow no value":    "allow_env SSL_CERT_FILE",
+		"allow relative":    "allow_env SSL_CERT_FILE=ca.pem",
+		"allow unclean":     "allow_env SSL_CERT_FILE=/etc/../tmp/ca.pem",
+		"allow list":        "allow_env SSL_CERT_DIR=/etc/ssl/certs:/tmp",
+		"allow two":         "allow_env SSL_CERT_FILE=/a /b",
+		"allow long":        "allow_env SSL_CERT_FILE=/" + strings.Repeat("c", MaxAllowEnvLen),
+		"allow duplicate":   "allow_env SSL_CERT_FILE=/a\nallow_env SSL_CERT_FILE=/a",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Load(writeConfig(t, "[launch_rules]\n"+line+"\n")); err == nil {

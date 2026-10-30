@@ -118,7 +118,7 @@ func (t *TrustGuard) AllowReplacement(path string, f *os.File, old, newKey Guard
 	}
 	// A new install: nothing to inherit. Protection #1 exempts system files, so only the library
 	// allowlist (TRUSTED_BINARY) applies, and its launch rules (row before the flag).
-	if id, ok, err := t.launchSet(path, f); err != nil || (ok && t.objs.GuardBinRules.Put(nk, id) != nil) {
+	if id, ok, err := t.launchSet(path); err != nil || (ok && t.objs.GuardBinRules.Put(nk, id) != nil) {
 		log.Warnf("trust guard: system binary %s not admitted: its launch rules could not be set", path)
 		return false
 	}

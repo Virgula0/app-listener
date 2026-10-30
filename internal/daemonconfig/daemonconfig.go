@@ -40,6 +40,9 @@ type Config struct {
 	ElectronApps []string
 	// LaunchRules are the [launch_rules] lines (LaunchRule).
 	LaunchRules []LaunchRule
+	// AllowEnv are the [launch_rules] allow_env NAME=/path strings no env rule matches; root
+	// placement is the daemon's to check.
+	AllowEnv []string
 	// RuntimePaths are the `runtime: true` section roots, present or not: the daemon creates a
 	// missing one at its user's login (`daemon login`), before any of the user's processes run.
 	RuntimePaths []string

@@ -162,8 +162,14 @@ whitelisted file's name:
   `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag (it reads the method from stdin).
 - `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,
   `fundchannel`, `multifundchannel`, `close`, `exposesecret`.
-- Every whitelisted Go binary: `SSL_CERT_FILE` or `SSL_CERT_DIR` set, which would make it trust a
-  certificate its caller chose and send its token to that server.
+- Every whitelisted binary: `SSL_CERT_FILE` or `SSL_CERT_DIR` set, which would make its TLS stack
+  (Go, OpenSSL, GnuTLS) trust a certificate its caller chose and send its token to that server.
+  A value that is exactly a distribution's system bundle passes (`/etc/ssl/certs/ca-certificates.crt`,
+  `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`,
+  `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
+  `/etc/ca-certificates/extracted/tls-ca-bundle.pem`; directories `/etc/ssl/certs`,
+  `/etc/pki/tls/certs`), as does one you add with `allow_env`, when only root decides what the path
+  holds. A match logs the variable's name only, never its value.
 
 A rule's words match in order anywhere in the arguments, with anything between them, so a flag's
 value can't split them (`gh auth --hostname x token`). Add your own with

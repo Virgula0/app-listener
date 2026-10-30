@@ -74,9 +74,10 @@ type TrustGuard struct {
 	apps   map[string]bool
 	// rootWriterMu serializes WithRootWriter: a nested caller must not delete the row early.
 	rootWriterMu sync.Mutex
-	// argvByPath: SetLaunchRules; argvSets: canonical rule set -> its trust_argv set id.
+	// argvByPath, allowEnv: SetLaunchRules; argvSets: canonical rule set -> its trust_argv set id.
 	argvMu     sync.Mutex
 	argvByPath map[string][]daemonconfig.LaunchRule
+	allowEnv   []string
 	argvSets   map[string]uint64
 }
 
@@ -193,7 +194,7 @@ func (t *TrustGuard) trustBinaries(binaries []string, flags map[GuardInodeKey]ui
 		}
 		k := GuardInodeKey{Dev: dev, Ino: ino}
 		flags[k] |= trustedBinary | runtimeClass(f, b)
-		id, ok, err := t.launchSet(b, f)
+		id, ok, err := t.launchSet(b)
 		f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("launch rules of %s: %w", b, err)

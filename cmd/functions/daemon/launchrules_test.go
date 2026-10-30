@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"os"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
@@ -38,5 +41,20 @@ func TestLaunchRulesByPath(t *testing.T) {
 	}
 	if len(got) != 3 {
 		t.Errorf("binaries without rules are left out: %v", got)
+	}
+}
+
+func TestAllowedEnvKeepsOnlyRootPlaced(t *testing.T) {
+	cfg := &daemonconfig.Config{AllowEnv: []string{
+		"SSL_CERT_FILE=/etc/passwd", "SSL_CERT_FILE=" + t.TempDir() + "/ca.pem", "SSL_CERT_DIR=/tmp",
+	}}
+	got := allowedEnv(cfg)
+	if !slices.Contains(got, "SSL_CERT_FILE=/etc/passwd") {
+		t.Errorf("a root-placed allow_env is dropped: %v", got)
+	}
+	for _, a := range got {
+		if strings.HasPrefix(a, "SSL_CERT_DIR=/tmp") || strings.Contains(a, os.TempDir()) {
+			t.Errorf("a user-fillable path is allowed: %s", a)
+		}
 	}
 }

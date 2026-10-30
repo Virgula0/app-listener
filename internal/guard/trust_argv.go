@@ -1,9 +1,7 @@
 package guard
 
 import (
-	"debug/elf"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 
@@ -17,6 +15,7 @@ import (
 const (
 	argvWord    uint32 = 1
 	argvEnv     uint32 = 2
+	argvEnvOK   uint32 = 3
 	argvDeny    uint64 = 1
 	argvWarn    uint64 = 2
 	argvRules          = daemonconfig.MaxLaunchRules
@@ -55,29 +54,32 @@ var builtinLaunchRules = func() map[string][]daemonconfig.LaunchRule {
 	}
 }()
 
-// goEnvRules: crypto/x509 trusts SSL_CERT_FILE / SSL_CERT_DIR, so a caller setting either makes a
-// whitelisted Go CLI hand its token to a TLS server it chose.
-var goEnvRules = []daemonconfig.LaunchRule{{Env: "SSL_CERT_FILE"}, {Env: "SSL_CERT_DIR"}}
+// caEnvRules: Go's crypto/x509, OpenSSL and GnuTLS trust SSL_CERT_FILE / SSL_CERT_DIR, so a caller
+// setting either makes a whitelisted client hand its token to a TLS server it chose. Every whitelisted
+// binary gets them; a value naming a root-placed bundle (SetLaunchRules' allowEnv) passes.
+var caEnvRules = []daemonconfig.LaunchRule{{Env: "SSL_CERT_FILE"}, {Env: "SSL_CERT_DIR"}}
+
+// builtinAllowedEnv: the distributions' system CA bundles.
+var builtinAllowedEnv = []string{
+	"SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+	"SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt",
+	"SSL_CERT_FILE=/etc/ssl/ca-bundle.pem",
+	"SSL_CERT_FILE=/etc/ssl/cert.pem",
+	"SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+	"SSL_CERT_FILE=/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+	"SSL_CERT_DIR=/etc/ssl/certs",
+	"SSL_CERT_DIR=/etc/pki/tls/certs",
+}
 
 // BuiltinLaunchRules returns a copy of the built-in rules for a whitelisted binary named name.
 func BuiltinLaunchRules(name string) []daemonconfig.LaunchRule {
 	return slices.Clone(builtinLaunchRules[name])
 }
 
-// isGoBinary: a Go executable carries .go.buildinfo (runtime/debug reads it), stripped or not. f may
-// be an O_PATH fd (OpenConfined): read through a reopen of that inode, as scanRuntimeClass does.
-func isGoBinary(f *os.File) bool {
-	r, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
-	if err != nil {
-		return false
-	}
-	defer r.Close()
-	ef, err := elf.NewFile(r)
-	if err != nil {
-		return false
-	}
-	defer ef.Close()
-	return ef.Section(".go.buildinfo") != nil
+// BuiltinAllowedEnv returns a copy of the built-in NAME=value strings no env rule matches; the
+// caller vets each path as it does allow_env lines.
+func BuiltinAllowedEnv() []string {
+	return slices.Clone(builtinAllowedEnv)
 }
 
 type argvEntry struct {
@@ -87,19 +89,23 @@ type argvEntry struct {
 
 // encodeLaunchSet lays rules out as trust_argv entries and their trust_argv_sets row: argv rule i's
 // word j sets bit i*argvWords+j of that word's entry; an env name maps to argvDeny, or argvWarn when
-// every rule naming it only warns. rules must be canonical (canonLaunchRules).
-func encodeLaunchSet(rules []daemonconfig.LaunchRule) (map[argvEntry]uint64, GuardTrustArgvSet, error) {
+// every rule naming it only warns; each allowed NAME=value is an argvEnvOK entry. rules must be
+// canonical (canonLaunchRules).
+func encodeLaunchSet(rules []daemonconfig.LaunchRule, allowed []string) (map[argvEntry]uint64,
+	GuardTrustArgvSet, error) {
 	words := map[argvEntry]uint64{}
+	for _, a := range allowed {
+		words[argvEntry{argvEnvOK, a}] = 1
+	}
 	var set GuardTrustArgvSet
 	i := 0
 	for _, r := range rules {
 		if r.Env != "" {
-			e := argvEntry{argvEnv, r.Env}
-			if !r.Warn || words[e] == 0 {
+			switch e := (argvEntry{argvEnv, r.Env}); {
+			case !r.Warn:
 				words[e] = argvDeny
-				if r.Warn {
-					words[e] = argvWarn
-				}
+			case words[e] == 0:
+				words[e] = argvWarn
 			}
 			continue
 		}
@@ -121,46 +127,54 @@ func encodeLaunchSet(rules []daemonconfig.LaunchRule) (map[argvEntry]uint64, Gua
 	return words, set, nil
 }
 
-// canonLaunchRules dedupes and orders rules, returning them with the key naming their set.
-func canonLaunchRules(rules []daemonconfig.LaunchRule) (canon []daemonconfig.LaunchRule, key string) {
+// canonLaunchRules dedupes and orders rules and the allowed NAME=value strings of the variables they
+// name, returning both with the key naming their set.
+func canonLaunchRules(rules []daemonconfig.LaunchRule, allowEnv []string) (canon []daemonconfig.LaunchRule,
+	allowed []string, key string) {
 	enc := func(r daemonconfig.LaunchRule) string {
 		return fmt.Sprintf("%s\x00%t\x00%s", r.Env, r.Warn, strings.Join(r.Words, "\x00"))
 	}
 	canon = slices.Clone(rules)
 	slices.SortFunc(canon, func(a, b daemonconfig.LaunchRule) int { return strings.Compare(enc(a), enc(b)) })
 	canon = slices.CompactFunc(canon, func(a, b daemonconfig.LaunchRule) bool { return enc(a) == enc(b) })
-	keys := make([]string, len(canon))
-	for i, r := range canon {
-		keys[i] = enc(r)
+	keys := make([]string, 0, len(canon)+len(allowEnv))
+	for _, r := range canon {
+		keys = append(keys, enc(r))
 	}
-	return canon, strings.Join(keys, "\x01")
+	for _, a := range allowEnv {
+		name, _, _ := strings.Cut(a, "=")
+		if slices.ContainsFunc(canon, func(r daemonconfig.LaunchRule) bool { return r.Env == name }) {
+			allowed = append(allowed, a)
+		}
+	}
+	slices.Sort(allowed)
+	allowed = slices.Compact(allowed)
+	for _, a := range allowed {
+		keys = append(keys, "\x02"+a)
+	}
+	return canon, allowed, strings.Join(keys, "\x01")
 }
 
 // SetLaunchRules sets each whitelisted binary's argv/env rules by resolved path, applied by the next
-// SetTrusted and by live admissions. A Go binary also gets goEnvRules.
-func (t *TrustGuard) SetLaunchRules(byPath map[string][]daemonconfig.LaunchRule) {
+// SetTrusted and by live admissions; every binary also gets caEnvRules. allowEnv: the vetted
+// NAME=value strings no env rule matches.
+func (t *TrustGuard) SetLaunchRules(byPath map[string][]daemonconfig.LaunchRule, allowEnv []string) {
 	t.argvMu.Lock()
 	defer t.argvMu.Unlock()
 	t.argvByPath = byPath
+	t.allowEnv = allowEnv
 }
 
-// launchSet returns the trust_argv set of the binary f holds at path, writing a new set first; ok
-// false: no rules. Sets are never rewritten nor reused, so a row always names the rules it was given.
-func (t *TrustGuard) launchSet(path string, f *os.File) (id uint64, ok bool, err error) {
+// launchSet returns the trust_argv set of the binary at path, writing a new set first; ok false: its
+// rules don't fit. Sets are never rewritten nor reused, so a row always names the rules it was given.
+func (t *TrustGuard) launchSet(path string) (id uint64, ok bool, err error) {
 	t.argvMu.Lock()
 	defer t.argvMu.Unlock()
-	rules := slices.Clone(t.argvByPath[path])
-	if isGoBinary(f) {
-		rules = append(rules, goEnvRules...)
-	}
-	if len(rules) == 0 {
-		return 0, false, nil
-	}
-	rules, canon := canonLaunchRules(rules)
+	rules, allowed, canon := canonLaunchRules(append(slices.Clone(t.argvByPath[path]), caEnvRules...), t.allowEnv)
 	if known, ok := t.argvSets[canon]; ok {
 		return known, true, nil
 	}
-	words, set, err := encodeLaunchSet(rules)
+	words, set, err := encodeLaunchSet(rules, allowed)
 	if err != nil {
 		log.Errorf("trust guard: launch rules of %s not applied: %v", logging.SanitizeText(path), err)
 		return 0, false, nil
