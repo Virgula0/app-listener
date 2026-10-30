@@ -13,6 +13,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
 )
 
@@ -33,6 +34,10 @@ type CandidateDir struct {
 	// holds RuntimeIf. Set instead of RelPaths/AbsPaths.
 	RuntimeDir string
 	RuntimeIf  string
+	// Ports are loopback TCP ports the entry's server listens on, each guarded as a `[port tcp/<n>]`
+	// section: MKNOD for the binaries that serve it, CONNECT for its clients. Offered for a user
+	// with one of the Whitelist binaries. Set instead of RelPaths/AbsPaths.
+	Ports []uint16
 	// Whitelist maps binary paths to allowed events (nil = all, emitted bare; else "<path>
 	// EV1,EV2"); matched by inode. Keep it minimal: each entry is a potential privilege-escalation
 	// path while the directory is unlocked. Shared (union) across an entry's RelPaths.
@@ -190,6 +195,13 @@ var Catalog = []CandidateDir{
 			"%HOME%/.local/bin/opencode": nil,
 		},
 		BunLaunchers: []string{"opencode"}},
+	// `opencode serve` (default port) drives the agent with the user's provider credentials and
+	// has no authentication. The TUI's own server takes a random port, which no section can name.
+	{Name: "opencode server", Ports: []uint16{4096},
+		Whitelist: map[string][]string{
+			"/usr/local/bin/opencode": {"MKNOD", "CONNECT"}, "/usr/bin/opencode": {"MKNOD", "CONNECT"},
+			"%HOME%/.local/bin/opencode": {"MKNOD", "CONNECT"},
+		}},
 	{Name: "code CLI (GitHub)", RelPaths: []string{".config/code-cli"},
 		Whitelist: map[string][]string{
 			"/usr/bin/code-cli": nil, "/usr/local/bin/code-cli": nil,
@@ -312,6 +324,16 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/dbeaver": nil, "/usr/lib/dbeaver/dbeaver": nil}},
 	{Name: "Android adb keys", RelPaths: []string{".android"},
 		Whitelist: map[string][]string{"/usr/bin/adb": nil}},
+	// The adb server has no authentication: whoever reaches it drives every connected device (shell,
+	// pull). adb is both server and client; Android Studio's bundled java talks to it directly.
+	{Name: "adb server", Ports: []uint16{5037},
+		Whitelist: map[string][]string{
+			"/usr/bin/adb":                          {"MKNOD", "CONNECT"},
+			"/opt/android-sdk/platform-tools/adb":   {"MKNOD", "CONNECT"},
+			"%HOME%/Android/Sdk/platform-tools/adb": {"MKNOD", "CONNECT"},
+			"/opt/android-studio/jbr/bin/java":      {"CONNECT"},
+			"%HOME%/android-studio/jbr/bin/java":    {"CONNECT"},
+		}},
 
 	// --- Cloud, containers and dev tooling --------------------------------------
 	{Name: "AWS credentials", RelPaths: []string{".aws"},
@@ -345,6 +367,12 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/rclone": nil}},
 	{Name: "Ollama config", RelPaths: []string{".ollama"},
 		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
+	// No authentication: any local process can run, pull or delete models. Other clients (a web UI,
+	// an editor plugin) need their own CONNECT line.
+	{Name: "Ollama API", Ports: []uint16{11434},
+		Whitelist: map[string][]string{
+			"/usr/bin/ollama": {"MKNOD", "CONNECT"}, "/usr/local/bin/ollama": {"MKNOD", "CONNECT"},
+		}},
 	// No npm entry: npm runs as node, and whitelisting node lets `node -e` read the tree (issue #79).
 	// pip is a #!/usr/bin/python script (never matches, like gcloud).
 	{Name: "pip config", RelPaths: []string{".config/pip"},
@@ -387,6 +415,22 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil}},
 	{Name: "Litecoin Core RPC cookie", RelPaths: []string{".litecoin/rpc"},
 		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil, "/usr/bin/litecoin-cli": nil}},
+	// RPC over loopback TCP (mainnet, testnet3, regtest; signet and testnet4 sit in the default
+	// ephemeral range). With rpcuser/rpcpassword in bitcoin.conf a client needs no cookie at all,
+	// and a process listening on a stopped node's port collects the credentials clients send.
+	{Name: "Bitcoin Core RPC port", Ports: []uint16{8332, 18332, 18443},
+		Whitelist: map[string][]string{
+			"/usr/bin/bitcoind": {"MKNOD"}, "/usr/bin/bitcoin-qt": {"MKNOD"},
+			"/usr/bin/bitcoin-node": {"MKNOD"}, "/usr/bin/bitcoin-gui": {"MKNOD"},
+			"/usr/bin/bitcoin-cli":    {"CONNECT"},
+			"/usr/local/bin/bitcoind": {"MKNOD"}, "/usr/local/bin/bitcoin-qt": {"MKNOD"},
+			"/usr/local/bin/bitcoin-cli": {"CONNECT"},
+		}},
+	{Name: "Litecoin Core RPC port", Ports: []uint16{9332, 19332, 19443},
+		Whitelist: map[string][]string{
+			"/usr/bin/litecoind": {"MKNOD"}, "/usr/bin/litecoin-qt": {"MKNOD"},
+			"/usr/bin/litecoin-cli": {"CONNECT"},
+		}},
 	{Name: "Monero", RelPaths: []string{".bitmonero/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/monero-wallet-gui": nil, "/usr/bin/monero-wallet-cli": nil, "/usr/bin/monerod": nil}},
 	// A Python app: its lines never match (see Google Cloud SDK).
@@ -871,6 +915,16 @@ type Candidate struct {
 	User  User
 	Entry CandidateDir
 	Path  string
+	// Port is a Ports entry's port (Path is then its anchor).
+	Port uint16
+}
+
+// Label names the candidate in a picker: its path, or tcp/<port>.
+func (c *Candidate) Label() string {
+	if c.Port != 0 {
+		return fmt.Sprintf("tcp/%d", c.Port)
+	}
+	return c.Path
 }
 
 // Discover probes the catalog for a user, returning existing per-user paths (AbsPaths skipped: see
@@ -906,6 +960,30 @@ func DiscoverRuntime(users []User) []Candidate {
 			}
 			if _, err := os.Lstat(filepath.Join(u.Home, entry.RuntimeIf)); err == nil {
 				out = append(out, Candidate{User: u, Entry: *entry, Path: entry.RuntimePath(u)})
+			}
+		}
+	}
+	return out
+}
+
+// DiscoverPorts proposes each Ports entry's ports for every user with one of its binaries (a %HOME%
+// line expands per user). Candidates of one port become one section (install's
+// sectionsFromCandidates merges their whitelists).
+func DiscoverPorts(users []User) []Candidate {
+	var out []Candidate
+	for i := range Catalog {
+		entry := &Catalog[i]
+		if len(entry.Ports) == 0 {
+			continue
+		}
+		for _, u := range users {
+			c := Candidate{User: u, Entry: *entry}
+			if len(c.FilterExistingWhitelist()) == 0 {
+				continue
+			}
+			for _, p := range entry.Ports {
+				c.Path, c.Port = daemonconfig.PortAnchor(p), p
+				out = append(out, c)
 			}
 		}
 	}

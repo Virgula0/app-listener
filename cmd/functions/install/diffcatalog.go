@@ -3,6 +3,7 @@ package install
 import (
 	"fmt"
 	"os"
+	"slices"
 
 	log "github.com/sirupsen/logrus"
 
@@ -147,7 +148,7 @@ func addedResources(prev, merged *daemonconfig.Config) *daemonconfig.Config {
 // path/encryption root nor nested with one (either direction): what a diff would propose adding.
 func uncoveredCandidates(cfg *daemonconfig.Config, users []inst.User) []inst.Candidate {
 	covered := inst.CoveredPaths(cfg)
-	all := append(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users)...)
+	all := slices.Concat(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users), inst.DiscoverPorts(users))
 	var fresh []inst.Candidate
 	for i := range all {
 		if !inst.PathCovered(all[i].Path, covered) {

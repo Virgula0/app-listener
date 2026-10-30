@@ -73,13 +73,17 @@ func (s *IntegrationSuite) startDaemon(c testcontainers.Container, config string
 	s.awaitDaemonUp(c, config)
 }
 
-// watchPathsInConfig extracts every "[watch <path>]" section header's path
-// from a daemon.conf, in order, for awaitDaemonUp to wait on each one's own
+// watchPathsInConfig extracts every "[watch <path>]" section header's path (a "[port tcp/<n>]"
+// section's anchor) from a daemon.conf, in order, for awaitDaemonUp to wait on each one's own
 // "guard started" line individually rather than stopping at the first.
 func watchPathsInConfig(config string) []string {
 	var paths []string
 	for line := range strings.SplitSeq(config, "\n") {
 		line = strings.TrimSpace(line)
+		if port, ok := strings.CutPrefix(line, "[port tcp/"); ok {
+			paths = append(paths, "/run/app-listener/ports/tcp-"+strings.TrimSuffix(port, "]"))
+			continue
+		}
 		if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
 			continue
 		}

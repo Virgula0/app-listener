@@ -1,6 +1,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 #include <errno.h>
 #include "inode_dev.h"
 
@@ -28,6 +29,10 @@
 #define FMODE_WRITE 0x2   // file->f_mode: file is open for write (stable across kernels)
 #define PROT_WRITE 0x2    // mmap prot
 #define MAP_SHARED 0x1    // mmap flags
+#define AF_UNIX 1
+#define AF_INET 2
+#define AF_INET6 10
+#define SOL_SOCKET 1
 
 #include "prctl_gate.h"
 
@@ -50,6 +55,8 @@
 #define GUARD_REASON_PROC_MEM 4
 // btrfs ioctl gate denial (btrfs_copy_gate): filesystem-granular like RAW_DEVICE.
 #define GUARD_REASON_BTRFS_IOCTL 5
+// A [port] section's port listened on at a non-loopback address: refused to its MKNOD binaries too.
+#define GUARD_REASON_PORT_ADDR 6
 // Bits 8-15: the trust_code_suspect mark (SUSPECT_*) behind a whitelist denial, logged as PRELOADED /
 // LAUNCH: an LSM chain stops at the first denial, so when the guard runs first the trust object's
 // report never does. Its own byte keeps a gate's label (RAW_DEVICE, BTRFS_IOCTL) in bits 0-7.
@@ -1433,27 +1440,48 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 // as CONNECT by the unix_* and socket_* hooks. The judged dentry is the listener's own bound path
 // (unix_sock.path), so a symlink or hardlink to the socket can't move it out of the tree.
 //
-// guard_unix_conns marks the caller's socket with the resource it was admitted to. A connected fd
-// outlives the exe that connected (exec-inherited, SCM_RIGHTS-passed), so every later message on it
-// is judged by that mark and the exe moving it now. Never by the peer: a server closing its end
-// clears that end's path while its data is still queued for the client. The mark names the
-// resource's watch root, not its slot: a reload moves the resource to a new slot and retires (then
-// reuses) the old one, while guard_inodes' row for the root follows it.
-struct unix_conn {
+// guard_conns marks the caller's socket with the resource it was admitted to (a unix connect, a
+// loopback port's connect or listen). A socket outlives the exe that was admitted (exec-inherited,
+// SCM_RIGHTS-passed), so every later message, accept or zerocopy read on it is judged by that mark
+// and the exe using it now. Never by the peer: a server closing its end clears that end's path
+// while its data is still queued for the client. The mark names the resource's watch root, not its
+// slot: a reload moves the resource to a new slot and retires (then reuses) the old one, while
+// guard_inodes' row for the root follows it. No BPF_F_CLONE: an accepted socket is unmarked.
+struct conn_mark {
 	struct inode_key root;
 	__u32 set;
 	__u32 global; // reached two resources: judged by GUARD_RES_GLOBAL
+	__u32 event;  // EVENT_CONNECT, or EVENT_MKNOD for a port's listener
+	__u32 pad;
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
-	__type(value, struct unix_conn);
-} guard_unix_conns SEC(".maps");
+	__type(value, struct conn_mark);
+} guard_conns SEC(".maps");
 
-// judge_unix_connect judges sk reaching peer's bound socket and marks sk on admission. Unmarkable =
-// denied: an unmarked connection's messages would go unjudged.
+// mark_conn records sk's admission to res. Unmarkable = denied: an unmarked socket's later use
+// would go unjudged.
+static __always_inline int mark_conn(struct sock *sk, __u32 res, __u32 event)
+{
+	struct res_config *cfg = res_cfg(res);
+	if (!sk || !cfg)
+		return -EPERM;
+	struct conn_mark *c = bpf_sk_storage_get(&guard_conns, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!c)
+		return -EPERM;
+	if (c->set && (c->root.dev != cfg->root_dev || c->root.ino != cfg->root_ino))
+		c->global = 1;
+	c->root.dev = cfg->root_dev;
+	c->root.ino = cfg->root_ino;
+	c->event = event;
+	c->set = 1;
+	return 0;
+}
+
+// judge_unix_connect judges sk reaching peer's bound socket and marks sk on admission.
 static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock *sk, struct sock *peer)
 {
 	__u32 res = GUARD_RES_NONE;
@@ -1470,30 +1498,19 @@ static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock 
 	int ret = check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, false, res);
 	if (ret)
 		return ret;
-	struct res_config *cfg = res_cfg(res);
-	if (!sk || !cfg)
-		return -EPERM;
-	struct unix_conn *c = bpf_sk_storage_get(&guard_unix_conns, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
-	if (!c)
-		return -EPERM;
-	if (c->set && (c->root.dev != cfg->root_dev || c->root.ino != cfg->root_ino))
-		c->global = 1;
-	c->root.dev = cfg->root_dev;
-	c->root.ino = cfg->root_ino;
-	c->set = 1;
-	return 0;
+	return mark_conn(sk, res, EVENT_CONNECT);
 }
 
-// judge_unix_msg judges a message on a marked socket. A root no longer in guard_inodes answers to
-// GUARD_RES_GLOBAL (fail closed). The peer's path is display only (read unreferenced, possibly
-// already released); allowed messages are quiet, the connect was logged.
-static __always_inline int judge_unix_msg(struct emit_args *ea, struct sock *sk)
+// judge_conn_use judges a use of a marked socket. A root no longer in guard_inodes answers to
+// GUARD_RES_GLOBAL (fail closed). A unix peer's path is display only (read unreferenced, possibly
+// already released); allowed uses are quiet, the admission was logged.
+static __always_inline int judge_conn_use(struct emit_args *ea, struct sock *sk)
 {
 	struct sock *peer = NULL;
 	struct dentry *dentry = NULL;
 	if (!sk)
 		return 0;
-	struct unix_conn *c = bpf_sk_storage_get(&guard_unix_conns, sk, 0, 0);
+	struct conn_mark *c = bpf_sk_storage_get(&guard_conns, sk, 0, 0);
 	if (!c)
 		return 0;
 	__u32 res = GUARD_RES_GLOBAL;
@@ -1503,10 +1520,119 @@ static __always_inline int judge_unix_msg(struct emit_args *ea, struct sock *sk)
 		if (found)
 			res = *found;
 	}
-	bpf_probe_read_kernel(&peer, sizeof(peer), &((struct unix_sock *)sk)->peer);
-	if (peer)
-		bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
-	return check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, true, res);
+	if (sk->__sk_common.skc_family == AF_UNIX) {
+		bpf_probe_read_kernel(&peer, sizeof(peer), &((struct unix_sock *)sk)->peer);
+		if (peer)
+			bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
+	}
+	return check_and_emit(c->event == EVENT_MKNOD ? EVENT_MKNOD : EVENT_CONNECT, dentry, NULL, false,
+			      NULL, false, true, res);
+}
+
+// Loopback TCP services (`[port tcp/N]`). A port resource's root is a root-owned anchor file the
+// daemon makes for it; guard_ports maps the port to that anchor's key, so a connect or listen
+// resolves to the resource through guard_inodes like a file does, and its mark names the same root.
+// Only sockets in the daemon's network namespace (guard_port_netns) are judged: a container's own
+// loopback is another host's.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, __u32); // TCP port, host order
+	__type(value, struct inode_key);
+} guard_ports SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64); // net namespace inode number; 0 = every namespace
+} guard_port_netns SEC(".maps");
+
+static __always_inline int port_netns_judged(struct sock *sk)
+{
+	__u32 z = 0;
+	__u64 *want = bpf_map_lookup_elem(&guard_port_netns, &z);
+	struct net *net = NULL;
+	unsigned int inum = 0;
+	if (!want || !*want)
+		return 1;
+	if (bpf_probe_read_kernel(&net, sizeof(net), &sk->__sk_common.skc_net.net) || !net ||
+	    bpf_probe_read_kernel(&inum, sizeof(inum), &net->ns.inum))
+		return 1;
+	return inum == *want;
+}
+
+// v4_local: a (network order) address only this host answers on: 127/8, or 0.0.0.0 when wild,
+// which connect(2) routes to loopback.
+static __always_inline int v4_local(__u32 a, bool wild)
+{
+	return (bpf_ntohl(a) >> 24) == 127 || (wild && a == 0);
+}
+
+// v6_local: ::1, ::ffff:<v4_local>, and :: when wild.
+static __always_inline int v6_local(const __u32 *w, bool wild)
+{
+	if (w[0] || w[1])
+		return 0;
+	if (w[2] == bpf_htonl(0xffff))
+		return v4_local(w[3], wild);
+	return !w[2] && (w[3] == bpf_htonl(1) || (wild && !w[3]));
+}
+
+// local_dest_port: the port addr (the kernel's copy) names on this host's loopback, 0 if none.
+// tcp_v6_connect accepts a 24-byte sockaddr_in6 (SIN6_LEN_RFC2133): read no more than that.
+static __always_inline __u32 local_dest_port(struct sockaddr *addr, int len)
+{
+	__u16 fam = 0;
+	if (!addr || len < 2 || bpf_probe_read_kernel(&fam, sizeof(fam), &addr->sa_family))
+		return 0;
+	if (fam == AF_INET) {
+		struct sockaddr_in in = {};
+		if (len < (int)sizeof(in) || bpf_probe_read_kernel(&in, sizeof(in), addr))
+			return 0;
+		return v4_local(in.sin_addr.s_addr, true) ? bpf_ntohs(in.sin_port) : 0;
+	}
+	if (fam == AF_INET6) {
+		struct sockaddr_in6 in6 = {};
+		if (len < 24 || bpf_probe_read_kernel(&in6, 24, addr))
+			return 0;
+		return v6_local(in6.sin6_addr.in6_u.u6_addr32, true) ? bpf_ntohs(in6.sin6_port) : 0;
+	}
+	return 0;
+}
+
+// port_res resolves a guarded port to its resource: GUARD_RES_NONE = not guarded here,
+// GUARD_RES_GLOBAL = guarded but its anchor has no live row (fail closed).
+static __always_inline __u32 port_res(struct sock *sk, __u32 port)
+{
+	if (!port)
+		return GUARD_RES_NONE;
+	struct inode_key *root = bpf_map_lookup_elem(&guard_ports, &port);
+	if (!root || !port_netns_judged(sk))
+		return GUARD_RES_NONE;
+	struct inode_key key = *root;
+	__u32 *found = bpf_map_lookup_elem(&guard_inodes, &key);
+	return found ? *found : GUARD_RES_GLOBAL;
+}
+
+// port_connect_res: the resource an inet stream socket reaches by connecting to addr (connect,
+// io_uring connect, a TCP Fast Open sendto), GUARD_RES_NONE if not a guarded loopback port.
+// sk is sock->sk loaded once by the caller: a re-read is a fresh, unchecked trusted_ptr_or_null.
+static __always_inline __u32 port_connect_res(struct socket *sock, struct sock *sk, struct sockaddr *addr,
+					      int len)
+{
+	if (!sk || sock->type != SOCK_STREAM)
+		return GUARD_RES_NONE;
+	return port_res(sk, local_dest_port(addr, len));
+}
+
+// admit_port judges reaching (CONNECT) or serving (MKNOD) a guarded port and marks sk on admission.
+static __always_inline int admit_port(struct emit_args *ea, struct sock *sk, __u32 res, __u32 event)
+{
+	int ret = check_and_emit(event, NULL, NULL, false, NULL, false, false, res);
+	if (ret)
+		return ret;
+	return mark_conn(sk, res, event);
 }
 
 SEC("lsm/file_open")
@@ -1631,6 +1757,11 @@ int guard_mmap_file(unsigned long long *ctx)
 	if (!file)
 		return 0;
 
+	// A socket mapping is what TCP_ZEROCOPY_RECEIVE maps received pages into.
+	struct socket *sock = bpf_sock_from_file(file);
+	if (sock)
+		return judge_conn_use(ea, sock->sk);
+
 	struct dentry *dentry;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
 	if (!dentry)
@@ -1681,7 +1812,7 @@ int guard_file_permission(unsigned long long *ctx)
 	// rw_verify_area's file_permission sees them.
 	struct socket *sock = bpf_sock_from_file(file);
 	if (sock)
-		return judge_unix_msg(ea, sock->sk);
+		return judge_conn_use(ea, sock->sk);
 
 	if (off_guarded_fs(dentry, inode) || !is_guarded_access(dentry, inode, &res))
 		return 0;
@@ -2405,12 +2536,37 @@ int guard_unix_may_send(unsigned long long *ctx)
 	return judge_unix_connect(&ea_buf, sock->sk, peer);
 }
 
+SEC("lsm/socket_connect")
+int guard_socket_connect(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct socket *sock = (struct socket *)ctx[0];
+	struct sock *sk = sock ? sock->sk : NULL;
+	__u32 res = port_connect_res(sock, sk, (struct sockaddr *)ctx[1], (int)ctx[2]);
+	if (res == GUARD_RES_NONE)
+		return 0;
+	return admit_port(&ea_buf, sk, res, EVENT_CONNECT);
+}
+
+// A sendto with an address on an inet stream socket is a TCP Fast Open connect
+// (tcp_sendmsg_fastopen), which never reaches socket_connect. msg_name is the kernel's copy.
 SEC("lsm/socket_sendmsg")
 int guard_socket_sendmsg(unsigned long long *ctx)
 {
 	struct emit_args ea_buf = {};
 	struct socket *sock = (struct socket *)ctx[0];
-	return judge_unix_msg(&ea_buf, sock->sk);
+	struct msghdr *msg = (struct msghdr *)ctx[1];
+	struct sockaddr *name = NULL;
+	int namelen = 0;
+	if (msg) {
+		bpf_probe_read_kernel(&name, sizeof(name), &msg->msg_name);
+		bpf_probe_read_kernel(&namelen, sizeof(namelen), &msg->msg_namelen);
+	}
+	struct sock *sk = sock ? sock->sk : NULL;
+	__u32 res = name ? port_connect_res(sock, sk, name, namelen) : GUARD_RES_NONE;
+	if (res != GUARD_RES_NONE)
+		return admit_port(&ea_buf, sk, res, EVENT_CONNECT);
+	return judge_conn_use(&ea_buf, sk);
 }
 
 SEC("lsm/socket_recvmsg")
@@ -2418,7 +2574,58 @@ int guard_socket_recvmsg(unsigned long long *ctx)
 {
 	struct emit_args ea_buf = {};
 	struct socket *sock = (struct socket *)ctx[0];
-	return judge_unix_msg(&ea_buf, sock->sk);
+	return judge_conn_use(&ea_buf, sock->sk);
+}
+
+// Only a [port] section's MKNOD binaries listen on its port, and only on loopback: a wildcard or LAN
+// address lets clients in through a destination the connect gate doesn't judge. A listen with no
+// port yet autobinds an ephemeral one, a range the daemon keeps guarded ports out of.
+SEC("lsm/socket_listen")
+int guard_socket_listen(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct socket *sock = (struct socket *)ctx[0];
+	struct sock *sk = sock ? sock->sk : NULL;
+	if (!sk)
+		return 0;
+	__u16 fam = sk->__sk_common.skc_family;
+	if (fam != AF_INET && fam != AF_INET6)
+		return 0;
+	__u32 res = port_res(sk, sk->__sk_common.skc_num);
+	if (res == GUARD_RES_NONE)
+		return 0;
+	__u32 a6[4] = {};
+	int local;
+	if (fam == AF_INET) {
+		local = v4_local(sk->__sk_common.skc_rcv_saddr, false);
+	} else {
+		bpf_probe_read_kernel(a6, sizeof(a6), &sk->__sk_common.skc_v6_rcv_saddr);
+		local = v6_local(a6, false);
+	}
+	if (!local)
+		return emit_process_denial(GUARD_REASON_PORT_ADDR, EVENT_MKNOD, NULL, 0, 0, res);
+	return admit_port(&ea_buf, sk, res, EVENT_MKNOD);
+}
+
+// A port's listener handed to another exe (inherited, SCM_RIGHTS) would collect its clients.
+SEC("lsm/socket_accept")
+int guard_socket_accept(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct socket *sock = (struct socket *)ctx[0];
+	return judge_conn_use(&ea_buf, sock->sk);
+}
+
+// getsockopt(TCP_ZEROCOPY_RECEIVE) reads queued data through tcp_recvmsg_locked, skipping
+// socket_recvmsg: every option of a marked socket's protocol level is judged.
+SEC("lsm/socket_getsockopt")
+int guard_socket_getsockopt(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct socket *sock = (struct socket *)ctx[0];
+	if ((int)ctx[1] == SOL_SOCKET)
+		return 0;
+	return judge_conn_use(&ea_buf, sock->sk);
 }
 
 // No inode_permission hook: its (inode, mask) context has no dentry, so a map hit can't be confined

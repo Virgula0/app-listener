@@ -18,6 +18,9 @@ each, and offers the ones that exist on your host. It covers, among others:
 - **VPNs:** NordVPN, Mullvad, ProtonVPN, OpenVPN, WireGuard
 - **Crypto wallets:** Bitcoin Core and Litecoin Core (wallets and RPC cookie), Monero, Electrum, Sparrow, Wasabi, Ledger Live,
   Trezor Suite, Exodus, Solana CLI, geth, LND, Core Lightning, Foundry
+- **Loopback services** ([port sections](daemon-config.md#port-sections)): Bitcoin Core and
+  Litecoin Core RPC (mainnet, testnet3 and regtest ports), the `adb` server, the Ollama API,
+  `opencode serve`. Offered when one of their binaries is installed.
 
 The catalog narrows each watch to the sensitive subtrees, so apps that update themselves inside
 their own config directory keep working (see below).
@@ -55,6 +58,11 @@ their own config directory keep working (see below).
   that reads the cookie (electrs, LND, Core Lightning's `bcli` runs `bitcoin-cli`), not on
   `wallets`. The node's config file stays writable, so malware can add an `rpcauth` login of its own
   and wait for a restart.
+
+- **Other clients of a guarded port.** A port entry whitelists the service and its own client: a
+  web UI for Ollama, electrs or LND talking to `bitcoind`, an IDE plugin talking to `opencode serve`
+  needs its own `CONNECT` line. Signet and testnet4 RPC ports sit in the default ephemeral range,
+  which the daemon refuses, and `install catalog refresh` leaves port sections as written.
 
 To add catalog directories that appeared after you installed (a newly installed app), run
 `sudo app-listener install catalog diff`.

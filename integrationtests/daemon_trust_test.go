@@ -324,9 +324,12 @@ const (
 
 // reloadAndAwait sends SIGHUP and waits for the reload to commit (trust set included) or be refused.
 func (s *IntegrationSuite) reloadAndAwait(c testcontainers.Container) {
+	// An earlier reload's outcome is already in the log: wait for one more.
+	outcomes := func(l string) int { return strings.Count(l, reloadEnd) + strings.Count(l, reloadRefused) }
+	before := outcomes(s.readDaemonLog(c))
 	s.sigDaemon(c, "HUP")
 	for dl := time.Now().Add(daemonShutdownTimeout); time.Now().Before(dl); {
-		if l := s.readDaemonLog(c); strings.Contains(l, reloadEnd) || strings.Contains(l, reloadRefused) {
+		if outcomes(s.readDaemonLog(c)) > before {
 			return
 		}
 		time.Sleep(300 * time.Millisecond)

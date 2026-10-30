@@ -520,7 +520,8 @@ func (d *daemonUseCase) refuseRemovedResources(resources []daemonconfig.Resource
 		if err != nil {
 			return fmt.Errorf("reload refused: %w", err)
 		}
-		if !released && !runtimeReleased(&d.resources[i]) {
+		// A port section has no vault: dropping it only stops guarding the port.
+		if !released && !runtimeReleased(&d.resources[i]) && d.resources[i].Port == 0 {
 			removed = append(removed, d.resources[i].Path)
 		}
 	}

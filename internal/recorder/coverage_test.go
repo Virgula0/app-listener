@@ -50,6 +50,10 @@ var hookCoverage = map[string]struct {
 	"inode_rename":         {none: "bookkeeping (superseded binary keys)"},
 	"socket_sendmsg":       {none: "messages on a connection, judged as CONNECT: the connect records it"},
 	"socket_recvmsg":       {none: "messages on a connection, judged as CONNECT: the connect records it"},
+	"socket_accept":        {none: "accepts on a [port] listener, judged as its MKNOD: the listen admits it"},
+	"socket_getsockopt":    {none: "zerocopy reads on a connection, judged as CONNECT: the connect records it"},
+	"socket_connect":       {none: "[port] sections only: a recording targets a path, a port's clients are listed by hand"},
+	"socket_listen":        {none: "[port] sections only: a recording targets a path, a port's server is listed by hand"},
 }
 
 func readSource(t *testing.T, path string) string {

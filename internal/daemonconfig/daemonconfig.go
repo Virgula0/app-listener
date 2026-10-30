@@ -109,6 +109,8 @@ type Resource struct {
 	// Runtime is a `runtime: true` section: a directory in a user's /run/user/<uid> (an agent's
 	// sockets), unencrypted, gone at logout. Its root may vanish with the mount (RuntimeDirFor).
 	Runtime bool
+	// Port is a `[port tcp/<n>]` section's TCP port; Path is then its anchor (PortAnchor).
+	Port uint16
 }
 
 // MovePeer is a lib_dir's move-peer class: lib_dirs with the same configured writers (paths, links,
@@ -217,7 +219,9 @@ type watchGroup struct {
 	// settingsBlock marks a [settings] block: daemon-wide `key: value` lines.
 	settingsBlock bool
 	// runtime: `runtime: true`, read even in a skipped group (RuntimePaths lists it either way).
-	runtime       bool
+	runtime bool
+	// port: a [port tcp/<n>] section (ports.go).
+	port          uint16
 	encryptionSet bool
 	blockName     string
 	// skipped marks a section whose root is missing: its directives are warned and ignored, never
@@ -308,8 +312,8 @@ func parseConfig(cfg *Config, file io.Reader) error {
 // applyConfigLine dispatches one line: section headers close the previous group and open a new one;
 // directives mutate the open group.
 func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) error {
-	if next := openBlock(cfg, line, lineNo); next != nil {
-		return switchGroup(cfg, group, next)
+	if opened, err := openHeader(cfg, group, line, lineNo); opened {
+		return err
 	}
 	dirPath, isSection, headerErr := parseWatchSection(line)
 	if headerErr != nil {
@@ -359,6 +363,21 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 		return nil
 	}
 	return applyDirective(g, line, lineNo)
+}
+
+// openHeader switches to the group a block or [port] header opens; false for any other line.
+func openHeader(cfg *Config, group **watchGroup, line string, lineNo int) (bool, error) {
+	if next := openBlock(cfg, line, lineNo); next != nil {
+		return true, switchGroup(cfg, group, next)
+	}
+	port, ok, err := ParsePortSection(line)
+	if !ok {
+		return false, nil
+	}
+	if err != nil {
+		return true, fmt.Errorf("daemon config line %d: %w", lineNo, err)
+	}
+	return true, switchGroup(cfg, group, &watchGroup{root: PortAnchor(port), port: port, lineNo: lineNo})
 }
 
 // switchGroup finalizes the open group and opens next.
@@ -432,6 +451,9 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 func finalizeGroup(cfg *Config, group *watchGroup) error {
 	if group == nil || group.inspectorsBlock || group.electronAppsBlock || group.launchRulesBlock || group.settingsBlock {
 		return nil
+	}
+	if group.port != 0 {
+		return materializePortGroup(cfg, group)
 	}
 	if group.runtime {
 		if err := checkRuntimeGroup(group); err != nil {

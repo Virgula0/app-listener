@@ -53,6 +53,35 @@ refused) and takes only binary lines: no `watch:`, `lib_dir` or `allow_lib`.
 Give every line an explicit event list, and `DELETE` only to a program that removes its own
 sockets: a program a caller can steer into `rmdir` would let the directory be recreated unguarded.
 
+### Port sections
+
+```ini
+[port tcp/8332]
+/usr/bin/bitcoind MKNOD
+/usr/bin/bitcoin-cli CONNECT
+```
+
+A service on a loopback TCP port (`bitcoind` RPC, the `adb` server, `ollama`) answers any local
+program that can reach it. `[port tcp/<n>]` guards one such port: only `CONNECT` lines may connect
+to it, and only `MKNOD` lines may listen on it, so another program can't take the port while the
+service is stopped and collect the credentials its clients send. A port section takes only binary
+lines, with `CONNECT`, `MKNOD` or no event list.
+
+- **Loopback only.** Connections to `127.0.0.0/8`, `::1`, `0.0.0.0` and `::` (which reach this
+  host's loopback) are judged; connections to other hosts are not. Even a `MKNOD` program is refused
+  when it listens on any other address (`0.0.0.0`, `::`, a LAN address), since clients could then
+  reach it through an address nobody judges. Configure the service to listen on `127.0.0.1` or `::1`.
+- **TCP only, this host's network namespace only.** A container's own loopback is another host's.
+- **Not in the ephemeral range.** The daemon refuses to start with a port the kernel may hand out to
+  any program (`net.ipv4.ip_local_port_range`, by default 32768-60999) unless it is listed in
+  `net.ipv4.ip_local_reserved_ports`.
+- **The connection is guarded, not just the connect.** A connection handed to another program
+  (inherited, passed over a unix socket) is judged again for every message that program sends or
+  receives, as for unix sockets.
+
+The daemon keeps one root-owned anchor file per port in `/run/app-listener/ports` (`tcp-<n>`); its
+events name that path. Removing a port section and reloading stops guarding the port.
+
 ### Several guarded trees, one vault
 
 `watch: <path>` lines inside a section turn the section path into the **encryption root** and each
@@ -63,7 +92,7 @@ lifecycle. Without `watch:` lines the section path itself is the guarded tree.
 
 Valid events: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD, CONNECT`.
 `CONNECT` is connecting, sending or receiving on a unix socket bound inside the tree (an agent or RPC
-socket).
+socket), or on a [port section](#port-sections)'s port. On a port, `MKNOD` is listening on it.
 
 Unlisted events are denied for that binary. `READ`, `WRITE` and `MMAP` imply `OPEN`.
 

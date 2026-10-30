@@ -62,7 +62,14 @@ over a channel the guard doesn't see answers whoever asks:
   hands back.
 - **Local servers.** A service on a loopback port (`bitcoind` RPC on 8332, `ollama` on 11434, `adb`
   on 5037, `opencode serve`) answers any local client that has its credential, or any client when it
-  has none. The guard doesn't judge TCP connections to them.
+  has none, unless a [port section](daemon-config.md#port-sections) guards the port. Even then:
+  - a whitelisted client run by malware still asks on its behalf, as with agents;
+  - connections opened before the daemon started are not judged;
+  - UDP, other hosts and other network namespaces are out of scope;
+  - a socket-activated service is listened on by systemd, which needs `MKNOD` itself;
+  - a port the service picks at random (the opencode TUI's own server) can't be named;
+  - user-mode network stacks (`pasta`, `slirp4netns`) connect as themselves, so a rootless
+    container reaching the host's service needs them whitelisted, which admits every container.
 - **The display.** Under X11, any client can read the clipboard, other windows' contents and
   keystrokes. Wayland compositors isolate clients, but the clipboard is still shared. Neither is in
   scope.

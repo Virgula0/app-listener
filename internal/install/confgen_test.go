@@ -262,3 +262,16 @@ func TestAppendSectionWhitelist(t *testing.T) {
 		t.Fatal("a path that would inject a line must be refused")
 	}
 }
+
+func TestGenerateConfPortSection(t *testing.T) {
+	conf := GenerateConf([]Section{{Port: 5037, Allow: []BinaryRule{
+		{Path: "/usr/bin/true", Events: []string{"MKNOD", "CONNECT"}},
+	}}}, nil)
+	if !strings.Contains(conf, "\n[port tcp/5037]\n") || strings.Contains(conf, "need_encryption") {
+		t.Fatalf("port section:\n%s", conf)
+	}
+	cfg := mustParse(t, conf)
+	if len(cfg.Resources) != 1 || cfg.Resources[0].Port != 5037 || len(cfg.Resources[0].Binaries[0].Events) != 2 {
+		t.Fatalf("resources = %+v", cfg.Resources)
+	}
+}

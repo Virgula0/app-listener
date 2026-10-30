@@ -7,10 +7,12 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 )
 
 // TestCatalogSanity verifies the master list is well-formed: every entry
-// has a name, exactly one non-empty of RelPaths/AbsPaths/RuntimeDir, absolute
+// has a name, exactly one non-empty of RelPaths/AbsPaths/RuntimeDir/Ports, absolute
 // whitelist binaries, WatchRelPaths only with a single RelPaths entry, and
 // no two entries probe the same path.
 func TestCatalogSanity(t *testing.T) {
@@ -20,13 +22,29 @@ func TestCatalogSanity(t *testing.T) {
 			t.Errorf("entry with empty name: %+v", entry)
 		}
 		set := 0
-		for _, n := range []int{len(entry.RelPaths), len(entry.AbsPaths), len(entry.RuntimeDir)} {
+		for _, n := range []int{len(entry.RelPaths), len(entry.AbsPaths), len(entry.RuntimeDir), len(entry.Ports)} {
 			if n > 0 {
 				set++
 			}
 		}
 		if set != 1 {
-			t.Errorf("entry %q must set exactly one of RelPaths, AbsPaths or RuntimeDir", entry.Name)
+			t.Errorf("entry %q must set exactly one of RelPaths, AbsPaths, RuntimeDir or Ports", entry.Name)
+		}
+		for _, p := range entry.Ports {
+			if p >= 32768 {
+				t.Errorf("entry %q: port %d is in the default ephemeral range, which the daemon refuses", entry.Name, p)
+			}
+			if prev, ok := seen[daemonconfig.PortAnchor(p)]; ok {
+				t.Errorf("duplicate catalog port %d (%s and %s)", p, prev, entry.Name)
+			}
+			seen[daemonconfig.PortAnchor(p)] = entry.Name
+		}
+		for bin, events := range entry.Whitelist {
+			for _, e := range events {
+				if len(entry.Ports) > 0 && e != "CONNECT" && e != "MKNOD" {
+					t.Errorf("entry %q: %s %s: a port entry takes CONNECT and MKNOD only", entry.Name, bin, e)
+				}
+			}
 		}
 		if entry.IsRuntime() && (entry.RuntimeIf == "" || filepath.IsAbs(entry.RuntimeIf) ||
 			strings.Contains(entry.RuntimeDir, "/")) {

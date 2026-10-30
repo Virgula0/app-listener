@@ -15,6 +15,8 @@ type Section struct {
 	Encrypt bool
 	// Runtime emits `runtime: true` (a CandidateDir.RuntimeDir; Encrypt must be false).
 	Runtime bool
+	// Port emits a `[port tcp/<n>]` section instead (Path and Encrypt unused).
+	Port uint16
 	// ExtraWatchPaths turns the section into an encryption GROUP: the section path stays the
 	// fscrypt root (its need_encryption governs the group) and each extra path is its own guarded
 	// tree sharing the whitelist, emitted as `watch: <path>`. For self-updating apps whose update
@@ -58,6 +60,11 @@ func GenerateSections(sections []Section) string {
 	var b strings.Builder
 	for i := range sections {
 		s := &sections[i]
+		if s.Port != 0 {
+			fmt.Fprintf(&b, "\n[port tcp/%d]\n\n", s.Port)
+			writeAllow(&b, s.Allow)
+			continue
+		}
 		b.WriteString("\n[watch ")
 		b.WriteString(quotePath(s.Path))
 		b.WriteString("]\n\n")
@@ -72,17 +79,7 @@ func GenerateSections(sections []Section) string {
 		if len(s.ExtraWatchPaths) > 0 {
 			b.WriteString("\n")
 		}
-		for _, bin := range s.Allow {
-			b.WriteString(quotePath(bin.Path))
-			if len(bin.Events) > 0 {
-				b.WriteString(" ")
-				b.WriteString(strings.Join(bin.Events, ","))
-			}
-			b.WriteString("\n")
-		}
-		if len(s.Allow) == 0 {
-			b.WriteString("# no binaries whitelisted: every access is denied\n")
-		}
+		writeAllow(&b, s.Allow)
 		b.WriteString("\n")
 		if s.Encrypt {
 			b.WriteString("need_encryption: true\n")
@@ -91,6 +88,20 @@ func GenerateSections(sections []Section) string {
 		}
 	}
 	return b.String()
+}
+
+func writeAllow(b *strings.Builder, allow []BinaryRule) {
+	for _, bin := range allow {
+		b.WriteString(quotePath(bin.Path))
+		if len(bin.Events) > 0 {
+			b.WriteString(" ")
+			b.WriteString(strings.Join(bin.Events, ","))
+		}
+		b.WriteString("\n")
+	}
+	if len(allow) == 0 {
+		b.WriteString("# no binaries whitelisted: every access is denied\n")
+	}
 }
 
 // SetNeedEncryption updates need_encryption in the [watch path] section of confText, inserting it

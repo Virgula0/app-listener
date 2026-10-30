@@ -78,6 +78,8 @@ type engine struct {
 	inspectors map[GuardInodeKey]string
 	// mcNames: the applets written to guard_multicall_names per multicall inode (ensureMulticall).
 	mcNames map[GuardInodeKey][]string
+	// ports: per guarded TCP port, its live guards (port.go).
+	ports map[uint32][]portOwner
 	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
 	// that registered the backing devices, whose consumer labels them as such. Delivering them to
 	// every guard duplicated each denial and let the self-guards label it with their own path.
@@ -298,6 +300,7 @@ func (e *engine) startLocked() error {
 		e.stopLocked()
 		return err
 	}
+	e.setPortNetNSLocked()
 
 	rd, err := ringbuf.NewReader(e.objs.Rb)
 	if err != nil {
@@ -785,6 +788,7 @@ func (e *engine) stopLocked() {
 	e.prevOwner = nil
 	e.successor = nil
 	e.mcNames = nil
+	e.ports = nil
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.

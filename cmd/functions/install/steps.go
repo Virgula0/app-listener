@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -83,7 +84,7 @@ func groupCandidates(cands []inst.Candidate) []catalogGroup {
 		paths := make([]string, 0, len(idxs))
 		for _, i := range idxs {
 			cs = append(cs, cands[i])
-			paths = append(paths, cands[i].Path)
+			paths = append(paths, cands[i].Label())
 		}
 		label := k.name
 		if k.user != "" {
@@ -102,7 +103,7 @@ func groupCandidates(cands []inst.Candidate) []catalogGroup {
 // pickDirectories probes the catalog for every selected user (plus system entries) and asks which
 // found directories to protect. All preselected.
 func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
-	candidates := append(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users)...)
+	candidates := slices.Concat(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users), inst.DiscoverPorts(users))
 	if len(candidates) == 0 {
 		log.Warn("no catalog directories found for the selected users — you can still add directories manually")
 		return nil, nil
@@ -190,8 +191,24 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 // by default, and the catalog entry's grouped extra watch sub-paths.
 func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
+	portAt := map[uint16]int{}
 	for i := range candidates {
 		c := &candidates[i]
+		if c.Port != 0 {
+			// One section per port: several users' (and entries') binaries share it.
+			at, seen := portAt[c.Port]
+			if !seen {
+				at = len(sections)
+				portAt[c.Port] = at
+				sections = append(sections, inst.Section{Port: c.Port})
+			}
+			for _, rule := range c.FilterExistingWhitelist() {
+				if !slices.ContainsFunc(sections[at].Allow, func(r inst.BinaryRule) bool { return r.Path == rule.Path }) {
+					sections[at].Allow = append(sections[at].Allow, rule)
+				}
+			}
+			continue
+		}
 		sections = append(sections, inst.Section{
 			Path:            c.Path,
 			Allow:           c.FilterExistingWhitelist(),
