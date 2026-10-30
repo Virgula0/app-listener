@@ -1,8 +1,6 @@
 package systemd
 
 import (
-	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -28,32 +26,11 @@ ExecStopPost=-/bin/sh -c '[ ! -x ` + InstallBinaryPath + ` ] || exec ` + Install
 
 // WriteLoginDropIn installs the drop-in unless it is already current; the caller daemon-reloads.
 func WriteLoginDropIn() error {
-	if cur, err := os.ReadFile(LoginDropInFile); err == nil && bytes.Equal(cur, loginDropIn) {
-		return nil
+	written, err := installFile(LoginDropInFile, loginDropIn)
+	if written {
+		log.Infof("installed %s", LoginDropInFile)
 	}
-	if err := os.MkdirAll(filepath.Dir(LoginDropInFile), 0o755); err != nil {
-		return fmt.Errorf("creating %s: %w", filepath.Dir(LoginDropInFile), err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(LoginDropInFile), ".app-listener-dropin-*")
-	if err != nil {
-		return fmt.Errorf("staging %s: %w", LoginDropInFile, err)
-	}
-	defer os.Remove(tmp.Name())
-	_, werr := tmp.Write(loginDropIn)
-	if werr == nil {
-		werr = tmp.Chmod(0o644)
-	}
-	if cerr := tmp.Close(); werr == nil {
-		werr = cerr
-	}
-	if werr != nil {
-		return fmt.Errorf("staging %s: %w", LoginDropInFile, werr)
-	}
-	if err := os.Rename(tmp.Name(), LoginDropInFile); err != nil {
-		return fmt.Errorf("installing %s: %w", LoginDropInFile, err)
-	}
-	log.Infof("installed %s", LoginDropInFile)
-	return nil
+	return err
 }
 
 // LoginDropInInstalled reports whether the drop-in exists.
@@ -64,13 +41,9 @@ func LoginDropInInstalled() bool {
 
 // RemoveLoginDropIn deletes the drop-in and its directory once empty; the caller daemon-reloads.
 func RemoveLoginDropIn() (bool, error) {
-	if err := os.Remove(LoginDropInFile); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("removing %s: %w", LoginDropInFile, err)
+	removed, err := removeFile(LoginDropInFile, true)
+	if removed {
+		log.Infof("removed %s", LoginDropInFile)
 	}
-	_ = os.Remove(filepath.Dir(LoginDropInFile)) // only succeeds when empty
-	log.Infof("removed %s", LoginDropInFile)
-	return true, nil
+	return removed, err
 }

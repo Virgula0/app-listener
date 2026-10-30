@@ -16,6 +16,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/secretgate"
+	"github.com/Virgula0/app-listener/internal/systemd"
 )
 
 // secretRelaySelfEvents is the relay dir guard's self mask: the daemon binds (MKNOD), hands over
@@ -66,13 +67,17 @@ func (j *secretJudge) setConfig(cfg *daemonconfig.Config) {
 	j.scopes.Store(&scopes)
 }
 
-func (j *secretJudge) Attest(pidfd int) (secretgate.Caller, error) { return guard.AttestBusClient(pidfd) }
+func (j *secretJudge) Attest(pidfd int) (secretgate.Caller, error) {
+	return guard.AttestBusClient(pidfd)
+}
 
 func (j *secretJudge) Scopes() []secretgate.Scope { return *j.scopes.Load() }
 
 // RelayGuarded: a relay socket outside a live relay guard would let any of the user's processes
 // connect as the keyring (a root bus connection that may own org.freedesktop.secrets).
-func (j *secretJudge) RelayGuarded() bool { return guard.LiveGuardAt(daemonconfig.SecretRelayDir) != nil }
+func (j *secretJudge) RelayGuarded() bool {
+	return guard.LiveGuardAt(daemonconfig.SecretRelayDir) != nil
+}
 
 func (j *secretJudge) Admits(scope string, c secretgate.Caller, op ebpf.EventType, what string) bool {
 	g := guard.LiveGuardAt(daemonconfig.SecretAnchor(scope))
@@ -144,6 +149,12 @@ func (s *secretGates) setConfig(cfg *daemonconfig.Config) {
 	}
 	s.judge.setConfig(cfg)
 	on := len(cfg.SecretService.Providers) > 0
+	if changed, err := systemd.SyncSecretServiceFiles(on); err != nil {
+		log.Errorf("daemon: CRITICAL: %v — the session bus policy may not match [secret_service]", err)
+	} else if changed && on {
+		log.Warnf("daemon: installed %s and %s: users logged in now must log in again before the "+
+			"Secret Service gate covers their keyring", systemd.SecretBusPolicyFile, systemd.SecretKeyringDropIn)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if on == s.on {

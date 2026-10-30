@@ -59,6 +59,12 @@ func revertSystemFiles(keepGUI bool) error {
 	} else if dropped {
 		removed++
 	}
+	if dropped, err := systemd.SyncSecretServiceFiles(false); err != nil {
+		return err
+	} else if dropped {
+		log.Infof("removed %s and %s", systemd.SecretBusPolicyFile, systemd.SecretKeyringDropIn)
+		removed++
+	}
 
 	// Stale runtime files from a crash that never cleaned them up.
 	if err := os.Remove("/run/app-listener-daemon.pid"); err == nil {

@@ -233,8 +233,8 @@ type watchGroup struct {
 	secret             string
 	secretMatches      []SecretMatch
 	secretServiceBlock bool
-	encryptionSet bool
-	blockName     string
+	encryptionSet      bool
+	blockName          string
 	// skipped marks a section whose root is missing: its directives are warned and ignored, never
 	// fatal (the group is dropped at finalize).
 	skipped bool
