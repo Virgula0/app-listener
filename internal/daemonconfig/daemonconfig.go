@@ -46,6 +46,8 @@ type Config struct {
 	// RuntimePaths are the `runtime: true` section roots, present or not: the daemon creates a
 	// missing one at its user's login (`daemon login`), before any of the user's processes run.
 	RuntimePaths []string
+	// SecretService is the [secret_service] block (secrets.go).
+	SecretService SecretService
 	// MaxInodes is [settings] max_inodes: the guard_inodes capacity, applied at daemon start. 0 =
 	// the compiled default (1<<18).
 	MaxInodes uint32
@@ -111,6 +113,10 @@ type Resource struct {
 	Runtime bool
 	// Port is a `[port tcp/<n>]` section's TCP port; Path is then its anchor (PortAnchor).
 	Port uint16
+	// Secret is a `[secret <name>]` scope; Path is then its anchor (SecretAnchor).
+	Secret *SecretScope
+	// SecretRelay is the gatekeeper's relay dir (SecretRelayDir), added for [secret_service].
+	SecretRelay bool
 }
 
 // MovePeer is a lib_dir's move-peer class: lib_dirs with the same configured writers (paths, links,
@@ -221,7 +227,12 @@ type watchGroup struct {
 	// runtime: `runtime: true`, read even in a skipped group (RuntimePaths lists it either way).
 	runtime bool
 	// port: a [port tcp/<n>] section (ports.go).
-	port          uint16
+	port uint16
+	// secret, secretMatches: a [secret <name>] section; secretServiceBlock: [secret_service]
+	// (secrets.go).
+	secret             string
+	secretMatches      []SecretMatch
+	secretServiceBlock bool
 	encryptionSet bool
 	blockName     string
 	// skipped marks a section whose root is missing: its directives are warned and ignored, never
@@ -302,6 +313,9 @@ func parseConfig(cfg *Config, file io.Reader) error {
 	if err := finalizeGroup(cfg, group); err != nil {
 		return err
 	}
+	if err := finishSecretService(cfg); err != nil {
+		return err
+	}
 	if cfg.Inspectors == nil {
 		cfg.Inspectors = append([]string(nil), DefaultInspectors...)
 		cfg.InspectorsDefault = true
@@ -344,6 +358,18 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	if g.settingsBlock {
 		return applySetting(cfg, line, lineNo)
 	}
+	if g.secretServiceBlock {
+		return applySecretService(cfg, line, lineNo)
+	}
+	if g.secret != "" {
+		if m, ok, err := parseSecretMatch(line); ok {
+			if err != nil {
+				return fmt.Errorf("daemon config line %d: %w", lineNo, err)
+			}
+			g.secretMatches = append(g.secretMatches, m)
+			return nil
+		}
+	}
 	if handled, err := applyAnyGroupDirective(g, line, lineNo); handled {
 		return err
 	}
@@ -365,10 +391,16 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	return applyDirective(g, line, lineNo)
 }
 
-// openHeader switches to the group a block or [port] header opens; false for any other line.
+// openHeader switches to the group a block, [secret] or [port] header opens; false for any other line.
 func openHeader(cfg *Config, group **watchGroup, line string, lineNo int) (bool, error) {
 	if next := openBlock(cfg, line, lineNo); next != nil {
 		return true, switchGroup(cfg, group, next)
+	}
+	if name, ok, err := ParseSecretSection(line); ok {
+		if err != nil {
+			return true, fmt.Errorf("daemon config line %d: %w", lineNo, err)
+		}
+		return true, switchGroup(cfg, group, &watchGroup{root: SecretAnchor(name), secret: name, lineNo: lineNo})
 	}
 	port, ok, err := ParsePortSection(line)
 	if !ok {
@@ -413,8 +445,8 @@ func applyAnyGroupDirective(g *watchGroup, line string, lineNo int) (bool, error
 	return true, nil
 }
 
-// openBlock returns the group a [libraries <name>], [inspectors], [electron_apps], [launch_rules] or
-// [settings] header opens, nil for any other line.
+// openBlock returns the group a [libraries <name>], [inspectors], [electron_apps], [launch_rules],
+// [settings] or [secret_service] header opens, nil for any other line.
 func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
 	if name, ok := ParseLibrariesSection(line); ok {
 		return &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
@@ -431,6 +463,8 @@ func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
 		return &watchGroup{launchRulesBlock: true, lineNo: lineNo}
 	case "[settings]":
 		return &watchGroup{settingsBlock: true, lineNo: lineNo}
+	case "[secret_service]":
+		return &watchGroup{secretServiceBlock: true, lineNo: lineNo}
 	}
 	return nil
 }
@@ -449,11 +483,15 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 
 // finalizeGroup materializes a closed group unless it was skipped.
 func finalizeGroup(cfg *Config, group *watchGroup) error {
-	if group == nil || group.inspectorsBlock || group.electronAppsBlock || group.launchRulesBlock || group.settingsBlock {
+	if group == nil || group.inspectorsBlock || group.electronAppsBlock || group.launchRulesBlock ||
+		group.settingsBlock || group.secretServiceBlock {
 		return nil
 	}
 	if group.port != 0 {
 		return materializePortGroup(cfg, group)
+	}
+	if group.secret != "" {
+		return materializeSecretGroup(cfg, group)
 	}
 	if group.runtime {
 		if err := checkRuntimeGroup(group); err != nil {
