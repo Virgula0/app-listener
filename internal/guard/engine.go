@@ -61,6 +61,9 @@ type engine struct {
 	started    bool
 	// ioctlCompat: this kernel has file_ioctl_compat (6.8+), so guard_file_ioctl_compat attaches.
 	ioctlCompat bool
+	// busPidNS: guard_bus_pidns holds the daemon's pid namespace, so bus rows are keyed by the
+	// pids its pidfds report (setBusPidNSLocked). False refuses every bus client.
+	busPidNS bool
 
 	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
 	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).
@@ -301,6 +304,7 @@ func (e *engine) startLocked() error {
 		return err
 	}
 	e.setPortNetNSLocked()
+	e.setBusPidNSLocked()
 
 	rd, err := ringbuf.NewReader(e.objs.Rb)
 	if err != nil {

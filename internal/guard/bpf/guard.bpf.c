@@ -2531,7 +2531,7 @@ struct bus_conn {
 	__u64 seq;
 	__u64 start;
 	__u32 foreign; // another process sent on one of its bus sockets: never attested again
-	__u32 pad;
+	__u32 htgid;   // host tgid (exe_stamps' key); the row's own key is the tgid the daemon sees
 };
 
 struct {
@@ -2548,12 +2548,41 @@ struct {
 	__type(value, struct bus_conn);
 } guard_bus_conns SEC(".maps");
 
+// guard_bus_pidns is the daemon's pid namespace when it isn't the init one ({0,0}): a pidfd tells the
+// daemon a pid in its own namespace, so rows are keyed by that, and a caller outside it gets none.
+struct bus_pidns {
+	__u64 dev;
+	__u64 ino;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct bus_pidns);
+} guard_bus_pidns SEC(".maps");
+
+// bus_key is current's tgid as the daemon sees it; 0 = none (outside its pid namespace).
+static __always_inline __u32 bus_key(__u32 htgid)
+{
+	__u32 z = 0;
+	struct bus_pidns *ns = bpf_map_lookup_elem(&guard_bus_pidns, &z);
+	if (!ns)
+		return 0;
+	if (!ns->ino)
+		return htgid;
+	struct bpf_pidns_info info = {};
+	if (bpf_get_ns_current_pid_tgid(ns->dev, ns->ino, &info, sizeof(info)))
+		return 0;
+	return info.tgid;
+}
+
 // guard_bus_socks marks each socket connected to a registered bus with the process that connected it.
 // The bus credits whatever is sent on it to that process, so a send by any other (an inherited or
 // SCM_RIGHTS-passed fd) marks the owner's row foreign before the message is queued.
 struct bus_owner {
-	__u32 tgid;
-	__u32 pad;
+	__u32 tgid; // host
+	__u32 key;  // its guard_bus_conns key
 	__u64 start;
 };
 
@@ -2575,11 +2604,11 @@ static __noinline int note_bus_send(struct sock *sk)
 		return 0;
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
-	__u32 owner = o->tgid;
+	__u32 key = o->key;
 	__u64 start = o->start;
-	if (owner == tgid && start == leader_start(task))
+	if (o->tgid == tgid && start == leader_start(task))
 		return 0;
-	struct bus_conn *bc = bpf_map_lookup_elem(&guard_bus_conns, &owner);
+	struct bus_conn *bc = bpf_map_lookup_elem(&guard_bus_conns, &key);
 	if (bc && bc->start == start)
 		bc->foreign = 1;
 	return 0;
@@ -2616,21 +2645,26 @@ static __always_inline void note_bus_connect(struct sock *sk, struct sock *peer)
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u32 key = bus_key(tgid);
+	if (!key)
+		return;
 	struct bus_conn v = {};
 	v.start = leader_start(task);
+	v.htgid = tgid;
 	struct bus_owner *o = sk ? bpf_sk_storage_get(&guard_bus_socks, sk, 0, BPF_SK_STORAGE_GET_F_CREATE) : NULL;
 	if (!o) {
-		bpf_map_delete_elem(&guard_bus_conns, &tgid);
+		bpf_map_delete_elem(&guard_bus_conns, &key);
 		return;
 	}
 	o->tgid = tgid;
+	o->key = key;
 	o->start = v.start;
-	struct bus_conn *cur = bpf_map_lookup_elem(&guard_bus_conns, &tgid);
-	if (cur && cur->start == v.start)
+	struct bus_conn *cur = bpf_map_lookup_elem(&guard_bus_conns, &key);
+	if (cur && cur->start == v.start && cur->htgid == tgid)
 		return; // keep this process's first connect
 	struct exec_stamp *st = bpf_map_lookup_elem(&exe_stamps, &tgid);
 	v.seq = st ? st->seq : 0; // no stamp: exec'd before the guard, never attested
-	bpf_map_update_elem(&guard_bus_conns, &tgid, &v, BPF_ANY); // full: no row, refused
+	bpf_map_update_elem(&guard_bus_conns, &key, &v, BPF_ANY); // full: no row, refused
 }
 
 SEC("lsm/unix_stream_connect")
@@ -3240,8 +3274,10 @@ int guard_task_free(unsigned long long *ctx)
 		return 0;
 
 	bpf_map_delete_elem(&guard_tainted_pids, &tgid);
+	// Keyed by host tgid only while the daemon is in the init pid namespace; otherwise a dead
+	// process's row stays until its key's next connect, and its htgid's stamp no longer matches.
 	struct bus_conn *bc = bpf_map_lookup_elem(&guard_bus_conns, &tgid);
-	if (bc && bc->start == leader_start(task))
+	if (bc && bc->start == leader_start(task) && bc->htgid == tgid)
 		bpf_map_delete_elem(&guard_bus_conns, &tgid);
 	exe_stamp_free(task, tgid);
 	return 0;

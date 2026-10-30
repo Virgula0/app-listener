@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	cilium "github.com/cilium/ebpf"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -28,6 +29,29 @@ type BusClient struct {
 
 // ErrUnattested refuses a bus client whose connection can't be tied to its current image.
 var ErrUnattested = errors.New("bus client not attested")
+
+// initPidNSIno is PROC_PID_INIT_INO, the init pid namespace's fixed inode number.
+const initPidNSIno = 0xEFFFFFFC
+
+// setBusPidNSLocked tells the guard which pid namespace the daemon's pidfds number in. Outside the
+// init namespace, rows are keyed by pids in the daemon's; unknown leaves every bus client refused.
+func (e *engine) setBusPidNSLocked() {
+	e.busPidNS = false
+	var st unix.Stat_t
+	if err := unix.Stat("/proc/self/ns/pid", &st); err != nil {
+		log.Warnf("guard: own pid namespace unknown (%v): bus clients are refused", err)
+		return
+	}
+	ns := GuardBusPidns{}
+	if st.Ino != initPidNSIno {
+		ns = GuardBusPidns{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}
+	}
+	if err := e.objs.GuardBusPidns.Put(uint32(0), ns); err != nil {
+		log.Warnf("guard: recording the pid namespace (%v): bus clients are refused", err)
+		return
+	}
+	e.busPidNS = true
+}
 
 // RegisterBusDir lets the guard record connects to dir/bus (a /run/user/<uid> dir) for AttestBusClient.
 // A user's connects made before it are unattested.
@@ -64,31 +88,37 @@ func AttestBusClient(pidfd int) (*BusClient, error) {
 		return nil, err
 	}
 	sharedEngine.mu.Lock()
-	objs := sharedEngine.objs
+	objs, pidNS := sharedEngine.objs, sharedEngine.busPidNS
 	sharedEngine.mu.Unlock()
 	if objs.GuardBusConns == nil {
 		return nil, errors.New("guard engine not running")
+	}
+	if !pidNS {
+		return nil, fmt.Errorf("%w: the guard doesn't know the daemon's pid namespace", ErrUnattested)
 	}
 	var bus GuardBusConn
 	if objs.GuardBusConns.Lookup(pid, &bus) != nil {
 		return nil, fmt.Errorf("%w: pid %d has no recorded bus connect", ErrUnattested, pid)
 	}
-	stamp, err := execStamp(&objs, pid)
+	// The host tgid keys the other maps. A stale row (its process gone, the key reused) fails the
+	// stamp match: a live htgid whose start equals the row's is the connecting process, still pid.
+	host := bus.Htgid
+	stamp, err := execStamp(&objs, host)
 	if err != nil {
 		return nil, err
 	}
-	if stamp.Start != bus.Start || stamp.Seq != bus.Seq || bus.Seq == 0 {
+	if host == 0 || stamp.Start != bus.Start || stamp.Seq != bus.Seq || bus.Seq == 0 {
 		return nil, fmt.Errorf("%w: pid %d exec'd after connecting to the bus", ErrUnattested, pid)
 	}
 	if bus.Foreign != 0 {
 		return nil, fmt.Errorf("%w: another process sent on a bus connection of pid %d", ErrUnattested, pid)
 	}
-	c, err := imageOf(&objs, pid, stamp)
+	c, err := imageOf(&objs, pid, host, stamp)
 	if err != nil {
 		return nil, err
 	}
 	c.UID, c.Comm = procIdentity(pid)
-	again, err := execStamp(&objs, pid)
+	again, err := execStamp(&objs, host)
 	if err != nil || again != stamp {
 		return nil, fmt.Errorf("%w: pid %d exec'd while being attested", ErrUnattested, pid)
 	}
@@ -122,7 +152,7 @@ func busClientKey(objs *GuardObjects, pid uint32, stamp GuardExecStamp) (GuardIn
 
 // imageOf is pid's image as check_and_emit_args judges it: its key, whether it is a superseded key
 // exec'd at or after the supersede, its code-suspect mark.
-func imageOf(objs *GuardObjects, pid uint32, stamp GuardExecStamp) (*BusClient, error) {
+func imageOf(objs *GuardObjects, pid, host uint32, stamp GuardExecStamp) (*BusClient, error) {
 	key, err := busClientKey(objs, pid, stamp)
 	if err != nil {
 		return nil, err
@@ -134,7 +164,7 @@ func imageOf(objs *GuardObjects, pid uint32, stamp GuardExecStamp) (*BusClient, 
 	} else if !errors.Is(err, cilium.ErrKeyNotExist) {
 		return nil, err
 	}
-	if err := objs.TrustCodeSuspect.Lookup(pid, &c.suspect); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
+	if err := objs.TrustCodeSuspect.Lookup(host, &c.suspect); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
 		return nil, err
 	}
 	return c, nil
