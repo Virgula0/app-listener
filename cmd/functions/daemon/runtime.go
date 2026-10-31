@@ -144,6 +144,7 @@ func startLoginServer(uc usecase.DaemonUseCase, cfg *daemonconfig.Config) (*logi
 	s := &loginServer{ln: ln, selfDev: selfDev, selfIno: selfIno, uc: uc, ready: make(chan struct{}),
 		secrets: newSecretGates(cfg)}
 	s.cfg.Store(cfg)
+	s.sentinelFound()
 	go s.acceptLoop()
 	return s, nil
 }
@@ -159,7 +160,57 @@ func (s *loginServer) setConfig(cfg *daemonconfig.Config) {
 	if s != nil && cfg != nil {
 		s.cfg.Store(cfg)
 		s.secrets.setConfig(cfg)
+		s.sentinelFound()
 	}
+}
+
+// sentinelFound plants the sentinel in each guarded runtime directory without one: those found at a
+// start or reload (made by the user before the daemon, as an agent unit's `mkdir -p` does) are
+// guarded as found, and an agent's own cleanup could leave one empty for an rmdir.
+func (s *loginServer) sentinelFound() {
+	resources := s.uc.Resources()
+	for i := range resources {
+		r := &resources[i]
+		uid, ok := daemonconfig.RuntimeDirFor(r.Path)
+		if !r.Runtime || !ok {
+			continue
+		}
+		if err := s.plantFound(uid, r.Path); err != nil {
+			log.Errorf("daemon: %s: planting %s: %v — an emptied root could be removed and made anew unguarded",
+				r.Path, runtimeSentinel, err)
+		}
+	}
+}
+
+func (s *loginServer) plantFound(uid uint32, path string) error {
+	userFd, _, err := openUserRuntimeDir(uid)
+	if err != nil {
+		return nil //nolint:nilerr // logged out: the reload drops the section
+	}
+	defer unix.Close(userFd)
+	fd, err := unix.Openat(userFd, path[strings.LastIndexByte(path, '/')+1:],
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if hasSentinel(fd) {
+		return nil
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	key := guard.GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}
+	return s.uc.WithRuntimeRoot(path, func(root guard.GuardInodeKey) error {
+		if root != key {
+			return errors.New("another directory is guarded at that path")
+		}
+		return plantSentinel(fd)
+	})
 }
 
 func (s *loginServer) close() {

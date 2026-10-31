@@ -97,7 +97,9 @@ The mount is fresh at login, so a runtime directory already in it was made by on
 processes before the daemon, and may hold its listeners: the daemon refuses it and the login fails
 (remove the directory and log in again). Only a directory a running guard already holds is
 accepted. A directory present when the daemon itself starts (the user logged in while no daemon
-ran) is guarded as found, and may hold sockets bound before the guard.
+ran) is guarded as found, and may hold sockets bound before the guard. The daemon plants its
+sentinel in it then (and at every reload), so an agent removing its own socket can't leave it
+empty.
 
 At logout the directory is gone with its mount, and the daemon reloads to drop the resource. Like
 any reload, a login or logout that adds or drops a runtime section ends a live `edit-protected`

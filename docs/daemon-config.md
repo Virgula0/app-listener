@@ -134,6 +134,8 @@ lifecycle. Without `watch:` lines the section path itself is the guarded tree.
 Valid events: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD, CONNECT`.
 `CONNECT` is connecting, sending or receiving on a unix socket bound inside the tree (an agent or RPC
 socket), or on a [port section](#port-sections)'s port. On a port, `MKNOD` is listening on it.
+`DELETE` also covers removing the guarded directory itself once it is empty, even when its parent
+isn't guarded.
 
 Unlisted events are denied for that binary. `READ`, `WRITE` and `MMAP` imply `OPEN`.
 

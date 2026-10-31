@@ -2417,6 +2417,10 @@ int guard_path_rmdir(unsigned long long *ctx)
 		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false, res);
 	} else if (parent && guarded_ancestor_within_limit(parent, &res, ANCESTOR_WALK)) {
 		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false, res);
+	} else if (inode && inode_is_watch_root(inode, &res)) {
+		// An empty root below an unguarded parent: removing it lets the parent's owner put an
+		// unguarded directory or a symlink at its name.
+		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false, res);
 	} else {
 		ret = 0;
 	}

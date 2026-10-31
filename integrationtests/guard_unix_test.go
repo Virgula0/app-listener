@@ -201,3 +201,60 @@ func (s *IntegrationSuite) TestDaemon_RuntimeSectionLogin() {
 	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
 	s.Require().Equalf(0, code, "with no daemon running a login goes ahead: %s", out)
 }
+
+// A runtime dir the user made before the daemon started (an agent unit's `mkdir -p`) is guarded as
+// found: the daemon plants the root-owned sentinel then too, so a TERMed agent's cleanup can't leave
+// the root empty for an rmdir and a re-made, unguarded dir. An empty watch root's own rmdir is judged.
+func (s *IntegrationSuite) TestDaemon_RuntimeDirFoundAtStart() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	code, out := s.exec(c, []string{"sh", "-c", "command -v ssh-agent >/dev/null 2>&1 || " +
+		"(timeout 120 apt-get update -qq && timeout 120 apt-get install -y -qq --no-install-recommends openssh-client >/dev/null)"})
+	if code != 0 {
+		s.T().Skipf("openssh-client unavailable: %s", out)
+	}
+	const dir = "/run/user/1000/ssh-agent"
+	const sock = dir + "/socket"
+	const vault = "/home/u1000/vault"
+	code, out = s.exec(c, []string{"sh", "-c", "(id -u 1000 >/dev/null 2>&1 || useradd -u 1000 -m u1000) && " +
+		"mkdir -p /watch /etc/app-listener /run/user/1000 /home/u1000 && chown 1000:1000 /home/u1000 && " +
+		"mount -t tmpfs -o mode=0700,uid=1000,gid=1000 tmpfs /run/user/1000"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	asUser := func(cmd string) (int, string) {
+		return s.exec(c, []string{"setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "sh", "-c", cmd})
+	}
+	code, out = asUser("mkdir -m 0700 " + dir + " && mkdir -m 0700 " + vault)
+	s.Require().Equalf(0, code, "pre-creating: %s", out)
+
+	const always = "[watch /watch]\nneed_encryption: false\n/usr/bin/true\n"
+	conf := always + "\n[watch " + vault + "]\nneed_encryption: false\n/usr/bin/true\n" +
+		"\n[watch " + dir + "]\nruntime: true\n/usr/bin/ssh-agent MKNOD,DELETE,STAT\n" +
+		"/usr/bin/ssh-add CONNECT,STAT\n/usr/bin/stat STAT\nneed_encryption: false\n"
+	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + conf + "EOF"})
+	s.launchDaemon(c)
+	s.awaitDaemonUp(c, conf)
+
+	code, out = s.exec(c, []string{"stat", "-c", "%u %a", dir + "/.app-listener/README"})
+	s.Require().Equalf(0, code, "no sentinel in a runtime dir found at start: %s\n%s", out, s.readDaemonLog(c))
+	s.Require().Equalf("0 444", out, "the sentinel stays root's")
+
+	isGone := "stat " + sock + " 2>&1 | grep -q 'No such file'"
+	code, out = asUser("(nohup /usr/bin/ssh-agent -D -a " + sock + " >/tmp/agent.log 2>&1 &) && " +
+		"for i in $(seq 50); do " + isGone + " || break; sleep 0.1; done; pkill -TERM ssh-agent; " +
+		"for i in $(seq 50); do " + isGone + " && break; sleep 0.1; done; rmdir " + dir + " 2>&1")
+	s.Require().NotEqualf(0, code, "the user removed a runtime root after its agent cleaned up: %s", out)
+	code, out = s.exec(c, []string{"stat", "-c", "%F", dir + "/.app-listener/README"})
+	s.Require().Equalf(0, code, "the runtime root is gone: %s", out)
+
+	code, out = asUser("rmdir " + vault + " 2>&1")
+	s.Require().NotEqualf(0, code, "the user removed an empty watch root: %s", out)
+	denied := false
+	for _, e := range parseDaemonEvents(s.readDaemonLog(c)) {
+		denied = denied || (e.Denied && e.Op == "DELETE" && e.Comm == "rmdir")
+	}
+	s.Require().Truef(denied, "no DAEMON DENIED op=DELETE for rmdir of the root:\n%s", s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
+}

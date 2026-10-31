@@ -1007,8 +1007,10 @@ func (g *Guard) WithSelfRuntimeAccess(fn func() error) error {
 	return g.withSelfMask(runtimeAccessEvents, "runtime", true, fn)
 }
 
-// ownerAccessEvents lets the daemon hand a runtime directory it made to its user (fchown).
-var ownerAccessEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat, ebpf.EventAttr}
+// ownerAccessEvents lets the daemon finish a runtime directory: plant its sentinel (one found at a
+// start or reload has none) and hand one it made to its user (fchown).
+var ownerAccessEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat, ebpf.EventAttr,
+	ebpf.EventMkdir, ebpf.EventMknod, ebpf.EventWrite}
 
 // WithSelfOwnerAccess is WithSelfRuntimeAccess with ownerAccessEvents.
 func (g *Guard) WithSelfOwnerAccess(fn func() error) error {
