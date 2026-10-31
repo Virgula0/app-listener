@@ -125,6 +125,19 @@ func (c *CandidateDir) RuntimePath(u User) string {
 	return fmt.Sprintf("/run/user/%d/%s", u.UID, c.RuntimeDir)
 }
 
+// codexBinaries are Codex's native binaries: the standalone install, distro and Homebrew packages,
+// and the binary npm's node launcher runs.
+var codexBinaries = map[string][]string{
+	"%HOME%/.local/bin/codex":                             nil,
+	"%HOME%/.codex/packages/standalone/current/bin/codex": nil,
+	"%HOME%/.codex/packages/standalone/current/codex":     nil,
+	"/usr/bin/codex": nil, "/usr/local/bin/codex": nil, "/home/linuxbrew/.linuxbrew/bin/codex": nil,
+	"/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex":       nil,
+	"/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex": nil,
+	"/usr/lib/node_modules/@openai/codex/vendor/*/bin/codex":                                          nil,
+	"/usr/local/lib/node_modules/@openai/codex/vendor/*/bin/codex":                                    nil,
+}
+
 // Catalog is the master list of critical directories probed per selected user; missing paths are
 // simply not proposed.
 var Catalog = []CandidateDir{
@@ -216,6 +229,18 @@ var Catalog = []CandidateDir{
 			"/usr/bin/gh": nil, "/usr/local/bin/gh": nil, "%HOME%/.local/bin/gh": nil,
 			"/home/linuxbrew/.linuxbrew/bin/gh": nil,
 		}},
+	// Codex's keyring mode (keyring crate): "Codex Auth" and "Codex MCP Credentials". The crate also
+	// caches the token in the session's kernel keyring, which no scope covers.
+	{Name: "OpenAI Codex token (keyring)", Secret: "codex", SecretMatches: []string{"service=Codex*"},
+		Whitelist: codexBinaries},
+	// agy (go-keyring) looks up service=gemini username=antigravity; the hub's language_server shares
+	// its auth code. Without a session bus, or in a container, both fall back to a file in ~/.gemini.
+	{Name: "Antigravity token (keyring)", Secret: "antigravity",
+		SecretMatches: []string{"service=gemini username=antigravity"},
+		Whitelist: map[string][]string{
+			"/usr/bin/agy": nil, "/usr/local/bin/agy": nil, "%HOME%/.local/bin/agy": nil,
+			"/opt/Antigravity/antigravity": nil, "/opt/Antigravity/resources/bin/language_server": nil,
+		}},
 	{Name: "git credentials (libsecret)", Secret: "git-credential-libsecret",
 		SecretMatches: []string{"xdg:schema=org.git.Password"},
 		Whitelist: map[string][]string{
@@ -267,10 +292,55 @@ var Catalog = []CandidateDir{
 			"/usr/local/bin/codeium": nil, "/usr/bin/codeium": nil,
 			"%HOME%/.local/bin/codeium": nil,
 		}},
-	{Name: "Gemini CLI", RelPaths: []string{".gemini"},
+	// ~/.gemini is shared: Gemini CLI, the Antigravity CLI (agy), the Antigravity 2.0 hub's
+	// language_server and the Antigravity IDE all read and write it, so one fscrypt root carries one
+	// whitelist and each may read the others' tokens. Watches only the secrets and the config the
+	// agents execute (MCP servers, hooks, plugins). Gemini CLI is a node script: its lines never match.
+	{Name: "Gemini CLI and Antigravity", RelPaths: []string{".gemini"},
+		WatchRelPaths: []string{
+			".gemini/oauth_creds.json", ".gemini/google_accounts.json", ".gemini/.env",
+			".gemini/mcp-oauth-tokens.json", ".gemini/mcp-oauth-tokens-v2.json", ".gemini/settings.json",
+			".gemini/antigravity-cli", ".gemini/antigravity", ".gemini/config",
+		},
 		Whitelist: map[string][]string{
 			"/usr/local/bin/gemini": nil, "/usr/bin/gemini": nil,
 			"%HOME%/.local/bin/gemini": nil,
+			"/usr/bin/agy":             nil, "/usr/local/bin/agy": nil, "%HOME%/.local/bin/agy": nil,
+			"/opt/Antigravity/antigravity": nil, "/opt/Antigravity/resources/bin/language_server": nil,
+			"/opt/antigravity-ide/antigravity-ide": nil,
+		}},
+	// Antigravity 2.0 (Electron hub) keeps its profile in ~/.config/Antigravity, the IDE 1.x deb its
+	// own there too; agy and the hub's language_server keep plugin secrets in ~/.config/antigravity.
+	{Name: "Antigravity", RelPaths: []string{".config/Antigravity", ".config/antigravity"},
+		Whitelist: map[string][]string{
+			"/opt/Antigravity/antigravity": nil, "/opt/Antigravity/resources/bin/language_server": nil,
+			"/opt/Antigravity/chrome_crashpad_handler": nil,
+			"/usr/share/antigravity/antigravity":       nil,
+			"/usr/bin/agy":                             nil, "/usr/local/bin/agy": nil, "%HOME%/.local/bin/agy": nil,
+		}},
+	// The IDE keeps its Google OAuth token in plain text in User/globalStorage/state.vscdb.
+	{Name: "Antigravity IDE", RelPaths: []string{".config/Antigravity IDE"},
+		Whitelist: map[string][]string{
+			"/opt/antigravity-ide/antigravity-ide": nil, "/opt/antigravity-ide/chrome_crashpad_handler": nil,
+		},
+		LibDirRelPaths: []string{".antigravity-ide"},
+		LibDirWriters:  []string{"/opt/antigravity-ide/antigravity-ide"}},
+	// The standalone installer keeps the binary in ~/.codex/packages and rewrites it on update, so
+	// only the secrets are watched. config.toml too: it sets the base URL Codex sends its token to.
+	{Name: "OpenAI Codex CLI", RelPaths: []string{".codex"},
+		WatchRelPaths: []string{
+			".codex/auth.json", ".codex/.credentials.json", ".codex/config.toml",
+			".codex/history.jsonl", ".codex/sessions", ".codex/archived_sessions",
+		},
+		Whitelist: codexBinaries},
+	// pi's installer and npm install a node script (its own install lives in ~/.pi/agent/install), so
+	// only the release tarball's Bun binary matches; otherwise pi is denied like gcloud.
+	{Name: "pi coding agent", RelPaths: []string{".pi/agent"},
+		WatchRelPaths: []string{
+			".pi/agent/auth.json", ".pi/agent/models.json", ".pi/agent/settings.json", ".pi/agent/sessions",
+		},
+		Whitelist: map[string][]string{
+			"%HOME%/.local/bin/pi": nil, "/usr/local/bin/pi": nil, "/opt/pi/pi": nil,
 		}},
 	{Name: "Cursor", RelPaths: []string{".cursor"},
 		Whitelist: map[string][]string{

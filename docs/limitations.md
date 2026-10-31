@@ -51,7 +51,7 @@ over a channel the guard doesn't see answers whoever asks:
 
 - **The keyring.** The Secret Service (GNOME keyring, KDE Wallet, KeePassXC) is reached over the
   session bus, so any of your programs can read an unlocked collection. `gh`, Copilot CLI, Gemini CLI,
-  JetBrains IDEs, Zed, ProtonVPN, `docker` with a `secretservice` helper and `git`'s libsecret helper
+  the Antigravity CLI, Codex (in keyring mode), JetBrains IDEs, Zed, ProtonVPN, `docker` with a `secretservice` helper and `git`'s libsecret helper
   keep tokens there. With gnome-keyring, [secret scopes](daemon-config.md#secret-service-sections)
   restrict the items they cover to their whitelists, with the limits below. Elsewhere, prefer file
   storage inside a guarded tree where the app offers it
