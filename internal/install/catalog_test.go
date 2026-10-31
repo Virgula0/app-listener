@@ -7,10 +7,12 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 )
 
 // TestCatalogSanity verifies the master list is well-formed: every entry
-// has a name, exactly one non-empty of RelPaths/AbsPaths, absolute
+// has a name, exactly one non-empty of RelPaths/AbsPaths/RuntimeDir/Ports/Secret, absolute
 // whitelist binaries, WatchRelPaths only with a single RelPaths entry, and
 // no two entries probe the same path.
 func TestCatalogSanity(t *testing.T) {
@@ -19,9 +21,34 @@ func TestCatalogSanity(t *testing.T) {
 		if entry.Name == "" {
 			t.Errorf("entry with empty name: %+v", entry)
 		}
-		rel, abs := len(entry.RelPaths), len(entry.AbsPaths)
-		if (rel == 0) == (abs == 0) {
-			t.Errorf("entry %q must set exactly one of RelPaths or AbsPaths (non-empty)", entry.Name)
+		set := 0
+		for _, n := range []int{len(entry.RelPaths), len(entry.AbsPaths), len(entry.RuntimeDir), len(entry.Ports), len(entry.Secret)} {
+			if n > 0 {
+				set++
+			}
+		}
+		if set != 1 {
+			t.Errorf("entry %q must set exactly one of RelPaths, AbsPaths, RuntimeDir, Ports or Secret", entry.Name)
+		}
+		for _, p := range entry.Ports {
+			if p >= 32768 {
+				t.Errorf("entry %q: port %d is in the default ephemeral range, which the daemon refuses", entry.Name, p)
+			}
+			if prev, ok := seen[daemonconfig.PortAnchor(p)]; ok {
+				t.Errorf("duplicate catalog port %d (%s and %s)", p, prev, entry.Name)
+			}
+			seen[daemonconfig.PortAnchor(p)] = entry.Name
+		}
+		for bin, events := range entry.Whitelist {
+			for _, e := range events {
+				if len(entry.Ports) > 0 && e != "CONNECT" && e != "MKNOD" {
+					t.Errorf("entry %q: %s %s: a port entry takes CONNECT and MKNOD only", entry.Name, bin, e)
+				}
+			}
+		}
+		if entry.IsRuntime() && (entry.RuntimeIf == "" || filepath.IsAbs(entry.RuntimeIf) ||
+			strings.Contains(entry.RuntimeDir, "/")) {
+			t.Errorf("entry %q: RuntimeDir must be one name and RuntimeIf home-relative", entry.Name)
 		}
 		for _, p := range entry.RelPaths {
 			if p == "" || filepath.IsAbs(p) {
@@ -201,8 +228,28 @@ func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	if !found {
 		t.Fatal(".ssh whitelist does not include sshd: public-key logins would be denied while guarded")
 	}
-	if events := entry.Whitelist["/usr/bin/ssh"]; len(events) != 5 || events[0] != "READ" || events[1] != "WRITE" || events[2] != "DELETE" || events[3] != "RENAME" || events[4] != "HARDLINK" {
-		t.Errorf("/usr/bin/ssh must be READ,WRITE,DELETE,RENAME,HARDLINK, got %v", events)
+	if events := entry.Whitelist["/usr/bin/ssh"]; !slices.Equal(events, []string{"READ", "WRITE", "DELETE", "RENAME", "HARDLINK", "MKNOD", "CONNECT"}) {
+		t.Errorf("/usr/bin/ssh must be READ,WRITE,DELETE,RENAME,HARDLINK,MKNOD,CONNECT, got %v", events)
+	}
+}
+
+// TestRuntimeEntriesNeverDeleteRoot: a DELETE grant to a binary a caller can steer into removing
+// the runtime root (rmdir) would let the user recreate it unguarded.
+func TestRuntimeEntriesNeverDeleteRoot(t *testing.T) {
+	for _, e := range Catalog {
+		if !e.IsRuntime() {
+			continue
+		}
+		for _, bin := range []string{"/usr/lib/systemd/systemd", "/usr/bin/gpgconf", "/usr/bin/rmdir", "/usr/bin/mkdir"} {
+			if slices.Contains(e.Whitelist[bin], "DELETE") {
+				t.Errorf("%s: %s must not get DELETE", e.Name, bin)
+			}
+		}
+		for bin, events := range e.Whitelist {
+			if events == nil {
+				t.Errorf("%s: %s needs an explicit event list", e.Name, bin)
+			}
+		}
 	}
 }
 

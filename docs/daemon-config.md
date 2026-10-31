@@ -33,6 +33,96 @@ need_encryption: true             # default true; false skips the fscrypt lifecy
 - **`need_encryption: true`** (the default) requires the directory to already carry an fscrypt
   policy; otherwise the daemon refuses to start. Use `false` for a resource you only want guarded.
 
+### Runtime sections
+
+```ini
+[watch /run/user/1000/gnupg]
+runtime: true
+/usr/bin/gpg-agent MKNOD,DELETE,MKDIR,CONNECT,STAT
+/usr/bin/gpg MKDIR,CONNECT,STAT
+need_encryption: false
+```
+
+Agents listen on sockets in `/run/user/<uid>`, which exists only while that user is logged in.
+`runtime: true` marks a section naming one directory directly in it. The daemon makes the directory
+at the user's login and guards it before any of the user's processes start
+([details](daemon.md#runtime-sections-at-login)); while the user is logged out the section is
+listed but guards nothing. A runtime section is never encrypted (`need_encryption: true` is
+refused) and takes only binary lines: no `watch:`, `lib_dir` or `allow_lib`.
+
+Give every line an explicit event list, and `DELETE` only to a program that removes its own
+sockets: a program a caller can steer into `rmdir` would let the directory be recreated unguarded.
+
+### Port sections
+
+```ini
+[port tcp/8332]
+/usr/bin/bitcoind MKNOD
+/usr/bin/bitcoin-cli CONNECT
+```
+
+A service on a loopback TCP port (`bitcoind` RPC, the `adb` server, `ollama`) answers any local
+program that can reach it. `[port tcp/<n>]` guards one such port: only `CONNECT` lines may connect
+to it, and only `MKNOD` lines may listen on it, so another program can't take the port while the
+service is stopped and collect the credentials its clients send. A listener made while the daemon
+was stopped is judged at its first `accept` instead, so a program that took the port then can't
+serve a client either. A port section takes only binary lines, with `CONNECT`, `MKNOD` or no event
+list.
+
+- **Loopback only.** Connections to `127.0.0.0/8`, `::1`, `0.0.0.0` and `::` (which reach this
+  host's loopback) are judged; connections to other hosts are not. Even a `MKNOD` program is refused
+  when it listens on any other address (`0.0.0.0`, `::`, a LAN address), since clients could then
+  reach it through an address nobody judges. Configure the service to listen on `127.0.0.1` or `::1`.
+- **TCP only, this host's network namespace only.** A container's own loopback is another host's.
+- **Not in the ephemeral range.** The daemon refuses to start with a port the kernel may hand out to
+  any program (`net.ipv4.ip_local_port_range`, by default 32768-60999) unless it is listed in
+  `net.ipv4.ip_local_reserved_ports`.
+- **The connection is guarded, not just the connect.** A connection handed to another program
+  (inherited, passed over a unix socket) is judged again for every message that program sends or
+  receives, as for unix sockets.
+
+The daemon keeps one root-owned anchor file per port in `/run/app-listener/ports` (`tcp-<n>`); its
+events name that path. Removing a port section and reloading stops guarding the port.
+
+### Secret Service sections
+
+```ini
+[secret_service]
+provider /usr/bin/gnome-keyring-daemon
+prompter /usr/libexec/gcr-prompter
+manager /usr/bin/seahorse
+
+[secret gh]
+match service=gh:*
+/usr/bin/gh
+```
+
+Apps such as `gh` keep their token in the Secret Service (the keyring), which any of your programs
+can ask for over the session bus. With a `[secret_service]` block the keyring reaches the bus only
+through the daemon: every call that reads, writes or deletes an item is judged before the keyring
+sees it ([how](daemon.md#the-secret-service-gate)).
+
+`[secret_service]` names the keyring daemon (`provider`, gnome-keyring is the one supported), the
+program that shows its password dialogs (`prompter`) and the programs that may manage the keyring as
+a whole (`manager`: delete a collection, set an alias, change the master password). Prompter and
+manager lines must name root-owned binaries.
+
+A `[secret <name>]` section is a scope: the items it covers and the binaries that may use them.
+
+- **`match key=value ...`** covers an item whose attributes have every listed value; a value
+  ending in `*` matches any attribute starting with the rest. A section takes one or more `match`
+  lines and covers an item any of them matches. `secret-tool search --all <key> <value>` shows an
+  item's attributes.
+- **Binary lines** take `READ` (get the secret), `WRITE` (create or change an item, its secret,
+  label or attributes) and `DELETE`, or no event list for all three.
+- An item that several scopes cover needs every scope's admission. Changing an item's attributes
+  is judged under its old and new ones, so an item can't be moved out of a scope. Creating an item
+  that replaces existing ones (the keyring picks them by a subset of their attributes) is judged
+  under the scopes of every item it could replace. An item no scope covers stays as open as the
+  keyring keeps it.
+- The name is lowercase letters, digits, `.`, `_` and `-`. The daemon keeps one root-owned anchor
+  file per scope in `/run/app-listener/secret-scopes`; its events name that path and the call.
+
 ### Several guarded trees, one vault
 
 `watch: <path>` lines inside a section turn the section path into the **encryption root** and each
@@ -41,7 +131,11 @@ lifecycle. Without `watch:` lines the section path itself is the guarded tree.
 
 ### Per-binary event masks
 
-Valid events: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD`.
+Valid events: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD, CONNECT`.
+`CONNECT` is connecting, sending or receiving on a unix socket bound inside the tree (an agent or RPC
+socket), or on a [port section](#port-sections)'s port. On a port, `MKNOD` is listening on it.
+`DELETE` also covers removing the guarded directory itself once it is empty, even when its parent
+isn't guarded.
 
 Unlisted events are denied for that binary. `READ`, `WRITE` and `MMAP` imply `OPEN`.
 
@@ -107,6 +201,37 @@ non-switch argument names. Whitelisted, it may be started only with an app liste
 
 A bundled Electron (Discord, VS Code: `resources/app.asar` or `resources/app/`, no
 `default_app.asar`) ignores its arguments when choosing the app and is not judged this way.
+
+## Launch rules: `[launch_rules]`
+
+A whitelisted CLI that prints or spends its secret on request (`gh auth token`) hands it to whoever
+runs it. Launch rules mark such a launch: the process is refused every guarded secret, as a risky
+runtime launch is ([Binary trust](binary-trust.md#launch-rules)). Add your own on top of the
+built-in ones:
+
+```ini
+[launch_rules]
+deny_args /usr/bin/gh repo delete
+warn_args /usr/bin/kubectl config view --raw
+deny_env /usr/bin/kubectl HTTPS_PROXY
+allow_env SSL_CERT_FILE=/etc/corp/ca-bundle.pem
+```
+
+- `deny_args <binary> <word>...` marks a launch whose arguments hold the 1 to 4 words in this order,
+  anything between them. A word starting with `-` is a flag, compared up to `=`, so write it
+  without a value. Words are at most 43 bytes.
+- `deny_env <binary> <NAME>` marks a launch with that variable set.
+- `warn_args` and `warn_env` only log the match (`ARGV comm=... word=...`).
+- `allow_env <NAME>=<path>`: no env rule on `NAME` matches when the value is exactly this one
+  clean absolute path (no `:`, at most 63 bytes in all), for every binary. Use it for a corporate CA
+  bundle passed in `SSL_CERT_FILE`. The daemon accepts it only when root decides what the path
+  holds: every directory on the way and the file (or, for a directory, everything in it) root-owned
+  and writable by no one else, outside user homes, on a mount without `nosuid`. Otherwise it logs
+  `allow_env ... refused` and launches setting it stay marked.
+- The binary is a whitelisted line, as written or its symlink's target; a rule naming any other
+  path does nothing and is logged. At most 16 argument rules per binary, built-ins included.
+- A rule can only refuse more: it is a tripwire, never a boundary (see
+  [Limitations](limitations.md#whitelisted-programs-that-disclose-on-request)).
 
 ## Process inspectors
 

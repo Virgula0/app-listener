@@ -8,6 +8,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 // generalTools run attacker-chosen code or copy attacker-chosen bytes from their arguments (`git`,
@@ -65,10 +66,32 @@ func GeneralToolsOf(res *daemonconfig.Resource) []string {
 	return out
 }
 
-// WarnGeneralTools logs, per resource, the general tools that make it readable by any script.
-func WarnGeneralTools(cfg *daemonconfig.Config) {
+// ScriptsOf lists res's whitelist lines that are "#!" scripts: the exe is their interpreter, so
+// such a line never matches.
+func ScriptsOf(res *daemonconfig.Resource) []string {
+	var out []string
+	for _, b := range res.Binaries {
+		line := b.Path
+		if b.Link != "" {
+			line = b.Link
+		}
+		if ebpf.IsScript(b.Path) && !slices.Contains(out, line) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// WarnWhitelistLines logs, per resource, the general tools that make it readable by any script and
+// the script lines that never match.
+func WarnWhitelistLines(cfg *daemonconfig.Config) {
 	for i := range cfg.Resources {
 		res := &cfg.Resources[i]
+		if scripts := ScriptsOf(res); len(scripts) > 0 {
+			log.Warnf("%s whitelists script(s) %s, which never match: a #! script runs as its interpreter "+
+				"(never whitelist that), so the app is denied too; whitelist the ELF it ends up running, if any",
+				res.Path, strings.Join(scripts, ", "))
+		}
 		if res.ReadOnly {
 			continue // a lib_dir holds no secret: a tool there is a writer, judged by the updater plan
 		}

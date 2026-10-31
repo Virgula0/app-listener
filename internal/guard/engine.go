@@ -61,6 +61,9 @@ type engine struct {
 	started    bool
 	// ioctlCompat: this kernel has file_ioctl_compat (6.8+), so guard_file_ioctl_compat attaches.
 	ioctlCompat bool
+	// busPidNS: guard_bus_pidns holds the daemon's pid namespace, so bus rows are keyed by the
+	// pids its pidfds report (setBusPidNSLocked). False refuses every bus client.
+	busPidNS bool
 
 	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
 	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).
@@ -78,6 +81,8 @@ type engine struct {
 	inspectors map[GuardInodeKey]string
 	// mcNames: the applets written to guard_multicall_names per multicall inode (ensureMulticall).
 	mcNames map[GuardInodeKey][]string
+	// ports: per guarded TCP port, its live guards (port.go).
+	ports map[uint32][]portOwner
 	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
 	// that registered the backing devices, whose consumer labels them as such. Delivering them to
 	// every guard duplicated each denial and let the self-guards label it with their own path.
@@ -298,6 +303,8 @@ func (e *engine) startLocked() error {
 		e.stopLocked()
 		return err
 	}
+	e.setPortNetNSLocked()
+	e.setBusPidNSLocked()
 
 	rd, err := ringbuf.NewReader(e.objs.Rb)
 	if err != nil {
@@ -785,6 +792,7 @@ func (e *engine) stopLocked() {
 	e.prevOwner = nil
 	e.successor = nil
 	e.mcNames = nil
+	e.ports = nil
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.

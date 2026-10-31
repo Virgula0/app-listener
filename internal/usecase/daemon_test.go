@@ -1313,3 +1313,50 @@ func TestDaemonUseCaseReloadAddsUnencryptedResource(t *testing.T) {
 		}
 	}
 }
+
+// withMounted fakes the mount table: dev is mounted while *on.
+func withMounted(t *testing.T, dev uint64, on *bool) {
+	t.Helper()
+	orig := mountedDev
+	mountedDev = func(d uint64) (bool, error) { return d == dev && *on, nil }
+	t.Cleanup(func() { mountedDev = orig })
+}
+
+func TestDaemonUseCaseReloadRuntimeRootReleasedOnlyWhenUnmounted(t *testing.T) {
+	run := daemonconfig.Resource{Path: "/run/user/1000/ssh-agent", Runtime: true}
+	for _, mounted := range []bool{true, false} {
+		oldA, oldRun := newFakeGuardRepo(), newFakeGuardRepo()
+		oldRun.anchor, oldRun.anchorAlive = guard.GuardInodeKey{Dev: 7, Ino: 10}, true
+		withMounted(t, 7, &mounted)
+		d := startDaemon(t, newFakeVault("/a"), []daemonconfig.Resource{resource("/a"), run},
+			[]repository.GuardRepository{oldA, oldRun})
+
+		err := d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{newFakeGuardRepo()})
+		if mounted && err == nil {
+			t.Error("a runtime root whose mount is still there (hidden by another mount) must not be dropped")
+		}
+		if !mounted && err != nil {
+			t.Errorf("a runtime root whose mount went at logout must be dropped: %v", err)
+		}
+	}
+}
+
+func TestDaemonUseCaseReloadRuntimeRootMovedWhileMounted(t *testing.T) {
+	run := daemonconfig.Resource{Path: "/run/user/1000/ssh-agent", Runtime: true}
+	for _, mounted := range []bool{true, false} {
+		oldRun := newFakeGuardRepo()
+		oldRun.anchor, oldRun.anchorAlive = guard.GuardInodeKey{Dev: 7, Ino: 10}, true
+		withMounted(t, 7, &mounted)
+		d := startDaemon(t, newFakeVault(), []daemonconfig.Resource{run}, []repository.GuardRepository{oldRun})
+
+		newRun := newFakeGuardRepo()
+		newRun.anchor, newRun.anchorAlive = guard.GuardInodeKey{Dev: 9, Ino: 3}, true
+		err := d.Reload([]daemonconfig.Resource{run}, []repository.GuardRepository{newRun})
+		if mounted && err == nil {
+			t.Error("a runtime path naming another directory while the guarded one's mount lives must be refused")
+		}
+		if !mounted && err != nil {
+			t.Errorf("a new login's mount must replace a logged-out one: %v", err)
+		}
+	}
+}

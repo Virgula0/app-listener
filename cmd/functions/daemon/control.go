@@ -452,6 +452,11 @@ func (cs *controlServer) clearActive(session *editControlSession) {
 // authPeer requires the peer to run as uid 0 and execute this very daemon binary (same dev/ino): a
 // grant on the shared exe inode is only useful to a caller that is that binary.
 func (cs *controlServer) authPeer(conn net.Conn) error {
+	return authSelfPeer(conn, cs.selfDev, cs.selfIno)
+}
+
+// authSelfPeer admits a peer running as uid 0 whose executable is selfDev:selfIno (this daemon's).
+func authSelfPeer(conn net.Conn, selfDev, selfIno uint64) error {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
 		return errors.New("not a unix socket")
@@ -477,7 +482,7 @@ func (cs *controlServer) authPeer(conn net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("resolving peer executable: %w", err)
 	}
-	if dev != cs.selfDev || ino != cs.selfIno {
+	if dev != selfDev || ino != selfIno {
 		return errors.New("peer is not the installed app-listener binary " +
 			"(live edit-protected requires /usr/local/sbin/app-listener)")
 	}

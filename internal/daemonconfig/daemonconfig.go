@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -37,6 +38,16 @@ type Config struct {
 	// that runs the app its argv names, /usr/lib/electronNN) may be started with. Any other is code
 	// its caller chose; root placement is the daemon's to check.
 	ElectronApps []string
+	// LaunchRules are the [launch_rules] lines (LaunchRule).
+	LaunchRules []LaunchRule
+	// AllowEnv are the [launch_rules] allow_env NAME=/path strings no env rule matches; root
+	// placement is the daemon's to check.
+	AllowEnv []string
+	// RuntimePaths are the `runtime: true` section roots, present or not: the daemon creates a
+	// missing one at its user's login (`daemon login`), before any of the user's processes run.
+	RuntimePaths []string
+	// SecretService is the [secret_service] block (secrets.go).
+	SecretService SecretService
 	// MaxInodes is [settings] max_inodes: the guard_inodes capacity, applied at daemon start. 0 =
 	// the compiled default (1<<18).
 	MaxInodes uint32
@@ -97,6 +108,15 @@ type Resource struct {
 	// addResource), which clears this flag. Still missing afterwards = hard error, never silently
 	// dropped.
 	PathPending bool
+	// Runtime is a `runtime: true` section: a directory in a user's /run/user/<uid> (an agent's
+	// sockets), unencrypted, gone at logout. Its root may vanish with the mount (RuntimeDirFor).
+	Runtime bool
+	// Port is a `[port tcp/<n>]` section's TCP port; Path is then its anchor (PortAnchor).
+	Port uint16
+	// Secret is a `[secret <name>]` scope; Path is then its anchor (SecretAnchor).
+	Secret *SecretScope
+	// SecretRelay is the gatekeeper's relay dir (SecretRelayDir), added for [secret_service].
+	SecretRelay bool
 }
 
 // MovePeer is a lib_dir's move-peer class: lib_dirs with the same configured writers (paths, links,
@@ -200,12 +220,25 @@ type watchGroup struct {
 	inspectorsBlock bool
 	// electronAppsBlock marks an [electron_apps] block: one app path per line.
 	electronAppsBlock bool
+	// launchRulesBlock marks a [launch_rules] block: one LaunchRule per line.
+	launchRulesBlock bool
 	// settingsBlock marks a [settings] block: daemon-wide `key: value` lines.
 	settingsBlock bool
-	blockName     string
+	// runtime: `runtime: true`, read even in a skipped group (RuntimePaths lists it either way).
+	runtime bool
+	// port: a [port tcp/<n>] section (ports.go).
+	port uint16
+	// secret, secretMatches: a [secret <name>] section; secretServiceBlock: [secret_service]
+	// (secrets.go).
+	secret             string
+	secretMatches      []SecretMatch
+	secretServiceBlock bool
+	encryptionSet      bool
+	blockName          string
 	// skipped marks a section whose root is missing: its directives are warned and ignored, never
-	// fatal (the group is dropped at finalize).
+	// fatal (the group is dropped at finalize). statErr is why.
 	skipped bool
+	statErr error
 	lineNo  int
 }
 
@@ -278,7 +311,12 @@ func parseConfig(cfg *Config, file io.Reader) error {
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	finalizeGroup(cfg, group)
+	if err := finalizeGroup(cfg, group); err != nil {
+		return err
+	}
+	if err := finishSecretService(cfg); err != nil {
+		return err
+	}
 	if cfg.Inspectors == nil {
 		cfg.Inspectors = append([]string(nil), DefaultInspectors...)
 		cfg.InspectorsDefault = true
@@ -289,19 +327,15 @@ func parseConfig(cfg *Config, file io.Reader) error {
 // applyConfigLine dispatches one line: section headers close the previous group and open a new one;
 // directives mutate the open group.
 func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) error {
-	if next := openBlock(cfg, line, lineNo); next != nil {
-		finalizeGroup(cfg, *group)
-		*group = next
-		return nil
+	if opened, err := openHeader(cfg, group, line, lineNo); opened {
+		return err
 	}
 	dirPath, isSection, headerErr := parseWatchSection(line)
 	if headerErr != nil {
 		return fmt.Errorf("daemon config line %d: %w", lineNo, headerErr)
 	}
 	if isSection {
-		finalizeGroup(cfg, *group)
-		*group = newWatchGroup(dirPath, lineNo)
-		return nil
+		return switchGroup(cfg, group, newWatchGroup(dirPath, lineNo))
 	}
 	if *group == nil {
 		// Tolerated like ssh-guard, but warned: a silently dropped security directive must be
@@ -310,21 +344,11 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 		return nil
 	}
 	g := *group
-	if g.libraryBlock {
-		return applyLibraryBlockDirective(g, line, lineNo)
+	if handled, err := applyBlockLine(cfg, g, line, lineNo); handled {
+		return err
 	}
-	if g.inspectorsBlock {
-		return applyInspector(cfg, line, lineNo)
-	}
-	if g.electronAppsBlock {
-		return applyElectronApp(cfg, line, lineNo)
-	}
-	if g.settingsBlock {
-		return applySetting(cfg, line, lineNo)
-	}
-	if g.skipped {
-		log.Warnf("daemon config line %d: skipped section: ignoring directive %q", lineNo, line)
-		return nil
+	if handled, err := applyAnyGroupDirective(g, line, lineNo); handled {
+		return err
 	}
 	if isWatchDirective(line) {
 		return g.addWatchPath(line, lineNo)
@@ -344,8 +368,89 @@ func applyConfigLine(cfg *Config, group **watchGroup, line string, lineNo int) e
 	return applyDirective(g, line, lineNo)
 }
 
-// openBlock returns the group a [libraries <name>], [inspectors], [electron_apps] or [settings]
-// header opens, nil for any other line.
+// applyBlockLine applies a line of a named block or a [secret] section's `match` line.
+func applyBlockLine(cfg *Config, g *watchGroup, line string, lineNo int) (bool, error) {
+	switch {
+	case g.libraryBlock:
+		return true, applyLibraryBlockDirective(g, line, lineNo)
+	case g.inspectorsBlock:
+		return true, applyInspector(cfg, line, lineNo)
+	case g.electronAppsBlock:
+		return true, applyElectronApp(cfg, line, lineNo)
+	case g.launchRulesBlock:
+		return true, applyLaunchRule(cfg, line, lineNo)
+	case g.settingsBlock:
+		return true, applySetting(cfg, line, lineNo)
+	case g.secretServiceBlock:
+		return true, applySecretService(cfg, line, lineNo)
+	case g.secret != "":
+		m, ok, err := parseSecretMatch(line)
+		if ok && err == nil {
+			g.secretMatches = append(g.secretMatches, m)
+		} else if err != nil {
+			err = fmt.Errorf("daemon config line %d: %w", lineNo, err)
+		}
+		return ok, err
+	}
+	return false, nil
+}
+
+// openHeader switches to the group a block, [secret] or [port] header opens; false for any other line.
+func openHeader(cfg *Config, group **watchGroup, line string, lineNo int) (bool, error) {
+	if next := openBlock(cfg, line, lineNo); next != nil {
+		return true, switchGroup(cfg, group, next)
+	}
+	if name, ok, err := ParseSecretSection(line); ok {
+		if err != nil {
+			return true, fmt.Errorf("daemon config line %d: %w", lineNo, err)
+		}
+		return true, switchGroup(cfg, group, &watchGroup{root: SecretAnchor(name), secret: name, lineNo: lineNo})
+	}
+	port, ok, err := ParsePortSection(line)
+	if !ok {
+		return false, nil
+	}
+	if err != nil {
+		return true, fmt.Errorf("daemon config line %d: %w", lineNo, err)
+	}
+	return true, switchGroup(cfg, group, &watchGroup{root: PortAnchor(port), port: port, lineNo: lineNo})
+}
+
+// switchGroup finalizes the open group and opens next.
+func switchGroup(cfg *Config, group **watchGroup, next *watchGroup) error {
+	if err := finalizeGroup(cfg, *group); err != nil {
+		return err
+	}
+	*group = next
+	return nil
+}
+
+// applyAnyGroupDirective handles what a skipped [watch] group still reads (`runtime:`, and
+// need_encryption for checkRuntimeGroup) and ignores the rest of a skipped group's lines. An error
+// is always handled.
+func applyAnyGroupDirective(g *watchGroup, line string, lineNo int) (bool, error) {
+	if value, ok := CutDirective(line, "runtime"); ok {
+		if value != "true" {
+			return true, fmt.Errorf("daemon config line %d: invalid runtime value %q (only `runtime: true`)", lineNo, value)
+		}
+		g.runtime = true
+		return true, nil
+	}
+	if !g.skipped {
+		return false, nil
+	}
+	if value, ok := parseNeedEncryption(line); ok {
+		g.encryptionSet, g.needEncryption = true, value != "false"
+		return true, nil
+	}
+	if !g.runtime { // a runtime dir is missing whenever its user is logged out
+		log.Warnf("daemon config line %d: skipped section: ignoring directive %q", lineNo, line)
+	}
+	return true, nil
+}
+
+// openBlock returns the group a [libraries <name>], [inspectors], [electron_apps], [launch_rules],
+// [settings] or [secret_service] header opens, nil for any other line.
 func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
 	if name, ok := ParseLibrariesSection(line); ok {
 		return &watchGroup{libraryBlock: true, blockName: name, lineNo: lineNo}
@@ -358,8 +463,12 @@ func openBlock(cfg *Config, line string, lineNo int) *watchGroup {
 		return &watchGroup{inspectorsBlock: true, lineNo: lineNo}
 	case "[electron_apps]":
 		return &watchGroup{electronAppsBlock: true, lineNo: lineNo}
+	case "[launch_rules]":
+		return &watchGroup{launchRulesBlock: true, lineNo: lineNo}
 	case "[settings]":
 		return &watchGroup{settingsBlock: true, lineNo: lineNo}
+	case "[secret_service]":
+		return &watchGroup{secretServiceBlock: true, lineNo: lineNo}
 	}
 	return nil
 }
@@ -370,24 +479,93 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 	g := &watchGroup{root: dirPath, needEncryption: true, lineNo: lineNo}
 	if dirPath != "" {
 		if _, statErr := os.Lstat(dirPath); statErr != nil {
-			g.skipped = true
+			g.skipped, g.statErr = true, statErr
 		}
 	}
 	return g
 }
 
 // finalizeGroup materializes a closed group unless it was skipped.
-func finalizeGroup(cfg *Config, group *watchGroup) {
-	if group == nil || group.skipped || group.inspectorsBlock || group.electronAppsBlock || group.settingsBlock {
-		return
+func finalizeGroup(cfg *Config, group *watchGroup) error {
+	if group == nil || group.inspectorsBlock || group.electronAppsBlock || group.launchRulesBlock ||
+		group.settingsBlock || group.secretServiceBlock {
+		return nil
+	}
+	if group.port != 0 {
+		return materializePortGroup(cfg, group)
+	}
+	if group.secret != "" {
+		return materializeSecretGroup(cfg, group)
+	}
+	if group.runtime {
+		if err := listRuntimeGroup(cfg, group); err != nil {
+			return err
+		}
+	}
+	if group.skipped {
+		return nil
 	}
 	if group.libraryBlock {
 		cfg.SharedAllowLibs = append(cfg.SharedAllowLibs, group.libs...)
 		cfg.SharedAllowLibs = append(cfg.SharedAllowLibs, group.pendingLibs...)
 		materializeLibDirs(cfg, group) // writers: the block's lib_binary rules only
-		return
+		return nil
 	}
 	materializeWatchGroup(cfg, group)
+	return nil
+}
+
+// listRuntimeGroup validates a runtime group and lists it in RuntimePaths, present or not.
+func listRuntimeGroup(cfg *Config, group *watchGroup) error {
+	if err := checkRuntimeGroup(group); err != nil {
+		return err
+	}
+	// Root can't look: a filesystem the user mounted over /run/user/<uid> hides the directory,
+	// which a guard may hold. Missing means logged out; anything else isn't known to be.
+	if group.skipped && !os.IsNotExist(group.statErr) {
+		return fmt.Errorf("daemon config line %d: runtime section %s: %w (a filesystem mounted over its "+
+			"/run/user directory?)", group.lineNo, group.root, group.statErr)
+	}
+	group.needEncryption = false
+	if slices.Contains(cfg.RuntimePaths, group.root) {
+		return fmt.Errorf("daemon config line %d: duplicate watch path: %s", group.lineNo, group.root)
+	}
+	cfg.RuntimePaths = append(cfg.RuntimePaths, group.root)
+	return nil
+}
+
+// RuntimeDirFor returns the uid whose runtime directory (/run/user/<uid>) holds path, which must
+// be one entry directly below it.
+func RuntimeDirFor(path string) (uint32, bool) {
+	rest, ok := strings.CutPrefix(path, "/run/user/")
+	if !ok {
+		return 0, false
+	}
+	uidText, name, ok := strings.Cut(rest, "/")
+	if !ok || name == "" || name == "." || name == ".." || strings.Contains(name, "/") {
+		return 0, false
+	}
+	uid, err := strconv.ParseUint(uidText, 10, 32)
+	if err != nil || strconv.FormatUint(uid, 10) != uidText {
+		return 0, false
+	}
+	return uint32(uid), true
+}
+
+// checkRuntimeGroup validates a `runtime: true` section: one unencrypted directory directly in a
+// user's runtime directory, nothing else (no `watch:` paths or library directives).
+func checkRuntimeGroup(g *watchGroup) error {
+	if _, ok := RuntimeDirFor(g.root); !ok {
+		return fmt.Errorf("daemon config line %d: a runtime section must name one directory directly in "+
+			"/run/user/<uid>, not %q", g.lineNo, g.root)
+	}
+	if g.encryptionSet && g.needEncryption {
+		return fmt.Errorf("daemon config line %d: a runtime section is never encrypted: write need_encryption: false", g.lineNo)
+	}
+	if len(g.watchPaths)+len(g.libDirs)+len(g.libs)+len(g.pendingLibs)+len(g.libBinaries)+len(g.libPending) > 0 {
+		return fmt.Errorf("daemon config line %d: a runtime section takes only binary lines and need_encryption", g.lineNo)
+	}
+	return nil
 }
 
 // isWatchDirective recognizes `watch: <path>` (optional space after the colon), adding a guarded
@@ -490,6 +668,7 @@ func materializeWatchGroup(cfg *Config, g *watchGroup) {
 			}
 		}
 		res.NeedEncryption = g.needEncryption
+		res.Runtime = g.runtime
 		if grouped {
 			res.EncryptionRoot = g.root
 		}
@@ -789,6 +968,7 @@ func rejectSymlinkedComponents(encRoot, target string) error {
 // from the section.
 func applyDirective(group *watchGroup, line string, lineNo int) error {
 	if value, ok := parseNeedEncryption(line); ok {
+		group.encryptionSet = true
 		switch value {
 		case "true":
 			group.needEncryption = true
@@ -1037,7 +1217,7 @@ func parseEvents(tokens []string) ([]ebpf.EventType, error) {
 	for _, token := range tokens {
 		et, ok := ebpf.ParseEventType(strings.TrimSpace(token))
 		if !ok {
-			return nil, fmt.Errorf("unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD)", token)
+			return nil, fmt.Errorf("unknown event type %q (valid: OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD, CONNECT)", token)
 		}
 		if !seen[et] {
 			seen[et] = true

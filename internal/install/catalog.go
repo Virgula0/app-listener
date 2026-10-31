@@ -4,6 +4,7 @@
 package install
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
 )
 
@@ -27,6 +29,21 @@ type CandidateDir struct {
 	// AbsPaths are system-level locations (e.g. "/etc/wireguard"), probed once regardless of users.
 	// Same multi-location semantics as RelPaths.
 	AbsPaths []string
+	// RuntimeDir names one directory in each user's /run/user/<uid> (an agent's sockets), guarded as
+	// a `runtime: true` section the daemon makes at that user's login. Offered for a user whose home
+	// holds RuntimeIf. Set instead of RelPaths/AbsPaths.
+	RuntimeDir string
+	RuntimeIf  string
+	// Ports are loopback TCP ports the entry's server listens on, each guarded as a `[port tcp/<n>]`
+	// section: MKNOD for the binaries that serve it, CONNECT for its clients. Offered for a user
+	// with one of the Whitelist binaries. Set instead of RelPaths/AbsPaths.
+	Ports []uint16
+	// Secret names a `[secret <name>]` scope: the Secret Service items matching one of SecretMatches
+	// (`key=value ...`, a value may end in '*'), usable only by Whitelist (READ, WRITE, DELETE). Offered
+	// with gnome-keyring installed, for a user with one of the Whitelist binaries. Set instead of
+	// RelPaths/AbsPaths.
+	Secret        string
+	SecretMatches []string
 	// Whitelist maps binary paths to allowed events (nil = all, emitted bare; else "<path>
 	// EV1,EV2"); matched by inode. Keep it minimal: each entry is a potential privilege-escalation
 	// path while the directory is unlocked. Shared (union) across an entry's RelPaths.
@@ -97,16 +114,40 @@ func (c *CandidateDir) IsBun() bool { return len(c.BunLaunchers) > 0 }
 // IsSystem reports a system-level (AbsPaths) entry, probed once regardless of users.
 func (c *CandidateDir) IsSystem() bool { return len(c.AbsPaths) > 0 }
 
+// IsSecret reports a Secret entry.
+func (c *CandidateDir) IsSecret() bool { return c.Secret != "" }
+
+// IsRuntime reports a RuntimeDir entry.
+func (c *CandidateDir) IsRuntime() bool { return c.RuntimeDir != "" }
+
+// RuntimePath is u's RuntimeDir.
+func (c *CandidateDir) RuntimePath(u User) string {
+	return fmt.Sprintf("/run/user/%d/%s", u.UID, c.RuntimeDir)
+}
+
+// codexBinaries are Codex's native binaries: the standalone install, distro and Homebrew packages,
+// and the binary npm's node launcher runs.
+var codexBinaries = map[string][]string{
+	"%HOME%/.local/bin/codex":                             nil,
+	"%HOME%/.codex/packages/standalone/current/bin/codex": nil,
+	"%HOME%/.codex/packages/standalone/current/codex":     nil,
+	"/usr/bin/codex": nil, "/usr/local/bin/codex": nil, "/home/linuxbrew/.linuxbrew/bin/codex": nil,
+	"/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex":       nil,
+	"/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex": nil,
+	"/usr/lib/node_modules/@openai/codex/vendor/*/bin/codex":                                          nil,
+	"/usr/local/lib/node_modules/@openai/codex/vendor/*/bin/codex":                                    nil,
+}
+
 // Catalog is the master list of critical directories probed per selected user; missing paths are
 // simply not proposed.
 var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPaths: []string{".ssh"},
-		// ssh needs WRITE (known_hosts rotation); sshd and helpers (sshd-auth/-session,
-		// sftp-server) only READ authorized_keys; keysign/pkcs11/cleanup helpers are inert. git
-		// excluded: it reads keys.
+		// ssh needs WRITE (known_hosts rotation), MKNOD + CONNECT (binding / reaching a ControlMaster
+		// socket here); sshd and helpers (sshd-auth/-session, sftp-server) only READ authorized_keys;
+		// keysign/pkcs11/cleanup helpers are inert. git excluded: it reads keys.
 		Whitelist: map[string][]string{
-			"/usr/bin/ssh":                         {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK"},
+			"/usr/bin/ssh":                         {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK", "MKNOD", "CONNECT"},
 			"/usr/bin/ssh-add":                     nil,
 			"/usr/bin/ssh-agent":                   nil,
 			"/usr/bin/ssh-keygen":                  nil,
@@ -129,18 +170,110 @@ var Catalog = []CandidateDir{
 			"/usr/lib/openssh/ssh-session-cleanup": nil,
 		}},
 	{Name: "GNU Privacy Guard keyring", RelPaths: []string{".gnupg"},
+		// Without /run/user, gpg-agent's sockets (S.gpg-agent.ssh too) live here: ssh may connect.
 		Whitelist: map[string][]string{
 			"/usr/bin/gpg": nil, "/usr/bin/gpg-agent": nil,
 			"/usr/bin/gpgconf": nil, "/usr/bin/gpg-connect-agent": nil,
+			"/usr/bin/ssh": {"CONNECT"}, "/usr/bin/ssh-add": {"CONNECT"},
+		}},
+	// Agent sockets in /run/user/<uid>: without a guard there, any of the user's programs can ask
+	// the agent to sign or decrypt. Nothing may DELETE that could remove the root (a crafted user
+	// unit's RuntimeDirectory= has systemd rm -rf it, gpgconf --remove-socketdir rmdirs it); the
+	// daemon's sentinel keeps an rm -d from emptying it.
+	{Name: "GnuPG agent sockets", RuntimeDir: "gnupg", RuntimeIf: ".gnupg",
+		// The agents bind and remove their own sockets; systemd's user manager binds the socket
+		// units'. A non-default GNUPGHOME gets a d.<hash> subdir (MKDIR).
+		Whitelist: map[string][]string{
+			"/usr/lib/systemd/systemd":   {"MKNOD", "STAT"},
+			"/usr/bin/gpg-agent":         {"MKNOD", "DELETE", "MKDIR", "CONNECT", "STAT"},
+			"/usr/bin/dirmngr":           {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/lib/gnupg/keyboxd":     {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/libexec/keyboxd":       {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/lib/gnupg/scdaemon":    {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/libexec/scdaemon":      {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/bin/gpgconf":           {"MKDIR", "CONNECT", "STAT"},
+			"/usr/bin/gpg":               {"MKDIR", "CONNECT", "STAT"},
+			"/usr/bin/gpgsm":             {"CONNECT", "STAT"},
+			"/usr/bin/gpg-connect-agent": {"CONNECT", "STAT"},
+			"/usr/bin/ssh":               {"CONNECT", "STAT"},
+			"/usr/bin/ssh-add":           {"CONNECT", "STAT"},
+		}},
+	{Name: "SSH agent socket", RuntimeDir: SSHAgentRuntimeDir, RuntimeIf: ".ssh",
+		// The installer's ssh-agent unit binds socket here; rm clears one a killed agent left.
+		Whitelist: map[string][]string{
+			"/usr/bin/ssh-agent":  {"MKNOD", "DELETE", "STAT"},
+			"/usr/bin/rm":         {"DELETE", "STAT"},
+			"/usr/bin/ssh":        {"CONNECT", "STAT"},
+			"/usr/bin/ssh-add":    {"CONNECT", "STAT"},
+			"/usr/bin/ssh-keygen": {"CONNECT", "STAT"},
+		}},
+	// gnome-keyring's control and pkcs11 sockets: pkcs11 hands any client every stored secret
+	// (pkcs11-tool --read-object), past the Secret Service gate. The user manager binds the socket
+	// unit's control socket; login programs' pam_gnome_keyring unlocks the keyring through it.
+	{Name: "GNOME Keyring sockets", RuntimeDir: "keyring", RuntimeIf: ".local/share/keyrings",
+		Whitelist: map[string][]string{
+			SecretProvider:                               {"MKNOD", "DELETE", "ATTR", "CONNECT", "STAT"},
+			"/usr/lib/systemd/systemd":                   {"MKNOD", "ATTR", "STAT"},
+			"/usr/bin/login":                             {"CONNECT", "STAT"},
+			"/usr/lib/gdm-session-worker":                {"CONNECT", "STAT"},
+			"/usr/libexec/gdm-session-worker":            {"CONNECT", "STAT"},
+			"/usr/lib/sddm/sddm-helper":                  {"CONNECT", "STAT"},
+			"/usr/lib/x86_64-linux-gnu/sddm/sddm-helper": {"CONNECT", "STAT"},
+			"/usr/sbin/lightdm":                          {"CONNECT", "STAT"},
+			"/usr/bin/lightdm":                           {"CONNECT", "STAT"},
+		}},
+	// Secret Service items, judged by the daemon's gate in front of gnome-keyring ([secret_service]).
+	// gh (go-keyring) stores its token as service=gh:<host>, in clear text over the bus.
+	{Name: "GitHub CLI token (keyring)", Secret: "gh", SecretMatches: []string{"service=gh:*"},
+		Whitelist: map[string][]string{
+			"/usr/bin/gh": nil, "/usr/local/bin/gh": nil, "%HOME%/.local/bin/gh": nil,
+			"/home/linuxbrew/.linuxbrew/bin/gh": nil,
+		}},
+	// Codex's keyring mode (keyring crate): "Codex Auth" and "Codex MCP Credentials". The crate also
+	// caches the token in the session's kernel keyring, which no scope covers.
+	{Name: "OpenAI Codex token (keyring)", Secret: "codex", SecretMatches: []string{"service=Codex*"},
+		Whitelist: codexBinaries},
+	// agy (go-keyring) looks up service=gemini username=antigravity; the hub's language_server shares
+	// its auth code. Without a session bus, or in a container, both fall back to a file in ~/.gemini.
+	{Name: "Antigravity token (keyring)", Secret: "antigravity",
+		SecretMatches: []string{"service=gemini username=antigravity"},
+		Whitelist: map[string][]string{
+			"/usr/bin/agy": nil, "/usr/local/bin/agy": nil, "%HOME%/.local/bin/agy": nil,
+			"/opt/Antigravity/antigravity": nil, "/opt/Antigravity/resources/bin/language_server": nil,
+		}},
+	{Name: "git credentials (libsecret)", Secret: "git-credential-libsecret",
+		SecretMatches: []string{"xdg:schema=org.git.Password"},
+		Whitelist: map[string][]string{
+			"/usr/lib/git-core/git-credential-libsecret":                               nil,
+			"/usr/libexec/git-core/git-credential-libsecret":                           nil,
+			"/usr/share/doc/git/contrib/credential/libsecret/git-credential-libsecret": nil,
+		}},
+	// The key that encrypts a Chromium profile's cookies and passwords (os_crypt).
+	{Name: "Google Chrome Safe Storage", Secret: "chrome-safe-storage",
+		SecretMatches: []string{"xdg:schema=chrome_libsecret_os_crypt_password* application=chrome"},
+		Whitelist:     map[string][]string{"/opt/google/chrome/chrome": nil}},
+	{Name: "Chromium Safe Storage", Secret: "chromium-safe-storage",
+		SecretMatches: []string{"xdg:schema=chrome_libsecret_os_crypt_password* application=chromium"},
+		Whitelist: map[string][]string{
+			"/usr/lib/chromium/chromium": nil, "/usr/lib/chromium/chrome": nil,
 		}},
 
 	// --- AI coding agents and CLI tools ----------------------------------------
-	{Name: "opencode", RelPaths: []string{".config/opencode"},
+	// opencode 2 keeps provider credentials in .local/share/opencode/opencode.db. Its snapshots there
+	// run git, which is never whitelisted (it would print the db): snapshots fail while guarded.
+	{Name: "opencode", RelPaths: []string{".config/opencode", ".local/share/opencode"},
 		Whitelist: map[string][]string{
 			"/usr/local/bin/opencode": nil, "/usr/bin/opencode": nil,
 			"%HOME%/.local/bin/opencode": nil,
 		},
 		BunLaunchers: []string{"opencode"}},
+	// `opencode serve` (default port) drives the agent with the user's provider credentials and
+	// has no authentication. The TUI's own server takes a random port, which no section can name.
+	{Name: "opencode server", Ports: []uint16{4096},
+		Whitelist: map[string][]string{
+			"/usr/local/bin/opencode": {"MKNOD", "CONNECT"}, "/usr/bin/opencode": {"MKNOD", "CONNECT"},
+			"%HOME%/.local/bin/opencode": {"MKNOD", "CONNECT"},
+		}},
 	{Name: "code CLI (GitHub)", RelPaths: []string{".config/code-cli"},
 		Whitelist: map[string][]string{
 			"/usr/bin/code-cli": nil, "/usr/local/bin/code-cli": nil,
@@ -159,15 +292,67 @@ var Catalog = []CandidateDir{
 			"/usr/local/bin/codeium": nil, "/usr/bin/codeium": nil,
 			"%HOME%/.local/bin/codeium": nil,
 		}},
-	{Name: "Gemini CLI", RelPaths: []string{".gemini"},
+	// ~/.gemini is shared: Gemini CLI, the Antigravity CLI (agy), the Antigravity 2.0 hub's
+	// language_server and the Antigravity IDE all read and write it, so one fscrypt root carries one
+	// whitelist and each may read the others' tokens. Watches only the secrets and the config the
+	// agents execute (MCP servers, hooks, plugins). Gemini CLI is a node script: its lines never match.
+	{Name: "Gemini CLI and Antigravity", RelPaths: []string{".gemini"},
+		WatchRelPaths: []string{
+			".gemini/oauth_creds.json", ".gemini/google_accounts.json", ".gemini/.env",
+			".gemini/mcp-oauth-tokens.json", ".gemini/mcp-oauth-tokens-v2.json", ".gemini/settings.json",
+			".gemini/antigravity-cli", ".gemini/antigravity", ".gemini/config",
+		},
 		Whitelist: map[string][]string{
 			"/usr/local/bin/gemini": nil, "/usr/bin/gemini": nil,
 			"%HOME%/.local/bin/gemini": nil,
+			"/usr/bin/agy":             nil, "/usr/local/bin/agy": nil, "%HOME%/.local/bin/agy": nil,
+			"/opt/Antigravity/antigravity": nil, "/opt/Antigravity/resources/bin/language_server": nil,
+			"/opt/antigravity-ide/antigravity-ide": nil,
+		}},
+	// Antigravity 2.0 (Electron hub) keeps its profile in ~/.config/Antigravity, the IDE 1.x deb its
+	// own there too; agy and the hub's language_server keep plugin secrets in ~/.config/antigravity.
+	{Name: "Antigravity", RelPaths: []string{".config/Antigravity", ".config/antigravity"},
+		Whitelist: map[string][]string{
+			"/opt/Antigravity/antigravity": nil, "/opt/Antigravity/resources/bin/language_server": nil,
+			"/opt/Antigravity/chrome_crashpad_handler": nil,
+			"/usr/share/antigravity/antigravity":       nil,
+			"/usr/bin/agy":                             nil, "/usr/local/bin/agy": nil, "%HOME%/.local/bin/agy": nil,
+		}},
+	// The IDE keeps its Google OAuth token in plain text in User/globalStorage/state.vscdb.
+	{Name: "Antigravity IDE", RelPaths: []string{".config/Antigravity IDE"},
+		Whitelist: map[string][]string{
+			"/opt/antigravity-ide/antigravity-ide": nil, "/opt/antigravity-ide/chrome_crashpad_handler": nil,
+		},
+		LibDirRelPaths: []string{".antigravity-ide"},
+		LibDirWriters:  []string{"/opt/antigravity-ide/antigravity-ide"}},
+	// The standalone installer keeps the binary in ~/.codex/packages and rewrites it on update, so
+	// only the secrets are watched. config.toml too: it sets the base URL Codex sends its token to.
+	{Name: "OpenAI Codex CLI", RelPaths: []string{".codex"},
+		WatchRelPaths: []string{
+			".codex/auth.json", ".codex/.credentials.json", ".codex/config.toml",
+			".codex/history.jsonl", ".codex/sessions", ".codex/archived_sessions",
+		},
+		Whitelist: codexBinaries},
+	// pi's installer and npm install a node script (its own install lives in ~/.pi/agent/install), so
+	// only the release tarball's Bun binary matches; otherwise pi is denied like gcloud.
+	{Name: "pi coding agent", RelPaths: []string{".pi/agent"},
+		WatchRelPaths: []string{
+			".pi/agent/auth.json", ".pi/agent/models.json", ".pi/agent/settings.json", ".pi/agent/sessions",
+		},
+		Whitelist: map[string][]string{
+			"%HOME%/.local/bin/pi": nil, "/usr/local/bin/pi": nil, "/opt/pi/pi": nil,
 		}},
 	{Name: "Cursor", RelPaths: []string{".cursor"},
 		Whitelist: map[string][]string{
 			"/usr/bin/cursor": nil, "/usr/local/bin/cursor": nil,
 			"%HOME%/.local/bin/cursor": nil,
+		}},
+	// Copilot CLI keeps its token in the keyring, in config.json only when you choose plaintext.
+	// The VS Code extension writes ide/ lock files here for /ide; whitelist code for that.
+	{Name: "GitHub Copilot CLI", RelPaths: []string{".copilot"},
+		Whitelist: map[string][]string{
+			"/usr/bin/copilot": nil, "/usr/local/bin/copilot": nil,
+			"%HOME%/.local/bin/copilot": nil,
 		}},
 	{Name: "GitHub Copilot", RelPaths: []string{".config/github-copilot"},
 		Whitelist: map[string][]string{
@@ -256,13 +441,23 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/dbeaver": nil, "/usr/lib/dbeaver/dbeaver": nil}},
 	{Name: "Android adb keys", RelPaths: []string{".android"},
 		Whitelist: map[string][]string{"/usr/bin/adb": nil}},
+	// The adb server has no authentication: whoever reaches it drives every connected device (shell,
+	// pull). adb is both server and client; Android Studio's bundled java talks to it directly.
+	{Name: "adb server", Ports: []uint16{5037},
+		Whitelist: map[string][]string{
+			"/usr/bin/adb":                          {"MKNOD", "CONNECT"},
+			"/opt/android-sdk/platform-tools/adb":   {"MKNOD", "CONNECT"},
+			"%HOME%/Android/Sdk/platform-tools/adb": {"MKNOD", "CONNECT"},
+			"/opt/android-studio/jbr/bin/java":      {"CONNECT"},
+			"%HOME%/android-studio/jbr/bin/java":    {"CONNECT"},
+		}},
 
 	// --- Cloud, containers and dev tooling --------------------------------------
 	{Name: "AWS credentials", RelPaths: []string{".aws"},
 		Whitelist: map[string][]string{"/usr/bin/aws": nil}},
 	{Name: "Google Cloud SDK", RelPaths: []string{".config/gcloud"},
-		// Python launchers: the exe is the interpreter (not whitelisted), so both entries are
-		// inert; documentation only.
+		// Python launchers: the exe is the interpreter, so these lines never match (the daemon warns)
+		// and gcloud itself is denied. Kept: dropping a section's only lines fails `catalog refresh`.
 		Whitelist: map[string][]string{"/usr/bin/gcloud": nil, "/usr/bin/gsutil": nil}},
 	{Name: "Kubernetes kubeconfig", RelPaths: []string{".kube"},
 		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil,
@@ -282,28 +477,39 @@ var Catalog = []CandidateDir{
 			"/home/linuxbrew/.linuxbrew/bin/gh": nil,
 			"/snap/bin/gh":                      nil,
 		}},
+	// A Python app: its lines never match (see Google Cloud SDK).
 	{Name: "Azure CLI", RelPaths: []string{".azure", ".config/azure"},
 		Whitelist: map[string][]string{"/usr/bin/az": nil}},
 	{Name: "rclone config", RelPaths: []string{".config/rclone"},
 		Whitelist: map[string][]string{"/usr/bin/rclone": nil}},
 	{Name: "Ollama config", RelPaths: []string{".ollama"},
 		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
+	// No authentication: any local process can run, pull or delete models. Other clients (a web UI,
+	// an editor plugin) need their own CONNECT line.
+	{Name: "Ollama API", Ports: []uint16{11434},
+		Whitelist: map[string][]string{
+			"/usr/bin/ollama": {"MKNOD", "CONNECT"}, "/usr/local/bin/ollama": {"MKNOD", "CONNECT"},
+		}},
 	// No npm entry: npm runs as node, and whitelisting node lets `node -e` read the tree (issue #79).
-	// pip is a #!/usr/bin/python script (inert like gcloud); documentation only.
+	// pip is a #!/usr/bin/python script (never matches, like gcloud).
 	{Name: "pip config", RelPaths: []string{".config/pip"},
 		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
 	{Name: "Git config directory", RelPaths: []string{".config/git"},
 		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 
 	// --- Password managers and secrets -------------------------------------------
+	// pass is a bash script, so its line would never match: gpg does the reads, while the `tree`,
+	// `git` and `mkdir` it runs are denied.
 	{Name: "password-store (pass)", RelPaths: []string{".password-store"},
-		Whitelist: map[string][]string{"/usr/bin/pass": nil, "/usr/bin/gpg": nil}},
+		Whitelist: map[string][]string{"/usr/bin/gpg": nil}},
 	{Name: "gopass", RelPaths: []string{".local/share/gopass"},
 		Whitelist: map[string][]string{"/usr/bin/gopass": nil}},
 	{Name: "Bitwarden", RelPaths: []string{".config/Bitwarden"},
 		Whitelist: map[string][]string{"/usr/bin/bitwarden": nil, "/usr/local/bin/bitwarden": nil}},
 	{Name: "1Password", RelPaths: []string{".1password"},
-		Whitelist: map[string][]string{"/usr/bin/1password": nil, "/usr/bin/op": nil, "/usr/local/bin/op": nil}},
+		// ssh and ssh-add only talk to the SSH agent socket (IdentityAgent ~/.1password/agent.sock).
+		Whitelist: map[string][]string{"/usr/bin/1password": nil, "/usr/bin/op": nil, "/usr/local/bin/op": nil,
+			"/usr/bin/ssh": {"CONNECT"}, "/usr/bin/ssh-add": {"CONNECT"}}},
 	{Name: "age keys", RelPaths: []string{".config/age"},
 		Whitelist: map[string][]string{"/usr/bin/age": nil, "/usr/bin/age-keygen": nil}},
 	{Name: "KeePassXC", RelPaths: []string{".local/share/keepassxc"},
@@ -313,18 +519,38 @@ var Catalog = []CandidateDir{
 	{Name: "Chezmoi state", RelPaths: []string{".local/share/chezmoi"},
 		Whitelist: map[string][]string{"/usr/bin/chezmoi": nil}},
 
-	// --- Legacy dot-config files --------------------------------------------------
-	// No single-file entries: the daemon guards directories only (non-dir paths are skipped at
-	// load), so e.g. ~/.netrc would be silently dropped (same for Steam's ssfn files).
-
 	// --- Wallets and crypto -------------------------------------------------------
 	// Surface only once the wallet is installed. Solana keeps its keypair as a plaintext id.json.
 	{Name: "Bitcoin Core", RelPaths: []string{".bitcoin/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil, "/usr/bin/bitcoin-tx": nil}},
 	{Name: "Litecoin Core", RelPaths: []string{".litecoin/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil}},
+	// The RPC cookie grants every RPC (spending from an unlocked wallet). By default it is written to
+	// the datadir root as .cookie.tmp then renamed, outside any guarded tree: these entries appear
+	// once you create rpc/ and set `rpccookiefile=rpc/.cookie` (docs/catalog.md).
+	{Name: "Bitcoin Core RPC cookie", RelPaths: []string{".bitcoin/rpc"},
+		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil}},
+	{Name: "Litecoin Core RPC cookie", RelPaths: []string{".litecoin/rpc"},
+		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil, "/usr/bin/litecoin-cli": nil}},
+	// RPC over loopback TCP (mainnet, testnet3, regtest; signet and testnet4 sit in the default
+	// ephemeral range). With rpcuser/rpcpassword in bitcoin.conf a client needs no cookie at all,
+	// and a process listening on a stopped node's port collects the credentials clients send.
+	{Name: "Bitcoin Core RPC port", Ports: []uint16{8332, 18332, 18443},
+		Whitelist: map[string][]string{
+			"/usr/bin/bitcoind": {"MKNOD"}, "/usr/bin/bitcoin-qt": {"MKNOD"},
+			"/usr/bin/bitcoin-node": {"MKNOD"}, "/usr/bin/bitcoin-gui": {"MKNOD"},
+			"/usr/bin/bitcoin-cli":    {"CONNECT"},
+			"/usr/local/bin/bitcoind": {"MKNOD"}, "/usr/local/bin/bitcoin-qt": {"MKNOD"},
+			"/usr/local/bin/bitcoin-cli": {"CONNECT"},
+		}},
+	{Name: "Litecoin Core RPC port", Ports: []uint16{9332, 19332, 19443},
+		Whitelist: map[string][]string{
+			"/usr/bin/litecoind": {"MKNOD"}, "/usr/bin/litecoin-qt": {"MKNOD"},
+			"/usr/bin/litecoin-cli": {"CONNECT"},
+		}},
 	{Name: "Monero", RelPaths: []string{".bitmonero/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/monero-wallet-gui": nil, "/usr/bin/monero-wallet-cli": nil, "/usr/bin/monerod": nil}},
+	// A Python app: its lines never match (see Google Cloud SDK).
 	{Name: "Electrum", RelPaths: []string{".electrum"},
 		Whitelist: map[string][]string{"/usr/bin/electrum": nil, "/usr/local/bin/electrum": nil}},
 	{Name: "Sparrow", RelPaths: []string{".sparrow"},
@@ -357,12 +583,14 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/nordvpn": nil}},
 	{Name: "Mullvad VPN config", RelPaths: []string{".config/mullvad"},
 		Whitelist: map[string][]string{"/usr/bin/mullvad": nil}},
+	// A Python app: its lines never match (see Google Cloud SDK).
 	{Name: "ProtonVPN config", RelPaths: []string{".config/protonvpn"},
 		Whitelist: map[string][]string{"/usr/bin/protonvpn": nil, "/usr/bin/protonvpn-cli": nil}},
 	{Name: "OpenVPN config", RelPaths: []string{".config/openvpn"},
 		Whitelist: map[string][]string{"/usr/bin/openvpn": nil}},
 	{Name: "WireGuard config (per-user)", RelPaths: []string{".config/wireguard"},
-		Whitelist: map[string][]string{"/usr/bin/wg": nil, "/usr/bin/wg-quick": nil}},
+		// wg-quick is a bash script (never matches); wg reads the config.
+		Whitelist: map[string][]string{"/usr/bin/wg": nil}},
 
 	// --- Browsers and messaging -----------------------------------------------------
 	// Browser binaries are shell wrappers, so the whitelist matches the executed ELF under /usr/lib
@@ -804,6 +1032,19 @@ type Candidate struct {
 	User  User
 	Entry CandidateDir
 	Path  string
+	// Port is a Ports entry's port (Path is then its anchor).
+	Port uint16
+}
+
+// Label names the candidate in a picker: its path, tcp/<port> or secret <name>.
+func (c *Candidate) Label() string {
+	if c.Port != 0 {
+		return fmt.Sprintf("tcp/%d", c.Port)
+	}
+	if c.Entry.IsSecret() {
+		return "secret " + c.Entry.Secret
+	}
+	return c.Path
 }
 
 // Discover probes the catalog for a user, returning existing per-user paths (AbsPaths skipped: see
@@ -824,6 +1065,101 @@ func Discover(user User) []Candidate {
 		}
 	}
 	return out
+}
+
+// DiscoverRuntime proposes each RuntimeDir entry for every user whose home holds its RuntimeIf.
+// Kept out of Discover: those directories exist only while the user is logged in and are never
+// encrypted, so no fscrypt scan may address them.
+func DiscoverRuntime(users []User) []Candidate {
+	var out []Candidate
+	for _, u := range users {
+		for i := range Catalog {
+			entry := &Catalog[i]
+			if !entry.IsRuntime() {
+				continue
+			}
+			if _, err := os.Lstat(filepath.Join(u.Home, entry.RuntimeIf)); err == nil {
+				out = append(out, Candidate{User: u, Entry: *entry, Path: entry.RuntimePath(u)})
+			}
+		}
+	}
+	return out
+}
+
+// DiscoverPorts proposes each Ports entry's ports for every user with one of its binaries (a %HOME%
+// line expands per user). Candidates of one port become one section (install's
+// sectionsFromCandidates merges their whitelists).
+func DiscoverPorts(users []User) []Candidate {
+	var out []Candidate
+	for i := range Catalog {
+		entry := &Catalog[i]
+		if len(entry.Ports) == 0 {
+			continue
+		}
+		for _, u := range users {
+			c := Candidate{User: u, Entry: *entry}
+			if len(c.FilterExistingWhitelist()) == 0 {
+				continue
+			}
+			for _, p := range entry.Ports {
+				c.Path, c.Port = daemonconfig.PortAnchor(p), p
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// SecretProvider is the Secret Service provider the catalog's secret scopes are written for.
+const SecretProvider = "/usr/bin/gnome-keyring-daemon" //nolint:gosec // a path, not a credential
+
+// secretRoleCandidates are gnome-keyring's prompter (gcr 3) and Seahorse, the keyring manager.
+var (
+	secretPrompters = []string{"/usr/libexec/gcr-prompter", "/usr/lib/gcr-prompter"}
+	secretManagers  = []string{"/usr/bin/seahorse"}
+)
+
+// DiscoverSecrets proposes each Secret entry for every user with one of its binaries, when
+// gnome-keyring is installed. Candidates of one scope become one section.
+func DiscoverSecrets(users []User) []Candidate {
+	if _, err := os.Stat(SecretProvider); err != nil {
+		return nil
+	}
+	var out []Candidate
+	for i := range Catalog {
+		entry := &Catalog[i]
+		if !entry.IsSecret() {
+			continue
+		}
+		for _, u := range users {
+			c := Candidate{User: u, Entry: *entry, Path: daemonconfig.SecretAnchor(entry.Secret)}
+			if len(c.FilterExistingWhitelist()) > 0 {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// SecretServiceBlock renders the [secret_service] block for the catalog's provider: its prompter
+// and manager lines name only binaries installed here.
+func SecretServiceBlock() string {
+	var b strings.Builder
+	b.WriteString("\n# The Secret Service gate: gnome-keyring reaches the session bus only through the\n")
+	b.WriteString("# daemon, which judges every call touching a [secret] scope's items.\n")
+	b.WriteString("[secret_service]\n\n")
+	fmt.Fprintf(&b, "provider %s\n", SecretProvider)
+	for _, role := range []struct {
+		kw    string
+		paths []string
+	}{{"prompter", secretPrompters}, {"manager", secretManagers}} {
+		for _, p := range role.paths {
+			if _, err := os.Stat(p); err == nil {
+				fmt.Fprintf(&b, "%s %s\n", role.kw, p)
+			}
+		}
+	}
+	return b.String()
 }
 
 // DiscoverSystem probes the system-level (AbsPaths) entries, user-independent.

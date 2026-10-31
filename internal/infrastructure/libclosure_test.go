@@ -230,3 +230,33 @@ func TestMountVouchesOwnershipJudgesHostNamespace(t *testing.T) {
 		t.Fatalf("mountVouchesOwnership(/) = %v from a nosuid namespace; pid 1's / is suid", r.err)
 	}
 }
+
+func TestIsScript(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "wg-quick")
+	if err := os.WriteFile(script, []byte("#!/bin/bash\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(script, link); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	short := filepath.Join(dir, "short")
+	if err := os.WriteFile(short, []byte("#"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]bool{script: true, link: true, fifo: false, short: false, self: false,
+		dir: false, filepath.Join(dir, "missing"): false} {
+		if got := IsScript(path); got != want {
+			t.Errorf("IsScript(%s) = %v, want %v", path, got, want)
+		}
+	}
+}

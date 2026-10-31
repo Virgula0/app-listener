@@ -13,6 +13,13 @@ type Section struct {
 	Path    string
 	Allow   []BinaryRule // whitelisted binaries and their event restrictions
 	Encrypt bool
+	// Runtime emits `runtime: true` (a CandidateDir.RuntimeDir; Encrypt must be false).
+	Runtime bool
+	// Port emits a `[port tcp/<n>]` section instead (Path and Encrypt unused).
+	Port uint16
+	// Secret emits a `[secret <name>]` section with SecretMatches as `match` lines instead.
+	Secret        string
+	SecretMatches []string
 	// ExtraWatchPaths turns the section into an encryption GROUP: the section path stays the
 	// fscrypt root (its need_encryption governs the group) and each extra path is its own guarded
 	// tree sharing the whitelist, emitted as `watch: <path>`. For self-updating apps whose update
@@ -45,7 +52,22 @@ func GenerateConf(sections []Section, blocks []LibraryBlock) string {
 	b.WriteString("# for the full syntax documentation.\n")
 	b.WriteString(GenerateSections(sections))
 	b.WriteString(GenerateLibraryBlocks(blocks))
-	return b.String()
+	return EnsureSecretServiceBlock(b.String())
+}
+
+// EnsureSecretServiceBlock appends the catalog's [secret_service] block to a config with a
+// [secret] section and none.
+func EnsureSecretServiceBlock(confText string) string {
+	hasScope, hasBlock := false, false
+	for line := range strings.SplitSeq(confText, "\n") {
+		line = strings.TrimSpace(line)
+		hasScope = hasScope || strings.HasPrefix(line, "[secret ")
+		hasBlock = hasBlock || line == "[secret_service]"
+	}
+	if !hasScope || hasBlock {
+		return confText
+	}
+	return strings.TrimRight(confText, "\n") + "\n" + SecretServiceBlock()
 }
 
 // GenerateSections renders just the [watch ...] blocks (no file header, each preceded by a blank
@@ -56,9 +78,25 @@ func GenerateSections(sections []Section) string {
 	var b strings.Builder
 	for i := range sections {
 		s := &sections[i]
+		if s.Port != 0 {
+			fmt.Fprintf(&b, "\n[port tcp/%d]\n\n", s.Port)
+			writeAllow(&b, s.Allow)
+			continue
+		}
+		if s.Secret != "" {
+			fmt.Fprintf(&b, "\n[secret %s]\n\n", s.Secret)
+			for _, m := range s.SecretMatches {
+				fmt.Fprintf(&b, "match %s\n", m)
+			}
+			writeAllow(&b, s.Allow)
+			continue
+		}
 		b.WriteString("\n[watch ")
 		b.WriteString(quotePath(s.Path))
 		b.WriteString("]\n\n")
+		if s.Runtime {
+			b.WriteString("runtime: true\n")
+		}
 		for _, w := range s.ExtraWatchPaths {
 			b.WriteString("watch: ")
 			b.WriteString(quotePath(w))
@@ -67,17 +105,7 @@ func GenerateSections(sections []Section) string {
 		if len(s.ExtraWatchPaths) > 0 {
 			b.WriteString("\n")
 		}
-		for _, bin := range s.Allow {
-			b.WriteString(quotePath(bin.Path))
-			if len(bin.Events) > 0 {
-				b.WriteString(" ")
-				b.WriteString(strings.Join(bin.Events, ","))
-			}
-			b.WriteString("\n")
-		}
-		if len(s.Allow) == 0 {
-			b.WriteString("# no binaries whitelisted: every access is denied\n")
-		}
+		writeAllow(&b, s.Allow)
 		b.WriteString("\n")
 		if s.Encrypt {
 			b.WriteString("need_encryption: true\n")
@@ -86,6 +114,20 @@ func GenerateSections(sections []Section) string {
 		}
 	}
 	return b.String()
+}
+
+func writeAllow(b *strings.Builder, allow []BinaryRule) {
+	for _, bin := range allow {
+		b.WriteString(quotePath(bin.Path))
+		if len(bin.Events) > 0 {
+			b.WriteString(" ")
+			b.WriteString(strings.Join(bin.Events, ","))
+		}
+		b.WriteString("\n")
+	}
+	if len(allow) == 0 {
+		b.WriteString("# no binaries whitelisted: every access is denied\n")
+	}
 }
 
 // SetNeedEncryption updates need_encryption in the [watch path] section of confText, inserting it

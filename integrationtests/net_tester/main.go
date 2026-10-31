@@ -304,6 +304,17 @@ var commands = map[string]func(args []string) int{
 		unixServer(args[0])
 		return 0
 	},
+	// read prints a file as launch_probe does: a Go binary for the guard's Go-only launch rules.
+	"read": func(args []string) int {
+		needArgs(args, 1)
+		b, err := os.ReadFile(args[0])
+		if err != nil {
+			fmt.Printf("DENIED|%v\n", err)
+			return 1
+		}
+		fmt.Printf("STOLEN|%s\n", b)
+		return 0
+	},
 	"dns": func(args []string) int {
 		needArgs(args, 1)
 		r := &net.Resolver{}

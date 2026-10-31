@@ -1,6 +1,13 @@
 package install
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
+)
 
 func TestNamedGeneralTool(t *testing.T) {
 	for _, p := range []string{
@@ -18,5 +25,27 @@ func TestNamedGeneralTool(t *testing.T) {
 		if namedGeneralTool(p) {
 			t.Errorf("%s is not a general tool", p)
 		}
+	}
+}
+
+func TestScriptsOf_NamesTheConfiguredLine(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "versions", "pass")
+	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(script, []byte("#!/bin/bash\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "pass")
+	res := &daemonconfig.Resource{Binaries: []daemonconfig.BinaryRule{
+		{Path: script, Link: link}, {Path: script}, {Path: self},
+	}}
+	if got := ScriptsOf(res); !slices.Equal(got, []string{link, script}) {
+		t.Errorf("ScriptsOf = %v, want [%s %s]", got, link, script)
 	}
 }

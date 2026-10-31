@@ -299,7 +299,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			"self-access for a file-vault resource left unlocked by a crash of this run", pinErr)
 	}
 
-	markReady()
+	login := markReadyWithLogin(d, cfg)
 
 	if err := writePidFile(); err != nil {
 		return err
@@ -311,7 +311,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	control := startControlManager(d)
 	defer control.close()
 
-	reload, stopRefresh := startCatalogRefresh(d, configPath, cfg, vault, pin, control, trust)
+	reload, stopRefresh := startCatalogRefresh(d, configPath, cfg, vault, pin, control, trust, login)
 	defer stopRefresh()
 	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
 }
@@ -319,7 +319,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 // startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) and the app
 // maintainers (maintain.go) on the reload the SIGHUP handler uses, and returns that handler.
 func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemonconfig.Config, vault *fscrypt.Vault,
-	pin pinCfg, control *controlManager, trust *trustManager) (reload, stop func()) {
+	pin pinCfg, control *controlManager, trust *trustManager, login *loginServer) (reload, stop func()) {
 	keeper := startMaintainers(d, trust, cfg)
 	var refresher *catalogRefresher
 	reloadCfg := makeReloadHandler(d, configPath, vault, pin, control, trust, trust.vet, func(next *daemonconfig.Config) {
@@ -327,8 +327,12 @@ func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemon
 			refresher.setConfig(next)
 		}
 		keeper.setConfig(next)
+		login.setConfig(next)
 	})
 	reload = func() { _, _ = reloadCfg() }
+	if login != nil {
+		login.setReload(reloadCfg)
+	}
 	control.setConfigEditor(&configEditor{path: configPath, reload: reloadCfg})
 	resync := func() {
 		d.ResyncBinaries()
@@ -341,12 +345,16 @@ func startCatalogRefresh(d usecase.DaemonUseCase, configPath string, cfg *daemon
 	refresher, err := newCatalogRefresher(configPath, cfg, reloadOrNil, resync, control.sessionActive)
 	if err != nil {
 		log.Errorf("daemon: %v — new app versions wait for a reload", err)
-		return reload, keeper.close
+		return reload, func() {
+			login.close()
+			keeper.close()
+		}
 	}
 	refresher.start()
 	// A refresh judges a new version by its freed creator's updater row: the prune keeps it meanwhile.
 	guard.SetSupersedeHold(refresher.refreshes.pending)
 	return reload, func() {
+		login.close()
 		guard.SetSupersedeHold(nil)
 		refresher.stop()
 		keeper.close()
@@ -488,6 +496,13 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("%w: config %s contains no [watch] sections", constants.ErrCriticalStartup, configPath)
 	}
+	err = ensurePortAnchors(cfg)
+	if err == nil {
+		err = ensureSecretAnchors(cfg)
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: config %s: %w", constants.ErrCriticalStartup, configPath, err)
+	}
 	// Before the first guard loads the engine: the map is sized once per process.
 	if _, err := guard.ConfigureInodeCapacity(cfg.MaxInodes); err != nil {
 		return "", nil, fmt.Errorf("%w: config %s: %w", constants.ErrCriticalStartup, configPath, err)
@@ -576,6 +591,12 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 	}
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("config contains no [watch] sections")
+	}
+	if anchorErr := ensurePortAnchors(cfg); anchorErr != nil {
+		return "", nil, anchorErr
+	}
+	if anchorErr := ensureSecretAnchors(cfg); anchorErr != nil {
+		return "", nil, anchorErr
 	}
 	// Old and new guards overlap until the commit, with the self guards still attached: refuse up
 	// front rather than detach anything to make room.
@@ -1046,10 +1067,12 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	// File-vault resources stage a crash-recovery sidecar before every unlock/lock transform, which
 	// must exist before THIS guard attaches: once live, creating a dentry beside a single-file
 	// watch root is denied (fscrypt.EnsureRecoverySidecarPlaceholder, guard_path_rename
-	// destination-parent check). No-op for directories.
-	if err := fscrypt.EnsureRecoverySidecarPlaceholder(r.Path); err != nil {
-		log.Warnf("daemon: could not pre-create the recovery sidecar for %s (%v) — "+
-			"a lock/unlock interrupted by a crash may not be recoverable", r.Path, err)
+	// destination-parent check). No-op for directories, and a daemon-made anchor is no vault.
+	if !r.Anchored() {
+		if err := fscrypt.EnsureRecoverySidecarPlaceholder(r.Path); err != nil {
+			log.Warnf("daemon: could not pre-create the recovery sidecar for %s (%v) — "+
+				"a lock/unlock interrupted by a crash may not be recoverable", r.Path, err)
+		}
 	}
 
 	// lib_dir resource: every process must keep READING the tree (denying would break every binary
@@ -1065,7 +1088,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 		guard.WithPendingBinaries(append(deferred, r.PendingBinaries...)),
 		// Root-gated self access with the minimal event set the fscrypt lifecycle needs; non-root
 		// executors of this binary stay denied (self-key bypass regression test).
-		guard.WithSelfAllowBinary(self, daemonSelfBaselineEvents),
+		guard.WithSelfAllowBinary(self, selfEventsFor(r)),
 		// Pin LSM links so a SIGKILL leaves the tree enforced until ExecStopPost locks the vault.
 		guard.WithPinning(pin.prefix(r.Path)),
 		guard.WithBackingDevices(deviceSet),
@@ -1080,6 +1103,9 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	opts = append(opts, eventFilterOptions()...)
 	if r.ReadOnly {
 		opts = append(opts, guard.WithChmodDropWrite(), guard.WithMovePeer(r.MovePeer()))
+	}
+	if r.Port != 0 {
+		opts = append(opts, guard.WithPort(r.Port))
 	}
 	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0, opts...)
 	if err != nil {
@@ -1201,6 +1227,9 @@ func backingDeviceUnion(resources []daemonconfig.Resource) []uint32 {
 	out := make([]uint32, 0, len(resources))
 	for i := range resources {
 		r := &resources[i]
+		if r.Anchored() {
+			continue // a daemon-made root on tmpfs
+		}
 		rdevs, err := guard.BackingDevices(r.Path)
 		if err != nil {
 			log.Warnf("daemon: raw block-device gate: %v (raw access to this device is not blocked)", err)
@@ -1227,6 +1256,17 @@ func eventFilterOptions() []guard.GuardOption {
 }
 
 var processStart = time.Now()
+
+// markReadyWithLogin opens the login socket, then marks the daemon ready: a login ordered after the
+// unit that finds no socket means no daemon. Closed by startCatalogRefresh's stop.
+func markReadyWithLogin(d usecase.DaemonUseCase, cfg *daemonconfig.Config) *loginServer {
+	login, err := startLoginServer(d, cfg)
+	if err != nil {
+		log.Errorf("daemon: CRITICAL: %v — runtime sections stay unguarded at every login", err)
+	}
+	markReady()
+	return login
+}
 
 // markReady tells systemd the guards are up, then returns the startup peak (catalog, ELF closures,
 // populate: well above the steady-state heap) to the OS now rather than over the scavenger's

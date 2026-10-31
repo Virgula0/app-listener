@@ -262,3 +262,52 @@ func TestAppendSectionWhitelist(t *testing.T) {
 		t.Fatal("a path that would inject a line must be refused")
 	}
 }
+
+func TestGenerateConfPortSection(t *testing.T) {
+	conf := GenerateConf([]Section{{Port: 5037, Allow: []BinaryRule{
+		{Path: "/usr/bin/true", Events: []string{"MKNOD", "CONNECT"}},
+	}}}, nil)
+	if !strings.Contains(conf, "\n[port tcp/5037]\n") || strings.Contains(conf, "need_encryption") {
+		t.Fatalf("port section:\n%s", conf)
+	}
+	cfg := mustParse(t, conf)
+	if len(cfg.Resources) != 1 || cfg.Resources[0].Port != 5037 || len(cfg.Resources[0].Binaries[0].Events) != 2 {
+		t.Fatalf("resources = %+v", cfg.Resources)
+	}
+}
+
+func TestGenerateConfSecretSections(t *testing.T) {
+	var sections []Section
+	for _, e := range Catalog {
+		if e.IsSecret() {
+			sections = append(sections, Section{Secret: e.Secret, SecretMatches: e.SecretMatches,
+				Allow: []BinaryRule{{Path: "/usr/bin/true", Events: []string{"READ"}}}})
+		}
+	}
+	if len(sections) == 0 {
+		t.Fatal("no secret entries in the catalog")
+	}
+	conf := GenerateConf(sections, nil)
+	if strings.Count(conf, "[secret_service]") != 1 || EnsureSecretServiceBlock(conf) != conf {
+		t.Fatalf("want exactly one [secret_service] block:\n%s", conf)
+	}
+	cfg := mustParse(t, conf)
+	if cfg.SecretService.Providers[0] != SecretProvider {
+		t.Fatalf("providers = %v", cfg.SecretService.Providers)
+	}
+	scopes := 0
+	for i := range cfg.Resources {
+		if s := cfg.Resources[i].Secret; s != nil {
+			scopes++
+			if len(s.Matches) == 0 {
+				t.Errorf("scope %s has no match", s.Name)
+			}
+		}
+	}
+	if scopes != len(sections) {
+		t.Fatalf("parsed %d scopes, generated %d:\n%s", scopes, len(sections), conf)
+	}
+	if plain := GenerateConf(nil, nil); strings.Contains(plain, "[secret_service]") {
+		t.Fatal("a config without secret sections got a [secret_service] block")
+	}
+}

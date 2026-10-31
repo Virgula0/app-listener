@@ -33,7 +33,9 @@ type facultative struct {
 	// sshGuarded: daemon.conf covers ~/.ssh, so its config is left alone: the daemon denies the
 	// edit while it runs, and a stopped daemon leaves the vault locked (ENOKEY).
 	sshGuarded bool
-	installed  bool
+	// socketGuarded: daemon.conf guards the user's ssh-agent socket directory.
+	socketGuarded bool
+	installed     bool
 }
 
 func (f *facultative) label() string {
@@ -121,8 +123,9 @@ func listFacultatives(cfg *daemonconfig.Config, users []inst.User) ([]facultativ
 		if u.UID != 0 {
 			unit, _ := os.ReadFile(inst.SSHAgentUnitPath(u.Home))
 			out = append(out, facultative{kind: facultativeSSHAgent, user: u,
-				sshGuarded: inst.PathCovered(filepath.Join(u.Home, ".ssh"), covered),
-				installed:  bytes.Equal(unit, sample) && inst.HasSSHAgentEnv(u)})
+				sshGuarded:    inst.PathCovered(filepath.Join(u.Home, ".ssh"), covered),
+				socketGuarded: inst.SSHAgentSocketGuarded(cfg, u),
+				installed:     bytes.Equal(unit, sample) && inst.HasSSHAgentEnv(u)})
 		}
 		if launchers := bunLaunchersOffered(cfg, u); len(launchers) > 0 {
 			_, dirErr := os.Stat(inst.BunTmpDir(u.Home))
@@ -182,6 +185,10 @@ func installSSHAgentFacultative(f *facultative) error {
 			filepath.Join(f.user.Home, ".ssh"))
 	} else if err := addKeysToAgent([]inst.User{f.user}); err != nil {
 		return err
+	}
+	if !f.socketGuarded {
+		log.Warnf("the agent socket of %s is not guarded: any of that user's processes can use a loaded key "+
+			"— add the \"SSH agent socket\" entry with `sudo app-listener install catalog diff`", f.user.Name)
 	}
 	return installSSHAgent(f.user)
 }

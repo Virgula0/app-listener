@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -1670,5 +1671,76 @@ func TestMovePeer(t *testing.T) {
 	}
 	if f := lib(nil, nil); f.MovePeer() != 0 {
 		t.Fatal("a lib_dir without writers has no move-peer class")
+	}
+}
+
+func TestLoadRuntimeSectionMissingIsListed(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "[watch /run/user/4000000000/gnupg]\nruntime: true\nneed_encryption: false\n/usr/bin/gpg CONNECT\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 0 {
+		t.Fatalf("a missing runtime dir must not materialize: %+v", cfg.Resources)
+	}
+	if !slices.Equal(cfg.RuntimePaths, []string{"/run/user/4000000000/gnupg"}) {
+		t.Fatalf("RuntimePaths = %v", cfg.RuntimePaths)
+	}
+}
+
+func TestLoadRuntimeSectionPresent(t *testing.T) {
+	base := filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
+	if _, err := os.Stat(base); err != nil {
+		t.Skipf("no runtime dir %s", base)
+	}
+	dir, err := os.MkdirTemp(base, "daemonconfig-test-")
+	if err != nil {
+		t.Skipf("runtime dir not writable: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(dir) })
+	cfg, err := Load(writeConfig(t, "[watch "+dir+"]\nruntime: true\n/usr/bin/gpg CONNECT\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Resources) != 1 || !cfg.Resources[0].Runtime || cfg.Resources[0].NeedEncryption {
+		t.Fatalf("want one unencrypted runtime resource: %+v", cfg.Resources)
+	}
+}
+
+// A runtime dir root can't stat may be hidden by a mount over /run/user/<uid>: refused, not skipped
+// as logged out. ENAMETOOLONG stands in for EACCES, which needs another user's directory.
+func TestLoadRuntimeSectionUnstattableRefused(t *testing.T) {
+	base := filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
+	if _, err := os.Stat(base); err != nil {
+		t.Skipf("no runtime dir %s", base)
+	}
+	dir := filepath.Join(base, strings.Repeat("a", 300))
+	if _, err := Load(writeConfig(t, "[watch "+dir+"]\nruntime: true\n/usr/bin/gpg CONNECT\n")); err == nil {
+		t.Fatal("want an error for a runtime dir that can't be statted")
+	}
+}
+
+func TestLoadRuntimeSectionRefused(t *testing.T) {
+	for name, conf := range map[string]string{
+		"outside run/user": "[watch /tmp/gnupg]\nruntime: true\n",
+		"nested":           "[watch /run/user/4000000000/a/b]\nruntime: true\n",
+		"run/user itself":  "[watch /run/user/4000000000]\nruntime: true\n",
+		"bad uid":          "[watch /run/user/01000/gnupg]\nruntime: true\n",
+		"encrypted":        "[watch /run/user/4000000000/gnupg]\nruntime: true\nneed_encryption: true\n",
+		"bad value":        "[watch /run/user/4000000000/gnupg]\nruntime: yes\n",
+	} {
+		if _, err := Load(writeConfig(t, conf)); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
+	}
+}
+
+func TestRuntimeDirFor(t *testing.T) {
+	if uid, ok := RuntimeDirFor("/run/user/1000/gnupg"); !ok || uid != 1000 {
+		t.Fatalf("got %d %v", uid, ok)
+	}
+	for _, p := range []string{"/run/user/1000", "/run/user/1000/", "/run/user/x/gnupg", "/run/user/1000/..", "/run/userx/1/a"} {
+		if _, ok := RuntimeDirFor(p); ok {
+			t.Errorf("%s accepted", p)
+		}
 	}
 }

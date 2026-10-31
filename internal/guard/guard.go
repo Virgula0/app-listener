@@ -64,7 +64,7 @@ type GuardEvent struct {
 	// Scope labels a process-gate denial judged for several resources: MultipleResourceLabel (the
 	// GLOBAL slot) or a taint set's paths, comma-separated. Empty: the receiving guard's own.
 	Scope string
-	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH"): it runs
+	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH", "ARGV"): it runs
 	// code its exe doesn't vouch for (trust_code_suspect). Empty otherwise.
 	Suspect string
 	// Exe is the acting process's exe inode as the kernel judged it; zero for a process gate.
@@ -109,11 +109,13 @@ const (
 	guardReasonTracedExec = 3
 	guardReasonProcMem    = 4
 	guardReasonBtrfsIoctl = 5
+	guardReasonPortAddr   = 6
 
 	guardReasonGateMask     = 0xff
 	guardReasonSuspectShift = 8
 	suspectPreload          = 1
 	suspectLaunch           = 2
+	suspectArgv             = 3
 )
 
 // suspectLabel maps a reason's SUSPECT_* mark to its logged op label; "" when unmarked.
@@ -123,6 +125,8 @@ func suspectLabel(reason uint32) string {
 		return "PRELOADED"
 	case suspectLaunch:
 		return "LAUNCH"
+	case suspectArgv:
+		return "ARGV"
 	default:
 		return ""
 	}
@@ -141,6 +145,9 @@ func processGateLabel(reason uint32) string {
 		return ""
 	}
 }
+
+// PortAddrLabel is the Dest of a refused listen on a guarded port at a non-loopback address.
+const PortAddrLabel = "non-loopback-address"
 
 // Resource strings logged for filesystem-wide gate denials (GuardEvent.FsGate).
 const (
@@ -276,6 +283,8 @@ type Guard struct {
 	// rootMount is the mount the root was last reached through (noteRootMount): localizePaths maps
 	// the kernel's superblock-relative event paths through it. Nil when unknown.
 	rootMount atomic.Pointer[ebpf.MountInfo]
+	// port: WithPort.
+	port uint32
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -621,6 +630,16 @@ func (g *Guard) startSteps() []func() error {
 		}
 		return nil
 	}
+	if g.port != 0 {
+		// Once its anchor resolves to this slot: a port row ahead of it judges by GUARD_RES_GLOBAL.
+		claimAnchor := claimRoot
+		claimRoot = func() error {
+			if err := claimAnchor(); err != nil {
+				return err
+			}
+			return g.publishPort()
+		}
+	}
 
 	// Ordering. Normally ACTIVATE BEFORE claiming any inode: an active slot with no rows denies
 	// nothing, and claiming then displaces a prior owner's row into an ALREADY-ACTIVE slot — closing
@@ -669,12 +688,15 @@ func (g *Guard) PinDegraded() bool { return SharedPinDegraded() }
 // inode/bprm ones, a superseded binary or a reused inode number would keep its whitelist entry
 // (exe_supersede.h); without the ioctl ones, a btrfs snapshot copies a guarded tree unguarded;
 // without task_prctl, a process repoints mm->exe_file at a whitelisted inode (prctl PR_SET_MM) and
-// borrows its identity, so the guard's inode-keyed policy is bypassable.
+// borrows its identity, so the guard's inode-keyed policy is bypassable; without the socket ones,
+// anyone can talk to an agent socket bound inside a guarded tree or a guarded loopback port.
 var requiredHooks = map[string]bool{
 	"file_open": true, "file_permission": true,
 	"inode_unlink": true, "inode_rename": true, "bprm_committed_creds": true,
 	"file_ioctl": true, "file_ioctl_compat": true,
-	"task_prctl": true,
+	"task_prctl": true, "unix_stream_connect": true, "unix_may_send": true,
+	"socket_sendmsg": true, "socket_recvmsg": true, "socket_connect": true, "socket_listen": true,
+	"socket_accept": true, "socket_getsockopt": true, "mmap_file": true,
 }
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
@@ -774,6 +796,14 @@ func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []lsmHook {
 		{o.GuardInodeUnlink, "inode_unlink"},
 		{o.GuardInodeRename, "inode_rename"},
 		{o.GuardFileIoctl, "file_ioctl"},
+		{o.GuardUnixStreamConnect, "unix_stream_connect"},
+		{o.GuardUnixMaySend, "unix_may_send"},
+		{o.GuardSocketSendmsg, "socket_sendmsg"},
+		{o.GuardSocketRecvmsg, "socket_recvmsg"},
+		{o.GuardSocketConnect, "socket_connect"},
+		{o.GuardSocketListen, "socket_listen"},
+		{o.GuardSocketAccept, "socket_accept"},
+		{o.GuardSocketGetsockopt, "socket_getsockopt"},
 	}
 	if ioctlCompat {
 		hooks = append(hooks, lsmHook{o.GuardFileIoctlCompat, "file_ioctl_compat"})
@@ -975,6 +1005,16 @@ var runtimeAccessEvents = append(append([]ebpf.EventType(nil), editGrantEvents..
 // grant holds the mask: restoring the baseline afterwards would end that session's access.
 func (g *Guard) WithSelfRuntimeAccess(fn func() error) error {
 	return g.withSelfMask(runtimeAccessEvents, "runtime", true, fn)
+}
+
+// ownerAccessEvents lets the daemon finish a runtime directory: plant its sentinel (one found at a
+// start or reload has none) and hand one it made to its user (fchown).
+var ownerAccessEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat, ebpf.EventAttr,
+	ebpf.EventMkdir, ebpf.EventMknod, ebpf.EventWrite}
+
+// WithSelfOwnerAccess is WithSelfRuntimeAccess with ownerAccessEvents.
+func (g *Guard) WithSelfOwnerAccess(fn func() error) error {
+	return g.withSelfMask(ownerAccessEvents, "owner", true, fn)
 }
 
 // withSelfMask widens the self mask to events for fn. exclusive refuses while a live edit grant
@@ -1680,7 +1720,7 @@ func (g *Guard) updateRootKey(newKey GuardInodeKey, sbdev uint64) error {
 	g.mu.Lock()
 	g.rootKey = newKey
 	g.mu.Unlock()
-	return nil
+	return g.publishPort()
 }
 
 // treeInode returns the inode a tree walk records for path. Whitelist guards follow a symlink entry
@@ -2378,6 +2418,9 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 		Suspect:   suspectLabel(be.Reason),
 		Exe:       GuardInodeKey{Dev: be.ExeDev, Ino: be.ExeIno},
 	}
+	if be.Reason&guardReasonGateMask == guardReasonPortAddr {
+		ge.Dest = PortAddrLabel
+	}
 	if ge.Process != "" {
 		// The kernel sends the other task's comm in path and its tgid in fd.
 		ge.Path = fmt.Sprintf("pid=%d comm=%s", be.FD, ge.Path)
@@ -2410,6 +2453,10 @@ func (g *Guard) noteRootMount(root *rootHandle) {
 // event of this slot walked through the root's dentry, so it is on the root's filesystem. Display
 // only: no decision reads these paths.
 func (g *Guard) localizePaths(ev *GuardEvent) {
+	if g.port != 0 && ev.Path == "" {
+		ev.Path = g.path // a port decision has no dentry: name the section's anchor
+		return
+	}
 	m := g.rootMount.Load()
 	if m == nil || (m.Root == "/" && m.Mountpoint == "/") {
 		return
@@ -2585,6 +2632,7 @@ func (g *Guard) cleanup() {
 		log.Errorf("guard %s: CRITICAL: could not untrust libraries under the released root (%v) — "+
 			"they stay loadable by its writers until the next reload", g.path, err)
 	}
+	sharedEngine.unpublishPort(g)
 	sharedEngine.forgetResource(g.resID)
 	g.dropResourceState()
 	g.unpinSelfMaps()

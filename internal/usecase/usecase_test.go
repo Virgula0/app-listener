@@ -58,6 +58,7 @@ type fakeGuardRepo struct {
 	editGrantErr     error
 	vaultAccessCalls int
 	runtimeGrants    int
+	ownerGrants      int
 	tap              func(guard.GuardEvent)
 	tempPlan         func(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error)
 	events           chan guard.GuardEvent
@@ -120,6 +121,11 @@ func (f *fakeGuardRepo) RevokeSelfEditAccess() error {
 
 func (f *fakeGuardRepo) WithSelfRuntimeAccess(fn func() error) error {
 	f.runtimeGrants++
+	return fn()
+}
+
+func (f *fakeGuardRepo) WithSelfOwnerAccess(fn func() error) error {
+	f.ownerGrants++
 	return fn()
 }
 

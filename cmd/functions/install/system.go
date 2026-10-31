@@ -124,6 +124,15 @@ func upsertFile(path, label string, data []byte, mode os.FileMode, uid int) erro
 	return nil
 }
 
+// agentSocketNote says who may use a key the agent holds.
+func agentSocketNote(cfg *daemonconfig.Config, u inst.User) string {
+	if inst.SSHAgentSocketGuarded(cfg, u) {
+		return fmt.Sprintf("(the agent socket in /run/user/%d/%s is guarded: only binaries whitelisted there may use a loaded key)",
+			u.UID, inst.SSHAgentRuntimeDir)
+	}
+	return "(a loaded key can be used through the agent socket by any process of that user)"
+}
+
 // askSSHAgentUsers returns the users to set the ssh-agent up for: non-root users whose ~/.ssh is
 // guarded by cfg, after one question per user (naming user and unit path). A user whose matching
 // unit is already installed is included without asking. Asked before encryption, because the
@@ -163,8 +172,8 @@ func askSSHAgentUsers(cfg *daemonconfig.Config) ([]inst.User, error) {
 					"  - install and enable a per-user systemd unit (that user's session only) at %s\n"+
 					"  - add an SSH_AUTH_SOCK block to the user's shell startup file (.zshrc / .bashrc / fish conf.d)\n"+
 					"  - put `AddKeysToAgent yes` at the top of %s so ssh loads a key into the agent on first use\n"+
-					"    (a loaded key can be used through the agent socket by any process of that user)",
-				sshDir, unitPath, filepath.Join(sshDir, "config")),
+					"    %s",
+				sshDir, unitPath, filepath.Join(sshDir, "config"), agentSocketNote(cfg, u)),
 			Affirmative: "Set it up",
 			Negative:    "Skip",
 			Default:     true,

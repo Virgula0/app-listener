@@ -143,7 +143,7 @@ const (
 // file `read <path>` names. "" when bun is not on PATH or the build fails: the probe still covers the
 // rules. The baseline target fetches Bun's official runtime: a distro bun (Arch's) compiling for its
 // own target embeds itself, linked to the host's ICU, which the test image lacks.
-func (s *IntegrationSuite) bunRealApp() string {
+func (s *IntegrationSuite) bunRealApp(flags ...string) string {
 	bun, err := exec.LookPath("bun")
 	if err != nil {
 		s.T().Log("bun not on PATH: skipping the real Bun-compiled app")
@@ -158,8 +158,8 @@ if (verb === "read") {
 }
 `), 0o644))
 	out := filepath.Join(dir, "bunreal")
-	b, err := exec.Command(bun, "build", "--compile", "--target=bun-linux-x64-baseline", src, //nolint:gosec // test fixture
-		"--outfile", out).CombinedOutput()
+	args := append([]string{"build", "--compile", "--target=bun-linux-x64-baseline"}, flags...)
+	b, err := exec.Command(bun, append(args, src, "--outfile", out)...).CombinedOutput() //nolint:gosec // test fixture
 	if err != nil {
 		s.T().Logf("bun build --compile failed (offline?), skipping the real Bun-compiled app: %v\n%s", err, b)
 		return ""
@@ -227,6 +227,47 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_BunRuntimeEnv() {
 		s.Require().Containsf(out, "DENIED|", "the caller's script must have run and been refused: %s", out)
 	}
 	s.requireDenialLogged(c, "LAUNCH", "secret")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A default `bun build --compile` app runs the preload of a bunfig.toml in its working directory:
+// started there, it gets nothing below the secret (op=BUNFIG). One built without that autoload, its
+// embedded flags say, opens nothing there and keeps reading.
+func (s *IntegrationSuite) TestDaemon_LaunchScan_BunfigPreload() {
+	autoload := s.bunRealApp()
+	if autoload == "" {
+		s.T().Skip("no bun to build the apps with")
+	}
+	noAutoload := s.bunRealApp("--no-compile-autoload-bunfig")
+	s.Require().NotEmpty(noAutoload, "the second build")
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const quiet = "/opt/rt/bin/bunquiet"
+	s.exec(c, []string{"mkdir", "-p", "/opt/rt/bin", "/tmp/proj"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, autoload, launchBunReal, 0o755))
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, noAutoload, quiet, 0o755))
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
+		"' > " + launchSecret + " && printf '%s' 'try { console.log(\"STOLEN|\" + " +
+		"require(\"fs\").readFileSync(\"" + launchSecret + "\", \"utf8\")) } catch (e) { console.log(\"DENIED|\" + e.code) }' > " +
+		launchBunEvil + " && printf 'preload = [\"" + launchBunEvil + "\"]\\n' > /tmp/proj/bunfig.toml 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+launchBunReal+"\n"+quiet+"\n")
+
+	run := func(dir, bin string) string {
+		_, out := s.exec(c, []string{"sh", "-c", "cd " + dir + " && " + bin + " read " + launchSecret + " 2>&1"})
+		return out
+	}
+	out = run("/tmp", launchBunReal)
+	s.Require().Containsf(out, "STOLEN|"+launchMarker, "a clean start must read: %s\n%s", out, s.readDaemonLog(c))
+	out = run("/tmp/proj", launchBunReal)
+	s.Require().Containsf(out, "DENIED|", "the preload must have run and been refused: %s\n%s", out, s.readDaemonLog(c))
+	s.Require().NotContainsf(out, "STOLEN|", "the bunfig.toml preload read the secret as the app: %s", out)
+	s.requireDenialLogged(c, "BUNFIG", "bunfig.toml")
+	out = run("/tmp/proj", quiet)
+	s.Require().Containsf(out, "STOLEN|"+launchMarker, "an app that doesn't load bunfig.toml must keep reading: %s\n%s",
+		out, s.readDaemonLog(c))
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
@@ -359,6 +400,79 @@ need_encryption: false
 		s.Require().Equalf(0, code, "Discord must update its own inputs and code (%v): %s\ndaemon log:\n%s", step,
 			out, s.readDaemonLog(c))
 	}
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A whitelisted CLI started with words one of its launch rules names (built in by basename, or a
+// [launch_rules] line) is refused its secret; started otherwise it keeps reading. A warn rule only
+// logs. Every binary is judged on SSL_CERT_FILE/SSL_CERT_DIR unless the value is a root-placed bundle
+// (built in or allow_env); an allow_env a user can fill is refused. Rule sets must survive a reload.
+func (s *IntegrationSuite) TestDaemon_LaunchRules() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const gh, tool, goread = "/opt/rt/bin/gh", "/opt/rt/bin/tool", "/opt/rt/bin/goread"
+	const corpCA = "/etc/corp-ca.pem"
+	s.exec(c, []string{"mkdir", "-p", "/exploits", "/opt/rt/bin"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_plain"), gh, 0o755),
+		"copy launch_probe_plain (run make -C integrationtests/exploits)")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, goread, 0o755))
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
+		"' > " + launchSecret + " && cp " + gh + " " + tool + " && echo ca > " + corpCA + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[launch_rules]\ndeny_args "+tool+" export --all\nwarn_env "+tool+" NOTE_ME\n"+
+		"allow_env SSL_CERT_FILE="+corpCA+"\nallow_env SSL_CERT_FILE=/tmp/user-ca.pem\n\n"+
+		"[watch /protected]\nneed_encryption: false\n"+gh+"\n"+tool+"\n"+goread)
+
+	run := func(cmd string) string {
+		_, out := s.exec(c, []string{"sh", "-c", cmd + " 2>&1"})
+		return out
+	}
+	check := func(when string) {
+		for what, cmd := range map[string]string{
+			"a clean launch":            gh + " read " + launchSecret,
+			"a partial rule":            gh + " auth status read " + launchSecret,
+			"a warn rule":               gh + " auth git-credential read " + launchSecret,
+			"rule words out of order":   gh + " token auth read " + launchSecret,
+			"another binary's built-in": tool + " auth token read " + launchSecret,
+			"a warn env rule":           "NOTE_ME=1 " + tool + " read " + launchSecret,
+			"a clean Go launch":         goread + " read " + launchSecret,
+			"the system CA bundle":      "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt " + gh + " read " + launchSecret,
+			"the system CA dir on Go":   "SSL_CERT_DIR=/etc/ssl/certs " + goread + " read " + launchSecret,
+			"a root-placed allow_env":   "SSL_CERT_FILE=" + corpCA + " " + goread + " read " + launchSecret,
+		} {
+			s.Require().Containsf(run(cmd), "STOLEN|"+launchMarker, "%s: %s must read its resource\ndaemon log:\n%s",
+				when, what, s.readDaemonLog(c))
+		}
+		for what, cmd := range map[string]string{
+			"words around a flag's value":  gh + " auth --hostname x token read " + launchSecret,
+			"a short flag after operands":  gh + " auth status read " + launchSecret + " -t",
+			"a long flag with a value":     gh + " auth status --show-token=1 read " + launchSecret,
+			"a [launch_rules] argv rule":   tool + " export read " + launchSecret + " --all",
+			"SSL_CERT_FILE on a Go binary": "SSL_CERT_FILE=/tmp/ca.pem " + goread + " read " + launchSecret,
+			"SSL_CERT_FILE on any CLI":     "SSL_CERT_FILE=/tmp/ca.pem " + gh + " read " + launchSecret,
+			"SSL_CERT_DIR of a user":       "SSL_CERT_DIR=/tmp " + goread + " read " + launchSecret,
+			"a user-fillable allow_env":    "SSL_CERT_FILE=/tmp/user-ca.pem " + gh + " read " + launchSecret,
+			"an allowed path extended":     "SSL_CERT_FILE=" + corpCA + ".x " + gh + " read " + launchSecret,
+			"an allowed bundle in a list":  "SSL_CERT_DIR=/etc/ssl/certs:/tmp " + goread + " read " + launchSecret,
+		} {
+			s.Require().NotContainsf(run(cmd), launchMarker, "%s: %s read the secret\ndaemon log:\n%s",
+				when, what, s.readDaemonLog(c))
+		}
+	}
+	check("at start")
+	s.reloadAndAwait(c)
+	check("after a reload")
+
+	log := s.readDaemonLog(c)
+	for _, want := range []string{"word=token", "word=-t", "word=--show-token", "word=--all", "word=SSL_CERT_FILE",
+		"ARGV comm=gh", "word=git-credential", "word=NOTE_ME", "word=SSL_CERT_DIR",
+		"allow_env SSL_CERT_FILE=/tmp/user-ca.pem refused"} {
+		s.Require().Containsf(log, want, "daemon log lacks %q:\n%s", want, log)
+	}
+	s.Require().NotContainsf(log, "word=SSL_CERT_FILE=", "an env match must log the name alone:\n%s", log)
+	s.requireDenialLogged(c, "ARGV", "secret")
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

@@ -5,9 +5,9 @@ import (
 )
 
 // daemonConfLexer tokenizes daemon.conf (internal/daemonconfig): `# comments`, `[watch …]` /
-// `[libraries "…"]` / `[inspectors]` / `[electron_apps]` / `[settings]` headers, `key:` / `allow_lib`-style
-// directives, binary paths and their event lists (READ,WRITE,…). Paths are consumed whole first so
-// an upper-case path component is not colored as an event.
+// `[libraries "…"]` / `[inspectors]` / `[electron_apps]` / `[launch_rules]` / `[settings]` headers,
+// `key:` / `allow_lib`-style directives, binary paths and their event lists (READ,WRITE,…). Paths
+// are consumed whole first so an upper-case path component is not colored as an event.
 var daemonConfLexer = chroma.MustNewLexer(
 	&chroma.Config{Name: "daemon.conf", Filenames: []string{"daemon.conf"}},
 	func() chroma.Rules {
@@ -15,7 +15,7 @@ var daemonConfLexer = chroma.MustNewLexer(
 			"root": {
 				{Pattern: `^[^\S\n]*#.*`, Type: chroma.Comment},
 				{
-					Pattern: `^([^\S\n]*)(\[)(watch|libraries|inspectors|electron_apps|settings)\b([^\]\n]*)(\])`,
+					Pattern: `^([^\S\n]*)(\[)(watch|libraries|inspectors|electron_apps|launch_rules|settings)\b([^\]\n]*)(\])`,
 					Type: chroma.ByGroups(chroma.Text, chroma.Punctuation, chroma.Keyword,
 						chroma.LiteralString, chroma.Punctuation),
 				},

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -83,7 +84,7 @@ func groupCandidates(cands []inst.Candidate) []catalogGroup {
 		paths := make([]string, 0, len(idxs))
 		for _, i := range idxs {
 			cs = append(cs, cands[i])
-			paths = append(paths, cands[i].Path)
+			paths = append(paths, cands[i].Label())
 		}
 		label := k.name
 		if k.user != "" {
@@ -102,7 +103,8 @@ func groupCandidates(cands []inst.Candidate) []catalogGroup {
 // pickDirectories probes the catalog for every selected user (plus system entries) and asks which
 // found directories to protect. All preselected.
 func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
-	candidates := inst.DiscoverForUsers(users)
+	candidates := slices.Concat(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users), inst.DiscoverPorts(users),
+		inst.DiscoverSecrets(users))
 	if len(candidates) == 0 {
 		log.Warn("no catalog directories found for the selected users — you can still add directories manually")
 		return nil, nil
@@ -190,16 +192,44 @@ func addManualDirectories(candidates []inst.Candidate) ([]inst.Candidate, error)
 // by default, and the catalog entry's grouped extra watch sub-paths.
 func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 	sections := make([]inst.Section, 0, len(candidates))
+	sharedAt := map[string]int{}
 	for i := range candidates {
 		c := &candidates[i]
+		if key, fresh, ok := sharedSection(c); ok {
+			// One section per port or secret scope: several users' (and entries') binaries share it.
+			at, seen := sharedAt[key]
+			if !seen {
+				at = len(sections)
+				sharedAt[key] = at
+				sections = append(sections, fresh)
+			}
+			for _, rule := range c.FilterExistingWhitelist() {
+				if !slices.ContainsFunc(sections[at].Allow, func(r inst.BinaryRule) bool { return r.Path == rule.Path }) {
+					sections[at].Allow = append(sections[at].Allow, rule)
+				}
+			}
+			continue
+		}
 		sections = append(sections, inst.Section{
 			Path:            c.Path,
 			Allow:           c.FilterExistingWhitelist(),
-			Encrypt:         true,
+			Encrypt:         !c.Entry.IsRuntime(),
+			Runtime:         c.Entry.IsRuntime(),
 			ExtraWatchPaths: c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name),
 		})
 	}
 	return sections
+}
+
+// sharedSection is the section a port or secret candidate merges into, keyed; ok false for others.
+func sharedSection(c *inst.Candidate) (key string, s inst.Section, ok bool) {
+	switch {
+	case c.Port != 0:
+		return fmt.Sprintf("port %d", c.Port), inst.Section{Port: c.Port}, true
+	case c.Entry.IsSecret():
+		return "secret " + c.Entry.Secret, inst.Section{Secret: c.Entry.Secret, SecretMatches: c.Entry.SecretMatches}, true
+	}
+	return "", inst.Section{}, false
 }
 
 // libraryBlocksFromCandidates returns one [libraries] block per catalog entry and user, in

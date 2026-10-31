@@ -36,7 +36,9 @@ app-listener
 ├── daemon                              run the daemon               daemon.md
 │   ├── check [--verifier-only]         load the eBPF into the verifier
 │   ├── lockdown                        lock every vault and exit
-│   └── genkey                          create the fscrypt master key
+│   ├── genkey                          create the fscrypt master key
+│   ├── login UID                       guard a user's runtime sections at login
+│   └── logout UID                      drop them once the user logged out
 ├── edit-protected                      edit a protected directory   edit-protected.md
 │   ├── forward (-w BIN | -b BIN)...    temporary access for other binaries
 │   ├── config [--from FILE]            edit the running daemon.conf
@@ -63,10 +65,10 @@ The desktop window is the separate `app-listener-gui` binary: `sudo app-listener
 ## The daemon in depth
 
 - [Daemon](daemon.md): flags, lifecycle, boot ordering, reloads, encryption, filesystem-wide gates.
-- [Daemon configuration](daemon-config.md): `daemon.conf` grammar, event masks, `[electron_apps]`,
-  `[inspectors]`.
+- [Daemon configuration](daemon-config.md): `daemon.conf` grammar, event masks, `[port]` and
+  `[secret]` sections, `[electron_apps]`, `[launch_rules]`, `[inspectors]`.
 - [Binary trust](binary-trust.md): how whitelisted binaries stay trustworthy across updates, the
-  binary ledger, `trust`, launch scan, multicall binaries.
+  binary ledger, `trust`, launch scan, launch rules, multicall binaries.
 - [Self-updating apps and the catalog](catalog.md): the built-in list of sensitive directories and
   how apps like Discord or VS Code keep updating while guarded.
 - [edit-protected](edit-protected.md): changing protected files and the daemon config safely.

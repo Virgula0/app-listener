@@ -4,10 +4,14 @@ Documentation=man:ssh-agent(1)
 
 [Service]
 Type=simple
-Environment=SSH_AUTH_SOCK=%t/ssh-agent.socket
-# The minus sign (-) tells systemd to ignore errors if the file doesn't exist yet
-ExecStartPre=-/usr/bin/rm -f %t/ssh-agent.socket
-ExecStart=/usr/bin/ssh-agent -D -a %t/ssh-agent.socket
+Environment=SSH_AUTH_SOCK=%t/ssh-agent/socket
+# app-listener's daemon makes and guards %t/ssh-agent at login (a runtime section of daemon.conf),
+# so only whitelisted binaries may connect. mkdir covers a login with no daemon running; rm clears
+# a socket a killed agent left behind, which would block the bind. The minus sign (-) ignores a
+# failure (the directory exists, no socket to remove).
+ExecStartPre=-/usr/bin/mkdir -p -m 0700 %t/ssh-agent
+ExecStartPre=-/usr/bin/rm -f %t/ssh-agent/socket
+ExecStart=/usr/bin/ssh-agent -D -a %t/ssh-agent/socket
 Restart=on-failure
 RestartSec=2s
 

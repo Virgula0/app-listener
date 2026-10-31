@@ -35,7 +35,7 @@ func TestEnsureSSHAgentEnvAppendsOnceAndRemoveRestores(t *testing.T) {
 		}
 	}
 	got := readFile(t, rc)
-	if strings.Count(got, rcBegin) != 1 || !strings.Contains(got, "ssh-agent.socket") {
+	if strings.Count(got, rcBegin) != 1 || !strings.Contains(got, "ssh-agent/socket") {
 		t.Fatalf("expected exactly one block, got:\n%s", got)
 	}
 	if !strings.HasPrefix(got, orig+"\n") {
@@ -51,6 +51,26 @@ func TestEnsureSSHAgentEnvAppendsOnceAndRemoveRestores(t *testing.T) {
 	}
 	if changed, _ := RemoveSSHAgentEnv(u); len(changed) != 0 {
 		t.Fatalf("second remove must be a no-op, changed %v", changed)
+	}
+}
+
+func TestEnsureSSHAgentEnvRewritesEarlierReleaseBlock(t *testing.T) {
+	u := rcUser(t, "/usr/bin/zsh")
+	rc := filepath.Join(u.Home, ".zshrc")
+	old := rcBlock(rcBegin, rcEnd, `export SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-${XDG_RUNTIME_DIR:-/run/user/1000}/ssh-agent.socket}"`)
+	if err := os.WriteFile(rc, []byte("alias ll='ls -l'\n\n"+old+"export EDITOR=vim\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := EnsureSSHAgentEnv(u); err != nil || len(changed) != 1 {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	got := readFile(t, rc)
+	want := "alias ll='ls -l'\n\n" + rcTargets(u)[0].Block + "export EDITOR=vim\n"
+	if got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+	if changed, _ := EnsureSSHAgentEnv(u); len(changed) != 0 {
+		t.Fatalf("a current block must be left alone, changed %v", changed)
 	}
 }
 
@@ -254,7 +274,7 @@ func TestBunAndSSHBlocksCoexist(t *testing.T) {
 	if strings.Contains(got, bunRCBegin) {
 		t.Fatalf("bun block not removed:\n%s", got)
 	}
-	if !strings.Contains(got, "ssh-agent.socket") {
+	if !strings.Contains(got, "ssh-agent/socket") {
 		t.Fatalf("ssh-agent block must survive bun removal:\n%s", got)
 	}
 }

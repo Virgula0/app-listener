@@ -138,7 +138,14 @@ A risky launch still runs, but the process (and its forks; an exec is judged afr
 - gets nothing else below a whitelist-mode tree either: no `stat`, directory listing or xattr.
 
 Fix: start the app without that variable or flag. A process that mapped untrusted code before its
-binary was whitelisted is refused the same way (`op=PRELOADED`). Libraries from a `lib_dir` of the
+binary was whitelisted is refused the same way (`op=PRELOADED`).
+
+A Bun app compiled with the default `bun build --compile` (and the `bun` CLI itself) also runs the
+`preload` of a `bunfig.toml` in the directory it starts in. The daemon reads each Bun binary's
+embedded flags; one that loads `bunfig.toml` and opens a file of that name is refused every secret
+from then on (`TRUST DENIED  op=BUNFIG`, then `op=PRELOADED`). Start it elsewhere, or build it with
+`--no-compile-autoload-bunfig`. `opencode` and the native `claude` don't load it. A binary whose
+flags can't be read counts as loading it. Libraries from a `lib_dir` of the
 updater that created the binary don't count: a self-updating app such as Steam starts its new binary
 before the daemon admits it, and everything that process runs is code its updater chose. That new
 binary's launch is judged at exec too, before the daemon knows what runtime it is: by every
@@ -147,6 +154,38 @@ generic Electron app rule below.
 
 Generic Electron binaries that run an app named on the command line are covered by
 [`[electron_apps]`](daemon-config.md#generic-electron-apps-electron_apps).
+
+## Launch rules
+
+Some whitelisted CLIs print or spend their secret when asked. The launch scan also judges any
+whitelisted binary with launch rules, and a match marks the process the same way. Its denials
+name the binary, who ran it and the word that matched:
+`TRUST DENIED  op=ARGV  comm=... commFullPath=<its exe>  parentFullPath=<who ran it> ... path=<the secret>  word=<the word>`.
+Built in, by the whitelisted file's name:
+
+- `gh`: `auth token`, `auth status --show-token`, `auth status -t`, `alias set`, `alias import`;
+  `auth git-credential` is only logged, since git runs it on every push.
+- `aws`: `configure export-credentials`, `configure get`.
+- `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
+  `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag (it reads the method from stdin).
+- `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,
+  `fundchannel`, `multifundchannel`, `close`, `exposesecret`.
+- Every whitelisted binary: `SSL_CERT_FILE` or `SSL_CERT_DIR` set, which would make its TLS stack
+  (Go, OpenSSL, GnuTLS) trust a certificate its caller chose and send its token to that server.
+  A value that is exactly a distribution's system bundle passes (`/etc/ssl/certs/ca-certificates.crt`,
+  `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`,
+  `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
+  `/etc/ca-certificates/extracted/tls-ca-bundle.pem`; directories `/etc/ssl/certs`,
+  `/etc/pki/tls/certs`), as does one you add with `allow_env`, when only root decides what the path
+  holds. A match logs the variable's name only, never its value.
+
+A rule's words match in order anywhere in the arguments, with anything between them, so a flag's
+value can't split them (`gh auth --hostname x token`). Add your own with
+[`[launch_rules]`](daemon-config.md#launch-rules-launch_rules).
+
+The rules are a tripwire. They don't see combined short flags (`-th`), aliases, a script that
+feeds the CLI its arguments another way, or a token the CLI reads from the keyring rather than a
+guarded file: with keyring storage, `gh auth token` still prints it.
 
 ## The dynamic loader
 

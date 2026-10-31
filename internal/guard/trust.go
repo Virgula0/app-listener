@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/logging"
 )
@@ -31,6 +33,9 @@ const (
 	trustedChromium uint8 = 16
 	trustedElectron uint8 = 32
 	trustedBun      uint8 = 64
+	// trustedBunfig: a Bun image that runs ./bunfig.toml's preload (bunAutoloadsBunfig). Not a
+	// runtime class: it only marks its process code-suspect when it opens a file of that name.
+	trustedBunfig uint8 = 128
 )
 
 // trust_event.kind — must match guard_trust.bpf.c.
@@ -40,6 +45,10 @@ const (
 	trustPlant      uint32 = 2
 	trustSuspect    uint32 = 3
 	trustLaunch     uint32 = 4
+	trustArgv       uint32 = 5
+	trustArgvMatch  uint32 = 6
+	trustArgvWarn   uint32 = 7
+	trustBunfig     uint32 = 8
 )
 
 // TrustGuard owns guard_trusted_files and the daemon-wide trusted-binary/library protections
@@ -70,22 +79,27 @@ type TrustGuard struct {
 	apps   map[string]bool
 	// rootWriterMu serializes WithRootWriter: a nested caller must not delete the row early.
 	rootWriterMu sync.Mutex
+	// argvByPath, allowEnv: SetLaunchRules; argvSets: canonical rule set -> its trust_argv set id.
+	argvMu     sync.Mutex
+	argvByPath map[string][]daemonconfig.LaunchRule
+	allowEnv   []string
+	argvSets   map[string]uint64
 }
 
 // trustRows is one key's rows across guard_trusted_files and the bit maps (trustBitMaps order).
 type trustRows struct {
 	flags uint8
-	bits  [4]uint64
-	has   [4]bool
+	bits  [5]uint64
+	has   [5]bool
 }
 
 // maxRetiredRows bounds TrustGuard.retired; past it the oldest prune's rows are simply not kept
 // (a later replacement then waits for a reload: stricter).
 const maxRetiredRows = 1024
 
-func (t *TrustGuard) trustBitMaps() [4]*cilium.Map {
-	return [4]*cilium.Map{t.objs.GuardBinOwner, t.objs.GuardBinUpdaters, t.objs.GuardGlobWriters,
-		t.objs.GuardLibdirUsers}
+func (t *TrustGuard) trustBitMaps() [5]*cilium.Map {
+	return [5]*cilium.Map{t.objs.GuardBinOwner, t.objs.GuardBinUpdaters, t.objs.GuardGlobWriters,
+		t.objs.GuardLibdirUsers, t.objs.GuardBinRules}
 }
 
 // trustEvent mirrors struct trust_event in guard_trust.bpf.c.
@@ -137,17 +151,9 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 		}
 		flags[GuardInodeKey{Dev: dev, Ino: ino}] |= flag
 	}
-	// One open per binary: the runtime class is read from the inode the key names.
-	for _, b := range binaries {
-		f, err := ebpf.OpenConfined(b)
-		if err != nil {
-			log.Warnf("trust guard: skipping unresolvable %s: %v", b, err)
-			continue
-		}
-		if dev, ino, err := ebpf.StatFile(f); err == nil {
-			flags[GuardInodeKey{Dev: dev, Ino: ino}] |= trustedBinary | runtimeClass(f, b)
-		}
-		f.Close()
+	rules, err := t.trustBinaries(binaries, flags)
+	if err != nil {
+		return err
 	}
 	for _, l := range libs {
 		add(l, trustedLib)
@@ -158,14 +164,66 @@ func (t *TrustGuard) SetTrusted(binaries, libs []string) error {
 	t.retiredMu.Lock()
 	t.retired = nil
 	t.retiredMu.Unlock()
+	configured := make(map[GuardInodeKey]bool, len(flags))
+	for k := range flags {
+		configured[k] = true
+	}
 	if err := t.keepLive(flags); err != nil {
 		return fmt.Errorf("keeping live trusted files: %w", err)
+	}
+	if err := t.syncLaunchRows(rules, flags, configured); err != nil {
+		return err
 	}
 	if err := syncMap(t.objs.GuardTrustedFiles, flags); err != nil {
 		return fmt.Errorf("syncing trusted files: %w", err)
 	}
 	log.Infof("trust guard: %d trusted inode(s) loaded (%d binaries, %d libraries requested)",
 		len(flags), len(binaries), len(libs))
+	return nil
+}
+
+// trustBinaries adds each binary's flags and returns its launch rule rows. One open per binary: the
+// runtime class and the rules are read from the inode the key names.
+func (t *TrustGuard) trustBinaries(binaries []string, flags map[GuardInodeKey]uint8) (map[GuardInodeKey]uint64, error) {
+	rules := make(map[GuardInodeKey]uint64)
+	for _, b := range binaries {
+		f, err := ebpf.OpenConfined(b)
+		if err != nil {
+			log.Warnf("trust guard: skipping unresolvable %s: %v", b, err)
+			continue
+		}
+		dev, ino, err := ebpf.StatFile(f)
+		if err != nil {
+			f.Close()
+			continue
+		}
+		k := GuardInodeKey{Dev: dev, Ino: ino}
+		flags[k] |= trustedBinary | runtimeClass(f, b)
+		id, ok, err := t.launchSet(b)
+		f.Close()
+		if err != nil {
+			return nil, fmt.Errorf("launch rules of %s: %w", b, err)
+		}
+		if ok {
+			rules[k] = id
+		}
+	}
+	return rules, nil
+}
+
+// syncLaunchRows writes guard_bin_rules: a configured binary gets exactly its rules now, one kept
+// live (keepLive) keeps its row.
+func (t *TrustGuard) syncLaunchRows(rules map[GuardInodeKey]uint64, flags map[GuardInodeKey]uint8,
+	configured map[GuardInodeKey]bool) error {
+	for k := range flags {
+		var id uint64
+		if !configured[k] && t.objs.GuardBinRules.Lookup(GuardTrustInodeKey{Dev: k.Dev, Ino: k.Ino}, &id) == nil {
+			rules[k] = id
+		}
+	}
+	if err := syncMap(t.objs.GuardBinRules, rules); err != nil {
+		return fmt.Errorf("syncing launch rule rows: %w", err)
+	}
 	return nil
 }
 
@@ -200,8 +258,8 @@ func (t *TrustGuard) trusts(k GuardInodeKey) bool {
 func (t *TrustGuard) forgetExe(k GuardInodeKey) error {
 	key := GuardTrustInodeKey{Dev: k.Dev, Ino: k.Ino}
 	t.retire(key)
-	for _, m := range []*cilium.Map{t.objs.GuardTrustedFiles, t.objs.GuardBinOwner, t.objs.GuardBinUpdaters,
-		t.objs.GuardGlobWriters, t.objs.GuardLibdirUsers} {
+	bitMaps := t.trustBitMaps()
+	for _, m := range append([]*cilium.Map{t.objs.GuardTrustedFiles}, bitMaps[:]...) {
 		if err := m.Delete(key); err != nil && !errors.Is(err, cilium.ErrKeyNotExist) {
 			return err
 		}
@@ -478,7 +536,63 @@ func (t *TrustGuard) attachMemfdProvenance() {
 	t.links = append(t.links, l)
 }
 
+// argvMatch: the deny-rule words a launch matched (TRUST_ARGV_MATCH, emitted at exec, before any of
+// that launch's denials), shown on its ARGV denials. Display only: keyed by pid, so a reused pid may
+// show a stale word, never alter a verdict.
+type argvMatch struct {
+	words string
+	shown bool
+}
+
+type argvMatches map[uint32]*argvMatch
+
+const argvMatchMax = 4096
+
+func (m argvMatches) note(pid uint32, word string) {
+	switch w := m[pid]; {
+	case w == nil || w.shown:
+		if len(m) >= argvMatchMax {
+			clear(m)
+		}
+		m[pid] = &argvMatch{words: word}
+	case !slices.Contains(strings.Split(w.words, ","), word):
+		w.words += "," + word
+	}
+}
+
+func (m argvMatches) label(pid uint32, path string) string {
+	w := m[pid]
+	if w == nil {
+		return path
+	}
+	w.shown = true
+	return path + "  word=" + w.words
+}
+
+// procCaller is display data, read racily ("~" once the process is gone): pid's exe and its
+// parent's, so a launch rule's denial names who ran the CLI.
+func procCaller(pid uint32) string {
+	exe := func(p string) string {
+		if target, err := os.Readlink("/proc/" + p + "/exe"); err == nil {
+			return logging.SanitizeText(target)
+		}
+		return "~"
+	}
+	self := strconv.FormatUint(uint64(pid), 10)
+	parent := "~"
+	if status, err := os.ReadFile("/proc/" + self + "/status"); err == nil {
+		for line := range strings.SplitSeq(string(status), "\n") {
+			if v, ok := strings.CutPrefix(line, "PPid:"); ok {
+				parent = exe(strings.TrimSpace(v))
+				break
+			}
+		}
+	}
+	return "  commFullPath=" + exe(self) + "  parentFullPath=" + parent
+}
+
 func (t *TrustGuard) readLoop() {
+	matched := argvMatches{}
 	for {
 		rec, err := t.rd.Read()
 		if err != nil {
@@ -507,6 +621,18 @@ func (t *TrustGuard) readLoop() {
 				"this process was started with an env var or flag that runs other code in it "+
 					"(NODE_OPTIONS, ELECTRON_RUN_AS_NODE, JAVA_TOOL_OPTIONS, --inspect, --remote-debugging-port, "+
 					"--load-extension); start it without")
+		case trustArgv:
+			logTrustDenied("ARGV", comm+procCaller(ev.PID), ev.PID, ev.UID, matched.label(ev.PID, path),
+				"launched with arguments or env a launch rule denies")
+		case trustArgvMatch:
+			matched.note(ev.PID, path)
+		case trustBunfig:
+			logTrustDenied("BUNFIG", comm, ev.PID, ev.UID, path,
+				"this Bun app runs the preload of a bunfig.toml in its working directory: every secret is "+
+					"refused to this process; start it elsewhere")
+		case trustArgvWarn:
+			log.Warnf("trust guard: ARGV comm=%s pid=%d uid=%d word=%s: a warn-only launch rule matched",
+				comm, ev.PID, ev.UID, path)
 		default:
 			logTrustDenied("LIBLOAD", comm, ev.PID, ev.UID, path,
 				"a whitelisted binary tried to exec-map an untrusted file "+

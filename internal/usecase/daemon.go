@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/pulse"
 	"github.com/Virgula0/app-listener/internal/repository"
 )
@@ -76,6 +78,9 @@ type DaemonUseCase interface {
 	// binary's (uid 0) runtime writes (GuardRepository.WithSelfRuntimeAccess). Refused while a live
 	// edit grant is active; reloads, grants and shutdown wait for fn.
 	WithRuntimeAccess(resourcePath string, fn func() error) error
+	// WithRuntimeRoot runs fn with the anchored root of the runtime resource resourcePath while
+	// the app-listener binary (uid 0) may chown it (GuardRepository.WithSelfOwnerAccess).
+	WithRuntimeRoot(resourcePath string, fn func(root guard.GuardInodeKey) error) error
 }
 
 type daemonUseCase struct {
@@ -513,10 +518,14 @@ func (d *daemonUseCase) refuseRemovedResources(resources []daemonconfig.Resource
 			continue
 		}
 		released, err := d.libDirReleased(i)
+		if err == nil && !released {
+			released, err = d.runtimeReleased(i)
+		}
 		if err != nil {
 			return fmt.Errorf("reload refused: %w", err)
 		}
-		if !released {
+		// A daemon-made root has no vault: dropping it only stops guarding the port or scope.
+		if !released && !d.resources[i].Anchored() {
 			removed = append(removed, d.resources[i].Path)
 		}
 	}
@@ -540,6 +549,35 @@ func (d *daemonUseCase) libDirReleased(i int) (bool, error) {
 	return !alive, nil
 }
 
+// runtimeReleased reports whether the running resource i is a runtime one whose user logged out:
+// no mount of its anchored root's filesystem is left (the /run/user/<uid> tmpfs went at logout). A
+// path that only stopped resolving (a FUSE mount the user put over /run/user/<uid>, through setuid
+// fusermount3) keeps the guard: the reload is refused instead. An unmount frees no inode with
+// nlink 0, so the anchor stays set and alive.
+func (d *daemonUseCase) runtimeReleased(i int) (bool, error) {
+	if !d.resources[i].Runtime {
+		return false, nil
+	}
+	root, _, err := d.guards[i].RootAnchor()
+	if err != nil {
+		return false, fmt.Errorf("reading the root of %s: %w", d.resources[i].Path, err)
+	}
+	mounted, err := mountedDev(root.Dev)
+	if err != nil {
+		return false, fmt.Errorf("reading the mount table for %s: %w", d.resources[i].Path, err)
+	}
+	return !mounted, nil
+}
+
+// mountedDev reports whether a filesystem with dev (KernelDev) is mounted in the daemon's namespace.
+var mountedDev = func(dev uint64) (bool, error) {
+	mounts, err := ebpf.ReadMountinfo()
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(mounts, func(m ebpf.MountInfo) bool { return uint64(m.Dev) == dev }), nil
+}
+
 // refuseMovedRoots refuses a reload whose guard for a kept resource anchored on a different root
 // while the old root still exists: the path was re-pointed through an unguarded ancestor, and
 // committing would guard the new target and leave the real tree unguarded. A deleted root (anchor
@@ -549,6 +587,17 @@ func (d *daemonUseCase) refuseMovedRoots(resources []daemonconfig.Resource, guar
 		oi, kept := oldByPath[resources[i].Path]
 		if !kept {
 			continue
+		}
+		// A runtime root's new anchor is a new login's mount only once the old one is unmounted: a
+		// user can mount FUSE over /run/user/<uid> (setuid fusermount3).
+		if resources[i].Runtime {
+			released, err := d.runtimeReleased(oi)
+			if err != nil {
+				return fmt.Errorf("reload refused: %w", err)
+			}
+			if released {
+				continue
+			}
 		}
 		oldKey, alive, err := d.guards[oi].RootAnchor()
 		if err != nil {
@@ -911,6 +960,28 @@ func (d *daemonUseCase) WithRuntimeAccess(resourcePath string, fn func() error) 
 		}
 	}
 	return fmt.Errorf("%s is not a lib_dir in the running configuration", resourcePath)
+}
+
+func (d *daemonUseCase) WithRuntimeRoot(resourcePath string, fn func(root guard.GuardInodeKey) error) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.stopping {
+		return errors.New("daemon: shutdown in progress")
+	}
+	for i := range d.resources {
+		if d.resources[i].Path != resourcePath || !d.resources[i].Runtime {
+			continue
+		}
+		root, alive, err := d.guards[i].RootAnchor()
+		if err != nil {
+			return err
+		}
+		if !alive {
+			return fmt.Errorf("the guarded root of %s is gone", resourcePath)
+		}
+		return d.guards[i].WithSelfOwnerAccess(func() error { return fn(root) })
+	}
+	return fmt.Errorf("%s is not a runtime resource in the running configuration", resourcePath)
 }
 
 func (d *daemonUseCase) ResyncBinaries() {
