@@ -276,7 +276,8 @@ func TestResolveTempBinaryClassesRuntime(t *testing.T) {
 	}{
 		{"code", "ELF\x00NODE_OPTIONS\x00", trustedNode, []string{"Node"}},
 		{"chrome", "ELF\x00remote-debugging-port\x00", trustedChromium, []string{"Chromium"}},
-		{"opencode", "ELF\x00BUN_BE_BUN\x00BUN_INSPECT\x00", trustedBun, []string{"Bun"}},
+		// No .bun section to say otherwise: it loads ./bunfig.toml.
+		{"opencode", "ELF\x00BUN_BE_BUN\x00BUN_INSPECT\x00", trustedBun | trustedBunfig, []string{"Bun"}},
 		{"tool", "ELF plain", 0, nil},
 	} {
 		p := filepath.Join(dir, tc.name)

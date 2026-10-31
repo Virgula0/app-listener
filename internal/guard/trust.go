@@ -33,6 +33,9 @@ const (
 	trustedChromium uint8 = 16
 	trustedElectron uint8 = 32
 	trustedBun      uint8 = 64
+	// trustedBunfig: a Bun image that runs ./bunfig.toml's preload (bunAutoloadsBunfig). Not a
+	// runtime class: it only marks its process code-suspect when it opens a file of that name.
+	trustedBunfig uint8 = 128
 )
 
 // trust_event.kind — must match guard_trust.bpf.c.
@@ -45,6 +48,7 @@ const (
 	trustArgv       uint32 = 5
 	trustArgvMatch  uint32 = 6
 	trustArgvWarn   uint32 = 7
+	trustBunfig     uint32 = 8
 )
 
 // TrustGuard owns guard_trusted_files and the daemon-wide trusted-binary/library protections
@@ -622,6 +626,10 @@ func (t *TrustGuard) readLoop() {
 				"launched with arguments or env a launch rule denies")
 		case trustArgvMatch:
 			matched.note(ev.PID, path)
+		case trustBunfig:
+			logTrustDenied("BUNFIG", comm, ev.PID, ev.UID, path,
+				"this Bun app runs the preload of a bunfig.toml in its working directory: every secret is "+
+					"refused to this process; start it elsewhere")
 		case trustArgvWarn:
 			log.Warnf("trust guard: ARGV comm=%s pid=%d uid=%d word=%s: a warn-only launch rule matched",
 				comm, ev.PID, ev.UID, path)

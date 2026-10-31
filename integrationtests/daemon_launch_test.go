@@ -143,7 +143,7 @@ const (
 // file `read <path>` names. "" when bun is not on PATH or the build fails: the probe still covers the
 // rules. The baseline target fetches Bun's official runtime: a distro bun (Arch's) compiling for its
 // own target embeds itself, linked to the host's ICU, which the test image lacks.
-func (s *IntegrationSuite) bunRealApp() string {
+func (s *IntegrationSuite) bunRealApp(flags ...string) string {
 	bun, err := exec.LookPath("bun")
 	if err != nil {
 		s.T().Log("bun not on PATH: skipping the real Bun-compiled app")
@@ -158,8 +158,8 @@ if (verb === "read") {
 }
 `), 0o644))
 	out := filepath.Join(dir, "bunreal")
-	b, err := exec.Command(bun, "build", "--compile", "--target=bun-linux-x64-baseline", src, //nolint:gosec // test fixture
-		"--outfile", out).CombinedOutput()
+	args := append([]string{"build", "--compile", "--target=bun-linux-x64-baseline"}, flags...)
+	b, err := exec.Command(bun, append(args, src, "--outfile", out)...).CombinedOutput() //nolint:gosec // test fixture
 	if err != nil {
 		s.T().Logf("bun build --compile failed (offline?), skipping the real Bun-compiled app: %v\n%s", err, b)
 		return ""
@@ -227,6 +227,47 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_BunRuntimeEnv() {
 		s.Require().Containsf(out, "DENIED|", "the caller's script must have run and been refused: %s", out)
 	}
 	s.requireDenialLogged(c, "LAUNCH", "secret")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A default `bun build --compile` app runs the preload of a bunfig.toml in its working directory:
+// started there, it gets nothing below the secret (op=BUNFIG). One built without that autoload, its
+// embedded flags say, opens nothing there and keeps reading.
+func (s *IntegrationSuite) TestDaemon_LaunchScan_BunfigPreload() {
+	autoload := s.bunRealApp()
+	if autoload == "" {
+		s.T().Skip("no bun to build the apps with")
+	}
+	noAutoload := s.bunRealApp("--no-compile-autoload-bunfig")
+	s.Require().NotEmpty(noAutoload, "the second build")
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const quiet = "/opt/rt/bin/bunquiet"
+	s.exec(c, []string{"mkdir", "-p", "/opt/rt/bin", "/tmp/proj"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, autoload, launchBunReal, 0o755))
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, noAutoload, quiet, 0o755))
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
+		"' > " + launchSecret + " && printf '%s' 'try { console.log(\"STOLEN|\" + " +
+		"require(\"fs\").readFileSync(\"" + launchSecret + "\", \"utf8\")) } catch (e) { console.log(\"DENIED|\" + e.code) }' > " +
+		launchBunEvil + " && printf 'preload = [\"" + launchBunEvil + "\"]\\n' > /tmp/proj/bunfig.toml 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+launchBunReal+"\n"+quiet+"\n")
+
+	run := func(dir, bin string) string {
+		_, out := s.exec(c, []string{"sh", "-c", "cd " + dir + " && " + bin + " read " + launchSecret + " 2>&1"})
+		return out
+	}
+	out = run("/tmp", launchBunReal)
+	s.Require().Containsf(out, "STOLEN|"+launchMarker, "a clean start must read: %s\n%s", out, s.readDaemonLog(c))
+	out = run("/tmp/proj", launchBunReal)
+	s.Require().Containsf(out, "DENIED|", "the preload must have run and been refused: %s\n%s", out, s.readDaemonLog(c))
+	s.Require().NotContainsf(out, "STOLEN|", "the bunfig.toml preload read the secret as the app: %s", out)
+	s.requireDenialLogged(c, "BUNFIG", "bunfig.toml")
+	out = run("/tmp/proj", quiet)
+	s.Require().Containsf(out, "STOLEN|"+launchMarker, "an app that doesn't load bunfig.toml must keep reading: %s\n%s",
+		out, s.readDaemonLog(c))
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

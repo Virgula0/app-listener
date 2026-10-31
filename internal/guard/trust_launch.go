@@ -195,13 +195,13 @@ var (
 	classCache = map[classCacheKey]uint8{}
 )
 
-// runtimeClass returns the trustedRuntimes classes of the image f holds (path names it). Scanned once
-// per inode and content fingerprint: an Electron app's image is ~200 MB. An unreadable image is
-// classed as every runtime, so its launches are judged (fail closed).
+// runtimeClass returns the trustedRuntimes classes of the image f holds (path names it), plus
+// trustedBunfig. Scanned once per inode and content fingerprint: an Electron app's image is ~200 MB.
+// An unreadable image is classed as every runtime, so its launches are judged (fail closed).
 func runtimeClass(f *os.File, path string) uint8 {
 	var st unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
-		return trustedRuntimes
+		return trustedRuntimes | trustedBunfig
 	}
 	key := classCacheKey{dev: st.Dev, ino: st.Ino, size: st.Size, mtime: st.Mtim, ctime: st.Ctim}
 	classMu.Lock()
@@ -210,10 +210,13 @@ func runtimeClass(f *os.File, path string) uint8 {
 	if !ok {
 		var err error
 		if c, err = scanRuntimeClass(f); err != nil {
-			return trustedRuntimes
+			return trustedRuntimes | trustedBunfig
 		}
 		if base := filepath.Base(path); base == "java" || base == "javaw" {
 			c |= trustedJVM
+		}
+		if c&trustedBun != 0 && bunAutoloadsBunfig(f) {
+			c |= trustedBunfig
 		}
 		classMu.Lock()
 		if len(classCache) > 4096 {

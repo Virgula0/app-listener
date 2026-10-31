@@ -60,6 +60,7 @@
 #define TRUSTED_CHROMIUM 16 // a whitelisted Chromium-based binary (launch argv judged, trust_launch)
 #define TRUSTED_ELECTRON 32 // a generic Electron: runs the app its first positional argv names
 #define TRUSTED_BUN 64      // a Bun runtime or `bun build --compile` exe (launch env judged)
+#define TRUSTED_BUNFIG 128  // a Bun image that runs ./bunfig.toml's preload (not a runtime class)
 #define TRUSTED_RUNTIMES (TRUSTED_NODE | TRUSTED_JVM | TRUSTED_CHROMIUM | TRUSTED_ELECTRON | TRUSTED_BUN)
 
 // trust_event.kind
@@ -71,6 +72,7 @@
 #define TRUST_ARGV 5       // the same, marked by one of its exe's argv/env rules (trust_argv)
 #define TRUST_ARGV_MATCH 6 // a launch matched a deny rule: marked (path: the completing word)
 #define TRUST_ARGV_WARN 7  // a launch matched a warn rule: logged only
+#define TRUST_BUNFIG 8     // a TRUSTED_BUNFIG process opened a bunfig.toml: marked code-suspect
 
 struct inode_key {
 	__u64 dev;
@@ -1311,6 +1313,32 @@ int trust_path_rename(unsigned long long *ctx)
 	return 0;
 }
 
+// note_bunfig_open: a TRUSTED_BUNFIG process opening a file named bunfig.toml (its cwd's, read at
+// startup) is about to run that file's `preload` as the app: code-suspect before any of it runs.
+// Out of line: one body for file_open's verifier walk.
+static __noinline int note_bunfig_open(struct dentry *dentry)
+{
+	const unsigned char *name = NULL;
+	__u32 n = 0;
+	char buf[12] = {};
+	bpf_probe_read_kernel(&n, sizeof(n), &dentry->d_name.len);
+	if (n != 11)
+		return 0;
+	bpf_probe_read_kernel(&name, sizeof(name), &dentry->d_name.name);
+	if (!name || bpf_probe_read_kernel(buf, sizeof(buf), name))
+		return 0;
+	if (buf[0] != 'b' || buf[1] != 'u' || buf[2] != 'n' || buf[3] != 'f' || buf[4] != 'i' ||
+	    buf[5] != 'g' || buf[6] != '.' || buf[7] != 't' || buf[8] != 'o' || buf[9] != 'm' ||
+	    buf[10] != 'l' || buf[11] != '\0')
+		return 0;
+	if (!(current_exe_flags() & TRUSTED_BUNFIG))
+		return 0;
+	if (mark_code_suspect())
+		return -EPERM;
+	emit(dentry, TRUST_BUNFIG);
+	return 0;
+}
+
 SEC("lsm/file_open")
 int trust_file_open(unsigned long long *ctx)
 {
@@ -1340,7 +1368,10 @@ int trust_file_open(unsigned long long *ctx)
 	if (!dentry)
 		return 0;
 	if (!dentry_is_dir(dentry)) {
-		int r = suspect_denied(dentry, (f_mode & FMODE_WRITE) != 0);
+		int r = note_bunfig_open(dentry);
+		if (r)
+			return r;
+		r = suspect_denied(dentry, (f_mode & FMODE_WRITE) != 0);
 		if (r)
 			return r;
 	}

@@ -138,7 +138,14 @@ A risky launch still runs, but the process (and its forks; an exec is judged afr
 - gets nothing else below a whitelist-mode tree either: no `stat`, directory listing or xattr.
 
 Fix: start the app without that variable or flag. A process that mapped untrusted code before its
-binary was whitelisted is refused the same way (`op=PRELOADED`). Libraries from a `lib_dir` of the
+binary was whitelisted is refused the same way (`op=PRELOADED`).
+
+A Bun app compiled with the default `bun build --compile` (and the `bun` CLI itself) also runs the
+`preload` of a `bunfig.toml` in the directory it starts in. The daemon reads each Bun binary's
+embedded flags; one that loads `bunfig.toml` and opens a file of that name is refused every secret
+from then on (`TRUST DENIED  op=BUNFIG`, then `op=PRELOADED`). Start it elsewhere, or build it with
+`--no-compile-autoload-bunfig`. `opencode` and the native `claude` don't load it. A binary whose
+flags can't be read counts as loading it. Libraries from a `lib_dir` of the
 updater that created the binary don't count: a self-updating app such as Steam starts its new binary
 before the daemon admits it, and everything that process runs is code its updater chose. That new
 binary's launch is judged at exec too, before the daemon knows what runtime it is: by every
