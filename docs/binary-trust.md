@@ -151,9 +151,10 @@ Generic Electron binaries that run an app named on the command line are covered 
 ## Launch rules
 
 Some whitelisted CLIs print or spend their secret when asked. The launch scan also judges any
-whitelisted binary with launch rules, and a match marks the process the same way
-(`TRUST DENIED  op=ARGV`, and `op=ARGV ... word=<the matching word>` at exec). Built in, by the
-whitelisted file's name:
+whitelisted binary with launch rules, and a match marks the process the same way. Its denials
+name the binary, who ran it and the word that matched:
+`TRUST DENIED  op=ARGV  comm=... commFullPath=<its exe>  parentFullPath=<who ran it> ... path=<the secret>  word=<the word>`.
+Built in, by the whitelisted file's name:
 
 - `gh`: `auth token`, `auth status --show-token`, `auth status -t`, `alias set`, `alias import`;
   `auth git-credential` is only logged, since git runs it on every push.

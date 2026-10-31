@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -531,7 +532,63 @@ func (t *TrustGuard) attachMemfdProvenance() {
 	t.links = append(t.links, l)
 }
 
+// argvMatch: the deny-rule words a launch matched (TRUST_ARGV_MATCH, emitted at exec, before any of
+// that launch's denials), shown on its ARGV denials. Display only: keyed by pid, so a reused pid may
+// show a stale word, never alter a verdict.
+type argvMatch struct {
+	words string
+	shown bool
+}
+
+type argvMatches map[uint32]*argvMatch
+
+const argvMatchMax = 4096
+
+func (m argvMatches) note(pid uint32, word string) {
+	switch w := m[pid]; {
+	case w == nil || w.shown:
+		if len(m) >= argvMatchMax {
+			clear(m)
+		}
+		m[pid] = &argvMatch{words: word}
+	case !slices.Contains(strings.Split(w.words, ","), word):
+		w.words += "," + word
+	}
+}
+
+func (m argvMatches) label(pid uint32, path string) string {
+	w := m[pid]
+	if w == nil {
+		return path
+	}
+	w.shown = true
+	return path + "  word=" + w.words
+}
+
+// procCaller is display data, read racily ("~" once the process is gone): pid's exe and its
+// parent's, so a launch rule's denial names who ran the CLI.
+func procCaller(pid uint32) string {
+	exe := func(p string) string {
+		if target, err := os.Readlink("/proc/" + p + "/exe"); err == nil {
+			return logging.SanitizeText(target)
+		}
+		return "~"
+	}
+	self := strconv.FormatUint(uint64(pid), 10)
+	parent := "~"
+	if status, err := os.ReadFile("/proc/" + self + "/status"); err == nil {
+		for line := range strings.SplitSeq(string(status), "\n") {
+			if v, ok := strings.CutPrefix(line, "PPid:"); ok {
+				parent = exe(strings.TrimSpace(v))
+				break
+			}
+		}
+	}
+	return "  commFullPath=" + exe(self) + "  parentFullPath=" + parent
+}
+
 func (t *TrustGuard) readLoop() {
+	matched := argvMatches{}
 	for {
 		rec, err := t.rd.Read()
 		if err != nil {
@@ -561,11 +618,10 @@ func (t *TrustGuard) readLoop() {
 					"(NODE_OPTIONS, ELECTRON_RUN_AS_NODE, JAVA_TOOL_OPTIONS, --inspect, --remote-debugging-port, "+
 					"--load-extension); start it without")
 		case trustArgv:
-			logTrustDenied("ARGV", comm, ev.PID, ev.UID, path,
-				"this process was started with arguments or env one of its launch rules names")
+			logTrustDenied("ARGV", comm+procCaller(ev.PID), ev.PID, ev.UID, matched.label(ev.PID, path),
+				"launched with arguments or env a launch rule denies")
 		case trustArgvMatch:
-			logTrustDenied("ARGV", comm, ev.PID, ev.UID, "word="+path,
-				"a launch rule matched: this process is refused every guarded secret")
+			matched.note(ev.PID, path)
 		case trustArgvWarn:
 			log.Warnf("trust guard: ARGV comm=%s pid=%d uid=%d word=%s: a warn-only launch rule matched",
 				comm, ev.PID, ev.UID, path)
