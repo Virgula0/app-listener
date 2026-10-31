@@ -3,9 +3,9 @@ package usecase
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,6 +14,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/pulse"
 	"github.com/Virgula0/app-listener/internal/repository"
 )
@@ -517,11 +518,14 @@ func (d *daemonUseCase) refuseRemovedResources(resources []daemonconfig.Resource
 			continue
 		}
 		released, err := d.libDirReleased(i)
+		if err == nil && !released {
+			released, err = d.runtimeReleased(i)
+		}
 		if err != nil {
 			return fmt.Errorf("reload refused: %w", err)
 		}
 		// A daemon-made root has no vault: dropping it only stops guarding the port or scope.
-		if !released && !runtimeReleased(&d.resources[i]) && !d.resources[i].Anchored() {
+		if !released && !d.resources[i].Anchored() {
 			removed = append(removed, d.resources[i].Path)
 		}
 	}
@@ -545,15 +549,33 @@ func (d *daemonUseCase) libDirReleased(i int) (bool, error) {
 	return !alive, nil
 }
 
-// runtimeReleased reports a runtime resource whose directory is gone: its user logged out and the
-// /run/user/<uid> mount went with it (its root can't be removed while guarded, see the sentinel in
-// cmd/functions/daemon/runtime.go). An unmount frees no inode with nlink 0, so the anchor stays set.
-func runtimeReleased(r *daemonconfig.Resource) bool {
-	if !r.Runtime {
-		return false
+// runtimeReleased reports whether the running resource i is a runtime one whose user logged out:
+// no mount of its anchored root's filesystem is left (the /run/user/<uid> tmpfs went at logout). A
+// path that only stopped resolving (a FUSE mount the user put over /run/user/<uid>, through setuid
+// fusermount3) keeps the guard: the reload is refused instead. An unmount frees no inode with
+// nlink 0, so the anchor stays set and alive.
+func (d *daemonUseCase) runtimeReleased(i int) (bool, error) {
+	if !d.resources[i].Runtime {
+		return false, nil
 	}
-	_, err := os.Lstat(r.Path)
-	return errors.Is(err, fs.ErrNotExist)
+	root, _, err := d.guards[i].RootAnchor()
+	if err != nil {
+		return false, fmt.Errorf("reading the root of %s: %w", d.resources[i].Path, err)
+	}
+	mounted, err := mountedDev(root.Dev)
+	if err != nil {
+		return false, fmt.Errorf("reading the mount table for %s: %w", d.resources[i].Path, err)
+	}
+	return !mounted, nil
+}
+
+// mountedDev reports whether a filesystem with dev (KernelDev) is mounted in the daemon's namespace.
+var mountedDev = func(dev uint64) (bool, error) {
+	mounts, err := ebpf.ReadMountinfo()
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(mounts, func(m ebpf.MountInfo) bool { return uint64(m.Dev) == dev }), nil
 }
 
 // refuseMovedRoots refuses a reload whose guard for a kept resource anchored on a different root
@@ -563,10 +585,19 @@ func runtimeReleased(r *daemonconfig.Resource) bool {
 func (d *daemonUseCase) refuseMovedRoots(resources []daemonconfig.Resource, guards []repository.GuardRepository, oldByPath map[string]int) error {
 	for i := range resources {
 		oi, kept := oldByPath[resources[i].Path]
-		// A runtime root's ancestors are root's and its user's mount (only root can re-point those),
-		// and the root can't be moved while guarded: a new anchor is a new login's mount.
-		if !kept || resources[i].Runtime {
+		if !kept {
 			continue
+		}
+		// A runtime root's new anchor is a new login's mount only once the old one is unmounted: a
+		// user can mount FUSE over /run/user/<uid> (setuid fusermount3).
+		if resources[i].Runtime {
+			released, err := d.runtimeReleased(oi)
+			if err != nil {
+				return fmt.Errorf("reload refused: %w", err)
+			}
+			if released {
+				continue
+			}
 		}
 		oldKey, alive, err := d.guards[oi].RootAnchor()
 		if err != nil {

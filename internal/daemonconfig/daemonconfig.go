@@ -236,8 +236,9 @@ type watchGroup struct {
 	encryptionSet      bool
 	blockName          string
 	// skipped marks a section whose root is missing: its directives are warned and ignored, never
-	// fatal (the group is dropped at finalize).
+	// fatal (the group is dropped at finalize). statErr is why.
 	skipped bool
+	statErr error
 	lineNo  int
 }
 
@@ -478,7 +479,7 @@ func newWatchGroup(dirPath string, lineNo int) *watchGroup {
 	g := &watchGroup{root: dirPath, needEncryption: true, lineNo: lineNo}
 	if dirPath != "" {
 		if _, statErr := os.Lstat(dirPath); statErr != nil {
-			g.skipped = true
+			g.skipped, g.statErr = true, statErr
 		}
 	}
 	return g
@@ -499,6 +500,12 @@ func finalizeGroup(cfg *Config, group *watchGroup) error {
 	if group.runtime {
 		if err := checkRuntimeGroup(group); err != nil {
 			return err
+		}
+		// Root can't look: a filesystem the user mounted over /run/user/<uid> hides the directory,
+		// which a guard may hold. Missing means logged out; anything else isn't known to be.
+		if group.skipped && !os.IsNotExist(group.statErr) {
+			return fmt.Errorf("daemon config line %d: runtime section %s: %w (a filesystem mounted over its "+
+				"/run/user directory?)", group.lineNo, group.root, group.statErr)
 		}
 		group.needEncryption = false
 		if slices.Contains(cfg.RuntimePaths, group.root) {

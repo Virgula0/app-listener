@@ -1706,6 +1706,19 @@ func TestLoadRuntimeSectionPresent(t *testing.T) {
 	}
 }
 
+// A runtime dir root can't stat may be hidden by a mount over /run/user/<uid>: refused, not skipped
+// as logged out. ENAMETOOLONG stands in for EACCES, which needs another user's directory.
+func TestLoadRuntimeSectionUnstattableRefused(t *testing.T) {
+	base := filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
+	if _, err := os.Stat(base); err != nil {
+		t.Skipf("no runtime dir %s", base)
+	}
+	dir := filepath.Join(base, strings.Repeat("a", 300))
+	if _, err := Load(writeConfig(t, "[watch "+dir+"]\nruntime: true\n/usr/bin/gpg CONNECT\n")); err == nil {
+		t.Fatal("want an error for a runtime dir that can't be statted")
+	}
+}
+
 func TestLoadRuntimeSectionRefused(t *testing.T) {
 	for name, conf := range map[string]string{
 		"outside run/user": "[watch /tmp/gnupg]\nruntime: true\n",

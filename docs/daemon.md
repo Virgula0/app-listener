@@ -101,7 +101,10 @@ ran) is guarded as found, and may hold sockets bound before the guard. The daemo
 sentinel in it then (and at every reload), so an agent removing its own socket can't leave it
 empty.
 
-At logout the directory is gone with its mount, and the daemon reloads to drop the resource. Like
+At logout the directory is gone with its mount, and the daemon reloads to drop the resource. It
+drops one only once its mount is gone: a filesystem the user mounts over `/run/user/<uid>` (FUSE,
+through the setuid `fusermount3`) hides the directory, and every reload is refused until it is
+unmounted, as is a daemon start that can't look inside. Like
 any reload, a login or logout that adds or drops a runtime section ends a live `edit-protected`
 session.
 
