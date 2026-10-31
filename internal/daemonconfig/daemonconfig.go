@@ -498,20 +498,9 @@ func finalizeGroup(cfg *Config, group *watchGroup) error {
 		return materializeSecretGroup(cfg, group)
 	}
 	if group.runtime {
-		if err := checkRuntimeGroup(group); err != nil {
+		if err := listRuntimeGroup(cfg, group); err != nil {
 			return err
 		}
-		// Root can't look: a filesystem the user mounted over /run/user/<uid> hides the directory,
-		// which a guard may hold. Missing means logged out; anything else isn't known to be.
-		if group.skipped && !os.IsNotExist(group.statErr) {
-			return fmt.Errorf("daemon config line %d: runtime section %s: %w (a filesystem mounted over its "+
-				"/run/user directory?)", group.lineNo, group.root, group.statErr)
-		}
-		group.needEncryption = false
-		if slices.Contains(cfg.RuntimePaths, group.root) {
-			return fmt.Errorf("daemon config line %d: duplicate watch path: %s", group.lineNo, group.root)
-		}
-		cfg.RuntimePaths = append(cfg.RuntimePaths, group.root)
 	}
 	if group.skipped {
 		return nil
@@ -523,6 +512,25 @@ func finalizeGroup(cfg *Config, group *watchGroup) error {
 		return nil
 	}
 	materializeWatchGroup(cfg, group)
+	return nil
+}
+
+// listRuntimeGroup validates a runtime group and lists it in RuntimePaths, present or not.
+func listRuntimeGroup(cfg *Config, group *watchGroup) error {
+	if err := checkRuntimeGroup(group); err != nil {
+		return err
+	}
+	// Root can't look: a filesystem the user mounted over /run/user/<uid> hides the directory,
+	// which a guard may hold. Missing means logged out; anything else isn't known to be.
+	if group.skipped && !os.IsNotExist(group.statErr) {
+		return fmt.Errorf("daemon config line %d: runtime section %s: %w (a filesystem mounted over its "+
+			"/run/user directory?)", group.lineNo, group.root, group.statErr)
+	}
+	group.needEncryption = false
+	if slices.Contains(cfg.RuntimePaths, group.root) {
+		return fmt.Errorf("daemon config line %d: duplicate watch path: %s", group.lineNo, group.root)
+	}
+	cfg.RuntimePaths = append(cfg.RuntimePaths, group.root)
 	return nil
 }
 

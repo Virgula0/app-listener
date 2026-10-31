@@ -185,7 +185,7 @@ func (s *loginServer) sentinelFound() {
 func (s *loginServer) plantFound(uid uint32, path string) error {
 	userFd, _, err := openUserRuntimeDir(uid)
 	if err != nil {
-		return nil //nolint:nilerr // logged out: the reload drops the section
+		return nil // logged out: the reload drops the section
 	}
 	defer unix.Close(userFd)
 	fd, err := unix.Openat(userFd, path[strings.LastIndexByte(path, '/')+1:],

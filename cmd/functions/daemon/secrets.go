@@ -248,7 +248,7 @@ type userBus struct{ uid uint32 }
 
 func (b userBus) String() string { return fmt.Sprintf("/run/user/%d/bus", b.uid) }
 
-func (b userBus) Open() (string, func(), error) {
+func (b userBus) Open() (path string, release func(), err error) {
 	dir, _, err := openUserRuntimeDir(b.uid)
 	if err != nil {
 		return "", nil, err

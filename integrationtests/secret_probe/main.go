@@ -307,7 +307,7 @@ func own() {
 	failf(0, "OWNER")
 }
 
-// fakebus binds a listener and renames it over path (the real bus hardlinked aside first): every
+// fakebus binds a listener and renames it over path (the real bus linked aside first): every
 // relay connect then reaches it. It answers the first connection's SASL: 0 = the write reached the
 // relay, 1 = refused, 4 = nobody connected within secs.
 func fakebus(path string, secs time.Duration) {
@@ -317,8 +317,8 @@ func fakebus(path string, secs time.Duration) {
 		failf(3, "ERROR listen: %v", err)
 	}
 	ln.SetUnlinkOnClose(false)
-	if err := os.Rename(tmp, path); err != nil {
-		failf(3, "ERROR rename over %s: %v", path, err)
+	if rerr := os.Rename(tmp, path); rerr != nil {
+		failf(3, "ERROR rename over %s: %v", path, rerr)
 	}
 	fmt.Println("LISTENING")
 	_ = ln.SetDeadline(time.Now().Add(secs))
@@ -407,53 +407,47 @@ func usage() {
 	failf(3, "usage: secret_probe get|store|replace|own|monitor|connexec|sendexec|lend|heldexec|reader|rawget|rawreader|fakebus|dialsleep|sleep ...")
 }
 
+func duration(s string) time.Duration {
+	d, _ := time.ParseDuration(s)
+	return d
+}
+
+// modes run with the arguments after the mode name.
+var modes = map[string]func(a []string){
+	"get":       func(a []string) { get(dial(), a[0], a[1]) },
+	"store":     func(a []string) { store(a[0], a[1], a[2]) },
+	"replace":   func(a []string) { replace(a[0], a[1:]) },
+	"own":       func([]string) { own() },
+	"monitor":   func(a []string) { monitor(a[0], duration(a[1])) },
+	"connexec":  func(a []string) { connexec(a[0], a[1], a[2], a[3:]) },
+	"sendexec":  func(a []string) { sendexec(a[0], a[1], a[2], a[3:]) },
+	"reader":    func(a []string) { reader(a[0], a[1]) },
+	"lend":      func(a []string) { lend(a[0], a[1], a[2]) },
+	"heldexec":  func(a []string) { heldexec(a[0], a[1], a[2], a[3], a[4:]) },
+	"rawreader": func(a []string) { rawreader(a[0]) },
+	"fakebus":   func(a []string) { fakebus(a[0], duration(a[1])) },
+	"sleep":     func(a []string) { time.Sleep(duration(a[0])) },
+	"rawget": func(a []string) {
+		delay := 500 * time.Millisecond
+		if len(a) > 2 {
+			delay = duration(a[2])
+		}
+		rawget(a[0], a[1], delay)
+	},
+	"dialsleep": func(a []string) {
+		c := dial()
+		time.Sleep(duration(a[0]))
+		c.Close()
+	},
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 	}
-	a := os.Args[2:]
-	switch os.Args[1] {
-	case "get":
-		get(dial(), a[0], a[1])
-	case "store":
-		store(a[0], a[1], a[2])
-	case "replace":
-		replace(a[0], a[1:])
-	case "own":
-		own()
-	case "monitor":
-		d, _ := time.ParseDuration(a[1])
-		monitor(a[0], d)
-	case "connexec":
-		connexec(a[0], a[1], a[2], a[3:])
-	case "sendexec":
-		sendexec(a[0], a[1], a[2], a[3:])
-	case "reader":
-		reader(a[0], a[1])
-	case "lend":
-		lend(a[0], a[1], a[2])
-	case "rawget":
-		delay := 500 * time.Millisecond
-		if len(a) > 2 {
-			delay, _ = time.ParseDuration(a[2])
-		}
-		rawget(a[0], a[1], delay)
-	case "heldexec":
-		heldexec(a[0], a[1], a[2], a[3], a[4:])
-	case "dialsleep":
-		c := dial()
-		d, _ := time.ParseDuration(a[0])
-		time.Sleep(d)
-		c.Close()
-	case "rawreader":
-		rawreader(a[0])
-	case "fakebus":
-		d, _ := time.ParseDuration(a[1])
-		fakebus(a[0], d)
-	case "sleep":
-		d, _ := time.ParseDuration(a[0])
-		time.Sleep(d)
-	default:
+	run, ok := modes[os.Args[1]]
+	if !ok {
 		usage()
 	}
+	run(os.Args[2:])
 }
