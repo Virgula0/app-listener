@@ -34,6 +34,7 @@ const (
 // lib_dir itself: only its writers write it while the daemon runs.
 type sources struct {
 	dir     string
+	dev     uint64 // the lib_dir's filesystem: content on any other (a mount below it) vouches nothing
 	indexed bool
 	bySize  map[int64][]string
 	sums    map[string][32]byte
@@ -75,30 +76,86 @@ func (s *sources) index() error {
 	if s.indexed {
 		return nil
 	}
+	dev, err := libDirDev(s.dir)
+	if err != nil {
+		return err
+	}
+	s.dev = dev
 	s.bySize = map[int64][]string{}
-	err := filepath.WalkDir(s.dir, func(p string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(s.dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !d.Type().IsRegular() {
+		if !d.IsDir() && !d.Type().IsRegular() {
 			return nil
 		}
 		fi, err := d.Info()
 		if err != nil {
 			return nil //nolint:nilerr // removed since the walk listed it: not a source
 		}
-		s.bySize[fi.Size()] = append(s.bySize[fi.Size()], p)
+		// A user's FUSE mount below a read-only lib_dir (user_allow_other) serves any bytes.
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Dev != s.dev {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.Type().IsRegular() {
+			s.bySize[fi.Size()] = append(s.bySize[fi.Size()], p)
+		}
 		return nil
 	})
 	s.indexed = err == nil
 	return err
 }
 
+// libDirDev is dir's device; a FUSE one (a user's mount over an ancestor) is refused.
+func libDirDev(dir string) (uint64, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	var fsSt syscall.Statfs_t
+	if err := syscall.Fstatfs(int(f.Fd()), &fsSt); err != nil {
+		return 0, err
+	}
+	if fsSt.Type == fuseSuperMagic {
+		return 0, fmt.Errorf("%s is on a FUSE filesystem: its content vouches for nothing", dir)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		return 0, err
+	}
+	return st.Dev, nil
+}
+
+const fuseSuperMagic = 0x65735546
+
+// open opens p, a source only while it is on the lib_dir's filesystem (checked on the fd: a mount
+// made after the walk can't slip in).
+func (s *sources) open(p string) (*os.File, *syscall.Stat_t, error) {
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if st.Dev != s.dev {
+		f.Close()
+		return nil, nil, fmt.Errorf("%s is on another filesystem than the lib_dir", p)
+	}
+	return f, &st, nil
+}
+
 func (s *sources) sum(p string) ([32]byte, error) {
 	if h, ok := s.sums[p]; ok {
 		return h, nil
 	}
-	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, _, err := s.open(p)
 	if err != nil {
 		return [32]byte{}, err
 	}
@@ -128,15 +185,11 @@ type fileID struct {
 // addArchive adds p's member sums when p is a tar archive, plain or compressed; anything else adds
 // nothing.
 func (s *sources) addArchive(p string) error {
-	f, openErr := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, st, openErr := s.open(p)
 	if openErr != nil {
-		return nil // gone or unreadable: not a source
+		return nil // gone, unreadable or mounted over: not a source
 	}
 	defer f.Close()
-	var st syscall.Stat_t
-	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
-		return err
-	}
 	id := fileID{dev: st.Dev, ino: st.Ino, size: st.Size, mtime: st.Mtim, ctime: st.Ctim}
 	archiveCache.Lock()
 	cached, ok := archiveCache.m[id]

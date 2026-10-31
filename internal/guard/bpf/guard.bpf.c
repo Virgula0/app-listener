@@ -38,7 +38,8 @@
 
 // guard_config[0] modes: 0/1 = blacklist/whitelist. GUARD_MODE_READONLY (2): every process may
 // READ, only whitelisted binaries may modify (write, truncate, rename, unlink, chmod, mkdir, mknod,
-// xattr, writable mmap, mount-over). For /etc/app-listener (world-readable daemon.conf).
+// xattr, writable mmap). A mount over one passes (see guard_sb_mount). For /etc/app-listener
+// (world-readable daemon.conf) and lib_dirs.
 #define GUARD_MODE_BLACKLIST 0
 #define GUARD_MODE_WHITELIST 1
 #define GUARD_MODE_READONLY 2
