@@ -232,7 +232,7 @@ func (s *secretGates) startLocked(uid uint32) {
 	if rmErr := os.Remove(sock); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 		log.Errorf("secret gate %d: removing a stale %s: %v", uid, sock, rmErr)
 	}
-	g, err := secretgate.Listen(uid, gid, sock, runDir+"/bus", &s.judge)
+	g, err := secretgate.Listen(uid, gid, sock, userBus{uid: uid}, &s.judge)
 	if err != nil {
 		guard.UnregisterBusDir(dir)
 		log.Errorf("secret gate %d: %v — the keyring can't reach the session bus", uid, err)
@@ -240,6 +240,33 @@ func (s *secretGates) startLocked(uid uint32) {
 	}
 	s.users[uid] = &userGate{gate: g, dir: dir}
 	go g.Serve()
+}
+
+// userBus is uid's session bus socket, opened without following a symlink and tagged so only a bus
+// broker answers on it (guard.TagRelayBus): the user can put any listener at that name.
+type userBus struct{ uid uint32 }
+
+func (b userBus) String() string { return fmt.Sprintf("/run/user/%d/bus", b.uid) }
+
+func (b userBus) Open() (string, func(), error) {
+	dir, _, err := openUserRuntimeDir(b.uid)
+	if err != nil {
+		return "", nil, err
+	}
+	defer unix.Close(dir)
+	fd, err := unix.Openat(dir, "bus", unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return "", nil, err
+	}
+	untag, err := guard.TagRelayBus(fd)
+	if err != nil {
+		unix.Close(fd)
+		return "", nil, err
+	}
+	return fmt.Sprintf("/proc/self/fd/%d", fd), func() {
+		untag()
+		unix.Close(fd)
+	}, nil
 }
 
 func (s *secretGates) stopLocked(uid uint32) {

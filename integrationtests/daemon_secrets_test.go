@@ -18,7 +18,7 @@ const (
 // call touching a gh item needs a caller the scope admits, attested by the pidfd the bus took at
 // connect. The probes cover the item calls, a replace matching by a subset, owning the name,
 // monitoring, exec after connecting or after sending, a send on a socket another process connected, a
-// fake keyring on the relay, and the pkcs11 socket.
+// fake keyring on the relay, the pkcs11 socket, a fake bus renamed over the user's, and a connection made before a restart.
 func (s *IntegrationSuite) TestDaemon_SecretService() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -66,10 +66,13 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		">/tmp/bus.log 2>&1 &) && for i in $(seq 50); do [ -S /run/user/1000/bus ] && exit 0; sleep 0.1; done; "+
 		"cat /tmp/bus.log; exit 1")
 	s.Require().Equalf(0, code, "session bus: %s", out)
-	// Only the keyring dials the relay; the apps use the user bus.
-	code, out = user("", "(echo -n hunter2 | DBUS_SESSION_BUS_ADDRESS=unix:path="+secretRelay+"/1000.bus "+
-		"nohup gnome-keyring-daemon --foreground --unlock --components=pkcs11,secrets "+
-		"--control-directory="+keyringDir+" >/tmp/gk.log 2>&1 &); "+
+	// Only the keyring dials the relay; the apps use the user bus. A restart waits out the old one: the
+	// gate refuses a second keyring connection while the first session lives.
+	const keyring = "while pgrep -u 1000 gnome-keyring >/dev/null; do sleep 0.1; done; sleep 1; " +
+		"(echo -n hunter2 | DBUS_SESSION_BUS_ADDRESS=unix:path=" + secretRelay + "/1000.bus " +
+		"nohup gnome-keyring-daemon --foreground --unlock --components=pkcs11,secrets " +
+		"--control-directory=" + keyringDir + " >/tmp/gk.log 2>&1 &); "
+	code, out = user("", keyring+
 		"for i in $(seq 100); do /exploits/secret_probe_ok store service gh:github.com "+ghToken+
 		" >/tmp/store.log 2>&1 && exit 0; sleep 0.2; done; cat /tmp/store.log /tmp/gk.log; exit 1")
 	s.Require().Equalf(0, code, "the whitelisted app could not store through the relay: %s\n%s", out, s.readDaemonLog(c))
@@ -153,10 +156,48 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		s.requireSecretDenial(c, "CONNECT", "pkcs11-tool", keyringDir)
 	})
 
+	s.T().Run("fake bus", func(*testing.T) {
+		// The user renames a listener over their bus and restarts the keyring: the relay dials it. Only a
+		// bus broker may write on the relay's connections, so the fake can't answer even its SASL.
+		_, out := user("", "ln /run/user/1000/bus /run/user/1000/bus.real && "+
+			"(/exploits/secret_probe fakebus /run/user/1000/bus 20s >/tmp/fake.log 2>&1; echo rc=$? >>/tmp/fake.log) & "+
+			"for i in $(seq 50); do grep -q LISTENING /tmp/fake.log && break; sleep 0.1; done; "+
+			"pkill -u 1000 gnome-keyring; "+keyring+
+			"for i in $(seq 150); do grep -q rc= /tmp/fake.log && break; sleep 0.2; done; "+
+			"mv -f /run/user/1000/bus.real /run/user/1000/bus; cat /tmp/fake.log")
+		s.Require().NotContainsf(out, "WROTE", "a fake bus answered the relay: %s\n%s", out, s.readDaemonLog(c))
+		s.Require().Containsf(out, "rc=1", "want the fake's write refused: %s\n%s", out, s.readDaemonLog(c))
+		code, out := user("", "pkill -u 1000 gnome-keyring; "+keyring+
+			"for i in $(seq 100); do /exploits/secret_probe_ok get service gh:github.com >/tmp/get.log 2>&1 && "+
+			"exit 0; sleep 0.2; done; cat /tmp/get.log /tmp/gk.log; exit 1")
+		s.Require().Equalf(0, code, "the keyring must relay again on the real bus: %s\n%s", out, s.readDaemonLog(c))
+	})
+
 	s.reloadAndAwait(c)
 	s.Require().NotContainsf(s.readDaemonLog(c), reloadRefused, "reload refused:\n%s", s.readDaemonLog(c))
 	ok("whitelisted get after a reload", "/exploits/secret_probe_ok get service gh:github.com")
 	refused("attacker get after a reload", "/exploits/secret_probe get service gh:github.com", "READ", "secret_probe")
+
+	s.T().Run("connection from before a restart", func(*testing.T) {
+		// A connection the guard never saw made: its process execs the app, which connects anew, while a
+		// child sends on the held one. The bus credits that send to the app's pid.
+		code, out := user("", "(/exploits/secret_probe heldexec service gh:github.com /tmp/held.go /exploits/secret_probe "+
+			"/exploits/secret_probe_ok dialsleep 8s >/tmp/held.log 2>&1; echo rc=$? >>/tmp/held.log) & "+
+			"for i in $(seq 50); do grep -q CONNECTED /tmp/held.log && exit 0; sleep 0.1; done; cat /tmp/held.log; exit 1")
+		s.Require().Equalf(0, code, "holding a bus connection: %s", out)
+		s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+		s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
+		s.launchDaemon(c)
+		s.awaitDaemonUp(c, always+"\n[secret_service]\n[secret gh]\n")
+		code, out = user("", "pkill -u 1000 gnome-keyring; "+keyring+
+			"for i in $(seq 100); do /exploits/secret_probe_ok get service gh:github.com >/tmp/get.log 2>&1 && "+
+			"break; sleep 0.2; done; touch /tmp/held.go; "+
+			"for i in $(seq 100); do grep -q rc= /tmp/held.log && break; sleep 0.2; done; cat /tmp/get.log /tmp/held.log")
+		s.Require().Containsf(out, "SECRET="+ghToken, "the keyring must relay after the restart: %s\n%s", out, s.readDaemonLog(c))
+		_, held, _ := strings.Cut(out, "CONNECTED")
+		s.Require().NotContainsf(held, ghToken, "a send on a connection from before the restart leaked: %s", out)
+		s.Require().Containsf(held, "REFUSED", "want the gate's refusal: %s\n%s", out, s.readDaemonLog(c))
+	})
 
 	s.exec(c, []string{"sh", "-c", "pkill gnome-keyring; pkill dbus-daemon; pkill -f 'app-listener daemon' || true"})
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")

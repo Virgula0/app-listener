@@ -65,10 +65,18 @@ const (
 	injectedSerial = 0x80000000
 )
 
+// Bus opens the user's session bus for one relay session. path names one socket inode until release,
+// and only a bus broker may write on a connection made through it: the gate takes every sender and
+// credential it reports on trust.
+type Bus interface {
+	Open() (path string, release func(), err error)
+	String() string
+}
+
 // Gate serves one user's relay socket.
 type Gate struct {
 	uid   uint32
-	bus   string
+	bus   Bus
 	judge Judge
 	ln    *net.UnixListener
 
@@ -78,8 +86,8 @@ type Gate struct {
 }
 
 // Listen binds the relay socket at path for uid's provider (only uid may connect; the guard narrows it
-// to the provider binary) and relays to the bus socket at bus.
-func Listen(uid, gid uint32, path, bus string, judge Judge) (*Gate, error) {
+// to the provider binary) and relays to bus.
+func Listen(uid, gid uint32, path string, bus Bus, judge Judge) (*Gate, error) {
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		return nil, err
@@ -186,13 +194,7 @@ func (s *session) run() error {
 	if s.downR, err = serverAuth(s.down, s.g.uid); err != nil {
 		return err
 	}
-	if s.up, err = (&net.Dialer{Timeout: callTimeout}).DialContext(context.Background(), "unix", s.g.bus); err != nil {
-		return err
-	}
-	if s.upR, err = clientAuth(s.up, uint32(os.Geteuid())); err != nil { //nolint:gosec // euid >= 0
-		return err
-	}
-	if err := s.dialControl(); err != nil {
+	if err := s.dialBus(); err != nil {
 		return err
 	}
 	log.Infof("secret gate %d: keyring (pid %d) relayed to %s", s.g.uid, ucred.Pid, s.g.bus)
@@ -202,10 +204,29 @@ func (s *session) run() error {
 	return <-errc
 }
 
+// dialBus opens the relayed connection and the gate's own, both to the one socket Bus.Open named.
+func (s *session) dialBus() error {
+	path, release, err := s.g.bus.Open()
+	if err != nil {
+		return fmt.Errorf("opening the bus %s: %w", s.g.bus, err)
+	}
+	defer release()
+	if s.up, err = (&net.Dialer{Timeout: callTimeout}).DialContext(context.Background(), "unix", path); err != nil {
+		return err
+	}
+	// A fake bus is refused every write: it can't even answer the handshake.
+	_ = s.up.SetDeadline(time.Now().Add(callTimeout))
+	if s.upR, err = clientAuth(s.up, uint32(os.Geteuid())); err != nil { //nolint:gosec // euid >= 0
+		return fmt.Errorf("the bus %s did not answer the relay (only a root-placed bus broker may): %w", s.g.bus, err)
+	}
+	_ = s.up.SetDeadline(time.Time{})
+	return s.dialControl(path)
+}
+
 // dialControl opens the gate's own bus connection: credentials of callers, item attributes, and
 // NameOwnerChanged to drop a gone caller's pidfd.
-func (s *session) dialControl() error {
-	ctl, err := dbus.Dial("unix:path=" + s.g.bus)
+func (s *session) dialControl(path string) error {
+	ctl, err := dbus.Dial("unix:path=" + path)
 	if err != nil {
 		return err
 	}

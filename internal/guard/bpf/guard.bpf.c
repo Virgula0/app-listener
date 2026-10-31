@@ -1815,8 +1815,8 @@ int guard_file_permission(unsigned long long *ctx)
 	struct socket *sock = bpf_sock_from_file(file);
 	if (sock) {
 		struct sock *sk = sock->sk;
-		if (mask & MAY_WRITE)
-			note_bus_send(sk);
+		if ((mask & MAY_WRITE) && note_bus_send(sk))
+			return -EPERM;
 		return judge_conn_use(ea, sk);
 	}
 
@@ -2526,7 +2526,9 @@ int guard_inode_listxattr(unsigned long long *ctx)
 // took at connect: the process may have exec'd since, leaving a connection opened by other code under
 // a whitelisted image. guard_bus_dirs holds the /run/user/<uid> dirs the daemon registered;
 // guard_bus_conns the exec stamp of each process's FIRST connect to their `bus`, so a later exec
-// mismatches its exe_stamps row for the rest of its life. No row = unattested (refused).
+// mismatches its exe_stamps row for the rest of its life. No row = unattested (refused). A dir's
+// value is its registration time (task start_time's clock): a process started before it may hold a
+// connection made unrecorded, so its row is never attested.
 struct bus_conn {
 	__u64 seq;
 	__u64 start;
@@ -2538,8 +2540,33 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 64);
 	__type(key, struct inode_key);
-	__type(value, __u8);
+	__type(value, __u64);
 } guard_bus_dirs SEC(".maps");
+
+// The secret gate's relay trusts its bus for every sender and credential: guard_relay_targets names
+// the bus socket inode it is about to connect to, and the server side of each connect to one is
+// tagged in guard_relay_peers, where only a guard_bus_brokers exe that isn't code-suspect may write.
+// A fake bus the user put at that name can't send the relay a byte.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} guard_relay_targets SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} guard_bus_brokers SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, __u8);
+} guard_relay_peers SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -2594,11 +2621,17 @@ struct {
 } guard_bus_socks SEC(".maps");
 
 // note_bus_send runs before every send on a socket; out of line, so its branches don't fork the
-// caller's judge_conn_use.
+// caller's judge_conn_use. Nonzero: refused (a relay peer's writer isn't a bus broker).
 static __noinline int note_bus_send(struct sock *sk)
 {
 	if (!sk)
 		return 0;
+	if (bpf_sk_storage_get(&guard_relay_peers, sk, 0, 0)) {
+		struct inode_key exe = {};
+		if (!get_current_exe_inode(&exe) || !bpf_map_lookup_elem(&guard_bus_brokers, &exe) || code_suspect())
+			return -EPERM;
+		return 0;
+	}
 	struct bus_owner *o = bpf_sk_storage_get(&guard_bus_socks, sk, 0, 0);
 	if (!o)
 		return 0;
@@ -2615,63 +2648,78 @@ static __noinline int note_bus_send(struct sock *sk)
 }
 
 // note_bus_connect records sk's connect to peer when peer is a registered `bus`. A socket that can't
-// be marked leaves the row unrecorded: refused.
-static __always_inline void note_bus_connect(struct sock *sk, struct sock *peer)
+// be marked leaves the row unrecorded: refused. A relay target's newsk is tagged or the connect refused.
+static __always_inline int note_bus_connect(struct sock *sk, struct sock *peer, struct sock *newsk)
 {
 	struct dentry *dentry = NULL, *parent = NULL;
-	struct inode *dir = NULL;
+	struct inode *dir = NULL, *si = NULL;
 	const unsigned char *name_ptr = NULL;
 	char name[4] = {};
 	if (!peer)
-		return;
+		return 0;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
 	if (!dentry)
-		return;
+		return 0;
+	bpf_probe_read_kernel(&si, sizeof(si), &dentry->d_inode);
+	if (si) {
+		struct inode_key tk = {};
+		bpf_probe_read_kernel(&tk.ino, sizeof(tk.ino), &si->i_ino);
+		tk.dev = inode_dev((__u64)si);
+		if (bpf_map_lookup_elem(&guard_relay_targets, &tk) &&
+		    !(newsk && bpf_sk_storage_get(&guard_relay_peers, newsk, 0, BPF_SK_STORAGE_GET_F_CREATE)))
+			return -EPERM;
+	}
 	bpf_probe_read_kernel(&name_ptr, sizeof(name_ptr), &dentry->d_name.name);
 	if (!name_ptr || bpf_probe_read_kernel(name, sizeof(name), name_ptr) ||
 	    name[0] != 'b' || name[1] != 'u' || name[2] != 's' || name[3] != '\0')
-		return;
+		return 0;
 	bpf_probe_read_kernel(&parent, sizeof(parent), &dentry->d_parent);
 	if (!parent)
-		return;
+		return 0;
 	bpf_probe_read_kernel(&dir, sizeof(dir), &parent->d_inode);
 	if (!dir)
-		return;
+		return 0;
 	struct inode_key ik = {};
 	bpf_probe_read_kernel(&ik.ino, sizeof(ik.ino), &dir->i_ino);
 	ik.dev = inode_dev((__u64)dir);
-	if (!bpf_map_lookup_elem(&guard_bus_dirs, &ik))
-		return;
+	__u64 *registered = bpf_map_lookup_elem(&guard_bus_dirs, &ik);
+	if (!registered)
+		return 0;
+	__u64 since = *registered;
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	__u32 key = bus_key(tgid);
 	if (!key)
-		return;
+		return 0;
 	struct bus_conn v = {};
 	v.start = leader_start(task);
 	v.htgid = tgid;
 	struct bus_owner *o = sk ? bpf_sk_storage_get(&guard_bus_socks, sk, 0, BPF_SK_STORAGE_GET_F_CREATE) : NULL;
 	if (!o) {
 		bpf_map_delete_elem(&guard_bus_conns, &key);
-		return;
+		return 0;
 	}
 	o->tgid = tgid;
 	o->key = key;
 	o->start = v.start;
 	struct bus_conn *cur = bpf_map_lookup_elem(&guard_bus_conns, &key);
 	if (cur && cur->start == v.start && cur->htgid == tgid)
-		return; // keep this process's first connect
+		return 0; // keep this process's first connect
 	struct exec_stamp *st = bpf_map_lookup_elem(&exe_stamps, &tgid);
-	v.seq = st ? st->seq : 0; // no stamp: exec'd before the guard, never attested
+	// No stamp: exec'd before the guard. Started before the registration: never attested either.
+	v.seq = st && v.start >= since ? st->seq : 0;
 	bpf_map_update_elem(&guard_bus_conns, &key, &v, BPF_ANY); // full: no row, refused
+	return 0;
 }
 
 SEC("lsm/unix_stream_connect")
 int guard_unix_stream_connect(unsigned long long *ctx)
 {
 	struct emit_args ea_buf = {};
-	note_bus_connect((struct sock *)ctx[0], (struct sock *)ctx[1]);
+	int ret = note_bus_connect((struct sock *)ctx[0], (struct sock *)ctx[1], (struct sock *)ctx[2]);
+	if (ret)
+		return ret;
 	return judge_unix_connect(&ea_buf, (struct sock *)ctx[0], (struct sock *)ctx[1]);
 }
 
@@ -2718,7 +2766,8 @@ int guard_socket_sendmsg(unsigned long long *ctx)
 	__u32 res = name ? port_connect_res(sock, sk, name, namelen) : GUARD_RES_NONE;
 	if (res != GUARD_RES_NONE)
 		return admit_port(&ea_buf, sk, res, EVENT_CONNECT);
-	note_bus_send(sk);
+	if (note_bus_send(sk))
+		return -EPERM;
 	return judge_conn_use(&ea_buf, sk);
 }
 

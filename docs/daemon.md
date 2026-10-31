@@ -114,14 +114,18 @@ With a [`[secret_service]` block](daemon-config.md#secret-service-sections) the 
   points gnome-keyring at a relay socket, `/run/app-listener/secret-relay/<uid>.bus`, guarded so
   only the provider may connect;
 - at each login, before the user's processes start, registers `/run/user/<uid>` with the guard and
-  opens that user's relay. It reaches the real bus as root for the keyring.
+  opens that user's relay. It reaches the user's bus as root for the keyring, through the socket
+  named `/run/user/<uid>/bus` (never a symlink), and the guard lets only a root-placed
+  `dbus-broker` or `dbus-daemon` that loaded no untrusted code write on those connections: a
+  listener the user puts at that name can't answer the relay, so it can't forge a caller.
 
 Every method call to the keyring passes the gate first. Calls it doesn't know are refused; reading,
 writing or deleting an item a [secret scope](daemon-config.md#secret-service-sections) covers needs
 a caller that scope's whitelist admits. The caller is the process the bus reports for the
 connection, checked by inode like any guard decision, and refused if it ran another program since it
-connected to the bus, or if another process ever sent on one of its bus connections (an inherited or
-passed socket: the bus would credit that process's calls to it). Each decision is logged like a guard event, under the scope's anchor.
+connected to the bus, if another process ever sent on one of its bus connections (an inherited or
+passed socket: the bus would credit that process's calls to it), or if it started before the daemon
+opened that user's relay (its connections may predate the guard, which then never saw them). Each decision is logged like a guard event, under the scope's anchor.
 
 Both files are written to match the configuration at every start and reload, kept when the daemon
 stops (the keyring then can't reach the bus, so the Secret Service is off rather than unguarded) and

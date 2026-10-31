@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -54,7 +55,7 @@ func (e *engine) setBusPidNSLocked() {
 }
 
 // RegisterBusDir lets the guard record connects to dir/bus (a /run/user/<uid> dir) for AttestBusClient.
-// A user's connects made before it are unattested.
+// A process started before it is never attested: it may hold a connection made unrecorded.
 func RegisterBusDir(dir string) (GuardInodeKey, error) {
 	dev, ino, err := ebpf.StatInode(dir)
 	if err != nil {
@@ -63,10 +64,90 @@ func RegisterBusDir(dir string) (GuardInodeKey, error) {
 	key := GuardInodeKey{Dev: dev, Ino: ino}
 	sharedEngine.mu.Lock()
 	defer sharedEngine.mu.Unlock()
-	if sharedEngine.objs.GuardBusDirs == nil {
+	m := sharedEngine.objs.GuardBusDirs
+	if m == nil {
 		return GuardInodeKey{}, errors.New("guard engine not running")
 	}
-	return key, sharedEngine.objs.GuardBusDirs.Put(key, uint8(1))
+	// The time is read once the dir is live (refusing everyone until then): a process started
+	// between the read and the put would otherwise pass with a connect made before the put.
+	if err := m.Put(key, uint64(math.MaxUint64)); err != nil {
+		return GuardInodeKey{}, err
+	}
+	var now unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &now); err != nil {
+		return key, err
+	}
+	return key, m.Put(key, uint64(now.Nano())) //nolint:gosec // monotonic, >= 0
+}
+
+// BusBrokerPaths are the bus daemons whose writes a relay peer accepts (TagRelayBus).
+var BusBrokerPaths = []string{"/usr/bin/dbus-broker", "/usr/bin/dbus-daemon"}
+
+// busBrokers holds every guard_bus_brokers binary open (under sharedEngine.mu): its inode can't be
+// freed and its number reused by another file while the key admits writers.
+var busBrokers = map[GuardInodeKey]*os.File{}
+
+// TagRelayBus makes the server side of each connect to the socket open at fd (O_PATH) writable only
+// by a root-placed BusBrokerPaths binary that isn't code-suspect, until untag. Connect through
+// /proc/self/fd/<fd>, so the connect reaches that inode.
+func TagRelayBus(fd int) (untag func(), err error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFSOCK {
+		return nil, errors.New("not a socket")
+	}
+	key := GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}
+	e := &sharedEngine
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	objs := e.objs
+	if objs.GuardRelayTargets == nil || objs.GuardBusBrokers == nil {
+		return nil, errors.New("guard engine not running")
+	}
+	if err := syncBusBrokers(&objs); err != nil {
+		return nil, err
+	}
+	if err := objs.GuardRelayTargets.Put(key, uint8(1)); err != nil {
+		return nil, err
+	}
+	return func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		_ = objs.GuardRelayTargets.Delete(key)
+	}, nil
+}
+
+// syncBusBrokers adds the brokers installed now to the ones held: a broker upgraded since its bus
+// started still runs the old inode.
+func syncBusBrokers(objs *GuardObjects) error {
+	for _, p := range BusBrokerPaths {
+		f, err := ebpf.OpenSystemPlaced(p)
+		if err != nil {
+			continue // not installed, or not root's to vouch for
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+			f.Close()
+			continue
+		}
+		k := GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}
+		if _, held := busBrokers[k]; held {
+			f.Close()
+		} else {
+			busBrokers[k] = f
+		}
+	}
+	if len(busBrokers) == 0 {
+		return fmt.Errorf("no root-placed bus broker among %v", BusBrokerPaths)
+	}
+	for k := range busBrokers {
+		if err := objs.GuardBusBrokers.Put(k, uint8(1)); err != nil {
+			return fmt.Errorf("listing bus broker %v: %w", k, err)
+		}
+	}
+	return nil
 }
 
 // UnregisterBusDir drops a dir RegisterBusDir added (its tmpfs is gone at logout).

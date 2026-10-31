@@ -261,9 +261,36 @@ func lend(attr, val, readerBin string) {
 	os.Exit(reader.ProcessState.ExitCode())
 }
 
-// rawget sends GetSecret on an inherited bus socket (fd 3) and reads the answer.
-func rawget(item, session string) {
-	time.Sleep(500 * time.Millisecond) // let the lender drop its handle
+// heldexec holds a bus connection until waitfile appears (the daemon restarts meanwhile), looks the
+// item up on it, hands a dup to readerBin (rawget) and execs into argv, which connects anew: the bus
+// still credits the held connection to this pid.
+func heldexec(attr, val, waitfile, readerBin string, argv []string) {
+	c := dial()
+	fmt.Println("CONNECTED")
+	for {
+		if _, err := os.Stat(waitfile); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	session, item := lookup(c, attr, val)
+	dup, err := unix.Dup(connFD())
+	if err != nil {
+		failf(3, "ERROR dup: %v", err)
+	}
+	reader := exec.CommandContext(context.Background(), readerBin, "rawget", string(item), string(session), "1500ms") //nolint:gosec // the test names the reader
+	reader.ExtraFiles = []*os.File{os.NewFile(uintptr(dup), "bus")}
+	reader.Stdout, reader.Stderr = os.Stdout, os.Stderr
+	if err := reader.Start(); err != nil {
+		failf(3, "ERROR reader: %v", err)
+	}
+	execInto(argv)
+}
+
+// rawget sends GetSecret on an inherited bus socket (fd 3) after delay (default: until the lender
+// dropped its handle) and reads the answer.
+func rawget(item, session string, delay time.Duration) {
+	time.Sleep(delay)
 	writeGetSecret(3, dbus.ObjectPath(item), dbus.ObjectPath(session))
 	rawreader("SECRET-")
 }
@@ -278,6 +305,34 @@ func own() {
 		failf(4, "NOT OWNER (reply %d)", reply)
 	}
 	failf(0, "OWNER")
+}
+
+// fakebus binds a listener and renames it over path (the real bus hardlinked aside first): every
+// relay connect then reaches it. It answers the first connection's SASL: 0 = the write reached the
+// relay, 1 = refused, 4 = nobody connected within secs.
+func fakebus(path string, secs time.Duration) {
+	tmp := path + ".fake"
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: tmp, Net: "unix"})
+	if err != nil {
+		failf(3, "ERROR listen: %v", err)
+	}
+	ln.SetUnlinkOnClose(false)
+	if err := os.Rename(tmp, path); err != nil {
+		failf(3, "ERROR rename over %s: %v", path, err)
+	}
+	fmt.Println("LISTENING")
+	_ = ln.SetDeadline(time.Now().Add(secs))
+	c, err := ln.AcceptUnix()
+	if err != nil {
+		failf(4, "NOTHING: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 256)
+	n, _ := c.Read(buf)
+	if _, err := c.Write([]byte("OK 00112233445566778899aabbccddeeff\r\n")); err != nil {
+		refusal("write to the relay", err)
+	}
+	failf(0, "WROTE after %q", buf[:n])
 }
 
 func execInto(argv []string) {
@@ -349,7 +404,7 @@ func connFD() int {
 }
 
 func usage() {
-	failf(3, "usage: secret_probe get|store|replace|own|monitor|connexec|sendexec|lend|reader|rawget|rawreader|sleep ...")
+	failf(3, "usage: secret_probe get|store|replace|own|monitor|connexec|sendexec|lend|heldexec|reader|rawget|rawreader|fakebus|dialsleep|sleep ...")
 }
 
 func main() {
@@ -378,9 +433,23 @@ func main() {
 	case "lend":
 		lend(a[0], a[1], a[2])
 	case "rawget":
-		rawget(a[0], a[1])
+		delay := 500 * time.Millisecond
+		if len(a) > 2 {
+			delay, _ = time.ParseDuration(a[2])
+		}
+		rawget(a[0], a[1], delay)
+	case "heldexec":
+		heldexec(a[0], a[1], a[2], a[3], a[4:])
+	case "dialsleep":
+		c := dial()
+		d, _ := time.ParseDuration(a[0])
+		time.Sleep(d)
+		c.Close()
 	case "rawreader":
 		rawreader(a[0])
+	case "fakebus":
+		d, _ := time.ParseDuration(a[1])
+		fakebus(a[0], d)
 	case "sleep":
 		d, _ := time.ParseDuration(a[0])
 		time.Sleep(d)

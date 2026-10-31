@@ -65,8 +65,12 @@ over a channel the guard doesn't see answers whoever asks:
 - **Secret scopes.** The gate covers gnome-keyring's Secret Service only:
   - items no scope covers stay open to every program, as do item labels and attributes;
   - a whitelisted program run by malware still asks on its behalf (`gh auth token`);
-  - programs connected to the bus before the daemon started (or before it first installed its bus
-    policy) are refused every scoped item until restarted;
+  - programs started before the daemon (re)started, or before it first installed its bus policy,
+    are refused every scoped item until restarted;
+  - the bus is trusted for who sent each call: it must be a root-placed `dbus-broker` or
+    `dbus-daemon`, but one you start yourself with your own configuration counts, and so does one
+    any of your programs can debug (`kernel.yama.ptrace_scope` 0). After a broker upgrade and a
+    daemon restart, a bus still running the old binary can't answer the relay until you log in again;
   - the keyring must be started by its user unit (`gnome-keyring-daemon.service`): one started some
     other way (D-Bus activation outside systemd, a PAM `auto_start`) can't own the Secret Service
     name, so secrets are unavailable;
