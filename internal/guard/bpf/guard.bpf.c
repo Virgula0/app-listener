@@ -2782,14 +2782,8 @@ int guard_socket_recvmsg(unsigned long long *ctx)
 // Only a [port] section's MKNOD binaries listen on its port, and only on loopback: a wildcard or LAN
 // address lets clients in through a destination the connect gate doesn't judge. A listen with no
 // port yet autobinds an ephemeral one, a range the daemon keeps guarded ports out of.
-SEC("lsm/socket_listen")
-int guard_socket_listen(unsigned long long *ctx)
+static __always_inline int judge_listen(struct emit_args *ea, struct sock *sk)
 {
-	struct emit_args ea_buf = {};
-	struct socket *sock = (struct socket *)ctx[0];
-	struct sock *sk = sock ? sock->sk : NULL;
-	if (!sk)
-		return 0;
 	__u16 fam = sk->__sk_common.skc_family;
 	if (fam != AF_INET && fam != AF_INET6)
 		return 0;
@@ -2806,16 +2800,34 @@ int guard_socket_listen(unsigned long long *ctx)
 	}
 	if (!local)
 		return emit_process_denial(GUARD_REASON_PORT_ADDR, EVENT_MKNOD, NULL, 0, 0, res);
-	return admit_port(&ea_buf, sk, res, EVENT_MKNOD);
+	return admit_port(ea, sk, res, EVENT_MKNOD);
+}
+
+SEC("lsm/socket_listen")
+int guard_socket_listen(unsigned long long *ctx)
+{
+	struct emit_args ea_buf = {};
+	struct socket *sock = (struct socket *)ctx[0];
+	struct sock *sk = sock ? sock->sk : NULL;
+	if (!sk)
+		return 0;
+	return judge_listen(&ea_buf, sk);
 }
 
 // A port's listener handed to another exe (inherited, SCM_RIGHTS) would collect its clients.
+// A listener older than the guard (made while the daemon was stopped) was never judged at listen: an
+// unmarked one is judged as a listen at each accept, and marked once admitted.
 SEC("lsm/socket_accept")
 int guard_socket_accept(unsigned long long *ctx)
 {
 	struct emit_args ea_buf = {};
 	struct socket *sock = (struct socket *)ctx[0];
-	return judge_conn_use(&ea_buf, sock->sk);
+	struct sock *sk = sock ? sock->sk : NULL;
+	if (!sk)
+		return 0;
+	if (!bpf_sk_storage_get(&guard_conns, sk, 0, 0))
+		return judge_listen(&ea_buf, sk);
+	return judge_conn_use(&ea_buf, sk);
 }
 
 // getsockopt(TCP_ZEROCOPY_RECEIVE) reads queued data through tcp_recvmsg_locked, skipping

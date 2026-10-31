@@ -1,6 +1,7 @@
 package integrationtests
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -10,7 +11,8 @@ import (
 const portSecret = "INET-SERVICE-SECRET"
 
 // A [port tcp/N] section guards a loopback TCP service (bitcoind RPC, the adb server): only its
-// MKNOD binary listens on the port, and only on loopback; only its CONNECT binaries reach it,
+// MKNOD binary listens on the port, and only on loopback (a listener older than the daemon is judged
+// at accept); only its CONNECT binaries reach it,
 // through every connect path; a connection handed to another exe is judged by that exe.
 func (s *IntegrationSuite) TestDaemon_PortGuard() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
@@ -34,7 +36,20 @@ func (s *IntegrationSuite) TestDaemon_PortGuard() {
 		s.Require().Equalf(0, code, "writing %s: %s", liveConf, out)
 	}
 	writeLive(conf)
+	// A squatter that listened while the daemon was stopped (a restart, an update).
+	squat := s.capturePID(c, "nohup /exploits/inet_connect serve 127.0.0.1 "+port+" >/tmp/squat.log 2>&1 &")
+	code, out := s.exec(c, []string{"sh", "-c", "for i in $(seq 50); do grep -q serving /tmp/squat.log && exit 0; " +
+		"sleep 0.1; done; cat /tmp/squat.log; exit 1"})
+	s.Require().Equalf(0, code, "squatter: %s", out)
 	s.startDaemon(c, conf, "--config", liveConf)
+
+	s.T().Run("listener from before the start", func(*testing.T) {
+		code, out := s.exec(c, []string{"timeout", "5", "/exploits/inet_connect_ok", "connect", "127.0.0.1", port})
+		s.Require().NotContainsf(out, portSecret, "a squatter from before the start served a whitelisted client "+
+			"(exit %d): %s\n%s", code, out, s.readDaemonLog(c))
+		s.requireDaemonDenial(c, "MKNOD", "inet_connect")
+		s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d; while kill -0 %d 2>/dev/null; do sleep 0.1; done", squat, squat)})
+	})
 
 	s.T().Run("listen", func(t *testing.T) {
 		for what, args := range map[string][]string{
@@ -57,7 +72,7 @@ func (s *IntegrationSuite) TestDaemon_PortGuard() {
 
 	s.capturePID(c, "nohup /exploits/inet_connect_srv serve 127.0.0.1 "+port+" >/tmp/serve4.log 2>&1 &")
 	s.capturePID(c, "nohup /exploits/inet_connect_srv serve ::1 "+port+" >/tmp/serve6.log 2>&1 &")
-	code, out := s.exec(c, []string{"sh", "-c", "for i in $(seq 50); do /exploits/inet_connect_ok connect 127.0.0.1 " +
+	code, out = s.exec(c, []string{"sh", "-c", "for i in $(seq 50); do /exploits/inet_connect_ok connect 127.0.0.1 " +
 		port + " >/dev/null && exit 0; sleep 0.1; done; cat /tmp/serve4.log; exit 1"})
 	s.Require().Equalf(0, code, "the whitelisted server and client never met: %s\n%s", out, s.readDaemonLog(c))
 
