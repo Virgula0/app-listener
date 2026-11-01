@@ -242,12 +242,7 @@ func (s *watchSet) match(dir string, pos watchPos, mask uint32, name string) {
 	if ok, err := filepath.Match(comps[pos.next], name); err != nil || !ok {
 		return
 	}
-	// A home match leaving (an updater removing its old version after the new one was admitted)
-	// schedules the refresh that drops its vanished lines and lib_dir: no arrival follows it.
-	if mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) != 0 {
-		if pos.p.home {
-			s.refresh = true
-		}
+	if s.departed(pos, mask) {
 		return
 	}
 	isDir := mask&unix.IN_ISDIR != 0
@@ -265,6 +260,18 @@ func (s *watchSet) match(dir string, pos watchPos, mask uint32, name string) {
 	case isDir && arrived:
 		s.follow(filepath.Join(dir, name), watchPos{pos.p, pos.next + 1})
 	}
+}
+
+// departed: a match leaving. A home one (an updater removing its old version after the new one was
+// admitted) schedules the refresh that drops its vanished lines and lib_dir: no arrival follows it.
+func (s *watchSet) departed(pos watchPos, mask uint32) bool {
+	if mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) == 0 {
+		return false
+	}
+	if pos.p.home {
+		s.refresh = true
+	}
+	return true
 }
 
 func isSymlink(path string) bool {

@@ -216,85 +216,97 @@ func signatureField(frame []byte) (off, n int, ok bool) {
 	if end > len(frame) {
 		return 0, 0, false
 	}
-	for pos := 16; pos < end; {
+	for pos := 16; pos < end; pos = (pos + 7) &^ 7 {
 		if pos+4 > end || frame[pos+1] != 1 || frame[pos+3] != 0 {
 			return 0, 0, false
 		}
 		code, typ := frame[pos], frame[pos+2]
 		pos += 4
-		switch typ {
-		case 's', 'o':
-			pos = (pos + 3) &^ 3
-			if pos+4 > end {
-				return 0, 0, false
-			}
-			pos += 4 + int(order.Uint32(frame[pos:pos+4])) + 1
-		case 'g':
-			if pos >= end {
-				return 0, 0, false
-			}
-			l := int(frame[pos])
-			if pos+1+l >= end {
-				return 0, 0, false
-			}
-			if code == byte(dbus.FieldSignature) {
-				return pos + 1, l, true
-			}
-			pos += 1 + l + 1
-		case 'u':
-			if pos = (pos+3)&^3 + 4; pos > end {
-				return 0, 0, false
-			}
-		default:
+		if code == byte(dbus.FieldSignature) && typ == 'g' && pos < end && pos+1+int(frame[pos]) < end {
+			return pos + 1, int(frame[pos]), true
+		}
+		if pos, ok = skipHeaderValue(frame[:end], pos, typ, order); !ok {
 			return 0, 0, false
 		}
-		pos = (pos + 7) &^ 7
 	}
 	return 0, 0, false
+}
+
+// skipHeaderValue returns the offset past the header field value of type typ at pos.
+func skipHeaderValue(b []byte, pos int, typ byte, order binary.ByteOrder) (int, bool) {
+	switch typ {
+	case 's', 'o':
+		pos = (pos + 3) &^ 3
+		if pos+4 > len(b) {
+			return 0, false
+		}
+		pos += 4 + int(order.Uint32(b[pos:pos+4])) + 1
+	case 'g':
+		if pos >= len(b) {
+			return 0, false
+		}
+		pos += 1 + int(b[pos]) + 1
+	case 'u':
+		pos = (pos+3)&^3 + 4
+	default:
+		return 0, false
+	}
+	return pos, pos <= len(b)
 }
 
 // sameEntries walks a (dicts as maps) and b (dicts as entry arrays) together: every dict must have
 // as many distinct keys as entries.
 func sameEntries(a, b reflect.Value) bool {
-	for a.Kind() == reflect.Interface && !a.IsNil() {
-		a = a.Elem()
-	}
-	for b.Kind() == reflect.Interface && !b.IsNil() {
-		b = b.Elem()
-	}
+	a, b = unwrap(a), unwrap(b)
 	switch a.Kind() {
 	case reflect.Map:
-		if b.Kind() != reflect.Slice || b.Len() != a.Len() {
-			return false
-		}
-		for i := range b.Len() {
-			e, ok := b.Index(i).Interface().([]any)
-			if !ok || len(e) != 2 {
-				return false
-			}
-			k := reflect.ValueOf(e[0])
-			if !k.IsValid() || k.Type() != a.Type().Key() {
-				return false
-			}
-			v := a.MapIndex(k)
-			if !v.IsValid() || !sameEntries(v, reflect.ValueOf(e[1])) {
-				return false
-			}
-		}
-		return true
+		return sameDict(a, b)
 	case reflect.Slice:
-		if b.Kind() != reflect.Slice || b.Len() != a.Len() {
+		return sameList(a, b)
+	}
+	return true
+}
+
+func unwrap(v reflect.Value) reflect.Value {
+	for v.Kind() == reflect.Interface && !v.IsNil() {
+		v = v.Elem()
+	}
+	return v
+}
+
+func sameDict(a, b reflect.Value) bool {
+	if b.Kind() != reflect.Slice || b.Len() != a.Len() {
+		return false
+	}
+	for i := range b.Len() {
+		e, ok := b.Index(i).Interface().([]any)
+		if !ok || len(e) != 2 {
 			return false
 		}
-		switch a.Type().Elem().Kind() {
-		case reflect.Map, reflect.Slice, reflect.Interface:
-		default:
-			return true // no dict below (an ay, as, ao)
+		k := reflect.ValueOf(e[0])
+		if !k.IsValid() || k.Type() != a.Type().Key() {
+			return false
 		}
-		for i := range a.Len() {
-			if !sameEntries(a.Index(i), b.Index(i)) {
-				return false
-			}
+		v := a.MapIndex(k)
+		if !v.IsValid() || !sameEntries(v, reflect.ValueOf(e[1])) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameList(a, b reflect.Value) bool {
+	if b.Kind() != reflect.Slice || b.Len() != a.Len() {
+		return false
+	}
+	switch a.Type().Elem().Kind() {
+	case reflect.Map, reflect.Slice, reflect.Interface:
+	default:
+		return true // no dict below (an ay, as, ao)
+	}
+	for i := range a.Len() {
+		if !sameEntries(a.Index(i), b.Index(i)) {
+			return false
 		}
 	}
 	return true
