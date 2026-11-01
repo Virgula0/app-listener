@@ -34,7 +34,7 @@ const (
 	trustedElectron uint8 = 32
 	trustedBun      uint8 = 64
 	// trustedBunfig: a Bun image that runs ./bunfig.toml's preload (bunAutoloadsBunfig). Not a
-	// runtime class: it only marks its process code-suspect when it opens a file of that name.
+	// runtime class: its process is code-suspect from exec (no file name check survives a symlink).
 	trustedBunfig uint8 = 128
 )
 
@@ -628,8 +628,8 @@ func (t *TrustGuard) readLoop() {
 			matched.note(ev.PID, path)
 		case trustBunfig:
 			logTrustDenied("BUNFIG", comm, ev.PID, ev.UID, path,
-				"this Bun app runs the preload of a bunfig.toml in its working directory: every secret is "+
-					"refused to this process; start it elsewhere")
+				"this Bun app runs the preload of any bunfig.toml in its working directory, so it never "+
+					"reads a secret; rebuild it with --no-compile-autoload-bunfig")
 		case trustArgvWarn:
 			log.Warnf("trust guard: ARGV comm=%s pid=%d uid=%d word=%s: a warn-only launch rule matched",
 				comm, ev.PID, ev.UID, path)

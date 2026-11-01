@@ -231,9 +231,10 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_BunRuntimeEnv() {
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
-// A default `bun build --compile` app runs the preload of a bunfig.toml in its working directory:
-// started there, it gets nothing below the secret (op=BUNFIG). One built without that autoload, its
-// embedded flags say, opens nothing there and keeps reading.
+// A default `bun build --compile` app runs the preload of any ./bunfig.toml its open reaches: a
+// regular file, a symlink to another name, a bind mount over the name. It never reads the secret, not
+// even started elsewhere (op=BUNFIG). One built without that autoload, its embedded flags say, opens
+// nothing there and keeps reading.
 func (s *IntegrationSuite) TestDaemon_LaunchScan_BunfigPreload() {
 	autoload := s.bunRealApp()
 	if autoload == "" {
@@ -245,26 +246,38 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_BunfigPreload() {
 	defer c.Terminate(s.ctx)
 
 	const quiet = "/opt/rt/bin/bunquiet"
-	s.exec(c, []string{"mkdir", "-p", "/opt/rt/bin", "/tmp/proj"})
+	s.exec(c, []string{"mkdir", "-p", "/opt/rt/bin", "/tmp/proj", "/tmp/link", "/tmp/bind"})
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, autoload, launchBunReal, 0o755))
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, noAutoload, quiet, 0o755))
 	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
 		"' > " + launchSecret + " && printf '%s' 'try { console.log(\"STOLEN|\" + " +
 		"require(\"fs\").readFileSync(\"" + launchSecret + "\", \"utf8\")) } catch (e) { console.log(\"DENIED|\" + e.code) }' > " +
-		launchBunEvil + " && printf 'preload = [\"" + launchBunEvil + "\"]\\n' > /tmp/proj/bunfig.toml 2>&1"})
+		launchBunEvil + " && printf 'preload = [\"" + launchBunEvil + "\"]\\n' > /tmp/proj/bunfig.toml && " +
+		"cp /tmp/proj/bunfig.toml /tmp/x.cfg && ln -s /tmp/x.cfg /tmp/link/bunfig.toml && touch /tmp/bind/bunfig.toml 2>&1"})
 	s.Require().Equalf(0, code, "setup: %s", out)
 	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+launchBunReal+"\n"+quiet+"\n")
+	s.Require().Containsf(s.readDaemonLog(c), launchBunReal+" is a Bun app that loads ./bunfig.toml",
+		"the daemon must name the app that can't read")
 
 	run := func(dir, bin string) string {
 		_, out := s.exec(c, []string{"sh", "-c", "cd " + dir + " && " + bin + " read " + launchSecret + " 2>&1"})
 		return out
 	}
 	out = run("/tmp", launchBunReal)
-	s.Require().Containsf(out, "STOLEN|"+launchMarker, "a clean start must read: %s\n%s", out, s.readDaemonLog(c))
-	out = run("/tmp/proj", launchBunReal)
-	s.Require().Containsf(out, "DENIED|", "the preload must have run and been refused: %s\n%s", out, s.readDaemonLog(c))
-	s.Require().NotContainsf(out, "STOLEN|", "the bunfig.toml preload read the secret as the app: %s", out)
-	s.requireDenialLogged(c, "BUNFIG", "bunfig.toml")
+	s.Require().NotContainsf(out, "STOLEN|", "an app that loads ./bunfig.toml must not read, wherever it starts: %s", out)
+	s.requireDenialLogged(c, "BUNFIG", launchSecret)
+	read := launchBunReal + " read " + launchSecret
+	for _, tc := range []struct{ what, cmd string }{
+		{"a regular bunfig.toml", "cd /tmp/proj && " + read},
+		{"a bunfig.toml symlinked to another name", "cd /tmp/link && " + read},
+		{"another name bind-mounted over bunfig.toml",
+			"unshare -m sh -c 'mount --bind /tmp/x.cfg /tmp/bind/bunfig.toml && cd /tmp/bind && " + read + "'"},
+	} {
+		_, out := s.exec(c, []string{"sh", "-c", tc.cmd + " 2>&1"})
+		s.Require().Containsf(out, "DENIED|", "%s: the preload must have run and been refused: %s\n%s", tc.what, out,
+			s.readDaemonLog(c))
+		s.Require().NotContainsf(out, "STOLEN|", "%s: the preload read the secret as the app: %s", tc.what, out)
+	}
 	out = run("/tmp/proj", quiet)
 	s.Require().Containsf(out, "STOLEN|"+launchMarker, "an app that doesn't load bunfig.toml must keep reading: %s\n%s",
 		out, s.readDaemonLog(c))

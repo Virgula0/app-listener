@@ -116,6 +116,7 @@ const (
 	suspectPreload          = 1
 	suspectLaunch           = 2
 	suspectArgv             = 3
+	suspectBunfig           = 4
 )
 
 // suspectLabel maps a reason's SUSPECT_* mark to its logged op label; "" when unmarked.
@@ -127,6 +128,8 @@ func suspectLabel(reason uint32) string {
 		return "LAUNCH"
 	case suspectArgv:
 		return "ARGV"
+	case suspectBunfig:
+		return "BUNFIG"
 	default:
 		return ""
 	}

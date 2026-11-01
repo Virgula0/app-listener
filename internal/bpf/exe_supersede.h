@@ -83,6 +83,7 @@ struct {
 #define SUSPECT_PRELOAD 1
 #define SUSPECT_LAUNCH 2
 #define SUSPECT_ARGV 3
+#define SUSPECT_BUNFIG 4 // a TRUSTED_BUNFIG image: from exec, before ./bunfig.toml's preload runs
 
 static __always_inline __u64 leader_start(struct task_struct *task)
 {

@@ -217,6 +217,8 @@ func runtimeClass(f *os.File, path string) uint8 {
 		}
 		if c&trustedBun != 0 && bunAutoloadsBunfig(f) {
 			c |= trustedBunfig
+			log.Warnf("trust guard: %s is a Bun app that loads ./bunfig.toml: it never reads a secret; "+
+				"rebuild it with --no-compile-autoload-bunfig", logging.SanitizeText(path))
 		}
 		classMu.Lock()
 		if len(classCache) > 4096 {

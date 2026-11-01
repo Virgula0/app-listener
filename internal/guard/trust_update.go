@@ -99,7 +99,7 @@ func (t *TrustGuard) AllowReplacement(path string, f *os.File, old, newKey Guard
 	nk := GuardTrustInodeKey{Dev: newKey.Dev, Ino: newKey.Ino}
 	if t.updaterCreated(path, old, nk) {
 		liftSuperseded(newKey)
-		if err := t.adoptRows(GuardTrustInodeKey{Dev: old.Dev, Ino: old.Ino}, nk); err != nil {
+		if err := t.adoptRows(GuardTrustInodeKey{Dev: old.Dev, Ino: old.Ino}, nk, runtimeClass(f, path)); err != nil {
 			log.Warnf("trust guard: replacement of %s not re-admitted: %v", path, err)
 			return false
 		}
@@ -110,7 +110,7 @@ func (t *TrustGuard) AllowReplacement(path string, f *os.File, old, newKey Guard
 	}
 	liftSuperseded(newKey)
 	if old != (GuardInodeKey{}) && t.trusts(old) {
-		if err := t.adoptRows(GuardTrustInodeKey{Dev: old.Dev, Ino: old.Ino}, nk); err != nil {
+		if err := t.adoptRows(GuardTrustInodeKey{Dev: old.Dev, Ino: old.Ino}, nk, runtimeClass(f, path)); err != nil {
 			log.Warnf("trust guard: system binary %s not admitted: %v", path, err)
 			return false
 		}
@@ -183,7 +183,9 @@ func (t *TrustGuard) systemFile(path string, f *os.File, k GuardInodeKey) bool {
 // or one whose rows the prune retired: admitting an inode without TRUSTED_BINARY would leave it
 // outside protections #1 and #2. With neither, newKey qualifies only if a sibling guard's
 // admission of the same path already adopted them. Any failed copy removes the rows written.
-func (t *TrustGuard) adoptRows(old, newKey GuardTrustInodeKey) error {
+// runtime is the new image's runtimeClass: its classes are added to old's (a release may embed
+// another runtime) and its bunfig bit replaces old's (read from the image, fail closed).
+func (t *TrustGuard) adoptRows(old, newKey GuardTrustInodeKey, runtime uint8) error {
 	r, ok := t.rowsOf(old)
 	if !ok {
 		var flags uint8
@@ -213,7 +215,7 @@ func (t *TrustGuard) adoptRows(old, newKey GuardTrustInodeKey) error {
 			return fmt.Errorf("copying %s row: %w", m, err)
 		}
 	}
-	if err := t.objs.GuardTrustedFiles.Put(newKey, r.flags); err != nil {
+	if err := t.objs.GuardTrustedFiles.Put(newKey, r.flags&^trustedBunfig|runtime); err != nil {
 		rollback()
 		return fmt.Errorf("trusting the new inode: %w", err)
 	}
