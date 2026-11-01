@@ -108,6 +108,15 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		refused("attacker replace with a failing secret", "/exploits/secret_probe replace fail user alice",
 			"WRITE", "secret_probe")
 		ok("whitelisted get after the replaces", "/exploits/secret_probe_ok get service gh:github.com")
+		// Attributes named twice: the keyring replaces gh's item by the first and retags it with the
+		// last, which no scope covers; the gate must not judge the last alone.
+		code, out := user("", "/exploits/secret_probe dupkey service gh:github.com")
+		s.Require().NotContainsf(out, ghToken, "the duplicate-key replace leaked the token: %s", out)
+		s.Require().Equalf(1, code, "a duplicate Attributes key must be refused: %s\n%s", out, s.readDaemonLog(c))
+		s.Require().Contains(s.readDaemonLog(c), "names a key twice", "the gate must say why")
+		_, out = user("", "/exploits/secret_probe get x rnd")
+		s.Require().NotContainsf(out, ghToken, "gh's item was retagged out of its scope: %s", out)
+		ok("whitelisted get after the duplicate-key replace", "/exploits/secret_probe_ok get service gh:github.com")
 	})
 
 	s.T().Run("bus", func(*testing.T) {

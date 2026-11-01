@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -163,4 +164,138 @@ func clientAuth(rw io.ReadWriter, uid uint32) (*bufio.Reader, error) {
 		return nil, err
 	}
 	return br, nil
+}
+
+// distinctDictKeys reports whether no dict in m's body (frame decoded) names a key twice. godbus
+// keeps the last duplicate, gnome-keyring acts on the first (CreateItem's replace target) and keeps
+// all: the gate would judge a call other than the one the keyring runs. A dict entry {..} and a
+// struct (..) share their wire layout, so the frame decoded again with every dict signature read as
+// an array of structs yields every entry. Dicts inside a variant carry their own signature and are
+// not covered; both sides keep the last of those.
+func distinctDictKeys(frame []byte, m *dbus.Message) bool {
+	sig := header[dbus.Signature](m, dbus.FieldSignature).String()
+	if !strings.Contains(sig, "{") {
+		return true
+	}
+	off, n, ok := signatureField(frame)
+	if !ok || string(frame[off:off+n]) != sig {
+		return false
+	}
+	alt := append([]byte(nil), frame...)
+	for i := off; i < off+n; i++ {
+		switch alt[i] {
+		case '{':
+			alt[i] = '('
+		case '}':
+			alt[i] = ')'
+		}
+	}
+	entries, err := decodeFrame(alt)
+	if err != nil || len(entries.Body) != len(m.Body) {
+		return false
+	}
+	for i := range m.Body {
+		if !sameEntries(reflect.ValueOf(m.Body[i]), reflect.ValueOf(entries.Body[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+// signatureField finds the body signature's bytes in frame's header fields (an array of (yv), each
+// 8-aligned; every field type D-Bus defines is s, o, g or u).
+func signatureField(frame []byte) (off, n int, ok bool) {
+	if len(frame) < 16 {
+		return 0, 0, false
+	}
+	order := binary.ByteOrder(binary.LittleEndian)
+	if frame[0] == 'B' {
+		order = binary.BigEndian
+	}
+	end := 16 + int(order.Uint32(frame[12:16]))
+	if end > len(frame) {
+		return 0, 0, false
+	}
+	for pos := 16; pos < end; {
+		if pos+4 > end || frame[pos+1] != 1 || frame[pos+3] != 0 {
+			return 0, 0, false
+		}
+		code, typ := frame[pos], frame[pos+2]
+		pos += 4
+		switch typ {
+		case 's', 'o':
+			pos = (pos + 3) &^ 3
+			if pos+4 > end {
+				return 0, 0, false
+			}
+			pos += 4 + int(order.Uint32(frame[pos:pos+4])) + 1
+		case 'g':
+			if pos >= end {
+				return 0, 0, false
+			}
+			l := int(frame[pos])
+			if pos+1+l >= end {
+				return 0, 0, false
+			}
+			if code == byte(dbus.FieldSignature) {
+				return pos + 1, l, true
+			}
+			pos += 1 + l + 1
+		case 'u':
+			if pos = (pos+3)&^3 + 4; pos > end {
+				return 0, 0, false
+			}
+		default:
+			return 0, 0, false
+		}
+		pos = (pos + 7) &^ 7
+	}
+	return 0, 0, false
+}
+
+// sameEntries walks a (dicts as maps) and b (dicts as entry arrays) together: every dict must have
+// as many distinct keys as entries.
+func sameEntries(a, b reflect.Value) bool {
+	for a.Kind() == reflect.Interface && !a.IsNil() {
+		a = a.Elem()
+	}
+	for b.Kind() == reflect.Interface && !b.IsNil() {
+		b = b.Elem()
+	}
+	switch a.Kind() {
+	case reflect.Map:
+		if b.Kind() != reflect.Slice || b.Len() != a.Len() {
+			return false
+		}
+		for i := range b.Len() {
+			e, ok := b.Index(i).Interface().([]any)
+			if !ok || len(e) != 2 {
+				return false
+			}
+			k := reflect.ValueOf(e[0])
+			if !k.IsValid() || k.Type() != a.Type().Key() {
+				return false
+			}
+			v := a.MapIndex(k)
+			if !v.IsValid() || !sameEntries(v, reflect.ValueOf(e[1])) {
+				return false
+			}
+		}
+		return true
+	case reflect.Slice:
+		if b.Kind() != reflect.Slice || b.Len() != a.Len() {
+			return false
+		}
+		switch a.Type().Elem().Kind() {
+		case reflect.Map, reflect.Slice, reflect.Interface:
+		default:
+			return true // no dict below (an ay, as, ao)
+		}
+		for i := range a.Len() {
+			if !sameEntries(a.Index(i), b.Index(i)) {
+				return false
+			}
+		}
+	}
+	return true
 }

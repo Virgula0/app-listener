@@ -1,6 +1,8 @@
 package secretgate
 
 import (
+	"maps"
+
 	"github.com/godbus/dbus/v5"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
@@ -19,6 +21,9 @@ const (
 	ifaceGuiltRidden      = "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface"
 
 	propAttributes = "org.freedesktop.Secret.Item.Attributes"
+	// propType is stored as the item's schema and read back as its xdg:schema attribute.
+	propType  = "org.freedesktop.Secret.Item.Type"
+	schemaKey = "xdg:schema"
 )
 
 // openCalls pass undecided: {interface, member}, member "" for the whole interface (a call always
@@ -44,13 +49,15 @@ const (
 
 // verdict is what classify decides from the message alone. For gated, items are the item paths
 // whose current attributes decide, attrs the attribute sets the call would give an item, replaceIn
-// the collection whose items matching attrs[0] the call would overwrite.
+// the collection whose items matching attrs[0] the call would overwrite, schema the xdg:schema the
+// call gives items (their current attributes with it decide too).
 type verdict struct {
 	kind      verdictKind
 	op        ebpf.EventType
 	items     []dbus.ObjectPath
 	attrs     []map[string]string
 	replaceIn dbus.ObjectPath
+	schema    string
 }
 
 // classify maps a method call to the keyring onto the gatekeeper's policy. Anything not listed is
@@ -118,6 +125,13 @@ func classifyCollection(m *dbus.Message, member string, path dbus.ObjectPath) ve
 			return verdict{kind: refuse}
 		}
 		v := verdict{kind: gated, op: ebpf.EventWrite, attrs: []map[string]string{attrs}}
+		if t, present := props[propType]; present {
+			schema, ok := t.Value().(string)
+			if !ok {
+				return verdict{kind: refuse}
+			}
+			v.attrs = append(v.attrs, withSchema(attrs, schema))
+		}
 		// replace=true rewrites the first item whose attributes include these (a subset: {} matches
 		// any), attributes before secret, kept if the secret fails: that item's scopes decide too.
 		if replace {
@@ -148,22 +162,40 @@ func classifyProps(m *dbus.Message, member string, path dbus.ObjectPath) verdict
 	switch iface {
 	case ifaceItem:
 		v := verdict{kind: gated, op: ebpf.EventWrite, items: []dbus.ObjectPath{path}}
-		if prop, _ := arg[string](m, 1); prop == "Attributes" {
-			val, ok := arg[dbus.Variant](m, 2)
-			if !ok {
-				return verdict{kind: refuse}
-			}
-			attrs, ok := attributesOf(val)
-			if !ok {
-				return verdict{kind: refuse}
-			}
-			v.attrs = []map[string]string{attrs}
+		prop, _ := arg[string](m, 1)
+		if prop != "Attributes" && prop != "Type" {
+			return v
 		}
+		val, ok := arg[dbus.Variant](m, 2)
+		if !ok {
+			return verdict{kind: refuse}
+		}
+		if prop == "Type" {
+			if v.schema, ok = val.Value().(string); !ok {
+				return verdict{kind: refuse}
+			}
+			return v
+		}
+		attrs, ok := attributesOf(val)
+		if !ok {
+			return verdict{kind: refuse}
+		}
+		v.attrs = []map[string]string{attrs}
 		return v
 	case ifaceCollection, ifaceService:
 		return verdict{kind: needManager}
 	}
 	return verdict{kind: refuse}
+}
+
+// withSchema returns attrs with xdg:schema set to schema.
+func withSchema(attrs map[string]string, schema string) map[string]string {
+	out := maps.Clone(attrs)
+	if out == nil {
+		out = map[string]string{}
+	}
+	out[schemaKey] = schema
+	return out
 }
 
 // attributesOf reads an a{ss} variant; an absent one (zero Variant) is no attributes.

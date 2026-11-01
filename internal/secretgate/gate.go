@@ -417,6 +417,11 @@ func (s *session) handle(sender string, m *dbus.Message, frame []byte) {
 	// One token: event lines are key=value fields.
 	what := fmt.Sprintf("%s.%s:%s", header[string](m, dbus.FieldInterface),
 		header[string](m, dbus.FieldMember), header[dbus.ObjectPath](m, dbus.FieldPath))
+	if !distinctDictKeys(frame, m) {
+		log.Warnf("secret gate %d: refused %s from %s: a dict in it names a key twice", s.g.uid, what, sender)
+		s.deny(m, "refused by app-listener")
+		return
+	}
 	switch {
 	case v.replaceIn != "":
 		s.fwdMu.Lock()
@@ -490,6 +495,9 @@ func (s *session) admitGated(sender string, v *verdict, what string) bool {
 			return false
 		}
 		add(attrs)
+		if v.schema != "" {
+			add(withSchema(attrs, v.schema))
+		}
 	}
 	if len(hit) == 0 {
 		return true

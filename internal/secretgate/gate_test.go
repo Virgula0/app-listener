@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 
@@ -203,5 +204,91 @@ func TestClassifyOpenCallsExact(t *testing.T) {
 		if v := classify(m); v.kind != refuse {
 			t.Errorf("%v: got %+v", m, v)
 		}
+	}
+}
+
+type testSecret struct {
+	S dbus.ObjectPath
+	P []byte
+	V []byte
+	C string
+}
+
+type propEntry struct {
+	K string
+	V dbus.Variant
+}
+
+// dictFrame encodes CreateItem with props as an a(sv) (godbus maps can't hold a duplicate key),
+// then turns the header signature into a{sv}: the dict a client can send, same wire layout.
+func dictFrame(t *testing.T, props []propEntry) []byte {
+	t.Helper()
+	m := call(ifaceCollection, "CreateItem", "/org/freedesktop/secrets/collection/login", props,
+		testSecret{"/s", nil, []byte("x"), "text/plain"}, true)
+	frame, err := encodeWithSerial(m, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := bytes.Index(frame, []byte("a(sv)(oayays)b\x00"))
+	if i < 0 {
+		t.Fatal("signature not found")
+	}
+	frame[i+1], frame[i+4] = '{', '}'
+	return frame
+}
+
+func TestDuplicateDictKeyRefused(t *testing.T) {
+	gh := dbus.MakeVariant(map[string]string{"service": "gh:github.com"})
+	other := dbus.MakeVariant(map[string]string{"x": "rnd"})
+	dup := dictFrame(t, []propEntry{{propAttributes, gh}, {propAttributes, other}})
+	m, err := decodeFrame(dup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the gate would judge without the check: the last entry only, no scope.
+	if v := classify(m); len(v.attrs) != 1 || v.attrs[0]["service"] != "" {
+		t.Fatalf("fixture: got %+v", v)
+	}
+	if distinctDictKeys(dup, m) {
+		t.Error("a CreateItem whose props name Attributes twice must be refused: the keyring replaces by the first")
+	}
+	ok := dictFrame(t, []propEntry{{propAttributes, gh}, {"org.freedesktop.Secret.Item.Label", dbus.MakeVariant("l")}})
+	if m, err = decodeFrame(ok); err != nil || !distinctDictKeys(ok, m) {
+		t.Errorf("distinct keys refused (%v)", err)
+	}
+	plain := call(ifaceItem, "GetSecret", "/i", dbus.ObjectPath("/s"))
+	frame, err := encodeWithSerial(plain, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, err = decodeFrame(frame); err != nil || !distinctDictKeys(frame, m) {
+		t.Errorf("a call without a dict refused (%v)", err)
+	}
+}
+
+// gnome-keyring stores Item.Type as the item's schema and reads it back as xdg:schema: setting it
+// moves an item into a scope matched on xdg:schema (git-credential-libsecret's).
+func TestClassifyItemTypeIsSchema(t *testing.T) {
+	const git = "org.git.Password"
+	props := map[string]dbus.Variant{
+		propAttributes: dbus.MakeVariant(map[string]string{"server": "github.com"}),
+		propType:       dbus.MakeVariant(git),
+	}
+	v := classify(call(ifaceCollection, "CreateItem", "/c", props, testSecret{"/s", nil, nil, "text/plain"}, false))
+	if v.kind != gated || !slices.ContainsFunc(v.attrs, func(a map[string]string) bool {
+		return a["xdg:schema"] == git && a["server"] == "github.com"
+	}) {
+		t.Errorf("CreateItem with a Type: got %+v, want its attributes judged with xdg:schema=%s", v, git)
+	}
+	props[propType] = dbus.MakeVariant(7)
+	if v = classify(call(ifaceCollection, "CreateItem", "/c", props, testSecret{"/s", nil, nil, "text/plain"}, false)); v.kind != refuse {
+		t.Errorf("a non-string Type: got %+v, want refuse", v)
+	}
+	v = classify(call(ifaceProps, "Set", "/i", ifaceItem, "Type", dbus.MakeVariant(git)))
+	if v.kind != gated || v.schema != git || len(v.items) != 1 {
+		t.Errorf("Properties.Set Type: got %+v, want the item judged as it would become", v)
+	}
+	if v = classify(call(ifaceProps, "Set", "/i", ifaceItem, "Type", dbus.MakeVariant(7))); v.kind != refuse {
+		t.Errorf("Properties.Set non-string Type: got %+v, want refuse", v)
 	}
 }

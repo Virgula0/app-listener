@@ -287,6 +287,79 @@ func heldexec(attr, val, waitfile, readerBin string, argv []string) {
 	execInto(argv)
 }
 
+type propEntry struct {
+	K string
+	V dbus.Variant
+}
+
+// dupkey sends CreateItem(replace=true) whose props name Attributes twice, first {attr: val} (the
+// keyring's replace target) then {x: rnd} (the last, godbus's view), with a secret a plain session
+// rejects: the keyring retags the item and keeps its token. Exit 1 = AccessDenied, 0 = the keyring
+// answered (ANSWERED), 4 = no answer.
+func dupkey(attr, val string) {
+	c := dial()
+	svc := c.Object(service, svcPath)
+	var out dbus.Variant
+	var session dbus.ObjectPath
+	if err := svc.Call(svcIfc+".OpenSession", 0, "plain", dbus.MakeVariant("")).Store(&out, &session); err != nil {
+		refusal("OpenSession", err)
+	}
+	fd, err := unix.Dup(connFD())
+	if err != nil {
+		failf(3, "ERROR dup: %v", err)
+	}
+	c.Close() // its reader would take the reply; the socket stays open through the dup
+	body := []any{
+		[]propEntry{
+			{"org.freedesktop.Secret.Item.Attributes", dbus.MakeVariant(map[string]string{attr: val})},
+			{"org.freedesktop.Secret.Item.Attributes", dbus.MakeVariant(map[string]string{"x": "rnd"})},
+		},
+		secret{Session: session, Params: []byte("xyz"), Value: []byte("SECRET-evil"), ContentType: "text/plain"},
+		true,
+	}
+	msg := &dbus.Message{
+		Type: dbus.TypeMethodCall,
+		Headers: map[dbus.HeaderField]dbus.Variant{
+			dbus.FieldPath:        dbus.MakeVariant(dbus.ObjectPath("/org/freedesktop/secrets/aliases/default")),
+			dbus.FieldInterface:   dbus.MakeVariant("org.freedesktop.Secret.Collection"),
+			dbus.FieldMember:      dbus.MakeVariant("CreateItem"),
+			dbus.FieldDestination: dbus.MakeVariant(service),
+			dbus.FieldSignature:   dbus.MakeVariant(dbus.SignatureOf(body...)),
+		},
+		Body: body,
+	}
+	var buf bytes.Buffer
+	if err := msg.EncodeTo(&buf, binary.LittleEndian); err != nil {
+		failf(3, "ERROR encode: %v", err)
+	}
+	raw := buf.Bytes()
+	binary.LittleEndian.PutUint32(raw[8:12], 0x7fff0002)
+	// godbus can't hold a duplicate map key: encode an a(sv), then name it a{sv} (same wire layout).
+	i := bytes.Index(raw, []byte("a(sv)(oayays)b\x00"))
+	if i < 0 {
+		failf(3, "ERROR signature not found")
+	}
+	raw[i+1], raw[i+4] = '{', '}'
+	if _, err := unix.Write(fd, raw); err != nil {
+		failf(3, "ERROR write: %v", err)
+	}
+	_ = unix.SetNonblock(fd, true)
+	var seen []byte
+	rbuf := make([]byte, 65536)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if n, _ := unix.Read(fd, rbuf); n > 0 {
+			seen = append(seen, rbuf[:n]...)
+		}
+		if bytes.Contains(seen, []byte("AccessDenied")) {
+			failf(1, "REFUSED CreateItem (AccessDenied)")
+		}
+	}
+	if len(seen) > 0 {
+		failf(0, "ANSWERED %q", seen)
+	}
+	failf(4, "NOTHING")
+}
+
 // rawget sends GetSecret on an inherited bus socket (fd 3) after delay (default: until the lender
 // dropped its handle) and reads the answer.
 func rawget(item, session string, delay time.Duration) {
@@ -404,7 +477,7 @@ func connFD() int {
 }
 
 func usage() {
-	failf(3, "usage: secret_probe get|store|replace|own|monitor|connexec|sendexec|lend|heldexec|reader|rawget|rawreader|fakebus|dialsleep|sleep ...")
+	failf(3, "usage: secret_probe get|store|replace|dupkey|own|monitor|connexec|sendexec|lend|heldexec|reader|rawget|rawreader|fakebus|dialsleep|sleep ...")
 }
 
 func duration(s string) time.Duration {
@@ -425,6 +498,7 @@ var modes = map[string]func(a []string){
 	"lend":      func(a []string) { lend(a[0], a[1], a[2]) },
 	"heldexec":  func(a []string) { heldexec(a[0], a[1], a[2], a[3], a[4:]) },
 	"rawreader": func(a []string) { rawreader(a[0]) },
+	"dupkey":    func(a []string) { dupkey(a[0], a[1]) },
 	"fakebus":   func(a []string) { fakebus(a[0], duration(a[1])) },
 	"sleep":     func(a []string) { time.Sleep(duration(a[0])) },
 	"rawget": func(a []string) {

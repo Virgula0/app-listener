@@ -73,8 +73,10 @@ A [`[secret <name>]`](config-reference.md#secret-name) section is a scope: the i
 lines cover and the binaries that may use them.
 
 - An item that several scopes cover needs every scope's admission.
-- Changing an item's attributes is judged under its old and new ones, so an item can't be moved
-  out of a scope.
+- Changing an item's attributes or its type (the keyring reads the type back as `xdg:schema`) is
+  judged under its old and new ones, so an item can't be moved into or out of a scope.
+- A call that names the same key twice in a dict (two `Attributes` entries) is refused: the keyring
+  acts on the first, so the gate couldn't judge what it runs.
 - Creating an item that replaces existing ones (the keyring picks them by a subset of their
   attributes) is judged under the scopes of every item it could replace.
 - An item no scope covers stays as open as the keyring keeps it.
