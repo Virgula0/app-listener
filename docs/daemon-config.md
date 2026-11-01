@@ -65,8 +65,9 @@ A service on a loopback TCP port (`bitcoind` RPC, the `adb` server, `ollama`) an
 program that can reach it. `[port tcp/<n>]` guards one such port: only `CONNECT` lines may connect
 to it, and only `MKNOD` lines may listen on it, so another program can't take the port while the
 service is stopped and collect the credentials its clients send. A listener made while the daemon
-was stopped is judged at its first `accept` instead, so a program that took the port then can't
-serve a client either. A port section takes only binary lines, with `CONNECT`, `MKNOD` or no event
+was stopped is judged at its first `accept` instead, and every accepted connection is judged at
+each message the program sends or receives on it, so a program that took the port then (even one
+already waiting in `accept`) can't serve a client either. A port section takes only binary lines, with `CONNECT`, `MKNOD` or no event
 list.
 
 - **Loopback only.** Connections to `127.0.0.0/8`, `::1`, `0.0.0.0` and `::` (which reach this

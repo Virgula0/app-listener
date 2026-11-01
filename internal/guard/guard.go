@@ -696,7 +696,7 @@ var requiredHooks = map[string]bool{
 	"file_ioctl": true, "file_ioctl_compat": true,
 	"task_prctl": true, "unix_stream_connect": true, "unix_may_send": true,
 	"socket_sendmsg": true, "socket_recvmsg": true, "socket_connect": true, "socket_listen": true,
-	"socket_accept": true, "socket_getsockopt": true, "mmap_file": true,
+	"socket_accept": true, "sock_graft": true, "socket_getsockopt": true, "mmap_file": true,
 }
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
@@ -803,6 +803,7 @@ func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []lsmHook {
 		{o.GuardSocketConnect, "socket_connect"},
 		{o.GuardSocketListen, "socket_listen"},
 		{o.GuardSocketAccept, "socket_accept"},
+		{o.GuardSockGraft, "sock_graft"},
 		{o.GuardSocketGetsockopt, "socket_getsockopt"},
 	}
 	if ioctlCompat {

@@ -1447,7 +1447,8 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 // and the exe using it now. Never by the peer: a server closing its end clears that end's path
 // while its data is still queued for the client. The mark names the resource's watch root, not its
 // slot: a reload moves the resource to a new slot and retires (then reuses) the old one, while
-// guard_inodes' row for the root follows it. No BPF_F_CLONE: an accepted socket is unmarked.
+// guard_inodes' row for the root follows it. No BPF_F_CLONE: sock_graft marks a guarded port's
+// accepted socket itself.
 struct conn_mark {
 	struct inode_key root;
 	__u32 set;
@@ -2821,7 +2822,8 @@ int guard_socket_listen(unsigned long long *ctx)
 
 // A port's listener handed to another exe (inherited, SCM_RIGHTS) would collect its clients.
 // A listener older than the guard (made while the daemon was stopped) was never judged at listen: an
-// unmarked one is judged as a listen at each accept, and marked once admitted.
+// unmarked one is judged as a listen at each accept, and marked once admitted. An accept already
+// blocked when the guard attached passed this hook unjudged: sock_graft covers it.
 SEC("lsm/socket_accept")
 int guard_socket_accept(unsigned long long *ctx)
 {
@@ -2833,6 +2835,37 @@ int guard_socket_accept(unsigned long long *ctx)
 	if (!bpf_sk_storage_get(&guard_conns, sk, 0, 0))
 		return judge_listen(&ea_buf, sk);
 	return judge_conn_use(&ea_buf, sk);
+}
+
+// Every accept of a guarded port grafts its connection here, in the acceptor's context, including
+// one that blocked before the guard attached. The hook can't refuse: it marks the connection as
+// the port's MKNOD, so every message, splice or zerocopy read on it judges the exe using it.
+SEC("lsm/sock_graft")
+int guard_sock_graft(unsigned long long *ctx)
+{
+	struct sock *sk = (struct sock *)ctx[0];
+	if (!sk)
+		return 0;
+	__u16 fam = sk->__sk_common.skc_family;
+	if (fam != AF_INET && fam != AF_INET6)
+		return 0;
+	__u32 res = port_res(sk, sk->__sk_common.skc_num);
+	if (res == GUARD_RES_NONE)
+		return 0;
+	struct conn_mark *c = bpf_sk_storage_get(&guard_conns, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+	if (!c)
+		return 0;
+	// An anchor with no live row (or no active slot) is judged by GUARD_RES_GLOBAL: fail closed.
+	struct res_config *cfg = res_cfg(res);
+	if (cfg) {
+		c->root.dev = cfg->root_dev;
+		c->root.ino = cfg->root_ino;
+	} else {
+		c->global = 1;
+	}
+	c->event = EVENT_MKNOD;
+	c->set = 1;
+	return 0;
 }
 
 // getsockopt(TCP_ZEROCOPY_RECEIVE) reads queued data through tcp_recvmsg_locked, skipping
