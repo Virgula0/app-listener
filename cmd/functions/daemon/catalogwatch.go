@@ -136,7 +136,8 @@ const (
 	// maxDescend caps the entries read from one new directory.
 	maxDescend = 64
 
-	watchMask = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_CLOSE_WRITE | unix.IN_ONLYDIR | unix.IN_EXCL_UNLINK
+	watchMask = unix.IN_CREATE | unix.IN_MOVED_TO | unix.IN_CLOSE_WRITE | unix.IN_DELETE | unix.IN_MOVED_FROM |
+		unix.IN_ONLYDIR | unix.IN_EXCL_UNLINK
 )
 
 type watchPos struct {
@@ -239,6 +240,14 @@ func (s *watchSet) follow(dir string, pos watchPos) {
 func (s *watchSet) match(dir string, pos watchPos, mask uint32, name string) {
 	comps := pos.p.comps
 	if ok, err := filepath.Match(comps[pos.next], name); err != nil || !ok {
+		return
+	}
+	// A home match leaving (an updater removing its old version after the new one was admitted)
+	// schedules the refresh that drops its vanished lines and lib_dir: no arrival follows it.
+	if mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) != 0 {
+		if pos.p.home {
+			s.refresh = true
+		}
 		return
 	}
 	isDir := mask&unix.IN_ISDIR != 0

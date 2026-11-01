@@ -97,8 +97,9 @@ To add catalog directories that appeared after you installed (a newly installed 
 ## Catalog refresh
 
 The daemon keeps the catalog whitelists current by itself. It watches the catalog's directories
-(inotify, as a hint only) and re-expands the catalog whitelists at startup and whenever a binary
-is written below a catalog pattern, with the same rules as `install catalog refresh`,
+(inotify, as a hint only) and re-expands the catalog whitelists at startup, whenever a binary
+is written below a catalog pattern, and whenever a match of a home pattern is deleted or moved
+away, with the same rules as `install catalog refresh`,
 keeping lines whose binary still exists. In the app's `[libraries]` block it also drops the
 `lib_dir` and `lib_binary` lines a catalog pattern produced whose path is gone (an old version
 directory the updater removed). Hand-written lines stay, and nothing is dropped from an encrypted
@@ -122,6 +123,8 @@ The daemon follows them:
 - A new version directory (Discord's `~/.config/discord/0.0.N/`) is admitted by the catalog
   refresh as soon as the updater finishes writing the binary, also when it deletes the old version
   first. No restart, no manual step.
+- An old version directory the app deletes later (Discord removes it on its next start) is dropped
+  from `daemon.conf` by the refresh that deletion triggers.
 - A process that creates such a directory without being one of the app's binaries can't plant the
   binary name there (the names are reserved), so nothing it does is admitted.
 

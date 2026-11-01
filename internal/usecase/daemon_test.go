@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	logtest "github.com/sirupsen/logrus/hooks/test"
+
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
@@ -1358,5 +1360,26 @@ func TestDaemonUseCaseReloadRuntimeRootMovedWhileMounted(t *testing.T) {
 		if !mounted && err != nil {
 			t.Errorf("a new login's mount must replace a logged-out one: %v", err)
 		}
+	}
+}
+
+func TestRepeatLogOncePerErrorAndOnRecovery(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	var r repeatLog
+	gone := errors.New("stating guarded path /x: no such file or directory")
+	for range 3 {
+		r.report("sweep /x", &r.inodes, gone)
+	}
+	r.report("sweep /x", &r.inodes, errors.New("another"))
+	r.report("sweep /x", &r.inodes, nil)
+	r.report("sweep /x", &r.inodes, nil)
+	var msgs []string
+	for _, e := range hook.AllEntries() {
+		msgs = append(msgs, e.Message)
+	}
+	if len(msgs) != 3 || !strings.Contains(msgs[0], "no such file") || !strings.Contains(msgs[1], "another") ||
+		!strings.Contains(msgs[2], "ok again") {
+		t.Fatalf("want one line per distinct error and one on recovery, got %q", msgs)
 	}
 }

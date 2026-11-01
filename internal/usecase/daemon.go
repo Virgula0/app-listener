@@ -369,6 +369,7 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 		follow = followRootPulse.Subscribe()
 	}
 	var lastResync time.Time
+	var sweepLog repeatLog
 	for {
 		var followRoot <-chan struct{}
 		if follow != nil {
@@ -388,7 +389,7 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 			}
 		case <-sweep.C():
 			sweep.Ack()
-			d.periodicSweep(resource, g)
+			d.periodicSweep(resource, g, &sweepLog)
 			lastResync = time.Now()
 		case <-inodeGC.C():
 			inodeGC.Ack()
@@ -432,12 +433,24 @@ func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRe
 // and refreshes the inode map. SweepInodes only works when the root's fingerprint moved (recreated
 // single-file root, or a directory that gained/lost a top-level entry); an unconditional re-walk
 // per tick was a large share of steady-state CPU.
-func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardRepository) {
-	if _, err := g.SweepReSyncBinaries(); err != nil {
-		log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
-	}
-	if err := g.SweepInodes(); err != nil {
-		log.Errorf("daemon: periodic inode sweep for %s: %v", resource, err)
+func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardRepository, logged *repeatLog) {
+	_, resyncErr := g.SweepReSyncBinaries()
+	logged.report(fmt.Sprintf("daemon: periodic binary re-sync for %s", resource), &logged.resync, resyncErr)
+	logged.report(fmt.Sprintf("daemon: periodic inode sweep for %s", resource), &logged.inodes, g.SweepInodes())
+}
+
+// repeatLog logs a periodic error once, not every tick (a released lib_dir's root stays gone until
+// the refresh drops it), then once more when it clears.
+type repeatLog struct{ resync, inodes string }
+
+func (repeatLog) report(what string, last *string, err error) {
+	switch {
+	case err == nil && *last != "":
+		log.Infof("%s: ok again", what)
+		*last = ""
+	case err != nil && err.Error() != *last:
+		log.Errorf("%s: %v (logged once while it repeats)", what, err)
+		*last = err.Error()
 	}
 }
 
