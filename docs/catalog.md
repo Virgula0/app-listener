@@ -45,8 +45,12 @@ their own config directory keep working (see below).
   matches, and the app is denied like any other program. Google Cloud SDK, Azure CLI, pip, Electrum
   and ProtonVPN are Python apps, and Gemini CLI and pi (from npm or pi's installer) are Node apps:
   their entries lock the guarded files against everyone, the app included, unless you whitelist an
-  ELF they end up running (pi's release tarball ships one). Never whitelist the interpreter. The installer and
-  the daemon warn about every script line.
+  ELF they end up running (pi's release tarball ships one). Never whitelist the interpreter. The
+  installer writes no line for a file that is a script on this machine (a launcher may be a script on
+  one distro and an ELF on another), so such a section may have an empty whitelist. The daemon's own
+  catalog refresh keeps existing lines, so a script line written by an older installer stays until
+  `install catalog refresh` drops it. The installer and the daemon warn about every script line left,
+  once per set of lines with every section that lists it.
 - **opencode snapshots.** opencode 2 keeps provider credentials in
   `~/.local/share/opencode/opencode.db`, which the entry guards. opencode runs `git` on its snapshot
   repositories in the same directory, and `git` is never whitelisted (it would print the database), so

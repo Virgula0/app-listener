@@ -13,6 +13,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 // ErrNoCatalogMatch: the config has no section mapping to a catalog entry (all-manual).
@@ -101,7 +102,7 @@ func RefreshSection(confText string, r *daemonconfig.Resource, users []User,
 		fresh = keepExisting(fresh, r)
 	}
 	log.Infof("re-scanned %s (%s) — %d whitelisted binaries", sectionPath, entry.Name, len(fresh))
-	if LiveEmptyWhitelistRejected(encrypted, opts.Live, len(fresh), len(old)) {
+	if LiveEmptyWhitelistRejected(encrypted, opts.Live, len(fresh), matchableLines(old)) {
 		return "", change, false, fmt.Errorf("live re-scan of %s produced an empty whitelist while the config "+
 			"lists binaries for it: the vault appears locked or this installer is not the running daemon's "+
 			"binary — refusing to shrink the whitelist", sectionPath)
@@ -250,6 +251,18 @@ func ParseSectionWhitelist(confText, resourcePath string) []string {
 		}
 	}
 	return out
+}
+
+// matchableLines counts the lines that can match an exe. A "#!" script never does, so a section
+// listing only scripts may refresh to empty; an unreadable line (locked vault) still counts.
+func matchableLines(lines []string) int {
+	n := 0
+	for _, l := range lines {
+		if !ebpf.IsScript(l) {
+			n++
+		}
+	}
+	return n
 }
 
 // LiveEmptyWhitelistRejected is the live refresh's fail-closed contract (RefreshSection).

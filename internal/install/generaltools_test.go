@@ -4,7 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+
+	logtest "github.com/sirupsen/logrus/hooks/test"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 )
@@ -47,5 +50,28 @@ func TestScriptsOf_NamesTheConfiguredLine(t *testing.T) {
 	}}
 	if got := ScriptsOf(res); !slices.Equal(got, []string{link, script}) {
 		t.Errorf("ScriptsOf = %v, want [%s %s]", got, link, script)
+	}
+}
+
+func TestWarnWhitelistLines_OneWarningPerScriptSet(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "pv-locale-gen")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: "/home/u/.steam", Binaries: []daemonconfig.BinaryRule{{Path: script}}},
+		{Path: "/home/u/.local/share/Steam/config", Binaries: []daemonconfig.BinaryRule{{Path: script}}},
+	}}
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	WarnWhitelistLines(cfg)
+	var hits []string
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "never match") {
+			hits = append(hits, e.Message)
+		}
+	}
+	if len(hits) != 1 || !strings.Contains(hits[0], "/home/u/.steam, /home/u/.local/share/Steam/config") {
+		t.Errorf("want one warning naming both resources, got %q", hits)
 	}
 }

@@ -82,15 +82,19 @@ func ScriptsOf(res *daemonconfig.Resource) []string {
 	return out
 }
 
-// WarnWhitelistLines logs, per resource, the general tools that make it readable by any script and
-// the script lines that never match.
+// WarnWhitelistLines logs, per resource, the general tools that make it readable by any script, and
+// the script lines that never match once per distinct set (one app's resources share theirs).
 func WarnWhitelistLines(cfg *daemonconfig.Config) {
+	var sets []string
+	resourcesOf := map[string][]string{}
 	for i := range cfg.Resources {
 		res := &cfg.Resources[i]
 		if scripts := ScriptsOf(res); len(scripts) > 0 {
-			log.Warnf("%s whitelists script(s) %s, which never match: a #! script runs as its interpreter "+
-				"(never whitelist that), so the app is denied too; whitelist the ELF it ends up running, if any",
-				res.Path, strings.Join(scripts, ", "))
+			set := strings.Join(scripts, ", ")
+			if _, seen := resourcesOf[set]; !seen {
+				sets = append(sets, set)
+			}
+			resourcesOf[set] = append(resourcesOf[set], res.Path)
 		}
 		if res.ReadOnly {
 			continue // a lib_dir holds no secret: a tool there is a writer, judged by the updater plan
@@ -99,5 +103,10 @@ func WarnWhitelistLines(cfg *daemonconfig.Config) {
 			log.Warnf("%s whitelists general tool(s) %s: identity is the executable, so any script or "+
 				"arguments run through them can read it (not an updater either)", res.Path, strings.Join(tools, ", "))
 		}
+	}
+	for _, set := range sets {
+		log.Warnf("%s whitelist(s) script(s) %s, which never match: a #! script runs as its interpreter "+
+			"(never whitelist that), so the app is denied too; whitelist the ELF it ends up running, if any "+
+			"(`install catalog refresh` drops catalog script lines)", strings.Join(resourcesOf[set], ", "), set)
 	}
 }

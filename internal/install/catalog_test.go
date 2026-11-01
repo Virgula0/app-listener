@@ -438,26 +438,35 @@ func TestDiscoverSystemOnlyAbsolute(t *testing.T) {
 	}
 }
 
-// TestFilterExistingWhitelist verifies that non-existent binaries are
-// dropped from the generated whitelist.
+// TestFilterExistingWhitelist verifies that non-existent binaries and "#!" scripts are
+// dropped from the generated whitelist, while discovery still sees the script.
 func TestFilterExistingWhitelist(t *testing.T) {
-	existing := filepath.Join(t.TempDir(), "existing-bin")
-	if err := os.WriteFile(existing, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "existing-bin")
+	if err := os.WriteFile(existing, []byte("\x7fELF\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "launcher")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	c := Candidate{
 		User: User{Name: "tester", Home: "/home/tester"},
 		Entry: CandidateDir{Whitelist: map[string][]string{
 			existing:                      nil,
+			script:                        nil,
 			"/definitely/not/here/binary": nil,
 		}},
 	}
 	got := c.FilterExistingWhitelist()
 	if len(got) != 1 || got[0].Path != existing {
-		t.Errorf("FilterExistingWhitelist = %v, want [%s]", got, existing)
+		t.Fatalf("FilterExistingWhitelist = %v, want [%s]", got, existing)
 	}
 	if len(got[0].Events) != 0 {
 		t.Errorf("existing binary should have no event restriction: %v", got[0].Events)
+	}
+	if n := len(c.existingWhitelist()); n != 2 {
+		t.Errorf("existingWhitelist has %d lines, want 2: discovery must still see the script", n)
 	}
 }
 
@@ -470,7 +479,7 @@ func TestFilterExistingWhitelistSkipsOpaqueMulticall(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain := filepath.Join(dir, "tool")
-	if err := os.WriteFile(plain, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(plain, []byte("\x7fELF\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	c := Candidate{User: User{Name: "tester", Home: "/home/tester"},

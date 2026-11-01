@@ -15,6 +15,7 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 // CandidateDir describes one critical directory type the installer probes.
@@ -456,8 +457,8 @@ var Catalog = []CandidateDir{
 	{Name: "AWS credentials", RelPaths: []string{".aws"},
 		Whitelist: map[string][]string{"/usr/bin/aws": nil}},
 	{Name: "Google Cloud SDK", RelPaths: []string{".config/gcloud"},
-		// Python launchers: the exe is the interpreter, so these lines never match (the daemon warns)
-		// and gcloud itself is denied. Kept: dropping a section's only lines fails `catalog refresh`.
+		// Python launchers: the exe is the interpreter, so these lines never match and are never
+		// written (FilterExistingWhitelist): the section guards the tree against everyone, gcloud too.
 		Whitelist: map[string][]string{"/usr/bin/gcloud": nil, "/usr/bin/gsutil": nil}},
 	{Name: "Kubernetes kubeconfig", RelPaths: []string{".kube"},
 		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil,
@@ -1098,7 +1099,7 @@ func DiscoverPorts(users []User) []Candidate {
 		}
 		for _, u := range users {
 			c := Candidate{User: u, Entry: *entry}
-			if len(c.FilterExistingWhitelist()) == 0 {
+			if len(c.existingWhitelist()) == 0 {
 				continue
 			}
 			for _, p := range entry.Ports {
@@ -1133,7 +1134,7 @@ func DiscoverSecrets(users []User) []Candidate {
 		}
 		for _, u := range users {
 			c := Candidate{User: u, Entry: *entry, Path: daemonconfig.SecretAnchor(entry.Secret)}
-			if len(c.FilterExistingWhitelist()) > 0 {
+			if len(c.existingWhitelist()) > 0 {
 				out = append(out, c)
 			}
 		}
@@ -1204,9 +1205,18 @@ func DiscoverForUsers(users []User) []Candidate {
 	return out
 }
 
-// FilterExistingWhitelist drops missing entries and expands globs (*, ?, [) to existing matches,
-// re-evaluated every install so relocated apps are found; matches inherit the pattern's events.
+// FilterExistingWhitelist is existingWhitelist without "#!" scripts: one runs as its interpreter, so
+// its line never matches. Checked per host (a launcher is a script on one distro, an ELF on another).
 func (c *Candidate) FilterExistingWhitelist() []BinaryRule {
+	return slices.DeleteFunc(c.existingWhitelist(), func(r BinaryRule) bool {
+		return ebpf.IsScript(r.Path)
+	})
+}
+
+// existingWhitelist drops missing entries and expands globs (*, ?, [) to existing matches,
+// re-evaluated every install so relocated apps are found; matches inherit the pattern's events.
+// Discovery keys on it, so an app installed only as a script is still proposed.
+func (c *Candidate) existingWhitelist() []BinaryRule {
 	var out []BinaryRule
 	for _, rule := range c.Entry.ExpandWhitelist(c.User.Name, c.User.Home) {
 		if strings.ContainsAny(rule.Path, "*?[") {
