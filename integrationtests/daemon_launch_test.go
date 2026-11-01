@@ -179,7 +179,8 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_BunRuntimeEnv() {
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_bun"), launchBunProbe, 0o755),
 		"copy launch_probe_bun (run make -C integrationtests/exploits)")
 	whitelist := launchBunProbe
-	real := s.bunRealApp()
+	real := s.bunRealApp("--no-compile-autoload-bunfig") // else op=BUNFIG refuses every launch
+
 	if real != "" {
 		s.Require().NoError(c.CopyFileToContainer(s.ctx, real, launchBunReal, 0o755), "copy the Bun-compiled app")
 		whitelist += "\n" + launchBunReal
