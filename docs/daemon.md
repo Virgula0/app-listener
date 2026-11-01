@@ -48,7 +48,8 @@ The flags `daemon --check`, `--verifier-only`, `--lockdown` and `--genkey` are a
 subcommands and stay listed in `--help`: installed systemd units, `scripts/install.sh` and
 `check-compatibility.sh` run binaries of other versions with them.
 
-The config format is covered in [Daemon configuration](daemon-config.md).
+The config syntax is in the [daemon.conf reference](config-reference.md); what each section does
+is in [Daemon configuration](daemon-config.md).
 
 ## Lifecycle
 
@@ -280,7 +281,8 @@ its own writes are refused. Start Steam again once that line appears.
 
 ## Related
 
-- [Daemon configuration](daemon-config.md): the config file.
+- [daemon.conf reference](config-reference.md): the config syntax.
+- [Daemon configuration](daemon-config.md): what each config section does.
 - [Binary trust](binary-trust.md): binary updates, the ledger, `trust`, launch scan.
 - [Self-updating apps and the catalog](catalog.md): catalog refresh.
 - [edit-protected](edit-protected.md): editing protected files while the daemon runs, and the

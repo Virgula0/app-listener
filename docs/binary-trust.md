@@ -153,7 +153,7 @@ runtime's rules above (so a flag only another runtime treats as risky marks it t
 generic Electron app rule below.
 
 Generic Electron binaries that run an app named on the command line are covered by
-[`[electron_apps]`](daemon-config.md#generic-electron-apps-electron_apps).
+[`[electron_apps]`](daemon-config.md#generic-electron-apps).
 
 ## Launch rules
 
@@ -176,12 +176,12 @@ Built in, by the whitelisted file's name:
   `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`,
   `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
   `/etc/ca-certificates/extracted/tls-ca-bundle.pem`; directories `/etc/ssl/certs`,
-  `/etc/pki/tls/certs`), as does one you add with `allow_env`, when only root decides what the path
+  `/etc/pki/tls/certs`), as does one you add with [`allow_env`](config-reference.md#allow_env), when only root decides what the path
   holds. A match logs the variable's name only, never its value.
 
 A rule's words match in order anywhere in the arguments, with anything between them, so a flag's
 value can't split them (`gh auth --hostname x token`). Add your own with
-[`[launch_rules]`](daemon-config.md#launch-rules-launch_rules).
+[`[launch_rules]`](config-reference.md#launch_rules).
 
 The rules are a tripwire. They don't see combined short flags (`-th`), aliases, a script that
 feeds the CLI its arguments another way, or a token the CLI reads from the keyring rather than a

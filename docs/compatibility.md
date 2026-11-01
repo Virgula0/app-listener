@@ -87,7 +87,7 @@ an arm64 host.
 - The guard's BPF maps are preallocated kernel memory, about 50 MiB whatever the RAM, on top of
   the daemon's own ~70 MiB. `check-compatibility` reports the running daemon's figure and warns
   below 1 GiB of RAM. Of that, `guard_inodes` (about 22 MiB) can be shrunk with `max_inodes`
-  in `[settings]` ([Daemon configuration](daemon-config.md#daemon-settings-settings)) when the
+  in `[settings]` ([`max_inodes`](config-reference.md#max_inodes)) when the
   guarded trees are small.
 - The first start hashes every whitelisted binary once (a binary several sections list is read
   once); on SD/eMMC storage and CPUs without SHA-2 instructions (Raspberry Pi 4) that takes longer,

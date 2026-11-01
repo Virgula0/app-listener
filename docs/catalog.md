@@ -72,7 +72,7 @@ their own config directory keep working (see below).
   (`auth.json`, `oauth_creds.json`, ...) inside their directory, and only those that exist when the
   section is written; `install catalog refresh` updates whitelists, never `watch:` lines. Log in to
   the app before you install, or add the missing `watch: <path>` line later with
-  `sudo app-listener edit-protected config` ([several guarded trees](daemon-config.md#several-guarded-trees-one-vault)).
+  `sudo app-listener edit-protected config` ([`watch:`](config-reference.md#watch)).
   If none of them exists yet, the section guards the whole directory, which breaks Codex's
   standalone updates in `~/.codex/packages`.
 - **Copilot CLI `/ide`.** The VS Code Copilot extension writes lock files to `~/.copilot/ide`.

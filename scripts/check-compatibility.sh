@@ -310,7 +310,7 @@ else
 	maps_note="the daemon's guard maps hold about 50 MiB of kernel memory, whatever the RAM (scripts/kernel-prof.sh measures it)"
 fi
 if [ -n "$mem_kb" ] && [ "$mem_kb" -lt 1048576 ]; then
-	warn "$((mem_kb / 1024)) MiB of RAM — $maps_note, plus the daemon's own ~70 MiB; with few, small guarded trees, max_inodes in daemon.conf [settings] shrinks guard_inodes (docs/daemon-config.md)"
+	warn "$((mem_kb / 1024)) MiB of RAM — $maps_note, plus the daemon's own ~70 MiB; with few, small guarded trees, max_inodes in daemon.conf [settings] shrinks guard_inodes (docs/config-reference.md#max_inodes)"
 elif [ -n "$mem_kb" ]; then
 	pass "$((mem_kb / 1024)) MiB of RAM ($maps_note)"
 fi

@@ -1,8 +1,8 @@
 # Daemon configuration
 
 The daemon reads `/etc/app-listener/daemon.conf`. The install wizard writes it for you from the
-[catalog](catalog.md); this page is for reading it or editing it by hand. The fully commented
-template is [`daemon-samples/daemon.conf`](../daemon-samples/daemon.conf).
+[catalog](catalog.md). This page explains what each kind of section does at run time; the syntax
+of every section and directive, with examples, is in the [daemon.conf reference](config-reference.md).
 
 To change the config of a running daemon, prefer `sudo app-listener edit-protected config`
 ([edit-protected](edit-protected.md#editing-the-daemon-config)): the file is self-guarded, and that
@@ -10,74 +10,51 @@ path validates the new config by reloading it and puts the old one back if the r
 
 ## Watch sections
 
-```ini
-[watch /home/alice/.ssh]          # one section per protected directory
-need_encryption: true             # default true; false skips the fscrypt lifecycle
-/usr/bin/ssh READ,WRITE           # whitelisted binary, restricted to these events
-/usr/bin/ssh-agent                # bare path = all events allowed
-```
+A [`[watch <path>]`](config-reference.md#watch-path) section protects one directory or file.
 
 - **Whitelist only, default deny.** Only the listed binaries may access the tree; everything else
-  gets `EPERM`. Identity is by inode.
-- **Absolute paths only.** `~` is not expanded.
-- **Symlinked binaries** are resolved to their real path at load time, so either the link or its
-  target may be listed.
-- **Quoting.** Wrap a path in double quotes when it contains spaces, so it isn't read as the event
-  list: `"/home/alice/Steam/.../Proton - Experimental/files/bin/wineserver"`. The installer always
-  quotes the paths it writes.
-- **Targets.** A section watches a directory (recursively) or a single regular file that carries
-  its own fscrypt policy. Symlinks, files with more than one hard link and special files are
-  refused, because an alias would extend the rule to another path to the same inode.
-- **No nesting.** Guarded paths may not sit inside one another: a file follows exactly one
-  whitelist. Guard sibling directories instead.
-- **`need_encryption: true`** (the default) requires the directory to already carry an fscrypt
-  policy; otherwise the daemon refuses to start. Use `false` for a resource you only want guarded.
+  gets `EPERM`. Identity is by inode, so a renamed or copied program is not the listed one.
+- **Encryption.** A resource with [`need_encryption: true`](config-reference.md#need_encryption)
+  (the default) must already carry an fscrypt policy. The daemon unlocks it only after its guard
+  attached, and locks it at shutdown while the guard still denies
+  ([details](daemon.md#shutdown-and-crashes)).
+- **Event masks** ([events](config-reference.md#binary-lines-and-events)) are a least-privilege
+  hint, **not a confinement boundary**: a masked binary that execs another whitelisted binary
+  escapes its mask.
+
+### Several guarded trees, one vault
+
+[`watch:`](config-reference.md#watch) lines inside a section turn the section path into the
+**encryption root** and each `watch:` path into a separately guarded tree. The trees share the
+section's whitelist and its lock/unlock lifecycle: one key unlocks them all. Without `watch:` lines
+the section path itself is the guarded tree. Use it to guard the token files of a directory an app
+also keeps other state in, without guarding the whole directory.
 
 ### Runtime sections
 
-```ini
-[watch /run/user/1000/gnupg]
-runtime: true
-/usr/bin/gpg-agent MKNOD,DELETE,MKDIR,CONNECT,STAT
-/usr/bin/gpg MKDIR,CONNECT,STAT
-need_encryption: false
-```
+Agents listen on sockets in `/run/user/<uid>`, which exists only while that user is logged in. A
+[`runtime: true`](config-reference.md#runtime) section names one directory directly in it. The
+daemon makes the directory at the user's login and guards it before any of the user's processes
+start ([details](daemon.md#runtime-sections-at-login)); while the user is logged out the section is
+listed but guards nothing.
 
-Agents listen on sockets in `/run/user/<uid>`, which exists only while that user is logged in.
-`runtime: true` marks a section naming one directory directly in it. The daemon makes the directory
-at the user's login and guards it before any of the user's processes start
-([details](daemon.md#runtime-sections-at-login)); while the user is logged out the section is
-listed but guards nothing. A runtime section is never encrypted (`need_encryption: true` is
-refused) and takes only binary lines: no `watch:`, `lib_dir` or `allow_lib`.
-
-Give every line an explicit event list, and `DELETE` only to a program that removes its own
-sockets: a program a caller can steer into `rmdir` would let the directory be recreated unguarded.
-
-### Port sections
-
-```ini
-[port tcp/8332]
-/usr/bin/bitcoind MKNOD
-/usr/bin/bitcoin-cli CONNECT
-```
+## Port sections
 
 A service on a loopback TCP port (`bitcoind` RPC, the `adb` server, `ollama`) answers any local
-program that can reach it. `[port tcp/<n>]` guards one such port: only `CONNECT` lines may connect
-to it, and only `MKNOD` lines may listen on it, so another program can't take the port while the
-service is stopped and collect the credentials its clients send. A listener made while the daemon
-was stopped is judged at its first `accept` instead, and every accepted connection is judged at
-each message the program sends or receives on it, so a program that took the port then (even one
-already waiting in `accept`) can't serve a client either. A port section takes only binary lines, with `CONNECT`, `MKNOD` or no event
-list.
+program that can reach it. A [`[port tcp/<n>]`](config-reference.md#port-tcpn) section guards one
+such port: only its `CONNECT` lines may connect to it, and only its `MKNOD` lines may listen on it,
+so another program can't take the port while the service is stopped and collect the credentials
+its clients send. A listener made while the daemon was stopped is judged at its first `accept`
+instead, and every accepted connection is judged at each message the program sends or receives on
+it, so a program that took the port then (even one already waiting in `accept`) can't serve a
+client either.
 
 - **Loopback only.** Connections to `127.0.0.0/8`, `::1`, `0.0.0.0` and `::` (which reach this
   host's loopback) are judged; connections to other hosts are not. Even a `MKNOD` program is refused
   when it listens on any other address (`0.0.0.0`, `::`, a LAN address), since clients could then
   reach it through an address nobody judges. Configure the service to listen on `127.0.0.1` or `::1`.
 - **TCP only, this host's network namespace only.** A container's own loopback is another host's.
-- **Not in the ephemeral range.** The daemon refuses to start with a port the kernel may hand out to
-  any program (`net.ipv4.ip_local_port_range`, by default 32768-60999) unless it is listed in
-  `net.ipv4.ip_local_reserved_ports`.
+- **Not in the ephemeral range**, where the kernel could hand the port to any program.
 - **The connection is guarded, not just the connect.** A connection handed to another program
   (inherited, passed over a unix socket) is judged again for every message that program sends or
   receives, as for unix sockets.
@@ -85,65 +62,26 @@ list.
 The daemon keeps one root-owned anchor file per port in `/run/app-listener/ports` (`tcp-<n>`); its
 events name that path. Removing a port section and reloading stops guarding the port.
 
-### Secret Service sections
-
-```ini
-[secret_service]
-provider /usr/bin/gnome-keyring-daemon
-prompter /usr/libexec/gcr-prompter
-manager /usr/bin/seahorse
-
-[secret gh]
-match service=gh:*
-/usr/bin/gh
-```
+## Secret Service sections
 
 Apps such as `gh` keep their token in the Secret Service (the keyring), which any of your programs
-can ask for over the session bus. With a `[secret_service]` block the keyring reaches the bus only
-through the daemon: every call that reads, writes or deletes an item is judged before the keyring
-sees it ([how](daemon.md#the-secret-service-gate)).
+can ask for over the session bus. With a [`[secret_service]`](config-reference.md#secret_service)
+block the keyring reaches the bus only through the daemon: every call that reads, writes or deletes
+an item is judged before the keyring sees it ([how](daemon.md#the-secret-service-gate)).
 
-`[secret_service]` names the keyring daemon (`provider`, gnome-keyring is the one supported), the
-program that shows its password dialogs (`prompter`) and the programs that may manage the keyring as
-a whole (`manager`: delete a collection, set an alias, change the master password). Prompter and
-manager lines must name root-owned binaries.
+A [`[secret <name>]`](config-reference.md#secret-name) section is a scope: the items its `match`
+lines cover and the binaries that may use them.
 
-A `[secret <name>]` section is a scope: the items it covers and the binaries that may use them.
+- An item that several scopes cover needs every scope's admission.
+- Changing an item's attributes is judged under its old and new ones, so an item can't be moved
+  out of a scope.
+- Creating an item that replaces existing ones (the keyring picks them by a subset of their
+  attributes) is judged under the scopes of every item it could replace.
+- An item no scope covers stays as open as the keyring keeps it.
+- The daemon keeps one root-owned anchor file per scope in `/run/app-listener/secret-scopes`; its
+  events name that path and the call.
 
-- **`match key=value ...`** covers an item whose attributes have every listed value; a value
-  ending in `*` matches any attribute starting with the rest. A section takes one or more `match`
-  lines and covers an item any of them matches. `secret-tool search --all <key> <value>` shows an
-  item's attributes.
-- **Binary lines** take `READ` (get the secret), `WRITE` (create or change an item, its secret,
-  label or attributes) and `DELETE`, or no event list for all three.
-- An item that several scopes cover needs every scope's admission. Changing an item's attributes
-  is judged under its old and new ones, so an item can't be moved out of a scope. Creating an item
-  that replaces existing ones (the keyring picks them by a subset of their attributes) is judged
-  under the scopes of every item it could replace. An item no scope covers stays as open as the
-  keyring keeps it.
-- The name is lowercase letters, digits, `.`, `_` and `-`. The daemon keeps one root-owned anchor
-  file per scope in `/run/app-listener/secret-scopes`; its events name that path and the call.
-
-### Several guarded trees, one vault
-
-`watch: <path>` lines inside a section turn the section path into the **encryption root** and each
-`watch:` path into a separately guarded tree that shares the section's whitelist and lock/unlock
-lifecycle. Without `watch:` lines the section path itself is the guarded tree.
-
-### Per-binary event masks
-
-Valid events: `OPEN, READ, WRITE, DELETE, RENAME, SYMLINK, HARDLINK, MKDIR, MMAP, ATTR, STAT, MKNOD, CONNECT`.
-`CONNECT` is connecting, sending or receiving on a unix socket bound inside the tree (an agent or RPC
-socket), or on a [port section](#port-sections)'s port. On a port, `MKNOD` is listening on it.
-`DELETE` also covers removing the guarded directory itself once it is empty, even when its parent
-isn't guarded.
-
-Unlisted events are denied for that binary. `READ`, `WRITE` and `MMAP` imply `OPEN`.
-
-Masks are a least-privilege hint, **not a confinement boundary**: a masked binary that execs
-another whitelisted binary escapes its mask.
-
-## Library trust: `[libraries "<name>"]`
+## Library trust
 
 A whitelisted binary may only map libraries the daemon trusts, which is what defeats
 `LD_PRELOAD` and library injection. Three things are trusted without any configuration:
@@ -154,23 +92,16 @@ A whitelisted binary may only map libraries the daemon trusts, which is what def
    writer moved aside stops counting as soon as its guard lets go of it.
 3. **Code a whitelisted process generated itself**, such as a GPU driver's JIT output.
 
-Anything else goes in a `[libraries]` block, one per application, after the watch sections:
+Anything else goes in a [`[libraries "<name>"]`](config-reference.md#libraries-name) block, one per
+application:
 
-```ini
-[libraries "Steam (alice)"]
-allow_lib /home/alice/.local/share/Steam/plugin.so
-lib_dir /home/alice/.local/share/Steam/steamrt64
-lib_binary /home/alice/.local/share/Steam/ubuntu12_32/steam
-```
-
-| Directive | Meaning |
-|---|---|
-| `allow_lib <path>` | Trusts one library file at a fixed, user-writable path that the app `dlopen`s. The file also becomes write-protected. Trust is **daemon-wide**: every whitelisted binary may load it. Static ELF dependencies are resolved automatically and need no listing. |
-| `lib_dir <path>` | Guards a whole library directory read-only: everyone may still read it, but only the block's `lib_binary` entries may write, rename, delete or truncate inside it, and only they may load from it. Never encrypted. For trees whose files can't be listed (Steam's runtimes are rebuilt under random names at each launch). |
-| `lib_binary <path>` | Allows one binary to write this block's `lib_dir` trees, and nothing else (not other blocks, not any watch section). Event masks are rejected here. |
-
-The block name is a label the installer uses to find the block again. Older configs that nest
-these directives inside a `[watch]` section are still accepted.
+- [`allow_lib`](config-reference.md#allow_lib) trusts one file. The trust is **daemon-wide**: every
+  whitelisted binary may load it, which is why it lives in its own block rather than under one
+  watch section.
+- [`lib_dir`](config-reference.md#lib_dir) is for trees whose files can't be listed (Steam's
+  runtimes are rebuilt under random names at each launch). Only the block's
+  [`lib_binary`](config-reference.md#lib_binary) programs may change it, which is what makes loading
+  from it safe; they get no access to any watch section.
 
 Moving a file from one guarded tree into another is refused to every process but the daemon,
 with one exception: two `lib_dir` trees with exactly the same writers, where those writers may
@@ -179,22 +110,13 @@ its staging dir `package/` into `linux32/`, `ubuntu12_32/` and the other runtime
 file stays protected by the tree it lands in. A refused move is logged with
 `resource=cross-resource`.
 
-## Generic Electron apps: `[electron_apps]`
+## Generic Electron apps
 
 An Electron with `resources/default_app.asar` next to it (Arch's `/usr/lib/electronNN/electron`,
 which wrapper scripts for `signal-desktop`, `obsidian`, ... start) runs whatever app its first
-non-switch argument names. Whitelisted, it may be started only with an app listed here:
+non-switch argument names. Whitelisted, it may be started only with an app listed in
+[`[electron_apps]`](config-reference.md#electron_apps).
 
-```ini
-[electron_apps]
-/usr/lib/signal-desktop/app.asar
-```
-
-- Each entry is an absolute path written exactly as the wrapper passes it, at most 43 bytes, at
-  most 32 entries.
-- It must name a root-owned file (an `.asar` or a JS entry point; a directory is refused) in
-  root-owned directories on a filesystem mounted without `nosuid`; otherwise the daemon logs
-  `electron app ... refused`.
 - Any other app, a relative path, default_app's `-r`/`-i`/`-repl`, or `--app=<file>` counts as a
   risky launch (`op=LAUNCH`, see [Binary trust](binary-trust.md#launch-scan)). No app at all
   (Chromium's child processes) is fine.
@@ -203,91 +125,52 @@ non-switch argument names. Whitelisted, it may be started only with an app liste
 A bundled Electron (Discord, VS Code: `resources/app.asar` or `resources/app/`, no
 `default_app.asar`) ignores its arguments when choosing the app and is not judged this way.
 
-## Launch rules: `[launch_rules]`
+## Launch rules
 
 A whitelisted CLI that prints or spends its secret on request (`gh auth token`) hands it to whoever
 runs it. Launch rules mark such a launch: the process is refused every guarded secret, as a risky
-runtime launch is ([Binary trust](binary-trust.md#launch-rules)). Add your own on top of the
-built-in ones:
-
-```ini
-[launch_rules]
-deny_args /usr/bin/gh repo delete
-warn_args /usr/bin/kubectl config view --raw
-deny_env /usr/bin/kubectl HTTPS_PROXY
-allow_env SSL_CERT_FILE=/etc/corp/ca-bundle.pem
-```
-
-- `deny_args <binary> <word>...` marks a launch whose arguments hold the 1 to 4 words in this order,
-  anything between them. A word starting with `-` is a flag, compared up to `=`, so write it
-  without a value. Words are at most 43 bytes.
-- `deny_env <binary> <NAME>` marks a launch with that variable set.
-- `warn_args` and `warn_env` only log the match (`ARGV comm=... word=...`).
-- `allow_env <NAME>=<path>`: no env rule on `NAME` matches when the value is exactly this one
-  clean absolute path (no `:`, at most 63 bytes in all), for every binary. Use it for a corporate CA
-  bundle passed in `SSL_CERT_FILE`. The daemon accepts it only when root decides what the path
-  holds: every directory on the way and the file (or, for a directory, everything in it) root-owned
-  and writable by no one else, outside user homes, on a mount without `nosuid`. Otherwise it logs
-  `allow_env ... refused` and launches setting it stay marked.
-- The binary is a whitelisted line, as written or its symlink's target; a rule naming any other
-  path does nothing and is logged. At most 16 argument rules per binary, built-ins included.
-- A rule can only refuse more: it is a tripwire, never a boundary (see
-  [Limitations](limitations.md#whitelisted-programs-that-disclose-on-request)).
+runtime launch is ([Binary trust](binary-trust.md#launch-rules), which lists the built-in rules).
+Add your own in [`[launch_rules]`](config-reference.md#launch_rules). A rule can only refuse more:
+it is a tripwire, never a boundary (see
+[Limitations](limitations.md#whitelisted-programs-that-disclose-on-request)).
 
 ## Process inspectors
 
 A process that read a protected file is *tainted*: no program outside its resource's whitelist
-may read its memory or even its `/proc/<pid>` metadata. Programs listed under `[inspectors]` may
-read that metadata (`environ`, `fd`, `maps`, `root`, `exe`) of **every** protected process, but
-never its memory (`ptrace`, `process_vm_readv`, `/proc/<pid>/mem`) and never a protected file.
+may read its memory or even its `/proc/<pid>` metadata. Programs listed under
+[`[inspectors]`](config-reference.md#inspectors) may read that metadata (`environ`, `fd`, `maps`,
+`root`, `exe`) of **every** protected process, but never its memory (`ptrace`, `process_vm_readv`,
+`/proc/<pid>/mem`) and never a protected file.
 
-```ini
-[inspectors]
-/usr/lib/xdg-desktop-portal
-```
-
-- **Default without the block:** `xdg-desktop-portal` (`/usr/lib/...` or `/usr/libexec/...`;
-  a path not installed is skipped). It opens `/proc/<pid>/root` of every screen-sharing caller
-  and otherwise refuses the request, so Meet or Discord sharing fails with no picker.
-- **An empty `[inspectors]` block** disables the default.
-- At most 16 entries. Only a root-owned binary in root-owned directories on a filesystem mounted
-  without `nosuid` is accepted (else `inspector ... refused`). Inspectors are protected like
-  whitelisted binaries (no `LD_PRELOAD`), and attaching to or tracing one needs a program
-  **every** section whitelists.
+The default inspector is `xdg-desktop-portal`: it opens `/proc/<pid>/root` of every
+screen-sharing caller and otherwise refuses the request, so Meet or Discord sharing fails with no
+picker. Inspectors are protected like whitelisted binaries (no `LD_PRELOAD`), and attaching to or
+tracing one needs a program **every** section whitelists.
 
 **What an inspector can see** is everything the kernel gates at `PTRACE_MODE_READ`: each
 protected process's environment variables (tokens passed via env included), open-file paths and
 memory map, the contents of its *unguarded* open files reachable through `/proc/<pid>/fd/N`
 (pipes, memfds, deleted files), and `perf_event_open` samples of its user stack. Protected files
-stay denied through `/proc/<pid>/fd`. Never list a shell, an interpreter, `cat`, `ps`, `perf`,
-`gdb` or anything that does what its caller asks.
+stay denied through `/proc/<pid>/fd`.
 
-## Daemon settings: `[settings]`
+## Daemon settings
 
-Daemon-wide `key: value` lines. An unknown or repeated key, or a value out of range, is a config
-error: the daemon refuses to start (a reload keeps the running config).
+[`max_inodes`](config-reference.md#max_inodes) in `[settings]` sizes `guard_inodes`, the kernel
+map holding one row per inode of every guarded tree.
 
-```ini
-[settings]
-max_inodes: 65536
-```
-
-- **`max_inodes`** sizes `guard_inodes`, the kernel map holding one row per inode of every guarded
-  tree. Default 262144 rows (about 22 MiB of preallocated kernel memory); accepted range 32768 to
-  4194304. Only worth lowering on a small-RAM host with few, small resources: 37 resources
-  (browser profiles, Steam, Discord, AI agents) use about 100,000 rows. `sudo
-  scripts/kernel-prof.sh` prints the running daemon's `guard_inodes_used`.
+- Only worth lowering on a small-RAM host with few, small resources: 37 resources (browser
+  profiles, Steam, Discord, AI agents) use about 100,000 rows. `sudo scripts/kernel-prof.sh` prints
+  the running daemon's `guard_inodes_used`.
 - When the map passes 75% the daemon logs `guard_inodes holds N of M rows`, after startup, after
   each reload and every 10 minutes. Once full, inodes it can't hold are guarded by the ancestor
   walk alone (`degraded coverage: guard_inodes map full`): raise the value.
-- It is never lowered automatically, and a reload can't resize the live map: a changed value takes
-  effect at the next restart (the reload logs so).
+- It is never lowered automatically.
 
 ## Reloading
 
 `sudo systemctl reload app-listener-daemon` re-reads the file. New guards attach before old ones
 detach, and a malformed config keeps the previous one running. A reload never drops a guarded
 resource (stop, edit and start for that), except a `lib_dir` whose directory its writer deleted
-(an app's old version dir after an update), which it drops as a restart would. Binaries added by hand are vetted
-like any other: one that isn't root-placed needs `sudo app-listener trust`
+(an app's old version dir after an update), which it drops as a restart would. Binaries added by
+hand are vetted like any other: one that isn't root-placed needs `sudo app-listener trust`
 ([Binary trust](binary-trust.md#trust)).
