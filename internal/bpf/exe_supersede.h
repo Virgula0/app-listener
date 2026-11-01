@@ -95,8 +95,10 @@ static __always_inline __u64 leader_start(struct task_struct *task)
 	return start;
 }
 
-// exe_refused: exe is superseded and task's image was exec'd at or after that, or its stamp can't
-// be trusted. Callers fold the result into a lookup key instead of branching on it.
+// exe_refused: exe is superseded and task's image was exec'd after that, or its stamp can't be
+// trusted. Callers fold the result into a lookup key instead of branching on it. A supersede records
+// exe_seq without incrementing, so an equal stamp is the last exec before it (bprm_committed_creds
+// runs after the image's open): `>`, or a binary that deletes its own last link loses its rows.
 static __noinline int exe_refused(struct task_struct *task, struct inode_key *exe)
 {
 	struct inode_key real = *exe;
@@ -110,7 +112,7 @@ static __noinline int exe_refused(struct task_struct *task, struct inode_key *ex
 	bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
 	struct exec_stamp *st = bpf_map_lookup_elem(&exe_stamps, &tgid);
 	if (st)
-		return st->start != leader_start(task) || st->seq >= s->seq;
+		return st->start != leader_start(task) || st->seq > s->seq;
 	__u32 k = EXE_SEQ_LOST;
 	__u64 *lost = bpf_map_lookup_elem(&exe_seq, &k);
 	return !lost || *lost != 0;

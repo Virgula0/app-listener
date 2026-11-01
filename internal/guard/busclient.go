@@ -24,7 +24,7 @@ type BusClient struct {
 	UID     uint32
 	Comm    string // display only
 	key     GuardInodeKey
-	refused bool  // exe_refused: a superseded image exec'd at or after the supersede
+	refused bool  // exe_refused: a superseded image exec'd after the supersede
 	suspect uint8 // trust_code_suspect mark, 0 = none
 }
 
@@ -232,7 +232,7 @@ func busClientKey(objs *GuardObjects, pid uint32, stamp GuardExecStamp) (GuardIn
 }
 
 // imageOf is pid's image as check_and_emit_args judges it: its key, whether it is a superseded key
-// exec'd at or after the supersede, its code-suspect mark.
+// exec'd after the supersede (exe_refused), its code-suspect mark.
 func imageOf(objs *GuardObjects, pid, host uint32, stamp GuardExecStamp) (*BusClient, error) {
 	key, err := busClientKey(objs, pid, stamp)
 	if err != nil {
@@ -241,7 +241,7 @@ func imageOf(objs *GuardObjects, pid, host uint32, stamp GuardExecStamp) (*BusCl
 	c := &BusClient{PID: pid, key: key}
 	var sup GuardExeSupersede
 	if err := objs.ExeSuperseded.Lookup(key.Real(), &sup); err == nil {
-		c.refused = stamp.Seq >= sup.Seq
+		c.refused = stamp.Seq > sup.Seq
 	} else if !errors.Is(err, cilium.ErrKeyNotExist) {
 		return nil, err
 	}
