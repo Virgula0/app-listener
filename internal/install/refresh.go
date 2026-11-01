@@ -127,20 +127,20 @@ func RefreshSection(confText string, r *daemonconfig.Resource, users []User,
 	change.Admitted = missingFrom(freshPaths, old)
 	change.Dropped = missingFrom(old, freshPaths)
 	text = EnsureLibraryBlock(migrated, &block)
-	// Live view only: a locked vault hides every lib_dir inside it, and dropping a live one would
-	// leave that code tree writable. No lib_dir found in an encrypted section looks locked.
-	if opts.KeepExisting && (!encrypted || len(block.LibDirs) > 0) {
-		var gone []string
-		text, gone = PruneLibraryBlock(text, block.Name, vanishedLibLine(entry, *user))
-		change.Dropped = append(change.Dropped, gone...)
-	}
+	// Vanished lines: live view only. A locked vault hides every lib_dir inside it, and dropping a
+	// live one would leave that code tree writable. No lib_dir found in an encrypted section looks
+	// locked. Script writers go in every mode: an unreadable line is never taken for one.
+	vanished := opts.KeepExisting && (!encrypted || len(block.LibDirs) > 0)
+	text, gone := PruneLibraryBlock(text, block.Name, staleLibLine(entry, *user, vanished))
+	change.Dropped = append(change.Dropped, gone...)
 	return text, change, true, nil
 }
 
-// vanishedLibLine reports a lib_dir / lib_binary line that entry's own patterns produce and whose
-// path is gone (an app version its updater removed); the refresh re-adds it if it returns. A
+// staleLibLine reports a lib_dir / lib_binary line that entry's own patterns produce and that
+// can't serve: a lib_binary that is a "#!" script (never matches), or, when vanished, a path that
+// is gone (an app version its updater removed; the refresh re-adds it if it returns). A
 // hand-written line, or any error but ENOENT, keeps it.
-func vanishedLibLine(entry *CandidateDir, u User) func(keyword, path string) bool {
+func staleLibLine(entry *CandidateDir, u User, vanished bool) func(keyword, path string) bool {
 	return func(keyword, path string) bool {
 		var patterns []string
 		stat := os.Stat // a symlinked writer resolves like ExpandLibDirWriters
@@ -159,6 +159,12 @@ func vanishedLibLine(entry *CandidateDir, u User) func(keyword, path string) boo
 			ok, err := filepath.Match(p, path)
 			return err == nil && ok
 		}) {
+			return false
+		}
+		if keyword == "lib_binary" && ebpf.IsScript(path) {
+			return true
+		}
+		if !vanished {
 			return false
 		}
 		_, err := stat(path)

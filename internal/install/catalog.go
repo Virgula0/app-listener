@@ -910,8 +910,9 @@ func (c *CandidateDir) ExpandMaintainer(user, home string) string {
 
 // ExpandLibDirWriters expands %USER%/%HOME% in LibDirWriters, matches globs, and keeps only
 // existing REGULAR files, sorted and de-duplicated. Globbing a whole helper directory is the
-// intended use (tool dirs gain binaries each update), so directories and dangling symlinks are
-// dropped rather than written as writers that can never match.
+// intended use (tool dirs gain binaries each update), so directories, dangling symlinks and "#!"
+// scripts (they run as their interpreter) are dropped rather than written as writers that can
+// never match.
 func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
 	if len(c.LibDirWriters) == 0 {
 		return nil
@@ -935,7 +936,7 @@ func (c *CandidateDir) ExpandLibDirWriters(user, home string) []string {
 			// Stat, not Lstat: a symlinked helper resolves like any whitelisted binary (the daemon
 			// records the target's inode).
 			info, err := os.Stat(p)
-			if err != nil || !info.Mode().IsRegular() {
+			if err != nil || !info.Mode().IsRegular() || ebpf.IsScript(p) {
 				continue
 			}
 			seen[p] = true

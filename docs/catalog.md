@@ -48,8 +48,10 @@ their own config directory keep working (see below).
   ELF they end up running (pi's release tarball ships one). Never whitelist the interpreter. The
   installer writes no line for a file that is a script on this machine (a launcher may be a script on
   one distro and an ELF on another), so such a section may have an empty whitelist. The daemon's own
-  catalog refresh keeps existing lines, so a script line written by an older installer stays until
-  `install catalog refresh` drops it. The installer and the daemon warn about every script line left,
+  catalog refresh keeps existing whitelist lines, so one an older installer wrote stays until
+  `install catalog refresh` drops it. A catalog `lib_binary` writer that is a script (Steam's
+  `pressure-vessel-unruntime` and `pv-locale-gen` match its helper globs) is dropped by every
+  refresh; a hand-written one stays. The installer and the daemon warn about every script line left,
   once per set of lines with every section that lists it.
 - **opencode snapshots.** opencode 2 keeps provider credentials in
   `~/.local/share/opencode/opencode.db`, which the entry guards. opencode runs `git` on its snapshot
