@@ -135,7 +135,7 @@ A bundled Electron (Discord, VS Code: `resources/app.asar` or `resources/app/`, 
 
 A whitelisted CLI that prints or spends its secret on request (`gh auth token`) hands it to whoever
 runs it. Launch rules mark such a launch: the process is refused every guarded secret, as a risky
-runtime launch is ([Binary trust](binary-trust.md#launch-rules), which lists the built-in rules).
+runtime launch is ([Binary trust](binary-trust.md#launch-rules), which lists the catalog's rules).
 Add your own in [`[launch_rules]`](config-reference.md#launch_rules). A rule can only refuse more:
 it is a tripwire, never a boundary (see
 [Limitations](limitations.md#whitelisted-programs-that-disclose-on-request)).

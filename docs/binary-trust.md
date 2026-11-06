@@ -171,7 +171,8 @@ Some whitelisted CLIs print or spend their secret when asked. The launch scan al
 whitelisted binary with launch rules, and a match marks the process the same way. Its denials
 name the binary, who ran it and the word that matched:
 `TRUST DENIED  op=ARGV  comm=... commFullPath=<its exe>  parentFullPath=<who ran it> ... path=<the secret>  word=<the word>`.
-Built in, by the whitelisted file's name:
+From the catalog (each entry's `LaunchRules` in `internal/install/catalog.go`), by the whitelisted
+file's name, in every section that whitelists a file of that name:
 
 - `gh`: `auth token`, `auth status --show-token`, `auth status -t`, `alias set`, `alias import`;
   `auth git-credential` is only logged, since git runs it on every push.
@@ -187,13 +188,19 @@ Built in, by the whitelisted file's name:
   in a remote command (`ssh host ls -F`); `-o Include` is refused by `ssh` itself.
 - `sshd`, `sshd-session`, `sshd-auth`: run by any uid but 0 (logged as `word=uid`): `sshd -t -f`
   prints the config it names line by line, and only root runs the server.
+- `gpg`: `--export-secret-keys`, `--export-secret-subkeys`, `--export-secret-ssh-key`, `--enarmor`
+  (`--enarmour`) and `--store`, each in every abbreviation gpg accepts (`--export-se` up to the full
+  name: gpg runs any unambiguous prefix of a long option). The first three print secret keys,
+  the last two wrap any file gpg reads ([what they miss](limitations.md#whitelisted-programs-that-disclose-on-request)).
+- `kubectl`, `oc`: `config view --raw` (plain `config view` redacts keys and tokens).
+- `rclone`: `config show`, `config dump` (every remote's tokens and passwords).
 - JetBrains launchers (`idea`, `pycharm`, ..., Android Studio's `studio`): `installPlugins`, which
   installs a plugin from any repository; the plugin then runs in the IDE.
 - `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
   `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag (it reads the method from stdin).
 - `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,
   `fundchannel`, `multifundchannel`, `close`, `exposesecret`.
-- Every whitelisted binary: `SSL_CERT_FILE` or `SSL_CERT_DIR` (Go, OpenSSL, GnuTLS) or
+- Every whitelisted binary (built into the daemon, not the catalog): `SSL_CERT_FILE` or `SSL_CERT_DIR` (Go, OpenSSL, GnuTLS) or
   `NODE_EXTRA_CA_CERTS` (Node, Bun) set, which would make its TLS stack trust a certificate its
   caller chose and send its token to that server, and `NODE_TLS_REJECT_UNAUTHORIZED`, which can turn
   verification off. A value that is exactly a distribution's system bundle passes (`/etc/ssl/certs/ca-certificates.crt`,

@@ -9,11 +9,12 @@ import (
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/logging"
 )
 
-// launchRulesByPath maps each whitelisted binary's resolved path to its launch rules: the built-ins
-// of its config line's and its target's basenames, and the [launch_rules] naming either path.
+// launchRulesByPath maps each whitelisted binary's resolved path to its launch rules: the catalog's
+// for its config line's and its target's basenames, and the [launch_rules] naming either path.
 func launchRulesByPath(cfg *daemonconfig.Config) map[string][]daemonconfig.LaunchRule {
 	out := make(map[string][]daemonconfig.LaunchRule)
 	used := make([]bool, len(cfg.LaunchRules))
@@ -42,9 +43,9 @@ func launchRulesByPath(cfg *daemonconfig.Config) map[string][]daemonconfig.Launc
 
 // binaryLaunchRules lists b's rules, marking in used the [launch_rules] lines it takes.
 func binaryLaunchRules(cfg *daemonconfig.Config, b daemonconfig.BinaryRule, used []bool) []daemonconfig.LaunchRule {
-	rules := guard.BuiltinLaunchRules(filepath.Base(b.Path))
+	rules := install.CatalogLaunchRules(filepath.Base(b.Path))
 	if b.Link != "" && filepath.Base(b.Link) != filepath.Base(b.Path) {
-		rules = append(rules, guard.BuiltinLaunchRules(filepath.Base(b.Link))...)
+		rules = append(rules, install.CatalogLaunchRules(filepath.Base(b.Link))...)
 	}
 	for i, r := range cfg.LaunchRules {
 		if r.Path == b.Path || (b.Link != "" && r.Path == b.Link) {

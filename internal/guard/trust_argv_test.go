@@ -71,20 +71,9 @@ func TestCanonLaunchRulesKeyCoversAllowed(t *testing.T) {
 	}
 }
 
-func TestBuiltinLaunchRulesFit(t *testing.T) {
-	for name := range builtinLaunchRules {
-		rules, allowed, _ := canonLaunchRules(append(BuiltinLaunchRules(name), caEnvRules...), BuiltinAllowedEnv())
-		if _, _, err := encodeLaunchSet(rules, allowed); err != nil {
-			t.Errorf("%s: %v", name, err)
-		}
-		for _, r := range rules {
-			for _, w := range r.Words {
-				if len(w) > daemonconfig.MaxLaunchWordLen {
-					t.Errorf("%s: word %q too long", name, w)
-				}
-			}
-		}
-	}
+func deny(words ...string) daemonconfig.LaunchRule { return daemonconfig.LaunchRule{Words: words} }
+
+func TestBuiltinAllowedEnvFits(t *testing.T) {
 	var k GuardTrustArgvKey
 	for _, a := range BuiltinAllowedEnv() {
 		if _, err := daemonconfig.ParseAllowEnv(a); err != nil || len(a) >= len(k.Name) {
@@ -95,21 +84,27 @@ func TestBuiltinLaunchRulesFit(t *testing.T) {
 			t.Errorf("built-in %q allows a variable no CA rule names", a)
 		}
 	}
-	a := BuiltinLaunchRules("bitcoin-cli")
-	a = append(a, deny("mine"))
-	if b := BuiltinLaunchRules("litecoin-cli"); len(b) != len(a)-1 || b[len(b)-1].Words[0] == "mine" {
-		t.Fatal("BuiltinLaunchRules must return a copy")
-	}
 }
 
-func TestPiLaunchRulesRefuseExtensionLoaders(t *testing.T) {
-	rules := BuiltinLaunchRules("pi")
-	for _, want := range []daemonconfig.LaunchRule{deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"}} {
-		if !slices.ContainsFunc(rules, func(r daemonconfig.LaunchRule) bool {
-			return r.Env == want.Env && slices.Equal(r.Words, want.Words) && !r.Warn
-		}) {
-			t.Errorf("pi has no deny rule %+v: %+v", want, rules)
+func TestEncodeLaunchSetSpellsOutAbbreviations(t *testing.T) {
+	words, set, err := encodeLaunchSet([]daemonconfig.LaunchRule{deny("--sto[re]"), deny("x", "--ab[c]")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[argvEntry]uint64{
+		{argvWord, "--sto"}: 1, {argvWord, "--stor"}: 1, {argvWord, "--store"}: 1,
+		{argvWord, "x"}: 1 << 4, {argvWord, "--ab"}: 1 << 5, {argvWord, "--abc"}: 1 << 5,
+	}
+	if len(words) != len(want) || set.Lens != 1|2<<4 {
+		t.Fatalf("words = %v, lens %#x", words, set.Lens)
+	}
+	for e, v := range want {
+		if words[e] != v {
+			t.Errorf("%v = %#x, want %#x", e, words[e], v)
 		}
+	}
+	if _, _, err := encodeLaunchSet([]daemonconfig.LaunchRule{deny("sto[re]")}, nil); err == nil {
+		t.Fatal("a non-flag abbreviation must be refused")
 	}
 }
 
@@ -118,23 +113,6 @@ func TestCAEnvRulesCoverNode(t *testing.T) {
 	for _, env := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED"} {
 		if !slices.ContainsFunc(caEnvRules, func(r daemonconfig.LaunchRule) bool { return r.Env == env && !r.Warn }) {
 			t.Errorf("no CA env deny rule for %s", env)
-		}
-	}
-}
-
-// Env and config flags that redirect an agent's token or load a config of its caller's choosing.
-func TestAgentRedirectRules(t *testing.T) {
-	has := func(name, env string) bool {
-		return slices.ContainsFunc(BuiltinLaunchRules(name), func(r daemonconfig.LaunchRule) bool {
-			return r.Env == env && !r.Warn
-		})
-	}
-	for _, c := range [][2]string{
-		{"opencode", "OPENCODE_CONFIG"}, {"opencode", "OPENCODE_CONFIG_DIR"}, {"opencode", "OPENCODE_CONFIG_CONTENT"},
-		{"codex", "OPENAI_BASE_URL"},
-	} {
-		if !has(c[0], c[1]) {
-			t.Errorf("%s: no deny_env %s", c[0], c[1])
 		}
 	}
 }
@@ -157,36 +135,6 @@ func shortHit(set GuardTrustArgvSet, word string) bool {
 		}
 	}
 	return false
-}
-
-func TestSSHConfigFileRefusedInEveryCluster(t *testing.T) {
-	rules, allowed, _ := canonLaunchRules(BuiltinLaunchRules("ssh"), nil)
-	_, set, err := encodeLaunchSet(rules, allowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for word, want := range map[string]bool{
-		"-F": true, "-F/tmp/c": true, "-4F/tmp/c": true, "-vvqF": true, "-TF": true,
-		"-oF": false, "-oForwardAgent=yes": false, "-L8080:F": false, "-iF": false, "--F": false,
-		"-": false, "host": false, "-v": false,
-	} {
-		if got := shortHit(set, word); got != want {
-			t.Errorf("ssh %q: refused = %v, want %v", word, got, want)
-		}
-	}
-}
-
-func TestSSHServerBinariesAreRootOnly(t *testing.T) {
-	for _, n := range []string{"sshd", "sshd-session", "sshd-auth"} {
-		rules, allowed, _ := canonLaunchRules(BuiltinLaunchRules(n), nil)
-		_, set, err := encodeLaunchSet(rules, allowed)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if set.Flags&argvRootOnly == 0 || set.Lens != 0 {
-			t.Errorf("%s: flags %#x lens %#x, want root-only and no argv rule", n, set.Flags, set.Lens)
-		}
-	}
 }
 
 func TestShortMaskRefusesNonLetters(t *testing.T) {

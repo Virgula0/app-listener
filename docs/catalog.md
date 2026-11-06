@@ -28,6 +28,12 @@ each, and offers the ones that exist on your host. It covers, among others:
 The catalog narrows each watch to the sensitive subtrees, so apps that update themselves inside
 their own config directory keep working (see below).
 
+An entry also carries the [launch rules](binary-trust.md#launch-rules) of the CLIs it whitelists
+that print or spend its secret on request (`gh auth token`, `gpg --export-secret-keys`). The daemon
+applies them by the binary's file name in every section, a hand-written one too, so a rule changes
+with the catalog, never in the guard. Add your own in
+[`[launch_rules]`](config-reference.md#launch_rules).
+
 ### What an entry can't cover
 
 - **Tokens in the keyring.** These apps keep their main token in the Secret Service keyring by

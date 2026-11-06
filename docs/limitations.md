@@ -16,8 +16,21 @@ binary with arguments of its choosing gets whatever that binary prints.
 tripwire: a CLI has more ways to print a secret than any list names.
 
 Programs that read a configuration file can disclose too: `ssh` and `sshd` print each line of a
-config they can't parse, a key included. The built-in rules refuse `ssh -F` and any `sshd` not run
+config they can't parse, a key included. The catalog's rules refuse `ssh -F` and any `sshd` not run
 by root, the routes to a config of the caller's choosing.
+
+Some whitelisted CLIs also process any file they are given, so a rule only stops the one-command
+dump, never the copy:
+
+- `gpg`: the rules refuse `--export-secret-keys`, `--export-secret-subkeys`,
+  `--export-secret-ssh-key`, `--enarmor` and `--store` in every abbreviation gpg accepts, but
+  `gpg -e -r <their key> <file>` or `gpg -c <file>` still wraps any file gpg reads, the keys in
+  `~/.gnupg/private-keys-v1.d` included (they stay protected by their passphrase, if they have one).
+  pass needs `-e`, so it can't be refused.
+- `kubectl`, `oc`: `config view --raw` is refused, but
+  `kubectl create configmap x --from-file=<kubeconfig> --dry-run=client -o yaml` prints the file.
+- `rclone`: `config show` and `config dump` are refused, but `rclone cat <rclone.conf>` prints it.
+  Set a config password (`rclone config encryption set`) to keep it encrypted at rest.
 
 A browser or Electron app sends its cookies and tokens wherever its TLS stack trusts. The launch
 scan refuses the flags that redirect it (`--ignore-certificate-errors`, `--proxy-server`), but not a

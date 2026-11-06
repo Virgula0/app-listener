@@ -105,6 +105,55 @@ type CandidateDir struct {
 	// reserved there (guard_trust.bpf.c #3, buildGlobReservations), so those extractions load under
 	// trust while a non-writer can neither plant nor load one.
 	BunLaunchers []string
+	// LaunchRules mark risky launches (daemonconfig.LaunchRule) of a binary that prints or spends
+	// this entry's secret on request, keyed by the basename of one of its Whitelist binaries. The
+	// daemon applies every entry's rules to each whitelisted binary of that basename (or symlink
+	// target's), in any section: a rule only refuses more, so a name picks it; identity stays the inode.
+	LaunchRules map[string][]daemonconfig.LaunchRule
+}
+
+// jetbrainsLauncherNames are the basenames of the JetBrains IDEs' native launchers (bin/<name>; Android
+// Studio's is studio).
+var jetbrainsLauncherNames = []string{"idea", "pycharm", "webstorm", "clion", "goland", "phpstorm", "rider",
+	"datagrip", "rustrover", "rubymine", "dataspell", "studio"}
+
+func deny(words ...string) daemonconfig.LaunchRule { return daemonconfig.LaunchRule{Words: words} }
+
+func warn(words ...string) daemonconfig.LaunchRule {
+	return daemonconfig.LaunchRule{Words: words, Warn: true}
+}
+
+// denyEach is one single-word deny rule per word.
+func denyEach(words ...string) []daemonconfig.LaunchRule {
+	out := make([]daemonconfig.LaunchRule, 0, len(words))
+	for _, w := range words {
+		out = append(out, deny(w))
+	}
+	return out
+}
+
+// sshdRootOnly: sshd prints every line of the config -f names (`sshd -t -f ~/.ssh/id_ed25519`); only
+// root runs the server and its session and auth helpers.
+var sshdRootOnly = []daemonconfig.LaunchRule{{RootOnly: true}}
+
+// coinRules: an unlocked wallet's keys and funds over RPC; -stdin carries the method on stdin.
+var coinRules = denyEach("-stdin", "dumpprivkey", "dumpwallet", "walletpassphrase", "send", "sendall",
+	"sendmany", "sendtoaddress")
+
+// catalogLaunchRules indexes every entry's LaunchRules by basename.
+var catalogLaunchRules = func() map[string][]daemonconfig.LaunchRule {
+	m := map[string][]daemonconfig.LaunchRule{}
+	for i := range Catalog {
+		for name, rules := range Catalog[i].LaunchRules {
+			m[name] = append(m[name], rules...)
+		}
+	}
+	return m
+}()
+
+// CatalogLaunchRules returns a copy of the catalog's launch rules for a whitelisted binary named name.
+func CatalogLaunchRules(name string) []daemonconfig.LaunchRule {
+	return slices.Clone(catalogLaunchRules[name])
 }
 
 // BunTmpRelDir is the home-relative shared directory Bun launchers redirect $TMPDIR to, so a Bun
@@ -155,7 +204,7 @@ var Catalog = []CandidateDir{
 	{Name: "SSH client configuration and keys", RelPaths: []string{".ssh"},
 		// ssh needs WRITE (known_hosts rotation), MKNOD + CONNECT (binding / reaching a ControlMaster
 		// socket here); sshd and its helpers (sshd-auth/-session) only READ authorized_keys, as root
-		// (a built-in launch rule: run by a user, `sshd -t -f <key>` prints it);
+		// (a launch rule: run by a user, `sshd -t -f <key>` prints it);
 		// keysign/pkcs11/cleanup helpers are inert. Not scp, sftp or sftp-server: they copy or serve
 		// whatever file their caller names (their ssh child reads the keys); nor git, which reads keys.
 		Whitelist: map[string][]string{
@@ -176,6 +225,11 @@ var Catalog = []CandidateDir{
 			"/usr/lib/openssh/ssh-pkcs11-helper":   nil,
 			"/usr/lib/ssh/ssh-pkcs11-helper":       nil,
 			"/usr/lib/openssh/ssh-session-cleanup": nil,
+		},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{
+			// -F: a config file of the caller's choosing, whose every line a parse error prints (a key).
+			"ssh":  {{Short: &daemonconfig.ShortOpts{Deny: "F", Args: "BbcDEeFIiJLlmOoPpQRSWw"}}},
+			"sshd": sshdRootOnly, "sshd-session": sshdRootOnly, "sshd-auth": sshdRootOnly,
 		}},
 	{Name: "GNU Privacy Guard keyring", RelPaths: []string{".gnupg"},
 		// Without /run/user, gpg-agent's sockets (S.gpg-agent.ssh too) live here: ssh may connect.
@@ -183,7 +237,14 @@ var Catalog = []CandidateDir{
 			"/usr/bin/gpg": nil, "/usr/bin/gpg-agent": nil,
 			"/usr/bin/gpgconf": nil, "/usr/bin/gpg-connect-agent": nil,
 			"/usr/bin/ssh": {"CONNECT"}, "/usr/bin/ssh-add": {"CONNECT"},
-		}},
+		},
+		// gpg takes any unambiguous abbreviation of a long option: each rule names every spelling from
+		// the shortest only these options start. --enarmor / --store wrap any file gpg reads
+		// (private-keys-v1.d too); -e -r <key> and -c still do (docs/limitations.md).
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"gpg": {
+			deny("--export-se[cret-keys]"), deny("--export-se[cret-subkeys]"), deny("--export-se[cret-ssh-key]"),
+			deny("--enar[mor]"), deny("--enar[mour]"), deny("--sto[re]"),
+		}}},
 	// Agent sockets in /run/user/<uid>: without a guard there, any of the user's programs can ask
 	// the agent to sign or decrypt. Nothing may DELETE that could remove the root (a crafted user
 	// unit's RuntimeDirectory= has systemd rm -rf it, gpgconf --remove-socketdir rmdirs it); the
@@ -285,7 +346,11 @@ var Catalog = []CandidateDir{
 			"/usr/local/bin/opencode": nil, "/usr/bin/opencode": nil,
 			"%HOME%/.local/bin/opencode": nil,
 		},
-		BunLaunchers: []string{"opencode"}},
+		BunLaunchers: []string{"opencode"},
+		// A config of the caller's choosing (plugins, provider base URLs); a key it sends elsewhere.
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"opencode": {
+			{Env: "OPENCODE_CONFIG"}, {Env: "OPENCODE_CONFIG_DIR"}, {Env: "OPENCODE_CONFIG_CONTENT"},
+		}}},
 	// `opencode serve` (default port) drives the agent with the user's provider credentials and
 	// has no authentication. The TUI's own server takes a random port, which no section can name.
 	{Name: "opencode server", Ports: []uint16{4096},
@@ -351,7 +416,11 @@ var Catalog = []CandidateDir{
 			".codex/auth.json", ".codex/.credentials.json", ".codex/config.toml",
 			".codex/history.jsonl", ".codex/sessions", ".codex/archived_sessions",
 		},
-		Whitelist: codexBinaries},
+		Whitelist: codexBinaries,
+		// -c overrides any config key, base URLs included: too common to refuse, so logged.
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"codex": {
+			{Env: "OPENAI_BASE_URL"}, warn("-c"), warn("--config"),
+		}}},
 	// pi's installer and npm install a node script (its own install lives in ~/.pi/agent/install), so
 	// only the release tarball's Bun binary matches; otherwise pi is denied like gcloud. pi runs, in its
 	// own process, every extension in extensions/, the packages in npm/ and git/, and a trusted
@@ -364,7 +433,12 @@ var Catalog = []CandidateDir{
 		SeedWatchPaths: map[string]string{".pi/agent/extensions": "", ".pi/agent/trust.json": "{}\n"},
 		Whitelist: map[string][]string{
 			"%HOME%/.local/bin/pi": nil, "/usr/local/bin/pi": nil, "/opt/pi/pi": nil,
-		}},
+		},
+		// pi runs an extension -e names in its own process; PI_CODING_AGENT_DIR points it at an agent
+		// dir whose extensions/ the caller wrote.
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"pi": {
+			deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"},
+		}}},
 	{Name: "Cursor", RelPaths: []string{".cursor"},
 		Whitelist: map[string][]string{
 			"/usr/bin/cursor": nil, "/usr/local/bin/cursor": nil,
@@ -441,7 +515,9 @@ var Catalog = []CandidateDir{
 		// and updates them.
 		LibDirRelPaths: []string{".local/share/JetBrains"},
 		LibDirWriters: append(jetbrainsLauncherPaths(),
-			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox")},
+			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox"),
+		// A launcher installs any plugin from any repository it is given; the plugin then runs in the IDE.
+		LaunchRules: jetbrainsLaunchRules()},
 	// Config (~/.config/zed) and data (~/.local/share/zed, holds the auth token): one resource, two
 	// watch roots.
 	{Name: "Zed editor", RelPaths: []string{".config/zed", ".local/share/zed"},
@@ -475,7 +551,10 @@ var Catalog = []CandidateDir{
 
 	// --- Cloud, containers and dev tooling --------------------------------------
 	{Name: "AWS credentials", RelPaths: []string{".aws"},
-		Whitelist: map[string][]string{"/usr/bin/aws": nil}},
+		Whitelist: map[string][]string{"/usr/bin/aws": nil},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"aws": {
+			deny("configure", "export-credentials"), deny("configure", "get"),
+		}}},
 	{Name: "Google Cloud SDK", RelPaths: []string{".config/gcloud"},
 		// Python launchers: the exe is the interpreter, so these lines never match and are never
 		// written (FilterExistingWhitelist): the section guards the tree against everyone, gcloud too.
@@ -484,7 +563,12 @@ var Catalog = []CandidateDir{
 		Whitelist: map[string][]string{"/usr/bin/kubectl": nil, "/usr/bin/helm": nil, "/usr/bin/oc": nil,
 			"/usr/lib/docker/cli-plugins/docker-buildx":     nil,
 			"/usr/libexec/docker/cli-plugins/docker-buildx": nil,
-			"%HOME%/.docker/cli-plugins/docker-buildx":      nil}},
+			"%HOME%/.docker/cli-plugins/docker-buildx":      nil},
+		// Only --raw prints the inline client keys and tokens; `config view` alone redacts them.
+		// `create ... --from-file=<kubeconfig> --dry-run=client -o yaml` still prints it (docs/limitations.md).
+		LaunchRules: map[string][]daemonconfig.LaunchRule{
+			"kubectl": {deny("config", "view", "--raw")}, "oc": {deny("config", "view", "--raw")},
+		}},
 	{Name: "Docker config and credentials", RelPaths: []string{".docker"},
 		Whitelist: map[string][]string{"/usr/bin/docker": nil, "/usr/bin/docker-credential-desktop": nil, "/usr/bin/docker-credential-pass": nil,
 			"/usr/lib/docker/cli-plugins/docker-buildx":     nil,
@@ -497,12 +581,21 @@ var Catalog = []CandidateDir{
 			"%HOME%/.local/bin/gh":              nil,
 			"/home/linuxbrew/.linuxbrew/bin/gh": nil,
 			"/snap/bin/gh":                      nil,
-		}},
+		},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"gh": {
+			deny("auth", "token"), deny("auth", "status", "--show-token"), deny("auth", "status", "-t"),
+			deny("alias", "set"), deny("alias", "import"),
+			// git's credential helper: denying it breaks every git push, so it is only logged.
+			warn("auth", "git-credential"),
+		}}},
 	// A Python app: its lines never match (see Google Cloud SDK).
 	{Name: "Azure CLI", RelPaths: []string{".azure", ".config/azure"},
 		Whitelist: map[string][]string{"/usr/bin/az": nil}},
 	{Name: "rclone config", RelPaths: []string{".config/rclone"},
-		Whitelist: map[string][]string{"/usr/bin/rclone": nil}},
+		Whitelist: map[string][]string{"/usr/bin/rclone": nil},
+		// The remotes' tokens and passwords (obscured, which `rclone reveal` undoes). `rclone cat` of the
+		// config still prints it (docs/limitations.md).
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"rclone": {deny("config", "show"), deny("config", "dump")}}},
 	{Name: "Ollama config", RelPaths: []string{".ollama"},
 		Whitelist: map[string][]string{"/usr/bin/ollama": nil}},
 	// No authentication: any local process can run, pull or delete models. Other clients (a web UI,
@@ -550,9 +643,11 @@ var Catalog = []CandidateDir{
 	// the datadir root as .cookie.tmp then renamed, outside any guarded tree: these entries appear
 	// once you create rpc/ and set `rpccookiefile=rpc/.cookie` (docs/catalog.md).
 	{Name: "Bitcoin Core RPC cookie", RelPaths: []string{".bitcoin/rpc"},
-		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil}},
+		Whitelist:   map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"bitcoin-cli": coinRules}},
 	{Name: "Litecoin Core RPC cookie", RelPaths: []string{".litecoin/rpc"},
-		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil, "/usr/bin/litecoin-cli": nil}},
+		Whitelist:   map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil, "/usr/bin/litecoin-cli": nil},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"litecoin-cli": coinRules}},
 	// RPC over loopback TCP (mainnet, testnet3, regtest; signet and testnet4 sit in the default
 	// ephemeral range). With rpcuser/rpcpassword in bitcoin.conf a client needs no cookie at all,
 	// and a process listening on a stopped node's port collects the credentials clients send.
@@ -592,7 +687,9 @@ var Catalog = []CandidateDir{
 	{Name: "LND (Lightning Network Daemon)", RelPaths: []string{".lnd"},
 		Whitelist: map[string][]string{"/usr/bin/lnd": nil, "/usr/bin/lncli": nil}},
 	{Name: "Core Lightning", RelPaths: []string{".lightning"},
-		Whitelist: map[string][]string{"/usr/bin/lightningd": nil, "/usr/bin/lightning-cli": nil}},
+		Whitelist: map[string][]string{"/usr/bin/lightningd": nil, "/usr/bin/lightning-cli": nil},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"lightning-cli": denyEach("pay", "xpay", "renepay",
+			"keysend", "withdraw", "sendpay", "sendonion", "fundchannel", "multifundchannel", "close", "exposesecret")}},
 	// Binaries live inside the guarded dir next to the keystores: glob needed.
 	{Name: "Foundry", RelPaths: []string{".foundry"},
 		Whitelist: map[string][]string{"%HOME%/.foundry/bin/*": nil}},
@@ -853,11 +950,19 @@ func (c *CandidateDir) ExtraWatchPathsFor(home, user string) []string {
 
 // jetbrainsLauncherPaths are the native launchers under /opt/* and GoLand's ~/.goland install.
 func jetbrainsLauncherPaths() []string {
-	out := make([]string, 0, len(guard.JetBrainsLaunchers)+1)
-	for _, n := range guard.JetBrainsLaunchers {
+	out := make([]string, 0, len(jetbrainsLauncherNames)+1)
+	for _, n := range jetbrainsLauncherNames {
 		out = append(out, "/opt/*/bin/"+n)
 	}
 	return append(out, "%HOME%/.goland/bin/goland")
+}
+
+func jetbrainsLaunchRules() map[string][]daemonconfig.LaunchRule {
+	m := make(map[string][]daemonconfig.LaunchRule, len(jetbrainsLauncherNames))
+	for _, n := range jetbrainsLauncherNames {
+		m[n] = []daemonconfig.LaunchRule{deny("installPlugins")}
+	}
+	return m
 }
 
 // jetbrainsLaunchers adds every launcher to wl with events.

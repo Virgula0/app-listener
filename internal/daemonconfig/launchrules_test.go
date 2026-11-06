@@ -35,6 +35,12 @@ func TestLaunchRulesBlockRejectsMalformedLines(t *testing.T) {
 		"no words":          "deny_args /usr/bin/gh",
 		"five words":        "deny_args /usr/bin/gh a b c d e",
 		"flag with value":   "deny_args /usr/bin/gh --hostname=x",
+		"abbrev not a flag": "deny_args /usr/bin/gpg sto[re]",
+		"abbrev unclosed":   "deny_args /usr/bin/gpg --sto[re",
+		"abbrev empty":      "deny_args /usr/bin/gpg --sto[]",
+		"abbrev dashes":     "deny_args /usr/bin/gpg --[store]",
+		"abbrev nested":     "deny_args /usr/bin/gpg --s[t[ore]]",
+		"abbrev too long":   "deny_args /usr/bin/gpg --a[" + strings.Repeat("w", MaxLaunchWordLen) + "]",
 		"long word":         "deny_args /usr/bin/gh " + strings.Repeat("w", MaxLaunchWordLen+1),
 		"two env names":     "deny_env /usr/bin/gh A B",
 		"bad env name":      "deny_env /usr/bin/gh 1PROXY",
@@ -61,5 +67,23 @@ func TestLaunchRulesBlockRejectsMalformedLines(t *testing.T) {
 	}
 	if _, err := Load(writeConfig(t, b.String())); err == nil {
 		t.Fatal("more than MaxLaunchRules argv rules for one binary must be refused")
+	}
+}
+
+func TestLaunchWordForms(t *testing.T) {
+	for w, want := range map[string][]string{
+		"token":     {"token"},
+		"--raw":     {"--raw"},
+		"--sto[re]": {"--sto", "--stor", "--store"},
+		"-x[y]":     {"-x", "-xy"},
+	} {
+		got, err := LaunchWordForms(w)
+		if err != nil || !slices.Equal(got, want) {
+			t.Errorf("LaunchWordForms(%q) = %v, %v; want %v", w, got, err, want)
+		}
+	}
+	cfg, err := Load(writeConfig(t, "[launch_rules]\ndeny_args /usr/bin/gpg --export-se[cret-keys]\n"))
+	if err != nil || len(cfg.LaunchRules) != 1 || cfg.LaunchRules[0].Words[0] != "--export-se[cret-keys]" {
+		t.Fatalf("an abbreviation line: %+v, %v", cfg, err)
 	}
 }

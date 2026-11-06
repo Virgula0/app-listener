@@ -24,62 +24,6 @@ const (
 	argvRootOnly        = 1
 )
 
-// JetBrainsLaunchers are the basenames of the JetBrains IDEs' native launchers (bin/<name>; Android
-// Studio's is studio).
-var JetBrainsLaunchers = []string{"idea", "pycharm", "webstorm", "clion", "goland", "phpstorm", "rider",
-	"datagrip", "rustrover", "rubymine", "dataspell", "studio"}
-
-func deny(words ...string) daemonconfig.LaunchRule { return daemonconfig.LaunchRule{Words: words} }
-
-// builtinLaunchRules: CLIs that print or spend their secret on request, keyed by the whitelist line's
-// basename. A rule only adds denials, so picking it by name weakens nothing; identity stays the inode.
-var builtinLaunchRules = func() map[string][]daemonconfig.LaunchRule {
-	each := func(words ...string) []daemonconfig.LaunchRule {
-		out := make([]daemonconfig.LaunchRule, 0, len(words))
-		for _, w := range words {
-			out = append(out, deny(w))
-		}
-		return out
-	}
-	// -stdin carries the method on stdin.
-	coin := each("-stdin", "dumpprivkey", "dumpwallet", "walletpassphrase", "send", "sendall", "sendmany",
-		"sendtoaddress")
-	lightning := each("pay", "xpay", "renepay", "keysend", "withdraw", "sendpay", "sendonion", "fundchannel",
-		"multifundchannel", "close", "exposesecret")
-	m := map[string][]daemonconfig.LaunchRule{
-		"gh": {
-			deny("auth", "token"), deny("auth", "status", "--show-token"), deny("auth", "status", "-t"),
-			deny("alias", "set"), deny("alias", "import"),
-			// git's credential helper: denying it breaks every git push, so it is only logged.
-			{Words: []string{"auth", "git-credential"}, Warn: true},
-		},
-		"aws": {deny("configure", "export-credentials"), deny("configure", "get")},
-		// pi runs an extension -e names in its own process; PI_CODING_AGENT_DIR points it at an agent
-		// dir whose extensions/ the caller wrote.
-		"pi": {deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"}},
-		// A config of the caller's choosing (plugins, provider base URLs); a key it sends elsewhere.
-		"opencode": {{Env: "OPENCODE_CONFIG"}, {Env: "OPENCODE_CONFIG_DIR"}, {Env: "OPENCODE_CONFIG_CONTENT"}},
-		// -c overrides any config key, base URLs included: too common to refuse, so logged.
-		"codex": {{Env: "OPENAI_BASE_URL"}, {Words: []string{"-c"}, Warn: true}, {Words: []string{"--config"}, Warn: true}},
-		// -F: a config file of the caller's choosing, whose every line a parse error prints (a key).
-		"ssh":           {{Short: &daemonconfig.ShortOpts{Deny: "F", Args: "BbcDEeFIiJLlmOoPpQRSWw"}}},
-		"bitcoin-cli":   coin,
-		"litecoin-cli":  coin,
-		"lightning-cli": lightning,
-	}
-	// A JetBrains launcher installs any plugin from any repository it is given; the plugin then runs
-	// in the IDE.
-	for _, n := range JetBrainsLaunchers {
-		m[n] = []daemonconfig.LaunchRule{deny("installPlugins")}
-	}
-	// sshd prints every line of the config -f names (`sshd -t -f ~/.ssh/id_ed25519`); only root
-	// runs the server and its session and auth helpers.
-	for _, n := range []string{"sshd", "sshd-session", "sshd-auth"} {
-		m[n] = []daemonconfig.LaunchRule{{RootOnly: true}}
-	}
-	return m
-}()
-
 // caEnvRules: Go's crypto/x509, OpenSSL and GnuTLS trust SSL_CERT_FILE / SSL_CERT_DIR, Node and Bun
 // NODE_EXTRA_CA_CERTS, and NODE_TLS_REJECT_UNAUTHORIZED=0 trusts any certificate: a caller setting
 // one makes a whitelisted client hand its token to a TLS server it chose. Every whitelisted binary
@@ -104,11 +48,6 @@ var builtinAllowedEnv = []string{
 	"SSL_CERT_DIR=/etc/pki/tls/certs",
 }
 
-// BuiltinLaunchRules returns a copy of the built-in rules for a whitelisted binary named name.
-func BuiltinLaunchRules(name string) []daemonconfig.LaunchRule {
-	return slices.Clone(builtinLaunchRules[name])
-}
-
 // BuiltinAllowedEnv returns a copy of the built-in NAME=value strings no env rule matches; the
 // caller vets each path as it does allow_env lines.
 func BuiltinAllowedEnv() []string {
@@ -120,10 +59,9 @@ type argvEntry struct {
 	name string
 }
 
-// encodeLaunchSet lays rules out as trust_argv entries and their trust_argv_sets row: argv rule i's
-// word j sets bit i*argvWords+j of that word's entry; an env name maps to argvDeny, or argvWarn when
-// every rule naming it only warns; each allowed NAME=value is an argvEnvOK entry. rules must be
-// canonical (canonLaunchRules).
+// encodeLaunchSet lays rules out as trust_argv entries and their trust_argv_sets row (see
+// encodeArgvRule); an env name maps to argvDeny, or argvWarn when every rule naming it only warns;
+// each allowed NAME=value is an argvEnvOK entry. rules must be canonical (canonLaunchRules).
 func encodeLaunchSet(rules []daemonconfig.LaunchRule, allowed []string) (map[argvEntry]uint64,
 	GuardTrustArgvSet, error) {
 	words := map[argvEntry]uint64{}
@@ -133,32 +71,46 @@ func encodeLaunchSet(rules []daemonconfig.LaunchRule, allowed []string) (map[arg
 	var set GuardTrustArgvSet
 	i := 0
 	for _, r := range rules {
-		if r.RootOnly || r.Short != nil {
-			if err := encodeSetFlags(&set, &r); err != nil {
-				return nil, set, err
-			}
-			continue
-		}
-		if r.Env != "" {
+		var err error
+		switch {
+		case r.RootOnly || r.Short != nil:
+			err = encodeSetFlags(&set, &r)
+		case r.Env != "":
 			encodeEnvRule(words, &r)
-			continue
+		default:
+			err = encodeArgvRule(words, &set, &r, i)
+			i++
 		}
-		if i >= argvRules {
-			return nil, set, fmt.Errorf("more than %d argv rules", argvRules)
+		if err != nil {
+			return nil, set, err
 		}
-		if len(r.Words) == 0 || len(r.Words) > argvWords {
-			return nil, set, fmt.Errorf("argv rule %q: 1 to %d words", strings.Join(r.Words, " "), argvWords)
-		}
-		for j, w := range r.Words {
-			words[argvEntry{argvWord, w}] |= 1 << (i*argvWords + j)
-		}
-		set.Lens |= uint64(len(r.Words)) << (i * 4)
-		if r.Warn {
-			set.Warn |= 1 << i
-		}
-		i++
 	}
 	return words, set, nil
+}
+
+// encodeArgvRule records argv rule i: its word j sets bit i*argvWords+j of each of that word's
+// forms' entries. An abbreviation's every spelling is an exact key, so the kernel needs no prefix match.
+func encodeArgvRule(words map[argvEntry]uint64, set *GuardTrustArgvSet, r *daemonconfig.LaunchRule, i int) error {
+	if i >= argvRules {
+		return fmt.Errorf("more than %d argv rules", argvRules)
+	}
+	if len(r.Words) == 0 || len(r.Words) > argvWords {
+		return fmt.Errorf("argv rule %q: 1 to %d words", strings.Join(r.Words, " "), argvWords)
+	}
+	for j, w := range r.Words {
+		forms, err := daemonconfig.LaunchWordForms(w)
+		if err != nil {
+			return err
+		}
+		for _, f := range forms {
+			words[argvEntry{argvWord, f}] |= 1 << (i*argvWords + j)
+		}
+	}
+	set.Lens |= uint64(len(r.Words)) << (i * 4)
+	if r.Warn {
+		set.Warn |= 1 << i
+	}
+	return nil
 }
 
 // encodeEnvRule maps an env rule's name to argvDeny, or argvWarn while every rule naming it warns.

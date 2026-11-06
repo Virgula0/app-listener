@@ -34,7 +34,7 @@ func TestLaunchRulesByPath(t *testing.T) {
 		t.Errorf("ssh = %+v", ssh)
 	}
 	if len(got["/home/u/.local/bin/bitcoin-cli"]) != 8 {
-		t.Errorf("a pending bitcoin-cli gets its built-ins: %+v", got["/home/u/.local/bin/bitcoin-cli"])
+		t.Errorf("a pending bitcoin-cli gets its catalog rules: %+v", got["/home/u/.local/bin/bitcoin-cli"])
 	}
 	if _, ok := got["/usr/bin/gh-helper"]; ok {
 		t.Error("a lib_binary line is no whitelisted exe")

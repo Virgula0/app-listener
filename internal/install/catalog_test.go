@@ -1,6 +1,7 @@
 package install
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1088,5 +1089,54 @@ func TestRuntimeServersGateTheOffer(t *testing.T) {
 	Catalog[i].RuntimeServers = []string{filepath.Join(home, "missing"), server}
 	if !offered() {
 		t.Fatal("not offered with its server installed")
+	}
+}
+
+// A rule sits beside the binary it judges: its key is the basename of one of the entry's lines.
+func TestCatalogLaunchRulesKeyedByWhitelistBasename(t *testing.T) {
+	for _, entry := range Catalog {
+		for name, rules := range entry.LaunchRules {
+			if len(rules) == 0 || !slices.ContainsFunc(slices.Collect(maps.Keys(entry.Whitelist)),
+				func(p string) bool { return filepath.Base(p) == name }) {
+				t.Errorf("%s: launch rules for %q, no whitelisted binary of that name (or no rule)", entry.Name, name)
+			}
+			for _, r := range rules {
+				for _, w := range r.Words {
+					if _, err := daemonconfig.LaunchWordForms(w); err != nil {
+						t.Errorf("%s: %v", entry.Name, err)
+					}
+				}
+			}
+		}
+	}
+	a := CatalogLaunchRules("bitcoin-cli")
+	a[0].Words = []string{"mine"}
+	if CatalogLaunchRules("litecoin-cli")[0].Words[0] == "mine" || CatalogLaunchRules("bitcoin-cli")[0].Words[0] == "mine" {
+		t.Fatal("CatalogLaunchRules must return a copy")
+	}
+}
+
+// Extension loaders, and env and config flags that redirect an agent's token or load a config of
+// its caller's choosing.
+func TestCatalogAgentLaunchRules(t *testing.T) {
+	has := func(name string, want daemonconfig.LaunchRule) bool {
+		return slices.ContainsFunc(CatalogLaunchRules(name), func(r daemonconfig.LaunchRule) bool {
+			return r.Env == want.Env && slices.Equal(r.Words, want.Words) && !r.Warn
+		})
+	}
+	for name, rules := range map[string][]daemonconfig.LaunchRule{
+		"pi":       {deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"}},
+		"opencode": {{Env: "OPENCODE_CONFIG"}, {Env: "OPENCODE_CONFIG_DIR"}, {Env: "OPENCODE_CONFIG_CONTENT"}},
+		"codex":    {{Env: "OPENAI_BASE_URL"}},
+		"kubectl":  {deny("config", "view", "--raw")},
+		"oc":       {deny("config", "view", "--raw")},
+		"rclone":   {deny("config", "show"), deny("config", "dump")},
+		"idea":     {deny("installPlugins")},
+	} {
+		for _, want := range rules {
+			if !has(name, want) {
+				t.Errorf("%s has no deny rule %+v: %+v", name, want, CatalogLaunchRules(name))
+			}
+		}
 	}
 }

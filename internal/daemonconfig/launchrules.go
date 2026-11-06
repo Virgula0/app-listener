@@ -7,21 +7,21 @@ import (
 	"strings"
 )
 
-// LaunchRule is one [launch_rules] line, on top of the built-in rules (guard/trust_argv.go). Words: an
-// argv rule, its words matched in order anywhere in the launch's argv (a flag word compared up to
-// '='). Env instead: a variable whose presence matches. A match marks the launch code-suspect (a
-// tripwire, never a boundary); Warn only logs it.
+// LaunchRule is one [launch_rules] line, or a catalog entry's (install.CandidateDir.LaunchRules).
+// Words: an argv rule, its words matched in order anywhere in the launch's argv (a flag word compared
+// up to '=', see LaunchWordForms). Env instead: a variable whose presence matches. A match marks the
+// launch code-suspect (a tripwire, never a boundary); Warn only logs it.
 type LaunchRule struct {
 	Path  string
 	Words []string
 	Env   string
 	Warn  bool
-	// Built-in only (no config syntax). RootOnly: a launch by any uid but 0 matches.
+	// Catalog only (no config syntax). RootOnly: a launch by any uid but 0 matches.
 	RootOnly bool
 	Short    *ShortOpts
 }
 
-// ShortOpts (built-in only): getopt letters refused anywhere in an option cluster before one of
+// ShortOpts (catalog only): getopt letters refused anywhere in an option cluster before one of
 // Args, the letters taking the rest of it as their value.
 type ShortOpts struct{ Deny, Args string }
 
@@ -104,15 +104,36 @@ func parseLaunchRule(line string) (LaunchRule, error) {
 		return r, fmt.Errorf("%s takes 1 to %d words, got %q", kw, MaxLaunchRuleWords, words)
 	}
 	for _, w := range fields {
-		if len(w) > MaxLaunchWordLen {
-			return r, fmt.Errorf("launch rule word %q is longer than %d bytes", w, MaxLaunchWordLen)
-		}
-		if strings.HasPrefix(w, "-") && strings.Contains(w, "=") {
-			return r, fmt.Errorf("launch rule flag %q: a flag is compared up to '=', so name it without a value", w)
+		if _, err := LaunchWordForms(w); err != nil {
+			return r, err
 		}
 	}
 	r.Words = fields
 	return r, nil
+}
+
+// LaunchWordForms lists the argv words a rule word matches: itself, or for a flag written
+// `--name[rest]` every prefix from --name to --namerest. gpg (like getopt_long) takes any
+// unambiguous abbreviation of a long option, so `--export-secret-ke` runs --export-secret-keys.
+func LaunchWordForms(w string) ([]string, error) {
+	base, rest, abbrev := strings.Cut(w, "[")
+	tail, closed := strings.CutSuffix(rest, "]")
+	switch {
+	case len(base)+len(tail) > MaxLaunchWordLen:
+		return nil, fmt.Errorf("launch rule word %q is longer than %d bytes", w, MaxLaunchWordLen)
+	case strings.HasPrefix(w, "-") && strings.Contains(w, "="):
+		return nil, fmt.Errorf("launch rule flag %q: a flag is compared up to '=', so name it without a value", w)
+	case !abbrev:
+		return []string{w}, nil
+	case !closed || tail == "" || strings.ContainsAny(tail, "[]") || !strings.HasPrefix(base, "-") ||
+		strings.TrimLeft(base, "-") == "":
+		return nil, fmt.Errorf("launch rule word %q: only a flag abbreviates, written --name[rest]", w)
+	}
+	out := make([]string, 0, len(tail)+1)
+	for i := range len(tail) + 1 {
+		out = append(out, base+tail[:i])
+	}
+	return out, nil
 }
 
 // ParseAllowEnv checks an allow_env NAME=/path: one clean absolute path, no ':' (SSL_CERT_DIR reads

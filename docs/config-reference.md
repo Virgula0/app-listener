@@ -338,7 +338,7 @@ warn_env /usr/bin/terraform TF_LOG
 allow_env SSL_CERT_FILE=/etc/corp/ca-bundle.pem
 ```
 
-Marks risky launches of whitelisted binaries, on top of the built-in rules
+Marks risky launches of whitelisted binaries, on top of the catalog's rules
 ([what a mark does](binary-trust.md#launch-rules)). The `<binary>` of a rule is an absolute path
 of a whitelisted line, as written or its symlink's target; a rule naming any other path does
 nothing and is logged. Each rule once.
@@ -353,9 +353,13 @@ warn_args /usr/bin/kubectl config view --raw
 `deny_args <binary> <word>...` marks a launch whose arguments hold the 1 to 4 words in this order,
 anything between them. `warn_args` only logs the match (`ARGV comm=... word=...`).
 
-- A word is at most 43 bytes.
+- A word is at most 43 bytes (an abbreviation spelled out in full).
 - A word starting with `-` is a flag, compared up to `=`: write it without a value (`--raw`, not
   `--raw=true`, which is refused).
+- `--name[rest]` matches every abbreviation from `--name` to `--namerest`, for a program that runs
+  any unambiguous prefix of a long option (gpg, getopt_long): `deny_args /usr/bin/gpg
+  --export-se[cret-keys]` refuses `--export-se`, `--export-sec`, ..., `--export-secret-keys`. Only a
+  flag abbreviates, and `--name` must hold more than the dashes.
 - At most 16 argument rules per binary, built-ins included.
 
 ### `deny_env`, `warn_env`
