@@ -16,7 +16,14 @@ type LaunchRule struct {
 	Words []string
 	Env   string
 	Warn  bool
+	// Built-in only (no config syntax). RootOnly: a launch by any uid but 0 matches.
+	RootOnly bool
+	Short    *ShortOpts
 }
+
+// ShortOpts (built-in only): getopt letters refused anywhere in an option cluster before one of
+// Args, the letters taking the rest of it as their value.
+type ShortOpts struct{ Deny, Args string }
 
 // MaxLaunchRuleWords, MaxLaunchWordLen, MaxLaunchRules and MaxAllowEnvLen bound rules to the
 // kernel's (guard_trust.bpf.c ARGV_WORDS, LAUNCH_KEY with its NUL, ARGV_RULES argv rules per binary,

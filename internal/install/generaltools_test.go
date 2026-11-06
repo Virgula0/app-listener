@@ -81,8 +81,7 @@ func TestWarnWhitelistLines_OneWarningPerScriptSet(t *testing.T) {
 func TestCatalogWhitelistsNoGeneralTool(t *testing.T) {
 	for _, e := range Catalog {
 		for bin := range e.Whitelist {
-			// git reads its own config on every run (the section's comment).
-			if namedGeneralTool(bin) && (e.Name != "Git config directory" || bin != "/usr/bin/git") {
+			if namedGeneralTool(bin) {
 				t.Errorf("%s whitelists general tool %s", e.Name, bin)
 			}
 		}

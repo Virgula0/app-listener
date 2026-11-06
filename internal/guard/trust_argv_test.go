@@ -138,3 +138,62 @@ func TestAgentRedirectRules(t *testing.T) {
 		}
 	}
 }
+
+// shortHit mirrors guard_trust.bpf.c argv_short over set's masks.
+func shortHit(set GuardTrustArgvSet, word string) bool {
+	if set.ShortDeny == 0 || len(word) < 2 || word[0] != '-' || word[1] == '-' {
+		return false
+	}
+	for j := 1; j < len(word) && j < 32; j++ {
+		m, err := shortMask(word[j : j+1])
+		if err != nil {
+			return false
+		}
+		if set.ShortDeny&m != 0 {
+			return true
+		}
+		if set.ShortArg&m != 0 {
+			return false
+		}
+	}
+	return false
+}
+
+func TestSSHConfigFileRefusedInEveryCluster(t *testing.T) {
+	rules, allowed, _ := canonLaunchRules(BuiltinLaunchRules("ssh"), nil)
+	_, set, err := encodeLaunchSet(rules, allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for word, want := range map[string]bool{
+		"-F": true, "-F/tmp/c": true, "-4F/tmp/c": true, "-vvqF": true, "-TF": true,
+		"-oF": false, "-oForwardAgent=yes": false, "-L8080:F": false, "-iF": false, "--F": false,
+		"-": false, "host": false, "-v": false,
+	} {
+		if got := shortHit(set, word); got != want {
+			t.Errorf("ssh %q: refused = %v, want %v", word, got, want)
+		}
+	}
+}
+
+func TestSSHServerBinariesAreRootOnly(t *testing.T) {
+	for _, n := range []string{"sshd", "sshd-session", "sshd-auth"} {
+		rules, allowed, _ := canonLaunchRules(BuiltinLaunchRules(n), nil)
+		_, set, err := encodeLaunchSet(rules, allowed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if set.Flags&argvRootOnly == 0 || set.Lens != 0 {
+			t.Errorf("%s: flags %#x lens %#x, want root-only and no argv rule", n, set.Flags, set.Lens)
+		}
+	}
+}
+
+func TestShortMaskRefusesNonLetters(t *testing.T) {
+	if _, err := shortMask("F-"); err == nil {
+		t.Fatal("a '-' got a bit")
+	}
+	if m, _ := shortMask("Aa0"); m != 1|1<<26|1<<52 {
+		t.Fatalf("mask %#x", m)
+	}
+}

@@ -154,7 +154,8 @@ var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPaths: []string{".ssh"},
 		// ssh needs WRITE (known_hosts rotation), MKNOD + CONNECT (binding / reaching a ControlMaster
-		// socket here); sshd and its helpers (sshd-auth/-session) only READ authorized_keys;
+		// socket here); sshd and its helpers (sshd-auth/-session) only READ authorized_keys, as root
+		// (a built-in launch rule: run by a user, `sshd -t -f <key>` prints it);
 		// keysign/pkcs11/cleanup helpers are inert. Not scp, sftp or sftp-server: they copy or serve
 		// whatever file their caller names (their ssh child reads the keys); nor git, which reads keys.
 		Whitelist: map[string][]string{
@@ -514,10 +515,8 @@ var Catalog = []CandidateDir{
 	// pip is a #!/usr/bin/python script (never matches, like gcloud).
 	{Name: "pip config", RelPaths: []string{".config/pip"},
 		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
-	// git reads its config on every run, so it is whitelisted though it prints any file it is pointed
-	// at: the section stops other readers of credentials there, not git (docs/limitations.md).
-	{Name: "Git config directory", RelPaths: []string{".config/git"},
-		Whitelist: map[string][]string{"/usr/bin/git": nil}},
+	// No entry for ~/.config/git: git reads its config on every run and prints any file it is pointed
+	// at (`git diff --no-index`), and its credential-store and -cache helpers are git itself.
 
 	// --- Password managers and secrets -------------------------------------------
 	// pass is a bash script, so its line would never match: gpg does the reads, while the `tree`,

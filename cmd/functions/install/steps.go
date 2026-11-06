@@ -111,7 +111,7 @@ func pickDirectories(users []inst.User) ([]inst.Candidate, error) {
 	}
 	picked, err := pickFromCandidates(candidates,
 		"Critical directories found — select the ones to protect",
-		"Only existing paths are listed. All are preselected. A resource stored in several locations is one entry. Whitelisted binaries per directory are curated and minimal.")
+		"Only existing paths are listed. All are preselected. A resource stored in several locations is one entry. Each whitelists only the app's own binaries, never a general tool (shells, interpreters, git, file copiers).")
 	if err != nil {
 		return nil, err
 	}

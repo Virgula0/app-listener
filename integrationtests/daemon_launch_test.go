@@ -111,6 +111,8 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 		{"a tab before --remote-debugging-port", "", launchProbe, []string{"\"$(printf '\\t--remote-debugging-port=9222')\""}},
 		{"--disable-extensions-except", "", launchProbe, []string{"--disable-extensions-except=/tmp/ext"}},
 		{"-load-apps", "", launchProbe, []string{"-load-apps=/tmp/app"}},
+		{"--ignore-certificate-errors", "", launchProbe, []string{"--ignore-certificate-errors"}},
+		{"--proxy-server", "", launchProbe, []string{"--proxy-server=127.0.0.1:8080"}},
 		{"a JetBrains VM options file", "IDEA_VM_OPTIONS=/tmp/x.vmoptions", launchJava, nil},
 		{"NODE_EXTRA_CA_CERTS", "NODE_EXTRA_CA_CERTS=/tmp/ca.pem", launchProbe, nil},
 		{"NODE_TLS_REJECT_UNAUTHORIZED", "NODE_TLS_REJECT_UNAUTHORIZED=0", launchProbe, nil},

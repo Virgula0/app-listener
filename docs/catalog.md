@@ -8,7 +8,7 @@ each, and offers the ones that exist on your host. It covers, among others:
 
 - **Keys and credentials:** SSH, GnuPG (and the `ssh-agent`, gcr `ssh` and `gpg-agent` sockets in
   `/run/user/<uid>`, guarded as [runtime sections](daemon-config.md#runtime-sections)), age, AWS, Google Cloud, Azure, Kubernetes, Docker,
-  GitHub CLI, adb keys, rclone, pip, Git
+  GitHub CLI, adb keys, rclone, pip
 - **AI agents and editors:** Claude Code, Gemini CLI and Antigravity (CLI, 2.0 and IDE), OpenAI
   Codex CLI, pi, opencode, Codeium, Cursor, GitHub Copilot (and Copilot CLI), VS Code (and Insiders, server, VSCodium), JetBrains IDEs, Zed, Sublime Text
 - **API and database clients:** Insomnia, Postman, DBeaver
@@ -62,9 +62,12 @@ their own config directory keep working (see below).
   reading they need, so `scp` and `sftp` keep working. A section an older installer wrote may still
   list them (and `git` on `~/.config/github-copilot`): remove those lines with
   `sudo app-listener edit-protected config`; the installer and the daemon warn about each.
-- **`~/.config/git`.** `git` reads its config on every run, so the entry whitelists it, and `git`
-  prints any file it is pointed at: the section keeps other programs from reading credentials stored
-  there, not `git` ([general tools](limitations.md#whitelisted-programs-that-disclose-on-request)).
+- **Git.** There is no entry for `~/.config/git` or `~/.git-credentials`: `git` reads its config on
+  every run, so a guard there would have to whitelist it, and `git` prints any file it is pointed at
+  (`git diff --no-index /dev/null <file>`); its `store` and `cache` credential helpers are `git`
+  itself. Keep git credentials in the keyring (`git-credential-libsecret`, which the catalog's secret
+  scope covers). A section an older installer wrote for `~/.config/git` whitelists `git`: remove it
+  with `sudo app-listener edit-protected config`; the installer and the daemon warn about it.
 - **Cursor logins.** The Cursor entry guards `~/.cursor` (MCP and extension config). The IDE keeps
   its login in `~/.config/Cursor/User/globalStorage/state.vscdb` and `cursor-agent` in
   `~/.config/cursor/auth.json`; neither is in the catalog. Add a section for them yourself,

@@ -124,7 +124,9 @@ A launch is **risky** when it has any of:
   `RUSTROVER`, `RUBYMINE`, `DATASPELL`, `STUDIO`);
 - code-loading flags: `--inspect*`, `--eval`, `--print`, `--require`, `--import`, `--loader`,
   `--env-file*`, `--remote-debugging-*`, `--load-extension`, `--disable-extensions-except`,
-  `--load-apps`;
+  `--load-apps` (whatever `--disable-features` re-enables in branded Chrome);
+- TLS and proxy flags: `--ignore-certificate-errors*`, `--proxy-server`, `--proxy-pac-url` (the
+  app would send its cookies and tokens to a server its caller chose);
 - for Node/Electron and Chromium, an argument starting with whitespace: Chromium trims it off and
   reads what follows as a switch;
 - child-process launchers: `--renderer-cmd-prefix`, `--utility-cmd-prefix`,
@@ -180,6 +182,11 @@ Built in, by the whitelisted file's name:
   plugins and provider URLs of its caller's choosing).
 - `codex`: `OPENAI_BASE_URL` set (the server it sends its key to); `-c` and `--config` are only
   logged: they override any config key, base URLs included, and are too common to refuse.
+- `ssh`: `-F`, in any cluster of short options (`-4F/tmp/c`): `ssh` prints every line of a
+  config file it can't parse, so `ssh -F ~/.ssh/id_ed25519 -G x` would print the key. Also matched
+  in a remote command (`ssh host ls -F`); `-o Include` is refused by `ssh` itself.
+- `sshd`, `sshd-session`, `sshd-auth`: run by any uid but 0 (logged as `word=uid`): `sshd -t -f`
+  prints the config it names line by line, and only root runs the server.
 - JetBrains launchers (`idea`, `pycharm`, ..., Android Studio's `studio`): `installPlugins`, which
   installs a plugin from any repository; the plugin then runs in the IDE.
 - `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
@@ -201,7 +208,7 @@ A rule's words match in order anywhere in the arguments, with anything between t
 value can't split them (`gh auth --hostname x token`). Add your own with
 [`[launch_rules]`](config-reference.md#launch_rules).
 
-The rules are a tripwire. They don't see combined short flags (`-th`), aliases, a script that
+The rules are a tripwire. Except for `ssh`'s, they don't see combined short flags (`-th`), aliases, a script that
 feeds the CLI its arguments another way, or a token the CLI reads from the keyring rather than a
 guarded file: with keyring storage, `gh auth token` still prints it.
 

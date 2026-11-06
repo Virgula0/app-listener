@@ -71,9 +71,12 @@ var launchRules = func() []launchRule {
 		rules = append(rules, launchRule{launchArg, a, trustedNode, launchPresent})
 	}
 	// The DevTools protocol runs script in the process and reads its cookies; an unpacked extension
-	// reads them too (--disable-extensions-except loads the ones it names). Chromium takes "-" as a
-	// switch prefix as well as "--".
-	for _, a := range []string{"remote-debugging", "load-extension", "disable-extensions-except", "load-apps"} {
+	// reads them too (--disable-extensions-except loads the ones it names; both are refused whatever
+	// --disable-features re-enables). Chromium takes "-" as a switch prefix as well as "--".
+	// --ignore-certificate-errors (and -spki-list, by its first two words) trusts any server, and a
+	// proxy flag routes every request to the caller's.
+	for _, a := range []string{"remote-debugging", "load-extension", "disable-extensions-except", "load-apps",
+		"ignore-certificate", "proxy-server", "proxy-pac-url"} {
 		rules = append(rules, launchRule{launchArg, "--" + a, trustedNode | trustedChromium, launchPresent},
 			launchRule{launchArg, "-" + a, trustedNode | trustedChromium, launchPresent})
 	}

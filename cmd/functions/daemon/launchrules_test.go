@@ -30,7 +30,7 @@ func TestLaunchRulesByPath(t *testing.T) {
 	if len(gh) != 7 || gh[6].Words[0] != "repo" {
 		t.Errorf("gh (via its link's name, plus the rule naming the link) = %+v", gh)
 	}
-	if ssh := got["/usr/bin/ssh"]; len(ssh) != 1 || ssh[0].Env != "SSH_ASKPASS" {
+	if ssh := got["/usr/bin/ssh"]; len(ssh) != 2 || ssh[0].Short == nil || ssh[1].Env != "SSH_ASKPASS" {
 		t.Errorf("ssh = %+v", ssh)
 	}
 	if len(got["/home/u/.local/bin/bitcoin-cli"]) != 8 {

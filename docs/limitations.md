@@ -15,6 +15,15 @@ binary with arguments of its choosing gets whatever that binary prints.
 (`gh auth token`, `aws configure export-credentials`, `bitcoin-cli dumpprivkey`), but they are a
 tripwire: a CLI has more ways to print a secret than any list names.
 
+Programs that read a configuration file can disclose too: `ssh` and `sshd` print each line of a
+config they can't parse, a key included. The built-in rules refuse `ssh -F` and any `sshd` not run
+by root, the routes to a config of the caller's choosing.
+
+A browser or Electron app sends its cookies and tokens wherever its TLS stack trusts. The launch
+scan refuses the flags that redirect it (`--ignore-certificate-errors`, `--proxy-server`), but not a
+CA added to `~/.pki/nssdb` (Chromium trusts that store) combined with a desktop or `https_proxy`
+proxy setting: both are your own to change.
+
 - Whitelist only what needs the resource.
 - Prefer apps that keep secrets in a running agent.
 - Never whitelist a general tool: a shell, an interpreter (`node`, `python`, `java`), `git`, `cp`,
@@ -151,6 +160,10 @@ least-privilege hint.
   [Troubleshooting](troubleshooting.md#an-app-breaks-and-nothing-is-logged)).
 - **Bun apps from desktop menus** still use `/tmp` and are denied their native library
   ([details](installation.md#bun-based-apps-opencode)).
+- **Refused launches.** A launch that matches a rule runs without its secrets, so the app fails:
+  `ssh -F <config>` and `ssh host ls -F`, `git` over ssh with `GIT_SSH_COMMAND="ssh -F ..."`, a
+  browser or VS Code started with `--proxy-server`, `ssh-add` to an agent outside a guarded tree.
+  Use the user config (`~/.ssh/config`) and the desktop's proxy settings instead.
 
 ## Project status
 

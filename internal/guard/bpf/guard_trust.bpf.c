@@ -386,10 +386,18 @@ struct {
 } trust_argv SEC(".maps");
 
 // trust_argv_sets[set]: each rule's word count, 4 bits per rule (0: none), and the rules that only
-// log. Written before any guard_bin_rules row names the set, never changed after.
+// log. short_deny/short_arg: getopt letters (A-Z, a-z, 0-9 = bits 0-61) refused anywhere in an
+// option cluster, and those taking the rest of it as their value (`ssh -4F/x`). ARGV_ROOT_ONLY: any
+// launch by a non-root uid matches (sshd reads a config of the caller's choosing and prints its
+// lines). Written before any guard_bin_rules row names the set, never changed after.
+#define ARGV_ROOT_ONLY 1
+
 struct argv_set {
 	__u64 lens;
 	__u64 warn;
+	__u64 short_deny;
+	__u64 short_arg;
+	__u64 flags;
 };
 
 struct {
@@ -429,6 +437,8 @@ struct launch_scan {
 	__u32 pad;
 	__u64 lens;     // trust_argv_sets[set]
 	__u64 warn;
+	__u64 short_deny;
+	__u64 short_arg;
 	__u8 prog[ARGV_RULES]; // each rule's words seen so far
 	struct launch_key key;
 	struct argv_key akey;
@@ -1629,6 +1639,36 @@ static __noinline void argv_word(struct launch_scan *s)
 	}
 }
 
+static __always_inline int short_bit(char c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return 26 + c - 'a';
+	if (c >= '0' && c <= '9')
+		return 52 + c - '0';
+	return -1;
+}
+
+// argv_short judges buf as a getopt cluster: a short_deny letter before any short_arg one (whose
+// value the rest is) matches. Unanchored like the word rules: `ssh host ls -F` matches too.
+static __noinline void argv_short(struct launch_scan *s)
+{
+	if (!s->short_deny || s->buf[0] != '-' || s->buf[1] == '-')
+		return;
+	for (int j = 1; j < 32; j++) {
+		int b = short_bit(s->buf[j]);
+		if (b < 0)
+			return;
+		if (s->short_deny & (1ULL << b)) {
+			argv_matched(s, 0);
+			return;
+		}
+		if (s->short_arg & (1ULL << b))
+			return;
+	}
+}
+
 // argv_env judges an env string. ENV_OK is looked up first so the key a match reports is the NAME
 // alone: a value may be a secret.
 static __noinline void argv_env(struct launch_scan *s)
@@ -1671,10 +1711,12 @@ static long launch_step(__u64 i, void *ctx)
 		return 0;
 	}
 	if (s->rules) {
-		if (argv)
-			argv_word(s);
-		else
+		if (argv) {
+			argv_word(s); // fills akey with the word: argv_short's match reports it
+			argv_short(s);
+		} else {
 			argv_env(s);
+		}
 		if (s->argv_hit) {
 			s->done = 1;
 			return 1;
@@ -1720,6 +1762,27 @@ static long launch_step(__u64 i, void *ctx)
 		return 0;
 	s->tok = s->vpos;
 	s->intok = 0;
+	return 0;
+}
+
+// argv_not_root marks an ARGV_ROOT_ONLY binary run by another uid, logged as the word "uid".
+static __noinline int argv_not_root(__u32 tgid)
+{
+	__u8 v = SUSPECT_ARGV;
+	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
+		bpf_send_signal(9); // SIGKILL
+	struct trust_event *e = bpf_ringbuf_reserve(&trust_rb, sizeof(*e), 0);
+	if (!e)
+		return 0;
+	e->pid = tgid;
+	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+	e->kind = TRUST_ARGV_MATCH;
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	e->path[0] = 'u';
+	e->path[1] = 'i';
+	e->path[2] = 'd';
+	e->path[3] = 0;
+	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
 
@@ -1773,10 +1836,14 @@ int trust_exec_launch(unsigned long long *ctx)
 		__u32 id = *set;
 		struct argv_set *as = bpf_map_lookup_elem(&trust_argv_sets, &id);
 		if (as) {
+			if ((as->flags & ARGV_ROOT_ONLY) && (bpf_get_current_uid_gid() & 0xFFFFFFFF))
+				return argv_not_root(tgid);
 			s->rules = 1;
 			s->set = id;
 			s->lens = as->lens;
 			s->warn = as->warn;
+			s->short_deny = as->short_deny;
+			s->short_arg = as->short_arg;
 		}
 	}
 	struct mm_struct *mm = BPF_CORE_READ(p, mm);

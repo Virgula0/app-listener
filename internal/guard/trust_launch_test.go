@@ -178,6 +178,11 @@ func TestLaunchRulesJudgeRuntimes(t *testing.T) {
 		{"chromium extensions except", trustedChromium, []string{"chromium", "--disable-extensions-except=/tmp/e"}, nil, true},
 		{"chromium extensions except single dash", trustedChromium, []string{"chromium", "-disable-extensions-except=/tmp/e"}, nil, true},
 		{"chromium load apps", trustedChromium, []string{"chromium", "--load-apps=/tmp/a"}, nil, true},
+		{"chromium ignore cert errors", trustedChromium, []string{"chromium", "--ignore-certificate-errors"}, nil, true},
+		{"chromium ignore cert spki", trustedChromium, []string{"chromium", "-ignore-certificate-errors-spki-list=x"}, nil, true},
+		{"chromium proxy server", trustedChromium, []string{"chromium", "--proxy-server=127.0.0.1:8080"}, nil, true},
+		{"electron proxy pac", trustedNode, []string{"code", "--proxy-pac-url=http://x/p"}, nil, true},
+		{"chromium proxy bypass list", trustedChromium, []string{"chromium", "--proxy-bypass-list=*"}, nil, false},
 		{"chromium file with a space", trustedChromium, []string{"chromium", "/home/u/my page.html"}, nil, false},
 		{"jvm ignores leading space", trustedJVM, []string{"java", " -Xmx2g"}, nil, false},
 	} {
