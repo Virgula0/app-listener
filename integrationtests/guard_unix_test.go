@@ -123,7 +123,7 @@ func (s *IntegrationSuite) TestDaemon_UnixConnectMarkSurvivesReload() {
 
 // A runtime section (/run/user/<uid>/ssh-agent) exists only while its user is logged in: `daemon
 // login` makes it root-owned, guards it, then hands it to the user; `daemon logout` drops it once
-// the mount is gone, and the next login guards the fresh mount's directory.
+// the mount is gone, and the next login guards the fresh mount's directory, never one the user made.
 func (s *IntegrationSuite) TestDaemon_RuntimeSectionLogin() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -188,13 +188,26 @@ func (s *IntegrationSuite) TestDaemon_RuntimeSectionLogin() {
 	s.Require().NotContainsf(s.readDaemonLog(c), reloadRefused, "logout reload refused:\n%s", s.readDaemonLog(c))
 	code, out = s.exec(c, []string{"sh", "-c", mount})
 	s.Require().Equalf(0, code, "remount: %s", out)
-	// A process of the user that beat the daemon to the fresh mount may have planted listeners.
-	code, out = asUser("mkdir -m 0700 " + dir)
-	s.Require().Equalf(0, code, "pre-creating: %s", out)
-	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
-	s.Require().NotEqualf(0, code, "a runtime dir made before the daemon must fail the login: %s", out)
-	s.exec(c, []string{"rmdir", dir})
-	login()
+	// A process of the user that beat the daemon to the fresh mount may have planted listeners: the
+	// login moves its dir aside and guards a fresh one, also once a reload guarded it as found.
+	squat := func(reload bool) {
+		code, out := asUser("mkdir -m 0700 " + dir + " && touch " + dir + "/planted && stat -c %i " + dir)
+		s.Require().Equalf(0, code, "pre-creating: %s", out)
+		if reload {
+			s.reloadAndAwait(c)
+			s.Require().NotContainsf(s.readDaemonLog(c), reloadRefused, "reload refused:\n%s", s.readDaemonLog(c))
+		}
+		login()
+		code, now := s.exec(c, []string{"stat", "-c", "%i", dir})
+		s.Require().Equalf(0, code, "stat: %s", now)
+		s.Require().NotEqualf(out, now, "the login guarded the user's own dir (reload %v)", reload)
+		code, out = s.exec(c, []string{"stat", dir + "/planted"})
+		s.Require().NotEqualf(0, code, "the user's planted file is in the guarded dir: %s", out)
+	}
+	squat(false)
+	code, out = s.exec(c, []string{"sh", "-c", "umount /run/user/1000 && /app-listener daemon logout 1000 && " + mount})
+	s.Require().Equalf(0, code, "logout: %s", out)
+	squat(true)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
