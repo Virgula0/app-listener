@@ -428,8 +428,8 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
-// A whitelisted CLI started with words one of its launch rules names (built in by basename, or a
-// [launch_rules] line) is refused its secret; started otherwise it keeps reading. A warn rule only
+// A whitelisted CLI started with words one of its launch rules names (the catalog's by basename, or a
+// [launch_rules] line, in any spelling an abbreviation rule names) is refused its secret; started otherwise it keeps reading. A warn rule only
 // logs. Every binary is judged on SSL_CERT_FILE/SSL_CERT_DIR unless the value is a root-placed bundle
 // (built in or allow_env); an allow_env a user can fill is refused. Rule sets must survive a reload.
 func (s *IntegrationSuite) TestDaemon_LaunchRules() {
@@ -437,17 +437,20 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 	defer c.Terminate(s.ctx)
 
 	const gh, tool, goread = "/opt/rt/bin/gh", "/opt/rt/bin/tool", "/opt/rt/bin/goread"
+	const gpg, kubectl, rclone = "/opt/rt/bin/gpg", "/opt/rt/bin/kubectl", "/opt/rt/bin/rclone"
 	const corpCA = "/etc/corp-ca.pem"
 	s.exec(c, []string{"mkdir", "-p", "/exploits", "/opt/rt/bin"})
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_plain"), gh, 0o755),
 		"copy launch_probe_plain (run make -C integrationtests/exploits)")
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, goread, 0o755))
 	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
-		"' > " + launchSecret + " && cp " + gh + " " + tool + " && echo ca > " + corpCA + " 2>&1"})
+		"' > " + launchSecret + " && for b in " + tool + " " + gpg + " " + kubectl + " " + rclone + "; do cp " + gh +
+		" $b; done && echo ca > " + corpCA + " 2>&1"})
 	s.Require().Equalf(0, code, "setup: %s", out)
 	s.startDaemon(c, "[launch_rules]\ndeny_args "+tool+" export --all\nwarn_env "+tool+" NOTE_ME\n"+
+		"deny_args "+tool+" --frob[nicate]\n"+
 		"allow_env SSL_CERT_FILE="+corpCA+"\nallow_env SSL_CERT_FILE=/tmp/user-ca.pem\n\n"+
-		"[watch /protected]\nneed_encryption: false\n"+gh+"\n"+tool+"\n"+goread)
+		"[watch /protected]\nneed_encryption: false\n"+gh+"\n"+tool+"\n"+goread+"\n"+gpg+"\n"+kubectl+"\n"+rclone)
 
 	run := func(cmd string) string {
 		_, out := s.exec(c, []string{"sh", "-c", cmd + " 2>&1"})
@@ -465,21 +468,37 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 			"the system CA bundle":      "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt " + gh + " read " + launchSecret,
 			"the system CA dir on Go":   "SSL_CERT_DIR=/etc/ssl/certs " + goread + " read " + launchSecret,
 			"a root-placed allow_env":   "SSL_CERT_FILE=" + corpCA + " " + goread + " read " + launchSecret,
+			"gpg's public export":       gpg + " --export --export-ssh-key read " + launchSecret,
+			"gpg -e":                    gpg + " -e -r x read " + launchSecret,
+			"an ambiguous gpg prefix":   gpg + " --export-s --st read " + launchSecret,
+			"a redacted kubeconfig":     kubectl + " config view read " + launchSecret,
+			"a redacted rclone config":  rclone + " config redacted read " + launchSecret,
+			"an abbreviation too short": tool + " --fro read " + launchSecret,
 		} {
 			s.Require().Containsf(run(cmd), "STOLEN|"+launchMarker, "%s: %s must read its resource\ndaemon log:\n%s",
 				when, what, s.readDaemonLog(c))
 		}
 		for what, cmd := range map[string]string{
-			"words around a flag's value":  gh + " auth --hostname x token read " + launchSecret,
-			"a short flag after operands":  gh + " auth status read " + launchSecret + " -t",
-			"a long flag with a value":     gh + " auth status --show-token=1 read " + launchSecret,
-			"a [launch_rules] argv rule":   tool + " export read " + launchSecret + " --all",
-			"SSL_CERT_FILE on a Go binary": "SSL_CERT_FILE=/tmp/ca.pem " + goread + " read " + launchSecret,
-			"SSL_CERT_FILE on any CLI":     "SSL_CERT_FILE=/tmp/ca.pem " + gh + " read " + launchSecret,
-			"SSL_CERT_DIR of a user":       "SSL_CERT_DIR=/tmp " + goread + " read " + launchSecret,
-			"a user-fillable allow_env":    "SSL_CERT_FILE=/tmp/user-ca.pem " + gh + " read " + launchSecret,
-			"an allowed path extended":     "SSL_CERT_FILE=" + corpCA + ".x " + gh + " read " + launchSecret,
-			"an allowed bundle in a list":  "SSL_CERT_DIR=/etc/ssl/certs:/tmp " + goread + " read " + launchSecret,
+			"words around a flag's value":   gh + " auth --hostname x token read " + launchSecret,
+			"a short flag after operands":   gh + " auth status read " + launchSecret + " -t",
+			"a long flag with a value":      gh + " auth status --show-token=1 read " + launchSecret,
+			"a [launch_rules] argv rule":    tool + " export read " + launchSecret + " --all",
+			"SSL_CERT_FILE on a Go binary":  "SSL_CERT_FILE=/tmp/ca.pem " + goread + " read " + launchSecret,
+			"SSL_CERT_FILE on any CLI":      "SSL_CERT_FILE=/tmp/ca.pem " + gh + " read " + launchSecret,
+			"SSL_CERT_DIR of a user":        "SSL_CERT_DIR=/tmp " + goread + " read " + launchSecret,
+			"a user-fillable allow_env":     "SSL_CERT_FILE=/tmp/user-ca.pem " + gh + " read " + launchSecret,
+			"an allowed path extended":      "SSL_CERT_FILE=" + corpCA + ".x " + gh + " read " + launchSecret,
+			"an allowed bundle in a list":   "SSL_CERT_DIR=/etc/ssl/certs:/tmp " + goread + " read " + launchSecret,
+			"gpg --export-secret-keys":      gpg + " --export-secret-keys read " + launchSecret,
+			"an abbreviated secret export":  gpg + " -a --export-secret-ke read " + launchSecret,
+			"the shortest export prefix":    gpg + " --export-se=x read " + launchSecret,
+			"gpg --enarmo":                  gpg + " --enarmo read " + launchSecret,
+			"gpg --enarmour":                gpg + " --enarmour read " + launchSecret,
+			"gpg --sto":                     gpg + " --sto read " + launchSecret,
+			"kubectl config view --raw":     kubectl + " config view --minify --raw read " + launchSecret,
+			"rclone config show":            rclone + " config show read " + launchSecret,
+			"rclone config dump":            rclone + " config dump read " + launchSecret,
+			"a [launch_rules] abbreviation": tool + " --frobn read " + launchSecret,
 		} {
 			s.Require().NotContainsf(run(cmd), launchMarker, "%s: %s read the secret\ndaemon log:\n%s",
 				when, what, s.readDaemonLog(c))
@@ -492,6 +511,7 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 	log := s.readDaemonLog(c)
 	for _, want := range []string{"word=token", "word=-t", "word=--show-token", "word=--all", "word=SSL_CERT_FILE",
 		"ARGV comm=gh", "word=git-credential", "word=NOTE_ME", "word=SSL_CERT_DIR",
+		"word=--export-secret-ke", "word=--export-se", "word=--sto", "word=--raw", "word=show", "word=--frobn",
 		"allow_env SSL_CERT_FILE=/tmp/user-ca.pem refused"} {
 		s.Require().Containsf(log, want, "daemon log lacks %q:\n%s", want, log)
 	}
