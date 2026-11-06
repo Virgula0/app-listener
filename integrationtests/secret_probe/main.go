@@ -356,10 +356,10 @@ func unmarkableSocket() int {
 	if err != nil {
 		failf(3, "ERROR self: %v", err)
 	}
-	child := exec.CommandContext(context.Background(), "unshare", "-rn", self, "mksock") //nolint:gosec // own binary
+	child := exec.CommandContext(context.Background(), "unshare", "-rn", self, "mksock")
 	child.ExtraFiles = []*os.File{os.NewFile(uintptr(pair[1]), "pair")}
-	if out, err := child.CombinedOutput(); err != nil {
-		failf(2, "UNSUPPORTED unshare -rn: %v: %s", err, out)
+	if out, cerr := child.CombinedOutput(); cerr != nil {
+		failf(2, "UNSUPPORTED unshare -rn: %v: %s", cerr, out)
 	}
 	buf := make([]byte, 1)
 	oob := make([]byte, unix.CmsgSpace(4))

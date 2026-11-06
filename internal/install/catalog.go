@@ -880,7 +880,7 @@ func (c *CandidateDir) SeedMissing(u User) error {
 	return nil
 }
 
-func seedPath(u User, rel string, content string) error {
+func seedPath(u User, rel, content string) error {
 	uid, gid := -1, -1
 	if os.Geteuid() == 0 {
 		uid, gid = int(u.UID), int(u.GID)
