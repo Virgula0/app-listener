@@ -210,12 +210,20 @@ func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 			}
 			continue
 		}
+		var extra []string
+		if err := c.Entry.SeedMissing(c.User); err != nil {
+			// A seed path left missing would sit unguarded: guard the whole directory instead.
+			log.Warnf("install: %v — guarding all of %s", err, c.Path)
+			extra = nil
+		} else {
+			extra = c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name)
+		}
 		sections = append(sections, inst.Section{
 			Path:            c.Path,
 			Allow:           c.FilterExistingWhitelist(),
 			Encrypt:         !c.Entry.IsRuntime(),
 			Runtime:         c.Entry.IsRuntime(),
-			ExtraWatchPaths: c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name),
+			ExtraWatchPaths: extra,
 		})
 	}
 	return sections

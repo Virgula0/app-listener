@@ -75,6 +75,13 @@ their own config directory keep working (see below).
   `sudo app-listener edit-protected config` ([`watch:`](config-reference.md#watch)).
   If none of them exists yet, the section guards the whole directory, which breaks Codex's
   standalone updates in `~/.codex/packages`.
+- **pi extensions.** pi runs every extension in `~/.pi/agent/extensions`, the packages in
+  `~/.pi/agent/npm` and `~/.pi/agent/git`, and the `.pi/extensions` of each project
+  `~/.pi/agent/trust.json` trusts, in its own process, where they can read its tokens. The entry
+  guards all of them; the installer creates an empty `extensions` and `trust.json` when missing, so
+  they are guarded from the start. `pi install` then fails while the daemon runs: npm and git write
+  the package, and they are not pi. A section written by an older installer lacks these `watch:`
+  lines: add them with `sudo app-listener edit-protected config`.
 - **Copilot CLI `/ide`.** The VS Code Copilot extension writes lock files to `~/.copilot/ide`.
   Whitelist the VS Code binary on `~/.copilot` for that integration.
 - **Bitcoin and Litecoin RPC cookie.** The cookie grants every RPC call, including spending from an

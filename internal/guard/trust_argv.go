@@ -47,7 +47,10 @@ var builtinLaunchRules = func() map[string][]daemonconfig.LaunchRule {
 			// git's credential helper: denying it breaks every git push, so it is only logged.
 			{Words: []string{"auth", "git-credential"}, Warn: true},
 		},
-		"aws":           {deny("configure", "export-credentials"), deny("configure", "get")},
+		"aws": {deny("configure", "export-credentials"), deny("configure", "get")},
+		// pi runs an extension -e names in its own process; PI_CODING_AGENT_DIR points it at an agent
+		// dir whose extensions/ the caller wrote.
+		"pi":            {deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"}},
 		"bitcoin-cli":   coin,
 		"litecoin-cli":  coin,
 		"lightning-cli": lightning,

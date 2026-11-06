@@ -101,3 +101,14 @@ func TestBuiltinLaunchRulesFit(t *testing.T) {
 		t.Fatal("BuiltinLaunchRules must return a copy")
 	}
 }
+
+func TestPiLaunchRulesRefuseExtensionLoaders(t *testing.T) {
+	rules := BuiltinLaunchRules("pi")
+	for _, want := range []daemonconfig.LaunchRule{deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"}} {
+		if !slices.ContainsFunc(rules, func(r daemonconfig.LaunchRule) bool {
+			return r.Env == want.Env && slices.Equal(r.Words, want.Words) && !r.Warn
+		}) {
+			t.Errorf("pi has no deny rule %+v: %+v", want, rules)
+		}
+	}
+}

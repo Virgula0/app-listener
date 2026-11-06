@@ -4,6 +4,7 @@
 package install
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,10 +13,12 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
+	"github.com/Virgula0/app-listener/internal/safeio"
 )
 
 // CandidateDir describes one critical directory type the installer probes.
@@ -55,6 +58,10 @@ type CandidateDir struct {
 	// set. Empty = plain per-RelPath watch. Only valid with exactly one RelPaths entry;
 	// home-relative, same %HOME% expansion as whitelist entries.
 	WatchRelPaths []string
+	// SeedWatchPaths are WatchRelPaths entries the app loads code or trust decisions from, made as the
+	// user when missing ("" = a 0700 directory, else a 0600 file holding the value) so they are guarded
+	// from the start: one made after install would sit outside every watch.
+	SeedWatchPaths map[string]string
 	// Libs are extra libraries the entry's whitelisted binaries may load (`allow_lib`). Only needed
 	// for user-writable libraries at FIXED paths an app dlopen()s: root-owned system libs are
 	// auto-trusted and in-tree ones trusted by location. %HOME%/%USER% expand. Per-launch ephemeral
@@ -335,11 +342,15 @@ var Catalog = []CandidateDir{
 		},
 		Whitelist: codexBinaries},
 	// pi's installer and npm install a node script (its own install lives in ~/.pi/agent/install), so
-	// only the release tarball's Bun binary matches; otherwise pi is denied like gcloud.
+	// only the release tarball's Bun binary matches; otherwise pi is denied like gcloud. pi runs, in its
+	// own process, every extension in extensions/, the packages in npm/ and git/, and a trusted
+	// project's .pi/extensions (trust.json): all guarded, the first and the last seeded.
 	{Name: "pi coding agent", RelPaths: []string{".pi/agent"},
 		WatchRelPaths: []string{
 			".pi/agent/auth.json", ".pi/agent/models.json", ".pi/agent/settings.json", ".pi/agent/sessions",
+			".pi/agent/mcp.json", ".pi/agent/extensions", ".pi/agent/npm", ".pi/agent/git", ".pi/agent/trust.json",
 		},
+		SeedWatchPaths: map[string]string{".pi/agent/extensions": "", ".pi/agent/trust.json": "{}\n"},
 		Whitelist: map[string][]string{
 			"%HOME%/.local/bin/pi": nil, "/usr/local/bin/pi": nil, "/opt/pi/pi": nil,
 		}},
@@ -829,6 +840,64 @@ func (c *CandidateDir) ExtraWatchPathsFor(home, user string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// SeedMissing makes c's missing SeedWatchPaths in u's home, owned by u (when run as root), never
+// through a symlink. Their parents must exist.
+func (c *CandidateDir) SeedMissing(u User) error {
+	for rel, content := range c.SeedWatchPaths {
+		if err := seedPath(u, expandPlaceholders(rel, u.Name, u.Home), content); err != nil {
+			return fmt.Errorf("seeding %s: %w", filepath.Join(u.Home, rel), err)
+		}
+	}
+	return nil
+}
+
+func seedPath(u User, rel string, content string) error {
+	uid, gid := -1, -1
+	if os.Geteuid() == 0 {
+		uid, gid = int(u.UID), int(u.GID)
+	}
+	home, err := unix.Open(u.Home, unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(filepath.Clean(rel), "/")
+	dir, err := safeio.DescendNoFollow(home, parts[:len(parts)-1], false, 0)
+	defer unix.Close(dir)
+	if err != nil {
+		return err
+	}
+	name := parts[len(parts)-1]
+	if content == "" {
+		switch mkErr := unix.Mkdirat(dir, name, 0o700); {
+		case errors.Is(mkErr, unix.EEXIST):
+			return nil
+		case mkErr != nil:
+			return mkErr
+		}
+		fd, oErr := unix.Openat(dir, name, unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if oErr != nil {
+			return oErr
+		}
+		defer unix.Close(fd)
+		if uid >= 0 {
+			return unix.Fchown(fd, uid, gid)
+		}
+		return nil
+	}
+	f, err := safeio.CreateExclNoFollow(dir, name, 0o600, uid, gid)
+	if errors.Is(err, unix.EEXIST) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, werr := f.WriteString(content)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	return werr
 }
 
 // BinaryRule is one whitelisted binary and its allowed events (empty = every event).

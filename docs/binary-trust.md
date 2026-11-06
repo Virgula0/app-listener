@@ -167,6 +167,8 @@ Built in, by the whitelisted file's name:
 - `gh`: `auth token`, `auth status --show-token`, `auth status -t`, `alias set`, `alias import`;
   `auth git-credential` is only logged, since git runs it on every push.
 - `aws`: `configure export-credentials`, `configure get`.
+- `pi`: `-e` and `--extension` (it runs the extension in its own process), and
+  `PI_CODING_AGENT_DIR` set (an agent directory whose `extensions/` its caller wrote).
 - `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
   `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag (it reads the method from stdin).
 - `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,

@@ -968,3 +968,91 @@ func TestCatalogGuardsAppCodeAndUpdaterInputs(t *testing.T) {
 		t.Errorf("Discord's bootstrap must stay able to create the first app dir: %v", d.LibDirWriters)
 	}
 }
+
+func TestSeedMissingMakesCodeDirsGuardable(t *testing.T) {
+	home := t.TempDir()
+	agent := filepath.Join(home, ".pi", "agent")
+	if err := os.MkdirAll(agent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pi := catalogEntry(t, "pi coding agent")
+	u := User{Name: "u", UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), Home: home}
+	if err := pi.SeedMissing(u); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(filepath.Join(agent, "extensions")); err != nil || !st.IsDir() || st.Mode().Perm() != 0o700 {
+		t.Fatalf("extensions not seeded as a 0700 dir: %v %v", st, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(agent, "trust.json")); err != nil || string(b) != "{}\n" {
+		t.Fatalf("trust.json not seeded empty: %q %v", b, err)
+	}
+	got := pi.ExtraWatchPathsFor(home, "u")
+	for _, want := range []string{"extensions", "trust.json"} {
+		if !slices.Contains(got, filepath.Join(agent, want)) {
+			t.Errorf("%s seeded but not watched: %v", want, got)
+		}
+	}
+	// An existing one is left alone.
+	if err := os.WriteFile(filepath.Join(agent, "trust.json"), []byte(`{"/p": true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := pi.SeedMissing(u); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(agent, "trust.json")); string(b) != `{"/p": true}` {
+		t.Errorf("an existing trust.json was rewritten: %q", b)
+	}
+}
+
+func TestSeedMissingRefusesSymlinkedParent(t *testing.T) {
+	home, elsewhere := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".pi"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(home, ".pi", "agent")); err != nil {
+		t.Fatal(err)
+	}
+	pi := catalogEntry(t, "pi coding agent")
+	if err := pi.SeedMissing(User{Name: "u", Home: home}); err == nil {
+		t.Fatal("seeded through a symlinked parent")
+	}
+	if ents, _ := os.ReadDir(elsewhere); len(ents) != 0 {
+		t.Errorf("wrote through the symlink: %v", ents)
+	}
+}
+
+func TestSeedWatchPathsAreWatched(t *testing.T) {
+	for _, e := range Catalog {
+		for rel := range e.SeedWatchPaths {
+			if !slices.Contains(e.WatchRelPaths, rel) {
+				t.Errorf("%s: seed %s is not a WatchRelPaths entry", e.Name, rel)
+			}
+		}
+	}
+}
+
+// pi runs, in its own process, every extension in these: they must be guarded with its secrets.
+func TestPiCodeLoadersGuarded(t *testing.T) {
+	pi := catalogEntry(t, "pi coding agent")
+	for _, rel := range []string{".pi/agent/extensions", ".pi/agent/npm", ".pi/agent/git", ".pi/agent/trust.json"} {
+		if !slices.Contains(pi.WatchRelPaths, rel) {
+			t.Errorf("pi: %s is not watched", rel)
+		}
+	}
+	for _, rel := range []string{".pi/agent/extensions", ".pi/agent/trust.json"} {
+		if _, ok := pi.SeedWatchPaths[rel]; !ok {
+			t.Errorf("pi: %s is not seeded: one made after install would be unguarded", rel)
+		}
+	}
+}
+
+func catalogEntry(t *testing.T, name string) CandidateDir {
+	t.Helper()
+	for i := range Catalog {
+		if Catalog[i].Name == name {
+			return Catalog[i]
+		}
+	}
+	t.Fatalf("no catalog entry %q", name)
+	return CandidateDir{}
+}
