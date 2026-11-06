@@ -60,6 +60,10 @@ func (s *IntegrationSuite) TestDaemon_PortGuard() {
 			"the server on ::":              {"/exploits/inet_connect_srv", "listen", "::", port},
 			"the server on ::ffff:0.0.0.0":  {"/exploits/inet_connect_srv", "listen", "::ffff:0.0.0.0", port},
 			"the server on the LAN address": {"sh", "-c", "/exploits/inet_connect_srv listen $(hostname -i | cut -d' ' -f1) " + port},
+			// Its internal TCP socket is bound and listens out of every hook's sight.
+			"an SMC listener":         {"/exploits/inet_connect", "smclisten", "127.0.0.1", port},
+			"an IPPROTO_SMC listener": {"/exploits/inet_connect", "smcinetlisten", "127.0.0.1", port},
+			"the server over SMC":     {"/exploits/inet_connect_srv", "smclisten", "127.0.0.1", port},
 		} {
 			code, out := s.exec(c, args)
 			if code == 2 {
