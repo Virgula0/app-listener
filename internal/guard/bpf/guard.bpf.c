@@ -2654,7 +2654,7 @@ static __noinline int note_bus_send(struct sock *sk)
 }
 
 // note_bus_connect records sk's connect to peer when peer is a registered `bus`. A socket that can't
-// be marked leaves the row unrecorded: refused. A relay target's newsk is tagged or the connect refused.
+// be marked is refused, as is a relay target's connect whose newsk can't be tagged.
 static __always_inline int note_bus_connect(struct sock *sk, struct sock *peer, struct sock *newsk)
 {
 	struct dentry *dentry = NULL, *parent = NULL;
@@ -2701,10 +2701,11 @@ static __always_inline int note_bus_connect(struct sock *sk, struct sock *peer, 
 	struct bus_conn v = {};
 	v.start = leader_start(task);
 	v.htgid = tgid;
+	// Unmarked, a send by another process on sk would never mark the row foreign.
 	struct bus_owner *o = sk ? bpf_sk_storage_get(&guard_bus_socks, sk, 0, BPF_SK_STORAGE_GET_F_CREATE) : NULL;
 	if (!o) {
 		bpf_map_delete_elem(&guard_bus_conns, &key);
-		return 0;
+		return -EPERM;
 	}
 	o->tgid = tgid;
 	o->key = key;
