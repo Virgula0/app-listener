@@ -18,8 +18,8 @@ const (
 // call touching a gh item needs a caller the scope admits, attested by the pidfd the bus took at
 // connect. The probes cover the item calls, a replace matching by a subset, owning the name,
 // monitoring, exec after connecting or after sending, a send on a socket another process connected
-// or the guard could not mark, an item locked since load, a fake keyring on the relay, the pkcs11 socket, a fake bus renamed
-// over the user's, and a connection made before a restart.
+// or the guard could not mark, an item locked since load, a fake keyring on the relay, the pkcs11
+// socket, a fake bus renamed over the user's, and a connection made before a restart.
 func (s *IntegrationSuite) TestDaemon_SecretService() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)

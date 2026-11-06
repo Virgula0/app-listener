@@ -292,3 +292,60 @@ func TestClassifyItemTypeIsSchema(t *testing.T) {
 		t.Errorf("Properties.Set non-string Type: got %+v, want refuse", v)
 	}
 }
+
+func TestPlaceableAttributes(t *testing.T) {
+	gh := map[string]string{"service": "gh:github.com", "username": "u"}
+	for _, c := range []struct {
+		name  string
+		props map[string]dbus.Variant
+		ok    bool
+	}{
+		{"unlocked", map[string]dbus.Variant{"Locked": dbus.MakeVariant(false), "Attributes": dbus.MakeVariant(gh)}, true},
+		{"locked", map[string]dbus.Variant{"Locked": dbus.MakeVariant(true), "Attributes": dbus.MakeVariant(gh)}, false},
+		{"hashed only", map[string]dbus.Variant{"Locked": dbus.MakeVariant(false), "Attributes": dbus.MakeVariant(
+			map[string]string{"gkr:compat:hashed:service": "0123abcd", "xdg:schema": "org.freedesktop.Secret.Generic"})}, false},
+		{"no Locked", map[string]dbus.Variant{"Attributes": dbus.MakeVariant(gh)}, false},
+		{"no Attributes", map[string]dbus.Variant{"Locked": dbus.MakeVariant(false)}, false},
+	} {
+		if _, err := placeableAttributes(c.props); (err == nil) != c.ok {
+			t.Errorf("%s: err = %v, want ok %v", c.name, err, c.ok)
+		}
+	}
+}
+
+func TestConnectionGoneOnlyFromTheBus(t *testing.T) {
+	sig := func(sender string) *dbus.Signal {
+		return &dbus.Signal{Sender: sender, Path: "/org/freedesktop/DBus", Name: "org.freedesktop.DBus.NameOwnerChanged",
+			Body: []any{":1.42", ":1.42", ""}}
+	}
+	if name, ok := connectionGone(sig("org.freedesktop.DBus")); !ok || name != ":1.42" {
+		t.Errorf("the bus driver's NameOwnerChanged: %q %v", name, ok)
+	}
+	if _, ok := connectionGone(sig(":1.7")); ok {
+		t.Error("a client's forged NameOwnerChanged dropped a caller")
+	}
+	acquired := sig("org.freedesktop.DBus")
+	acquired.Body = []any{":1.42", "", ":1.42"}
+	if _, ok := connectionGone(acquired); ok {
+		t.Error("a name acquired counted as gone")
+	}
+}
+
+func TestLearnKeyringFromFirstReply(t *testing.T) {
+	reply := &dbus.Message{Type: dbus.TypeMethodReply, Headers: map[dbus.HeaderField]dbus.Variant{
+		dbus.FieldReplySerial: dbus.MakeVariant(uint32(1)), dbus.FieldDestination: dbus.MakeVariant(":1.9"),
+		dbus.FieldSender: dbus.MakeVariant("org.freedesktop.DBus"), dbus.FieldSignature: dbus.MakeVariant(dbus.SignatureOf(""))},
+		Body: []any{":1.9"}}
+	frame, err := encodeWithSerial(reply, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &session{}
+	if _, err := s.keyringObject("/x"); err == nil {
+		t.Error("lookups before the keyring is named must fail")
+	}
+	s.learnKeyring(frame)
+	if n := s.keyring.Load(); n == nil || *n != ":1.9" {
+		t.Fatalf("keyring name = %v", n)
+	}
+}

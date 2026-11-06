@@ -171,6 +171,9 @@ type session struct {
 	upMu    sync.Mutex
 	ctl     *dbus.Conn
 	ctlName string
+	// keyring is the relayed connection's unique name, from the bus's first message to it: the gate's
+	// own lookups address it, never whoever owns the well-known name.
+	keyring atomic.Pointer[string]
 	serial  atomic.Uint32
 	// fwdMu orders forwarded calls around a replacing CreateItem: held exclusively from its search
 	// to its forward, so the keyring replaces the items the search found (it answers in order).
@@ -247,16 +250,25 @@ func (s *session) dialControl(path string) error {
 	ctl.Signal(sigs)
 	go func() {
 		for sig := range sigs {
-			if len(sig.Body) == 3 {
-				name, _ := sig.Body[0].(string)
-				owner, _ := sig.Body[2].(string)
-				if owner == "" && strings.HasPrefix(name, ":") {
-					s.forget(name)
-				}
+			if name, ok := connectionGone(sig); ok {
+				s.forget(name)
 			}
 		}
 	}()
 	return nil
+}
+
+// connectionGone returns the unique name a NameOwnerChanged from the bus driver reports gone. A
+// signal sent straight to the gate by a client matches no rule but is delivered all the same: it
+// would drop another caller's queue.
+func connectionGone(sig *dbus.Signal) (string, bool) {
+	if sig.Sender != "org.freedesktop.DBus" || sig.Path != "/org/freedesktop/DBus" ||
+		sig.Name != "org.freedesktop.DBus.NameOwnerChanged" || len(sig.Body) != 3 {
+		return "", false
+	}
+	name, _ := sig.Body[0].(string)
+	owner, _ := sig.Body[2].(string)
+	return name, owner == "" && strings.HasPrefix(name, ":")
 }
 
 func (s *session) close() {
@@ -306,6 +318,9 @@ func (s *session) pumpDown() error {
 			return fmt.Errorf("from bus: %w", err)
 		}
 		if frame[1] != byte(dbus.TypeMethodCall) {
+			if s.keyring.Load() == nil {
+				s.learnKeyring(frame)
+			}
 			if err := s.writeDown(frame); err != nil {
 				return err
 			}
@@ -318,6 +333,28 @@ func (s *session) pumpDown() error {
 		}
 		s.enqueue(header[string](m, dbus.FieldSender), m, frame)
 	}
+}
+
+// learnKeyring records the destination of the bus's first message on the relay (its Hello reply):
+// only a bus broker writes there, and it addresses the keyring by its unique name.
+func (s *session) learnKeyring(frame []byte) {
+	m, err := decodeFrame(frame)
+	if err != nil {
+		return
+	}
+	if dest := header[string](m, dbus.FieldDestination); strings.HasPrefix(dest, ":") {
+		s.keyring.CompareAndSwap(nil, &dest)
+	}
+}
+
+// keyringObject is the keyring's object path on the gate's connection, or an error before the bus
+// named the keyring.
+func (s *session) keyringObject(path dbus.ObjectPath) (dbus.BusObject, error) {
+	name := s.keyring.Load()
+	if name == nil {
+		return nil, errors.New("the keyring has no bus name yet")
+	}
+	return s.ctl.Object(*name, path), nil
 }
 
 func (s *session) writeUp(frame []byte) error {
@@ -515,22 +552,51 @@ func (s *session) admitGated(sender string, v *verdict, what string) bool {
 	return true
 }
 
+// attributes returns item's attributes, read with its Locked state in one GetAll.
 func (s *session) attributes(item dbus.ObjectPath) (map[string]string, error) {
+	obj, err := s.keyringObject(item)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
-	var attrs map[string]string
-	err := s.ctl.Object("org.freedesktop.secrets", item).CallWithContext(ctx, ifaceProps+".Get", 0,
-		ifaceItem, "Attributes").Store(&attrs)
-	return attrs, err
+	var props map[string]dbus.Variant
+	if err := obj.CallWithContext(ctx, ifaceProps+".GetAll", 0, ifaceItem).Store(&props); err != nil {
+		return nil, err
+	}
+	return placeableAttributes(props)
+}
+
+// placeableAttributes returns an item's Attributes when they are its real ones. gnome-keyring keeps
+// only gkr:compat:hashed: fields for an item of a collection locked since load: no scope could match
+// those, so such an item is refused (fail closed), as is one whose state can't be read.
+func placeableAttributes(props map[string]dbus.Variant) (map[string]string, error) {
+	locked, lok := props["Locked"].Value().(bool)
+	attrs, aok := props["Attributes"].Value().(map[string]string)
+	switch {
+	case !lok || !aok:
+		return nil, errors.New("no Locked or Attributes property")
+	case locked:
+		return nil, errors.New("locked: its attributes are hidden")
+	}
+	for k := range attrs {
+		if strings.HasPrefix(k, "gkr:compat:hashed:") {
+			return nil, errors.New("only hashed attributes")
+		}
+	}
+	return attrs, nil
 }
 
 // search asks the keyring which items of collection match attrs: its own matcher, the one replace uses.
 func (s *session) search(collection dbus.ObjectPath, attrs map[string]string) ([]dbus.ObjectPath, error) {
+	obj, err := s.keyringObject(collection)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
 	var items []dbus.ObjectPath
-	err := s.ctl.Object("org.freedesktop.secrets", collection).CallWithContext(ctx, ifaceCollection+".SearchItems", 0,
-		attrs).Store(&items)
+	err = obj.CallWithContext(ctx, ifaceCollection+".SearchItems", 0, attrs).Store(&items)
 	return items, err
 }
 
