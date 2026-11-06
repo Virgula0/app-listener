@@ -1503,9 +1503,12 @@ static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock 
 	return mark_conn(sk, res, EVENT_CONNECT);
 }
 
+static __noinline __u32 unmarked_port_res(struct sock *sk); // the loopback-port section below
+
 // judge_conn_use judges a use of a marked socket. A root no longer in guard_inodes answers to
 // GUARD_RES_GLOBAL (fail closed). A unix peer's path is display only (read unreferenced, possibly
-// already released); allowed uses are quiet, the admission was logged.
+// already released); allowed uses are quiet, the admission was logged. An unmarked connection on a
+// guarded port (sock_graft's storage charge failed: it can't refuse) is judged as the port's MKNOD.
 static __always_inline int judge_conn_use(struct emit_args *ea, struct sock *sk)
 {
 	struct sock *peer = NULL;
@@ -1513,22 +1516,28 @@ static __always_inline int judge_conn_use(struct emit_args *ea, struct sock *sk)
 	if (!sk)
 		return 0;
 	struct conn_mark *c = bpf_sk_storage_get(&guard_conns, sk, 0, 0);
-	if (!c)
-		return 0;
 	__u32 res = GUARD_RES_GLOBAL;
-	if (!c->global) {
-		struct inode_key root = c->root;
-		__u32 *found = bpf_map_lookup_elem(&guard_inodes, &root);
-		if (found)
-			res = *found;
+	__u32 event = EVENT_MKNOD;
+	if (!c) {
+		res = unmarked_port_res(sk);
+		if (res == GUARD_RES_NONE)
+			return 0;
+	} else {
+		if (!c->global) {
+			struct inode_key root = c->root;
+			__u32 *found = bpf_map_lookup_elem(&guard_inodes, &root);
+			if (found)
+				res = *found;
+		}
+		if (c->event != EVENT_MKNOD)
+			event = EVENT_CONNECT;
+		if (sk->__sk_common.skc_family == AF_UNIX) {
+			bpf_probe_read_kernel(&peer, sizeof(peer), &((struct unix_sock *)sk)->peer);
+			if (peer)
+				bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
+		}
 	}
-	if (sk->__sk_common.skc_family == AF_UNIX) {
-		bpf_probe_read_kernel(&peer, sizeof(peer), &((struct unix_sock *)sk)->peer);
-		if (peer)
-			bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
-	}
-	return check_and_emit(c->event == EVENT_MKNOD ? EVENT_MKNOD : EVENT_CONNECT, dentry, NULL, false,
-			      NULL, false, true, res);
+	return check_and_emit(event, dentry, NULL, false, NULL, false, true, res);
 }
 
 // Loopback TCP services (`[port tcp/N]`). A port resource's root is a root-owned anchor file the
@@ -1615,6 +1624,18 @@ static __always_inline __u32 port_res(struct sock *sk, __u32 port)
 	struct inode_key key = *root;
 	__u32 *found = bpf_map_lookup_elem(&guard_inodes, &key);
 	return found ? *found : GUARD_RES_GLOBAL;
+}
+
+// unmarked_port_res: the resource of an inet stream socket bound to a guarded port (an accepted
+// connection; guarded ports sit outside the ephemeral range, so no client's), else GUARD_RES_NONE.
+static __noinline __u32 unmarked_port_res(struct sock *sk)
+{
+	if (!sk)
+		return GUARD_RES_NONE;
+	__u16 fam = sk->__sk_common.skc_family;
+	if ((fam != AF_INET && fam != AF_INET6) || sk->sk_type != SOCK_STREAM)
+		return GUARD_RES_NONE;
+	return port_res(sk, sk->__sk_common.skc_num);
 }
 
 // port_connect_res: the resource an inet stream socket reaches by connecting to addr (connect,
@@ -2840,7 +2861,8 @@ int guard_socket_accept(unsigned long long *ctx)
 
 // Every accept of a guarded port grafts its connection here, in the acceptor's context, including
 // one that blocked before the guard attached. The hook can't refuse: it marks the connection as
-// the port's MKNOD, so every message, splice or zerocopy read on it judges the exe using it.
+// the port's MKNOD, so every message, splice or zerocopy read on it judges the exe using it. A
+// connection it can't mark is judged the same way by judge_conn_use.
 SEC("lsm/sock_graft")
 int guard_sock_graft(unsigned long long *ctx)
 {
