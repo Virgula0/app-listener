@@ -3,6 +3,8 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -35,7 +37,10 @@ import (
 //
 // LOGIN makes each missing runtime directory as root 0700 (the user can't enter it), plants the
 // sentinel, reloads so a guard anchors on it, checks that guard holds the very inode made here,
-// and only then chowns it to the user. A failure fails the login (the drop-in's ExecStartPost).
+// and only then chowns it to the user. Meanwhile /run/user/<uid> is root's, so none of the user's
+// processes can rename, replace or add an entry there; a directory this daemon didn't make (one of
+// the user's, maybe holding listeners, even if a reload guarded it as found) is first moved into a
+// root-only directory. A failure fails the login (the drop-in's ExecStartPost).
 const (
 	loginSocket = "/run/app-listener-daemon.login"
 	loginLogin  = "LOGIN"
@@ -119,6 +124,10 @@ type loginServer struct {
 	reload   func() (*daemonconfig.Config, error)
 	cfg      atomic.Pointer[daemonconfig.Config]
 	secrets  *secretGates
+	// made: the runtime directories this daemon made and handed to their uid (under mu). Only these
+	// are admitted as found at a login; dropped at that uid's logout. A guard holds each one open, so
+	// its tmpfs, and with it the device number in the key, can't be reused while it is guarded.
+	made map[guard.GuardInodeKey]uint32
 }
 
 // startLoginServer opens the socket before READY=1: the drop-in orders after the daemon unit, so a
@@ -142,7 +151,7 @@ func startLoginServer(uc usecase.DaemonUseCase, cfg *daemonconfig.Config) (*logi
 			systemd.LoginDropInFile)
 	}
 	s := &loginServer{ln: ln, selfDev: selfDev, selfIno: selfIno, uc: uc, ready: make(chan struct{}),
-		secrets: newSecretGates(cfg)}
+		secrets: newSecretGates(cfg), made: map[guard.GuardInodeKey]uint32{}}
 	s.cfg.Store(cfg)
 	s.sentinelFound()
 	go s.acceptLoop()
@@ -302,7 +311,15 @@ func (s *loginServer) login(uid uint32) error {
 		return err
 	}
 	defer unix.Close(userFd)
-	made, err := s.prepareDirs(userFd, paths)
+	if s.allOurs(userFd, uid, paths) {
+		return nil
+	}
+	unlock, err := lockParent(userFd, uid)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	made, err := s.prepareDirs(userFd, uid, paths)
 	defer func() {
 		for _, m := range made {
 			unix.Close(m.fd)
@@ -329,14 +346,33 @@ func (s *loginServer) login(uid uint32) error {
 		}); chErr != nil {
 			return fmt.Errorf("handing %s to uid %d: %w", m.path, uid, chErr)
 		}
+		s.made[m.key] = uid
 		log.Infof("daemon: %s made and guarded for uid %d", m.path, uid)
 	}
 	return nil
 }
 
+// lockParent makes /run/user/<uid> root's until unlock (its group, and mode 0700, stay): none of
+// the user's processes can then add, rename or remove an entry in it.
+func lockParent(userFd int, uid uint32) (unlock func(), err error) {
+	if err := unix.Fchownat(userFd, "", 0, -1, unix.AT_EMPTY_PATH); err != nil {
+		return nil, fmt.Errorf("locking /run/user/%d: %w", uid, err)
+	}
+	return func() {
+		if err := unix.Fchownat(userFd, "", int(uid), -1, unix.AT_EMPTY_PATH); err != nil {
+			log.Errorf("daemon: handing /run/user/%d back to its user: %v — the next login retries", uid, err)
+		}
+	}, nil
+}
+
 // logout reloads when one of uid's runtime directories went with its mount, so the reload drops it.
 func (s *loginServer) logout(uid uint32) error {
 	s.secrets.logout(uid)
+	for k, owner := range s.made {
+		if owner == uid {
+			delete(s.made, k)
+		}
+	}
 	resources := s.uc.Resources()
 	for i := range resources {
 		r := &resources[i]
@@ -353,9 +389,9 @@ func (s *loginServer) logout(uid uint32) error {
 	return nil
 }
 
-// prepareDirs makes each missing runtime directory and vets each one found; made holds the ones to
-// hand over, open, even on error.
-func (s *loginServer) prepareDirs(userFd int, paths []string) (made []madeDir, err error) {
+// prepareDirs makes each missing runtime directory and moves aside each one found that this daemon
+// didn't make; made holds the ones to hand over, open, even on error. The parent is locked.
+func (s *loginServer) prepareDirs(userFd int, uid uint32, paths []string) (made []madeDir, err error) {
 	for _, p := range paths {
 		m, created, mkErr := makeRuntimeDir(userFd, p)
 		if mkErr != nil {
@@ -363,28 +399,87 @@ func (s *loginServer) prepareDirs(userFd int, paths []string) (made []madeDir, e
 		}
 		if created {
 			made = append(made, m)
-		} else if err := s.checkGuardedAlready(m); err != nil {
+			continue
+		}
+		if s.ours(m, uid) {
+			unix.Close(m.fd)
+			continue
+		}
+		if err := s.moveAside(userFd, m); err != nil {
 			return made, err
 		}
+		if m, created, mkErr = makeRuntimeDir(userFd, p); mkErr != nil {
+			return made, mkErr
+		}
+		if !created {
+			unix.Close(m.fd)
+			return made, fmt.Errorf("%s: made anew while /run/user/%d was locked", p, uid)
+		}
+		made = append(made, m)
 	}
 	return made, nil
 }
 
-// checkGuardedAlready admits a runtime directory found at login only when a running guard holds
-// that very inode (user-runtime-dir@ restarted over a live mount). Anything else was made by one of
-// the user's processes in the fresh mount, before the daemon, and may hold its listeners: refused.
-func (s *loginServer) checkGuardedAlready(m madeDir) error {
-	defer unix.Close(m.fd)
-	// WithRuntimeRoot only reads the anchor here; nothing is chowned.
-	err := s.uc.WithRuntimeRoot(m.path, func(root guard.GuardInodeKey) error {
+// allOurs: every path is a directory this daemon made for uid, anchored by its running guard
+// (user-runtime-dir@ restarted over a live mount). Unchanged since: the user can't rename a root.
+func (s *loginServer) allOurs(userFd int, uid uint32, paths []string) bool {
+	for _, p := range paths {
+		var st unix.Stat_t
+		if unix.Fstatat(userFd, p[strings.LastIndexByte(p, '/')+1:], &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
+			return false
+		}
+		key := guard.GuardInodeKey{Dev: ebpf.KernelDev(unix.Major(st.Dev), unix.Minor(st.Dev)), Ino: st.Ino}
+		if !s.ours(madeDir{path: p, key: key}, uid) {
+			return false
+		}
+	}
+	return true
+}
+
+// ours: m is a directory this daemon made for uid and its running guard still anchors it.
+func (s *loginServer) ours(m madeDir, uid uint32) bool {
+	if owner, ok := s.made[m.key]; !ok || owner != uid {
+		return false
+	}
+	// WithRuntimeRoot only reads the anchor here; nothing is changed.
+	return s.uc.WithRuntimeRoot(m.path, func(root guard.GuardInodeKey) error {
 		if root != m.key {
 			return errors.New("another directory is guarded at that path")
 		}
 		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("%s existed before the daemon made it (%w): refusing it — remove it and log in again", m.path, err)
+	}) == nil
+}
+
+// moveAside renames the directory m found into a new root-only directory beside it: whatever the
+// user put there (listeners bound before any guard) stays out of reach of the path's clients. A
+// running guard anchored on it lets the daemon move its root (ownerAccessEvents). Closes m.fd.
+func (s *loginServer) moveAside(userFd int, m madeDir) error {
+	defer unix.Close(m.fd)
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return err
 	}
+	name := m.path[strings.LastIndexByte(m.path, '/')+1:]
+	aside := ".app-listener-moved-" + hex.EncodeToString(rnd[:])
+	if err := unix.Mkdirat(userFd, aside, 0o700); err != nil {
+		return fmt.Errorf("moving %s aside: %w", m.path, err)
+	}
+	asideFd, err := unix.Openat(userFd, aside, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("moving %s aside: %w", m.path, err)
+	}
+	defer unix.Close(asideFd)
+	move := func() error { return unix.Renameat2(userFd, name, asideFd, name, unix.RENAME_NOREPLACE) }
+	if s.allRunning([]string{m.path}) {
+		err = s.uc.WithRuntimeRoot(m.path, func(guard.GuardInodeKey) error { return move() })
+	} else {
+		err = move()
+	}
+	if err != nil {
+		return fmt.Errorf("%s was not made by the daemon and can't be moved aside: %w", m.path, err)
+	}
+	log.Warnf("daemon: %s was not made by the daemon: moved to %s/%s, a fresh one is guarded", m.path,
+		m.path[:strings.LastIndexByte(m.path, '/')], aside)
 	return nil
 }
 
@@ -405,8 +500,8 @@ func (s *loginServer) notRunning(paths []string) []string {
 	return out
 }
 
-// openUserRuntimeDir opens /run/user/<uid> without following links and checks it is the user's,
-// returning its fd and group.
+// openUserRuntimeDir opens /run/user/<uid> without following links and checks it is the user's (or
+// root's: a login's lock its daemon didn't undo), returning its fd and group.
 func openUserRuntimeDir(uid uint32) (fd int, gid uint32, err error) {
 	base, err := unix.Open("/run/user", unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -418,11 +513,18 @@ func openUserRuntimeDir(uid uint32) (fd int, gid uint32, err error) {
 		return -1, 0, fmt.Errorf("opening /run/user/%d: %w", uid, err)
 	}
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil || st.Uid != uid {
+	var fs unix.Statfs_t
+	err = unix.Fstat(fd, &st)
+	switch {
+	case err != nil:
+	case st.Uid != uid && st.Uid != 0:
+		err = fmt.Errorf("owned by uid %d", st.Uid)
+	case unix.Fstatfs(fd, &fs) != nil || fs.Type != unix.TMPFS_MAGIC:
+		// user-runtime-dir@'s tmpfs, not a FUSE mount the user put over it (setuid fusermount3).
+		err = errors.New("not a tmpfs")
+	}
+	if err != nil {
 		unix.Close(fd)
-		if err == nil {
-			err = fmt.Errorf("owned by uid %d", st.Uid)
-		}
 		return -1, 0, fmt.Errorf("/run/user/%d: %w", uid, err)
 	}
 	return fd, st.Gid, nil

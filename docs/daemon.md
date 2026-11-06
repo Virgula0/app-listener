@@ -84,20 +84,27 @@ binary).
 
 At login the daemon:
 
-1. creates each missing runtime directory as root, mode 0700, so the user can't enter it yet, with
+1. makes `/run/user/<uid>` root's for the next steps (its group and mode stay), so none of the
+   user's processes can add, rename or remove anything in it;
+2. moves each runtime directory it didn't make itself into a new root-only
+   `.app-listener-moved-<random>` beside it: the mount is fresh at login, so such a directory was
+   made by one of the user's processes before the daemon, and may hold its listeners (also when a
+   reload guarded it as found);
+3. creates each missing runtime directory as root, mode 0700, so the user can't enter it yet, with
    a root-owned `.app-listener/` inside that keeps it non-empty: no whitelisted program with
    `DELETE` can then remove the guarded directory and let it be recreated unguarded;
-2. reloads, so a guard anchors on that directory;
-3. checks that the guard holds the very directory it made, then hands it to the user (`chown`).
+4. reloads, so a guard anchors on that directory;
+5. checks that the guard holds the very directory it made, then hands it to the user (`chown`),
+   and `/run/user/<uid>` back too.
 
 Only then does `user@<uid>.service` start the user's processes. If any step fails, the login
 fails. If no daemon is running, the login goes ahead with nothing guarded there. The drop-in is
-ordered after the daemon unit, so a login during the daemon's start waits for it.
+ordered after the daemon unit, so a login during the daemon's start waits for it. A directory the
+daemon made and still guards is kept (`user-runtime-dir@` restarted over a live mount), unless the
+daemon restarted since: it remembers what it made in memory only. `/run/user/<uid>` must be a
+tmpfs, not a filesystem the user mounted over it.
 
-The mount is fresh at login, so a runtime directory already in it was made by one of the user's
-processes before the daemon, and may hold its listeners: the daemon refuses it and the login fails
-(remove the directory and log in again). Only a directory a running guard already holds is
-accepted. A directory present when the daemon itself starts (the user logged in while no daemon
+A directory present when the daemon itself starts (the user logged in while no daemon
 ran) is guarded as found, and may hold sockets bound before the guard. The daemon plants its
 sentinel in it then (and at every reload), so an agent removing its own socket can't leave it
 empty.

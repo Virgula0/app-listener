@@ -1023,9 +1023,10 @@ func (g *Guard) WithSelfRuntimeAccess(fn func() error) error {
 }
 
 // ownerAccessEvents lets the daemon finish a runtime directory: plant its sentinel (one found at a
-// start or reload has none) and hand one it made to its user (fchown).
+// start or reload has none), hand one it made to its user (fchown), or move aside a found one it
+// didn't make (rename of the root).
 var ownerAccessEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat, ebpf.EventAttr,
-	ebpf.EventMkdir, ebpf.EventMknod, ebpf.EventWrite}
+	ebpf.EventMkdir, ebpf.EventMknod, ebpf.EventWrite, ebpf.EventRename}
 
 // WithSelfOwnerAccess is WithSelfRuntimeAccess with ownerAccessEvents.
 func (g *Guard) WithSelfOwnerAccess(fn func() error) error {

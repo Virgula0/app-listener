@@ -79,7 +79,7 @@ type DaemonUseCase interface {
 	// edit grant is active; reloads, grants and shutdown wait for fn.
 	WithRuntimeAccess(resourcePath string, fn func() error) error
 	// WithRuntimeRoot runs fn with the anchored root of the runtime resource resourcePath while
-	// the app-listener binary (uid 0) may chown it (GuardRepository.WithSelfOwnerAccess).
+	// the app-listener binary (uid 0) may chown or move it (GuardRepository.WithSelfOwnerAccess).
 	WithRuntimeRoot(resourcePath string, fn func(root guard.GuardInodeKey) error) error
 }
 
