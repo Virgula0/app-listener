@@ -54,10 +54,14 @@ client either.
   when it listens on any other address (`0.0.0.0`, `::`, a LAN address), since clients could then
   reach it through an address nobody judges. Configure the service to listen on `127.0.0.1` or `::1`.
 - **TCP only, this host's network namespace only.** A container's own loopback is another host's.
+  An SMC socket (`AF_SMC`, or `IPPROTO_SMC`) is refused the port to everyone, its `MKNOD` lines
+  included: it listens through a TCP socket of the kernel's own that no hook sees. The journal
+  names it `dest=smc-socket`.
 - **Not in the ephemeral range**, where the kernel could hand the port to any program.
 - **The connection is guarded, not just the connect.** A connection handed to another program
   (inherited, passed over a unix socket) is judged again for every message that program sends or
-  receives, as for unix sockets.
+  receives, as for unix sockets. A `sendto` on it that names another guarded port is refused: the
+  data would still go to the port it is connected to.
 
 The daemon keeps one root-owned anchor file per port in `/run/app-listener/ports` (`tcp-<n>`); its
 events name that path. Removing a port section and reloading stops guarding the port.

@@ -32,6 +32,8 @@
 #define AF_UNIX 1
 #define AF_INET 2
 #define AF_INET6 10
+#define AF_SMC 43
+#define IPPROTO_SMC 256
 #define SOL_SOCKET 1
 
 #include "prctl_gate.h"
@@ -58,6 +60,8 @@
 #define GUARD_REASON_BTRFS_IOCTL 5
 // A [port] section's port listened on at a non-loopback address: refused to its MKNOD binaries too.
 #define GUARD_REASON_PORT_ADDR 6
+// An SMC socket bound to a [port] section's port: refused to everyone (see guard_socket_bind).
+#define GUARD_REASON_PORT_SMC 7
 // Bits 8-15: the trust_code_suspect mark (SUSPECT_*) behind a whitelist denial, logged as PRELOADED /
 // LAUNCH: an LSM chain stops at the first denial, so when the guard runs first the trust object's
 // report never does. Its own byte keeps a gate's label (RAW_DEVICE, BTRFS_IOCTL) in bits 0-7.
@@ -2776,7 +2780,7 @@ int guard_socket_connect(unsigned long long *ctx)
 	return admit_port(&ea_buf, sk, res, EVENT_CONNECT);
 }
 
-// A sendto with an address on an inet stream socket is a TCP Fast Open connect
+// A sendto with an address on an unmarked inet stream socket is a TCP Fast Open connect
 // (tcp_sendmsg_fastopen), which never reaches socket_connect. msg_name is the kernel's copy.
 SEC("lsm/socket_sendmsg")
 int guard_socket_sendmsg(unsigned long long *ctx)
@@ -2792,8 +2796,16 @@ int guard_socket_sendmsg(unsigned long long *ctx)
 	}
 	struct sock *sk = sock ? sock->sk : NULL;
 	__u32 res = name ? port_connect_res(sock, sk, name, namelen) : GUARD_RES_NONE;
-	if (res != GUARD_RES_NONE)
-		return admit_port(&ea_buf, sk, res, EVENT_CONNECT);
+	if (res != GUARD_RES_NONE) {
+		struct conn_mark *c = sk ? bpf_sk_storage_get(&guard_conns, sk, 0, 0) : NULL;
+		if (!c || !c->set)
+			return admit_port(&ea_buf, sk, res, EVENT_CONNECT);
+		// A connected socket ignores the address: judged by its mark, which naming another
+		// resource widens to GUARD_RES_GLOBAL (as mark_conn does). One decision per path.
+		struct res_config *cfg = res_cfg(res);
+		if (!cfg || c->root.dev != cfg->root_dev || c->root.ino != cfg->root_ino)
+			c->global = 1;
+	}
 	if (note_bus_send(sk))
 		return -EPERM;
 	return judge_conn_use(&ea_buf, sk);
@@ -2829,6 +2841,28 @@ static __always_inline int judge_listen(struct emit_args *ea, struct sock *sk)
 	if (!local)
 		return emit_process_denial(GUARD_REASON_PORT_ADDR, EVENT_MKNOD, NULL, 0, 0, res);
 	return admit_port(ea, sk, res, EVENT_MKNOD);
+}
+
+// An SMC socket (AF_SMC, or IPPROTO_SMC on AF_INET*) binds and listens through an internal TCP
+// socket (kernel_bind, kernel_listen) no hook sees, and keeps no port of its own: its listener on a
+// guarded port would be neither judged nor marked, so the bind is refused. Every family smc_bind
+// takes keeps the port at sockaddr_in's offset.
+SEC("lsm/socket_bind")
+int guard_socket_bind(unsigned long long *ctx)
+{
+	struct socket *sock = (struct socket *)ctx[0];
+	struct sock *sk = sock ? sock->sk : NULL;
+	if (!sk || (sk->__sk_common.skc_family != AF_SMC && sk->sk_protocol != IPPROTO_SMC))
+		return 0;
+	struct sockaddr_in in = {};
+	if ((int)ctx[2] < (int)sizeof(in))
+		return 0; // smc_bind refuses it
+	if (bpf_probe_read_kernel(&in, sizeof(in), (void *)ctx[1]))
+		return -EPERM;
+	__u32 res = port_res(sk, bpf_ntohs(in.sin_port));
+	if (res == GUARD_RES_NONE)
+		return 0;
+	return emit_process_denial(GUARD_REASON_PORT_SMC, EVENT_MKNOD, NULL, 0, 0, res);
 }
 
 SEC("lsm/socket_listen")

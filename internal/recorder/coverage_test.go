@@ -55,6 +55,7 @@ var hookCoverage = map[string]struct {
 	"socket_getsockopt":    {none: "zerocopy reads on a connection, judged as CONNECT: the connect records it"},
 	"socket_connect":       {none: "[port] sections only: a recording targets a path, a port's clients are listed by hand"},
 	"socket_listen":        {none: "[port] sections only: a recording targets a path, a port's server is listed by hand"},
+	"socket_bind":          {none: "refuses SMC sockets on a [port] section's port to everyone: nothing to admit"},
 }
 
 func readSource(t *testing.T, path string) string {

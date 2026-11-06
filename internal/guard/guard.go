@@ -110,6 +110,7 @@ const (
 	guardReasonProcMem    = 4
 	guardReasonBtrfsIoctl = 5
 	guardReasonPortAddr   = 6
+	guardReasonPortSMC    = 7
 
 	guardReasonGateMask     = 0xff
 	guardReasonSuspectShift = 8
@@ -149,8 +150,12 @@ func processGateLabel(reason uint32) string {
 	}
 }
 
-// PortAddrLabel is the Dest of a refused listen on a guarded port at a non-loopback address.
-const PortAddrLabel = "non-loopback-address"
+// PortAddrLabel is the Dest of a refused listen on a guarded port at a non-loopback address;
+// PortSMCLabel of a refused SMC bind to one.
+const (
+	PortAddrLabel = "non-loopback-address"
+	PortSMCLabel  = "smc-socket"
+)
 
 // Resource strings logged for filesystem-wide gate denials (GuardEvent.FsGate).
 const (
@@ -699,7 +704,7 @@ var requiredHooks = map[string]bool{
 	"file_ioctl": true, "file_ioctl_compat": true,
 	"task_prctl": true, "unix_stream_connect": true, "unix_may_send": true,
 	"socket_sendmsg": true, "socket_recvmsg": true, "socket_connect": true, "socket_listen": true,
-	"socket_accept": true, "sock_graft": true, "socket_getsockopt": true, "mmap_file": true,
+	"socket_bind": true, "socket_accept": true, "sock_graft": true, "socket_getsockopt": true, "mmap_file": true,
 }
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
@@ -805,6 +810,7 @@ func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []lsmHook {
 		{o.GuardSocketRecvmsg, "socket_recvmsg"},
 		{o.GuardSocketConnect, "socket_connect"},
 		{o.GuardSocketListen, "socket_listen"},
+		{o.GuardSocketBind, "socket_bind"},
 		{o.GuardSocketAccept, "socket_accept"},
 		{o.GuardSockGraft, "sock_graft"},
 		{o.GuardSocketGetsockopt, "socket_getsockopt"},
@@ -2422,8 +2428,11 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 		Suspect:   suspectLabel(be.Reason),
 		Exe:       GuardInodeKey{Dev: be.ExeDev, Ino: be.ExeIno},
 	}
-	if be.Reason&guardReasonGateMask == guardReasonPortAddr {
+	switch be.Reason & guardReasonGateMask {
+	case guardReasonPortAddr:
 		ge.Dest = PortAddrLabel
+	case guardReasonPortSMC:
+		ge.Dest = PortSMCLabel
 	}
 	if ge.Process != "" {
 		// The kernel sends the other task's comm in path and its tgid in fd.
