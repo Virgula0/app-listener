@@ -17,8 +17,9 @@ const (
 // A [secret gh] scope: gnome-keyring reaches the user bus only through the daemon's relay, and every
 // call touching a gh item needs a caller the scope admits, attested by the pidfd the bus took at
 // connect. The probes cover the item calls, a replace matching by a subset, owning the name,
-// monitoring, exec after connecting or after sending, a send on a socket another process connected, a
-// fake keyring on the relay, the pkcs11 socket, a fake bus renamed over the user's, and a connection made before a restart.
+// monitoring, exec after connecting or after sending, a send on a socket another process connected
+// or the guard could not mark, a fake keyring on the relay, the pkcs11 socket, a fake bus renamed
+// over the user's, and a connection made before a restart.
 func (s *IntegrationSuite) TestDaemon_SecretService() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
@@ -144,6 +145,20 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		s.Require().NotContainsf(out, ghToken, "a call sent on the app's lent socket leaked: %s", out)
 		s.Require().Equalf(1, code, "want the gate's refusal: %s\n%s", out, s.readDaemonLog(c))
 		ok("the app on a fresh process after a lend", "/exploits/secret_probe_ok get service gh:github.com")
+	})
+
+	s.T().Run("unmarkable socket", func(t *testing.T) {
+		// A socket the guard can't mark (optmem_max 0 in its netns) must not reach the bus: unmarked, a
+		// child's send on it would be credited to the app the connecting pid execs into.
+		_, out := user("", "(/exploits/secret_probe unmarkexec service gh:github.com /exploits/secret_probe "+
+			"/exploits/secret_probe_ok dialsleep 8s >/tmp/unmark.log 2>&1; echo rc=$? >>/tmp/unmark.log) & "+
+			"for i in $(seq 120); do grep -qE 'SECRET=|REFUSED|NOTHING|UNSUPPORTED|ERROR' /tmp/unmark.log && break; "+
+			"sleep 0.1; done; sleep 0.5; cat /tmp/unmark.log")
+		if strings.Contains(out, "UNSUPPORTED") {
+			t.Skipf("no user+net namespace here: %s", out)
+		}
+		s.Require().NotContainsf(out, ghToken, "a send on an unmarkable bus socket leaked: %s\n%s", out, s.readDaemonLog(c))
+		s.Require().Containsf(out, "REFUSED connect", "want the unmarkable connect refused: %s\n%s", out, s.readDaemonLog(c))
 	})
 
 	s.T().Run("fake keyring", func(*testing.T) {

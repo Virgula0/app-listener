@@ -287,6 +287,83 @@ func heldexec(attr, val, waitfile, readerBin string, argv []string) {
 	execInto(argv)
 }
 
+// unmarkexec is heldexec on a socket the guard can't mark: made in a fresh user+net namespace whose
+// optmem_max is 0, so bpf_sk_storage_get(F_CREATE) fails on it. The connect, the lookup and the
+// handoff happen while the guard runs.
+func unmarkexec(attr, val, readerBin string, argv []string) {
+	fd := unmarkableSocket()
+	if err := unix.Connect(fd, &unix.SockaddrUnix{Name: busPath()}); err != nil {
+		refusal("connect", err)
+	}
+	nc, err := net.FileConn(os.NewFile(uintptr(fd), "bus"))
+	if err != nil {
+		failf(3, "ERROR fileconn: %v", err)
+	}
+	c, err := dbus.NewConn(nc)
+	if err != nil {
+		failf(3, "ERROR newconn: %v", err)
+	}
+	session, item := lookup(handshake(c), attr, val)
+	dup, err := unix.Dup(connFD())
+	if err != nil {
+		failf(3, "ERROR dup: %v", err)
+	}
+	reader := exec.CommandContext(context.Background(), readerBin, "rawget", string(item), string(session), "1500ms") //nolint:gosec // the test names the reader
+	reader.ExtraFiles = []*os.File{os.NewFile(uintptr(dup), "bus")}
+	reader.Stdout, reader.Stderr = os.Stdout, os.Stderr
+	if err := reader.Start(); err != nil {
+		failf(3, "ERROR reader: %v", err)
+	}
+	execInto(argv)
+}
+
+// unmarkableSocket has `unshare -rn <self> mksock` make the socket and pass it back over fd 3.
+func unmarkableSocket() int {
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		failf(3, "ERROR socketpair: %v", err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		failf(3, "ERROR self: %v", err)
+	}
+	child := exec.CommandContext(context.Background(), "unshare", "-rn", self, "mksock") //nolint:gosec // own binary
+	child.ExtraFiles = []*os.File{os.NewFile(uintptr(pair[1]), "pair")}
+	if out, err := child.CombinedOutput(); err != nil {
+		failf(2, "UNSUPPORTED unshare -rn: %v: %s", err, out)
+	}
+	buf := make([]byte, 1)
+	oob := make([]byte, unix.CmsgSpace(4))
+	_, oobn, _, _, err := unix.Recvmsg(pair[0], buf, oob, 0)
+	if err != nil {
+		failf(3, "ERROR recvmsg: %v", err)
+	}
+	msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+	if err != nil || len(msgs) != 1 {
+		failf(3, "ERROR no fd passed back: %v", err)
+	}
+	fds, err := unix.ParseUnixRights(&msgs[0])
+	if err != nil || len(fds) != 1 {
+		failf(3, "ERROR rights: %v", err)
+	}
+	return fds[0]
+}
+
+// mksock runs in the new namespaces: optmem_max 0, then an AF_UNIX socket sent back on fd 3.
+func mksock() {
+	if err := os.WriteFile("/proc/sys/net/core/optmem_max", []byte("0\n"), 0); err != nil {
+		failf(2, "UNSUPPORTED optmem_max: %v", err)
+	}
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		failf(3, "ERROR socket: %v", err)
+	}
+	if err := unix.Sendmsg(3, []byte{0}, unix.UnixRights(fd), nil, 0); err != nil {
+		failf(3, "ERROR sendmsg: %v", err)
+	}
+	os.Exit(0)
+}
+
 type propEntry struct {
 	K string
 	V dbus.Variant
@@ -477,7 +554,7 @@ func connFD() int {
 }
 
 func usage() {
-	failf(3, "usage: secret_probe get|store|replace|dupkey|own|monitor|connexec|sendexec|lend|heldexec|reader|rawget|rawreader|fakebus|dialsleep|sleep ...")
+	failf(3, "usage: secret_probe get|store|replace|dupkey|own|monitor|connexec|sendexec|lend|heldexec|unmarkexec|mksock|reader|rawget|rawreader|fakebus|dialsleep|sleep ...")
 }
 
 func duration(s string) time.Duration {
@@ -487,20 +564,22 @@ func duration(s string) time.Duration {
 
 // modes run with the arguments after the mode name.
 var modes = map[string]func(a []string){
-	"get":       func(a []string) { get(dial(), a[0], a[1]) },
-	"store":     func(a []string) { store(a[0], a[1], a[2]) },
-	"replace":   func(a []string) { replace(a[0], a[1:]) },
-	"own":       func([]string) { own() },
-	"monitor":   func(a []string) { monitor(a[0], duration(a[1])) },
-	"connexec":  func(a []string) { connexec(a[0], a[1], a[2], a[3:]) },
-	"sendexec":  func(a []string) { sendexec(a[0], a[1], a[2], a[3:]) },
-	"reader":    func(a []string) { reader(a[0], a[1]) },
-	"lend":      func(a []string) { lend(a[0], a[1], a[2]) },
-	"heldexec":  func(a []string) { heldexec(a[0], a[1], a[2], a[3], a[4:]) },
-	"rawreader": func(a []string) { rawreader(a[0]) },
-	"dupkey":    func(a []string) { dupkey(a[0], a[1]) },
-	"fakebus":   func(a []string) { fakebus(a[0], duration(a[1])) },
-	"sleep":     func(a []string) { time.Sleep(duration(a[0])) },
+	"get":        func(a []string) { get(dial(), a[0], a[1]) },
+	"store":      func(a []string) { store(a[0], a[1], a[2]) },
+	"replace":    func(a []string) { replace(a[0], a[1:]) },
+	"own":        func([]string) { own() },
+	"monitor":    func(a []string) { monitor(a[0], duration(a[1])) },
+	"connexec":   func(a []string) { connexec(a[0], a[1], a[2], a[3:]) },
+	"sendexec":   func(a []string) { sendexec(a[0], a[1], a[2], a[3:]) },
+	"reader":     func(a []string) { reader(a[0], a[1]) },
+	"lend":       func(a []string) { lend(a[0], a[1], a[2]) },
+	"heldexec":   func(a []string) { heldexec(a[0], a[1], a[2], a[3], a[4:]) },
+	"unmarkexec": func(a []string) { unmarkexec(a[0], a[1], a[2], a[3:]) },
+	"mksock":     func([]string) { mksock() },
+	"rawreader":  func(a []string) { rawreader(a[0]) },
+	"dupkey":     func(a []string) { dupkey(a[0], a[1]) },
+	"fakebus":    func(a []string) { fakebus(a[0], duration(a[1])) },
+	"sleep":      func(a []string) { time.Sleep(duration(a[0])) },
 	"rawget": func(a []string) {
 		delay := 500 * time.Millisecond
 		if len(a) > 2 {
