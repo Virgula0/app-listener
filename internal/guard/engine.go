@@ -303,6 +303,10 @@ func (e *engine) startLocked() error {
 		e.stopLocked()
 		return err
 	}
+	if err := e.syncConnectConfinedLocked(); err != nil {
+		e.stopLocked()
+		return err
+	}
 	e.setPortNetNSLocked()
 	e.setBusPidNSLocked()
 

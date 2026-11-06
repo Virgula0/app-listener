@@ -391,6 +391,9 @@ func (g *Guard) writeTempRow(r *tempRow, trust *TrustGuard) error {
 		if err := r.trustTempRuntime(trust); err != nil {
 			return err
 		}
+		if err := confineConnect(k, r.bin.Path); err != nil {
+			return err
+		}
 		return g.putExeAction(k, GUARD_ALLOW)
 	}
 	return nil

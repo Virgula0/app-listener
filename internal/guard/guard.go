@@ -55,8 +55,8 @@ var ComputeBinaryEntry = ebpf.ComputeBinaryEntry
 type GuardEvent struct {
 	ebpf.FileEvent
 	Blocked bool
-	// FsGate labels a filesystem-wide gate denial (RawDeviceResourceLabel, BtrfsIoctlResourceLabel):
-	// it names a device or filesystem, not a resource; don't attribute it to a watched path.
+	// FsGate labels a gate denial that names no resource (RawDeviceResourceLabel,
+	// BtrfsIoctlResourceLabel, ConfinedConnectResourceLabel); don't attribute it to a watched path.
 	FsGate string
 	// Process names a process-gate denial ("PTRACE", "TRACED_EXEC", "PROC_MEM"): no file involved;
 	// Path is "pid=<n> comm=<name>" of the other task. Empty for path-keyed events.
@@ -111,6 +111,7 @@ const (
 	guardReasonBtrfsIoctl = 5
 	guardReasonPortAddr   = 6
 	guardReasonPortSMC    = 7
+	guardReasonConfined   = 8
 
 	guardReasonGateMask     = 0xff
 	guardReasonSuspectShift = 8
@@ -157,10 +158,12 @@ const (
 	PortSMCLabel  = "smc-socket"
 )
 
-// Resource strings logged for filesystem-wide gate denials (GuardEvent.FsGate).
+// Resource strings logged for gate denials that name no resource (GuardEvent.FsGate).
 const (
 	RawDeviceResourceLabel  = "raw-block-device"
 	BtrfsIoctlResourceLabel = "btrfs-ioctl"
+	// A ConnectConfinedNames binary's unix connect to a socket outside every guarded tree.
+	ConfinedConnectResourceLabel = "unguarded-socket"
 )
 
 // fsGateLabel maps a filesystem-wide gate reason to its label; "" for every other event.
@@ -170,6 +173,8 @@ func fsGateLabel(reason uint32) string {
 		return RawDeviceResourceLabel
 	case guardReasonBtrfsIoctl:
 		return BtrfsIoctlResourceLabel
+	case guardReasonConfined:
+		return ConfinedConnectResourceLabel
 	default:
 		return ""
 	}
@@ -1298,6 +1303,11 @@ func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][
 			if err := g.objs().GuardExeEvents.Put(g.resKey(key), mask); err != nil {
 				return fmt.Errorf("storing exe events for %s: %w", path, err)
 			}
+		}
+	}
+	if action == GUARD_ALLOW {
+		if err := confineConnect(key, path); err != nil {
+			return err
 		}
 	}
 	if err := g.putExeAction(key, action); err != nil {

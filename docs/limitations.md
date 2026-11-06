@@ -61,7 +61,12 @@ over a channel the guard doesn't see answers whoever asks:
   whitelisted client run by malware still asks on its behalf: `ssh-add -L`, `ssh` signing to a host
   of the attacker's choice, `gpg --decrypt`. `git credential fill`, run by anyone, prints what your
   credential helper (`store`, `cache`, libsecret, Git Credential Manager, `gh auth git-credential`)
-  hands back.
+  hands back. `ssh-add` may reach only an agent whose socket is inside a guarded tree (the catalog's
+  `ssh-agent`, gcr and `gpg-agent` runtime sections, or one in a guarded directory): pointed at
+  any other socket it would send the key it read there. An agent started with `eval $(ssh-agent)`
+  listens in `/tmp`, so `ssh-add` is refused it (`DAEMON DENIED op=CONNECT comm=ssh-add
+  resource=unguarded-socket`). Its own user lookup is refused the same way, so for a user known only
+  to `sssd` or LDAP `ssh-add` fails (`nscd` is skipped, local users work).
 - **Secret scopes.** The gate covers gnome-keyring's Secret Service only:
   - items no scope covers stay open to every program, as do item labels and attributes;
   - a whitelisted program run by malware still asks on its behalf (`gh auth token`);

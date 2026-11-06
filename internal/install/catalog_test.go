@@ -1061,3 +1061,32 @@ func catalogEntry(t *testing.T, name string) CandidateDir {
 	t.Fatalf("no catalog entry %q", name)
 	return CandidateDir{}
 }
+
+func TestRuntimeServersGateTheOffer(t *testing.T) {
+	i := slices.IndexFunc(Catalog, func(c CandidateDir) bool { return c.Name == "GCR SSH agent socket" })
+	if i < 0 {
+		t.Fatal("no GCR SSH agent socket entry")
+	}
+	saved := Catalog[i].RuntimeServers
+	t.Cleanup(func() { Catalog[i].RuntimeServers = saved })
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	users := []User{{Name: "u", UID: 4242, Home: home}}
+	offered := func() bool {
+		return slices.ContainsFunc(DiscoverRuntime(users), func(c Candidate) bool { return c.Entry.Name == Catalog[i].Name })
+	}
+	Catalog[i].RuntimeServers = []string{filepath.Join(home, "missing")}
+	if offered() {
+		t.Fatal("offered without its server installed")
+	}
+	server := filepath.Join(home, "gcr-ssh-agent")
+	if err := os.WriteFile(server, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	Catalog[i].RuntimeServers = []string{filepath.Join(home, "missing"), server}
+	if !offered() {
+		t.Fatal("not offered with its server installed")
+	}
+}

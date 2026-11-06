@@ -62,6 +62,8 @@
 #define GUARD_REASON_PORT_ADDR 6
 // An SMC socket bound to a [port] section's port: refused to everyone (see guard_socket_bind).
 #define GUARD_REASON_PORT_SMC 7
+// A guard_connect_confined exe's unix connect to a socket bound outside every guarded tree.
+#define GUARD_REASON_CONFINED 8
 // Bits 8-15: the trust_code_suspect mark (SUSPECT_*) behind a whitelist denial, logged as PRELOADED /
 // LAUNCH: an LSM chain stops at the first denial, so when the guard runs first the trust object's
 // report never does. Its own byte keeps a gate's label (RAW_DEVICE, BTRFS_IOCTL) in bits 0-7.
@@ -1487,6 +1489,26 @@ static __always_inline int mark_conn(struct sock *sk, __u32 res, __u32 event)
 	return 0;
 }
 
+// guard_connect_confined: exe inodes (userspace's ConnectConfinedNames, held open so the number is
+// never reused) that may unix-connect only to a socket bound inside a guarded tree: ssh-add hands
+// the key it read to whatever agent SSH_AUTH_SOCK names.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} guard_connect_confined SEC(".maps");
+
+// unguarded_peer: sk reaches a socket outside every guarded tree (or an abstract or unbound one).
+// Out of line: one body for both unix hooks.
+static __noinline int unguarded_peer(void)
+{
+	struct inode_key ik = {};
+	if (!get_current_exe_inode(&ik) || !bpf_map_lookup_elem(&guard_connect_confined, &ik))
+		return 0;
+	return emit_process_denial(GUARD_REASON_CONFINED, EVENT_CONNECT, NULL, 0, 0, GUARD_RES_GLOBAL);
+}
+
 // judge_unix_connect judges sk reaching peer's bound socket and marks sk on admission.
 static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock *sk, struct sock *peer)
 {
@@ -1494,13 +1516,13 @@ static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock 
 	struct dentry *dentry = NULL;
 	struct inode *inode = NULL;
 	if (!peer)
-		return 0;
+		return unguarded_peer();
 	bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct unix_sock *)peer)->path.dentry);
 	if (!dentry)
-		return 0;
+		return unguarded_peer();
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 	if (off_guarded_fs(dentry, inode) || !is_guarded_access(dentry, inode, &res))
-		return 0;
+		return unguarded_peer();
 	int ret = check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, false, res);
 	if (ret)
 		return ret;

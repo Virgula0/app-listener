@@ -38,6 +38,8 @@ type CandidateDir struct {
 	// holds RuntimeIf. Set instead of RelPaths/AbsPaths.
 	RuntimeDir string
 	RuntimeIf  string
+	// RuntimeServers: when set, a RuntimeDir entry is offered only with one of them installed.
+	RuntimeServers []string
 	// Ports are loopback TCP ports the entry's server listens on, each guarded as a `[port tcp/<n>]`
 	// section: MKNOD for the binaries that serve it, CONNECT for its clients. Offered for a user
 	// with one of the Whitelist binaries. Set instead of RelPaths/AbsPaths.
@@ -211,6 +213,17 @@ var Catalog = []CandidateDir{
 			"/usr/bin/ssh":        {"CONNECT", "STAT"},
 			"/usr/bin/ssh-add":    {"CONNECT", "STAT"},
 			"/usr/bin/ssh-keygen": {"CONNECT", "STAT"},
+		}},
+	// gcr 4's ssh agent: gcr-ssh-agent.socket binds ssh, which proxies to the ssh-agent it runs on .ssh.
+	{Name: "GCR SSH agent socket", RuntimeDir: "gcr", RuntimeIf: ".ssh", RuntimeServers: gcrSSHAgents,
+		Whitelist: map[string][]string{
+			"/usr/lib/systemd/systemd": {"MKNOD", "STAT"},
+			gcrSSHAgents[0]:            {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			gcrSSHAgents[1]:            {"MKNOD", "DELETE", "CONNECT", "STAT"},
+			"/usr/bin/ssh-agent":       {"MKNOD", "DELETE", "STAT"},
+			"/usr/bin/ssh":             {"CONNECT", "STAT"},
+			"/usr/bin/ssh-add":         {"CONNECT", "STAT"},
+			"/usr/bin/ssh-keygen":      {"CONNECT", "STAT"},
 		}},
 	// gnome-keyring's control and pkcs11 sockets: pkcs11 hands any client every stored secret
 	// (pkcs11-tool --read-object), past the Secret Service gate. The user manager binds the socket
@@ -1152,6 +1165,14 @@ func Discover(user User) []Candidate {
 	return out
 }
 
+// gcrSSHAgents are gcr-ssh-agent's paths (Arch, Debian/Fedora).
+var gcrSSHAgents = []string{"/usr/lib/gcr-ssh-agent", "/usr/libexec/gcr-ssh-agent"}
+
+func isRegularFile(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
+}
+
 // DiscoverRuntime proposes each RuntimeDir entry for every user whose home holds its RuntimeIf.
 // Kept out of Discover: those directories exist only while the user is logged in and are never
 // encrypted, so no fscrypt scan may address them.
@@ -1161,6 +1182,9 @@ func DiscoverRuntime(users []User) []Candidate {
 		for i := range Catalog {
 			entry := &Catalog[i]
 			if !entry.IsRuntime() {
+				continue
+			}
+			if len(entry.RuntimeServers) > 0 && !slices.ContainsFunc(entry.RuntimeServers, isRegularFile) {
 				continue
 			}
 			if _, err := os.Lstat(filepath.Join(u.Home, entry.RuntimeIf)); err == nil {
