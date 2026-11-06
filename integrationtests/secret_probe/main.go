@@ -287,6 +287,35 @@ func heldexec(attr, val, waitfile, readerBin string, argv []string) {
 	execInto(argv)
 }
 
+// getlocked asks for the secret of the first LOCKED item matching attr=val. Exit 1 = the gate refused
+// it (AccessDenied), 4 = the keyring itself answered (IsLocked: the gate let the call through).
+func getlocked(attr, val string) {
+	c := dial()
+	svc := c.Object(service, svcPath)
+	var out dbus.Variant
+	var session dbus.ObjectPath
+	if err := svc.Call(svcIfc+".OpenSession", 0, "plain", dbus.MakeVariant("")).Store(&out, &session); err != nil {
+		refusal("OpenSession", err)
+	}
+	var unlocked, locked []dbus.ObjectPath
+	if err := svc.Call(svcIfc+".SearchItems", 0, map[string]string{attr: val}).Store(&unlocked, &locked); err != nil {
+		refusal("SearchItems", err)
+	}
+	if len(locked) == 0 {
+		failf(3, "ERROR no locked item %s=%s (unlocked: %v)", attr, val, unlocked)
+	}
+	var sec secret
+	err := c.Object(service, locked[0]).Call("org.freedesktop.Secret.Item.GetSecret", 0, session).Store(&sec)
+	if err == nil {
+		failf(0, "SECRET=%s", sec.Value)
+	}
+	var de dbus.Error
+	if errors.As(err, &de) && strings.Contains(de.Name, "IsLocked") {
+		failf(4, "KEYRING ANSWERED %s", de.Name)
+	}
+	refusal("GetSecret", err)
+}
+
 // unmarkexec is heldexec on a socket the guard can't mark: made in a fresh user+net namespace whose
 // optmem_max is 0, so bpf_sk_storage_get(F_CREATE) fails on it. The connect, the lookup and the
 // handoff happen while the guard runs.
@@ -554,7 +583,7 @@ func connFD() int {
 }
 
 func usage() {
-	failf(3, "usage: secret_probe get|store|replace|dupkey|own|monitor|connexec|sendexec|lend|heldexec|unmarkexec|mksock|reader|rawget|rawreader|fakebus|dialsleep|sleep ...")
+	failf(3, "usage: secret_probe get|store|replace|dupkey|own|monitor|connexec|sendexec|lend|heldexec|unmarkexec|mksock|getlocked|reader|rawget|rawreader|fakebus|dialsleep|sleep ...")
 }
 
 func duration(s string) time.Duration {
@@ -576,6 +605,7 @@ var modes = map[string]func(a []string){
 	"heldexec":   func(a []string) { heldexec(a[0], a[1], a[2], a[3], a[4:]) },
 	"unmarkexec": func(a []string) { unmarkexec(a[0], a[1], a[2], a[3:]) },
 	"mksock":     func([]string) { mksock() },
+	"getlocked":  func(a []string) { getlocked(a[0], a[1]) },
 	"rawreader":  func(a []string) { rawreader(a[0]) },
 	"dupkey":     func(a []string) { dupkey(a[0], a[1]) },
 	"fakebus":    func(a []string) { fakebus(a[0], duration(a[1])) },

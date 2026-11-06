@@ -18,7 +18,7 @@ const (
 // call touching a gh item needs a caller the scope admits, attested by the pidfd the bus took at
 // connect. The probes cover the item calls, a replace matching by a subset, owning the name,
 // monitoring, exec after connecting or after sending, a send on a socket another process connected
-// or the guard could not mark, a fake keyring on the relay, the pkcs11 socket, a fake bus renamed
+// or the guard could not mark, an item locked since load, a fake keyring on the relay, the pkcs11 socket, a fake bus renamed
 // over the user's, and a connection made before a restart.
 func (s *IntegrationSuite) TestDaemon_SecretService() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
@@ -145,6 +145,25 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		s.Require().NotContainsf(out, ghToken, "a call sent on the app's lent socket leaked: %s", out)
 		s.Require().Equalf(1, code, "want the gate's refusal: %s\n%s", out, s.readDaemonLog(c))
 		ok("the app on a fresh process after a lend", "/exploits/secret_probe_ok get service gh:github.com")
+	})
+
+	s.T().Run("locked item", func(*testing.T) {
+		// A collection locked since load keeps only hashed attributes: the gate can't place its items in
+		// a scope, so it must refuse calls on them rather than relay them as unscoped.
+		const lockedKeyring = "while pgrep -u 1000 gnome-keyring >/dev/null; do sleep 0.1; done; sleep 1; " +
+			"(DBUS_SESSION_BUS_ADDRESS=unix:path=" + secretRelay + "/1000.bus " +
+			"nohup gnome-keyring-daemon --foreground --components=pkcs11,secrets " +
+			"--control-directory=" + keyringDir + " >/tmp/gk.log 2>&1 &); "
+		code, out := user("", "pkill -u 1000 gnome-keyring; "+lockedKeyring+
+			"for i in $(seq 100); do /exploits/secret_probe getlocked service gh:github.com >/tmp/locked.log 2>&1; "+
+			"rc=$?; [ $rc -ne 3 ] && break; sleep 0.2; done; cat /tmp/locked.log; exit $rc")
+		s.Require().NotContainsf(out, ghToken, "a locked item leaked: %s", out)
+		s.Require().Equalf(1, code, "a call on a locked gh item must be refused by the gate, not answered by the "+
+			"keyring (exit %d): %s\n%s", code, out, s.readDaemonLog(c))
+		code, out = user("", "pkill -u 1000 gnome-keyring; "+keyring+
+			"for i in $(seq 100); do /exploits/secret_probe_ok get service gh:github.com >/tmp/get.log 2>&1 && "+
+			"exit 0; sleep 0.2; done; cat /tmp/get.log /tmp/gk.log; exit 1")
+		s.Require().Equalf(0, code, "the keyring must serve again once unlocked: %s\n%s", out, s.readDaemonLog(c))
 	})
 
 	s.T().Run("unmarkable socket", func(t *testing.T) {
