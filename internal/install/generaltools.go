@@ -21,7 +21,7 @@ var generalTools = []string{
 	"git", "node", "nodejs", "npm", "npx", "bun", "deno",
 	"python", "perl", "ruby", "irb", "php", "lua", "luajit", "java", "tclsh", "wish", "expect", "guile",
 	"Rscript", "R", "julia", "pwsh", "gdb", "m4", "make", "sqlite3",
-	"cp", "mv", "install", "rsync", "tar", "curl", "wget",
+	"cp", "mv", "install", "rsync", "scp", "sftp", "sftp-server", "tar", "curl", "wget",
 	"cat", "tac", "head", "tail", "dd", "od", "xxd", "hexdump", "hd", "strings", "base64", "base32",
 	"basenc", "sed", "awk", "gawk", "mawk", "grep", "egrep", "fgrep", "rg", "tee", "less", "more",
 	"sort", "uniq", "nl", "cut", "paste", "fold", "fmt", "pr", "rev", "expand", "unexpand", "join",

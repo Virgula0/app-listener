@@ -75,3 +75,24 @@ func TestWarnWhitelistLines_OneWarningPerScriptSet(t *testing.T) {
 		t.Errorf("want one warning naming both resources, got %q", hits)
 	}
 }
+
+// A catalog line naming a general tool makes its secret readable by any script run through it
+// (scp copies the file its caller names, sftp-server serves it, git diff prints it).
+func TestCatalogWhitelistsNoGeneralTool(t *testing.T) {
+	for _, e := range Catalog {
+		for bin := range e.Whitelist {
+			// git reads its own config on every run (the section's comment).
+			if namedGeneralTool(bin) && (e.Name != "Git config directory" || bin != "/usr/bin/git") {
+				t.Errorf("%s whitelists general tool %s", e.Name, bin)
+			}
+		}
+	}
+}
+
+func TestFileTransferToolsAreGeneral(t *testing.T) {
+	for _, p := range []string{"/usr/bin/scp", "/usr/bin/sftp", "/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server"} {
+		if !namedGeneralTool(p) {
+			t.Errorf("%s not named a general tool", p)
+		}
+	}
+}

@@ -1682,6 +1682,13 @@ static long launch_step(__u64 i, void *ctx)
 	}
 	if (!s->classes)
 		return 0;
+	// Chromium trims ASCII whitespace off every argument before parsing it (base/command_line.cc):
+	// " --load-extension=x" is a live switch no rule's name matches.
+	char c0 = s->buf[0];
+	if (argv && (s->classes & (TRUSTED_NODE | TRUSTED_CHROMIUM)) && (c0 == ' ' || (c0 >= '\t' && c0 <= '\r'))) {
+		s->risky = 1;
+		return 1;
+	}
 	struct launch_rule *r;
 	if (argv && (s->classes & TRUSTED_ELECTRON) && !s->app && s->buf[0] != '-') {
 		s->app = 1;

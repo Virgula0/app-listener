@@ -71,9 +71,11 @@ var launchRules = func() []launchRule {
 		rules = append(rules, launchRule{launchArg, a, trustedNode, launchPresent})
 	}
 	// The DevTools protocol runs script in the process and reads its cookies; an unpacked extension
-	// reads them too. Chromium takes "-" as a switch prefix as well as "--".
-	for _, a := range []string{"--remote-debugging", "--load-extension", "-remote-debugging", "-load-extension"} {
-		rules = append(rules, launchRule{launchArg, a, trustedNode | trustedChromium, launchPresent})
+	// reads them too (--disable-extensions-except loads the ones it names). Chromium takes "-" as a
+	// switch prefix as well as "--".
+	for _, a := range []string{"remote-debugging", "load-extension", "disable-extensions-except", "load-apps"} {
+		rules = append(rules, launchRule{launchArg, "--" + a, trustedNode | trustedChromium, launchPresent},
+			launchRule{launchArg, "-" + a, trustedNode | trustedChromium, launchPresent})
 	}
 	// Child-process launchers: the exe named runs as the app's renderer, utility (network service:
 	// brokered cookie fds) or GPU process and is handed what that process is handed.
@@ -107,6 +109,14 @@ var launchRules = func() []launchRule {
 		"--tls-min-v1.2", "--tls-min-v1.3", "--tls-max-v1.2", "--tls-max-v1.3",
 	} {
 		rules = append(rules, launchRule{launchOpt, o, trustedNode, 0})
+	}
+	// A JetBrains launcher reads <PRODUCT>_VM_OPTIONS (a -javaagent there), _JDK (another JVM) and
+	// _PROPERTIES (idea.plugins.path) from the file each names. PhpStorm's prefix is WEBIDE.
+	for _, p := range []string{"IDEA", "PYCHARM", "WEBSTORM", "CLION", "GOLAND", "WEBIDE", "PHPSTORM", "RIDER",
+		"DATAGRIP", "RUSTROVER", "RUBYMINE", "DATASPELL", "STUDIO"} {
+		for _, suffix := range []string{"_VM_OPTIONS", "_JDK", "_PROPERTIES"} {
+			rules = append(rules, launchRule{launchEnv, p + suffix, trustedJVM, launchPresent})
+		}
 	}
 	for _, o := range []string{
 		"-Xmx", "-Xms", "-Xss",
@@ -165,7 +175,8 @@ func (t *TrustGuard) attachLaunchScan() error {
 }
 
 // Markers of a runtime whose launch env/argv can make it run other code. The java launcher's own
-// options live in libjli, so a JVM is also known by its name. trustedElectron here means any
+// options live in libjli, so a JVM is also known by its name, or by JNI_CreateJavaVM: a launcher
+// that loads libjvm into its own process (JetBrains' bin/idea) names it to dlsym. trustedElectron here means any
 // Electron; runtimeClass keeps it only for a generic one.
 var runtimeMarkers = []struct {
 	marker []byte
@@ -176,6 +187,7 @@ var runtimeMarkers = []struct {
 	{[]byte("remote-debugging-port"), trustedChromium},
 	{[]byte("JDK_JAVA_OPTIONS"), trustedJVM},
 	{[]byte("JAVA_TOOL_OPTIONS"), trustedJVM},
+	{[]byte("JNI_CreateJavaVM"), trustedJVM},
 	{[]byte("BUN_INSPECT"), trustedBun},
 	{[]byte("BUN_BE_BUN"), trustedBun},
 	{[]byte("BUN_OPTIONS"), trustedBun},

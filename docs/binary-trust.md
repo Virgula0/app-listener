@@ -106,7 +106,8 @@ The desktop window's Trust page does the same (see [gui.md](gui.md#trust)).
 Identity is the executable, so `ELECTRON_RUN_AS_NODE=1 code -e ...` or
 `NODE_OPTIONS=--require=/tmp/x.js discord` is the whitelisted binary running **its caller's** code.
 For whitelisted Node/Electron, Chromium, JVM and Bun runtimes (detected from the binary's own
-strings, or the name `java`), the daemon judges the new process's environment and arguments at
+strings, the name `java`, or `JNI_CreateJavaVM` for a launcher that loads the JVM into its own
+process, such as JetBrains' `bin/idea`), the daemon judges the new process's environment and arguments at
 exec, before any of its code runs. Bun covers `bun build --compile` apps such as opencode and the
 native `claude`.
 
@@ -118,8 +119,14 @@ A launch is **risky** when it has any of:
   scaling);
 - Bun environment: `BUN_BE_BUN` (a compiled app becomes the `bun` CLI), `BUN_OPTIONS`
   (`--preload`), `BUN_INSPECT*`, `BUN_RUNTIME_TRANSPILER_CACHE_PATH`;
+- JetBrains launcher environment: `<PRODUCT>_VM_OPTIONS`, `<PRODUCT>_JDK`, `<PRODUCT>_PROPERTIES`
+  (`IDEA`, `PYCHARM`, `WEBSTORM`, `CLION`, `GOLAND`, `WEBIDE`, `PHPSTORM`, `RIDER`, `DATAGRIP`,
+  `RUSTROVER`, `RUBYMINE`, `DATASPELL`, `STUDIO`);
 - code-loading flags: `--inspect*`, `--eval`, `--print`, `--require`, `--import`, `--loader`,
-  `--env-file*`, `--remote-debugging-*`, `--load-extension`;
+  `--env-file*`, `--remote-debugging-*`, `--load-extension`, `--disable-extensions-except`,
+  `--load-apps`;
+- for Node/Electron and Chromium, an argument starting with whitespace: Chromium trims it off and
+  reads what follows as a switch;
 - child-process launchers: `--renderer-cmd-prefix`, `--utility-cmd-prefix`,
   `--zygote-cmd-prefix`, `--gpu-launcher`, `--browser-subprocess-path`;
 - VS Code extension flags: `--extensions-dir`, `--extensionDevelopmentPath`,
@@ -169,18 +176,26 @@ Built in, by the whitelisted file's name:
 - `aws`: `configure export-credentials`, `configure get`.
 - `pi`: `-e` and `--extension` (it runs the extension in its own process), and
   `PI_CODING_AGENT_DIR` set (an agent directory whose `extensions/` its caller wrote).
+- `opencode`: `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` or `OPENCODE_CONFIG_CONTENT` set (a config,
+  plugins and provider URLs of its caller's choosing).
+- `codex`: `OPENAI_BASE_URL` set (the server it sends its key to); `-c` and `--config` are only
+  logged: they override any config key, base URLs included, and are too common to refuse.
+- JetBrains launchers (`idea`, `pycharm`, ..., Android Studio's `studio`): `installPlugins`, which
+  installs a plugin from any repository; the plugin then runs in the IDE.
 - `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
   `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag (it reads the method from stdin).
 - `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,
   `fundchannel`, `multifundchannel`, `close`, `exposesecret`.
-- Every whitelisted binary: `SSL_CERT_FILE` or `SSL_CERT_DIR` set, which would make its TLS stack
-  (Go, OpenSSL, GnuTLS) trust a certificate its caller chose and send its token to that server.
-  A value that is exactly a distribution's system bundle passes (`/etc/ssl/certs/ca-certificates.crt`,
+- Every whitelisted binary: `SSL_CERT_FILE` or `SSL_CERT_DIR` (Go, OpenSSL, GnuTLS) or
+  `NODE_EXTRA_CA_CERTS` (Node, Bun) set, which would make its TLS stack trust a certificate its
+  caller chose and send its token to that server, and `NODE_TLS_REJECT_UNAUTHORIZED`, which can turn
+  verification off. A value that is exactly a distribution's system bundle passes (`/etc/ssl/certs/ca-certificates.crt`,
   `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`,
   `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
   `/etc/ca-certificates/extracted/tls-ca-bundle.pem`; directories `/etc/ssl/certs`,
   `/etc/pki/tls/certs`), as does one you add with [`allow_env`](config-reference.md#allow_env), when only root decides what the path
-  holds. A match logs the variable's name only, never its value.
+  holds. For `NODE_EXTRA_CA_CERTS` only the first four bundles fit the rule's 63-byte key.
+  A match logs the variable's name only, never its value.
 
 A rule's words match in order anywhere in the arguments, with anything between them, so a flag's
 value can't split them (`gh auth --hostname x token`). Add your own with

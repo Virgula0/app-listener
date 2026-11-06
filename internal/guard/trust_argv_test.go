@@ -112,3 +112,29 @@ func TestPiLaunchRulesRefuseExtensionLoaders(t *testing.T) {
 		}
 	}
 }
+
+// Node and Bun trust NODE_EXTRA_CA_CERTS and skip verification with NODE_TLS_REJECT_UNAUTHORIZED=0.
+func TestCAEnvRulesCoverNode(t *testing.T) {
+	for _, env := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED"} {
+		if !slices.ContainsFunc(caEnvRules, func(r daemonconfig.LaunchRule) bool { return r.Env == env && !r.Warn }) {
+			t.Errorf("no CA env deny rule for %s", env)
+		}
+	}
+}
+
+// Env and config flags that redirect an agent's token or load a config of its caller's choosing.
+func TestAgentRedirectRules(t *testing.T) {
+	has := func(name, env string) bool {
+		return slices.ContainsFunc(BuiltinLaunchRules(name), func(r daemonconfig.LaunchRule) bool {
+			return r.Env == env && !r.Warn
+		})
+	}
+	for _, c := range [][2]string{
+		{"opencode", "OPENCODE_CONFIG"}, {"opencode", "OPENCODE_CONFIG_DIR"}, {"opencode", "OPENCODE_CONFIG_CONTENT"},
+		{"codex", "OPENAI_BASE_URL"},
+	} {
+		if !has(c[0], c[1]) {
+			t.Errorf("%s: no deny_env %s", c[0], c[1])
+		}
+	}
+}

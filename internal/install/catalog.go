@@ -152,15 +152,14 @@ var Catalog = []CandidateDir{
 	// --- SSH and remote access -------------------------------------------------
 	{Name: "SSH client configuration and keys", RelPaths: []string{".ssh"},
 		// ssh needs WRITE (known_hosts rotation), MKNOD + CONNECT (binding / reaching a ControlMaster
-		// socket here); sshd and helpers (sshd-auth/-session, sftp-server) only READ authorized_keys;
-		// keysign/pkcs11/cleanup helpers are inert. git excluded: it reads keys.
+		// socket here); sshd and its helpers (sshd-auth/-session) only READ authorized_keys;
+		// keysign/pkcs11/cleanup helpers are inert. Not scp, sftp or sftp-server: they copy or serve
+		// whatever file their caller names (their ssh child reads the keys); nor git, which reads keys.
 		Whitelist: map[string][]string{
 			"/usr/bin/ssh":                         {"READ", "WRITE", "DELETE", "RENAME", "HARDLINK", "MKNOD", "CONNECT"},
 			"/usr/bin/ssh-add":                     nil,
 			"/usr/bin/ssh-agent":                   nil,
 			"/usr/bin/ssh-keygen":                  nil,
-			"/usr/bin/scp":                         nil,
-			"/usr/bin/sftp":                        nil,
 			"/usr/bin/sshd":                        {"READ"},
 			"/usr/sbin/sshd":                       {"READ"},
 			"/usr/lib/openssh/sshd-auth":           {"READ"},
@@ -169,8 +168,6 @@ var Catalog = []CandidateDir{
 			"/usr/lib/ssh/sshd-session":            {"READ"},
 			"/usr/lib/openssh/ssh-sk-helper":       {"READ"},
 			"/usr/lib/ssh/ssh-sk-helper":           {"READ"},
-			"/usr/lib/openssh/sftp-server":         {"READ"},
-			"/usr/lib/ssh/sftp-server":             {"READ"},
 			"/usr/lib/openssh/ssh-keysign":         nil,
 			"/usr/lib/ssh/ssh-keysign":             nil,
 			"/usr/lib/openssh/ssh-pkcs11-helper":   nil,
@@ -368,8 +365,7 @@ var Catalog = []CandidateDir{
 		}},
 	{Name: "GitHub Copilot", RelPaths: []string{".config/github-copilot"},
 		Whitelist: map[string][]string{
-			"/usr/bin/git": nil, "/usr/local/bin/copilot": nil,
-			"%HOME%/.local/bin/copilot": nil,
+			"/usr/local/bin/copilot": nil, "%HOME%/.local/bin/copilot": nil,
 		}},
 
 	// --- IDEs and editors ---------------------------------------------------------
@@ -415,24 +411,23 @@ var Catalog = []CandidateDir{
 		LibDirRelPaths: []string{".vscode-oss"},
 		LibDirWriters:  []string{"/opt/vscodium/codium", "/usr/share/vscodium/codium", "/usr/local/bin/codium"}},
 	{Name: "JetBrains IDEs", RelPaths: []string{".config/JetBrains"},
-		// IDEs run as the bundled JBR java, so the JBR and its fsnotifier are whitelisted (globs
-		// cover /opt installs). Toolbox apps stay unguarded (no credentials; those live in
+		// IDEs since 2023.2 run as their native launcher (bin/idea, ...), which loads the bundled
+		// JBR's libjvm into its own process; globs cover /opt installs. Never the JBR's bin/java: it
+		// runs any class its caller names. Toolbox apps stay unguarded (no credentials; those live in
 		// .config/JetBrains).
-		Whitelist: map[string][]string{
+		Whitelist: jetbrainsLaunchers(map[string][]string{
 			"/usr/bin/idea": nil, "/usr/bin/pycharm": nil, "/usr/bin/webstorm": nil,
 			"/usr/bin/clion": nil, "/usr/bin/goland": nil, "/usr/bin/phpstorm": nil,
 			"/usr/bin/rider": nil, "/usr/bin/datagrip": nil, "/usr/bin/rustrover": nil,
 			"/usr/bin/android-studio":       nil,
-			"/opt/*/jbr/bin/java":           nil,
 			"/opt/*/bin/fsnotifier":         nil,
-			"%HOME%/.goland/jbr/bin/java":   nil,
 			"%HOME%/.goland/bin/fsnotifier": nil,
-		},
-		// Plugins run inside the IDE's java: read-only to everything but the IDEs and Toolbox, which
-		// installs and updates them.
+		}, nil),
+		// Plugins run inside the IDE: read-only to everything but the IDEs and Toolbox, which installs
+		// and updates them.
 		LibDirRelPaths: []string{".local/share/JetBrains"},
-		LibDirWriters: []string{"/opt/*/jbr/bin/java", "%HOME%/.goland/jbr/bin/java",
-			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox"}},
+		LibDirWriters: append(jetbrainsLauncherPaths(),
+			"%HOME%/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox")},
 	// Config (~/.config/zed) and data (~/.local/share/zed, holds the auth token): one resource, two
 	// watch roots.
 	{Name: "Zed editor", RelPaths: []string{".config/zed", ".local/share/zed"},
@@ -454,14 +449,14 @@ var Catalog = []CandidateDir{
 	{Name: "Android adb keys", RelPaths: []string{".android"},
 		Whitelist: map[string][]string{"/usr/bin/adb": nil}},
 	// The adb server has no authentication: whoever reaches it drives every connected device (shell,
-	// pull). adb is both server and client; Android Studio's bundled java talks to it directly.
+	// pull). adb is both server and client; Android Studio's launcher (its JVM) talks to it directly.
 	{Name: "adb server", Ports: []uint16{5037},
 		Whitelist: map[string][]string{
 			"/usr/bin/adb":                          {"MKNOD", "CONNECT"},
 			"/opt/android-sdk/platform-tools/adb":   {"MKNOD", "CONNECT"},
 			"%HOME%/Android/Sdk/platform-tools/adb": {"MKNOD", "CONNECT"},
-			"/opt/android-studio/jbr/bin/java":      {"CONNECT"},
-			"%HOME%/android-studio/jbr/bin/java":    {"CONNECT"},
+			"/opt/android-studio/bin/studio":        {"CONNECT"},
+			"%HOME%/android-studio/bin/studio":      {"CONNECT"},
 		}},
 
 	// --- Cloud, containers and dev tooling --------------------------------------
@@ -506,6 +501,8 @@ var Catalog = []CandidateDir{
 	// pip is a #!/usr/bin/python script (never matches, like gcloud).
 	{Name: "pip config", RelPaths: []string{".config/pip"},
 		Whitelist: map[string][]string{"/usr/bin/pip": nil, "/usr/bin/pip3": nil}},
+	// git reads its config on every run, so it is whitelisted though it prints any file it is pointed
+	// at: the section stops other readers of credentials there, not git (docs/limitations.md).
 	{Name: "Git config directory", RelPaths: []string{".config/git"},
 		Whitelist: map[string][]string{"/usr/bin/git": nil}},
 
@@ -840,6 +837,23 @@ func (c *CandidateDir) ExtraWatchPathsFor(home, user string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// jetbrainsLauncherPaths are the native launchers under /opt/* and GoLand's ~/.goland install.
+func jetbrainsLauncherPaths() []string {
+	out := make([]string, 0, len(guard.JetBrainsLaunchers)+1)
+	for _, n := range guard.JetBrainsLaunchers {
+		out = append(out, "/opt/*/bin/"+n)
+	}
+	return append(out, "%HOME%/.goland/bin/goland")
+}
+
+// jetbrainsLaunchers adds every launcher to wl with events.
+func jetbrainsLaunchers(wl map[string][]string, events []string) map[string][]string {
+	for _, p := range jetbrainsLauncherPaths() {
+		wl[p] = events
+	}
+	return wl
 }
 
 // SeedMissing makes c's missing SeedWatchPaths in u's home, owned by u (when run as root), never

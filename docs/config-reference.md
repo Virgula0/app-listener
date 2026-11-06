@@ -431,7 +431,6 @@ need_encryption: true
 /usr/bin/ssh READ,WRITE,STAT
 /usr/bin/ssh-add READ,STAT
 /usr/bin/ssh-agent
-/usr/bin/scp READ,STAT
 
 # Codex: two files of the directory, one vault.
 [watch /home/alice/.codex]

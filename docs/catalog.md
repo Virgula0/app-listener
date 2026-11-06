@@ -57,6 +57,14 @@ their own config directory keep working (see below).
   `~/.local/share/opencode/opencode.db`, which the entry guards. opencode runs `git` on its snapshot
   repositories in the same directory, and `git` is never whitelisted (it would print the database), so
   snapshots fail while the directory is guarded.
+- **File copiers on `~/.ssh`.** The SSH entry whitelists neither `scp`, `sftp` nor `sftp-server`:
+  each copies or serves whatever file its caller names, the keys included. Their `ssh` child does the
+  reading they need, so `scp` and `sftp` keep working. A section an older installer wrote may still
+  list them (and `git` on `~/.config/github-copilot`): remove those lines with
+  `sudo app-listener edit-protected config`; the installer and the daemon warn about each.
+- **`~/.config/git`.** `git` reads its config on every run, so the entry whitelists it, and `git`
+  prints any file it is pointed at: the section keeps other programs from reading credentials stored
+  there, not `git` ([general tools](limitations.md#whitelisted-programs-that-disclose-on-request)).
 - **Cursor logins.** The Cursor entry guards `~/.cursor` (MCP and extension config). The IDE keeps
   its login in `~/.config/Cursor/User/globalStorage/state.vscdb` and `cursor-agent` in
   `~/.config/cursor/auth.json`; neither is in the catalog. Add a section for them yourself,

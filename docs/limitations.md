@@ -99,6 +99,15 @@ app runs code from anonymous memory, which is never judged. The [launch scan](bi
 catches the common ways of injecting code into Node, Electron, Chromium and JVM apps through
 environment or flags; it doesn't make `node` itself safe to whitelist.
 
+Some apps load code, or settings that redirect their token, from the directory they start in, which
+no launch rule can see:
+
+- `opencode` runs the plugins of the project it starts in (`.opencode/plugins`), in its own process,
+  and takes provider base URLs from the project's `opencode.json`;
+- `codex -c openai_base_url=...` (any `-c` key) is logged, not refused;
+- a JetBrains IDE asks before trusting a project, and pi before loading a project's extensions:
+  keep those prompts.
+
 ## Root
 
 Root can stop the daemon or load its own BPF programs. app-listener

@@ -23,6 +23,11 @@ const (
 	argvSetsMax        = 1024
 )
 
+// JetBrainsLaunchers are the basenames of the JetBrains IDEs' native launchers (bin/<name>; Android
+// Studio's is studio).
+var JetBrainsLaunchers = []string{"idea", "pycharm", "webstorm", "clion", "goland", "phpstorm", "rider",
+	"datagrip", "rustrover", "rubymine", "dataspell", "studio"}
+
 func deny(words ...string) daemonconfig.LaunchRule { return daemonconfig.LaunchRule{Words: words} }
 
 // builtinLaunchRules: CLIs that print or spend their secret on request, keyed by the whitelist line's
@@ -40,7 +45,7 @@ var builtinLaunchRules = func() map[string][]daemonconfig.LaunchRule {
 		"sendtoaddress")
 	lightning := each("pay", "xpay", "renepay", "keysend", "withdraw", "sendpay", "sendonion", "fundchannel",
 		"multifundchannel", "close", "exposesecret")
-	return map[string][]daemonconfig.LaunchRule{
+	m := map[string][]daemonconfig.LaunchRule{
 		"gh": {
 			deny("auth", "token"), deny("auth", "status", "--show-token"), deny("auth", "status", "-t"),
 			deny("alias", "set"), deny("alias", "import"),
@@ -50,20 +55,37 @@ var builtinLaunchRules = func() map[string][]daemonconfig.LaunchRule {
 		"aws": {deny("configure", "export-credentials"), deny("configure", "get")},
 		// pi runs an extension -e names in its own process; PI_CODING_AGENT_DIR points it at an agent
 		// dir whose extensions/ the caller wrote.
-		"pi":            {deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"}},
+		"pi": {deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"}},
+		// A config of the caller's choosing (plugins, provider base URLs); a key it sends elsewhere.
+		"opencode": {{Env: "OPENCODE_CONFIG"}, {Env: "OPENCODE_CONFIG_DIR"}, {Env: "OPENCODE_CONFIG_CONTENT"}},
+		// -c overrides any config key, base URLs included: too common to refuse, so logged.
+		"codex":         {{Env: "OPENAI_BASE_URL"}, {Words: []string{"-c"}, Warn: true}, {Words: []string{"--config"}, Warn: true}},
 		"bitcoin-cli":   coin,
 		"litecoin-cli":  coin,
 		"lightning-cli": lightning,
 	}
+	// A JetBrains launcher installs any plugin from any repository it is given; the plugin then runs
+	// in the IDE.
+	for _, n := range JetBrainsLaunchers {
+		m[n] = []daemonconfig.LaunchRule{deny("installPlugins")}
+	}
+	return m
 }()
 
-// caEnvRules: Go's crypto/x509, OpenSSL and GnuTLS trust SSL_CERT_FILE / SSL_CERT_DIR, so a caller
-// setting either makes a whitelisted client hand its token to a TLS server it chose. Every whitelisted
-// binary gets them; a value naming a root-placed bundle (SetLaunchRules' allowEnv) passes.
-var caEnvRules = []daemonconfig.LaunchRule{{Env: "SSL_CERT_FILE"}, {Env: "SSL_CERT_DIR"}}
+// caEnvRules: Go's crypto/x509, OpenSSL and GnuTLS trust SSL_CERT_FILE / SSL_CERT_DIR, Node and Bun
+// NODE_EXTRA_CA_CERTS, and NODE_TLS_REJECT_UNAUTHORIZED=0 trusts any certificate: a caller setting
+// one makes a whitelisted client hand its token to a TLS server it chose. Every whitelisted binary
+// gets them; a value naming a root-placed bundle (SetLaunchRules' allowEnv) passes.
+var caEnvRules = []daemonconfig.LaunchRule{{Env: "SSL_CERT_FILE"}, {Env: "SSL_CERT_DIR"},
+	{Env: "NODE_EXTRA_CA_CERTS"}, {Env: "NODE_TLS_REJECT_UNAUTHORIZED"}}
 
-// builtinAllowedEnv: the distributions' system CA bundles.
+// builtinAllowedEnv: the distributions' system CA bundles (NODE_EXTRA_CA_CERTS only where the whole
+// string fits the 63-byte key).
 var builtinAllowedEnv = []string{
+	"NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+	"NODE_EXTRA_CA_CERTS=/etc/pki/tls/certs/ca-bundle.crt",
+	"NODE_EXTRA_CA_CERTS=/etc/ssl/ca-bundle.pem",
+	"NODE_EXTRA_CA_CERTS=/etc/ssl/cert.pem",
 	"SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
 	"SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt",
 	"SSL_CERT_FILE=/etc/ssl/ca-bundle.pem",

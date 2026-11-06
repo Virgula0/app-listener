@@ -297,12 +297,17 @@ func TestSSHWhitelistIncludesModularDaemon(t *testing.T) {
 	required := []string{
 		"/usr/lib/openssh/sshd-auth", "/usr/lib/ssh/sshd-auth",
 		"/usr/lib/openssh/sshd-session", "/usr/lib/ssh/sshd-session",
-		"/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server",
+	}
+	// sftp-server serves any file its client names: an sftp -D session reads the keys.
+	for _, bin := range []string{"/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server"} {
+		if _, ok := entry.Whitelist[bin]; ok {
+			t.Errorf(".ssh whitelists %s", bin)
+		}
 	}
 	for _, bin := range required {
 		events, ok := entry.Whitelist[bin]
 		if !ok {
-			t.Errorf(".ssh whitelist is missing %s: public-key logins and scp reads would be denied while guarded", bin)
+			t.Errorf(".ssh whitelist is missing %s: public-key logins would be denied while guarded", bin)
 			continue
 		}
 		if len(events) != 1 || events[0] != "READ" {
