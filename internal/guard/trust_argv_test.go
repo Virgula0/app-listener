@@ -145,3 +145,26 @@ func TestShortMaskRefusesNonLetters(t *testing.T) {
 		t.Fatalf("mask %#x", m)
 	}
 }
+
+// Anchors are set flags and names, not argv rules: a binary with every argv rule slot used keeps them.
+func TestEncodeLaunchSetProfileAnchors(t *testing.T) {
+	rules := []daemonconfig.LaunchRule{{Profile: "SingletonLock"}, {Profile: "Local State"}}
+	for i := range argvRules {
+		rules = append(rules, deny(string(rune('a'+i))))
+	}
+	canon, allowed, key := canonLaunchRules(rules, nil)
+	words, set, err := encodeLaunchSet(canon, allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Flags&argvAnchored == 0 || words[argvEntry{argvProfile, "SingletonLock"}] != 1 ||
+		words[argvEntry{argvProfile, "Local State"}] != 1 {
+		t.Fatalf("anchors not encoded: flags %#x words %v", set.Flags, words)
+	}
+	if _, _, plain := canonLaunchRules(rules[2:], nil); plain == key {
+		t.Fatal("a set's key must name its anchors")
+	}
+	if _, set, _ := encodeLaunchSet(rules[2:], nil); set.Flags&argvAnchored != 0 {
+		t.Fatal("a set without anchors must not be flagged")
+	}
+}

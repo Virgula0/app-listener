@@ -149,6 +149,7 @@ struct res_config {
 	__u64 chmod_drop_write; // lib_dir only: see chmod_only_drops_write
 	__u64 root_sbdev;       // the watch root's superblock (sb_dev): root_in_chain's same-fs test
 	__u64 move_peer;        // lib_dir only: nonzero class shared by lib_dirs with identical writers
+	__u64 nested;           // a [narrow] root: inside another resource's tree
 };
 
 struct {
@@ -544,7 +545,9 @@ static __always_inline int event_is_read_class(__u32 type, bool write_intent)
 
 // Walk up from `parent` and report whether its subtree lies in the guarded region: rooted at the
 // farthest inode present in guard_inodes, bounded by the depth limit (a parent exactly at the limit
-// is NOT guarded, mirroring the eager scan and discover_guarded_parent). Protects the whole subtree
+// is NOT guarded, mirroring the eager scan and discover_guarded_parent). The owner is the NEAREST
+// guarded ancestor's: a [narrow] subtree (a narrower whitelist inside its parent's tree) must
+// judge its own unmapped files, never its parent. Protects the whole subtree
 // at any depth: covers the window between hook attach and the eager scan, deep files, and a full
 // inode map.
 //
@@ -588,6 +591,8 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent, 
 	__u64 farthest_steps = 0;
 	__u64 farthest_ino = 0;
 	__u32 found_res = GUARD_RES_NONE;
+	__u32 near_res = GUARD_RES_NONE;
+	__u64 near_ino = 0;
 	bool found_guarded = false;
 
 	for (int i = 0; i < bound; i++) {
@@ -606,10 +611,14 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent, 
 
 		__u32 anc_res = GUARD_RES_NONE;
 		if (read_inode_guard(anc_inode, &anc_res)) {
+			if (!found_guarded)
+				near_res = anc_res;
 			farthest_steps = i + 1;
 			found_guarded = true;
 			found_res = anc_res;
 			bpf_probe_read_kernel(&farthest_ino, sizeof(farthest_ino), &anc_inode->i_ino);
+			if (anc_res == near_res)
+				near_ino = farthest_ino;
 		}
 	}
 
@@ -632,8 +641,16 @@ static __always_inline int guarded_ancestor_within_limit(struct dentry *parent, 
 	if (farthest_ino != cfg->root_ino)
 		return 0;
 
+	// The nearest owner is confined the same way: its run of rows must end at its own root, or a
+	// row recycled from another resource would judge this tree by that one's whitelist.
+	if (near_res != found_res) {
+		struct res_config *ncfg = res_cfg(near_res);
+		if (!ncfg || near_ino != ncfg->root_ino)
+			near_res = found_res;
+	}
+
 	if (out_res)
-		*out_res = found_res;
+		*out_res = near_res;
 	return 1;
 }
 
@@ -1370,7 +1387,8 @@ static __always_inline int emit_with(struct emit_args *a, __u32 type, struct den
 			  false, GUARD_REASON_NONE, (_res))
 
 // Lazy directory discovery for file_open: for a file in a directory not yet in guard_inodes, find
-// the farthest guarded ancestor and add the file's immediate parent, only if strictly within the
+// the farthest guarded ancestor (depth) and add the file's immediate parent to the nearest one's
+// resource, only if strictly within the
 // depth limit (a boundary directory at exactly the limit is not added, so the guard never extends a
 // level deeper than configured).
 static __always_inline void discover_guarded_parent(struct dentry *dentry)
@@ -1399,6 +1417,7 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 	struct dentry *ancestor = parent;
 	__u64 farthest_steps = 0;
 	__u32 found_res = GUARD_RES_NONE;
+	__u32 near_res = GUARD_RES_NONE;
 	bool found_guarded = false;
 
 	for (int i = 0; i < ANCESTOR_WALK; i++) {
@@ -1417,6 +1436,8 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 
 		__u32 anc_res = GUARD_RES_NONE;
 		if (read_inode_guard(anc_inode, &anc_res)) {
+			if (!found_guarded)
+				near_res = anc_res;
 			farthest_steps = i + 1;
 			found_guarded = true;
 			found_res = anc_res;
@@ -1438,8 +1459,9 @@ static __always_inline void discover_guarded_parent(struct dentry *dentry)
 	// legacy learning; deny-side confinement still applies).
 	if (cfg->depth > 0 && farthest_steps >= cfg->depth)
 		return;
-	if (root_in_chain(parent, parent_inode, 32, found_res))
-		add_inode_to_guard(parent_inode, found_res);
+	// The nearest owner, as guarded_ancestor_within_limit judges it (a [narrow] subtree's own).
+	if (root_in_chain(parent, parent_inode, 32, near_res))
+		add_inode_to_guard(parent_inode, near_res);
 }
 
 // AF_UNIX connect/sendto finds the listener by inode: no file_open, file_permission or
@@ -2116,9 +2138,9 @@ decided:
 //
 // A root P matches when the target is P itself or lies below it (P followed by '/'): path_key_buf
 // holds target[0..i) zero-padded, so at every '/' or end it is an exact guard_path key, and a
-// similarly named sibling (/bypasses_fake for /bypasses) never forms it. If roots nest (config load
-// refuses it), the innermost (deepest) match wins, as guard_inodes records one owning res_id per
-// inode; guarded_ancestor_within_limit instead returns the farthest guarded ancestor.
+// similarly named sibling (/bypasses_fake for /bypasses) never forms it. If roots nest (a [narrow]
+// subtree), the innermost (deepest) match wins, as guard_inodes records one owning res_id per
+// inode and guarded_ancestor_within_limit returns the nearest guarded ancestor's.
 // Exactly one decision may be emitted here: two sequential check_and_emit calls cost >1M insns
 // because the second re-explores the shared body from every state the first one forked (a single
 // call is ~105k). Read-only roots are skipped: the check stops an alias reaching content the
@@ -2462,13 +2484,14 @@ int guard_path_rmdir(unsigned long long *ctx)
 	struct dentry *parent = get_dentry_from_path((void *)ctx[0]);
 
 	int ret;
-	if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 32, &res)) {
+	if (inode && inode_is_watch_root(inode, &res)) {
+		// A root is judged by its own resource: removed from an unguarded parent, the parent's
+		// owner can put an unguarded directory or a symlink at its name; from a [narrow]'s parent
+		// tree, a writer of that tree would recreate it under the wider whitelist.
+		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false, res);
+	} else if (parent && parent_inode && guarded_map_hit(parent, parent_inode, 32, &res)) {
 		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false, res);
 	} else if (parent && guarded_ancestor_within_limit(parent, &res, ANCESTOR_WALK)) {
-		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false, res);
-	} else if (inode && inode_is_watch_root(inode, &res)) {
-		// An empty root below an unguarded parent: removing it lets the parent's owner put an
-		// unguarded directory or a symlink at its name.
 		ret = check_and_emit(EVENT_DELETE, dentry, NULL, false, NULL, false, false, res);
 	} else {
 		ret = 0;
@@ -2503,11 +2526,13 @@ int guard_inode_getattr(unsigned long long *ctx)
 
 	// Allow stat of the watch-root DIRECTORY itself: leaks almost nothing (the path is in the
 	// config) and denying breaks `mkdir -p`, path probes and `ls` of the parent. A single-file
-	// watch root IS the secret, so its stat stays denied.
+	// watch root IS the secret, so its stat stays denied, as does a [narrow] root's, which its
+	// parent tree denied before the narrow existed.
 	if (inode && inode_is_watch_root(inode, &res)) {
 		umode_t mode = 0;
 		bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode);
-		if ((mode & S_IFMT) == S_IFDIR)
+		struct res_config *rc = res_cfg(res);
+		if ((mode & S_IFMT) == S_IFDIR && rc && !rc->nested)
 			return 0;
 	}
 

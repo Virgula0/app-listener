@@ -16,12 +16,14 @@ const (
 	argvWord     uint32 = 1
 	argvEnv      uint32 = 2
 	argvEnvOK    uint32 = 3
+	argvProfile  uint32 = 4
 	argvDeny     uint64 = 1
 	argvWarn     uint64 = 2
 	argvRules           = daemonconfig.MaxLaunchRules
 	argvWords           = daemonconfig.MaxLaunchRuleWords
 	argvSetsMax         = 1024
 	argvRootOnly        = 1
+	argvAnchored        = 2
 )
 
 // caEnvRules: Go's crypto/x509, OpenSSL and GnuTLS trust SSL_CERT_FILE / SSL_CERT_DIR, Node and Bun
@@ -75,6 +77,9 @@ func encodeLaunchSet(rules []daemonconfig.LaunchRule, allowed []string) (map[arg
 		switch {
 		case r.RootOnly || r.Short != nil:
 			err = encodeSetFlags(&set, &r)
+		case r.Profile != "":
+			words[argvEntry{argvProfile, r.Profile}] = 1
+			set.Flags |= argvAnchored
 		case r.Env != "":
 			encodeEnvRule(words, &r)
 		default:
@@ -171,7 +176,7 @@ func canonLaunchRules(rules []daemonconfig.LaunchRule, allowEnv []string) (canon
 		if r.Short != nil {
 			short = r.Short.Deny + "/" + r.Short.Args
 		}
-		return fmt.Sprintf("%s\x00%t\x00%t\x00%s\x00%s", r.Env, r.Warn, r.RootOnly, short,
+		return fmt.Sprintf("%s\x00%t\x00%t\x00%s\x00%s\x00%s", r.Env, r.Warn, r.RootOnly, short, r.Profile,
 			strings.Join(r.Words, "\x00"))
 	}
 	canon = slices.Clone(rules)

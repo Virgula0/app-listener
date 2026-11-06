@@ -218,12 +218,18 @@ func sectionsFromCandidates(candidates []inst.Candidate) []inst.Section {
 		} else {
 			extra = c.Entry.ExtraWatchPathsFor(c.User.Home, c.User.Name)
 		}
+		if err := c.Entry.SeedNarrowed(c.User, c.Path); err != nil {
+			log.Warnf("install: %v — it follows the whole section's whitelist until it exists and a "+
+				"catalog refresh runs", err)
+		}
+		allow := c.FilterExistingWhitelist()
 		sections = append(sections, inst.Section{
 			Path:            c.Path,
-			Allow:           c.FilterExistingWhitelist(),
+			Allow:           allow,
 			Encrypt:         !c.Entry.IsRuntime(),
 			Runtime:         c.Entry.IsRuntime(),
 			ExtraWatchPaths: extra,
+			Narrows:         c.Entry.NarrowSectionsFor(c.Path, allow),
 		})
 	}
 	return sections

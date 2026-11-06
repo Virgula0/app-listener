@@ -119,6 +119,7 @@ const (
 	suspectLaunch           = 2
 	suspectArgv             = 3
 	suspectBunfig           = 4
+	suspectProfile          = 5
 )
 
 // suspectLabel maps a reason's SUSPECT_* mark to its logged op label; "" when unmarked.
@@ -132,6 +133,8 @@ func suspectLabel(reason uint32) string {
 		return "ARGV"
 	case suspectBunfig:
 		return "BUNFIG"
+	case suspectProfile:
+		return "PROFILE"
 	default:
 		return ""
 	}
@@ -282,6 +285,8 @@ type Guard struct {
 	chmodDropWrite bool
 	// movePeer: WithMovePeer.
 	movePeer uint64
+	// nested: WithNested.
+	nested bool
 	// systemPatterns: WithSystemPatterns.
 	systemPatterns []daemonconfig.BinaryRule
 	// vetted: whitelist path -> the inode it was hashed from (binaryKey). Guarded by mu.
@@ -377,6 +382,14 @@ func WithoutOwnAllowedEvents() GuardOption {
 func WithMovePeer(peer uint64) GuardOption {
 	return func(g *Guard) {
 		g.movePeer = peer
+	}
+}
+
+// WithNested marks a [narrow] root inside another resource's tree: its directory root's stat is
+// judged like its contents (guard_inode_getattr).
+func WithNested() GuardOption {
+	return func(g *Guard) {
+		g.nested = true
 	}
 }
 
@@ -1593,6 +1606,9 @@ func (g *Guard) writeGuardConfig(modeKey uint64) error {
 	}
 	if g.mode == ModeReadOnly {
 		cfg.MovePeer = g.movePeer
+	}
+	if g.nested {
+		cfg.Nested = 1
 	}
 	if putErr := g.objs().GuardResConfig.Put(g.resID, cfg); putErr != nil {
 		return fmt.Errorf("writing resource slot %d: %w", g.resID, putErr)

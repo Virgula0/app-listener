@@ -40,15 +40,17 @@ const (
 
 // trust_event.kind — must match guard_trust.bpf.c.
 const (
-	trustLibload    uint32 = 0
-	trustWriteblock uint32 = 1
-	trustPlant      uint32 = 2
-	trustSuspect    uint32 = 3
-	trustLaunch     uint32 = 4
-	trustArgv       uint32 = 5
-	trustArgvMatch  uint32 = 6
-	trustArgvWarn   uint32 = 7
-	trustBunfig     uint32 = 8
+	trustLibload     uint32 = 0
+	trustWriteblock  uint32 = 1
+	trustPlant       uint32 = 2
+	trustSuspect     uint32 = 3
+	trustLaunch      uint32 = 4
+	trustArgv        uint32 = 5
+	trustArgvMatch   uint32 = 6
+	trustArgvWarn    uint32 = 7
+	trustBunfig      uint32 = 8
+	trustProfile     uint32 = 9
+	trustProfileMark uint32 = 10
 )
 
 // TrustGuard owns guard_trusted_files and the daemon-wide trusted-binary/library protections
@@ -630,6 +632,13 @@ func (t *TrustGuard) readLoop() {
 			logTrustDenied("BUNFIG", comm, ev.PID, ev.UID, path,
 				"this Bun app runs the preload of any bunfig.toml in its working directory, so it never "+
 					"reads a secret; rebuild it with --no-compile-autoload-bunfig")
+		case trustProfile:
+			logTrustDenied("PROFILE", comm, ev.PID, ev.UID, path,
+				"this browser runs on a profile outside its guarded tree (--profile, --user-data-dir, "+
+					"HOME), whose settings or extensions are its caller's; it and what it starts never read a secret")
+		case trustProfileMark:
+			log.Warnf("trust guard: PROFILE comm=%s pid=%d uid=%d anchor=%s%s: a browser started on a profile "+
+				"outside its guarded tree is refused its secrets for life", comm, ev.PID, ev.UID, path, procCaller(ev.PID))
 		case trustArgvWarn:
 			log.Warnf("trust guard: ARGV comm=%s pid=%d uid=%d word=%s: a warn-only launch rule matched",
 				comm, ev.PID, ev.UID, path)

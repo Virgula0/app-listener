@@ -20,7 +20,7 @@ func TestLaunchRulesBlockParsed(t *testing.T) {
 		{Path: "/usr/bin/kubectl", Env: "HTTPS_PROXY"},
 		{Path: "/usr/bin/kubectl", Env: "KUBECONFIG", Warn: true},
 	}
-	if !slices.EqualFunc(cfg.LaunchRules, want, LaunchRule.Same) {
+	if !slices.EqualFunc(cfg.LaunchRules, want, func(a, b LaunchRule) bool { return a.Same(&b) }) {
 		t.Fatalf("LaunchRules = %+v", cfg.LaunchRules)
 	}
 	if !slices.Equal(cfg.AllowEnv, []string{"SSL_CERT_FILE=/etc/corp/ca.pem"}) {

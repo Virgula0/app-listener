@@ -264,9 +264,12 @@ test-e2e:
 		go test -tags gui,e2e ./internal/gui/ -run 'TestSnapshots|TestIconGallery|TestDemoReel' -v --count=1
 .PHONY: test-e2e
 
+# APPLISTENER_BROWSER_TESTS=1 runs TestDaemon_RealBrowserProfiles: it downloads Firefox and Chrome
+# (~300 MB). Pass APPLISTENER_BROWSER_TESTS= to skip it.
+APPLISTENER_BROWSER_TESTS ?= 1
 test-integration:
 	$(MAKE) -C integrationtests/exploits
-	go test ./integrationtests/ -v --count=1 -timeout 60m
+	APPLISTENER_BROWSER_TESTS=$(APPLISTENER_BROWSER_TESTS) go test ./integrationtests/ -v --count=1 -timeout 60m
 .PHONY: test-integration
 
 check-compatibility:

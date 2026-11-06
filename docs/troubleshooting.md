@@ -55,7 +55,7 @@ sudo app-listener install --allow-metadata-output
 
 Re-run `install` without the flag to quiet them again. If the reader is a desktop service that
 legitimately needs every process's metadata (a screen-sharing portal), list it under
-[`[inspectors]`](daemon-config.md#process-inspectors).
+[`[inspectors]`](config-reference.md#inspectors).
 
 ## Snapshots or disk backups stopped working
 

@@ -92,10 +92,14 @@ func watchPathsInConfig(config string) []string {
 			paths = append(paths, "/run/app-listener/secret-relay")
 			continue
 		}
-		if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
+		head, ok := strings.CutPrefix(line, "[watch ")
+		if !ok {
+			head, ok = strings.CutPrefix(line, "[narrow ")
+		}
+		if !ok || !strings.HasSuffix(line, "]") {
 			continue
 		}
-		path := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))
+		path := strings.TrimSpace(strings.TrimSuffix(head, "]"))
 		if path = strings.Trim(path, `"`); path != "" { // generated configs quote the path
 			paths = append(paths, path)
 		}

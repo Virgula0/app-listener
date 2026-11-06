@@ -252,7 +252,10 @@ site and check each argument's declared type.
   then `go test ./integrationtests/ -v --count=1 -timeout 60m`. Needs **rootful Docker**;
   spins privileged testcontainers (`CAP_BPF`, `SYS_ADMIN`, host `/sys/kernel/btf` bind-mounted,
   `APPLISTENER_ASSUME_BPF_LSM=1` set inside because containers have no securityfs). Auto-skips
-  when `docker` is not on PATH.
+  when `docker` is not on PATH. It sets `APPLISTENER_BROWSER_TESTS=1` (`TestDaemon_RealBrowserProfiles`
+  downloads Firefox and Chrome, ~300 MB); plain `go test` skips that test unless you set it. apt
+  lists/packages (`build/test/apt-cache/<image>`, bind-mounted by `startContainer`) and the browser
+  downloads (`build/test/cache`, 7 days) persist across runs.
 - Single integration test: `go test ./integrationtests/ -v -run 'TestIntegrationSuite/TestGuardWhitelist' -count=1`.
 - The integration suite compiles the binary under test statically with `-tags ci,osusergo,netgo`
   (`main_test.go`), and runs it against `ubuntu:latest` containers whose glibc is older than a

@@ -117,6 +117,9 @@ type Resource struct {
 	Secret *SecretScope
 	// SecretRelay is the gatekeeper's relay dir (SecretRelayDir), added for [secret_service].
 	SecretRelay bool
+	// NarrowOf is a [narrow] section's parent tree (ParseNarrowSection): Path lies inside it and its
+	// whitelist is a subset of the parent's. EncryptionRoot is the parent's group root.
+	NarrowOf string
 }
 
 // MovePeer is a lib_dir's move-peer class: lib_dirs with the same configured writers (paths, links,
@@ -228,6 +231,8 @@ type watchGroup struct {
 	runtime bool
 	// port: a [port tcp/<n>] section (ports.go).
 	port uint16
+	// narrow: a [narrow <path>] section (narrow.go).
+	narrow bool
 	// secret, secretMatches: a [secret <name>] section; secretServiceBlock: [secret_service]
 	// (secrets.go).
 	secret             string
@@ -383,6 +388,8 @@ func applyBlockLine(cfg *Config, g *watchGroup, line string, lineNo int) (bool, 
 		return true, applySetting(cfg, line, lineNo)
 	case g.secretServiceBlock:
 		return true, applySecretService(cfg, line, lineNo)
+	case g.narrow:
+		return true, applyNarrowLine(g, line, lineNo)
 	case g.secret != "":
 		m, ok, err := parseSecretMatch(line)
 		if ok && err == nil {
@@ -399,6 +406,12 @@ func applyBlockLine(cfg *Config, g *watchGroup, line string, lineNo int) (bool, 
 func openHeader(cfg *Config, group **watchGroup, line string, lineNo int) (bool, error) {
 	if next := openBlock(cfg, line, lineNo); next != nil {
 		return true, switchGroup(cfg, group, next)
+	}
+	if path, ok, err := ParseNarrowSection(line); ok {
+		if err != nil {
+			return true, fmt.Errorf("daemon config line %d: %w", lineNo, err)
+		}
+		return true, switchGroup(cfg, group, &watchGroup{root: path, narrow: true, lineNo: lineNo})
 	}
 	if name, ok, err := ParseSecretSection(line); ok {
 		if err != nil {
@@ -493,6 +506,9 @@ func finalizeGroup(cfg *Config, group *watchGroup) error {
 	}
 	if group.port != 0 {
 		return materializePortGroup(cfg, group)
+	}
+	if group.narrow {
+		return materializeNarrowGroup(cfg, group)
 	}
 	if group.secret != "" {
 		return materializeSecretGroup(cfg, group)
@@ -839,9 +855,9 @@ func findResource(cfg *Config, path string) *Resource {
 	return nil
 }
 
-// validateResources rejects duplicate and nested guarded roots across the whole config. The guard
-// engine records one owning resource per inode, so a file under two roots would follow only one of
-// their whitelists. Roots are compared symlink-resolved where they resolve (a locked vault's pending
+// validateResources rejects duplicate and nested guarded roots across the whole config, but for a
+// [narrow] inside its parent. The guard engine records one owning resource per inode, so a file
+// under two roots would follow only one of their whitelists (a [narrow]'s: the innermost). Roots are compared symlink-resolved where they resolve (a locked vault's pending
 // path can't be), so two spellings of one directory are caught too.
 func validateResources(cfg *Config) error {
 	seen := make(map[string]bool, len(cfg.Resources))
@@ -866,7 +882,7 @@ func validateResources(cfg *Config) error {
 				return fmt.Errorf("daemon config: %s and %s are the same directory: each guarded tree may be "+
 					"declared once", cfg.Resources[i].Path, cfg.Resources[j].Path)
 			}
-			if isInsidePath(resolved[i], resolved[j]) {
+			if isInsidePath(resolved[i], resolved[j]) && cfg.Resources[i].NarrowOf != cfg.Resources[j].Path {
 				return fmt.Errorf("daemon config: guarded path %s is inside guarded path %s: nested guarded "+
 					"trees are not supported (a file can follow only one whitelist) — guard sibling "+
 					"directories or merge the two into one section", cfg.Resources[i].Path, cfg.Resources[j].Path)
@@ -991,7 +1007,11 @@ func applyDirective(group *watchGroup, line string, lineNo int) error {
 	if value, ok := parseLibBinary(line); ok {
 		return applyLibBinary(group, value, lineNo)
 	}
+	return applyBinaryLine(group, line, lineNo)
+}
 
+// applyBinaryLine records a whitelist line: `<path> [EV1,EV2...]`.
+func applyBinaryLine(group *watchGroup, line string, lineNo int) error {
 	binPath, rest, splitErr := splitPathAndRest(line)
 	if splitErr != nil {
 		return fmt.Errorf("daemon config line %d: %w", lineNo, splitErr)

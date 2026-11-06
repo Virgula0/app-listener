@@ -71,6 +71,7 @@ func TestParseGuardEventSuspectLabels(t *testing.T) {
 		{0, "OPEN", ""},
 		{suspectPreload << guardReasonSuspectShift, "PRELOADED", ""},
 		{suspectLaunch << guardReasonSuspectShift, "LAUNCH", ""},
+		{suspectProfile << guardReasonSuspectShift, "PROFILE", ""},
 		{suspectPreload<<guardReasonSuspectShift | guardReasonRawDevice, "PRELOADED", RawDeviceResourceLabel},
 	} {
 		var buf bytes.Buffer

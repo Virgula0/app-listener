@@ -99,7 +99,7 @@ When a user's `~/.ssh` ends up guarded, the wizard offers (one question per user
 and the unit path, asked before encryption):
 
 - a per-user `ssh-agent` systemd unit. It binds `$XDG_RUNTIME_DIR/ssh-agent/socket`, which the
-  catalog's "SSH agent socket" entry guards (a [runtime section](daemon-config.md#runtime-sections)),
+  catalog's "SSH agent socket" entry guards (a [runtime section](config-reference.md#runtime)),
   so only the programs whitelisted there (`ssh`, `ssh-add`, `ssh-keygen`) may use a loaded key.
   The wizard says so when that entry is not selected. A unit from an earlier release binds
   `$XDG_RUNTIME_DIR/ssh-agent.socket`, unguarded: `install facultatives` offers the new one and

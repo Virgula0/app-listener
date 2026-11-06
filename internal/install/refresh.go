@@ -120,6 +120,7 @@ func RefreshSection(confText string, r *daemonconfig.Resource, users []User,
 	if err != nil {
 		return "", change, false, fmt.Errorf("moving the library directives of %s: %w", sectionPath, err)
 	}
+	migrated = SyncNarrows(migrated, sectionPath, entry, fresh)
 	freshPaths := make([]string, 0, len(fresh))
 	for _, b := range fresh {
 		freshPaths = append(freshPaths, b.Path)

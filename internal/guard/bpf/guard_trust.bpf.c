@@ -73,6 +73,8 @@
 #define TRUST_ARGV_MATCH 6 // a launch matched a deny rule: marked (path: the completing word)
 #define TRUST_ARGV_WARN 7  // a launch matched a warn rule: logged only
 #define TRUST_BUNFIG 8     // a code-suspect TRUSTED_BUNFIG process opened a guarded file (marked at exec)
+#define TRUST_PROFILE 9    // the same, marked for running on a profile its caller made
+#define TRUST_PROFILE_MARK 10 // a browser locked or opened a profile anchor outside every secret root
 
 struct inode_key {
 	__u64 dev;
@@ -368,6 +370,7 @@ struct {
 #define ARGV_WORD 1
 #define ARGV_ENV 2
 #define ARGV_ENV_OK 3
+#define ARGV_PROFILE 4 // a profile anchor: a file name the browser creates or opens in its profile
 #define ARGV_DENY 1
 #define ARGV_WARN 2
 #define ARGV_KEY 64
@@ -391,6 +394,7 @@ struct {
 // launch by a non-root uid matches (sshd reads a config of the caller's choosing and prints its
 // lines). Written before any guard_bin_rules row names the set, never changed after.
 #define ARGV_ROOT_ONLY 1
+#define ARGV_ANCHORED 2 // the set has ARGV_PROFILE entries (trust_profile_anchor)
 
 struct argv_set {
 	__u64 lens;
@@ -1130,7 +1134,7 @@ __noinline int trust_suspect_denied(__u64 dir, int change)
 	if (!why)
 		return 0;
 	__u32 kind = *why == SUSPECT_LAUNCH ? TRUST_LAUNCH : *why == SUSPECT_ARGV ? TRUST_ARGV :
-		     *why == SUSPECT_BUNFIG ? TRUST_BUNFIG : TRUST_SUSPECT;
+		     *why == SUSPECT_BUNFIG ? TRUST_BUNFIG : *why == SUSPECT_PROFILE ? TRUST_PROFILE : TRUST_SUSPECT;
 	int root = guarded_root_kind(dentry);
 	if (root != ROOT_SECRET && !(root == ROOT_CODE && change))
 		return 0;
@@ -1142,6 +1146,63 @@ __noinline int trust_suspect_denied(__u64 dir, int change)
 static __always_inline int suspect_denied(struct dentry *dentry, int change)
 {
 	return trust_suspect_denied((__u64)dentry, change) ? -EPERM : 0;
+}
+
+// creds_overridden: the kernel acts with other creds on the task's behalf. overlayfs opens a file's
+// backing file so, after file_open judged the overlay file at the path the caller sees; the
+// backing file's dentry is in the upper or lower layer, outside every guarded root.
+static __always_inline int creds_overridden(void)
+{
+	struct task_struct *t = (struct task_struct *)bpf_get_current_task();
+	const struct cred *c = NULL, *rc = NULL;
+	bpf_probe_read_kernel(&c, sizeof(c), &t->cred);
+	bpf_probe_read_kernel(&rc, sizeof(rc), &t->real_cred);
+	return c != rc;
+}
+
+// trust_profile_anchor: the current exe's rule set names dentry (in dir) a profile anchor and no
+// secret root holds dir: the browser runs on a profile its caller made (a user.js turning file://
+// isolation off, an extension), whose pages read whatever the exe may. It and every process it
+// starts, across exec, are code-suspect for life (SUSPECT_PROFILE). A planted profile in another
+// guarded tree is refused to the browser by that tree's guard. 1: the mark can't be recorded, the
+// caller refuses the operation. Static: path_symlink passes its BTF ctx pointer, which a global
+// function's scalar argument refuses; each hook calls it once.
+static __noinline int trust_profile_anchor(struct dentry *dir, struct dentry *dentry)
+{
+	if (!dir || !dentry)
+		return 0;
+	struct inode_key ek = {};
+	if (!current_exe_key(&ek))
+		return 0;
+	__u64 *set = bpf_map_lookup_elem(&guard_bin_rules, &ek);
+	if (!set)
+		return 0;
+	__u32 id = *set;
+	struct argv_set *as = bpf_map_lookup_elem(&trust_argv_sets, &id);
+	if (!as || !(as->flags & ARGV_ANCHORED))
+		return 0;
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *cur = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
+	if (cur && *cur == SUSPECT_PROFILE)
+		return 0;
+	const unsigned char *name = NULL;
+	__u32 n = 0;
+	bpf_probe_read_kernel(&name, sizeof(name), &dentry->d_name.name);
+	bpf_probe_read_kernel(&n, sizeof(n), &dentry->d_name.len);
+	if (!name || !n || n >= ARGV_KEY)
+		return 0;
+	struct argv_key k = {.set = id, .kind = ARGV_PROFILE};
+	if (bpf_probe_read_kernel_str(k.name, sizeof(k.name), name) < 0)
+		return 0;
+	if (!bpf_map_lookup_elem(&trust_argv, &k))
+		return 0;
+	if (guarded_root_kind(dir) == ROOT_SECRET)
+		return 0;
+	__u8 v = SUSPECT_PROFILE;
+	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
+		return 1;
+	emit(dentry, TRUST_PROFILE_MARK);
+	return 0;
 }
 
 // #2 library load allowlist: a whitelisted binary may map executable code only from a trusted
@@ -1356,6 +1417,8 @@ int trust_file_open(unsigned long long *ctx)
 		int r = suspect_denied(dentry, (f_mode & FMODE_WRITE) != 0);
 		if (r)
 			return r;
+		if (!creds_overridden() && trust_profile_anchor(dentry_parent(dentry), dentry))
+			return -EPERM;
 	}
 
 	if (!(f_mode & FMODE_WRITE))
@@ -1396,6 +1459,8 @@ int trust_path_mkdir(unsigned long long *ctx)
 	return 0;
 }
 
+// Chromium's profile lock (SingletonLock) is a symlink: this hook runs before the filesystem can
+// refuse it, so a profile on one that has no symlinks is marked too.
 SEC("lsm/path_symlink")
 int trust_path_symlink(unsigned long long *ctx)
 {
@@ -1404,6 +1469,8 @@ int trust_path_symlink(unsigned long long *ctx)
 	int r = suspect_denied(dir, 1);
 	if (r)
 		return r;
+	if (trust_profile_anchor(dir, dentry))
+		return -EPERM;
 	if (glob_denied(dir, dentry))
 		return deny_plant(dentry);
 	return 0;
@@ -1811,6 +1878,9 @@ int trust_exec_launch(unsigned long long *ctx)
 			set = bpf_map_lookup_elem(&guard_bin_rules, &k);
 	}
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *prof = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
+	if (prof && *prof == SUSPECT_PROFILE)
+		return 0; // already marked for life
 	if (flags & TRUSTED_BUNFIG) {
 		// Its preload is any ./bunfig.toml the open reaches (a symlink, a bind mount): no name check
 		// can tell, so the image never reads a secret. Its launch is moot.
@@ -1873,11 +1943,15 @@ int trust_exec_launch(unsigned long long *ctx)
 }
 
 // Exec replaces every mapping; runs before the new image's segments and libraries are mapped, so
-// those are judged afresh by trust_mmap.
+// those are judged afresh by trust_mmap. A SUSPECT_PROFILE mark stays: Firefox execs its fork
+// server, which forks every content process, after it reads the profile's prefs.
 SEC("lsm/bprm_committed_creds")
 int trust_bprm_committed(unsigned long long *ctx)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *why = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
+	if (why && *why == SUSPECT_PROFILE)
+		return 0;
 	bpf_map_delete_elem(&trust_code_suspect, &tgid);
 	return 0;
 }

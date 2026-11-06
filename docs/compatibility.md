@@ -66,7 +66,7 @@ These must attach or the guard refuses to start:
   another binary's identity); `network guard` requires it too
 - `unix_stream_connect`, `unix_may_send`, `socket_sendmsg`, `socket_recvmsg`, `socket_connect`,
   `socket_listen`, `socket_bind`, `socket_accept`, `sock_graft`, `socket_getsockopt`, `mmap_file` (unix sockets
-  bound inside a guarded tree, and [port sections](daemon-config.md#port-sections))
+  bound inside a guarded tree, and [port sections](config-reference.md#port-tcpn))
 
 Every other LSM hook is best-effort: a kernel that lacks one logs a warning and keeps enforcing the
 rest.

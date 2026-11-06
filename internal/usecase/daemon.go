@@ -936,9 +936,24 @@ func (d *daemonUseCase) GrantEditAccess(resourcePath string) (func() error, erro
 		return nil, fmt.Errorf("%s is not a guarded resource in the running configuration", resourcePath)
 	}
 
-	g := d.guards[idx]
-	if err := g.GrantSelfEditAccess(); err != nil {
-		return nil, err
+	// A [narrow] inside the resource owns its own inodes: it is widened with it, or its files
+	// stay read-only to the session.
+	var granted []repository.GuardRepository
+	revokeAll := func() error {
+		errs := make([]error, 0, len(granted))
+		for _, g := range granted {
+			errs = append(errs, g.RevokeSelfEditAccess())
+		}
+		return errors.Join(errs...)
+	}
+	for i := range d.resources {
+		if i != idx && d.resources[i].NarrowOf != resourcePath {
+			continue
+		}
+		if err := d.guards[i].GrantSelfEditAccess(); err != nil {
+			return nil, errors.Join(err, revokeAll())
+		}
+		granted = append(granted, d.guards[i])
 	}
 	d.editGrantActive = true
 
@@ -946,7 +961,7 @@ func (d *daemonUseCase) GrantEditAccess(resourcePath string) (func() error, erro
 	revoke := func() error {
 		var rerr error
 		once.Do(func() {
-			rerr = g.RevokeSelfEditAccess()
+			rerr = revokeAll()
 			d.mu.Lock()
 			d.editGrantActive = false
 			d.mu.Unlock()

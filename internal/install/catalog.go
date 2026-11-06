@@ -64,6 +64,11 @@ type CandidateDir struct {
 	// user when missing ("" = a 0700 directory, else a 0600 file holding the value) so they are guarded
 	// from the start: one made after install would sit outside every watch.
 	SeedWatchPaths map[string]string
+	// Narrowed are subtrees of each location judged by a narrower whitelist (`[narrow]` sections):
+	// location-relative directory -> Whitelist basename -> its events there (nil = its events in the
+	// location). A whitelisted binary not named loses every access inside. Made (0700, as the user)
+	// when missing at install, so the subtree is judged from the start.
+	Narrowed map[string]map[string][]string
 	// Libs are extra libraries the entry's whitelisted binaries may load (`allow_lib`). Only needed
 	// for user-writable libraries at FIXED paths an app dlopen()s: root-owned system libs are
 	// auto-trusted and in-tree ones trusted by location. %HOME%/%USER% expand. Per-launch ephemeral
@@ -135,6 +140,32 @@ func denyEach(words ...string) []daemonconfig.LaunchRule {
 // sshdRootOnly: sshd prints every line of the config -f names (`sshd -t -f ~/.ssh/id_ed25519`); only
 // root runs the server and its session and auth helpers.
 var sshdRootOnly = []daemonconfig.LaunchRule{{RootOnly: true}}
+
+// profileAnchors: the files a browser locks or reads first in the profile it runs on. One locked
+// or opened outside every guarded tree (--profile, --user-data-dir, HOME) marks the browser for
+// life: a profile its caller made can turn file:// isolation off (user.js) or carry an extension.
+// Not Firefox's lock files: it locks $TMPDIR/firefox (its remote service) the same way.
+func profileAnchors(names ...string) []daemonconfig.LaunchRule {
+	out := make([]daemonconfig.LaunchRule, 0, len(names))
+	for _, n := range names {
+		out = append(out, daemonconfig.LaunchRule{Profile: n})
+	}
+	return out
+}
+
+var (
+	firefoxAnchors  = profileAnchors("prefs.js", "user.js", "extensions.json")
+	chromiumAnchors = profileAnchors("SingletonLock", "Local State", "Preferences", "Secure Preferences")
+)
+
+// firefoxRules: see the Firefox profile entry.
+var firefoxRules = slices.Concat(denyEach(
+	"--headless", "-headless", "--screenshot", "-screenshot",
+	"--remote-debugging-port", "-remote-debugging-port", "--marionette", "-marionette",
+	"--start-debugger-server", "-start-debugger-server", "--jsdebugger", "-jsdebugger",
+	"--MOZ_LOG", "-MOZ_LOG"), []daemonconfig.LaunchRule{
+	{Env: "MOZ_HEADLESS"}, {Env: "MOZ_MARIONETTE"}, {Env: "MOZ_LOG"}, {Env: "SSLKEYLOGFILE"}},
+	firefoxAnchors)
 
 // coinRules: an unlocked wallet's keys and funds over RPC; -stdin carries the method on stdin.
 var coinRules = denyEach("-stdin", "dumpprivkey", "dumpwallet", "walletpassphrase", "send", "sendall",
@@ -233,14 +264,21 @@ var Catalog = []CandidateDir{
 		}},
 	{Name: "GNU Privacy Guard keyring", RelPaths: []string{".gnupg"},
 		// Without /run/user, gpg-agent's sockets (S.gpg-agent.ssh too) live here: ssh may connect.
+		// gpg-connect-agent sends any file it reads to the socket its caller names (`-S <sock>
+		// /definqfile`); gpgconf --change-options sets encrypt-to: neither reads or writes here.
 		Whitelist: map[string][]string{
 			"/usr/bin/gpg": nil, "/usr/bin/gpg-agent": nil,
-			"/usr/bin/gpgconf": nil, "/usr/bin/gpg-connect-agent": nil,
+			"/usr/bin/gpgconf": {"READ", "STAT", "CONNECT"}, "/usr/bin/gpg-connect-agent": {"CONNECT", "STAT"},
 			"/usr/bin/ssh": {"CONNECT"}, "/usr/bin/ssh-add": {"CONNECT"},
 		},
+		// Only gpg-agent touches the secret keys; gpg wraps any file it reads (--enarmor, -e -r), so
+		// it only writes the revocation certificate it makes at key generation.
+		Narrowed: map[string]map[string][]string{
+			"private-keys-v1.d": {"gpg-agent": nil},
+			"openpgp-revocs.d":  {"gpg": {"MKNOD", "WRITE", "STAT"}},
+		},
 		// gpg takes any unambiguous abbreviation of a long option: each rule names every spelling from
-		// the shortest only these options start. --enarmor / --store wrap any file gpg reads
-		// (private-keys-v1.d too); -e -r <key> and -c still do (docs/limitations.md).
+		// the shortest only these options start.
 		LaunchRules: map[string][]daemonconfig.LaunchRule{"gpg": {
 			deny("--export-se[cret-keys]"), deny("--export-se[cret-subkeys]"), deny("--export-se[cret-ssh-key]"),
 			deny("--enar[mor]"), deny("--enar[mour]"), deny("--sto[re]"),
@@ -716,29 +754,39 @@ var Catalog = []CandidateDir{
 	// separately.
 	{Name: "Firefox profile", RelPaths: []string{".mozilla/firefox", ".config/mozilla/firefox"},
 		Whitelist: map[string][]string{
-			"/usr/bin/firefox":             nil,
-			"/usr/lib/firefox/firefox":     nil,
+			"/usr/bin/firefox":         nil,
+			"/usr/lib/firefox/firefox": nil,
+			// Mozilla's own builds (tarball, packages.mozilla.org): firefox is a launcher that execs this.
+			"/usr/lib/firefox/firefox-bin": nil,
 			"/usr/lib/firefox/crashhelper": nil, "/usr/lib/firefox/crashreporter": nil,
-		}},
+		},
+		// Firefox isn't a detected Chromium runtime. Headless renders any file:// it reads into the
+		// caller's output (--screenshot, an iframe of the profile); the remote protocols, the debugger
+		// server and Marionette drive the browser (cookies, file:// navigation); MOZ_LOG=nsHttp logs
+		// cookie headers and SSLKEYLOGFILE the TLS keys. Each switch takes one or two dashes.
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"firefox": firefoxRules, "firefox-bin": firefoxRules}},
 	{Name: "Google Chrome profile", RelPaths: []string{".config/google-chrome"},
 		Whitelist: map[string][]string{
 			"/usr/bin/google-chrome": nil, "/usr/bin/google-chrome-stable": nil,
 			"/opt/google/chrome/chrome": nil, "/usr/lib/chromium/chrome": nil,
 			"/opt/google/chrome/chrome_crashpad_handler": nil,
-		}},
+		},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"chrome": chromiumAnchors}},
 	{Name: "Chromium profile", RelPaths: []string{".config/chromium"},
 		Whitelist: map[string][]string{
 			"/usr/bin/chromium": nil, "/usr/bin/chromium-browser": nil,
 			"/usr/lib/chromium/chrome": nil, "/usr/lib/chromium/chromium": nil,
 			"/usr/lib/chromium/chrome_crashpad_handler": nil,
-		}},
+		},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"chromium": chromiumAnchors, "chrome": chromiumAnchors}},
 	{Name: "Brave profile", RelPaths: []string{".config/BraveSoftware"},
 		Whitelist: map[string][]string{
 			"/usr/bin/brave-browser": nil, "/usr/bin/brave": nil,
 			"/opt/brave/brave": nil, "/opt/brave-bin/brave": nil,
 			"/opt/brave-bin/chrome_crashpad_handler":         nil,
 			"/usr/lib/brave-browser/chrome_crashpad_handler": nil,
-		}},
+		},
+		LaunchRules: map[string][]daemonconfig.LaunchRule{"brave": chromiumAnchors}},
 	{Name: "Discord", RelPaths: []string{".config/discord"},
 		// WatchRelPaths encrypts/decrypts the whole ~/.config/discord with fscrypt but only watches
 		// and guards the listed subpaths (other accesses are ignored, and the guarded set is

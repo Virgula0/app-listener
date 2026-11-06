@@ -25,6 +25,8 @@ type Section struct {
 	// tree sharing the whitelist, emitted as `watch: <path>`. For self-updating apps whose update
 	// workspace must stay outside the guarded set (e.g. Discord's versioned app dirs).
 	ExtraWatchPaths []string
+	// Narrows are emitted as `[narrow <path>]` sections right after this one.
+	Narrows []NarrowSection
 }
 
 // GenerateConf renders a valid daemon.conf: every section has a whitelist and an explicit
@@ -111,6 +113,9 @@ func GenerateSections(sections []Section) string {
 			b.WriteString("need_encryption: true\n")
 		} else {
 			b.WriteString("need_encryption: false\n")
+		}
+		for _, n := range s.Narrows {
+			b.WriteString(n.text())
 		}
 	}
 	return b.String()

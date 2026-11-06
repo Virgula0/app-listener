@@ -48,8 +48,7 @@ The flags `daemon --check`, `--verifier-only`, `--lockdown` and `--genkey` are a
 subcommands and stay listed in `--help`: installed systemd units, `scripts/install.sh` and
 `check-compatibility.sh` run binaries of other versions with them.
 
-The config syntax is in the [daemon.conf reference](config-reference.md); what each section does
-is in [Daemon configuration](daemon-config.md).
+What each config section does, and its syntax, is in the [daemon.conf reference](config-reference.md).
 
 ## Lifecycle
 
@@ -74,7 +73,7 @@ start does not lock users out.
 
 ### Runtime sections at login
 
-A [runtime section](daemon-config.md#runtime-sections) guards a directory in `/run/user/<uid>`,
+A [runtime section](config-reference.md#runtime) guards a directory in `/run/user/<uid>`,
 which systemd mounts at the user's first login (`user-runtime-dir@<uid>.service`) and removes at
 the last logout. The installer adds a drop-in,
 `/etc/systemd/system/user-runtime-dir@.service.d/app-listener.conf`, that runs
@@ -118,7 +117,7 @@ session.
 
 ### The Secret Service gate
 
-With a [`[secret_service]` block](daemon-config.md#secret-service-sections) the daemon:
+With a [`[secret_service]` block](config-reference.md#secret_service) the daemon:
 
 - installs a session bus policy (`/etc/dbus-1/session.d/app-listener-secrets.conf`) under which
   only root may own `org.freedesktop.secrets` or monitor the bus, and the Secret Service interfaces
@@ -133,7 +132,7 @@ With a [`[secret_service]` block](daemon-config.md#secret-service-sections) the 
   listener the user puts at that name can't answer the relay, so it can't forge a caller.
 
 Every method call to the keyring passes the gate first. Calls it doesn't know are refused; reading,
-writing or deleting an item a [secret scope](daemon-config.md#secret-service-sections) covers needs
+writing or deleting an item a [secret scope](config-reference.md#secret-name) covers needs
 a caller that scope's whitelist admits. The caller is the process the bus reports for the
 connection, checked by inode like any guard decision, and refused if it ran another program since it
 connected to the bus, if another process ever sent on one of its bus connections (an inherited or
@@ -213,7 +212,7 @@ any disk or btrfs filesystem that hosts a guarded resource. These denials are lo
 A process that read a protected file is *tainted*: no program outside its resource's whitelist may
 read its memory or its `/proc/<pid>` metadata. Otherwise any process could read the secret back
 out of the app that loaded it. Programs that must inspect every process (screen-sharing portals)
-are listed under `[inspectors]`, see [Daemon configuration](daemon-config.md#process-inspectors).
+are listed under [`[inspectors]`](config-reference.md#inspectors).
 
 ## App maintainers (Steam runtime updates)
 
@@ -288,8 +287,7 @@ its own writes are refused. Start Steam again once that line appears.
 
 ## Related
 
-- [daemon.conf reference](config-reference.md): the config syntax.
-- [Daemon configuration](daemon-config.md): what each config section does.
+- [daemon.conf reference](config-reference.md): what each config section does, and its syntax.
 - [Binary trust](binary-trust.md): binary updates, the ledger, `trust`, launch scan.
 - [Self-updating apps and the catalog](catalog.md): catalog refresh.
 - [edit-protected](edit-protected.md): editing protected files while the daemon runs, and the

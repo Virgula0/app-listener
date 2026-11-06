@@ -75,11 +75,19 @@ var launchRules = func() []launchRule {
 	// --disable-features re-enables). Chromium takes "-" as a switch prefix as well as "--".
 	// --ignore-certificate-errors (and -spki-list, by its first two words) trusts any server, and a
 	// proxy flag routes every request to the caller's.
+	// Headless prints or renders any file:// it reads (--dump-dom, --screenshot, --print-to-pdf; an
+	// iframe of the profile in the caller's page), the net log and key log write cookies and TLS keys
+	// to the caller's file, and --pack-extension writes a crx of the directory it names beside it.
+	// --allow-file-access-from-files and --disable-web-security let a file:// page read any other
+	// file and post it out, windowed or not (--ozone-platform=headless only hides it, as Xvfb does).
 	for _, a := range []string{"remote-debugging", "load-extension", "disable-extensions-except", "load-apps",
-		"ignore-certificate", "proxy-server", "proxy-pac-url"} {
+		"ignore-certificate", "proxy-server", "proxy-pac-url",
+		"headless", "dump-dom", "screenshot", "print-to-pdf", "log-net-log", "net-log-capture-mode",
+		"ssl-key-log-file", "pack-extension", "allow-file-access-from-files", "disable-web-security"} {
 		rules = append(rules, launchRule{launchArg, "--" + a, trustedNode | trustedChromium, launchPresent},
 			launchRule{launchArg, "-" + a, trustedNode | trustedChromium, launchPresent})
 	}
+	rules = append(rules, launchRule{launchEnv, "SSLKEYLOGFILE", trustedNode | trustedChromium, launchPresent})
 	// Child-process launchers: the exe named runs as the app's renderer, utility (network service:
 	// brokered cookie fds) or GPU process and is handed what that process is handed.
 	for _, a := range []string{"renderer-cmd-prefix", "utility-cmd-prefix", "zygote-cmd-prefix",

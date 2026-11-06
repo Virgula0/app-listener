@@ -279,6 +279,23 @@ func TestValidateTargetsExtendsAGuardedPath(t *testing.T) {
 	}
 }
 
+// A line recorded for either side of a [narrow] would land in the parent's section.
+func TestValidateTargetsRefusesNarrowedTrees(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".gnupg")
+	keys := filepath.Join(root, "keys")
+	if err := os.MkdirAll(keys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := mustParse(t, "[watch "+root+"]\n/usr/bin/cat\nneed_encryption: false\n\n[narrow "+keys+"]\n/usr/bin/cat\n")
+	for _, p := range []string{root, keys} {
+		if _, err := ValidateTargets([]string{p}, base, []string{home}); err == nil ||
+			!strings.Contains(err.Error(), "[narrow") {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+}
+
 func TestPlanExtendsAnExistingSection(t *testing.T) {
 	rec, a, b := testRecording(t)
 	rec.Targets[0].Existing = &Existing{Section: a, Allow: []ExistingRule{{Line: "/usr/bin/ssh"}}}

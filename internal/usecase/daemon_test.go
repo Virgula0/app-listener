@@ -337,6 +337,42 @@ func TestDaemonUseCaseGrantEditAccess(t *testing.T) {
 	}
 }
 
+func TestDaemonUseCaseGrantEditAccessWidensNarrows(t *testing.T) {
+	vault := newFakeVault("/vault")
+	keys := resource("/vault/keys")
+	keys.NarrowOf, keys.EncryptionRoot = "/vault", "/vault"
+	g0, g1, g2 := newFakeGuardRepo(), newFakeGuardRepo(), newFakeGuardRepo()
+	d, err := NewDaemonUseCase(
+		[]daemonconfig.Resource{resource("/vault"), keys, resource("/vault2")},
+		vault,
+		[]repository.GuardRepository{g0, g1, g2},
+	)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+	revoke, err := d.GrantEditAccess("/vault")
+	if err != nil {
+		t.Fatalf("GrantEditAccess: %v", err)
+	}
+	if !g0.editGranted || !g1.editGranted || g2.editGranted {
+		t.Fatalf("grants = %v %v %v, want the resource and its narrow only", g0.editGranted, g1.editGranted,
+			g2.editGranted)
+	}
+	if err := revoke(); err != nil || g0.editGranted || g1.editGranted {
+		t.Fatalf("revoke: %v, grants %v %v", err, g0.editGranted, g1.editGranted)
+	}
+
+	// A narrow that refuses the grant undoes the parent's.
+	g1.editGrantErr = errBoom
+	if _, err := d.GrantEditAccess("/vault"); err == nil || g0.editGranted {
+		t.Fatalf("err %v, parent granted %v", err, g0.editGranted)
+	}
+	g1.editGrantErr = nil
+	if _, err := d.GrantEditAccess("/vault"); err != nil {
+		t.Fatalf("a failed grant must not hold the session: %v", err)
+	}
+}
+
 func TestDaemonUseCaseResolveFailureFailsStart(t *testing.T) {
 	// Set after unlock+populate, so a failed resolution must leave the
 	// resource in the pre-unlock state once the caller runs Stop().

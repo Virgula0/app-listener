@@ -41,6 +41,10 @@ with RAM.
   io_uring, `open_by_handle_at`, `copy_file_range`, `process_vm_readv`, raw block device, mount,
   `SCM_RIGHTS` fd passing, ...), then runs the suite in privileged containers. It needs rootful
   Docker and skips when `docker` is not on `PATH`.
+  It also runs `TestDaemon_RealBrowserProfiles`, which downloads Firefox and Google Chrome (about
+  300 MB) and runs them under Xvfb; `make test-integration APPLISTENER_BROWSER_TESTS=` skips it.
+  Runs keep what they download under `build/test`: apt's lists and packages per image
+  (`apt-cache/`) and the browsers (`cache/`, fetched again after 7 days). Delete them to start fresh.
 
 ## Docker
 

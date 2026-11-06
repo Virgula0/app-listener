@@ -65,10 +65,12 @@ struct {
 // (trust_mmap judges only new mappings, so a reload whitelisting the exe would not catch it).
 // SUSPECT_LAUNCH: a runtime started with env/argv that run its caller's code (trust_exec_launch).
 // SUSPECT_ARGV: a whitelisted binary started with argv/env one of its rules names (trust_argv).
+// SUSPECT_PROFILE: a browser that locked or opened a profile outside every secret root
+// (trust_profile_anchor). Kept across exec: the profile, not the image, is the caller's.
 // Either is refused every regular file below a secret root, any change below a code tree, its exe's
 // writer and updater rights (trust_suspect), guard_ptrace_access_check's inspector grant and, by the
 // guard's whitelist decision, any access below a secret (stat, readdir, xattrs).
-// Inherited across fork, cleared on exec and on leader exit (guard_tainted_pids' lifecycle), all by
+// Inherited across fork, cleared on exec (bar SUSPECT_PROFILE) and on leader exit (guard_tainted_pids' lifecycle), all by
 // the trust object. A mark that can't be recorded refuses the mapping / kills the launch.
 // networkguard.bpf.c keeps its own instance with the same values and lifecycle: a marked process
 // loses its exe's network whitelist.
@@ -84,6 +86,7 @@ struct {
 #define SUSPECT_LAUNCH 2
 #define SUSPECT_ARGV 3
 #define SUSPECT_BUNFIG 4 // a TRUSTED_BUNFIG image: from exec, before ./bunfig.toml's preload runs
+#define SUSPECT_PROFILE 5
 
 static __always_inline __u64 leader_start(struct task_struct *task)
 {

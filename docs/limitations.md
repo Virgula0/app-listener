@@ -22,15 +22,23 @@ by root, the routes to a config of the caller's choosing.
 Some whitelisted CLIs also process any file they are given, so a rule only stops the one-command
 dump, never the copy:
 
-- `gpg`: the rules refuse `--export-secret-keys`, `--export-secret-subkeys`,
-  `--export-secret-ssh-key`, `--enarmor` and `--store` in every abbreviation gpg accepts, but
-  `gpg -e -r <their key> <file>` or `gpg -c <file>` still wraps any file gpg reads, the keys in
-  `~/.gnupg/private-keys-v1.d` included (they stay protected by their passphrase, if they have one).
-  pass needs `-e`, so it can't be refused.
+- `gpg`: `gpg -e -r <their key> <file>` or `gpg -c <file>` wraps any file gpg reads (pass needs
+  `-e`, so it can't be refused). The catalog keeps the secret keys out of its reach instead: a
+  [`[narrow]`](config-reference.md#narrow-path) section lets only `gpg-agent` into
+  `~/.gnupg/private-keys-v1.d`, and gpg only writes `openpgp-revocs.d`. What gpg still reads (the
+  public keyring, the trust database, the configuration) is what it needs.
 - `kubectl`, `oc`: `config view --raw` is refused, but
   `kubectl create configmap x --from-file=<kubeconfig> --dry-run=client -o yaml` prints the file.
 - `rclone`: `config show` and `config dump` are refused, but `rclone cat <rclone.conf>` prints it.
   Set a config password (`rclone config encryption set`) to keep it encrypted at rest.
+
+A browser shows any file it can read, its own profile included: `brave --headless --dump-dom
+file://<profile file>` prints it, and `firefox --screenshot` renders it into an image. Headless,
+remote-control and logging launches of a browser therefore run without its profile
+([the table below](#commands-that-stop-working)).
+So does a browser started on a profile outside its guarded tree (`--profile`, `--user-data-dir`,
+another `HOME`): that profile's settings and extensions are its caller's
+([Browser profiles](binary-trust.md#browser-profiles)).
 
 A browser or Electron app sends its cookies and tokens wherever its TLS stack trusts. The launch
 scan refuses the flags that redirect it (`--ignore-certificate-errors`, `--proxy-server`), but not a
@@ -53,7 +61,7 @@ sending a datagram, or sending and receiving on a connection handed to another p
 `CONNECT` for a program that talks to such a socket. What stays outside:
 
 - **Sockets outside the tree.** Agents in `/run/user/<uid>` are guarded only through a
-  [runtime section](daemon-config.md#runtime-sections): the catalog has one for `gpg-agent` and one
+  [runtime section](config-reference.md#runtime): the catalog has one for `gpg-agent` and one
   for the installer's `ssh-agent`. An agent you start elsewhere, and the session bus, can be asked
   by any of your programs (see below).
 - **Impersonating a guarded agent.** The programs allowed to create sockets in a runtime directory
@@ -74,7 +82,7 @@ over a channel the guard doesn't see answers whoever asks:
 - **The keyring.** The Secret Service (GNOME keyring, KDE Wallet, KeePassXC) is reached over the
   session bus, so any of your programs can read an unlocked collection. `gh`, Copilot CLI, Gemini CLI,
   the Antigravity CLI, Codex (in keyring mode), JetBrains IDEs, Zed, ProtonVPN, `docker` with a `secretservice` helper and `git`'s libsecret helper
-  keep tokens there. With gnome-keyring, [secret scopes](daemon-config.md#secret-service-sections)
+  keep tokens there. With gnome-keyring, [secret scopes](config-reference.md#secret-name)
   restrict the items they cover to their whitelists, with the limits below. Elsewhere, prefer file
   storage inside a guarded tree where the app offers it
   (`gh auth login --insecure-storage`), or let KeePassXC serve the Secret Service with "Confirm when
@@ -107,7 +115,7 @@ over a channel the guard doesn't see answers whoever asks:
     then can't use.
 - **Local servers.** A service on a loopback port (`bitcoind` RPC on 8332, `ollama` on 11434, `adb`
   on 5037, `opencode serve`) answers any local client that has its credential, or any client when it
-  has none, unless a [port section](daemon-config.md#port-sections) guards the port. Even then:
+  has none, unless a [port section](config-reference.md#port-tcpn) guards the port. Even then:
   - a whitelisted client run by malware still asks on its behalf, as with agents;
   - connections opened before the daemon started are not judged;
   - UDP, other hosts and other network namespaces are out of scope;
@@ -169,14 +177,43 @@ least-privilege hint.
   imaging stop working there ([details](daemon.md#filesystem-wide-gates)).
 - **Process inspection.** Programs outside a resource's whitelist can't read `/proc/<pid>` of a
   process that read protected content. Screen-sharing portals are allowed by default through
-  [`[inspectors]`](daemon-config.md#process-inspectors); other tools may break silently (see
+  [`[inspectors]`](config-reference.md#inspectors); other tools may break silently (see
   [Troubleshooting](troubleshooting.md#an-app-breaks-and-nothing-is-logged)).
 - **Bun apps from desktop menus** still use `/tmp` and are denied their native library
   ([details](installation.md#bun-based-apps-opencode)).
-- **Refused launches.** A launch that matches a rule runs without its secrets, so the app fails:
-  `ssh -F <config>` and `ssh host ls -F`, `git` over ssh with `GIT_SSH_COMMAND="ssh -F ..."`, a
-  browser or VS Code started with `--proxy-server`, `ssh-add` to an agent outside a guarded tree.
-  Use the user config (`~/.ssh/config`) and the desktop's proxy settings instead.
+- **Refused launches.** Some commands of whitelisted programs run without their secrets, so they
+  fail: see [Commands that stop working](#commands-that-stop-working).
+
+## Commands that stop working
+
+These launches of a whitelisted program still run, but can't open anything the daemon guards (the
+journal logs `TRUST DENIED op=ARGV` or `op=LAUNCH`), so they usually fail. The match doesn't look
+at what a flag points to: `ssh -F /tmp/test` is refused like `ssh -F ~/.ssh/id_ed25519`, since the
+file named and the file opened can differ (a symlink, a relative path) by the time the program
+opens it. The full list is in [Binary trust](binary-trust.md#launch-rules).
+
+| Program | What stops working | Why it is refused | Do instead |
+|---|---|---|---|
+| `ssh` | `-F <any file>`, in any option cluster (`-4F/tmp/c`), also in a remote command (`ssh host ls -F`) and through `GIT_SSH_COMMAND="ssh -F ..."` | `ssh` prints each line of a config it can't parse, a private key included | Put the settings in `~/.ssh/config`, or pass them as `-o Option=value` |
+| `sshd` | Any run by a user other than root (`sshd -t -f <file>`) | `sshd -t -f` prints the file it names line by line | Run it as root |
+| `ssh-add` | Talking to an agent outside a guarded tree (`eval $(ssh-agent)` in `/tmp`) | It would hand the key it read to that socket | Use the catalog's `ssh-agent` |
+| Chrome, Chromium, Brave | `--headless`, `--dump-dom`, `--screenshot`, `--print-to-pdf` | A headless browser prints or renders any file it reads | Run automation on a separate profile (`--user-data-dir=/tmp/p`) |
+| Firefox | `--headless`, `--screenshot`, `MOZ_HEADLESS=1` | Same | Run automation on a separate profile (`firefox --profile /tmp/p`) |
+| Browsers | `--remote-debugging-port`/`-pipe`, and for Firefox `--marionette`, `--start-debugger-server`, `--jsdebugger` | Whoever connects drives the browser and reads its cookies | Run Selenium, Playwright or Puppeteer on a separate profile |
+| Chrome, Chromium, Brave | `--allow-file-access-from-files`, `--disable-web-security` | A local page reads any file the browser can read and sends it out | Serve the page over `http://localhost`; test on a separate profile |
+| Firefox, Chrome, Chromium, Brave | Any profile outside the guarded tree: `--profile`, `--user-data-dir`, `-P` naming one elsewhere, another `HOME` or `XDG_CONFIG_HOME` | The profile's `user.js` or extensions would run in the whitelisted browser | Nothing to change: a test or automation profile runs, only without the real profile's secrets |
+| Browsers | `--log-net-log`, `--net-log-capture-mode`, `--ssl-key-log-file`, `SSLKEYLOGFILE`, Firefox's `MOZ_LOG` / `-MOZ_LOG` | The log holds cookies or the TLS keys | Debug on a separate profile |
+| Browsers, Electron apps | `--proxy-server`, `--proxy-pac-url`, `--ignore-certificate-errors*` | The app would send its cookies and tokens to the caller's server | Use the desktop's proxy settings |
+| Browsers, Electron apps | `--load-extension`, `--disable-extensions-except`, `--pack-extension`, `--remote-debugging-*`, `--inspect*` | They run code of the caller's choosing in the app | Install extensions from the store; debug on a separate profile |
+| Node, Electron, Bun, JVM apps | Code-loading variables and flags (`NODE_OPTIONS=--require`, `ELECTRON_RUN_AS_NODE`, `BUN_OPTIONS`, `JAVA_TOOL_OPTIONS=-javaagent`, ...) | Same | Leave them unset for whitelisted apps |
+| `gh` | `auth token`, `auth status -t` / `--show-token`, `alias set`, `alias import` | They print the token, or make `gh` run a command of the caller's choosing | `gh auth status` without `-t` |
+| `aws` | `configure export-credentials`, `configure get` | They print the keys | Read `~/.aws` with an editor through `edit-protected` |
+| `gpg` | `--export-secret-keys`, `--export-secret-subkeys`, `--export-secret-ssh-key`, `--enarmor`, `--store`, in every abbreviation | They print the secret keys, or wrap any file `gpg` reads | None today |
+| `kubectl`, `oc` | `config view --raw` | It prints the client keys and tokens | `config view` (redacted) |
+| `rclone` | `config show`, `config dump` | They print every remote's tokens | `rclone config redacted` |
+| `bitcoin-cli`, `litecoin-cli`, `lightning-cli` | Key dumps and every send or payment command | They print keys or spend funds | None today |
+| JetBrains IDEs, `pi`, `opencode`, `codex` | `installPlugins`; `pi -e` / `--extension`; `OPENCODE_CONFIG*`; `OPENAI_BASE_URL` | They load code, or send the token to a server of the caller's choosing | Install plugins from the IDE; keep these in the app's own config |
+| Every whitelisted program | `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED` set to anything but the system bundle | The program would trust a certificate of the caller's choosing | Add the corporate bundle with [`allow_env`](config-reference.md#allow_env) |
 
 ## Project status
 

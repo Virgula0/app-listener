@@ -127,6 +127,13 @@ A launch is **risky** when it has any of:
   `--load-apps` (whatever `--disable-features` re-enables in branded Chrome);
 - TLS and proxy flags: `--ignore-certificate-errors*`, `--proxy-server`, `--proxy-pac-url` (the
   app would send its cookies and tokens to a server its caller chose);
+- output and log flags: `--headless`, `--dump-dom`, `--screenshot`, `--print-to-pdf` (a headless
+  browser prints or renders any `file://` it can read, its own profile included), `--log-net-log`,
+  `--net-log-capture-mode`, `--ssl-key-log-file` and the `SSLKEYLOGFILE` environment variable
+  (cookies and TLS keys written to a file of the caller's choosing), `--pack-extension` (a `.crx` of
+  the directory it names, written beside it);
+- file access flags: `--allow-file-access-from-files`, `--disable-web-security` (a `file://` page
+  reads any other file the browser can read and sends it out, with or without a window);
 - for Node/Electron and Chromium, an argument starting with whitespace: Chromium trims it off and
   reads what follows as a switch;
 - child-process launchers: `--renderer-cmd-prefix`, `--utility-cmd-prefix`,
@@ -163,7 +170,36 @@ runtime's rules above (so a flag only another runtime treats as risky marks it t
 generic Electron app rule below.
 
 Generic Electron binaries that run an app named on the command line are covered by
-[`[electron_apps]`](daemon-config.md#generic-electron-apps).
+[`[electron_apps]`](config-reference.md#electron_apps).
+
+### Browser profiles
+
+A browser runs whatever its profile tells it to: a `user.js` can turn off Firefox's `file://`
+isolation, and a Chromium profile can carry an extension. A page on a profile its caller made then
+reads any file the whitelisted browser may, its real profile included. No flag is needed:
+`HOME=/tmp/x firefox` finds a planted `.mozilla/firefox` by itself.
+
+So the catalog gives each browser its **profile anchors**, the files it locks or reads first in the
+profile it runs on:
+
+| Browser | Anchors |
+|---|---|
+| Firefox | `prefs.js`, `user.js`, `extensions.json` |
+| Chrome, Chromium, Brave | `SingletonLock`, `Local State`, `Preferences`, `Secure Preferences` |
+
+A whitelisted browser that creates or opens one outside every guarded tree (`--profile`,
+`--user-data-dir`, `-P` with a profile elsewhere, another `HOME` or `XDG_CONFIG_HOME`) is marked
+for life, its forks and the programs it execs included (Firefox execs the fork server that starts
+its content processes): `trust guard: PROFILE comm=... anchor=<path>` in the log, then
+`op=PROFILE` for every guarded file it asks for. A profile planted in another guarded tree is
+refused to the browser by that tree's guard. The anchors are applied by basename (`firefox`,
+`firefox-bin`, `chrome`, `chromium`, `brave`) to every whitelisted binary of that name, also in
+hand-written sections. They need the whole profile guarded: a section that watches only some of a
+profile's subdirectories leaves `Local State` outside, and the browser is marked on its own
+profile. Firefox's lock files are no anchors: it locks `$TMPDIR/firefox` the same way at every start.
+
+Fix: run test and automation profiles without the real profile's secrets, which is what the mark
+does. A browser that started before the daemon is not marked.
 
 ## Launch rules
 
@@ -191,9 +227,15 @@ file's name, in every section that whitelists a file of that name:
 - `gpg`: `--export-secret-keys`, `--export-secret-subkeys`, `--export-secret-ssh-key`, `--enarmor`
   (`--enarmour`) and `--store`, each in every abbreviation gpg accepts (`--export-se` up to the full
   name: gpg runs any unambiguous prefix of a long option). The first three print secret keys,
-  the last two wrap any file gpg reads ([what they miss](limitations.md#whitelisted-programs-that-disclose-on-request)).
+  the last two wrap any file gpg reads; the secret keys themselves are out of gpg's reach
+  ([what they miss](limitations.md#whitelisted-programs-that-disclose-on-request)).
 - `kubectl`, `oc`: `config view --raw` (plain `config view` redacts keys and tokens).
 - `rclone`: `config show`, `config dump` (every remote's tokens and passwords).
+- `firefox` (not a Chromium runtime, so the launch scan doesn't judge it): `--headless`,
+  `--screenshot`, `--remote-debugging-port`, `--marionette`, `--start-debugger-server`,
+  `--jsdebugger` and `--MOZ_LOG`, each with one or two dashes, and the variables `MOZ_HEADLESS`,
+  `MOZ_MARIONETTE`, `MOZ_LOG` and `SSLKEYLOGFILE`: the same output, remote-control and log routes
+  as Chromium's.
 - JetBrains launchers (`idea`, `pycharm`, ..., Android Studio's `studio`): `installPlugins`, which
   installs a plugin from any repository; the plugin then runs in the IDE.
 - `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,

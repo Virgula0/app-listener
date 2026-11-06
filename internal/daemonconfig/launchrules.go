@@ -16,9 +16,12 @@ type LaunchRule struct {
 	Words []string
 	Env   string
 	Warn  bool
-	// Catalog only (no config syntax). RootOnly: a launch by any uid but 0 matches.
+	// Catalog only (no config syntax). RootOnly: a launch by any uid but 0 matches. Profile: a file
+	// name the browser creates or opens in the profile it runs on; doing so outside every guarded
+	// secret tree marks it for life (guard_trust.bpf.c trust_profile_anchor).
 	RootOnly bool
 	Short    *ShortOpts
+	Profile  string
 }
 
 // ShortOpts (catalog only): getopt letters refused anywhere in an option cluster before one of
@@ -36,8 +39,9 @@ const (
 )
 
 // Same reports whether r and o are the same rule.
-func (r LaunchRule) Same(o LaunchRule) bool {
-	return r.Path == o.Path && r.Env == o.Env && r.Warn == o.Warn && slices.Equal(r.Words, o.Words)
+func (r *LaunchRule) Same(o *LaunchRule) bool {
+	return r.Path == o.Path && r.Env == o.Env && r.Warn == o.Warn && r.Profile == o.Profile &&
+		slices.Equal(r.Words, o.Words)
 }
 
 // applyLaunchRule records `deny_args|warn_args <path> <word>...`, `deny_env|warn_env <path> <NAME>`
@@ -58,8 +62,10 @@ func applyLaunchRule(cfg *Config, line string, lineNo int) error {
 	if err != nil {
 		return fmt.Errorf("daemon config line %d: %w", lineNo, err)
 	}
-	if slices.ContainsFunc(cfg.LaunchRules, r.Same) {
-		return fmt.Errorf("daemon config line %d: duplicate launch rule", lineNo)
+	for i := range cfg.LaunchRules {
+		if cfg.LaunchRules[i].Same(&r) {
+			return fmt.Errorf("daemon config line %d: duplicate launch rule", lineNo)
+		}
 	}
 	argvRules := 0
 	for _, o := range cfg.LaunchRules {

@@ -218,6 +218,10 @@ func guardedMatch(p string, base *daemonconfig.Config) (*daemonconfig.Resource, 
 	}
 	for i := range base.Resources {
 		r := &base.Resources[i]
+		if r.NarrowOf != "" && (r == match || r.NarrowOf == p) {
+			// A recorded line would land in the parent's section, widening it, or miss the narrow.
+			return nil, fmt.Errorf("%s has a [narrow %s] section: edit daemon.conf by hand", p, r.Path)
+		}
 		if r == match {
 			continue
 		}

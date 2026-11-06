@@ -1116,8 +1116,8 @@ func TestCatalogLaunchRulesKeyedByWhitelistBasename(t *testing.T) {
 	}
 }
 
-// Extension loaders, and env and config flags that redirect an agent's token or load a config of
-// its caller's choosing.
+// Extension loaders, env and config flags that redirect an agent's token or load a config of its
+// caller's choosing, and a browser's headless and remote-control switches.
 func TestCatalogAgentLaunchRules(t *testing.T) {
 	has := func(name string, want daemonconfig.LaunchRule) bool {
 		return slices.ContainsFunc(CatalogLaunchRules(name), func(r daemonconfig.LaunchRule) bool {
@@ -1132,10 +1132,60 @@ func TestCatalogAgentLaunchRules(t *testing.T) {
 		"oc":       {deny("config", "view", "--raw")},
 		"rclone":   {deny("config", "show"), deny("config", "dump")},
 		"idea":     {deny("installPlugins")},
+		"firefox":  {deny("--headless"), deny("-headless"), deny("--remote-debugging-port"), {Env: "MOZ_HEADLESS"}},
 	} {
 		for _, want := range rules {
 			if !has(name, want) {
 				t.Errorf("%s has no deny rule %+v: %+v", name, want, CatalogLaunchRules(name))
+			}
+		}
+	}
+}
+
+// A Narrowed spec naming no whitelisted binary, or an event its line lacks, would silently grant less
+// than written (narrowAllow drops it).
+func TestCatalogNarrowedNameWhitelistedBinaries(t *testing.T) {
+	for i := range Catalog {
+		e := &Catalog[i]
+		for rel, spec := range e.Narrowed {
+			if filepath.IsAbs(rel) || filepath.Clean(rel) != rel || strings.HasPrefix(rel, "..") {
+				t.Errorf("%s: narrowed path %q is not a clean relative path", e.Name, rel)
+			}
+			for base, events := range spec {
+				found := false
+				for path, parent := range e.Whitelist {
+					if filepath.Base(path) != base {
+						continue
+					}
+					found = true
+					if _, ok := intersectEvents(parent, events); !ok || (len(parent) > 0 && len(events) == 0) {
+						t.Errorf("%s: %s in %s asks for more than %s may do", e.Name, base, rel, path)
+					}
+					for _, ev := range events {
+						if len(parent) > 0 && !slices.Contains(parent, ev) {
+							t.Errorf("%s: %s may not %s in the location", e.Name, base, ev)
+						}
+					}
+				}
+				if !found {
+					t.Errorf("%s: narrowed %s names %s, which the entry doesn't whitelist", e.Name, rel, base)
+				}
+			}
+		}
+	}
+}
+
+// Every browser's main binary carries its profile anchors: bare names that fit the kernel's key.
+func TestCatalogBrowserProfileAnchors(t *testing.T) {
+	for name, want := range map[string]string{"firefox": "user.js", "firefox-bin": "user.js", "chrome": "SingletonLock",
+		"chromium": "SingletonLock", "brave": "SingletonLock"} {
+		rules := CatalogLaunchRules(name)
+		if !slices.ContainsFunc(rules, func(r daemonconfig.LaunchRule) bool { return r.Profile == want }) {
+			t.Errorf("%s: no %s profile anchor", name, want)
+		}
+		for _, r := range rules {
+			if r.Profile != "" && (strings.ContainsRune(r.Profile, '/') || len(r.Profile) >= 64) {
+				t.Errorf("%s: anchor %q must be a file name under 64 bytes", name, r.Profile)
 			}
 		}
 	}

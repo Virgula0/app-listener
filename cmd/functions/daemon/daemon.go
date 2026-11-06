@@ -1068,7 +1068,7 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	// must exist before THIS guard attaches: once live, creating a dentry beside a single-file
 	// watch root is denied (fscrypt.EnsureRecoverySidecarPlaceholder, guard_path_rename
 	// destination-parent check). No-op for directories, and a daemon-made anchor is no vault.
-	if !r.Anchored() {
+	if !r.Anchored() && r.NarrowOf == "" {
 		if err := fscrypt.EnsureRecoverySidecarPlaceholder(r.Path); err != nil {
 			log.Warnf("daemon: could not pre-create the recovery sidecar for %s (%v) — "+
 				"a lock/unlock interrupted by a crash may not be recoverable", r.Path, err)
@@ -1106,6 +1106,9 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	}
 	if r.Port != 0 {
 		opts = append(opts, guard.WithPort(r.Port))
+	}
+	if r.NarrowOf != "" {
+		opts = append(opts, guard.WithNested())
 	}
 	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0, opts...)
 	if err != nil {
@@ -1185,7 +1188,8 @@ func buildGuards(resources []daemonconfig.Resource, pin pinCfg, vet *binaryVette
 
 // systemPatterns returns, per resource, its catalog entry's absolute whitelist patterns with the
 // events they grant: a new system binary matching one is admitted by the re-sync, no reload
-// (guard.WithSystemPatterns). A pattern naming an unknown event is dropped rather than widened.
+// (guard.WithSystemPatterns). A pattern naming an unknown event is dropped rather than widened. A
+// [narrow] gets none: its parent's patterns would widen it.
 func systemPatterns(resources []daemonconfig.Resource) [][]daemonconfig.BinaryRule {
 	out := make([][]daemonconfig.BinaryRule, len(resources))
 	users, err := install.ListUsers()
@@ -1195,7 +1199,7 @@ func systemPatterns(resources []daemonconfig.Resource) [][]daemonconfig.BinaryRu
 	}
 	for i := range resources {
 		entry, _ := install.ResolveCatalogEntry(resources[i].EncryptionRootOrPath(), users)
-		if entry == nil || resources[i].ReadOnly {
+		if entry == nil || resources[i].ReadOnly || resources[i].NarrowOf != "" {
 			continue
 		}
 		for _, r := range entry.SystemWhitelist() {
