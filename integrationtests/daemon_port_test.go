@@ -18,16 +18,17 @@ func (s *IntegrationSuite) TestDaemon_PortGuard() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
 
-	const port = "8332"
+	const port, portB = "8332", "8340"
 	s.exec(c, []string{"mkdir", "-p", "/exploits", "/etc/app-listener", "/watch"})
 	host := absPath("./exploits/inet_connect")
-	for _, name := range []string{"inet_connect", "inet_connect_ok", "inet_connect_srv"} {
+	for _, name := range []string{"inet_connect", "inet_connect_ok", "inet_connect_srv", "inet_connect_b"} {
 		s.Require().NoError(c.CopyFileToContainer(s.ctx, host, "/exploits/"+name, 0o755),
 			"copy %s (run make -C integrationtests/exploits)", name)
 	}
 	const always = "[watch /watch]\nneed_encryption: false\n/usr/bin/true\n"
 	conf := always + "\n[launch_rules]\ndeny_args /exploits/inet_connect_ok dumpprivkey\n\n" +
-		"[port tcp/" + port + "]\n/exploits/inet_connect_srv MKNOD\n/exploits/inet_connect_ok CONNECT\n"
+		"[port tcp/" + port + "]\n/exploits/inet_connect_srv MKNOD\n/exploits/inet_connect_ok CONNECT\n" +
+		"\n[port tcp/" + portB + "]\n/exploits/inet_connect_b CONNECT\n"
 	// The daemon self-guards /etc/app-listener: it runs on a copy the test can rewrite (the later
 	// --config wins); startDaemon's /etc one only feeds confirmConfigBinaries.
 	const liveConf = "/tmp/port-daemon.conf"
@@ -99,6 +100,9 @@ func (s *IntegrationSuite) TestDaemon_PortGuard() {
 			s.requirePortDenied(c, t, []string{"/exploits/inet_connect_ok", mode, "127.0.0.1", port, "/exploits/inet_connect"},
 				"inet_connect")
 		}
+		// An exe admitted to another guarded port names that port on a connection to this one.
+		s.requirePortDenied(c, t, []string{"/exploits/inet_connect_ok", "inheritsendto", "127.0.0.1", port,
+			"/exploits/inet_connect_b", portB}, "inet_connect_b")
 	})
 
 	s.reloadAndAwait(c)
