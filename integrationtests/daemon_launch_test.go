@@ -106,6 +106,14 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 		{"a tab-separated -javaagent after an allowed option", "JAVA_TOOL_OPTIONS=\"$(printf '%s\\t%s' -Xmx512m -javaagent:/tmp/a.jar)\"",
 			launchJava, nil},
 		{"JDK_JAVA_OPTIONS", "JDK_JAVA_OPTIONS=-Djava.class.path=/tmp", launchJava, nil},
+		// Chromium trims ASCII whitespace off each argument: still a switch.
+		{"a space before --load-extension", "", launchProbe, []string{"' --load-extension=/tmp/ext'"}},
+		{"a tab before --remote-debugging-port", "", launchProbe, []string{"\"$(printf '\\t--remote-debugging-port=9222')\""}},
+		{"--disable-extensions-except", "", launchProbe, []string{"--disable-extensions-except=/tmp/ext"}},
+		{"-load-apps", "", launchProbe, []string{"-load-apps=/tmp/app"}},
+		{"a JetBrains VM options file", "IDEA_VM_OPTIONS=/tmp/x.vmoptions", launchJava, nil},
+		{"NODE_EXTRA_CA_CERTS", "NODE_EXTRA_CA_CERTS=/tmp/ca.pem", launchProbe, nil},
+		{"NODE_TLS_REJECT_UNAUTHORIZED", "NODE_TLS_REJECT_UNAUTHORIZED=0", launchProbe, nil},
 	} {
 		out := s.launch(c, lc, "read", launchSecret)
 		s.Require().NotContainsf(out, launchMarker, "launched with %s, the runtime read its resource: %s\ndaemon log:\n%s",
