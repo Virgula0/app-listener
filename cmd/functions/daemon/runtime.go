@@ -206,6 +206,9 @@ func (s *loginServer) plantFound(uid uint32, path string) error {
 		return err
 	}
 	defer unix.Close(fd)
+	if err := onParentMount(userFd, fd); err != nil {
+		return err
+	}
 	if hasSentinel(fd) {
 		return nil
 	}
@@ -581,6 +584,10 @@ func makeRuntimeDir(userFd int, path string) (m madeDir, created bool, err error
 	if err != nil {
 		return madeDir{}, false, fmt.Errorf("opening %s: %w", path, err)
 	}
+	if err := onParentMount(userFd, fd); err != nil {
+		unix.Close(fd)
+		return madeDir{}, false, fmt.Errorf("%s: %w", path, err)
+	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		unix.Close(fd)
@@ -601,6 +608,26 @@ func makeRuntimeDir(userFd int, path string) (m madeDir, created bool, err error
 		return madeDir{}, false, fmt.Errorf("%s: %w", path, err)
 	}
 	return m, true, nil
+}
+
+// onParentMount refuses a directory fd that isn't on parentFd's mount: an openat crosses into a
+// mount over the name (a user's FUSE mount with allow_other), whose owner and sentinel it reports.
+func onParentMount(parentFd, fd int) error {
+	var p, d unix.Statx_t
+	const mask = unix.STATX_MNT_ID | unix.STATX_INO
+	if err := unix.Statx(parentFd, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW, mask, &p); err != nil {
+		return err
+	}
+	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW, mask, &d); err != nil {
+		return err
+	}
+	if p.Mask&unix.STATX_MNT_ID == 0 || d.Mask&unix.STATX_MNT_ID == 0 {
+		return errors.New("the kernel reports no mount id")
+	}
+	if p.Mnt_id != d.Mnt_id || p.Dev_major != d.Dev_major || p.Dev_minor != d.Dev_minor {
+		return errors.New("a mount over the name, not a directory in /run/user/<uid>")
+	}
+	return nil
 }
 
 func hasSentinel(dirFd int) bool {
