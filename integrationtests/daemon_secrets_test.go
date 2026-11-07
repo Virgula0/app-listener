@@ -195,7 +195,11 @@ func (s *IntegrationSuite) TestDaemon_SecretService() {
 		}
 		_, out = user("", "pkcs11-tool --module "+module+" --slot-index 1 --read-object --type secrkey "+
 			"--label 'probe gh:github.com' 2>&1")
-		s.Require().NotContainsf(out, ghToken, "the pkcs11 socket handed out the token: %s", out)
+		if strings.Contains(out, ghToken) {
+			_, state := s.exec(c, []string{"sh", "-c", "ls -lai " + keyringDir + "; grep keyring /proc/net/unix"})
+			s.Require().NotContainsf(out, ghToken, "the pkcs11 socket handed out the token: %s\n%s\n%s", out, state,
+				s.readDaemonLog(c))
+		}
 		s.requireSecretDenial(c, "CONNECT", "pkcs11-tool", keyringDir)
 	})
 

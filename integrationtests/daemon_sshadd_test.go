@@ -20,7 +20,7 @@ func (s *IntegrationSuite) TestDaemon_SSHKeyDisclosure() {
 		return s.exec(c, []string{"setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "sh", "-c", cmd})
 	}
 	code, out = s.exec(c, []string{"sh", "-c", "(id -u 1000 >/dev/null 2>&1 || useradd -u 1000 -m u1000) && " +
-		"mkdir -p /etc/app-listener /exploits"})
+		"mkdir -p /etc/app-listener /exploits /home/u1000 && chown 1000:1000 /home/u1000"})
 	s.Require().Equalf(0, code, "setup: %s", out)
 	code, out = asUser("mkdir -m 700 -p " + ssh + " && ssh-keygen -q -t ed25519 -N '' -f " + ssh + "/id_ed25519")
 	s.Require().Equalf(0, code, "keygen: %s", out)
@@ -42,7 +42,9 @@ func (s *IntegrationSuite) TestDaemon_SSHKeyDisclosure() {
 
 	code, out = asUser("SSH_AUTH_SOCK=/tmp/agent.sock ssh-add " + ssh + "/id_ed25519")
 	s.Require().NotEqualf(0, code, "ssh-add sent the key to an agent outside every guarded tree: %s", out)
-	s.Require().Containsf(strings.ToLower(out), "permission denied", "the connect must be refused: %s\n%s", out,
+	// unguarded_peer refuses with EPERM, a resource's whitelist with EACCES.
+	s.Require().Truef(strings.Contains(strings.ToLower(out), "operation not permitted") ||
+		strings.Contains(strings.ToLower(out), "permission denied"), "the connect must be refused: %s\n%s", out,
 		s.readDaemonLog(c))
 	s.requireDaemonDenial(c, "CONNECT", "ssh-add")
 
