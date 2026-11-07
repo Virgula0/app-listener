@@ -1718,7 +1718,8 @@ static __always_inline int short_bit(char c)
 }
 
 // argv_short judges buf as a getopt cluster: a short_deny letter before any short_arg one (whose
-// value the rest is) matches. Unanchored like the word rules: `ssh host ls -F` matches too.
+// value the rest is) matches. Unanchored like the word rules: `ssh host ls -F` matches too. getopt
+// reads a cluster to its end, so one longer than the scan's bound matches (fail closed).
 static __noinline void argv_short(struct launch_scan *s)
 {
 	if (!s->short_deny || s->buf[0] != '-' || s->buf[1] == '-')
@@ -1734,6 +1735,7 @@ static __noinline void argv_short(struct launch_scan *s)
 		if (s->short_arg & (1ULL << b))
 			return;
 	}
+	argv_matched(s, 0);
 }
 
 // argv_env judges an env string. ENV_OK is looked up first so the key a match reports is the NAME

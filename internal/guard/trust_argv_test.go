@@ -133,8 +133,11 @@ func shortHit(set GuardTrustArgvSet, word string) bool {
 		if set.ShortArg&m != 0 {
 			return false
 		}
+		if j == len(word)-1 {
+			return false
+		}
 	}
-	return false
+	return true
 }
 
 func TestShortMaskRefusesNonLetters(t *testing.T) {
