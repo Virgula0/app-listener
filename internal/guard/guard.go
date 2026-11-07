@@ -55,8 +55,8 @@ var ComputeBinaryEntry = ebpf.ComputeBinaryEntry
 type GuardEvent struct {
 	ebpf.FileEvent
 	Blocked bool
-	// FsGate labels a gate denial that names no resource (RawDeviceResourceLabel,
-	// BtrfsIoctlResourceLabel, ConfinedConnectResourceLabel); don't attribute it to a watched path.
+	// FsGate labels a gate denial that names no resource (RawDeviceResourceLabel, BtrfsIoctlResourceLabel,
+	// ConfinedConnectResourceLabel, AgentOnlyResourceLabel); don't attribute it to a watched path.
 	FsGate string
 	// Process names a process-gate denial ("PTRACE", "TRACED_EXEC", "PROC_MEM"): no file involved;
 	// Path is "pid=<n> comm=<name>" of the other task. Empty for path-keyed events.
@@ -112,6 +112,7 @@ const (
 	guardReasonPortAddr   = 6
 	guardReasonPortSMC    = 7
 	guardReasonConfined   = 8
+	guardReasonAgentOnly  = 9
 
 	guardReasonGateMask     = 0xff
 	guardReasonSuspectShift = 8
@@ -167,6 +168,8 @@ const (
 	BtrfsIoctlResourceLabel = "btrfs-ioctl"
 	// A ConnectConfinedNames binary's unix connect to a socket outside every guarded tree.
 	ConfinedConnectResourceLabel = "unguarded-socket"
+	// A non-AgentNames binary's use of the server end of a ConnectConfinedNames connection.
+	AgentOnlyResourceLabel = "agent-only-connection"
 )
 
 // fsGateLabel maps a filesystem-wide gate reason to its label; "" for every other event.
@@ -178,6 +181,8 @@ func fsGateLabel(reason uint32) string {
 		return BtrfsIoctlResourceLabel
 	case guardReasonConfined:
 		return ConfinedConnectResourceLabel
+	case guardReasonAgentOnly:
+		return AgentOnlyResourceLabel
 	default:
 		return ""
 	}

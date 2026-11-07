@@ -86,8 +86,9 @@ sending a datagram, or sending and receiving on a connection handed to another p
   can be run by any of your programs: the agents themselves, and systemd's user manager, which binds
   the GnuPG socket units and takes orders from `systemctl --user` and `systemd-run --user`. With the
   real agent stopped and its socket gone, a program can have one of them listen at the agent's name
-  for it. Clients then talk to that listener: it gets no key, but can show its own passphrase
-  prompt.
+  for it. Clients then talk to that listener: it can show its own passphrase prompt, and read what
+  `gpg` or `ssh` send it. What `ssh-add` sends (the key) only an agent program may read: see
+  [Agents as oracles](#secrets-served-over-ipc).
 - **Logins with no daemon running.** A runtime directory created then (by the agent's own unit) is
   guarded once the daemon starts, but may already hold sockets bound by any program.
 - **Abstract sockets** have no file and are never judged.
@@ -109,12 +110,17 @@ over a channel the guard doesn't see answers whoever asks:
   whitelisted client run by malware still asks on its behalf: `ssh-add -L`, `ssh` signing to a host
   of the attacker's choice, `gpg --decrypt`. `git credential fill`, run by anyone, prints what your
   credential helper (`store`, `cache`, libsecret, Git Credential Manager, `gh auth git-credential`)
-  hands back. `ssh-add` may reach only an agent whose socket is inside a guarded tree (the catalog's
-  `ssh-agent`, gcr and `gpg-agent` runtime sections, or one in a guarded directory): pointed at
-  any other socket it would send the key it read there. An agent started with `eval $(ssh-agent)`
-  listens in `/tmp`, so `ssh-add` is refused it (`DAEMON DENIED op=CONNECT comm=ssh-add
-  resource=unguarded-socket`). Its own user lookup is refused the same way, so for a user known only
-  to `sssd` or LDAP `ssh-add` fails (`nscd` is skipped, local users work).
+  hands back. `ssh-add` sends the key it read to whatever socket it is pointed at, so it may reach
+  only an agent: a socket inside a guarded tree (the catalog's `ssh-agent`, gcr and `gpg-agent`
+  runtime sections, or one in a guarded directory), whose connection only a whitelisted agent
+  program (`ssh-agent`, `gpg-agent`, `gcr-ssh-agent`, 1Password) may read or answer. An agent started
+  with `eval $(ssh-agent)` listens in `/tmp`, so `ssh-add` is refused it (`DAEMON DENIED op=CONNECT
+  comm=ssh-add resource=unguarded-socket`). A listener another program made inside the tree (a
+  socket unit systemd binds, an `ssh -L` forward) accepts the connection, but its reads are refused
+  (`resource=agent-only-connection`). Its own user lookup is refused the same way as `/tmp`, so for
+  a user known only to `sssd` or LDAP `ssh-add` fails (`nscd` is skipped, local users work). Any
+  `gpg-agent` counts as an agent, including one a program starts on a home directory of its own,
+  and `gpg-agent` hands its keys to any client that asks (see [Whitelisted programs that disclose on request](#whitelisted-programs-that-disclose-on-request)).
 - **Secret scopes.** The gate covers gnome-keyring's Secret Service only:
   - items no scope covers stay open to every program, as do item labels and attributes;
   - a whitelisted program run by malware still asks on its behalf (`gh auth token`);

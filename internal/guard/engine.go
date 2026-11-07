@@ -303,7 +303,7 @@ func (e *engine) startLocked() error {
 		e.stopLocked()
 		return err
 	}
-	if err := e.syncConnectConfinedLocked(); err != nil {
+	if err := e.syncUnixRolesLocked(); err != nil {
 		e.stopLocked()
 		return err
 	}

@@ -62,8 +62,10 @@
 #define GUARD_REASON_PORT_ADDR 6
 // An SMC socket bound to a [port] section's port: refused to everyone (see guard_socket_bind).
 #define GUARD_REASON_PORT_SMC 7
-// A guard_connect_confined exe's unix connect to a socket bound outside every guarded tree.
+// A UNIX_CONFINED exe's unix connect to a socket bound outside every guarded tree, or its datagram.
 #define GUARD_REASON_CONFINED 8
+// A non-UNIX_AGENT exe's use of the server end of a UNIX_CONFINED exe's connection.
+#define GUARD_REASON_AGENT_ONLY 9
 // Bits 8-15: the trust_code_suspect mark (SUSPECT_*) behind a whitelist denial, logged as PRELOADED /
 // LAUNCH: an LSM chain stops at the first denial, so when the guard runs first the trust object's
 // report never does. Its own byte keeps a gate's label (RAW_DEVICE, BTRFS_IOCTL) in bits 0-7.
@@ -1492,28 +1494,72 @@ static __always_inline int mark_conn(struct sock *sk, __u32 res, __u32 event)
 	return 0;
 }
 
-// guard_connect_confined: exe inodes (userspace's ConnectConfinedNames, held open so the number is
-// never reused) that may unix-connect only to a socket bound inside a guarded tree: ssh-add hands
-// the key it read to whatever agent SSH_AUTH_SOCK names.
+// guard_unix_roles: exe inodes (userspace's ConnectConfinedNames and AgentNames, held open so the
+// number is never reused). A UNIX_CONFINED exe (ssh-add hands the key it read to whatever agent
+// SSH_AUTH_SOCK names) may unix-connect only to a socket bound inside a guarded tree, and only a
+// UNIX_AGENT exe may use the server end: a whitelisted binder (systemd binding a user's socket
+// unit) is no agent, nor whatever it hands the connection to.
+#define UNIX_CONFINED 1
+#define UNIX_AGENT 2
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 64);
 	__type(key, struct inode_key);
 	__type(value, __u8);
-} guard_connect_confined SEC(".maps");
+} guard_unix_roles SEC(".maps");
+
+// guard_agent_conns: the server end of a UNIX_CONFINED exe's connection, tagged at connect, before
+// the listener can accept it.
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, __u8);
+} guard_agent_conns SEC(".maps");
+
+static __always_inline __u8 current_unix_role(void)
+{
+	struct inode_key ik = {};
+	if (!get_current_exe_inode(&ik))
+		return 0;
+	__u8 *r = bpf_map_lookup_elem(&guard_unix_roles, &ik);
+	return r ? *r : 0;
+}
 
 // unguarded_peer: sk reaches a socket outside every guarded tree (or an abstract or unbound one).
 // Out of line: one body for both unix hooks.
 static __noinline int unguarded_peer(void)
 {
-	struct inode_key ik = {};
-	if (!get_current_exe_inode(&ik) || !bpf_map_lookup_elem(&guard_connect_confined, &ik))
+	if (!(current_unix_role() & UNIX_CONFINED))
 		return 0;
 	return emit_process_denial(GUARD_REASON_CONFINED, EVENT_CONNECT, NULL, 0, 0, GUARD_RES_GLOBAL);
 }
 
-// judge_unix_connect judges sk reaching peer's bound socket and marks sk on admission.
-static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock *sk, struct sock *peer)
+// confine_peer tags newsk, a UNIX_CONFINED exe's connection's server end, for agents only. No newsk
+// (a datagram) or no storage: refused.
+static __noinline int confine_peer(struct sock *newsk)
+{
+	if (!(current_unix_role() & UNIX_CONFINED))
+		return 0;
+	__u8 *t = newsk ? bpf_sk_storage_get(&guard_agent_conns, newsk, 0, BPF_SK_STORAGE_GET_F_CREATE) : NULL;
+	if (!t)
+		return emit_process_denial(GUARD_REASON_CONFINED, EVENT_CONNECT, NULL, 0, 0, GUARD_RES_GLOBAL);
+	*t = 1;
+	return 0;
+}
+
+// agent_only_use refuses a non-agent's use of a tagged server end.
+static __noinline int agent_only_use(struct sock *sk)
+{
+	if (!sk || !bpf_sk_storage_get(&guard_agent_conns, sk, 0, 0) || (current_unix_role() & UNIX_AGENT))
+		return 0;
+	return emit_process_denial(GUARD_REASON_AGENT_ONLY, EVENT_CONNECT, NULL, 0, 0, GUARD_RES_GLOBAL);
+}
+
+// judge_unix_connect judges sk reaching peer's bound socket (newsk: the server end a stream connect
+// queues, NULL for a datagram) and marks sk on admission.
+static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock *sk, struct sock *peer,
+					      struct sock *newsk)
 {
 	__u32 res = GUARD_RES_NONE;
 	struct dentry *dentry = NULL;
@@ -1529,7 +1575,10 @@ static __always_inline int judge_unix_connect(struct emit_args *ea, struct sock 
 	int ret = check_and_emit(EVENT_CONNECT, dentry, NULL, false, NULL, false, false, res);
 	if (ret)
 		return ret;
-	return mark_conn(sk, res, EVENT_CONNECT);
+	ret = mark_conn(sk, res, EVENT_CONNECT);
+	if (ret)
+		return ret;
+	return confine_peer(newsk);
 }
 
 static __noinline __u32 unmarked_port_res(struct sock *sk); // the loopback-port section below
@@ -1544,6 +1593,8 @@ static __always_inline int judge_conn_use(struct emit_args *ea, struct sock *sk)
 	struct dentry *dentry = NULL;
 	if (!sk)
 		return 0;
+	if (agent_only_use(sk))
+		return -EPERM;
 	struct conn_mark *c = bpf_sk_storage_get(&guard_conns, sk, 0, 0);
 	__u32 res = GUARD_RES_GLOBAL;
 	__u32 event = EVENT_MKNOD;
@@ -2776,7 +2827,7 @@ int guard_unix_stream_connect(unsigned long long *ctx)
 	int ret = note_bus_connect((struct sock *)ctx[0], (struct sock *)ctx[1], (struct sock *)ctx[2]);
 	if (ret)
 		return ret;
-	return judge_unix_connect(&ea_buf, (struct sock *)ctx[0], (struct sock *)ctx[1]);
+	return judge_unix_connect(&ea_buf, (struct sock *)ctx[0], (struct sock *)ctx[1], (struct sock *)ctx[2]);
 }
 
 // Every datagram send, connected or not (seqpacket goes through unix_stream_connect).
@@ -2789,7 +2840,7 @@ int guard_unix_may_send(unsigned long long *ctx)
 	struct sock *peer = NULL;
 	if (other)
 		bpf_probe_read_kernel(&peer, sizeof(peer), &other->sk);
-	return judge_unix_connect(&ea_buf, sock->sk, peer);
+	return judge_unix_connect(&ea_buf, sock->sk, peer, NULL);
 }
 
 SEC("lsm/socket_connect")
