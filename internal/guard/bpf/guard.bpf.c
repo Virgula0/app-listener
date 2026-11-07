@@ -769,8 +769,8 @@ static __always_inline void add_inode_to_guard(struct inode *inode, __u32 res_id
 }
 
 // note_root_moved records a watch root among src and victim in guard_root_moved. Called only on an
-// allowed rename (the moved inode and the displaced victim) or an allowed final unlink/rmdir, before
-// the row that names its resource is evicted. Out of line: one small body after the decision.
+// allowed rename (the moved inode and the displaced victim) or an allowed final unlink/rmdir. Out of
+// line: one small body after the decision.
 static __noinline int note_root_moved(struct inode *src, struct inode *victim)
 {
 	for (int i = 0; i < 2; i++) {
@@ -782,25 +782,6 @@ static __noinline int note_root_moved(struct inode *src, struct inode *victim)
 		bpf_map_update_elem(&guard_root_moved, &res, &ikey, BPF_ANY);
 	}
 	return 0;
-}
-
-// Evict an inode from guard_inodes when path_unlink/path_rmdir lets a delete through: the kernel
-// frees the inode right after, and its number can go to an unrelated file. Evicting now (not
-// waiting for ReconcileInodes, up to inodeGCEvery ~1h) closes that window. A miss (never a member)
-// is silent.
-static __always_inline void evict_inode_from_guard(struct inode *inode)
-{
-	if (!inode)
-		return;
-	// A deleted root is released like a renamed one: inode_free_security can no longer zero its
-	// anchor once the row naming its resource is gone.
-	note_root_moved(inode, NULL);
-
-	struct inode_key ikey = {};
-	bpf_probe_read_kernel(&ikey.ino, sizeof(ikey.ino), &inode->i_ino);
-	ikey.dev = inode_dev((__u64)inode);
-
-	bpf_map_delete_elem(&guard_inodes, &ikey);
 }
 
 // Returns the tainted target pid if dentry is /proc/<pid>/mem of one, else 0. Needed explicitly:
@@ -1945,15 +1926,12 @@ int guard_path_unlink(unsigned long long *ctx)
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 
-	// Captured up front: guarded_map_hit already computes this, and reusing it lets the single
-	// evict-on-allow at the bottom skip a second guard_inodes lookup.
+	// Captured up front: gates the root-moved note at the bottom.
 	__u32 ires = GUARD_RES_NONE;
 	bool inode_was_guarded = read_inode_guard(inode, &ires);
 
-	// i_nlink in this pre-hook is the count BEFORE the unlink: 1 = last name, inode about to be
-	// freed; more = another hardlink survives at this exact (dev, ino). guard_inodes is keyed on
-	// (dev, ino) alone, so the entry also protects surviving names; evicting on a non-final unlink
-	// would strip them until the next re-scan.
+	// i_nlink in this pre-hook is the count BEFORE the unlink: 1 = last name; more = another
+	// hardlink survives at this exact (dev, ino), so a root unlinked by one name is not released.
 	unsigned int nlink = 0;
 	if (inode)
 		bpf_probe_read_kernel(&nlink, sizeof(nlink), &inode->i_nlink);
@@ -1974,10 +1952,9 @@ int guard_path_unlink(unsigned long long *ctx)
 		ret = 0;
 	}
 
-	// Delete is going through (never on a denied one): evict the inode now rather than wait for the
-	// periodic sweep (see evict_inode_from_guard). Final link only, per the nlink note.
+	// The row stays, as in path_rmdir: may_delete (immutable, sticky) and EBUSY come after this hook.
 	if (ret == 0 && inode_was_guarded && nlink <= 1)
-		evict_inode_from_guard(inode);
+		note_root_moved(inode, NULL);
 	return ret;
 }
 
@@ -2473,8 +2450,6 @@ int guard_path_rmdir(unsigned long long *ctx)
 	if (!dentry)
 		return 0;
 
-	// rmdir only succeeds on an EMPTY directory, so evicting this dentry's own entry on allow is
-	// complete: descendants were each evicted by their own unlink/rmdir.
 	struct inode *inode;
 	bpf_probe_read_kernel(&inode, sizeof(inode), &dentry->d_inode);
 	__u32 ires = GUARD_RES_NONE;
@@ -2497,8 +2472,10 @@ int guard_path_rmdir(unsigned long long *ctx)
 		ret = 0;
 	}
 
+	// Allowed is not done: ENOTEMPTY and may_delete come after this hook, so the row stays (a
+	// non-empty root that lost it would take unguarded files) and guard_inode_free drops it.
 	if (ret == 0 && inode_was_guarded)
-		evict_inode_from_guard(inode);
+		note_root_moved(inode, NULL);
 	return ret;
 }
 
@@ -3214,8 +3191,8 @@ int guard_bprm_check_security(unsigned long long *ctx)
 
 // guard_inode_free forgets an inode the moment the kernel destroys a DELETED file. guard_inodes is
 // keyed on (dev, ino) and filesystems recycle inode numbers, so a stale entry eventually matches an
-// unrelated file. unlink/rmdir evict on the final link, but a rename OVER a tracked file frees the
-// victim with no unlink (how apps save, e.g. Steam's registry.vdf). Waiting for the hourly
+// unrelated file. It is the only eviction of a deleted file (unlink, rmdir, a rename OVER it): the
+// delete hooks run before the kernel can still refuse the delete. Waiting for the hourly
 // ReconcileInodes caused false DENYs: past root_in_chain's bounded walk a collision fails closed,
 // and a recycled watch-root number exact-matched the root.
 //

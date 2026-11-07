@@ -2212,7 +2212,7 @@ func (s *IntegrationSuite) TestDaemon_StaleRootInode_File_RecreatedRootReguarded
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 }
 
-// The guard_path_unlink eviction fix is tested at guard level
+// Deleted-inode eviction (guard_inode_free) is tested at guard level
 // (TestGuard_PathUnlinkEvictsInodeImmediately, TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode in
 // integrationtests/guard_test.go, with the TestGuard_InodeReuse_* family).
 

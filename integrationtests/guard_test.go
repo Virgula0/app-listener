@@ -353,8 +353,9 @@ func (s *IntegrationSuite) TestGuard_InodeReuse_StaleDir_DeepDestRename() {
 // Regression for the Steam/Docker-overlay false-DENY: deleting a tracked file used to leave its
 // (dev, ino) in guard_inodes until the next ReconcileInodes (up to inodeGCEvery, 1h), a window in
 // which the freed number could go to an unrelated file and be denied by root_in_chain's fail-closed
-// handling of a too-deep chain (see the InodeReuse tests). guard_path_unlink now evicts in the same
-// hook call that allows the delete, no sweep involved.
+// handling of a too-deep chain (see the InodeReuse tests). guard_inode_free evicts it when the unlink
+// frees the inode, before rm returns, no sweep involved (the delete hooks can't: the kernel may
+// still refuse the delete after them, TestDaemon_FailedRmdirKeepsRootGuarded).
 //
 // Eviction is asserted by querying guard_inodes with bpftool (dir counterpart:
 // PathRmdirEvictsInodeImmediately; hard-link case: PathUnlinkKeepsGuardOnSurvivingHardlink).
@@ -485,8 +486,8 @@ func le64HexKey(devDecimal, inoDecimal string) (string, error) {
 	return strings.Join(parts, " "), nil
 }
 
-// Directory counterpart of PathUnlinkEvictsInodeImmediately: guard_path_rmdir must evict a removed
-// directory's guard_inodes entry in the same hook call, closing the same staleness window.
+// Directory counterpart of PathUnlinkEvictsInodeImmediately: a removed directory's guard_inodes
+// entry must be gone when rmdir returns, closing the same staleness window.
 //
 // Not provable black-box like the file case: Linux refuses to hard-link a directory (EPERM), and a
 // bind-mounted second reference to a rmdir'd directory keeps (dev, ino) but is dead (creating
