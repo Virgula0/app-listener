@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -655,7 +654,9 @@ func (s *IntegrationSuite) TestDaemon_LaunchRulesMergedOrRefused() {
 	_, out = s.exec(c, []string{"sh", "-c", tool + " read " + launchSecret + " 2>&1"})
 	s.Require().Containsf(out, "STOLEN|"+launchMarker, "a clean launch must read: %s", out)
 	s.Require().NotContains(s.readDaemonLog(c), "is not a whitelisted binary")
-	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon'; sleep 2"})
+	// A running daemon guards /etc/app-listener read-only: the next config lands only once it is gone.
+	s.sigDaemon(c, "TERM")
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "the first daemon did not exit")
 
 	// The catalog gives gpg 6 argv rules: 11 more lines are 17, one over the slots.
 	var rules strings.Builder
@@ -671,12 +672,23 @@ func (s *IntegrationSuite) TestDaemon_LaunchRulesMergedOrRefused() {
 	s.Require().Containsf(out, "argv rules", "the refusal must name the rule cap: %s", out)
 	s.Require().NotContainsf(out, "guarding: /protected", "no guard may attach: %s", out)
 
-	// A reload onto that config keeps the running one, with its rules.
-	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+gpg)
-	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + conf + "\nEOF"})
-	s.confirmConfigBinaries(c)
+	// A reload onto that config keeps the running one, with its rules. The config lives outside the
+	// self-guarded /etc/app-listener so the test can rewrite it under the running daemon.
+	const cfg = "/tmp/launch-rules.conf"
+	writeCfg := func(body string) {
+		code, out := s.exec(c, []string{"sh", "-c", "cat > " + cfg + " <<'EOF'\n" + body + "\nEOF"})
+		s.Require().Equalf(0, code, "writing %s: %s", cfg, out)
+	}
+	writeCfg("[watch /protected]\nneed_encryption: false\n" + gpg)
+	code, out = s.exec(c, []string{"sh", "-c", "nohup /app-listener daemon --config " + cfg +
+		" --headless > /tmp/daemon.log 2>&1 &"})
+	s.Require().Equalf(0, code, "starting daemon: %s", out)
+	s.awaitDaemonUp(c, "[watch /protected]")
+	writeCfg(conf)
 	s.exec(c, []string{"sh", "-c", "pkill -HUP -f 'app-listener daemon'"})
-	s.Require().Truef(s.awaitLog(c, "argv rules", 30*time.Second), "the reload must be refused:\n%s", s.readDaemonLog(c))
+	s.Require().Truef(s.awaitLog(c, reloadRefused, daemonShutdownTimeout), "the reload must be refused:\n%s",
+		s.readDaemonLog(c))
+	s.Require().Contains(s.readDaemonLog(c), "argv rules", "the refusal must name the rule cap")
 	_, out = s.exec(c, []string{"sh", "-c", gpg + " --export-secret-keys read " + launchSecret + " 2>&1"})
 	s.Require().NotContainsf(out, launchMarker, "the running config lost its rules\ndaemon log:\n%s", s.readDaemonLog(c))
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
