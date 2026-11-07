@@ -45,7 +45,7 @@ sudo ./build/linux/app-listener install
 `make build` dumps `vmlinux.h` from the host BTF, regenerates the BPF bindings and builds
 `build/linux/app-listener`. Nothing but Docker is needed on the host.
 
-Without Docker, install a recent clang/LLVM, `bpftool`, Go 1.26+ and GCC, then run
+Without Docker, install a recent clang/LLVM, `bpftool`, Go 1.27+ and GCC, then run
 `make build-host`. Builds are native only: build arm64 on an arm64 host. See
 [Development](development.md) for every target.
 

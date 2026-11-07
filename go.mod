@@ -1,8 +1,8 @@
 module github.com/Virgula0/app-listener
 
-go 1.26.3
+go 1.27
 
-toolchain go1.26.10
+toolchain go1.27.3
 
 require (
 	fyne.io/fyne/v2 v2.8.0

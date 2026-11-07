@@ -13,7 +13,7 @@ import (
 	"crypto/x509"
 	"debug/elf"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -518,7 +518,7 @@ func fetchReleases(apiBase, repo string, client *http.Client) ([]githubRelease, 
 		return nil, fmt.Errorf("listing releases from %s: HTTP %d: %s", repo, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var releases []githubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &releases); err != nil {
 		return nil, fmt.Errorf("decoding releases of %s: %w", repo, err)
 	}
 	return releases, nil
@@ -833,7 +833,7 @@ func fetchRelease(apiBase, repo, tag string, client *http.Client) (githubRelease
 			strings.TrimSpace(string(body)))
 	}
 	var r githubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &r); err != nil {
 		return githubRelease{}, fmt.Errorf("decoding release %s: %w", tag, err)
 	}
 	if r.TagName != tag {

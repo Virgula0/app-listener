@@ -2,7 +2,7 @@
 # tools needed to regenerate BPF bindings and compile the Go binary live
 # here — the source is mounted read-write at build time, so this image is
 # intentionally free of any COPY of the repository.
-FROM golang:1.26-bookworm
+FROM golang:1.27-bookworm
 
 # BPF code generation is highly sensitive to the clang version: Debian
 # bookworm's stock clang 14 emits a `guard_path_rename` that overflows the

@@ -8,7 +8,7 @@ import (
 	"crypto/x509"
 	"debug/elf"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -211,7 +211,7 @@ func TestFetchReleases(t *testing.T) {
 			t.Errorf("unexpected User-Agent %q", r.Header.Get("User-Agent"))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(releases)
+		_ = json.MarshalWrite(w, releases)
 	}))
 	defer srv.Close()
 
@@ -602,9 +602,9 @@ func TestFetchReleaseByTag(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/owner/repo/releases/tags/v1.2.3":
-			_ = json.NewEncoder(w).Encode(githubRelease{TagName: "v1.2.3"})
+			_ = json.MarshalWrite(w, githubRelease{TagName: "v1.2.3"})
 		case "/repos/owner/repo/releases/tags/v9.9.9":
-			_ = json.NewEncoder(w).Encode(githubRelease{TagName: "v1.0.0"})
+			_ = json.MarshalWrite(w, githubRelease{TagName: "v1.0.0"})
 		default:
 			http.NotFound(w, r)
 		}
