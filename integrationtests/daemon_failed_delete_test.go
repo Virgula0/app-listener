@@ -1,5 +1,7 @@
 package integrationtests
 
+import "strings"
+
 // The guard's delete hooks run before the kernel's own checks, so a delete the guard allows can
 // still fail and leave the inode in place: it must stay guarded. A whitelisted app's cleanup rmdir of
 // its own non-empty root (gnome-keyring at exit) must not let anyone else create files in it.
@@ -33,13 +35,15 @@ func (s *IntegrationSuite) TestDaemon_FailedUnlinkKeepsFileRootGuarded() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
 	defer c.Terminate(s.ctx)
 
-	// FS_IOC_SETFLAGS (_IOW('f', 2, long)) with FS_IMMUTABLE_FL; tmpfs takes it since 6.0.
+	// FS_IOC_SETFLAGS (_IOW('f', 2, long)) with FS_IMMUTABLE_FL; tmpfs takes it since 6.0. perl's
+	// ioctl needs a writable buffer: a bare pack() dies before the syscall.
 	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /fw /etc/app-listener && mount -t tmpfs tmpfs /fw && " +
 		"echo SECRET-file-root > /fw/key && perl -e 'open F, \"<\", \"/fw/key\" or die $!; " +
-		"ioctl(F, 0x40086602, pack(\"l!\", 0x10)) or die \"setflags: $!\\n\"' 2>&1"})
-	if code != 0 {
-		s.T().Skipf("immutable flag unavailable: %s", out)
+		"my $f = pack(\"l!\", 0x10); ioctl(F, 0x40086602, $f) or die \"setflags: $!\\n\"' 2>&1"})
+	if code != 0 && strings.Contains(out, "Inappropriate ioctl") {
+		s.T().Skipf("this kernel's tmpfs has no immutable flag: %s", out)
 	}
+	s.Require().Equalf(0, code, "setup: %s", out)
 	s.startDaemon(c, "[watch /fw/key]\nneed_encryption: false\n/usr/bin/perl\n")
 
 	_, out = s.exec(c, []string{"perl", "-e", `unlink "/fw/key" and exit 0; print "unlink: $!\n"; exit 1`})
