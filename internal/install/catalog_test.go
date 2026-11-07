@@ -254,28 +254,23 @@ func TestRuntimeEntriesNeverDeleteRoot(t *testing.T) {
 	}
 }
 
-// docker-buildx (CLI plugin at /usr/lib/docker/cli-plugins) must be whitelisted in both .kube and
-// .docker entries: it reads ~/.kube/config (kubernetes driver) and ~/.docker/config.json plus the
-// buildx store (buildx/.lock, instance state). Otherwise every docker buildx invocation is denied
-// while the dirs are guarded.
-func TestBuildxWhitelistedInKubeAndDocker(t *testing.T) {
+// docker-buildx (CLI plugin at /usr/lib/docker/cli-plugins) must be whitelisted on .kube: it reads
+// ~/.kube/config for the kubernetes driver. Otherwise every docker buildx invocation is denied
+// while .kube is guarded. (~/.docker itself is deliberately not in the catalog; see catalog.go.)
+func TestBuildxWhitelistedInKube(t *testing.T) {
 	const buildx = "/usr/lib/docker/cli-plugins/docker-buildx"
-	seen := map[string]bool{}
+	seen := false
 	for i := range Catalog {
-		for _, rel := range Catalog[i].RelPaths {
-			if rel != ".kube" && rel != ".docker" {
-				continue
-			}
-			if _, ok := Catalog[i].Whitelist[buildx]; !ok {
-				t.Errorf("%s entry does not whitelist docker-buildx", rel)
-			}
-			seen[rel] = true
+		if !slices.Contains(Catalog[i].RelPaths, ".kube") {
+			continue
 		}
+		if _, ok := Catalog[i].Whitelist[buildx]; !ok {
+			t.Error(".kube entry does not whitelist docker-buildx")
+		}
+		seen = true
 	}
-	for _, rel := range []string{".kube", ".docker"} {
-		if !seen[rel] {
-			t.Errorf("%s entry not found in catalog", rel)
-		}
+	if !seen {
+		t.Error(".kube entry not found in catalog")
 	}
 }
 

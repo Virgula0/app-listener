@@ -7,7 +7,7 @@ catalog (`internal/install/catalog.go`) of sensitive directories with a ready-ma
 each, and offers the ones that exist on your host. It covers, among others:
 
 - **Keys and credentials:** SSH, GnuPG (and the `ssh-agent`, gcr `ssh` and `gpg-agent` sockets in
-  `/run/user/<uid>`, guarded as [runtime sections](config-reference.md#runtime)), age, AWS, Google Cloud, Azure, Kubernetes, Docker,
+  `/run/user/<uid>`, guarded as [runtime sections](config-reference.md#runtime)), AWS, Google Cloud, Azure, Kubernetes,
   GitHub CLI, adb keys, rclone, pip
 - **AI agents and editors:** Claude Code, Gemini CLI and Antigravity (CLI, 2.0 and IDE), OpenAI
   Codex CLI, pi, opencode, Codeium, Cursor, GitHub Copilot (and Copilot CLI), VS Code (and Insiders, server, VSCodium), JetBrains IDEs, Zed, Sublime Text
@@ -49,9 +49,8 @@ with the catalog, never in the guard. Add your own in
   Chromium browsers only, on gnome-keyring. Codex's keyring mode also caches its token in the
   session's kernel keyring, which no scope covers: keep `cli_auth_credentials_store = "file"` (the
   default) and the guarded `auth.json`. `install catalog refresh` leaves secret sections as written. The installer
-  says when `gh` or `docker` could keep the token in their guarded file instead
-  (`gh auth login --insecure-storage`; no `credsStore` in `~/.docker/config.json`), and names your
-  git credential helper.
+  says when `gh` could keep the token in its guarded file instead
+  (`gh auth login --insecure-storage`), and names your git credential helper.
 - **Script launchers.** A `#!` script runs as its interpreter, so a whitelist line naming one never
   matches, and the app is denied like any other program. Google Cloud SDK, Azure CLI, pip, Electrum
   and ProtonVPN are Python apps, and Gemini CLI and pi (from npm or pi's installer) are Node apps:

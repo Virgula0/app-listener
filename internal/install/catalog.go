@@ -607,11 +607,11 @@ var Catalog = []CandidateDir{
 		LaunchRules: map[string][]daemonconfig.LaunchRule{
 			"kubectl": {deny("config", "view", "--raw")}, "oc": {deny("config", "view", "--raw")},
 		}},
-	{Name: "Docker config and credentials", RelPaths: []string{".docker"},
-		Whitelist: map[string][]string{"/usr/bin/docker": nil, "/usr/bin/docker-credential-desktop": nil, "/usr/bin/docker-credential-pass": nil,
-			"/usr/lib/docker/cli-plugins/docker-buildx":     nil,
-			"/usr/libexec/docker/cli-plugins/docker-buildx": nil,
-			"%HOME%/.docker/cli-plugins/docker-buildx":      nil}},
+	// No ~/.docker entry: docker reads config.json as its ordinary job, so whitelisting docker to
+	// guard it hands the registry logins to anyone who can run docker, and no launch rule can fix a
+	// file processor whose legitimate read IS the secret. Keep the logins in the keyring instead
+	// (credsStore=secretservice, which a [secret_service] scope can gate). docker-buildx stays
+	// whitelisted on ~/.kube (it reads the kubeconfig) but nothing guards ~/.docker now.
 	{Name: "GitHub CLI", RelPaths: []string{".config/gh"},
 		Whitelist: map[string][]string{
 			"/usr/bin/gh":                       nil,
@@ -662,8 +662,10 @@ var Catalog = []CandidateDir{
 		// ssh and ssh-add only talk to the SSH agent socket (IdentityAgent ~/.1password/agent.sock).
 		Whitelist: map[string][]string{"/usr/bin/1password": nil, "/usr/bin/op": nil, "/usr/local/bin/op": nil,
 			"/usr/bin/ssh": {"CONNECT"}, "/usr/bin/ssh-add": {"CONNECT"}}},
-	{Name: "age keys", RelPaths: []string{".config/age"},
-		Whitelist: map[string][]string{"/usr/bin/age": nil, "/usr/bin/age-keygen": nil}},
+	// No ~/.config/age entry: age decrypts with the identity it reads, and `age -e -r <recipient>`
+	// re-encrypts that identity to any key the caller names, so whitelisting age to guard the keys
+	// discloses them to anyone who can run age. A file processor whose legitimate read is the secret
+	// can't be both whitelisted and protected; no launch rule closes it.
 	{Name: "KeePassXC", RelPaths: []string{".local/share/keepassxc"},
 		Whitelist: map[string][]string{"/usr/bin/keepassxc": nil}},
 	{Name: "GNOME keyring", RelPaths: []string{".local/share/keyrings", ".keyring"},

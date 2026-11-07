@@ -32,6 +32,24 @@ dump, never the copy:
 - `rclone`: `config show` and `config dump` are refused, but `rclone cat <rclone.conf>` prints it.
   Set a config password (`rclone config encryption set`) to keep it encrypted at rest.
 
+When a tool's whole job is to read the secret it holds, guarding the directory and whitelisting the
+tool protects nothing: whoever can run the tool reads the secret through it, and no launch rule
+closes that. Such entries are deliberately left out of the catalog rather than offered with a false
+sense of protection:
+
+- **`docker`** (`~/.docker`): docker reads `config.json` on every command, so it would disclose the
+  registry logins on request. Keep them in the Secret Service keyring (`credsStore` set to a keyring
+  helper) and gate that with a [secret scope](config-reference.md#secret-name), or use short-lived
+  tokens.
+- **`age`** (`~/.config/age`): `age -d` decrypts with the identity it reads, and `age -e -r
+  <recipient>` re-encrypts that identity to any key the caller names. A file guard cannot stop age
+  from handing out the key it is meant to use.
+
+Python- and Node-launched tools are the opposite case: because a `#!` script runs as its
+interpreter, a whitelist line naming the tool never matches, so the directory is locked against
+everyone, the tool included. The entry protects the files but the app can't use them while guarded
+(see [Script launchers](catalog.md#what-an-entry-cant-cover)).
+
 A browser shows any file it can read, its own profile included: `brave --headless --dump-dom
 file://<profile file>` prints it, and `firefox --screenshot` renders it into an image. Headless,
 remote-control and logging launches of a browser therefore run without its profile

@@ -1,7 +1,6 @@
 package install
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,9 +15,6 @@ import (
 )
 
 const ipcDoc = "docs/limitations.md#secrets-served-over-ipc"
-
-// keyringCredHelpers are docker credential helpers backed by the Secret Service keyring.
-var keyringCredHelpers = []string{"secretservice", "desktop"}
 
 // SecretStoreNotes lists u's tokens kept where the guard can't judge the caller: the Secret Service
 // keyring, or a git credential helper, both answering any of u's programs. A file-storage hint is
@@ -35,14 +31,8 @@ func SecretStoreNotes(cfg *daemonconfig.Config, u User) []string {
 				"`gh auth login --insecure-storage` moves it to the guarded ~/.config/gh/hosts.yml")
 		}
 	}
-	dockerDir := filepath.Join(u.Home, ".docker")
-	if PathCovered(dockerDir, covered) {
-		if helper := dockerKeyringHelper(filepath.Join(dockerDir, "config.json"), u.UID); helper != "" {
-			notes = append(notes, fmt.Sprintf("docker keeps registry logins in the keyring "+
-				"(docker-credential-%s): drop credsStore/credHelpers from ~/.docker/config.json and log in "+
-				"again to keep them in the guarded file", helper))
-		}
-	}
+	// No ~/.docker note: guarding that directory is not offered (docker discloses config.json on
+	// request, see catalog.go), so there is no guarded file to move registry logins into.
 	if helpers := gitCredentialHelpers(u); len(helpers) > 0 {
 		notes = append(notes, fmt.Sprintf("git's credential helper (%s) answers `git credential fill` "+
 			"for any of your programs; no file guard changes that", strings.Join(helpers, ", ")))
@@ -57,29 +47,6 @@ func WarnSecretStores(cfg *daemonconfig.Config, users []User) {
 			log.Warnf("%s: %s (%s)", users[i].Name, n, ipcDoc)
 		}
 	}
-}
-
-func dockerKeyringHelper(path string, uid uint32) string {
-	text, err := readOwnedRegular(path, uid)
-	if err != nil {
-		return ""
-	}
-	var conf struct {
-		CredsStore  string            `json:"credsStore"`
-		CredHelpers map[string]string `json:"credHelpers"`
-	}
-	if json.Unmarshal([]byte(text), &conf) != nil {
-		return ""
-	}
-	if slices.Contains(keyringCredHelpers, conf.CredsStore) {
-		return conf.CredsStore
-	}
-	for _, h := range conf.CredHelpers {
-		if slices.Contains(keyringCredHelpers, h) {
-			return h
-		}
-	}
-	return ""
 }
 
 // gitCredentialHelpers lists the `helper` values of every [credential] section in u's global git

@@ -21,17 +21,15 @@ func TestSecretStoreNotes(t *testing.T) {
 		}
 	}
 	write(".config/gh/hosts.yml", "github.com:\n    users:\n        alice:\n    user: alice\n")
-	write(".docker/config.json", `{"auths":{"ghcr.io":{}},"credsStore":"secretservice"}`)
 	write(".gitconfig", "[user]\n\thelper = nope\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n"+
 		"[credential]\n\thelper = libsecret\n")
 	u := User{Name: "alice", Home: home, UID: uint32(os.Getuid())}
 	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
-		{Path: filepath.Join(home, ".config/gh")}, {Path: filepath.Join(home, ".docker")},
+		{Path: filepath.Join(home, ".config/gh")},
 	}}
 
 	notes := strings.Join(SecretStoreNotes(cfg, u), "\n")
-	for _, want := range []string{"--insecure-storage", "docker-credential-secretservice",
-		"(!gh auth git-credential, libsecret)"} {
+	for _, want := range []string{"--insecure-storage", "(!gh auth git-credential, libsecret)"} {
 		if !strings.Contains(notes, want) {
 			t.Errorf("notes miss %q:\n%s", want, notes)
 		}
@@ -41,10 +39,9 @@ func TestSecretStoreNotes(t *testing.T) {
 	}
 
 	write(".config/gh/hosts.yml", "github.com:\n    oauth_token: gho_x\n    user: alice\n")
-	cfg.Resources = cfg.Resources[:1]
 	notes = strings.Join(SecretStoreNotes(cfg, u), "\n")
-	if strings.Contains(notes, "gh keeps") || strings.Contains(notes, "docker") {
-		t.Errorf("file-stored gh token or unguarded ~/.docker noted:\n%s", notes)
+	if strings.Contains(notes, "gh keeps") {
+		t.Errorf("file-stored gh token noted:\n%s", notes)
 	}
 }
 
