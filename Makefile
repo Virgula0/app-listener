@@ -212,7 +212,7 @@ bpftool-headers:
 
 install-linter:
 	@GOPATH=$$(go env GOPATH); \
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $$GOPATH/bin v2.9.0
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $$GOPATH/bin v2.15.0
 .PHONY: install-linter
 
 install-deps:

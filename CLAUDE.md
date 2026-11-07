@@ -267,7 +267,7 @@ site and check each argument's declared type.
 
 ## Lint
 
-`make lint` → golangci-lint v2.9.0 (`make install-linter`, config `.golangci.yaml`) on the default
+`make lint` → golangci-lint v2.15.0 (`make install-linter`, config `.golangci.yaml`) on the default
 and the `gui` build, then `tools/codecheck` (own module, keeps x/tools out of go.mod): x/tools
 `deadcode` (`DEADCODE_VERSION`) intersected over tag sets `"" gui ci gui,e2e` with `-test`, plus
 zero-use package symbols, identical bodies, pure forwarding wrappers, `if err := f(); … return nil`.
