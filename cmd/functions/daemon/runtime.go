@@ -352,17 +352,54 @@ func (s *loginServer) login(uid uint32) error {
 	return nil
 }
 
-// lockParent makes /run/user/<uid> root's until unlock (its group, and mode 0700, stay): none of
-// the user's processes can then add, rename or remove an entry in it.
+// lockParent makes /run/user/<uid> root's, mode 0700 and ACL-free, until unlock: none of the user's
+// processes can then add, rename or remove an entry in it. A mode or ACL the user set before is
+// dropped (only the owner can set them back): it would let the user in as group or other.
 func lockParent(userFd int, uid uint32) (unlock func(), err error) {
 	if err := unix.Fchownat(userFd, "", 0, -1, unix.AT_EMPTY_PATH); err != nil {
 		return nil, fmt.Errorf("locking /run/user/%d: %w", uid, err)
 	}
-	return func() {
+	unlock = func() {
 		if err := unix.Fchownat(userFd, "", int(uid), -1, unix.AT_EMPTY_PATH); err != nil {
 			log.Errorf("daemon: handing /run/user/%d back to its user: %v — the next login retries", uid, err)
 		}
-	}, nil
+	}
+	if err := lockDownMode(userFd); err != nil {
+		unlock()
+		return nil, fmt.Errorf("locking /run/user/%d: %w", uid, err)
+	}
+	return unlock, nil
+}
+
+// lockDownMode sets the root-owned directory userFd (O_PATH) to 0700 with no ACL and checks it.
+func lockDownMode(userFd int) error {
+	fd, err := unix.Openat(userFd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if err := unix.Fchmod(fd, 0o700); err != nil {
+		return err
+	}
+	for _, acl := range []string{"system.posix_acl_access", "system.posix_acl_default"} {
+		if err := unix.Fremovexattr(fd, acl); err != nil && !errors.Is(err, unix.ENODATA) &&
+			!errors.Is(err, unix.EOPNOTSUPP) {
+			return fmt.Errorf("removing %s: %w", acl, err)
+		}
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Uid != 0 || st.Mode&0o7077 != 0 {
+		return fmt.Errorf("still uid %d mode %#o", st.Uid, st.Mode&0o7777)
+	}
+	for _, acl := range []string{"system.posix_acl_access", "system.posix_acl_default"} {
+		if _, err := unix.Fgetxattr(fd, acl, nil); !errors.Is(err, unix.ENODATA) && !errors.Is(err, unix.EOPNOTSUPP) {
+			return fmt.Errorf("%s still set", acl)
+		}
+	}
+	return nil
 }
 
 // logout reloads when one of uid's runtime directories went with its mount, so the reload drops it.
