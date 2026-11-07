@@ -44,7 +44,7 @@ with RAM.
   It also runs `TestDaemon_RealBrowserProfiles`, which downloads Firefox and Google Chrome (about
   300 MB) and runs them under Xvfb; `make test-integration APPLISTENER_BROWSER_TESTS=` skips it.
   Runs keep what they download under `build/test`: apt's lists and packages per image
-  (`apt-cache/`) and the browsers (`cache/`, fetched again after 7 days). Delete them to start fresh.
+  (`_apt-cache/`) and the browsers (`cache/`, fetched again after 7 days). Delete them to start fresh.
 
 ## Docker
 
