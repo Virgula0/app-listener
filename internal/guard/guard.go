@@ -259,6 +259,8 @@ type Guard struct {
 	// updateRootKey when a single-file root is recreated (a stale anchor stops guarding the real
 	// file and guards whatever reuses the freed inode). Guarded by mu.
 	rootKey GuardInodeKey
+	// rootSlot: where rootKey was anchored (anchorAlive). Guarded by mu.
+	rootSlot rootSlot
 	// rootReal is where the root path resolved when anchored (d_path); a sweep never re-anchors
 	// onto a root that now resolves elsewhere. anchorRefused: last refused key (log once). Both
 	// guarded by mu.
@@ -1637,7 +1639,7 @@ func (g *Guard) populateMaps() error {
 	}
 	g.noteRootMount(root)
 	root.close()
-	if keyErr := g.updateRootKey(root.key, root.sbdev); keyErr != nil {
+	if keyErr := g.updateRootKey(root); keyErr != nil {
 		return keyErr
 	}
 	g.mu.Lock()
@@ -1737,10 +1739,11 @@ func (g *Guard) putBackingDevices(rdevs []uint32) error {
 	return nil
 }
 
-// updateRootKey re-anchors the watch-root identity to newKey on superblock sbdev in the resource's
-// config (root_in_chain) and g.rootKey. Called from populateMaps and from SweepInodes when a
-// single-file root is recreated.
-func (g *Guard) updateRootKey(newKey GuardInodeKey, sbdev uint64) error {
+// updateRootKey re-anchors the watch-root identity to root's key on its superblock in the resource's
+// config (root_in_chain), g.rootKey and g.rootSlot. Called from populateMaps and from SweepInodes
+// when a root is recreated. root's fd may already be closed.
+func (g *Guard) updateRootKey(root *rootHandle) error {
+	newKey, sbdev, slot := root.key, root.sbdev, slotOf(root)
 	cfg, err := g.resConfig()
 	if err != nil {
 		return err
@@ -1755,7 +1758,7 @@ func (g *Guard) updateRootKey(newKey GuardInodeKey, sbdev uint64) error {
 		return err
 	}
 	g.mu.Lock()
-	g.rootKey = newKey
+	g.rootKey, g.rootSlot = newKey, slot
 	g.mu.Unlock()
 	return g.publishPort()
 }
@@ -1866,7 +1869,7 @@ func (g *Guard) reanchorRoot(oldKey GuardInodeKey, root *rootHandle) error {
 	if err := releaseRootTrust(g.resID, oldKey); err != nil {
 		return fmt.Errorf("untrusting libraries under the old root of %s: %w", g.path, err)
 	}
-	if err := g.updateRootKey(root.key, root.sbdev); err != nil {
+	if err := g.updateRootKey(root); err != nil {
 		return err
 	}
 	if delErr := g.objs().GuardInodes.Delete(oldKey); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {
@@ -1898,7 +1901,9 @@ func (g *Guard) reanchorRefusal(oldKey GuardInodeKey, root *rootHandle, resolved
 // anchorAlive reports whether key is still the anchor and no allowed operation released it. A
 // root moved by an ancestor swap stays anchored (re-anchoring would leave that tree unguarded);
 // guard_root_moved records one an allowed rename, unlink or rmdir released, and
-// inode_free_security zeroes the anchor of one freed with no links.
+// inode_free_security zeroes the anchor of one freed with no links. The hooks record before the
+// kernel's own checks, so a failed delete leaves a record behind: it counts only once the root has
+// left its slot, or a later ancestor swap would pass as that release.
 func (g *Guard) anchorAlive(key GuardInodeKey) (bool, error) {
 	cfg, err := g.resConfig()
 	if err != nil {
@@ -1911,7 +1916,13 @@ func (g *Guard) anchorAlive(key GuardInodeKey) (bool, error) {
 	if err := g.objs().GuardRootMoved.Lookup(g.resID, &moved); err != nil {
 		return false, fmt.Errorf("reading moved root of resource slot %d: %w", g.resID, err)
 	}
-	return moved != key, nil
+	if moved != key {
+		return true, nil
+	}
+	g.mu.Lock()
+	slot := g.rootSlot
+	g.mu.Unlock()
+	return slot.holds(key), nil
 }
 
 // clearRootMoved forgets a recorded root move: the anchor it released is gone or back in place.
