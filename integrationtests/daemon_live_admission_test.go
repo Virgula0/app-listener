@@ -53,7 +53,7 @@ need_encryption: false
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
-// A new match of an absolute catalog glob (JetBrains' /opt/*/jbr/bin/java) is admitted live when
+// A new match of an absolute catalog glob (JetBrains' /opt/*/bin/idea) is admitted live when
 // root installed it; the same name in a directory a user owns is not.
 func (s *IntegrationSuite) TestDaemon_LiveAdmission_NewCatalogGlobMatch() {
 	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
@@ -65,18 +65,18 @@ func (s *IntegrationSuite) TestDaemon_LiveAdmission_NewCatalogGlobMatch() {
 		marker = "TOP-SECRET-JBR-GLOB-5A61"
 		secret = "/root/.config/JetBrains/secret"
 	)
-	s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /root/.config/JetBrains /opt/idea/jbr/bin && printf '" +
-		marker + "' > " + secret + " && cp " + swapReaderPath + " /opt/idea/jbr/bin/java"})
+	s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener /root/.config/JetBrains /opt/idea/bin && printf '" +
+		marker + "' > " + secret + " && cp " + swapReaderPath + " /opt/idea/bin/idea"})
 	s.startDaemon(c, `[watch /root/.config/JetBrains]
 need_encryption: false
-/opt/idea/jbr/bin/java`)
+/opt/idea/bin/idea`)
 
-	s.exec(c, []string{"sh", "-c", "mkdir -p /opt/clion/jbr/bin /opt/evil/jbr/bin && chown 65534 /opt/evil/jbr/bin && " +
-		"cp " + swapReaderPath + " /opt/clion/jbr/bin/java && " + nobodyRun + "cp " + swapReaderPath +
-		" /opt/evil/jbr/bin/java"})
+	s.exec(c, []string{"sh", "-c", "mkdir -p /opt/idea-ultimate/bin /opt/evil/bin && chown 65534 /opt/evil/bin && " +
+		"cp " + swapReaderPath + " /opt/idea-ultimate/bin/idea && " + nobodyRun + "cp " + swapReaderPath +
+		" /opt/evil/bin/idea"})
 
-	ok, out := s.awaitStolen(c, "/opt/clion/jbr/bin/java", secret, marker, 40*time.Second)
-	s.Require().Truef(ok, "a root-installed match of /opt/*/jbr/bin/java was not admitted: %s\ndaemon log:\n%s",
+	ok, out := s.awaitStolen(c, "/opt/idea-ultimate/bin/idea", secret, marker, 40*time.Second)
+	s.Require().Truef(ok, "a root-installed match of /opt/*/bin/idea was not admitted: %s\ndaemon log:\n%s",
 		out, s.readDaemonLog(c))
 	s.Require().NotContains(s.readDaemonLog(c), "configuration reloaded", "admission must need no reload")
 
@@ -87,33 +87,33 @@ need_encryption: false
 		"copy lib_probe.so")
 	s.exec(c, []string{"chown", "-R", "65534:65534", "/tmp/u"})
 	s.reloadAndAwait(c)
-	ok, out = s.awaitStolen(c, "/opt/clion/jbr/bin/java", secret, marker, 10*time.Second)
+	ok, out = s.awaitStolen(c, "/opt/idea-ultimate/bin/idea", secret, marker, 10*time.Second)
 	s.Require().Truef(ok, "after a reload the live-admitted match lost its resource: %s", out)
-	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/tmp/u/evil.so /opt/clion/jbr/bin/java " + secret + " 2>&1"})
+	_, out = s.exec(c, []string{"sh", "-c", "LD_PRELOAD=/tmp/u/evil.so /opt/idea-ultimate/bin/idea " + secret + " 2>&1"})
 	s.Require().NotContainsf(out, libProbeMarker, "after a reload a user library preloaded into the live-admitted "+
 		"match: %s", out)
 
-	s.assertNeverStolen(c, "/opt/evil/jbr/bin/java", secret, marker)
+	s.assertNeverStolen(c, "/opt/evil/bin/idea", secret, marker)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
 const jetbrainsSecret = "/root/.config/JetBrains/secret"
 
-// startJetBrainsDaemon guards jetbrainsSecret (a catalog section, so /opt/*/jbr/bin/java is a
-// system pattern) with a root-installed /opt/idea/jbr/bin/java plus extra lines. The secret holds
+// startJetBrainsDaemon guards jetbrainsSecret (a catalog section, so /opt/*/bin/idea is a
+// system pattern) with a root-installed /opt/idea/bin/idea plus extra lines. The secret holds
 // "STOLEN|marker" so a plain reader (grep, sed) prints what the probes look for.
 func (s *IntegrationSuite) startJetBrainsDaemon(c testcontainers.Container, marker, setup string, extra ...string) {
 	s.exec(c, []string{"mkdir", "-p", "/exploits"})
 	s.copySwapFixtures(c)
-	cmd := "mkdir -p /etc/app-listener /root/.config/JetBrains /opt/idea/jbr/bin && printf 'STOLEN|" + marker +
-		"\\n' > " + jetbrainsSecret + " && cp " + swapReaderPath + " /opt/idea/jbr/bin/java"
+	cmd := "mkdir -p /etc/app-listener /root/.config/JetBrains /opt/idea/bin && printf 'STOLEN|" + marker +
+		"\\n' > " + jetbrainsSecret + " && cp " + swapReaderPath + " /opt/idea/bin/idea"
 	if setup != "" {
 		cmd += " && " + setup
 	}
 	code, out := s.exec(c, []string{"sh", "-c", cmd + " 2>&1"})
 	s.Require().Equalf(0, code, "setup: %s", out)
-	s.startDaemon(c, "[watch /root/.config/JetBrains]\nneed_encryption: false\n/opt/idea/jbr/bin/java\n"+
+	s.startDaemon(c, "[watch /root/.config/JetBrains]\nneed_encryption: false\n/opt/idea/bin/idea\n"+
 		strings.Join(extra, "\n"))
 }
 
@@ -141,25 +141,25 @@ func (s *IntegrationSuite) TestDaemon_LiveAdmission_UserPlacedNameRefused() {
 
 	s.asNobody(c, "swapping the whitelisted tool's directory", "mv /opt/uapp/bin /opt/uapp/old && "+
 		"mkdir /opt/uapp/bin && ln -s /usr/bin/grep /opt/uapp/bin/tool")
-	s.asNobody(c, "planting a glob match", "mkdir -p /opt/evil/jbr/bin && ln -s /usr/bin/sed /opt/evil/jbr/bin/java")
+	s.asNobody(c, "planting a glob match", "mkdir -p /opt/evil/bin && ln -s /usr/bin/sed /opt/evil/bin/idea")
 
-	old := s.inodeOf(c, "/opt/idea/jbr/bin/java")
-	code, out := s.exec(c, []string{"sh", "-c", "cp " + swapReaderPath + " /opt/idea/jbr/bin/.java.new && " +
-		"printf x >> /opt/idea/jbr/bin/.java.new && mv -f /opt/idea/jbr/bin/.java.new /opt/idea/jbr/bin/java 2>&1"})
+	old := s.inodeOf(c, "/opt/idea/bin/idea")
+	code, out := s.exec(c, []string{"sh", "-c", "cp " + swapReaderPath + " /opt/idea/bin/.idea.new && " +
+		"printf x >> /opt/idea/bin/.idea.new && mv -f /opt/idea/bin/.idea.new /opt/idea/bin/idea 2>&1"})
 	s.Require().Equalf(0, code, "the upgrade: %s", out)
-	s.Require().NotEqual(old, s.inodeOf(c, "/opt/idea/jbr/bin/java"), "fixture: the upgrade must make a new inode")
-	ok, out := s.awaitStolen(c, "/opt/idea/jbr/bin/java", jetbrainsSecret, marker, 40*time.Second)
+	s.Require().NotEqual(old, s.inodeOf(c, "/opt/idea/bin/idea"), "fixture: the upgrade must make a new inode")
+	ok, out := s.awaitStolen(c, "/opt/idea/bin/idea", jetbrainsSecret, marker, 40*time.Second)
 	s.Require().Truef(ok, "control: the root-placed upgrade was not admitted live: %s\ndaemon log:\n%s", out,
 		s.readDaemonLog(c))
 
 	// The control's admission proves re-syncs judged both planted names.
 	s.assertNeverStolen(c, "/opt/uapp/bin/tool ''", jetbrainsSecret, marker)
-	s.assertNeverStolen(c, "/opt/evil/jbr/bin/java -n p", jetbrainsSecret, marker)
+	s.assertNeverStolen(c, "/opt/evil/bin/idea -n p", jetbrainsSecret, marker)
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
-// The daemon's own catalog refresh (here the startup one) expands /opt/*/jbr/bin/java. A match the
+// The daemon's own catalog refresh (here the startup one) expands /opt/*/bin/idea. A match the
 // user placed, a symlink to root's sed, must not be written to daemon.conf: the reload that follows
 // resolves it by path and would admit sed.
 func (s *IntegrationSuite) TestDaemon_CatalogRefresh_UserPlacedSystemMatchRefused() {
@@ -168,11 +168,11 @@ func (s *IntegrationSuite) TestDaemon_CatalogRefresh_UserPlacedSystemMatchRefuse
 
 	const marker = "TOP-SECRET-REFRESH-PLANT-71C4"
 	s.startJetBrainsDaemon(c, marker, "mkdir -p /opt/evil && chown 65534:65534 /opt/evil && "+nobodyRun+
-		"sh -c 'mkdir -p /opt/evil/jbr/bin && ln -s /usr/bin/sed /opt/evil/jbr/bin/java'")
+		"sh -c 'mkdir -p /opt/evil/bin && ln -s /usr/bin/sed /opt/evil/bin/idea'")
 	s.Require().Truef(s.awaitLog(c, "re-scanned /root/.config/JetBrains", 30*time.Second),
 		"the startup catalog refresh did not run: %s", s.readDaemonLog(c))
 
-	s.assertNeverStolen(c, "/opt/evil/jbr/bin/java -n p", jetbrainsSecret, marker)
+	s.assertNeverStolen(c, "/opt/evil/bin/idea -n p", jetbrainsSecret, marker)
 	_, conf := s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
 	s.Require().NotContainsf(conf, "/opt/evil", "the refresh wrote the user-placed match:\n%s", conf)
 	s.Require().NotContainsf(conf, "/usr/bin/sed", "the refresh wrote the match's target:\n%s", conf)

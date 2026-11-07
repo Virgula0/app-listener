@@ -2,7 +2,7 @@ package daemon
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json/v2"
 	"net"
 	"slices"
 	"strings"

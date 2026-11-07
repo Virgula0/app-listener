@@ -52,6 +52,63 @@ func openRoot(path string) (*rootHandle, error) {
 
 const procFDDir = "/proc/self/fd/"
 
+// rootSlot is where a root was anchored: its physical parent directory (path and inode) and its
+// name there. Only an operation on the root itself (rename, unlink, rmdir, a rename over it), which
+// the guard judges, takes it out; moving an unguarded ancestor moves the slot along with it.
+type rootSlot struct {
+	parent GuardInodeKey
+	dir    string
+	name   string
+}
+
+// slotOf records root's slot, zero when its parent can't be verified (raced, unreadable).
+func slotOf(root *rootHandle) rootSlot {
+	dir, name := filepath.Dir(root.resolved), filepath.Base(root.resolved)
+	fd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return rootSlot{}
+	}
+	defer unix.Close(fd)
+	parent, err := statFD(fd)
+	if err != nil {
+		return rootSlot{}
+	}
+	if key, err := statAt(fd, name); err != nil || key != root.key {
+		return rootSlot{}
+	}
+	return rootSlot{parent: parent.key, dir: dir, name: name}
+}
+
+// holds reports whether key still sits in the slot. Unknowable counts as holding (a zero slot, the
+// parent no longer at its path, a stat error): it keeps the anchor, never moves it.
+func (s rootSlot) holds(key GuardInodeKey) bool {
+	if s.dir == "" {
+		return true
+	}
+	fd, err := unix.Open(s.dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return true
+	}
+	defer unix.Close(fd)
+	if parent, statErr := statFD(fd); statErr != nil || parent.key != s.parent {
+		return true
+	}
+	cur, err := statAt(fd, s.name)
+	if errors.Is(err, unix.ENOENT) {
+		return false
+	}
+	return err != nil || cur == key
+}
+
+// statAt is name's key in dirfd, not following a final symlink (the slot names the entry itself).
+func statAt(dirfd int, name string) (GuardInodeKey, error) {
+	var sx unix.Statx_t
+	if err := unix.Statx(dirfd, name, unix.AT_SYMLINK_NOFOLLOW|unix.AT_STATX_SYNC_AS_STAT, unix.STATX_INO, &sx); err != nil {
+		return GuardInodeKey{}, err
+	}
+	return GuardInodeKey{Dev: ebpf.KernelDev(sx.Dev_major, sx.Dev_minor), Ino: sx.Ino}, nil
+}
+
 func (r *rootHandle) close() { _ = unix.Close(r.fd) }
 
 // logical maps a path below r.proc back to the configured root path.

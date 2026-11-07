@@ -29,6 +29,7 @@ var (
 	tuiTestAmd64Bin      string
 	netguardTestAmd64Bin string
 	recorderTestAmd64Bin string
+	secretProbeAmd64Bin  string
 )
 
 // hostInfraBindPaths are host binaries the LSM network guard blocks in whitelist mode because its
@@ -76,6 +77,7 @@ func TestMain(m *testing.M) {
 	tuiTestAmd64Bin = absPath("../build/test/tui-amd64")
 	netguardTestAmd64Bin = absPath("../build/test/networkguard-amd64")
 	recorderTestAmd64Bin = absPath("../build/test/recorder-amd64")
+	secretProbeAmd64Bin = absPath("../build/test/secret_probe-amd64")
 
 	// Daemon mode links fscrypt, which needs cgo (mlock): CGO_ENABLED=0 no longer compiles. The
 	// binary must still be static: it runs in ubuntu:latest containers whose glibc (2.39) is older
@@ -98,6 +100,14 @@ func TestMain(m *testing.M) {
 	cmdNet.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	if err := cmdNet.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "build net_tester amd64 binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	cmdSecret := exec.Command("go", "build", "-o", secretProbeAmd64Bin, "./secret_probe")
+	cmdSecret.Stderr = os.Stderr
+	cmdSecret.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+	if err := cmdSecret.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build secret_probe amd64 binary: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -244,12 +254,38 @@ func (s *IntegrationSuite) startContainer(
 		}
 	}
 
+	s.cacheApt(&req, image, platform)
+
 	c, err := testcontainers.GenericContainer(s.ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
 		Started:          true,
 	})
 	s.Require().NoError(err, "start container %s/%s", image, platform)
 	return c
+}
+
+// cacheApt keeps apt's package lists and downloaded .debs across containers and runs, per apt image and
+// platform, under build/test/_apt-cache: the image's docker-clean would delete the .debs after every
+// install. Tests run one at a time, so the directories are never shared by two apt runs. The leading
+// "_" keeps `./...` (go list, golangci-lint) out of apt's root-only partial/ dirs.
+func (s *IntegrationSuite) cacheApt(req *testcontainers.ContainerRequest, image, platform string) {
+	if !strings.HasPrefix(image, "ubuntu:") && !strings.HasPrefix(image, "debian:") {
+		return
+	}
+	key := strings.NewReplacer("/", "_", ":", "_").Replace(image + "-" + platform)
+	for target, dir := range map[string]string{"/var/cache/apt/archives": "archives", "/var/lib/apt/lists": "lists"} {
+		host := absPath(filepath.Join("../build/test/_apt-cache", key, dir))
+		s.Require().NoError(os.MkdirAll(filepath.Join(host, "partial"), 0o755))
+		req.Mounts = append(req.Mounts, testcontainers.ContainerMount{
+			Source: testcontainers.GenericBindMountSource{HostPath: host},
+			Target: testcontainers.ContainerMountTarget(target),
+		})
+	}
+	req.Files = append(req.Files, testcontainers.ContainerFile{
+		Reader:            strings.NewReader("// integration tests keep downloaded packages (cacheApt)\n"),
+		ContainerFilePath: "/etc/apt/apt.conf.d/docker-clean",
+		FileMode:          0o644,
+	})
 }
 
 func (s *IntegrationSuite) exec(c testcontainers.Container, cmd []string) (int, string) {

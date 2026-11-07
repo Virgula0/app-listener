@@ -95,6 +95,60 @@ rmdir "` + oldDir + `" or die "rmdir $!\n"; print "UPDATED\n"`})
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
 
+// awaitConf polls daemon.conf until it holds needle (want) or no longer does (!want).
+func (s *IntegrationSuite) awaitConf(c testcontainers.Container, needle string, want bool, timeout time.Duration) string {
+	var conf string
+	for dl := time.Now().Add(timeout); time.Now().Before(dl); time.Sleep(300 * time.Millisecond) {
+		_, conf = s.exec(c, []string{"cat", "/etc/app-listener/daemon.conf"})
+		if strings.Contains(conf, needle) == want {
+			break
+		}
+	}
+	return conf
+}
+
+// Discord installs app-<new> while app-<old> still exists (both admitted, each a lib_dir), and
+// deletes app-<old> hours later on its next start. Only that deletion happens then: the refresh must
+// still run and drop the old version's lines and lib_dir, or its guard's sweep fails every tick.
+func (s *IntegrationSuite) TestDaemon_CatalogRefresh_OldVersionDroppedWhenDeletedLater() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	oldDir, newDir := discordDir+"/app-0.0.1", discordDir+"/app-0.0.2"
+	oldBin, newBin := oldDir+"/Discord", newDir+"/Discord"
+	s.exec(c, []string{"sh", "-c", "mkdir -p /etc/app-listener " + discordDir + "/sentry " + oldDir + " && cp /usr/bin/perl " +
+		oldBin + " && printf '" + refreshMarker + "' > " + refreshSecret})
+	s.startDaemon(c, `[watch `+discordDir+`/sentry]
+need_encryption: false
+`+oldBin)
+	conf := s.awaitConf(c, `lib_dir "`+oldDir+`"`, true, 30*time.Second)
+	s.Require().Containsf(conf, `lib_dir "`+oldDir+`"`, "the startup refresh must adopt the old version's lib_dir")
+
+	code, out := s.exec(c, []string{oldBin, "-e", `
+mkdir "` + newDir + `" or die "mkdir $!\n";
+open(I, "<", "/usr/bin/dash") or die "read $!\n"; binmode I;
+open(O, ">", "` + newBin + `") or die "create $!\n"; binmode O;
+{ local $/; print O <I>; } close O or die "close $!\n";
+chmod 0755, "` + newBin + `" or die "chmod $!\n"; print "UPDATED\n"`})
+	s.Require().Truef(code == 0 && strings.Contains(out, "UPDATED"), "the client must install its update: %s", out)
+	conf = s.awaitConf(c, `lib_dir "`+newDir+`"`, true, 30*time.Second)
+	s.Require().Containsf(conf, `lib_dir "`+newDir+`"`, "the new version's lib_dir must be adopted; log:\n%s",
+		s.readDaemonLog(c))
+	s.Require().Contains(conf, oldBin, "the old version still exists: its line stays")
+
+	code, out = s.exec(c, []string{oldBin, "-e", `unlink "` + oldBin + `" or die "unlink $!\n";
+rmdir "` + oldDir + `" or die "rmdir $!\n"; print "REMOVED\n"`})
+	s.Require().Truef(code == 0 && strings.Contains(out, "REMOVED"), "the client must remove its old version: %s", out)
+
+	conf = s.awaitConf(c, oldDir, false, 45*time.Second)
+	s.Require().NotContainsf(conf, oldDir, "the deleted version must leave daemon.conf; log:\n%s", s.readDaemonLog(c))
+	time.Sleep(65 * time.Second) // two sweep ticks
+	s.Require().LessOrEqualf(strings.Count(s.readDaemonLog(c), "periodic inode sweep for "+oldDir), 1,
+		"the dropped lib_dir's sweep must not keep failing; log:\n%s", s.readDaemonLog(c))
+	s.Require().Containsf(s.readAs(c, newBin), "STOLEN|"+refreshMarker, "the new version must keep reading")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
 // A non-writer's mkdir is allowed (version names are free) but planting the binary name is not,
 // and nothing it does gets a refresh to admit anything.
 func (s *IntegrationSuite) TestDaemon_CatalogRefresh_NonWriterPlantAdmitsNothing() {

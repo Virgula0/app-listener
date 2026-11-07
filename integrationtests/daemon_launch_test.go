@@ -1,10 +1,13 @@
 package integrationtests
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -106,6 +109,25 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_RiskyLaunchRefusedSecretAndCode
 		{"a tab-separated -javaagent after an allowed option", "JAVA_TOOL_OPTIONS=\"$(printf '%s\\t%s' -Xmx512m -javaagent:/tmp/a.jar)\"",
 			launchJava, nil},
 		{"JDK_JAVA_OPTIONS", "JDK_JAVA_OPTIONS=-Djava.class.path=/tmp", launchJava, nil},
+		// Chromium trims ASCII whitespace off each argument: still a switch.
+		{"a space before --load-extension", "", launchProbe, []string{"' --load-extension=/tmp/ext'"}},
+		{"a tab before --remote-debugging-port", "", launchProbe, []string{"\"$(printf '\\t--remote-debugging-port=9222')\""}},
+		{"--disable-extensions-except", "", launchProbe, []string{"--disable-extensions-except=/tmp/ext"}},
+		{"-load-apps", "", launchProbe, []string{"-load-apps=/tmp/app"}},
+		{"--ignore-certificate-errors", "", launchProbe, []string{"--ignore-certificate-errors"}},
+		{"--proxy-server", "", launchProbe, []string{"--proxy-server=127.0.0.1:8080"}},
+		{"--headless", "", launchProbe, []string{"--headless=new"}},
+		{"-dump-dom", "", launchProbe, []string{"-dump-dom"}},
+		{"--screenshot", "", launchProbe, []string{"--screenshot=/tmp/s.png"}},
+		{"--print-to-pdf", "", launchProbe, []string{"--print-to-pdf=/tmp/x.pdf"}},
+		{"--log-net-log", "", launchProbe, []string{"--log-net-log=/tmp/n.json"}},
+		{"--pack-extension", "", launchProbe, []string{"--pack-extension=/tmp/d"}},
+		{"--allow-file-access-from-files", "", launchProbe, []string{"--allow-file-access-from-files"}},
+		{"-disable-web-security", "", launchProbe, []string{"-disable-web-security"}},
+		{"SSLKEYLOGFILE", "SSLKEYLOGFILE=/tmp/k", launchProbe, nil},
+		{"a JetBrains VM options file", "IDEA_VM_OPTIONS=/tmp/x.vmoptions", launchJava, nil},
+		{"NODE_EXTRA_CA_CERTS", "NODE_EXTRA_CA_CERTS=/tmp/ca.pem", launchProbe, nil},
+		{"NODE_TLS_REJECT_UNAUTHORIZED", "NODE_TLS_REJECT_UNAUTHORIZED=0", launchProbe, nil},
 	} {
 		out := s.launch(c, lc, "read", launchSecret)
 		s.Require().NotContainsf(out, launchMarker, "launched with %s, the runtime read its resource: %s\ndaemon log:\n%s",
@@ -143,7 +165,7 @@ const (
 // file `read <path>` names. "" when bun is not on PATH or the build fails: the probe still covers the
 // rules. The baseline target fetches Bun's official runtime: a distro bun (Arch's) compiling for its
 // own target embeds itself, linked to the host's ICU, which the test image lacks.
-func (s *IntegrationSuite) bunRealApp() string {
+func (s *IntegrationSuite) bunRealApp(flags ...string) string {
 	bun, err := exec.LookPath("bun")
 	if err != nil {
 		s.T().Log("bun not on PATH: skipping the real Bun-compiled app")
@@ -158,8 +180,8 @@ if (verb === "read") {
 }
 `), 0o644))
 	out := filepath.Join(dir, "bunreal")
-	b, err := exec.Command(bun, "build", "--compile", "--target=bun-linux-x64-baseline", src, //nolint:gosec // test fixture
-		"--outfile", out).CombinedOutput()
+	args := append([]string{"build", "--compile", "--target=bun-linux-x64-baseline"}, flags...)
+	b, err := exec.Command(bun, append(args, src, "--outfile", out)...).CombinedOutput() //nolint:gosec // test fixture
 	if err != nil {
 		s.T().Logf("bun build --compile failed (offline?), skipping the real Bun-compiled app: %v\n%s", err, b)
 		return ""
@@ -179,7 +201,8 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_BunRuntimeEnv() {
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_bun"), launchBunProbe, 0o755),
 		"copy launch_probe_bun (run make -C integrationtests/exploits)")
 	whitelist := launchBunProbe
-	real := s.bunRealApp()
+	real := s.bunRealApp("--no-compile-autoload-bunfig") // else op=BUNFIG refuses every launch
+
 	if real != "" {
 		s.Require().NoError(c.CopyFileToContainer(s.ctx, real, launchBunReal, 0o755), "copy the Bun-compiled app")
 		whitelist += "\n" + launchBunReal
@@ -227,6 +250,60 @@ func (s *IntegrationSuite) TestDaemon_LaunchScan_BunRuntimeEnv() {
 		s.Require().Containsf(out, "DENIED|", "the caller's script must have run and been refused: %s", out)
 	}
 	s.requireDenialLogged(c, "LAUNCH", "secret")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A default `bun build --compile` app runs the preload of any ./bunfig.toml its open reaches: a
+// regular file, a symlink to another name, a bind mount over the name. It never reads the secret, not
+// even started elsewhere (op=BUNFIG). One built without that autoload, its embedded flags say, opens
+// nothing there and keeps reading.
+func (s *IntegrationSuite) TestDaemon_LaunchScan_BunfigPreload() {
+	autoload := s.bunRealApp()
+	if autoload == "" {
+		s.T().Skip("no bun to build the apps with")
+	}
+	noAutoload := s.bunRealApp("--no-compile-autoload-bunfig")
+	s.Require().NotEmpty(noAutoload, "the second build")
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const quiet = "/opt/rt/bin/bunquiet"
+	s.exec(c, []string{"mkdir", "-p", "/opt/rt/bin", "/tmp/proj", "/tmp/link", "/tmp/bind"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, autoload, launchBunReal, 0o755))
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, noAutoload, quiet, 0o755))
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
+		"' > " + launchSecret + " && printf '%s' 'try { console.log(\"STOLEN|\" + " +
+		"require(\"fs\").readFileSync(\"" + launchSecret + "\", \"utf8\")) } catch (e) { console.log(\"DENIED|\" + e.code) }' > " +
+		launchBunEvil + " && printf 'preload = [\"" + launchBunEvil + "\"]\\n' > /tmp/proj/bunfig.toml && " +
+		"cp /tmp/proj/bunfig.toml /tmp/x.cfg && ln -s /tmp/x.cfg /tmp/link/bunfig.toml && touch /tmp/bind/bunfig.toml 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+launchBunReal+"\n"+quiet+"\n")
+	s.Require().Containsf(s.readDaemonLog(c), launchBunReal+" is a Bun app that loads ./bunfig.toml",
+		"the daemon must name the app that can't read")
+
+	run := func(dir, bin string) string {
+		_, out := s.exec(c, []string{"sh", "-c", "cd " + dir + " && " + bin + " read " + launchSecret + " 2>&1"})
+		return out
+	}
+	out = run("/tmp", launchBunReal)
+	s.Require().NotContainsf(out, "STOLEN|", "an app that loads ./bunfig.toml must not read, wherever it starts: %s", out)
+	s.requireDenialLogged(c, "BUNFIG", launchSecret)
+	read := launchBunReal + " read " + launchSecret
+	for _, tc := range []struct{ what, cmd string }{
+		{"a regular bunfig.toml", "cd /tmp/proj && " + read},
+		{"a bunfig.toml symlinked to another name", "cd /tmp/link && " + read},
+		{"another name bind-mounted over bunfig.toml",
+			"unshare -m sh -c 'mount --bind /tmp/x.cfg /tmp/bind/bunfig.toml && cd /tmp/bind && " + read + "'"},
+	} {
+		_, out := s.exec(c, []string{"sh", "-c", tc.cmd + " 2>&1"})
+		s.Require().Containsf(out, "DENIED|", "%s: the preload must have run and been refused: %s\n%s", tc.what, out,
+			s.readDaemonLog(c))
+		s.Require().NotContainsf(out, "STOLEN|", "%s: the preload read the secret as the app: %s", tc.what, out)
+	}
+	out = run("/tmp/proj", quiet)
+	s.Require().Containsf(out, "STOLEN|"+launchMarker, "an app that doesn't load bunfig.toml must keep reading: %s\n%s",
+		out, s.readDaemonLog(c))
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }
@@ -360,5 +437,247 @@ need_encryption: false
 			out, s.readDaemonLog(c))
 	}
 
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A whitelisted CLI started with words one of its launch rules names (the catalog's by basename, or a
+// [launch_rules] line, in any spelling an abbreviation rule names) is refused its secret; started otherwise it keeps reading. A warn rule only
+// logs. Every binary is judged on SSL_CERT_FILE/SSL_CERT_DIR unless the value is a root-placed bundle
+// (built in or allow_env); an allow_env a user can fill is refused. Rule sets must survive a reload.
+func (s *IntegrationSuite) TestDaemon_LaunchRules() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const gh, tool, goread = "/opt/rt/bin/gh", "/opt/rt/bin/tool", "/opt/rt/bin/goread"
+	const gpg, kubectl, rclone = "/opt/rt/bin/gpg", "/opt/rt/bin/kubectl", "/opt/rt/bin/rclone"
+	const firefox = "/opt/rt/bin/firefox"
+	const corpCA = "/etc/corp-ca.pem"
+	s.exec(c, []string{"mkdir", "-p", "/exploits", "/opt/rt/bin"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_plain"), gh, 0o755),
+		"copy launch_probe_plain (run make -C integrationtests/exploits)")
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, goread, 0o755))
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
+		"' > " + launchSecret + " && for b in " + tool + " " + gpg + " " + kubectl + " " + rclone + " " + firefox + "; do cp " + gh +
+		" $b; done && echo ca > " + corpCA + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[launch_rules]\ndeny_args "+tool+" export --all\nwarn_env "+tool+" NOTE_ME\n"+
+		"deny_args "+tool+" --frob[nicate]\n"+
+		"allow_env SSL_CERT_FILE="+corpCA+"\nallow_env SSL_CERT_FILE=/tmp/user-ca.pem\n\n"+
+		"[watch /protected]\nneed_encryption: false\n"+gh+"\n"+tool+"\n"+goread+"\n"+gpg+"\n"+kubectl+"\n"+rclone+"\n"+firefox)
+
+	run := func(cmd string) string {
+		_, out := s.exec(c, []string{"sh", "-c", cmd + " 2>&1"})
+		return out
+	}
+	check := func(when string) {
+		for what, cmd := range map[string]string{
+			"a clean launch":            gh + " read " + launchSecret,
+			"a partial rule":            gh + " auth status read " + launchSecret,
+			"a warn rule":               gh + " auth git-credential read " + launchSecret,
+			"rule words out of order":   gh + " token auth read " + launchSecret,
+			"another binary's built-in": tool + " auth token read " + launchSecret,
+			"a warn env rule":           "NOTE_ME=1 " + tool + " read " + launchSecret,
+			"a clean Go launch":         goread + " read " + launchSecret,
+			"the system CA bundle":      "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt " + gh + " read " + launchSecret,
+			"the system CA dir on Go":   "SSL_CERT_DIR=/etc/ssl/certs " + goread + " read " + launchSecret,
+			"a root-placed allow_env":   "SSL_CERT_FILE=" + corpCA + " " + goread + " read " + launchSecret,
+			"gpg's public export":       gpg + " --export --export-ssh-key read " + launchSecret,
+			"gpg -e":                    gpg + " -e -r x read " + launchSecret,
+			"an ambiguous gpg prefix":   gpg + " --export-s --st read " + launchSecret,
+			"a redacted kubeconfig":     kubectl + " config view read " + launchSecret,
+			"a redacted rclone config":  rclone + " config redacted read " + launchSecret,
+			"an abbreviation too short": tool + " --fro read " + launchSecret,
+			"a Firefox window":          firefox + " --new-tab -P default read " + launchSecret,
+			"Firefox's log file alone":  firefox + " -MOZ_LOG_FILE=/tmp/l read " + launchSecret,
+		} {
+			s.Require().Containsf(run(cmd), "STOLEN|"+launchMarker, "%s: %s must read its resource\ndaemon log:\n%s",
+				when, what, s.readDaemonLog(c))
+		}
+		for what, cmd := range map[string]string{
+			"words around a flag's value":   gh + " auth --hostname x token read " + launchSecret,
+			"a short flag after operands":   gh + " auth status read " + launchSecret + " -t",
+			"a long flag with a value":      gh + " auth status --show-token=1 read " + launchSecret,
+			"a [launch_rules] argv rule":    tool + " export read " + launchSecret + " --all",
+			"SSL_CERT_FILE on a Go binary":  "SSL_CERT_FILE=/tmp/ca.pem " + goread + " read " + launchSecret,
+			"SSL_CERT_FILE on any CLI":      "SSL_CERT_FILE=/tmp/ca.pem " + gh + " read " + launchSecret,
+			"SSL_CERT_DIR of a user":        "SSL_CERT_DIR=/tmp " + goread + " read " + launchSecret,
+			"a user-fillable allow_env":     "SSL_CERT_FILE=/tmp/user-ca.pem " + gh + " read " + launchSecret,
+			"an allowed path extended":      "SSL_CERT_FILE=" + corpCA + ".x " + gh + " read " + launchSecret,
+			"an allowed bundle in a list":   "SSL_CERT_DIR=/etc/ssl/certs:/tmp " + goread + " read " + launchSecret,
+			"gpg --export-secret-keys":      gpg + " --export-secret-keys read " + launchSecret,
+			"an abbreviated secret export":  gpg + " -a --export-secret-ke read " + launchSecret,
+			"the shortest export prefix":    gpg + " --export-se=x read " + launchSecret,
+			"gpg --enarmo":                  gpg + " --enarmo read " + launchSecret,
+			"gpg --enarmour":                gpg + " --enarmour read " + launchSecret,
+			"gpg --sto":                     gpg + " --sto read " + launchSecret,
+			"kubectl config view --raw":     kubectl + " config view --minify --raw read " + launchSecret,
+			"rclone config show":            rclone + " config show read " + launchSecret,
+			"rclone config dump":            rclone + " config dump read " + launchSecret,
+			"a [launch_rules] abbreviation": tool + " --frobn read " + launchSecret,
+			"firefox --headless":            firefox + " --headless --screenshot read " + launchSecret,
+			"firefox -screenshot":           firefox + " -screenshot /tmp/s.png read " + launchSecret,
+			"firefox remote debugging":      firefox + " --remote-debugging-port=9222 read " + launchSecret,
+			"firefox -marionette":           firefox + " -marionette read " + launchSecret,
+			"firefox debugger server":       firefox + " -start-debugger-server 6000 read " + launchSecret,
+			"firefox -MOZ_LOG":              firefox + " -MOZ_LOG=nsHttp:5 read " + launchSecret,
+			"MOZ_HEADLESS on firefox":       "MOZ_HEADLESS=1 " + firefox + " read " + launchSecret,
+			"SSLKEYLOGFILE on firefox":      "SSLKEYLOGFILE=/tmp/k " + firefox + " read " + launchSecret,
+		} {
+			s.Require().NotContainsf(run(cmd), launchMarker, "%s: %s read the secret\ndaemon log:\n%s",
+				when, what, s.readDaemonLog(c))
+		}
+	}
+	check("at start")
+	s.reloadAndAwait(c)
+	check("after a reload")
+
+	log := s.readDaemonLog(c)
+	for _, want := range []string{"word=token", "word=-t", "word=--show-token", "word=--all", "word=SSL_CERT_FILE",
+		"ARGV comm=gh", "word=git-credential", "word=NOTE_ME", "word=SSL_CERT_DIR",
+		"word=--export-secret-ke", "word=--export-se", "word=--sto", "word=--raw", "word=show", "word=--frobn",
+		"word=--headless", "word=-start-debugger-server", "word=MOZ_HEADLESS", "word=-MOZ_LOG",
+		"allow_env SSL_CERT_FILE=/tmp/user-ca.pem refused"} {
+		s.Require().Containsf(log, want, "daemon log lacks %q:\n%s", want, log)
+	}
+	s.Require().NotContainsf(log, "word=SSL_CERT_FILE=", "an env match must log the name alone:\n%s", log)
+	s.requireDenialLogged(c, "ARGV", "secret")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A whitelisted browser that locks or opens one of its profile anchors outside every guarded tree
+// (--profile, --user-data-dir, HOME) runs on a profile its caller made: it, and what it forks and
+// execs, are refused the secret. Inside the tree, under another binary's name or with a name no
+// anchor lists, the same launch reads it. The probe is a plain CLI named as each browser.
+func (s *IntegrationSuite) TestDaemon_ProfileAnchors() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const firefox, brave, gh = "/opt/rt/bin/firefox", "/opt/rt/bin/brave", "/opt/rt/bin/gh"
+	s.exec(c, []string{"mkdir", "-p", "/opt/rt/bin"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_plain"), gh, 0o755),
+		"copy launch_probe_plain (run make -C integrationtests/exploits)")
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
+		"' > " + launchSecret + " && cp " + gh + " " + firefox + " && cp " + gh + " " + brave + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+firefox+"\n"+brave+"\n"+gh)
+
+	n := 0
+	run := func(bin, verb, anchor string) string {
+		_, out := s.exec(c, []string{"sh", "-c", bin + " " + verb + " '" + anchor + "' " + launchSecret + " 2>&1"})
+		return out
+	}
+	// Fresh directories per case: a lock left by an earlier case would fail the next symlink.
+	outside := func(name string) string {
+		n++
+		dir := "/tmp/profile-" + strconv.Itoa(n)
+		s.exec(c, []string{"mkdir", "-p", dir})
+		return dir + "/" + name
+	}
+	inside := func(bin, name string) string {
+		n++
+		dir := "/protected/profile-" + strconv.Itoa(n)
+		_, out := s.exec(c, []string{bin, "mkdir", dir})
+		s.Require().Containsf(out, "MADE|", "%s must make its profile dir: %s", bin, out)
+		return dir + "/" + name
+	}
+	check := func(when string) {
+		for what, cmd := range map[string][3]string{
+			"firefox locking a profile in its tree":  {firefox, "lock", inside(firefox, "lock")},
+			"firefox reading user.js in its tree":    {firefox, "open", inside(firefox, "user.js")},
+			"brave locking a profile in its tree":    {brave, "lock", inside(brave, "SingletonLock")},
+			"firefox, a name no anchor lists":        {firefox, "lock", outside("lockfile")},
+			"firefox, another browser's anchor":      {firefox, "open", outside("Local State")},
+			"a CLI no anchor names":                  {gh, "lock", outside("lock")},
+			"brave, Firefox's anchor":                {brave, "open", outside("user.js")},
+			"a fork and exec of an unmarked firefox": {firefox, "openexec", inside(firefox, "user.js")},
+			// Firefox locks $TMPDIR/firefox as it locks a profile, at every start.
+			"firefox's startup lock symlink": {firefox, "lock", outside("lock")},
+			"firefox's startup fcntl lock":   {firefox, "open", outside(".parentlock")},
+		} {
+			out := run(cmd[0], cmd[1], cmd[2])
+			s.Require().Containsf(out, "STOLEN|"+launchMarker, "%s: %s must read its resource: %s\ndaemon log:\n%s",
+				when, what, out, s.readDaemonLog(c))
+		}
+		for what, cmd := range map[string][3]string{
+			"firefox reading a planted user.js":   {firefox, "open", outside("user.js")},
+			"firefox's prefs.js":                  {firefox, "open", outside("prefs.js")},
+			"firefox's extensions.json":           {firefox, "open", outside("extensions.json")},
+			"brave locking a user data dir":       {brave, "lock", outside("SingletonLock")},
+			"brave reading a planted Local State": {brave, "open", outside("Local State")},
+			"brave's Secure Preferences":          {brave, "open", outside("Secure Preferences")},
+			// Firefox execs its fork server after reading its prefs; every content process forks from it.
+			"the exec'd child of a marked firefox": {firefox, "openexec", outside("user.js")},
+			"the exec'd child of a marked brave":   {brave, "lockexec", outside("SingletonLock")},
+		} {
+			out := run(cmd[0], cmd[1], cmd[2])
+			s.Require().Containsf(out, "ANCHORED|", "%s: %s: the anchor must be made: %s", when, what, out)
+			s.Require().NotContainsf(out, launchMarker, "%s: %s read the secret\ndaemon log:\n%s",
+				when, what, s.readDaemonLog(c))
+		}
+		_, out := s.exec(c, []string{firefox, "read", launchSecret})
+		s.Require().Containsf(out, "STOLEN|"+launchMarker, "%s: a marked firefox must not mark the next one: %s", when, out)
+	}
+	check("at start")
+	s.reloadAndAwait(c)
+	check("after a reload")
+
+	log := s.readDaemonLog(c)
+	for _, want := range []string{"PROFILE comm=firefox", "PROFILE comm=brave", "anchor=/tmp/profile-",
+		"Secure Preferences"} {
+		s.Require().Containsf(log, want, "daemon log lacks %q:\n%s", want, log)
+	}
+	s.requireDenialLogged(c, "PROFILE", "secret")
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A binary's launch rules are its inode's, whichever spelling names them: a [launch_rules] line on a
+// symlink line applies even when another section lists the target first. Rules that don't fit the
+// kernel's slots (the catalog's plus the config's) refuse the config instead of dropping them all.
+func (s *IntegrationSuite) TestDaemon_LaunchRulesMergedOrRefused() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const tool, link, gpg = "/opt/rt/bin/tool", "/opt/rt/bin/toollink", "/opt/rt/bin/gpg"
+	s.exec(c, []string{"mkdir", "-p", "/exploits", "/opt/rt/bin"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_plain"), tool, 0o755),
+		"copy launch_probe_plain (run make -C integrationtests/exploits)")
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /protected2 /etc/app-listener && printf '" +
+		launchMarker + "' > " + launchSecret + " && cp " + tool + " " + gpg + " && ln -s tool " + link + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[launch_rules]\ndeny_args "+link+" --leak\n\n"+
+		"[watch /protected]\nneed_encryption: false\n"+tool+"\n"+gpg+"\n\n"+
+		"[watch /protected2]\nneed_encryption: false\n"+link)
+	_, out = s.exec(c, []string{"sh", "-c", tool + " --leak read " + launchSecret + " 2>&1"})
+	s.Require().NotContainsf(out, launchMarker, "a rule on the symlink's spelling was dropped\ndaemon log:\n%s",
+		s.readDaemonLog(c))
+	_, out = s.exec(c, []string{"sh", "-c", tool + " read " + launchSecret + " 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+launchMarker, "a clean launch must read: %s", out)
+	s.Require().NotContains(s.readDaemonLog(c), "is not a whitelisted binary")
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon'; sleep 2"})
+
+	// The catalog gives gpg 6 argv rules: 11 more lines are 17, one over the slots.
+	var rules strings.Builder
+	for i := range 11 {
+		fmt.Fprintf(&rules, "deny_args %s --extra%d\n", gpg, i)
+	}
+	conf := "[launch_rules]\n" + rules.String() + "\n[watch /protected]\nneed_encryption: false\n" + gpg
+	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + conf + "\nEOF"})
+	s.confirmConfigBinaries(c)
+	_, out = s.exec(c, []string{"sh", "-c", "timeout 90 /app-listener daemon --config /etc/app-listener/daemon.conf " +
+		"--headless 2>&1; echo rc=$?"})
+	s.Require().Containsf(out, "rc=78", "rules that don't fit must refuse the start: %s", out)
+	s.Require().Containsf(out, "argv rules", "the refusal must name the rule cap: %s", out)
+	s.Require().NotContainsf(out, "guarding: /protected", "no guard may attach: %s", out)
+
+	// A reload onto that config keeps the running one, with its rules.
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+gpg)
+	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + conf + "\nEOF"})
+	s.confirmConfigBinaries(c)
+	s.exec(c, []string{"sh", "-c", "pkill -HUP -f 'app-listener daemon'"})
+	s.Require().Truef(s.awaitLog(c, "argv rules", 30*time.Second), "the reload must be refused:\n%s", s.readDaemonLog(c))
+	_, out = s.exec(c, []string{"sh", "-c", gpg + " --export-secret-keys read " + launchSecret + " 2>&1"})
+	s.Require().NotContainsf(out, launchMarker, "the running config lost its rules\ndaemon log:\n%s", s.readDaemonLog(c))
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

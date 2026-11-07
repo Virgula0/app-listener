@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/testcontainers/testcontainers-go"
 )
 
 // selfDirGuarded matches the read-only directory self guard, the last one attached.
@@ -168,4 +170,107 @@ need_encryption: false
 		"(%s reads)", strings.TrimSpace(n))
 
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// narrowConfig: perl may do anything in /outer, but only grep (READ) and tee/mkdir (writers) inside
+// its [narrow] subtrees. perl stands for gpg: whitelisted for the tree, never for the secret keys.
+const narrowConfig = `[watch /outer]
+need_encryption: false
+/usr/bin/perl
+/usr/bin/grep
+/usr/bin/tee
+/usr/bin/mkdir
+
+[narrow /outer/keys]
+/usr/bin/grep READ
+/usr/bin/tee
+/usr/bin/mkdir
+
+[narrow /outer/empty]
+/usr/bin/grep READ`
+
+const narrowMarker = "NARROW-SECRET-MARKER-0123456789"
+
+// perlOp runs one perl statement as the tree-only binary and returns its output; `$!` names the
+// errno, so a denial reads "Operation not permitted".
+func (s *IntegrationSuite) perlOp(c testcontainers.Container, stmt string) string {
+	_, out := s.exec(c, []string{"perl", "-e", stmt})
+	return out
+}
+
+func (s *IntegrationSuite) assertNarrowHolds(c testcontainers.Container, when string) {
+	out := s.perlOp(c, `open(F,"<","/outer/pub") or die "open: $!\n"; print <F>`)
+	s.Require().Containsf(out, "pub", "%s: perl must still read its tree: %s", when, out)
+	_, out = s.exec(c, []string{"grep", "-r", "", "/outer/keys"})
+	s.Require().Containsf(out, narrowMarker, "%s: the narrow's own binary must read it: %s", when, out)
+
+	for name, stmt := range map[string]string{
+		"read a key":         `open(F,"<","/outer/keys/secret") or die "open: $!\n"; print <F>`,
+		"read a later file":  `open(F,"<","/outer/keys/d1/d2/d3/late") or die "open: $!\n"; print <F>`,
+		"list the keys":      `opendir(D,"/outer/keys") or die "open: $!\n"; print join(",",readdir D)`,
+		"stat the narrow":    `my @s = stat("/outer/keys") or die "stat: $!\n"; print "mtime=$s[9]\n"`,
+		"create a key":       `open(F,">","/outer/keys/planted") or die "open: $!\n"; print "made\n"`,
+		"move the narrow":    `rename("/outer/keys","/outer/k2") or die "rename: $!\n"; print "moved\n"`,
+		"remove an empty":    `rmdir("/outer/empty") or die "rmdir: $!\n"; print "removed\n"`,
+		"move a key out":     `rename("/outer/keys/secret","/outer/stolen") or die "rename: $!\n"; print "moved\n"`,
+		"move a file in":     `rename("/outer/pub","/outer/keys/pub") or die "rename: $!\n"; print "moved\n"`,
+		"unlink a key":       `unlink("/outer/keys/secret") or die "unlink: $!\n"; print "unlinked\n"`,
+		"hardlink a key out": `link("/outer/keys/secret","/outer/linked") or die "link: $!\n"; print "linked\n"`,
+	} {
+		out := s.perlOp(c, stmt)
+		s.Require().Containsf(out, "Operation not permitted", "%s: perl must not %s: %s", when, name, out)
+		s.Require().NotContainsf(out, narrowMarker, "%s: %s leaked the key: %s", when, name, out)
+	}
+	_, out = s.exec(c, []string{"sh", "-c", "ls -d /outer/keys /outer/empty /outer/pub; cat /outer/keys/secret 2>&1"})
+	s.Require().NotContainsf(out, "No such file", "%s: a denied operation went through: %s", when, out)
+}
+
+// A [narrow] subtree follows only its own whitelist: a binary whitelisted for the tree around it can't
+// read, list, stat, create, move, remove or hard-link anything inside, files made after the start and
+// deeper than the scan included, and a reload keeps the subtree's owner.
+func (s *IntegrationSuite) TestDaemon_Narrow_SubtreeFollowsItsOwnWhitelist() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	s.exec(c, []string{"sh", "-c", "mkdir -p /outer/keys /outer/empty /etc/app-listener && echo pub > /outer/pub && " +
+		"echo " + narrowMarker + " > /outer/keys/secret"})
+	s.startDaemon(c, narrowConfig)
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /outer/keys/d1/d2/d3 && echo " + narrowMarker +
+		" | tee /outer/keys/d1/d2/d3/late"})
+	s.Require().Equalf(0, code, "the narrow's writers must write it: %s", out)
+	s.assertNarrowHolds(c, "after start")
+
+	s.sigDaemon(c, "HUP")
+	const reloadDone = "configuration reloaded without dropping protection"
+	done := false
+	for deadline := time.Now().Add(daemonShutdownTimeout); time.Now().Before(deadline); {
+		if strings.Contains(s.readDaemonLog(c), reloadDone) {
+			done = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	s.Require().Truef(done, "reload did not complete, log:\n%s", s.readDaemonLog(c))
+	s.assertNarrowHolds(c, "after a reload")
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A [narrow] granting what its parent doesn't, or naming a missing path, refuses to start: never a
+// silent fallback to the parent's wider whitelist.
+func (s *IntegrationSuite) TestDaemon_Narrow_ConfigRefused() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+	s.exec(c, []string{"sh", "-c", "mkdir -p /outer/keys /etc/app-listener"})
+	for name, narrow := range map[string]string{
+		"wider":   "[narrow /outer/keys]\n/usr/bin/cat\n",
+		"missing": "[narrow /outer/gone]\n/usr/bin/grep\n",
+	} {
+		s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n[watch /outer]\n" +
+			"need_encryption: false\n/usr/bin/grep READ\n\n" + narrow + "EOF"})
+		_, out := s.exec(c, []string{"sh", "-c",
+			"timeout 60 /app-listener daemon --config /etc/app-listener/daemon.conf --headless 2>&1; echo rc=$?"})
+		s.Require().Containsf(out, "[narrow", "%s: the daemon must name the section: %s", name, out)
+		s.Require().NotContainsf(out, "rc=0", "%s: must refuse: %s", name, out)
+		s.Require().NotContainsf(out, "rc=124", "%s: must refuse at load, not run: %s", name, out)
+	}
 }

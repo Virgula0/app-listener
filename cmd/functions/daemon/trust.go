@@ -246,7 +246,7 @@ func (m *trustManager) afterUnlock(cfg *daemonconfig.Config) error {
 	}
 	log.Infof("trust guard: enforcing write-protection + library allowlist for %d whitelisted binary(ies)",
 		m.binaries)
-	install.WarnGeneralTools(cfg)
+	install.WarnWhitelistLines(cfg)
 	if err := m.applyInspectors(cfg); err != nil {
 		return trustStartupError(err)
 	}
@@ -316,7 +316,7 @@ func (m *trustManager) reload(cfg *daemonconfig.Config) {
 		return
 	}
 	log.Infof("trust guard: trusted set rebuilt after reload (%d whitelisted binary(ies))", m.binaries)
-	install.WarnGeneralTools(cfg)
+	install.WarnWhitelistLines(cfg)
 	if err := m.applyInspectors(cfg); err != nil {
 		log.Errorf("daemon: CRITICAL: reload could not apply [inspectors] (%v) — inspector grants may be "+
 			"stale until this is fixed", err)
@@ -352,6 +352,7 @@ func (m *trustManager) applyTrustSet(cfg *daemonconfig.Config, binaries, libs []
 	if err := tg.SetGuardedDirs(dirs); err != nil {
 		return fmt.Errorf("recording guarded roots: %w", err)
 	}
+	tg.SetLaunchRules(launchRulesByPath(cfg), allowedEnv(cfg))
 	if err := tg.SetTrusted(binaries, libs); err != nil {
 		return fmt.Errorf("loading the trusted set: %w", err)
 	}

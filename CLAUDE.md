@@ -127,7 +127,7 @@ needs cgo (`mlock`). A `CGO_ENABLED=0` build no longer compiles.
 | Command | Use |
 |---|---|
 | `make build` | Full pipeline in a **rootful Docker** container: dumps `vmlinux.h` from the host BTF, regenerates BPF bindings, builds to `build/linux/app-listener`. Nothing but Docker needed on the host. |
-| `make build-host` | Same pipeline on the host — needs a **recent** `clang`/LLVM (`docker/builder.Dockerfile` pins clang 22; clang 14 emits a `guard_path_rename` that overflows the BPF verifier's 1M-insn budget on modern kernels — issue #45), `bpftool`, Go 1.26+, GCC. |
+| `make build-host` | Same pipeline on the host — needs a **recent** `clang`/LLVM (`docker/builder.Dockerfile` pins clang 22; clang 14 emits a `guard_path_rename` that overflows the BPF verifier's 1M-insn budget on modern kernels — issue #45), `bpftool`, Go 1.27.0+, GCC. |
 | `make build-linux` | Go compile only (assumes generated files exist). `GUI=1` adds `-tags gui`: the `app-listener-gui` build, which only opens the fyne window (~20 MiB larger, X11/OpenGL deps). Off by default: the default build is the headless CLI the daemon runs. |
 | `make generate` | Regenerate BPF bindings (`bpf2go`). Needs `bpftool` + readable `/sys/kernel/btf/vmlinux`. `ARCH` (amd64/arm64) defaults to the host's and must equal it: vmlinux.h and `__TARGET_ARCH_*` (PT_REGS layout) are the host's, so the eBPF never cross-builds. |
 | `make vuln` | govulncheck (pinned `GOVULNCHECK_VERSION`) over the module; `GUI=1` scans the `-tags gui` build. Needs generated bindings. |
@@ -252,7 +252,10 @@ site and check each argument's declared type.
   then `go test ./integrationtests/ -v --count=1 -timeout 60m`. Needs **rootful Docker**;
   spins privileged testcontainers (`CAP_BPF`, `SYS_ADMIN`, host `/sys/kernel/btf` bind-mounted,
   `APPLISTENER_ASSUME_BPF_LSM=1` set inside because containers have no securityfs). Auto-skips
-  when `docker` is not on PATH.
+  when `docker` is not on PATH. It sets `APPLISTENER_BROWSER_TESTS=1` (`TestDaemon_RealBrowserProfiles`
+  downloads Firefox and Chrome, ~300 MB); plain `go test` skips that test unless you set it. apt
+  lists/packages (`build/test/_apt-cache/<image>`, bind-mounted by `startContainer`) and the browser
+  downloads (`build/test/cache`, 7 days) persist across runs.
 - Single integration test: `go test ./integrationtests/ -v -run 'TestIntegrationSuite/TestGuardWhitelist' -count=1`.
 - The integration suite compiles the binary under test statically with `-tags ci,osusergo,netgo`
   (`main_test.go`), and runs it against `ubuntu:latest` containers whose glibc is older than a

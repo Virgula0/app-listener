@@ -106,7 +106,8 @@ The desktop window's Trust page does the same (see [gui.md](gui.md#trust)).
 Identity is the executable, so `ELECTRON_RUN_AS_NODE=1 code -e ...` or
 `NODE_OPTIONS=--require=/tmp/x.js discord` is the whitelisted binary running **its caller's** code.
 For whitelisted Node/Electron, Chromium, JVM and Bun runtimes (detected from the binary's own
-strings, or the name `java`), the daemon judges the new process's environment and arguments at
+strings, the name `java`, or `JNI_CreateJavaVM` for a launcher that loads the JVM into its own
+process, such as JetBrains' `bin/idea`), the daemon judges the new process's environment and arguments at
 exec, before any of its code runs. Bun covers `bun build --compile` apps such as opencode and the
 native `claude`.
 
@@ -118,8 +119,23 @@ A launch is **risky** when it has any of:
   scaling);
 - Bun environment: `BUN_BE_BUN` (a compiled app becomes the `bun` CLI), `BUN_OPTIONS`
   (`--preload`), `BUN_INSPECT*`, `BUN_RUNTIME_TRANSPILER_CACHE_PATH`;
+- JetBrains launcher environment: `<PRODUCT>_VM_OPTIONS`, `<PRODUCT>_JDK`, `<PRODUCT>_PROPERTIES`
+  (`IDEA`, `PYCHARM`, `WEBSTORM`, `CLION`, `GOLAND`, `WEBIDE`, `PHPSTORM`, `RIDER`, `DATAGRIP`,
+  `RUSTROVER`, `RUBYMINE`, `DATASPELL`, `STUDIO`);
 - code-loading flags: `--inspect*`, `--eval`, `--print`, `--require`, `--import`, `--loader`,
-  `--env-file*`, `--remote-debugging-*`, `--load-extension`;
+  `--env-file*`, `--remote-debugging-*`, `--load-extension`, `--disable-extensions-except`,
+  `--load-apps` (whatever `--disable-features` re-enables in branded Chrome);
+- TLS and proxy flags: `--ignore-certificate-errors*`, `--proxy-server`, `--proxy-pac-url` (the
+  app would send its cookies and tokens to a server its caller chose);
+- output and log flags: `--headless`, `--dump-dom`, `--screenshot`, `--print-to-pdf` (a headless
+  browser prints or renders any `file://` it can read, its own profile included), `--log-net-log`,
+  `--net-log-capture-mode`, `--ssl-key-log-file` and the `SSLKEYLOGFILE` environment variable
+  (cookies and TLS keys written to a file of the caller's choosing), `--pack-extension` (a `.crx` of
+  the directory it names, written beside it);
+- file access flags: `--allow-file-access-from-files`, `--disable-web-security` (a `file://` page
+  reads any other file the browser can read and sends it out, with or without a window);
+- for Node/Electron and Chromium, an argument starting with whitespace: Chromium trims it off and
+  reads what follows as a switch;
 - child-process launchers: `--renderer-cmd-prefix`, `--utility-cmd-prefix`,
   `--zygote-cmd-prefix`, `--gpu-launcher`, `--browser-subprocess-path`;
 - VS Code extension flags: `--extensions-dir`, `--extensionDevelopmentPath`,
@@ -138,7 +154,15 @@ A risky launch still runs, but the process (and its forks; an exec is judged afr
 - gets nothing else below a whitelist-mode tree either: no `stat`, directory listing or xattr.
 
 Fix: start the app without that variable or flag. A process that mapped untrusted code before its
-binary was whitelisted is refused the same way (`op=PRELOADED`). Libraries from a `lib_dir` of the
+binary was whitelisted is refused the same way (`op=PRELOADED`).
+
+A Bun app compiled with the default `bun build --compile` (and the `bun` CLI itself) also runs the
+`preload` of a `bunfig.toml` in the directory it starts in. The daemon reads each Bun binary's
+embedded flags; one that loads `bunfig.toml` never reads a secret (`TRUST DENIED  op=BUNFIG`),
+wherever it starts: the file it loads may be a symlink or a bind mount under that name, which no
+name check can tell. The daemon names such a binary when it loads the configuration. Build it with
+`--no-compile-autoload-bunfig`. `opencode` and the native `claude` don't load it. A binary whose
+flags can't be read counts as loading it. Libraries from a `lib_dir` of the
 updater that created the binary don't count: a self-updating app such as Steam starts its new binary
 before the daemon admits it, and everything that process runs is code its updater chose. That new
 binary's launch is judged at exec too, before the daemon knows what runtime it is: by every
@@ -146,7 +170,96 @@ runtime's rules above (so a flag only another runtime treats as risky marks it t
 generic Electron app rule below.
 
 Generic Electron binaries that run an app named on the command line are covered by
-[`[electron_apps]`](daemon-config.md#generic-electron-apps-electron_apps).
+[`[electron_apps]`](config-reference.md#electron_apps).
+
+### Browser profiles
+
+A browser runs whatever its profile tells it to: a `user.js` can turn off Firefox's `file://`
+isolation, and a Chromium profile can carry an extension. A page on a profile its caller made then
+reads any file the whitelisted browser may, its real profile included. No flag is needed:
+`HOME=/tmp/x firefox` finds a planted `.mozilla/firefox` by itself.
+
+So the catalog gives each browser its **profile anchors**, the files it locks or reads first in the
+profile it runs on:
+
+| Browser | Anchors |
+|---|---|
+| Firefox | `prefs.js`, `user.js`, `extensions.json` |
+| Chrome, Chromium, Brave | `SingletonLock`, `Local State`, `Preferences`, `Secure Preferences` |
+
+A whitelisted browser that creates or opens one outside every guarded tree (`--profile`,
+`--user-data-dir`, `-P` with a profile elsewhere, another `HOME` or `XDG_CONFIG_HOME`) is marked
+for life, its forks and the programs it execs included (Firefox execs the fork server that starts
+its content processes): `trust guard: PROFILE comm=... anchor=<path>` in the log, then
+`op=PROFILE` for every guarded file it asks for. A profile planted in another guarded tree is
+refused to the browser by that tree's guard. The anchors are applied by basename (`firefox`,
+`firefox-bin`, `chrome`, `chromium`, `brave`) to every whitelisted binary of that name, also in
+hand-written sections. They need the whole profile guarded: a section that watches only some of a
+profile's subdirectories leaves `Local State` outside, and the browser is marked on its own
+profile. Firefox's lock files are no anchors: it locks `$TMPDIR/firefox` the same way at every start.
+
+Fix: run test and automation profiles without the real profile's secrets, which is what the mark
+does. A browser that started before the daemon is not marked.
+
+## Launch rules
+
+Some whitelisted CLIs print or spend their secret when asked. The launch scan also judges any
+whitelisted binary with launch rules, and a match marks the process the same way. Its denials
+name the binary, who ran it and the word that matched:
+`TRUST DENIED  op=ARGV  comm=... commFullPath=<its exe>  parentFullPath=<who ran it> ... path=<the secret>  word=<the word>`.
+From the catalog (each entry's `LaunchRules` in `internal/install/catalog.go`), by the whitelisted
+file's name, in every section that whitelists a file of that name:
+
+- `gh`: `auth token`, `auth status --show-token`, `auth status -t`, `alias set`, `alias import`;
+  `auth git-credential` is only logged, since git runs it on every push.
+- `aws`: `configure export-credentials`, `configure get`.
+- `pi`: `-e` and `--extension` (it runs the extension in its own process), and
+  `PI_CODING_AGENT_DIR` set (an agent directory whose `extensions/` its caller wrote).
+- `opencode`: `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR` or `OPENCODE_CONFIG_CONTENT` set (a config,
+  plugins and provider URLs of its caller's choosing).
+- `codex`: `OPENAI_BASE_URL` set (the server it sends its key to); `-c` and `--config` are only
+  logged: they override any config key, base URLs included, and are too common to refuse.
+- `ssh`: `-F`, in any cluster of short options (`-4F/tmp/c`): `ssh` prints every line of a
+  config file it can't parse, so `ssh -F ~/.ssh/id_ed25519 -G x` would print the key. Also matched
+  in a remote command (`ssh host ls -F`); `-o Include` is refused by `ssh` itself.
+- `sshd`, `sshd-session`, `sshd-auth`: run by any uid but 0 (logged as `word=uid`): `sshd -t -f`
+  prints the config it names line by line, and only root runs the server.
+- `gpg`: `--export-secret-keys`, `--export-secret-subkeys`, `--export-secret-ssh-key`, `--enarmor`
+  (`--enarmour`) and `--store`, each in every abbreviation gpg accepts (`--export-se` up to the full
+  name: gpg runs any unambiguous prefix of a long option). The first three print secret keys,
+  the last two wrap any file gpg reads; the secret keys themselves are out of gpg's reach
+  ([what they miss](limitations.md#whitelisted-programs-that-disclose-on-request)).
+- `kubectl`, `oc`: `config view --raw` (plain `config view` redacts keys and tokens).
+- `rclone`: `config show`, `config dump` (every remote's tokens and passwords).
+- `firefox` (not a Chromium runtime, so the launch scan doesn't judge it): `--headless`,
+  `--screenshot`, `--remote-debugging-port`, `--marionette`, `--start-debugger-server`,
+  `--jsdebugger` and `--MOZ_LOG`, each with one or two dashes, and the variables `MOZ_HEADLESS`,
+  `MOZ_MARIONETTE`, `MOZ_LOG` and `SSLKEYLOGFILE`: the same output, remote-control and log routes
+  as Chromium's.
+- JetBrains launchers (`idea`, `pycharm`, ..., Android Studio's `studio`): `installPlugins`, which
+  installs a plugin from any repository; the plugin then runs in the IDE.
+- `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
+  `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag (it reads the method from stdin).
+- `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,
+  `fundchannel`, `multifundchannel`, `close`, `exposesecret`.
+- Every whitelisted binary (built into the daemon, not the catalog): `SSL_CERT_FILE` or `SSL_CERT_DIR` (Go, OpenSSL, GnuTLS) or
+  `NODE_EXTRA_CA_CERTS` (Node, Bun) set, which would make its TLS stack trust a certificate its
+  caller chose and send its token to that server, and `NODE_TLS_REJECT_UNAUTHORIZED`, which can turn
+  verification off. A value that is exactly a distribution's system bundle passes (`/etc/ssl/certs/ca-certificates.crt`,
+  `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`,
+  `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
+  `/etc/ca-certificates/extracted/tls-ca-bundle.pem`; directories `/etc/ssl/certs`,
+  `/etc/pki/tls/certs`), as does one you add with [`allow_env`](config-reference.md#allow_env), when only root decides what the path
+  holds. For `NODE_EXTRA_CA_CERTS` only the first four bundles fit the rule's 63-byte key.
+  A match logs the variable's name only, never its value.
+
+A rule's words match in order anywhere in the arguments, with anything between them, so a flag's
+value can't split them (`gh auth --hostname x token`). Add your own with
+[`[launch_rules]`](config-reference.md#launch_rules).
+
+The rules are a tripwire. Except for `ssh`'s, they don't see combined short flags (`-th`), aliases, a script that
+feeds the CLI its arguments another way, or a token the CLI reads from the keyring rather than a
+guarded file: with keyring storage, `gh auth token` still prints it.
 
 ## The dynamic loader
 

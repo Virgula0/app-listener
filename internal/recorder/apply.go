@@ -230,8 +230,8 @@ func (a *applier) unguarded(p *Plan) []string {
 		return []string{"could not confirm the new guards with the daemon: " + err.Error()}
 	}
 	paths := make([]string, 0, len(p.Sections)+len(p.Extensions))
-	for _, s := range p.Sections {
-		paths = append(paths, s.Path)
+	for i := range p.Sections {
+		paths = append(paths, p.Sections[i].Path)
 	}
 	for _, e := range p.Extensions {
 		paths = append(paths, e.Path)

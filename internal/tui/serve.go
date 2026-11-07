@@ -1,12 +1,11 @@
 package tui
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -441,9 +440,7 @@ func writeSnapshotLoop(conn *websocket.Conn, updates chan string, readDone chan 
 
 func parseResize(data []byte) (tea.WindowSizeMsg, error) {
 	var resize resizeMessage
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&resize); err != nil || !decodeEndsAtEOF(decoder) {
+	if err := json.Unmarshal(data, &resize, json.RejectUnknownMembers(true)); err != nil {
 		return tea.WindowSizeMsg{}, errors.New("invalid resize message")
 	}
 	if resize.Type != "resize" || resize.Cols < minServeCols || resize.Cols > maxServeCols ||
@@ -451,11 +448,6 @@ func parseResize(data []byte) (tea.WindowSizeMsg, error) {
 		return tea.WindowSizeMsg{}, errors.New("resize dimensions out of range")
 	}
 	return tea.WindowSizeMsg{Width: resize.Cols, Height: resize.Rows}, nil
-}
-
-func decodeEndsAtEOF(decoder *json.Decoder) bool {
-	var extra any
-	return errors.Is(decoder.Decode(&extra), io.EOF)
 }
 
 func writeSnapshot(conn *websocket.Conn, snapshot string) error {

@@ -3,6 +3,7 @@ package install
 import (
 	"fmt"
 	"os"
+	"slices"
 
 	log "github.com/sirupsen/logrus"
 
@@ -93,7 +94,7 @@ func collectDiffAdditions() (prevCfg *daemonconfig.Config, mergedText string, me
 	if editErr != nil {
 		return nil, "", nil, false, editErr
 	}
-	inst.WarnGeneralTools(parsed)
+	inst.WarnWhitelistLines(parsed)
 	return cfg, text, parsed, true, nil
 }
 
@@ -147,7 +148,8 @@ func addedResources(prev, merged *daemonconfig.Config) *daemonconfig.Config {
 // path/encryption root nor nested with one (either direction): what a diff would propose adding.
 func uncoveredCandidates(cfg *daemonconfig.Config, users []inst.User) []inst.Candidate {
 	covered := inst.CoveredPaths(cfg)
-	all := inst.DiscoverForUsers(users)
+	all := slices.Concat(inst.DiscoverForUsers(users), inst.DiscoverRuntime(users), inst.DiscoverPorts(users),
+		inst.DiscoverSecrets(users))
 	var fresh []inst.Candidate
 	for i := range all {
 		if !inst.PathCovered(all[i].Path, covered) {
@@ -165,6 +167,7 @@ func appendSectionsAndEdit(oldText string, picked []inst.Candidate) (string, *da
 	for _, block := range libraryBlocksFromCandidates(picked) {
 		merged = inst.EnsureLibraryBlock(merged, &block)
 	}
+	merged = inst.EnsureSecretServiceBlock(merged)
 	prev, err := daemonconfig.Parse([]byte(oldText))
 	if err != nil {
 		prev = nil // every line is checked

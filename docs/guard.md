@@ -20,7 +20,7 @@ sudo app-listener guard /secret -b /usr/bin/rm     # block only rm
 
 `-w` and `-b` are mutually exclusive. Binaries are matched by inode, see
 [How it works](how-it-works.md#identity-is-the-executables-inode). The rule covers every
-operation: `guard` has no per-event filter (the [daemon](daemon-config.md) has one per binary).
+operation: `guard` has no per-event filter (the [daemon](config-reference.md#binary-lines-and-events) has one per binary).
 
 ## Flags
 

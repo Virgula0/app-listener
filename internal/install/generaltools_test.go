@@ -1,6 +1,16 @@
 package install
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	logtest "github.com/sirupsen/logrus/hooks/test"
+
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
+)
 
 func TestNamedGeneralTool(t *testing.T) {
 	for _, p := range []string{
@@ -17,6 +27,71 @@ func TestNamedGeneralTool(t *testing.T) {
 	} {
 		if namedGeneralTool(p) {
 			t.Errorf("%s is not a general tool", p)
+		}
+	}
+}
+
+func TestScriptsOf_NamesTheConfiguredLine(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "versions", "pass")
+	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(script, []byte("#!/bin/bash\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "pass")
+	res := &daemonconfig.Resource{Binaries: []daemonconfig.BinaryRule{
+		{Path: script, Link: link}, {Path: script}, {Path: self},
+	}}
+	if got := ScriptsOf(res); !slices.Equal(got, []string{link, script}) {
+		t.Errorf("ScriptsOf = %v, want [%s %s]", got, link, script)
+	}
+}
+
+func TestWarnWhitelistLines_OneWarningPerScriptSet(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "pv-locale-gen")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{
+		{Path: "/home/u/.steam", Binaries: []daemonconfig.BinaryRule{{Path: script}}},
+		{Path: "/home/u/.local/share/Steam/config", Binaries: []daemonconfig.BinaryRule{{Path: script}}},
+	}}
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	WarnWhitelistLines(cfg)
+	var hits []string
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "never match") {
+			hits = append(hits, e.Message)
+		}
+	}
+	if len(hits) != 1 || !strings.Contains(hits[0], "/home/u/.steam, /home/u/.local/share/Steam/config") {
+		t.Errorf("want one warning naming both resources, got %q", hits)
+	}
+}
+
+// A catalog line naming a general tool makes its secret readable by any script run through it
+// (scp copies the file its caller names, sftp-server serves it, git diff prints it).
+func TestCatalogWhitelistsNoGeneralTool(t *testing.T) {
+	for _, e := range Catalog {
+		for bin := range e.Whitelist {
+			if namedGeneralTool(bin) {
+				t.Errorf("%s whitelists general tool %s", e.Name, bin)
+			}
+		}
+	}
+}
+
+func TestFileTransferToolsAreGeneral(t *testing.T) {
+	for _, p := range []string{"/usr/bin/scp", "/usr/bin/sftp", "/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server"} {
+		if !namedGeneralTool(p) {
+			t.Errorf("%s not named a general tool", p)
 		}
 	}
 }

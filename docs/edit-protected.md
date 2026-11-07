@@ -221,7 +221,7 @@ page and again in the review). Then:
   once it is whitelisted.
 - In a `watch:` group the whitelist is shared: a line added for one path reaches the group's other
   paths too, and the warning names them.
-- Encryption is not offered for such a path: change its `need_encryption` with `edit-protected config`.
+- Encryption is not offered for such a path: change its [`need_encryption`](config-reference.md#need_encryption) with `edit-protected config`.
 - Selecting nothing new applies nothing. Paths around or inside a guarded path, a `lib_dir`, or a
   group's encryption root are still refused.
 

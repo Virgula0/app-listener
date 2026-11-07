@@ -55,8 +55,8 @@ var ComputeBinaryEntry = ebpf.ComputeBinaryEntry
 type GuardEvent struct {
 	ebpf.FileEvent
 	Blocked bool
-	// FsGate labels a filesystem-wide gate denial (RawDeviceResourceLabel, BtrfsIoctlResourceLabel):
-	// it names a device or filesystem, not a resource; don't attribute it to a watched path.
+	// FsGate labels a gate denial that names no resource (RawDeviceResourceLabel,
+	// BtrfsIoctlResourceLabel, ConfinedConnectResourceLabel); don't attribute it to a watched path.
 	FsGate string
 	// Process names a process-gate denial ("PTRACE", "TRACED_EXEC", "PROC_MEM"): no file involved;
 	// Path is "pid=<n> comm=<name>" of the other task. Empty for path-keyed events.
@@ -64,7 +64,7 @@ type GuardEvent struct {
 	// Scope labels a process-gate denial judged for several resources: MultipleResourceLabel (the
 	// GLOBAL slot) or a taint set's paths, comma-separated. Empty: the receiving guard's own.
 	Scope string
-	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH"): it runs
+	// Suspect names why a whitelisted exe's process was denied ("PRELOADED", "LAUNCH", "ARGV"): it runs
 	// code its exe doesn't vouch for (trust_code_suspect). Empty otherwise.
 	Suspect string
 	// Exe is the acting process's exe inode as the kernel judged it; zero for a process gate.
@@ -109,11 +109,17 @@ const (
 	guardReasonTracedExec = 3
 	guardReasonProcMem    = 4
 	guardReasonBtrfsIoctl = 5
+	guardReasonPortAddr   = 6
+	guardReasonPortSMC    = 7
+	guardReasonConfined   = 8
 
 	guardReasonGateMask     = 0xff
 	guardReasonSuspectShift = 8
 	suspectPreload          = 1
 	suspectLaunch           = 2
+	suspectArgv             = 3
+	suspectBunfig           = 4
+	suspectProfile          = 5
 )
 
 // suspectLabel maps a reason's SUSPECT_* mark to its logged op label; "" when unmarked.
@@ -123,6 +129,12 @@ func suspectLabel(reason uint32) string {
 		return "PRELOADED"
 	case suspectLaunch:
 		return "LAUNCH"
+	case suspectArgv:
+		return "ARGV"
+	case suspectBunfig:
+		return "BUNFIG"
+	case suspectProfile:
+		return "PROFILE"
 	default:
 		return ""
 	}
@@ -142,10 +154,19 @@ func processGateLabel(reason uint32) string {
 	}
 }
 
-// Resource strings logged for filesystem-wide gate denials (GuardEvent.FsGate).
+// PortAddrLabel is the Dest of a refused listen on a guarded port at a non-loopback address;
+// PortSMCLabel of a refused SMC bind to one.
+const (
+	PortAddrLabel = "non-loopback-address"
+	PortSMCLabel  = "smc-socket"
+)
+
+// Resource strings logged for gate denials that name no resource (GuardEvent.FsGate).
 const (
 	RawDeviceResourceLabel  = "raw-block-device"
 	BtrfsIoctlResourceLabel = "btrfs-ioctl"
+	// A ConnectConfinedNames binary's unix connect to a socket outside every guarded tree.
+	ConfinedConnectResourceLabel = "unguarded-socket"
 )
 
 // fsGateLabel maps a filesystem-wide gate reason to its label; "" for every other event.
@@ -155,6 +176,8 @@ func fsGateLabel(reason uint32) string {
 		return RawDeviceResourceLabel
 	case guardReasonBtrfsIoctl:
 		return BtrfsIoctlResourceLabel
+	case guardReasonConfined:
+		return ConfinedConnectResourceLabel
 	default:
 		return ""
 	}
@@ -236,6 +259,8 @@ type Guard struct {
 	// updateRootKey when a single-file root is recreated (a stale anchor stops guarding the real
 	// file and guards whatever reuses the freed inode). Guarded by mu.
 	rootKey GuardInodeKey
+	// rootSlot: where rootKey was anchored (anchorAlive). Guarded by mu.
+	rootSlot rootSlot
 	// rootReal is where the root path resolved when anchored (d_path); a sweep never re-anchors
 	// onto a root that now resolves elsewhere. anchorRefused: last refused key (log once). Both
 	// guarded by mu.
@@ -262,6 +287,8 @@ type Guard struct {
 	chmodDropWrite bool
 	// movePeer: WithMovePeer.
 	movePeer uint64
+	// nested: WithNested.
+	nested bool
 	// systemPatterns: WithSystemPatterns.
 	systemPatterns []daemonconfig.BinaryRule
 	// vetted: whitelist path -> the inode it was hashed from (binaryKey). Guarded by mu.
@@ -276,6 +303,8 @@ type Guard struct {
 	// rootMount is the mount the root was last reached through (noteRootMount): localizePaths maps
 	// the kernel's superblock-relative event paths through it. Nil when unknown.
 	rootMount atomic.Pointer[ebpf.MountInfo]
+	// port: WithPort.
+	port uint32
 }
 
 // GuardOption customizes a Guard before its BPF maps are populated.
@@ -355,6 +384,14 @@ func WithoutOwnAllowedEvents() GuardOption {
 func WithMovePeer(peer uint64) GuardOption {
 	return func(g *Guard) {
 		g.movePeer = peer
+	}
+}
+
+// WithNested marks a [narrow] root inside another resource's tree: its directory root's stat is
+// judged like its contents (guard_inode_getattr).
+func WithNested() GuardOption {
+	return func(g *Guard) {
+		g.nested = true
 	}
 }
 
@@ -621,6 +658,16 @@ func (g *Guard) startSteps() []func() error {
 		}
 		return nil
 	}
+	if g.port != 0 {
+		// Once its anchor resolves to this slot: a port row ahead of it judges by GUARD_RES_GLOBAL.
+		claimAnchor := claimRoot
+		claimRoot = func() error {
+			if err := claimAnchor(); err != nil {
+				return err
+			}
+			return g.publishPort()
+		}
+	}
 
 	// Ordering. Normally ACTIVATE BEFORE claiming any inode: an active slot with no rows denies
 	// nothing, and claiming then displaces a prior owner's row into an ALREADY-ACTIVE slot — closing
@@ -669,12 +716,15 @@ func (g *Guard) PinDegraded() bool { return SharedPinDegraded() }
 // inode/bprm ones, a superseded binary or a reused inode number would keep its whitelist entry
 // (exe_supersede.h); without the ioctl ones, a btrfs snapshot copies a guarded tree unguarded;
 // without task_prctl, a process repoints mm->exe_file at a whitelisted inode (prctl PR_SET_MM) and
-// borrows its identity, so the guard's inode-keyed policy is bypassable.
+// borrows its identity, so the guard's inode-keyed policy is bypassable; without the socket ones,
+// anyone can talk to an agent socket bound inside a guarded tree or a guarded loopback port.
 var requiredHooks = map[string]bool{
 	"file_open": true, "file_permission": true,
 	"inode_unlink": true, "inode_rename": true, "bprm_committed_creds": true,
 	"file_ioctl": true, "file_ioctl_compat": true,
-	"task_prctl": true,
+	"task_prctl": true, "unix_stream_connect": true, "unix_may_send": true,
+	"socket_sendmsg": true, "socket_recvmsg": true, "socket_connect": true, "socket_listen": true,
+	"socket_bind": true, "socket_accept": true, "sock_graft": true, "socket_getsockopt": true, "mmap_file": true,
 }
 
 // ExeActionsPinName/ExeEventsPinName are the pin suffixes of guard_exe_actions/guard_exe_events
@@ -774,6 +824,16 @@ func guardLSMHooks(o *GuardObjects, ioctlCompat bool) []lsmHook {
 		{o.GuardInodeUnlink, "inode_unlink"},
 		{o.GuardInodeRename, "inode_rename"},
 		{o.GuardFileIoctl, "file_ioctl"},
+		{o.GuardUnixStreamConnect, "unix_stream_connect"},
+		{o.GuardUnixMaySend, "unix_may_send"},
+		{o.GuardSocketSendmsg, "socket_sendmsg"},
+		{o.GuardSocketRecvmsg, "socket_recvmsg"},
+		{o.GuardSocketConnect, "socket_connect"},
+		{o.GuardSocketListen, "socket_listen"},
+		{o.GuardSocketBind, "socket_bind"},
+		{o.GuardSocketAccept, "socket_accept"},
+		{o.GuardSockGraft, "sock_graft"},
+		{o.GuardSocketGetsockopt, "socket_getsockopt"},
 	}
 	if ioctlCompat {
 		hooks = append(hooks, lsmHook{o.GuardFileIoctlCompat, "file_ioctl_compat"})
@@ -975,6 +1035,17 @@ var runtimeAccessEvents = append(append([]ebpf.EventType(nil), editGrantEvents..
 // grant holds the mask: restoring the baseline afterwards would end that session's access.
 func (g *Guard) WithSelfRuntimeAccess(fn func() error) error {
 	return g.withSelfMask(runtimeAccessEvents, "runtime", true, fn)
+}
+
+// ownerAccessEvents lets the daemon finish a runtime directory: plant its sentinel (one found at a
+// start or reload has none), hand one it made to its user (fchown), or move aside a found one it
+// didn't make (rename of the root).
+var ownerAccessEvents = []ebpf.EventType{ebpf.EventOpen, ebpf.EventRead, ebpf.EventStat, ebpf.EventAttr,
+	ebpf.EventMkdir, ebpf.EventMknod, ebpf.EventWrite, ebpf.EventRename}
+
+// WithSelfOwnerAccess is WithSelfRuntimeAccess with ownerAccessEvents.
+func (g *Guard) WithSelfOwnerAccess(fn func() error) error {
+	return g.withSelfMask(ownerAccessEvents, "owner", true, fn)
 }
 
 // withSelfMask widens the self mask to events for fn. exclusive refuses while a live edit grant
@@ -1248,6 +1319,11 @@ func (g *Guard) putBinaryKey(key GuardInodeKey, path string, events map[string][
 			if err := g.objs().GuardExeEvents.Put(g.resKey(key), mask); err != nil {
 				return fmt.Errorf("storing exe events for %s: %w", path, err)
 			}
+		}
+	}
+	if action == GUARD_ALLOW {
+		if err := confineConnect(key, path); err != nil {
+			return err
 		}
 	}
 	if err := g.putExeAction(key, action); err != nil {
@@ -1533,6 +1609,9 @@ func (g *Guard) writeGuardConfig(modeKey uint64) error {
 	if g.mode == ModeReadOnly {
 		cfg.MovePeer = g.movePeer
 	}
+	if g.nested {
+		cfg.Nested = 1
+	}
 	if putErr := g.objs().GuardResConfig.Put(g.resID, cfg); putErr != nil {
 		return fmt.Errorf("writing resource slot %d: %w", g.resID, putErr)
 	}
@@ -1560,7 +1639,7 @@ func (g *Guard) populateMaps() error {
 	}
 	g.noteRootMount(root)
 	root.close()
-	if keyErr := g.updateRootKey(root.key, root.sbdev); keyErr != nil {
+	if keyErr := g.updateRootKey(root); keyErr != nil {
 		return keyErr
 	}
 	g.mu.Lock()
@@ -1660,10 +1739,11 @@ func (g *Guard) putBackingDevices(rdevs []uint32) error {
 	return nil
 }
 
-// updateRootKey re-anchors the watch-root identity to newKey on superblock sbdev in the resource's
-// config (root_in_chain) and g.rootKey. Called from populateMaps and from SweepInodes when a
-// single-file root is recreated.
-func (g *Guard) updateRootKey(newKey GuardInodeKey, sbdev uint64) error {
+// updateRootKey re-anchors the watch-root identity to root's key on its superblock in the resource's
+// config (root_in_chain), g.rootKey and g.rootSlot. Called from populateMaps and from SweepInodes
+// when a root is recreated. root's fd may already be closed.
+func (g *Guard) updateRootKey(root *rootHandle) error {
+	newKey, sbdev, slot := root.key, root.sbdev, slotOf(root)
 	cfg, err := g.resConfig()
 	if err != nil {
 		return err
@@ -1678,9 +1758,9 @@ func (g *Guard) updateRootKey(newKey GuardInodeKey, sbdev uint64) error {
 		return err
 	}
 	g.mu.Lock()
-	g.rootKey = newKey
+	g.rootKey, g.rootSlot = newKey, slot
 	g.mu.Unlock()
-	return nil
+	return g.publishPort()
 }
 
 // treeInode returns the inode a tree walk records for path. Whitelist guards follow a symlink entry
@@ -1789,7 +1869,7 @@ func (g *Guard) reanchorRoot(oldKey GuardInodeKey, root *rootHandle) error {
 	if err := releaseRootTrust(g.resID, oldKey); err != nil {
 		return fmt.Errorf("untrusting libraries under the old root of %s: %w", g.path, err)
 	}
-	if err := g.updateRootKey(root.key, root.sbdev); err != nil {
+	if err := g.updateRootKey(root); err != nil {
 		return err
 	}
 	if delErr := g.objs().GuardInodes.Delete(oldKey); delErr != nil && !errors.Is(delErr, cilium.ErrKeyNotExist) {
@@ -1821,7 +1901,9 @@ func (g *Guard) reanchorRefusal(oldKey GuardInodeKey, root *rootHandle, resolved
 // anchorAlive reports whether key is still the anchor and no allowed operation released it. A
 // root moved by an ancestor swap stays anchored (re-anchoring would leave that tree unguarded);
 // guard_root_moved records one an allowed rename, unlink or rmdir released, and
-// inode_free_security zeroes the anchor of one freed with no links.
+// inode_free_security zeroes the anchor of one freed with no links. The hooks record before the
+// kernel's own checks, so a failed delete leaves a record behind: it counts only once the root has
+// left its slot, or a later ancestor swap would pass as that release.
 func (g *Guard) anchorAlive(key GuardInodeKey) (bool, error) {
 	cfg, err := g.resConfig()
 	if err != nil {
@@ -1834,7 +1916,13 @@ func (g *Guard) anchorAlive(key GuardInodeKey) (bool, error) {
 	if err := g.objs().GuardRootMoved.Lookup(g.resID, &moved); err != nil {
 		return false, fmt.Errorf("reading moved root of resource slot %d: %w", g.resID, err)
 	}
-	return moved != key, nil
+	if moved != key {
+		return true, nil
+	}
+	g.mu.Lock()
+	slot := g.rootSlot
+	g.mu.Unlock()
+	return slot.holds(key), nil
 }
 
 // clearRootMoved forgets a recorded root move: the anchor it released is gone or back in place.
@@ -2378,6 +2466,12 @@ func parseGuardEvent(raw []byte) (*GuardEvent, uint32, bool) {
 		Suspect:   suspectLabel(be.Reason),
 		Exe:       GuardInodeKey{Dev: be.ExeDev, Ino: be.ExeIno},
 	}
+	switch be.Reason & guardReasonGateMask {
+	case guardReasonPortAddr:
+		ge.Dest = PortAddrLabel
+	case guardReasonPortSMC:
+		ge.Dest = PortSMCLabel
+	}
 	if ge.Process != "" {
 		// The kernel sends the other task's comm in path and its tgid in fd.
 		ge.Path = fmt.Sprintf("pid=%d comm=%s", be.FD, ge.Path)
@@ -2410,6 +2504,10 @@ func (g *Guard) noteRootMount(root *rootHandle) {
 // event of this slot walked through the root's dentry, so it is on the root's filesystem. Display
 // only: no decision reads these paths.
 func (g *Guard) localizePaths(ev *GuardEvent) {
+	if g.port != 0 && ev.Path == "" {
+		ev.Path = g.path // a port decision has no dentry: name the section's anchor
+		return
+	}
 	m := g.rootMount.Load()
 	if m == nil || (m.Root == "/" && m.Mountpoint == "/") {
 		return
@@ -2585,6 +2683,7 @@ func (g *Guard) cleanup() {
 		log.Errorf("guard %s: CRITICAL: could not untrust libraries under the released root (%v) — "+
 			"they stay loadable by its writers until the next reload", g.path, err)
 	}
+	sharedEngine.unpublishPort(g)
 	sharedEngine.forgetResource(g.resID)
 	g.dropResourceState()
 	g.unpinSelfMaps()

@@ -73,17 +73,33 @@ func (s *IntegrationSuite) startDaemon(c testcontainers.Container, config string
 	s.awaitDaemonUp(c, config)
 }
 
-// watchPathsInConfig extracts every "[watch <path>]" section header's path
-// from a daemon.conf, in order, for awaitDaemonUp to wait on each one's own
+// watchPathsInConfig extracts every "[watch <path>]" section header's path (a port or secret
+// section's anchor, [secret_service]'s relay dir) from a daemon.conf, in order, for awaitDaemonUp to wait on each one's own
 // "guard started" line individually rather than stopping at the first.
 func watchPathsInConfig(config string) []string {
 	var paths []string
 	for line := range strings.SplitSeq(config, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "[watch ") || !strings.HasSuffix(line, "]") {
+		if port, ok := strings.CutPrefix(line, "[port tcp/"); ok {
+			paths = append(paths, "/run/app-listener/ports/tcp-"+strings.TrimSuffix(port, "]"))
 			continue
 		}
-		path := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))
+		if name, ok := strings.CutPrefix(line, "[secret "); ok {
+			paths = append(paths, "/run/app-listener/secret-scopes/"+strings.TrimSuffix(name, "]"))
+			continue
+		}
+		if line == "[secret_service]" {
+			paths = append(paths, "/run/app-listener/secret-relay")
+			continue
+		}
+		head, ok := strings.CutPrefix(line, "[watch ")
+		if !ok {
+			head, ok = strings.CutPrefix(line, "[narrow ")
+		}
+		if !ok || !strings.HasSuffix(line, "]") {
+			continue
+		}
+		path := strings.TrimSpace(strings.TrimSuffix(head, "]"))
 		if path = strings.Trim(path, `"`); path != "" { // generated configs quote the path
 			paths = append(paths, path)
 		}
@@ -121,11 +137,14 @@ func (s *IntegrationSuite) confirmConfigBinaries(c testcontainers.Container) {
 	s.Require().Equalf(0, code, "confirming daemon.conf's binaries: %s", out)
 }
 
-// configBinaryLines are the binary paths of a daemon.conf: whitelist and lib_binary lines.
+// configBinaryLines are the binary paths of a daemon.conf: whitelist, lib_binary and [secret_service] lines.
 func configBinaryLines(conf string) []string {
 	var out []string
 	for line := range strings.SplitSeq(conf, "\n") {
-		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "lib_binary"))
+		line = strings.TrimSpace(line)
+		for _, kw := range []string{"lib_binary", "provider ", "prompter ", "manager "} {
+			line = strings.TrimSpace(strings.TrimPrefix(line, kw))
+		}
 		line = strings.TrimSpace(strings.TrimPrefix(line, ":"))
 		switch {
 		case strings.HasPrefix(line, `"`):
@@ -2193,7 +2212,7 @@ func (s *IntegrationSuite) TestDaemon_StaleRootInode_File_RecreatedRootReguarded
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit after SIGTERM")
 }
 
-// The guard_path_unlink eviction fix is tested at guard level
+// Deleted-inode eviction (guard_inode_free) is tested at guard level
 // (TestGuard_PathUnlinkEvictsInodeImmediately, TestGuard_PathUnlinkDeniedDeleteKeepsGuardedInode in
 // integrationtests/guard_test.go, with the TestGuard_InodeReuse_* family).
 

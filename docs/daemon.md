@@ -28,8 +28,10 @@ You rarely run it by hand: `install` deploys it as the `app-listener-daemon` sys
 | `daemon check [--verifier-only]` | Check BPF-LSM is active and load every guard eBPF program into this kernel's verifier, attaching nothing; exit non-zero on any rejection. `--verifier-only` skips the BPF-LSM activation check (CI hosts that build BPF-LSM in without enabling it): a pass then says the programs verify, not that the host enforces |
 | `daemon lockdown` | Force-lock every encryption root in the config and exit. The systemd unit runs it as `ExecStopPost`, after every exit (clean stop, crash, SIGKILL, startup timeout) |
 | `daemon genkey` | Generate `/etc/app-listener/fscrypt.key` and exit (regenerating asks for confirmation) |
+| `daemon login <uid>` | Ask the running daemon to make and guard that user's [runtime sections](#runtime-sections-at-login); exit 0 with no daemon running, non-zero when it refused or timed out (75 s) |
+| `daemon logout <uid>` | Ask the running daemon to drop that user's runtime sections once their directory is gone; never fails |
 
-`--config <path>` applies to all four. Config resolution order: this flag, then
+`--config <path>` applies to `daemon`, `check`, `lockdown` and `genkey`. Config resolution order: this flag, then
 `/etc/app-listener/daemon.conf`, then `daemon-samples/daemon.conf`.
 
 Flags of `daemon` itself:
@@ -46,7 +48,7 @@ The flags `daemon --check`, `--verifier-only`, `--lockdown` and `--genkey` are a
 subcommands and stay listed in `--help`: installed systemd units, `scripts/install.sh` and
 `check-compatibility.sh` run binaries of other versions with them.
 
-The config format is covered in [Daemon configuration](daemon-config.md).
+What each config section does, and its syntax, is in the [daemon.conf reference](config-reference.md).
 
 ## Lifecycle
 
@@ -68,6 +70,78 @@ The unit is `Type=notify` and ordered
 lingering user managers, cron and `at` jobs wait until every guard is attached (`READY=1`), so no
 user code runs while the whitelisted paths are unguarded. This is ordering only: a failed daemon
 start does not lock users out.
+
+### Runtime sections at login
+
+A [runtime section](config-reference.md#runtime) guards a directory in `/run/user/<uid>`,
+which systemd mounts at the user's first login (`user-runtime-dir@<uid>.service`) and removes at
+the last logout. The installer adds a drop-in,
+`/etc/systemd/system/user-runtime-dir@.service.d/app-listener.conf`, that runs
+`app-listener daemon login <uid>` right after the mount and `daemon logout <uid>` after the
+unmount. Both talk to the daemon over `/run/app-listener-daemon.login` (root only, and only this
+binary).
+
+At login the daemon:
+
+1. makes `/run/user/<uid>` root's for the next steps (its group and mode stay), so none of the
+   user's processes can add, rename or remove anything in it;
+2. moves each runtime directory it didn't make itself into a new root-only
+   `.app-listener-moved-<random>` beside it: the mount is fresh at login, so such a directory was
+   made by one of the user's processes before the daemon, and may hold its listeners (also when a
+   reload guarded it as found);
+3. creates each missing runtime directory as root, mode 0700, so the user can't enter it yet, with
+   a root-owned `.app-listener/` inside that keeps it non-empty: no whitelisted program with
+   `DELETE` can then remove the guarded directory and let it be recreated unguarded;
+4. reloads, so a guard anchors on that directory;
+5. checks that the guard holds the very directory it made, then hands it to the user (`chown`),
+   and `/run/user/<uid>` back too.
+
+Only then does `user@<uid>.service` start the user's processes. If any step fails, the login
+fails. If no daemon is running, the login goes ahead with nothing guarded there. The drop-in is
+ordered after the daemon unit, so a login during the daemon's start waits for it. A directory the
+daemon made and still guards is kept (`user-runtime-dir@` restarted over a live mount), unless the
+daemon restarted since: it remembers what it made in memory only. `/run/user/<uid>` must be a
+tmpfs, not a filesystem the user mounted over it.
+
+A directory present when the daemon itself starts (the user logged in while no daemon
+ran) is guarded as found, and may hold sockets bound before the guard. The daemon plants its
+sentinel in it then (and at every reload), so an agent removing its own socket can't leave it
+empty.
+
+At logout the directory is gone with its mount, and the daemon reloads to drop the resource. It
+drops one only once its mount is gone: a filesystem the user mounts over `/run/user/<uid>` (FUSE,
+through the setuid `fusermount3`) hides the directory, and every reload is refused until it is
+unmounted, as is a daemon start that can't look inside. Like
+any reload, a login or logout that adds or drops a runtime section ends a live `edit-protected`
+session.
+
+### The Secret Service gate
+
+With a [`[secret_service]` block](config-reference.md#secret_service) the daemon:
+
+- installs a session bus policy (`/etc/dbus-1/session.d/app-listener-secrets.conf`) under which
+  only root may own `org.freedesktop.secrets` or monitor the bus, and the Secret Service interfaces
+  are reachable only through that name;
+- installs a drop-in (`/etc/systemd/user/gnome-keyring-daemon.service.d/app-listener.conf`) that
+  points gnome-keyring at a relay socket, `/run/app-listener/secret-relay/<uid>.bus`, guarded so
+  only the provider may connect;
+- at each login, before the user's processes start, registers `/run/user/<uid>` with the guard and
+  opens that user's relay. It reaches the user's bus as root for the keyring, through the socket
+  named `/run/user/<uid>/bus` (never a symlink), and the guard lets only a root-placed
+  `dbus-broker` or `dbus-daemon` that loaded no untrusted code write on those connections: a
+  listener the user puts at that name can't answer the relay, so it can't forge a caller.
+
+Every method call to the keyring passes the gate first. Calls it doesn't know are refused; reading,
+writing or deleting an item a [secret scope](config-reference.md#secret-name) covers needs
+a caller that scope's whitelist admits. The caller is the process the bus reports for the
+connection, checked by inode like any guard decision, and refused if it ran another program since it
+connected to the bus, if another process ever sent on one of its bus connections (an inherited or
+passed socket: the bus would credit that process's calls to it), or if it started before the daemon
+opened that user's relay (its connections may predate the guard, which then never saw them). Each decision is logged like a guard event, under the scope's anchor.
+
+Both files are written to match the configuration at every start and reload, kept when the daemon
+stops (the keyring then can't reach the bus, so the Secret Service is off rather than unguarded) and
+removed by `uninstall`. Users logged in when they are first installed must log in again.
 
 ### Reload (`systemctl reload`)
 
@@ -138,7 +212,7 @@ any disk or btrfs filesystem that hosts a guarded resource. These denials are lo
 A process that read a protected file is *tainted*: no program outside its resource's whitelist may
 read its memory or its `/proc/<pid>` metadata. Otherwise any process could read the secret back
 out of the app that loaded it. Programs that must inspect every process (screen-sharing portals)
-are listed under `[inspectors]`, see [Daemon configuration](daemon-config.md#process-inspectors).
+are listed under [`[inspectors]`](config-reference.md#inspectors).
 
 ## App maintainers (Steam runtime updates)
 
@@ -213,7 +287,7 @@ its own writes are refused. Start Steam again once that line appears.
 
 ## Related
 
-- [Daemon configuration](daemon-config.md): the config file.
+- [daemon.conf reference](config-reference.md): what each config section does, and its syntax.
 - [Binary trust](binary-trust.md): binary updates, the ledger, `trust`, launch scan.
 - [Self-updating apps and the catalog](catalog.md): catalog refresh.
 - [edit-protected](edit-protected.md): editing protected files while the daemon runs, and the

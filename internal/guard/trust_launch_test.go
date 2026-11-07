@@ -45,6 +45,9 @@ func launchModel(classes uint8, argv, env []string) bool {
 	}
 	app := false
 	for _, a := range argv[1:] {
+		if classes&(trustedNode|trustedChromium) != 0 && a != "" && strings.ContainsRune(" \t\n\v\f\r", rune(a[0])) {
+			return true
+		}
 		if classes&trustedElectron != 0 && !app && !strings.HasPrefix(a, "-") {
 			app = true
 			if len(a) >= launchKeyMax || !testElectronApps[a] {
@@ -164,6 +167,39 @@ func TestLaunchRulesJudgeRuntimes(t *testing.T) {
 		{"bun app, transpiler cache", bunApp, []string{"claude"}, []string{"BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/c"}, true},
 		{"bun app, tmpdir", bunApp, []string{"opencode"}, []string{"BUN_TMPDIR=/h/.cache/bun-tmp"}, false},
 		{"node ignores bun env", electron, []string{"code"}, []string{"BUN_BE_BUN=1"}, false},
+		{"jetbrains vm options file", trustedJVM, []string{"idea"}, []string{"IDEA_VM_OPTIONS=/tmp/x.vmoptions"}, true},
+		{"jetbrains jdk", trustedJVM, []string{"studio"}, []string{"STUDIO_JDK=/tmp/jdk"}, true},
+		{"jetbrains properties", trustedJVM, []string{"pycharm"}, []string{"PYCHARM_PROPERTIES=/tmp/p"}, true},
+		{"phpstorm vm options", trustedJVM, []string{"phpstorm"}, []string{"WEBIDE_VM_OPTIONS=/tmp/x"}, true},
+		// Chromium trims ASCII whitespace off every argument (base/command_line.cc): still a switch.
+		{"chromium space before a switch", trustedChromium, []string{"chromium", " --load-extension=/tmp/e"}, nil, true},
+		{"chromium tab before devtools", trustedChromium, []string{"chrome", "\t--remote-debugging-port=9222"}, nil, true},
+		{"electron newline before a switch", electron, []string{"discord", "\n--inspect=9229"}, nil, true},
+		{"chromium extensions except", trustedChromium, []string{"chromium", "--disable-extensions-except=/tmp/e"}, nil, true},
+		{"chromium extensions except single dash", trustedChromium, []string{"chromium", "-disable-extensions-except=/tmp/e"}, nil, true},
+		{"chromium load apps", trustedChromium, []string{"chromium", "--load-apps=/tmp/a"}, nil, true},
+		{"chromium ignore cert errors", trustedChromium, []string{"chromium", "--ignore-certificate-errors"}, nil, true},
+		{"chromium ignore cert spki", trustedChromium, []string{"chromium", "-ignore-certificate-errors-spki-list=x"}, nil, true},
+		{"chromium proxy server", trustedChromium, []string{"chromium", "--proxy-server=127.0.0.1:8080"}, nil, true},
+		{"electron proxy pac", trustedNode, []string{"code", "--proxy-pac-url=http://x/p"}, nil, true},
+		{"chromium proxy bypass list", trustedChromium, []string{"chromium", "--proxy-bypass-list=*"}, nil, false},
+		{"chromium headless", trustedChromium, []string{"brave", "--headless=new", "--dump-dom", "file:///x"}, nil, true},
+		{"chromium dump-dom alone", trustedChromium, []string{"brave", "-dump-dom", "file:///x"}, nil, true},
+		{"chromium screenshot", trustedChromium, []string{"chrome", "--screenshot=/tmp/s.png", "file:///x"}, nil, true},
+		{"chromium print to pdf", trustedChromium, []string{"chrome", "--print-to-pdf=/tmp/x.pdf", "file:///x"}, nil, true},
+		{"chromium net log", trustedChromium, []string{"chromium", "--log-net-log=/tmp/n.json"}, nil, true},
+		{"chromium net log mode", trustedChromium, []string{"chromium", "--net-log-capture-mode=Everything"}, nil, true},
+		{"chromium key log flag", trustedChromium, []string{"chromium", "--ssl-key-log-file=/tmp/k"}, nil, true},
+		{"chromium key log env", trustedChromium, []string{"chromium"}, []string{"SSLKEYLOGFILE=/tmp/k"}, true},
+		{"chromium pack extension key", trustedChromium, []string{"chromium", "--pack-extension-key=/tmp/k.pem"}, nil, true},
+		{"chromium file access from files", trustedChromium, []string{"brave", "--allow-file-access-from-files", "file:///tmp/e.html"}, nil, true},
+		{"chromium web security off", trustedChromium, []string{"chrome", "-disable-web-security", "--user-data-dir=/tmp/p"}, nil, true},
+		{"chromium ozone wayland", trustedChromium, []string{"brave", "--ozone-platform=wayland"}, nil, false},
+		{"electron headless", electron, []string{"code", "--headless"}, nil, true},
+		{"chromium new window", trustedChromium, []string{"brave", "--new-window", "https://example.com"}, nil, false},
+		{"jvm ignores key log env", trustedJVM, []string{"java"}, []string{"SSLKEYLOGFILE=/tmp/k"}, false},
+		{"chromium file with a space", trustedChromium, []string{"chromium", "/home/u/my page.html"}, nil, false},
+		{"jvm ignores leading space", trustedJVM, []string{"java", " -Xmx2g"}, nil, false},
 	} {
 		if got := launchModel(c.classes, c.argv, c.env); got != c.risky {
 			t.Errorf("%s: risky = %v, want %v", c.name, got, c.risky)
@@ -213,6 +249,10 @@ func TestRuntimeClassMarkers(t *testing.T) {
 	}
 	if c := runtimeClass(write("java", []byte("ELF")), filepath.Join(dir, "java")); c != trustedJVM {
 		t.Errorf("java launcher class = %d, want JVM by name", c)
+	}
+	// JetBrains' native launcher loads libjvm in its own process: JAVA_TOOL_OPTIONS reaches it.
+	if c := runtimeClass(write("idea", []byte("ELF\x00JNI_CreateJavaVM\x00")), filepath.Join(dir, "idea")); c != trustedJVM {
+		t.Errorf("an in-process JVM launcher's class = %d, want JVM", c)
 	}
 	if c := runtimeClass(write("ssh", []byte("ELF ssh")), "ssh"); c != 0 {
 		t.Errorf("ssh class = %d, want none", c)
@@ -276,7 +316,8 @@ func TestResolveTempBinaryClassesRuntime(t *testing.T) {
 	}{
 		{"code", "ELF\x00NODE_OPTIONS\x00", trustedNode, []string{"Node"}},
 		{"chrome", "ELF\x00remote-debugging-port\x00", trustedChromium, []string{"Chromium"}},
-		{"opencode", "ELF\x00BUN_BE_BUN\x00BUN_INSPECT\x00", trustedBun, []string{"Bun"}},
+		// No .bun section to say otherwise: it loads ./bunfig.toml.
+		{"opencode", "ELF\x00BUN_BE_BUN\x00BUN_INSPECT\x00", trustedBun | trustedBunfig, []string{"Bun"}},
 		{"tool", "ELF plain", 0, nil},
 	} {
 		p := filepath.Join(dir, tc.name)

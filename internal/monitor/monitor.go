@@ -56,7 +56,7 @@ type Monitor struct {
 type exeKey struct{ dev, ino uint64 }
 
 // bpfEventExec is EVENT_EXEC (monitor.bpf.c): it names an executable, never reaches Events().
-const bpfEventExec = 12
+const bpfEventExec = 13
 
 const exeCacheMax = 16384
 
@@ -220,7 +220,8 @@ func putBtrfsLayout(objs *MonitorObjects) {
 func (m *Monitor) RecordExecMappings(on bool) { m.execMaps.Store(on) }
 
 // AttachRecordProbes adds the guard-chokepoint probes (monitor.bpf.c "Record probes"): file
-// creation as MKNOD, every write and truncate as WRITE, xattr reads as STAT. All or
+// creation as MKNOD, every write and truncate as WRITE, xattr reads as STAT, AF_UNIX connects as
+// CONNECT. All or
 // nothing: a recording missing one would propose a mask the guard then denies the program under.
 func (m *Monitor) AttachRecordProbes() error {
 	probes := []struct {
@@ -232,6 +233,8 @@ func (m *Monitor) AttachRecordProbes() error {
 		{m.objs.TraceSecurityFileTruncate, "security_file_truncate"},
 		{m.objs.TraceSecurityInodeGetxattr, "security_inode_getxattr"},
 		{m.objs.TraceSecurityInodeListxattr, "security_inode_listxattr"},
+		{m.objs.TraceSecurityUnixStreamConnect, "security_unix_stream_connect"},
+		{m.objs.TraceSecurityUnixMaySend, "security_unix_may_send"},
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

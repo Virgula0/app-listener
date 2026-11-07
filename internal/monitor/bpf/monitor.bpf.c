@@ -20,6 +20,7 @@ enum event_type {
 	EVENT_ATTR,
 	EVENT_STAT,
 	EVENT_MKNOD,
+	EVENT_CONNECT,
 	// EVENT_EXEC names a new executable (path = its file, dest = bprm->filename) so userspace can
 	// map exe_dev/exe_ino to a path after a short-lived process exited. Never a file access.
 	EVENT_EXEC,
@@ -688,6 +689,32 @@ SEC("kprobe/security_inode_listxattr")
 int trace_security_inode_listxattr(struct pt_regs *ctx)
 {
 	return emit_dentry(EVENT_STAT, (struct dentry *)PT_REGS_PARM1(ctx));
+}
+
+// AF_UNIX connect/sendto: the guard's CONNECT, judged on the listener's bound dentry.
+static __always_inline int emit_unix_peer(struct sock *peer)
+{
+	struct dentry *dentry = NULL;
+	if (!peer || bpf_probe_read_kernel(&dentry, sizeof(dentry),
+					   &((struct unix_sock *)peer)->path.dentry))
+		return 0;
+	return emit_dentry(EVENT_CONNECT, dentry);
+}
+
+SEC("kprobe/security_unix_stream_connect")
+int trace_security_unix_stream_connect(struct pt_regs *ctx)
+{
+	return emit_unix_peer((struct sock *)PT_REGS_PARM2(ctx));
+}
+
+SEC("kprobe/security_unix_may_send")
+int trace_security_unix_may_send(struct pt_regs *ctx)
+{
+	struct socket *other = (struct socket *)PT_REGS_PARM2(ctx);
+	struct sock *sk = NULL;
+	if (!other || bpf_probe_read_kernel(&sk, sizeof(sk), &other->sk))
+		return 0;
+	return emit_unix_peer(sk);
 }
 
 static __always_inline int emit_file_write(struct file *file)
