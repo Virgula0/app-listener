@@ -209,6 +209,24 @@ func (s *IntegrationSuite) TestDaemon_RuntimeSectionLogin() {
 	s.Require().Equalf(0, code, "logout: %s", out)
 	squat(true)
 
+	// A parent the user opened up before the login (chmod 0777) is locked all the same: the user can't
+	// swap the directory the daemon just made for one of its own before the guard anchors on it.
+	code, out = s.exec(c, []string{"sh", "-c", "umount /run/user/1000 && /app-listener daemon logout 1000 && " + mount})
+	s.Require().Equalf(0, code, "logout: %s", out)
+	code, out = asUser("chmod 0777 /run/user/1000")
+	s.Require().Equalf(0, code, "chmod: %s", out)
+	swapper := s.capturePID(c, "setpriv --reuid=1000 --regid=1000 --clear-groups nohup sh -c 'while :; do mv "+dir+
+		" "+dir+".x 2>/dev/null && mkdir "+dir+" && touch "+dir+"/planted /tmp/swapped && exit 0; done' "+
+		">/dev/null 2>&1 &")
+	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null; true", swapper)})
+	swapped, _ := s.exec(c, []string{"test", "-e", "/tmp/swapped"})
+	s.Require().NotEqualf(0, swapped, "the user swapped the daemon's dir through an opened-up parent:\n%s",
+		s.readDaemonLog(c))
+	s.Require().Equalf(0, code, "login with an opened-up parent: %s\n%s", out, s.readDaemonLog(c))
+	code, out = s.exec(c, []string{"stat", "-c", "%u %a", "/run/user/1000"})
+	s.Require().Equalf("1000 700", strings.TrimSpace(out), "the parent goes back to its user, locked down: %d", code)
+
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
 	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
