@@ -474,7 +474,9 @@ anything between them. `warn_args` only logs the match (`ARGV comm=... word=...`
   any unambiguous prefix of a long option (gpg, getopt_long): `deny_args /usr/bin/gpg
   --export-se[cret-keys]` refuses `--export-se`, `--export-sec`, ..., `--export-secret-keys`. Only a
   flag abbreviates, and `--name` must hold more than the dashes.
-- At most 16 argument rules per binary, built-ins included.
+- At most 16 argument rules per binary, counting the catalog's for its name and every line naming
+  any of its spellings (a symlink and its target). A config over that is refused: the daemon won't
+  start on it, and a reload or `edit-protected config` keeps the running one.
 
 ### `deny_env`, `warn_env`
 

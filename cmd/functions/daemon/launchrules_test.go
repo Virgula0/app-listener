@@ -76,3 +76,17 @@ func TestLaunchRulesByPathMergesSpellings(t *testing.T) {
 		t.Errorf("the link name's catalog rules were dropped: %+v", tool)
 	}
 }
+
+func TestRefuseUnfitLaunchRules(t *testing.T) {
+	cfg := &daemonconfig.Config{Resources: []daemonconfig.Resource{{Binaries: []daemonconfig.BinaryRule{{Path: "/usr/bin/gpg"}}}}}
+	if err := refuseUnfitLaunchRules(cfg); err != nil {
+		t.Fatalf("the catalog's gpg rules fit: %v", err)
+	}
+	for i := range 11 {
+		cfg.LaunchRules = append(cfg.LaunchRules, daemonconfig.LaunchRule{Path: "/usr/bin/gpg",
+			Words: []string{"--x" + strings.Repeat("y", i)}})
+	}
+	if err := refuseUnfitLaunchRules(cfg); err == nil || !strings.Contains(err.Error(), "/usr/bin/gpg") {
+		t.Fatalf("17 argv rules must be refused, naming the binary: %v", err)
+	}
+}

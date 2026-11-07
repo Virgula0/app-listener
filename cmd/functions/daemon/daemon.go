@@ -496,6 +496,9 @@ func loadDaemonConfig() (string, *daemonconfig.Config, error) {
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("%w: config %s contains no [watch] sections", constants.ErrCriticalStartup, configPath)
 	}
+	if err := refuseUnfitLaunchRules(cfg); err != nil {
+		return "", nil, fmt.Errorf("%w: config %s: %w", constants.ErrCriticalStartup, configPath, err)
+	}
 	err = ensurePortAnchors(cfg)
 	if err == nil {
 		err = ensureSecretAnchors(cfg)
@@ -591,6 +594,9 @@ func reloadOnce(d usecase.DaemonUseCase, configPath string, vault *fscrypt.Vault
 	}
 	if len(cfg.Resources) == 0 {
 		return "", nil, fmt.Errorf("config contains no [watch] sections")
+	}
+	if err := refuseUnfitLaunchRules(cfg); err != nil {
+		return "", nil, err
 	}
 	if anchorErr := ensurePortAnchors(cfg); anchorErr != nil {
 		return "", nil, anchorErr

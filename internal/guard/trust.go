@@ -201,14 +201,12 @@ func (t *TrustGuard) trustBinaries(binaries []string, flags map[GuardInodeKey]ui
 		}
 		k := GuardInodeKey{Dev: dev, Ino: ino}
 		flags[k] |= trustedBinary | runtimeClass(f, b)
-		id, ok, err := t.launchSet(b)
+		id, err := t.launchSet(b)
 		f.Close()
 		if err != nil {
-			return nil, fmt.Errorf("launch rules of %s: %w", b, err)
+			return nil, err
 		}
-		if ok {
-			rules[k] = id
-		}
+		rules[k] = id
 	}
 	return rules, nil
 }

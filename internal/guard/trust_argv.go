@@ -5,8 +5,6 @@ import (
 	"slices"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/logging"
 )
@@ -210,44 +208,59 @@ func (t *TrustGuard) SetLaunchRules(byPath map[string][]daemonconfig.LaunchRule,
 	t.allowEnv = allowEnv
 }
 
-// launchSet returns the trust_argv set of the binary at path, writing a new set first; ok false: its
-// rules don't fit. Sets are never rewritten nor reused, so a row always names the rules it was given.
-func (t *TrustGuard) launchSet(path string) (id uint64, ok bool, err error) {
+// CheckLaunchRules reports whether rules (plus caEnvRules) fit one trust_argv set.
+func CheckLaunchRules(rules []daemonconfig.LaunchRule) error {
+	canon, _, _ := canonLaunchRules(append(slices.Clone(rules), caEnvRules...), nil)
+	words, _, err := encodeLaunchSet(canon, nil)
+	if err != nil {
+		return err
+	}
+	var k GuardTrustArgvKey
+	for e := range words {
+		if len(e.name) >= len(k.Name) {
+			return fmt.Errorf("launch rule word %q does not fit the %d-byte key", e.name, len(k.Name))
+		}
+	}
+	return nil
+}
+
+// launchSet returns the trust_argv set of the binary at path, writing a new set first. Rules that
+// don't fit are an error, never a binary admitted without them. Sets are never rewritten nor
+// reused, so a row always names the rules it was given.
+func (t *TrustGuard) launchSet(path string) (uint64, error) {
 	t.argvMu.Lock()
 	defer t.argvMu.Unlock()
 	rules, allowed, canon := canonLaunchRules(append(slices.Clone(t.argvByPath[path]), caEnvRules...), t.allowEnv)
 	if known, ok := t.argvSets[canon]; ok {
-		return known, true, nil
+		return known, nil
 	}
 	words, set, err := encodeLaunchSet(rules, allowed)
 	if err != nil {
-		log.Errorf("trust guard: launch rules of %s not applied: %v", logging.SanitizeText(path), err)
-		return 0, false, nil
+		return 0, fmt.Errorf("launch rules of %s: %w", logging.SanitizeText(path), err)
 	}
 	if len(t.argvSets) >= argvSetsMax {
-		log.Errorf("trust guard: launch rules of %s not applied: more than %d distinct rule sets since the "+
-			"daemon started; restart it", logging.SanitizeText(path), argvSetsMax)
-		return 0, false, nil
+		return 0, fmt.Errorf("launch rules of %s: more than %d distinct rule sets since the daemon "+
+			"started; restart it", logging.SanitizeText(path), argvSetsMax)
 	}
-	id = uint64(len(t.argvSets))
+	id := uint64(len(t.argvSets))
 	for e, v := range words {
 		k := GuardTrustArgvKey{Set: uint32(id), Kind: e.kind} //nolint:gosec // id < argvSetsMax
 		if len(e.name) >= len(k.Name) {
-			return 0, false, fmt.Errorf("launch rule word %q does not fit the %d-byte key", e.name, len(k.Name))
+			return 0, fmt.Errorf("launch rule word %q does not fit the %d-byte key", e.name, len(k.Name))
 		}
 		for i := range len(e.name) {
 			k.Name[i] = int8(e.name[i]) //nolint:gosec // byte reinterpreted as a C char
 		}
 		if err := t.objs.TrustArgv.Put(k, v); err != nil {
-			return 0, false, fmt.Errorf("launch rule word %s: %w", e.name, err)
+			return 0, fmt.Errorf("launch rule word %s: %w", e.name, err)
 		}
 	}
 	if err := t.objs.TrustArgvSets.Put(uint32(id), set); err != nil { //nolint:gosec // id < argvSetsMax
-		return 0, false, fmt.Errorf("launch rule set: %w", err)
+		return 0, fmt.Errorf("launch rule set: %w", err)
 	}
 	if t.argvSets == nil {
 		t.argvSets = map[string]uint64{}
 	}
 	t.argvSets[canon] = id
-	return id, true, nil
+	return id, nil
 }

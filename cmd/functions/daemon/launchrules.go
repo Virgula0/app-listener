@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -14,15 +15,17 @@ import (
 )
 
 // launchRulesByPath maps each whitelisted binary's resolved path to its launch rules: the catalog's
-// for its config line's and its target's basenames, and the [launch_rules] naming either path.
+// for every config line's and its target's basenames, and the [launch_rules] naming any of them.
 func launchRulesByPath(cfg *daemonconfig.Config) map[string][]daemonconfig.LaunchRule {
 	out := make(map[string][]daemonconfig.LaunchRule)
 	used := make([]bool, len(cfg.LaunchRules))
+	seen := make(map[[2]string]bool)
 	for i := range cfg.Resources {
 		for _, list := range [][]daemonconfig.BinaryRule{cfg.Resources[i].Binaries, cfg.Resources[i].PendingBinaries} {
 			for _, b := range list {
-				if _, done := out[b.Path]; !done && !b.LibBinary {
-					out[b.Path] = binaryLaunchRules(cfg, b, used)
+				if spelling := [2]string{b.Path, b.Link}; !seen[spelling] && !b.LibBinary {
+					seen[spelling] = true
+					out[b.Path] = append(out[b.Path], binaryLaunchRules(cfg, b, used)...)
 				}
 			}
 		}
@@ -39,6 +42,17 @@ func launchRulesByPath(cfg *daemonconfig.Config) map[string][]daemonconfig.Launc
 		}
 	}
 	return out
+}
+
+// refuseUnfitLaunchRules refuses cfg when a binary's merged rules don't fit the kernel's slots: the
+// trust guard would otherwise run that binary with none of them.
+func refuseUnfitLaunchRules(cfg *daemonconfig.Config) error {
+	for p, rules := range launchRulesByPath(cfg) {
+		if err := guard.CheckLaunchRules(rules); err != nil {
+			return fmt.Errorf("launch rules of %s (the catalog's plus [launch_rules]): %w", p, err)
+		}
+	}
+	return nil
 }
 
 // binaryLaunchRules lists b's rules, marking in used the [launch_rules] lines it takes.
