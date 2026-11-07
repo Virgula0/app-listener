@@ -1,6 +1,7 @@
 package guard_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
@@ -37,6 +38,9 @@ func TestSSHConfigFileRefusedInEveryCluster(t *testing.T) {
 		"-F": true, "-F/tmp/c": true, "-4F/tmp/c": true, "-vvqF": true, "-TF": true,
 		"-oF": false, "-oForwardAgent=yes": false, "-L8080:F": false, "-iF": false, "--F": false,
 		"-": false, "host": false, "-v": false,
+		// getopt reads a cluster to its end: one longer than the scan judges is refused whole.
+		"-" + strings.Repeat("C", 31) + "F": true, "-" + strings.Repeat("v", 40): true,
+		"-" + strings.Repeat("C", 30) + "F": true, "-" + strings.Repeat("C", 30): false,
 	} {
 		if got := guard.ShortRefused(set, word); got != want {
 			t.Errorf("ssh %q: refused = %v, want %v", word, got, want)

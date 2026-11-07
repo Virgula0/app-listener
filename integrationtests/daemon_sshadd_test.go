@@ -51,6 +51,7 @@ func (s *IntegrationSuite) TestDaemon_SSHKeyDisclosure() {
 	for _, cmd := range []string{
 		"ssh -F " + ssh + "/id_ed25519 -G x",
 		"ssh -4F" + ssh + "/id_ed25519 -G x",
+		"ssh -" + strings.Repeat("C", 40) + "F " + ssh + "/id_ed25519 -G x",
 		sshd + " -t -f " + ssh + "/id_ed25519",
 	} {
 		_, out = asUser(cmd + " 2>&1")
