@@ -1,11 +1,13 @@
 package integrationtests
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -627,5 +629,55 @@ func (s *IntegrationSuite) TestDaemon_ProfileAnchors() {
 	}
 	s.requireDenialLogged(c, "PROFILE", "secret")
 
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+}
+
+// A binary's launch rules are its inode's, whichever spelling names them: a [launch_rules] line on a
+// symlink line applies even when another section lists the target first. Rules that don't fit the
+// kernel's slots (the catalog's plus the config's) refuse the config instead of dropping them all.
+func (s *IntegrationSuite) TestDaemon_LaunchRulesMergedOrRefused() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	const tool, link, gpg = "/opt/rt/bin/tool", "/opt/rt/bin/toollink", "/opt/rt/bin/gpg"
+	s.exec(c, []string{"mkdir", "-p", "/exploits", "/opt/rt/bin"})
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_plain"), tool, 0o755),
+		"copy launch_probe_plain (run make -C integrationtests/exploits)")
+	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /protected2 /etc/app-listener && printf '" +
+		launchMarker + "' > " + launchSecret + " && cp " + tool + " " + gpg + " && ln -s tool " + link + " 2>&1"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.startDaemon(c, "[launch_rules]\ndeny_args "+link+" --leak\n\n"+
+		"[watch /protected]\nneed_encryption: false\n"+tool+"\n"+gpg+"\n\n"+
+		"[watch /protected2]\nneed_encryption: false\n"+link)
+	_, out = s.exec(c, []string{"sh", "-c", tool + " --leak read " + launchSecret + " 2>&1"})
+	s.Require().NotContainsf(out, launchMarker, "a rule on the symlink's spelling was dropped\ndaemon log:\n%s",
+		s.readDaemonLog(c))
+	_, out = s.exec(c, []string{"sh", "-c", tool + " read " + launchSecret + " 2>&1"})
+	s.Require().Containsf(out, "STOLEN|"+launchMarker, "a clean launch must read: %s", out)
+	s.Require().NotContains(s.readDaemonLog(c), "is not a whitelisted binary")
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon'; sleep 2"})
+
+	// The catalog gives gpg 6 argv rules: 11 more lines are 17, one over the slots.
+	var rules strings.Builder
+	for i := range 11 {
+		fmt.Fprintf(&rules, "deny_args %s --extra%d\n", gpg, i)
+	}
+	conf := "[launch_rules]\n" + rules.String() + "\n[watch /protected]\nneed_encryption: false\n" + gpg
+	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + conf + "\nEOF"})
+	s.confirmConfigBinaries(c)
+	_, out = s.exec(c, []string{"sh", "-c", "timeout 90 /app-listener daemon --config /etc/app-listener/daemon.conf " +
+		"--headless 2>&1; echo rc=$?"})
+	s.Require().Containsf(out, "rc=78", "rules that don't fit must refuse the start: %s", out)
+	s.Require().Containsf(out, "argv rules", "the refusal must name the rule cap: %s", out)
+	s.Require().NotContainsf(out, "guarding: /protected", "no guard may attach: %s", out)
+
+	// A reload onto that config keeps the running one, with its rules.
+	s.startDaemon(c, "[watch /protected]\nneed_encryption: false\n"+gpg)
+	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + conf + "\nEOF"})
+	s.confirmConfigBinaries(c)
+	s.exec(c, []string{"sh", "-c", "pkill -HUP -f 'app-listener daemon'"})
+	s.Require().Truef(s.awaitLog(c, "argv rules", 30*time.Second), "the reload must be refused:\n%s", s.readDaemonLog(c))
+	_, out = s.exec(c, []string{"sh", "-c", gpg + " --export-secret-keys read " + launchSecret + " 2>&1"})
+	s.Require().NotContainsf(out, launchMarker, "the running config lost its rules\ndaemon log:\n%s", s.readDaemonLog(c))
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 }

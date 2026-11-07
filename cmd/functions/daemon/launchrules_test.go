@@ -58,3 +58,21 @@ func TestAllowedEnvKeepsOnlyRootPlaced(t *testing.T) {
 		}
 	}
 }
+
+// The inode's rules gather every spelling that names it, whichever section lists it first.
+func TestLaunchRulesByPathMergesSpellings(t *testing.T) {
+	cfg := &daemonconfig.Config{
+		Resources: []daemonconfig.Resource{
+			{Binaries: []daemonconfig.BinaryRule{{Path: "/opt/t/tool"}}},
+			{Binaries: []daemonconfig.BinaryRule{{Path: "/opt/t/tool", Link: "/opt/t/gh"}}},
+		},
+		LaunchRules: []daemonconfig.LaunchRule{{Path: "/opt/t/gh", Words: []string{"--leak"}}},
+	}
+	tool := launchRulesByPath(cfg)["/opt/t/tool"]
+	if !slices.ContainsFunc(tool, func(r daemonconfig.LaunchRule) bool { return slices.Equal(r.Words, []string{"--leak"}) }) {
+		t.Errorf("the link's [launch_rules] line was dropped: %+v", tool)
+	}
+	if !slices.ContainsFunc(tool, func(r daemonconfig.LaunchRule) bool { return slices.Equal(r.Words, []string{"auth", "token"}) }) {
+		t.Errorf("the link name's catalog rules were dropped: %+v", tool)
+	}
+}
