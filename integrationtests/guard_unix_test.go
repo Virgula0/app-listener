@@ -227,6 +227,18 @@ func (s *IntegrationSuite) TestDaemon_RuntimeSectionLogin() {
 	code, out = s.exec(c, []string{"stat", "-c", "%u %a", "/run/user/1000"})
 	s.Require().Equalf("1000 700", strings.TrimSpace(out), "the parent goes back to its user, locked down: %d", code)
 
+	// A mount over the directory's name (a user's FUSE mount with allow_other, reporting uid 0 and a
+	// sentinel) is no directory this daemon made: the login refuses it rather than guard and hand it out.
+	code, out = s.exec(c, []string{"sh", "-c", "umount /run/user/1000 && /app-listener daemon logout 1000 && " + mount +
+		" && mkdir " + dir + " && mount -t tmpfs -o mode=0700 tmpfs " + dir + " && mkdir " + dir + "/.app-listener && " +
+		"echo x > " + dir + "/.app-listener/README && touch " + dir + "/planted"})
+	s.Require().Equalf(0, code, "mount over the runtime dir: %s", out)
+	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
+	s.Require().NotEqualf(0, code, "the login took a mount over %s for its own dir: %s\n%s", dir, out, s.readDaemonLog(c))
+	code, out = s.exec(c, []string{"stat", "-c", "%u", dir})
+	s.Require().Equalf("0", strings.TrimSpace(out), "the mount was handed to the user: %d", code)
+	s.exec(c, []string{"umount", dir})
+
 	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
 	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
