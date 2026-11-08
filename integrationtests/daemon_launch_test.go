@@ -472,7 +472,6 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 		for what, cmd := range map[string]string{
 			"a clean launch":            gh + " read " + launchSecret,
 			"a partial rule":            gh + " auth read " + launchSecret,
-			"a warn rule":               gh + " auth git-credential read " + launchSecret,
 			"rule words out of order":   gh + " token auth read " + launchSecret,
 			"another binary's built-in": tool + " auth token read " + launchSecret,
 			"a warn env rule":           "NOTE_ME=1 " + tool + " read " + launchSecret,
@@ -502,6 +501,7 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 			"gh auth status":                gh + " auth status read " + launchSecret,
 			"gh auth status -tt":            gh + " auth status -tt read " + launchSecret,
 			"gh auth status -at":            gh + " auth status -at read " + launchSecret,
+			"gh auth git-credential":        gh + " auth git-credential read " + launchSecret,
 			"a [launch_rules] argv rule":    tool + " export read " + launchSecret + " --all",
 			"SSL_CERT_FILE on a Go binary":  "SSL_CERT_FILE=/tmp/ca.pem " + goread + " read " + launchSecret,
 			"SSL_CERT_FILE on any CLI":      "SSL_CERT_FILE=/tmp/ca.pem " + gh + " read " + launchSecret,
@@ -547,7 +547,7 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 
 	log := s.readDaemonLog(c)
 	for _, want := range []string{"word=token", "word=status", "word=--all", "word=SSL_CERT_FILE",
-		"ARGV comm=gh", "word=git-credential", "word=NOTE_ME", "word=SSL_CERT_DIR",
+		"ARGV comm=tool", "word=git-credential", "word=NOTE_ME", "word=SSL_CERT_DIR",
 		"word=--export-secret-ke", "word=--export-se", "word=--sto", "word=--raw", "word=show", "word=--frobn",
 		"word=--headless", "word=-start-debugger-server", "word=MOZ_HEADLESS", "word=-MOZ_LOG",
 		"word=-HEADLESS", "word=--Start-Debugger-Server", "word=--MOZ_LOG",
