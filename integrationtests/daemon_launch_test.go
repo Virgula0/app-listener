@@ -471,7 +471,7 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 	check := func(when string) {
 		for what, cmd := range map[string]string{
 			"a clean launch":            gh + " read " + launchSecret,
-			"a partial rule":            gh + " auth status read " + launchSecret,
+			"a partial rule":            gh + " auth read " + launchSecret,
 			"a warn rule":               gh + " auth git-credential read " + launchSecret,
 			"rule words out of order":   gh + " token auth read " + launchSecret,
 			"another binary's built-in": tool + " auth token read " + launchSecret,
@@ -497,9 +497,13 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 				when, what, s.readDaemonLog(c))
 		}
 		for what, cmd := range map[string]string{
-			"words around a flag's value":   gh + " auth --hostname x token read " + launchSecret,
-			"a short flag after operands":   gh + " auth status read " + launchSecret + " -t",
-			"a long flag with a value":      gh + " auth status --show-token=1 read " + launchSecret,
+			"words around a flag's value": gh + " auth --hostname x token read " + launchSecret,
+			"a short flag after operands": gh + " auth status read " + launchSecret + " -t",
+			"a long flag with a value":    gh + " auth status --show-token=1 read " + launchSecret,
+			// pflag reads any cluster (-tt, -at, -ta) and -t=true: only the whole subcommand is refused.
+			"gh auth status":                gh + " auth status read " + launchSecret,
+			"gh auth status -tt":            gh + " auth status -tt read " + launchSecret,
+			"gh auth status -at":            gh + " auth status -at read " + launchSecret,
 			"a [launch_rules] argv rule":    tool + " export read " + launchSecret + " --all",
 			"SSL_CERT_FILE on a Go binary":  "SSL_CERT_FILE=/tmp/ca.pem " + goread + " read " + launchSecret,
 			"SSL_CERT_FILE on any CLI":      "SSL_CERT_FILE=/tmp/ca.pem " + gh + " read " + launchSecret,
@@ -548,7 +552,7 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 	check("after a reload")
 
 	log := s.readDaemonLog(c)
-	for _, want := range []string{"word=token", "word=-t", "word=--show-token", "word=--all", "word=SSL_CERT_FILE",
+	for _, want := range []string{"word=token", "word=status", "word=--all", "word=SSL_CERT_FILE",
 		"ARGV comm=gh", "word=git-credential", "word=NOTE_ME", "word=SSL_CERT_DIR",
 		"word=--export-secret-ke", "word=--export-se", "word=--sto", "word=--raw", "word=show", "word=--frobn",
 		"word=--headless", "word=-start-debugger-server", "word=MOZ_HEADLESS", "word=-MOZ_LOG",
