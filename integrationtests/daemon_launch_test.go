@@ -449,20 +449,20 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 
 	const gh, tool, goread = "/opt/rt/bin/gh", "/opt/rt/bin/tool", "/opt/rt/bin/goread"
 	const gpg, kubectl, rclone = "/opt/rt/bin/gpg", "/opt/rt/bin/kubectl", "/opt/rt/bin/rclone"
-	const firefox = "/opt/rt/bin/firefox"
+	const firefox, coin = "/opt/rt/bin/firefox", "/opt/rt/bin/bitcoin-cli"
 	const corpCA = "/etc/corp-ca.pem"
 	s.exec(c, []string{"mkdir", "-p", "/exploits", "/opt/rt/bin"})
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/launch_probe_plain"), gh, 0o755),
 		"copy launch_probe_plain (run make -C integrationtests/exploits)")
 	s.Require().NoError(c.CopyFileToContainer(s.ctx, netTesterAmd64Bin, goread, 0o755))
 	code, out := s.exec(c, []string{"sh", "-c", "mkdir -p /protected /etc/app-listener && printf '" + launchMarker +
-		"' > " + launchSecret + " && for b in " + tool + " " + gpg + " " + kubectl + " " + rclone + " " + firefox + "; do cp " + gh +
+		"' > " + launchSecret + " && for b in " + tool + " " + gpg + " " + kubectl + " " + rclone + " " + firefox + " " + coin + "; do cp " + gh +
 		" $b; done && echo ca > " + corpCA + " 2>&1"})
 	s.Require().Equalf(0, code, "setup: %s", out)
 	s.startDaemon(c, "[launch_rules]\ndeny_args "+tool+" export --all\nwarn_env "+tool+" NOTE_ME\n"+
 		"deny_args "+tool+" --frob[nicate]\n"+
 		"allow_env SSL_CERT_FILE="+corpCA+"\nallow_env SSL_CERT_FILE=/tmp/user-ca.pem\n\n"+
-		"[watch /protected]\nneed_encryption: false\n"+gh+"\n"+tool+"\n"+goread+"\n"+gpg+"\n"+kubectl+"\n"+rclone+"\n"+firefox)
+		"[watch /protected]\nneed_encryption: false\n"+gh+"\n"+tool+"\n"+goread+"\n"+gpg+"\n"+kubectl+"\n"+rclone+"\n"+firefox+"\n"+coin)
 
 	run := func(cmd string) string {
 		_, out := s.exec(c, []string{"sh", "-c", cmd + " 2>&1"})
@@ -488,6 +488,10 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 			"an abbreviation too short": tool + " --fro read " + launchSecret,
 			"a Firefox window":          firefox + " --new-tab -P default read " + launchSecret,
 			"Firefox's log file alone":  firefox + " -MOZ_LOG_FILE=/tmp/l read " + launchSecret,
+			// Firefox's log switch is matched case-sensitively (LogCommandLineHandler), unlike its flags.
+			"a -moz_log Firefox ignores": firefox + " -moz_log=nsHttp:5 read " + launchSecret,
+			"a bitcoin-cli query":        coin + " getblockcount read " + launchSecret,
+			"a -STDIN bitcoin ignores":   coin + " -STDIN read " + launchSecret,
 		} {
 			s.Require().Containsf(run(cmd), "STOLEN|"+launchMarker, "%s: %s must read its resource\ndaemon log:\n%s",
 				when, what, s.readDaemonLog(c))
@@ -520,7 +524,20 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 			"firefox debugger server":       firefox + " -start-debugger-server 6000 read " + launchSecret,
 			"firefox -MOZ_LOG":              firefox + " -MOZ_LOG=nsHttp:5 read " + launchSecret,
 			"MOZ_HEADLESS on firefox":       "MOZ_HEADLESS=1 " + firefox + " read " + launchSecret,
-			"SSLKEYLOGFILE on firefox":      "SSLKEYLOGFILE=/tmp/k " + firefox + " read " + launchSecret,
+			// Firefox's CheckArg compares flags case-insensitively, after one or two dashes.
+			"firefox -HEADLESS":              firefox + " -HEADLESS read " + launchSecret,
+			"firefox --HeadLess":             firefox + " --HeadLess read " + launchSecret,
+			"firefox -Screenshot":            firefox + " -Screenshot /tmp/s.png read " + launchSecret,
+			"firefox remote debugging, caps": firefox + " -Remote-Debugging-Port=9222 read " + launchSecret,
+			"firefox --MARIONETTE":           firefox + " --MARIONETTE read " + launchSecret,
+			"firefox debugger server, caps":  firefox + " --Start-Debugger-Server 6000 read " + launchSecret,
+			"firefox -JSDebugger":            firefox + " -JSDebugger read " + launchSecret,
+			"firefox --MOZ_LOG":              firefox + " --MOZ_LOG=nsHttp:5 read " + launchSecret,
+			// Bitcoin Core's ArgsManager reads --foo as -foo.
+			"bitcoin-cli -stdin":       coin + " -stdin read " + launchSecret,
+			"bitcoin-cli --stdin":      coin + " --stdin=1 read " + launchSecret,
+			"bitcoin-cli dumpprivkey":  coin + " -named dumpprivkey read " + launchSecret,
+			"SSLKEYLOGFILE on firefox": "SSLKEYLOGFILE=/tmp/k " + firefox + " read " + launchSecret,
 		} {
 			s.Require().NotContainsf(run(cmd), launchMarker, "%s: %s read the secret\ndaemon log:\n%s",
 				when, what, s.readDaemonLog(c))
@@ -535,6 +552,7 @@ func (s *IntegrationSuite) TestDaemon_LaunchRules() {
 		"ARGV comm=gh", "word=git-credential", "word=NOTE_ME", "word=SSL_CERT_DIR",
 		"word=--export-secret-ke", "word=--export-se", "word=--sto", "word=--raw", "word=show", "word=--frobn",
 		"word=--headless", "word=-start-debugger-server", "word=MOZ_HEADLESS", "word=-MOZ_LOG",
+		"word=-HEADLESS", "word=--Start-Debugger-Server", "word=--MOZ_LOG", "word=--stdin",
 		"allow_env SSL_CERT_FILE=/tmp/user-ca.pem refused"} {
 		s.Require().Containsf(log, want, "daemon log lacks %q:\n%s", want, log)
 	}
