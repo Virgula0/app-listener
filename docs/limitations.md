@@ -232,7 +232,7 @@ opens it. The full list is in [Binary trust](binary-trust.md#launch-rules).
 | Browsers, Electron apps | `--proxy-server`, `--proxy-pac-url`, `--ignore-certificate-errors*` | The app would send its cookies and tokens to the caller's server | Use the desktop's proxy settings |
 | Browsers, Electron apps | `--load-extension`, `--disable-extensions-except`, `--pack-extension`, `--remote-debugging-*`, `--inspect*` | They run code of the caller's choosing in the app | Install extensions from the store; debug on a separate profile |
 | Node, Electron, Bun, JVM apps | Code-loading variables and flags (`NODE_OPTIONS=--require`, `ELECTRON_RUN_AS_NODE`, `BUN_OPTIONS`, `JAVA_TOOL_OPTIONS=-javaagent`, ...) | Same | Leave them unset for whitelisted apps |
-| `gh` | `auth token`, `auth status -t` / `--show-token`, `alias set`, `alias import` | They print the token, or make `gh` run a command of the caller's choosing | `gh auth status` without `-t` |
+| `gh` | `auth token`, `auth status`, `alias set`, `alias import` | They print the token (`auth status -t`, also as `-tt` or `-at`), or make `gh` run a command of the caller's choosing | `gh api user -q .login` shows who is logged in |
 | `aws` | `configure export-credentials`, `configure get` | They print the keys | Read `~/.aws` with an editor through `edit-protected` |
 | `gpg` | `--export-secret-keys`, `--export-secret-subkeys`, `--export-secret-ssh-key`, `--enarmor`, `--store`, in every abbreviation | They print the secret keys, or wrap any file `gpg` reads | None today |
 | `kubectl`, `oc` | `config view --raw` | It prints the client keys and tokens | `config view` (redacted) |

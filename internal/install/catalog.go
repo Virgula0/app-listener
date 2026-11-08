@@ -631,7 +631,8 @@ var Catalog = []CandidateDir{
 			"/snap/bin/gh":                      nil,
 		},
 		LaunchRules: map[string][]daemonconfig.LaunchRule{"gh": {
-			deny("auth", "token"), deny("auth", "status", "--show-token"), deny("auth", "status", "-t"),
+			// auth status: pflag reads -t in any cluster (-tt, -at) or as -t=true, so no flag list holds.
+			deny("auth", "token"), deny("auth", "status"),
 			deny("alias", "set"), deny("alias", "import"),
 			// git's credential helper: denying it breaks every git push, so it is only logged.
 			warn("auth", "git-credential"),
