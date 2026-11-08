@@ -302,6 +302,11 @@ func (s *IntegrationSuite) TestDaemon_RuntimeSectionGuardedAcrossRestart() {
 		s.Require().NotEqualf(0, code, "%s in the runtime section succeeded while the daemon was stopped: %s", p.name, out)
 	}
 	// Through the whitelisted stat: the guard denies every other probe inside the section.
+	const listPins = "ls /sys/fs/bpf/app-listener"
+	pinGens := "ls /sys/fs/bpf/app-listener | sed -n 's/^al-\\([a-z0-9]*\\)-.*/\\1/p' | sort -u"
+	_, pins := s.exec(c, []string{"sh", "-c", listPins})
+	s.Require().Containsf(pins, "-shared-handover", "the stop left no handover marker:\n%s\n%s", pins, s.readDaemonLog(c))
+	_, stopped := s.exec(c, []string{"sh", "-c", pinGens})
 	code, out = s.exec(c, []string{"sh", "-c", "stat -c %F " + sock + "; for p in moved evil sub evil.sock; do " +
 		"stat " + dir + "/$p >/dev/null 2>&1 && echo planted $p; done; true"})
 	s.Require().Equalf("socket", strings.TrimSpace(out), "the section changed while stopped: %d", code)
@@ -319,11 +324,14 @@ func (s *IntegrationSuite) TestDaemon_RuntimeSectionGuardedAcrossRestart() {
 	s.Require().Equalf(1, code, "whitelisted ssh-add must reach the agent after the restart: %s\n%s", out, s.readDaemonLog(c))
 	code, out = asUser("mkdir " + dir + "/sub 2>&1")
 	s.Require().NotEqualf(0, code, "the restarted daemon does not guard the section: %s", out)
-	// Only this run's pins are left: the stopped run's were retired once the new guards held the tree.
-	code, out = s.exec(c, []string{"sh", "-c",
-		"ls /sys/fs/bpf/app-listener | sed -n 's/^al-\\([a-z0-9]*\\)-.*/\\1/p' | sort -u | wc -l"})
-	s.Require().Equalf("1", strings.TrimSpace(out), "stale pin generations left after the restart (%d):\n%s",
-		code, s.readDaemonLog(c))
+	// The stopped run's pins were retired once the new guards held the tree. The new run may hold
+	// two generations itself: a reload moves the config guards, the self-guards keep the start's.
+	_, pins = s.exec(c, []string{"sh", "-c", listPins})
+	for gen := range strings.FieldsSeq(stopped) {
+		s.Require().NotContainsf(pins, "al-"+gen+"-", "the stopped run's pins (generation %s) outlived the restart:\n%s\n%s",
+			gen, pins, s.readDaemonLog(c))
+	}
+	s.Require().NotContainsf(pins, "-shared-handover", "a handover marker outlived the restart:\n%s", pins)
 
 	s.exec(c, []string{"sh", "-c", "pkill ssh-agent; pkill -f 'app-listener daemon' || true"})
 	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
