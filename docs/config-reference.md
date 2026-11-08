@@ -470,6 +470,9 @@ anything between them. `warn_args` only logs the match (`ARGV comm=... word=...`
 - A word is at most 43 bytes (an abbreviation spelled out in full).
 - A word starting with `-` is a flag, compared up to `=`: write it without a value (`--raw`, not
   `--raw=true`, which is refused).
+- Words are compared byte for byte: `--Raw` is another word, so a rule fits only a program whose
+  parser is case-sensitive too. Some catalog rules ignore case or take either dash count where
+  their program's parser does (Firefox's flags), each rule on its own.
 - `--name[rest]` matches every abbreviation from `--name` to `--namerest`, for a program that runs
   any unambiguous prefix of a long option (gpg, getopt_long): `deny_args /usr/bin/gpg
   --export-se[cret-keys]` refuses `--export-se`, `--export-sec`, ..., `--export-secret-keys`. Only a

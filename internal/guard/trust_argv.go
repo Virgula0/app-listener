@@ -15,6 +15,7 @@ const (
 	argvEnv      uint32 = 2
 	argvEnvOK    uint32 = 3
 	argvProfile  uint32 = 4
+	argvWordFold uint32 = 5
 	argvDeny     uint64 = 1
 	argvWarn     uint64 = 2
 	argvRules           = daemonconfig.MaxLaunchRules
@@ -22,6 +23,7 @@ const (
 	argvSetsMax         = 1024
 	argvRootOnly        = 1
 	argvAnchored        = 2
+	argvFolded          = 4
 )
 
 // caEnvRules: Go's crypto/x509, OpenSSL and GnuTLS trust SSL_CERT_FILE / SSL_CERT_DIR, Node and Bun
@@ -92,7 +94,8 @@ func encodeLaunchSet(rules []daemonconfig.LaunchRule, allowed []string) (map[arg
 }
 
 // encodeArgvRule records argv rule i: its word j sets bit i*argvWords+j of each of that word's
-// forms' entries. An abbreviation's every spelling is an exact key, so the kernel needs no prefix match.
+// forms' entries. An abbreviation's every spelling is an exact key, so the kernel needs no prefix
+// match; a FoldCase rule's are lowercase argvWordFold keys, which the kernel looks up lowercased.
 func encodeArgvRule(words map[argvEntry]uint64, set *GuardTrustArgvSet, r *daemonconfig.LaunchRule, i int) error {
 	if i >= argvRules {
 		return fmt.Errorf("more than %d argv rules", argvRules)
@@ -105,8 +108,13 @@ func encodeArgvRule(words map[argvEntry]uint64, set *GuardTrustArgvSet, r *daemo
 		if err != nil {
 			return err
 		}
-		for _, f := range forms {
-			words[argvEntry{argvWord, f}] |= 1 << (i*argvWords + j)
+		kind := argvWord
+		if r.FoldCase {
+			kind = argvWordFold
+			set.Flags |= argvFolded
+		}
+		for _, f := range ruleForms(r, forms) {
+			words[argvEntry{kind, f}] |= 1 << (i*argvWords + j)
 		}
 	}
 	set.Lens |= uint64(len(r.Words)) << (i * 4)
@@ -114,6 +122,38 @@ func encodeArgvRule(words map[argvEntry]uint64, set *GuardTrustArgvSet, r *daemo
 		set.Warn |= 1 << i
 	}
 	return nil
+}
+
+// ruleForms adds forms' other-dash spellings for an EitherDash rule and lowercases a FoldCase one's.
+func ruleForms(r *daemonconfig.LaunchRule, forms []string) []string {
+	out := slices.Clone(forms)
+	if r.EitherDash {
+		for _, f := range forms {
+			switch {
+			case strings.HasPrefix(f, "--"):
+				out = append(out, f[1:])
+			case strings.HasPrefix(f, "-") && len(f) > 1:
+				out = append(out, "-"+f)
+			}
+		}
+	}
+	if r.FoldCase {
+		for k, f := range out {
+			out[k] = asciiLower(f)
+		}
+	}
+	return out
+}
+
+// asciiLower folds A-Z only, as the kernel does: no Unicode case mapping.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for k, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[k] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // encodeEnvRule maps an env rule's name to argvDeny, or argvWarn while every rule naming it warns.
@@ -174,8 +214,8 @@ func canonLaunchRules(rules []daemonconfig.LaunchRule, allowEnv []string) (canon
 		if r.Short != nil {
 			short = r.Short.Deny + "/" + r.Short.Args
 		}
-		return fmt.Sprintf("%s\x00%t\x00%t\x00%s\x00%s\x00%s", r.Env, r.Warn, r.RootOnly, short, r.Profile,
-			strings.Join(r.Words, "\x00"))
+		return fmt.Sprintf("%s\x00%t\x00%t\x00%s\x00%s\x00%t\x00%t\x00%s", r.Env, r.Warn, r.RootOnly, short,
+			r.Profile, r.FoldCase, r.EitherDash, strings.Join(r.Words, "\x00"))
 	}
 	canon = slices.Clone(rules)
 	slices.SortFunc(canon, func(a, b daemonconfig.LaunchRule) int { return strings.Compare(enc(a), enc(b)) })

@@ -137,6 +137,16 @@ func denyEach(words ...string) []daemonconfig.LaunchRule {
 	return out
 }
 
+// flagRules is one single-word deny rule per flag, matched after one or two dashes, ignoring ASCII
+// case when fold (the parser's own comparison, per flag).
+func flagRules(fold bool, flags ...string) []daemonconfig.LaunchRule {
+	out := make([]daemonconfig.LaunchRule, 0, len(flags))
+	for _, f := range flags {
+		out = append(out, daemonconfig.LaunchRule{Words: []string{f}, FoldCase: fold, EitherDash: true})
+	}
+	return out
+}
+
 // sshdRootOnly: sshd prints every line of the config -f names (`sshd -t -f ~/.ssh/id_ed25519`); only
 // root runs the server and its session and auth helpers.
 var sshdRootOnly = []daemonconfig.LaunchRule{{RootOnly: true}}
@@ -158,18 +168,18 @@ var (
 	chromiumAnchors = profileAnchors("SingletonLock", "Local State", "Preferences", "Secure Preferences")
 )
 
-// firefoxRules: see the Firefox profile entry.
-var firefoxRules = slices.Concat(denyEach(
-	"--headless", "-headless", "--screenshot", "-screenshot",
-	"--remote-debugging-port", "-remote-debugging-port", "--marionette", "-marionette",
-	"--start-debugger-server", "-start-debugger-server", "--jsdebugger", "-jsdebugger",
-	"--MOZ_LOG", "-MOZ_LOG"), []daemonconfig.LaunchRule{
+// firefoxRules: see the Firefox profile entry. nsAppRunner's CheckArg and the command-line handlers
+// ignore a flag's case; LogCommandLineHandler matches MOZ_LOG exactly.
+var firefoxRules = slices.Concat(flagRules(true,
+	"-headless", "-screenshot", "-remote-debugging-port", "-marionette", "-start-debugger-server", "-jsdebugger"),
+	flagRules(false, "-MOZ_LOG"), []daemonconfig.LaunchRule{
 	{Env: "MOZ_HEADLESS"}, {Env: "MOZ_MARIONETTE"}, {Env: "MOZ_LOG"}, {Env: "SSLKEYLOGFILE"}},
 	firefoxAnchors)
 
-// coinRules: an unlocked wallet's keys and funds over RPC; -stdin carries the method on stdin.
-var coinRules = denyEach("-stdin", "dumpprivkey", "dumpwallet", "walletpassphrase", "send", "sendall",
-	"sendmany", "sendtoaddress")
+// coinRules: an unlocked wallet's keys and funds over RPC; -stdin carries the method on stdin
+// (ArgsManager reads --stdin as -stdin, case-sensitively on Linux).
+var coinRules = append(flagRules(false, "-stdin"), denyEach("dumpprivkey", "dumpwallet", "walletpassphrase", "send", "sendall",
+	"sendmany", "sendtoaddress")...)
 
 // catalogLaunchRules indexes every entry's LaunchRules by basename.
 var catalogLaunchRules = func() map[string][]daemonconfig.LaunchRule {
@@ -765,7 +775,7 @@ var Catalog = []CandidateDir{
 		// Firefox isn't a detected Chromium runtime. Headless renders any file:// it reads into the
 		// caller's output (--screenshot, an iframe of the profile); the remote protocols, the debugger
 		// server and Marionette drive the browser (cookies, file:// navigation); MOZ_LOG=nsHttp logs
-		// cookie headers and SSLKEYLOGFILE the TLS keys. Each switch takes one or two dashes.
+		// cookie headers and SSLKEYLOGFILE the TLS keys. Each switch takes one or two dashes; see firefoxRules.
 		LaunchRules: map[string][]daemonconfig.LaunchRule{"firefox": firefoxRules, "firefox-bin": firefoxRules}},
 	{Name: "Google Chrome profile", RelPaths: []string{".config/google-chrome"},
 		Whitelist: map[string][]string{

@@ -171,3 +171,56 @@ func TestEncodeLaunchSetProfileAnchors(t *testing.T) {
 		t.Fatal("a set without anchors must not be flagged")
 	}
 }
+
+// wordMask mirrors guard_trust.bpf.c argv_word's lookups for one argv word.
+func wordMask(words map[argvEntry]uint64, set GuardTrustArgvSet, w string) uint64 {
+	if strings.HasPrefix(w, "-") {
+		w, _, _ = strings.Cut(w, "=")
+	}
+	m := words[argvEntry{argvWord, w}]
+	if set.Flags&argvFolded != 0 {
+		m |= words[argvEntry{argvWordFold, asciiLower(w)}]
+	}
+	return m
+}
+
+// One binary may mix a parser that ignores case (Firefox's flags) with one that doesn't (its
+// -MOZ_LOG): each rule says how its words compare, and either dash count where it says so.
+func TestEncodeLaunchSetFoldsPerRule(t *testing.T) {
+	words, set, err := encodeLaunchSet([]daemonconfig.LaunchRule{
+		{Words: []string{"-headless"}, FoldCase: true, EitherDash: true},
+		{Words: []string{"-MOZ_LOG"}, EitherDash: true},
+		deny("--exact"),
+		{Words: []string{"--ab[c]"}, FoldCase: true},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Flags&argvFolded == 0 {
+		t.Fatal("a set with a folded rule must be flagged for the folded lookup")
+	}
+	for w, want := range map[string]uint64{
+		"-headless": 1, "--headless": 1, "-HEADLESS": 1, "--HeadLess": 1, "-headless=1": 1, "---headless": 0,
+		"-MOZ_LOG": 1 << 4, "--MOZ_LOG=x": 1 << 4, "-moz_log": 0, "--Moz_Log": 0,
+		"--exact": 1 << 8, "-exact": 0, "--EXACT": 0,
+		"--AB": 1 << 12, "--aBc": 1 << 12, "-ab": 0,
+	} {
+		if got := wordMask(words, set, w); got != want {
+			t.Errorf("%q matches %#x, want %#x", w, got, want)
+		}
+	}
+	for e := range words {
+		if e.kind == argvWordFold && e.name != asciiLower(e.name) {
+			t.Errorf("folded key %q is not lowercase: the kernel looks it up lowercased", e.name)
+		}
+	}
+	_, plain, _ := encodeLaunchSet([]daemonconfig.LaunchRule{deny("-headless")}, nil)
+	if plain.Flags&argvFolded != 0 {
+		t.Error("a set without folded rules must not pay for the folded lookup")
+	}
+	a := []daemonconfig.LaunchRule{{Words: []string{"-x"}, FoldCase: true}}
+	b := []daemonconfig.LaunchRule{{Words: []string{"-x"}}}
+	if _, _, ka := canonLaunchRules(a, nil); func() bool { _, _, kb := canonLaunchRules(b, nil); return ka == kb }() {
+		t.Error("a folded and an exact rule must not share a set")
+	}
+}

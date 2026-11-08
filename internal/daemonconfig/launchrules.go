@@ -22,6 +22,11 @@ type LaunchRule struct {
 	RootOnly bool
 	Short    *ShortOpts
 	Profile  string
+	// FoldCase: the parser ignores ASCII case in this rule's words (Firefox's flags), so every
+	// spelling matches. EitherDash: a flag word written -x also matches --x and the reverse.
+	// Per rule: one parser can mix them (Firefox's -MOZ_LOG is case-sensitive).
+	FoldCase   bool
+	EitherDash bool
 }
 
 // ShortOpts (catalog only): getopt letters refused anywhere in an option cluster before one of
@@ -41,7 +46,7 @@ const (
 // Same reports whether r and o are the same rule.
 func (r *LaunchRule) Same(o *LaunchRule) bool {
 	return r.Path == o.Path && r.Env == o.Env && r.Warn == o.Warn && r.Profile == o.Profile &&
-		slices.Equal(r.Words, o.Words)
+		r.FoldCase == o.FoldCase && r.EitherDash == o.EitherDash && slices.Equal(r.Words, o.Words)
 }
 
 // applyLaunchRule records `deny_args|warn_args <path> <word>...`, `deny_env|warn_env <path> <NAME>`

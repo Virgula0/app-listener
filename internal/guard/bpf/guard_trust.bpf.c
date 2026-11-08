@@ -362,7 +362,9 @@ struct {
 // that print or spend its secret (`gh auth token`) is marked code-suspect (SUSPECT_ARGV). An ARGV_WORD
 // entry's value has bit rule*ARGV_WORDS+pos set for each rule word it is; a rule matches once its
 // words appear in argv in order, others between (unanchored: a global flag taking a separate value
-// would shift any anchor). A word starting with '-' is compared up to '='. An ARGV_ENV entry matches
+// would shift any anchor). A word starting with '-' is compared up to '='. An ARGV_WORD_FOLD entry is a
+// rule word of a parser that ignores ASCII case, stored lowercase and looked up with the argv word
+// lowercased, in sets flagged ARGV_FOLDED only. An ARGV_ENV entry matches
 // when the variable is set (value ARGV_DENY or ARGV_WARN), unless the whole NAME=value string is an
 // ARGV_ENV_OK entry (a root-owned CA bundle). Filled by userspace (guard/trust_argv.go).
 #define ARGV_RULES 16
@@ -371,6 +373,7 @@ struct {
 #define ARGV_ENV 2
 #define ARGV_ENV_OK 3
 #define ARGV_PROFILE 4 // a profile anchor: a file name the browser creates or opens in its profile
+#define ARGV_WORD_FOLD 5
 #define ARGV_DENY 1
 #define ARGV_WARN 2
 #define ARGV_KEY 64
@@ -395,6 +398,7 @@ struct {
 // lines). Written before any guard_bin_rules row names the set, never changed after.
 #define ARGV_ROOT_ONLY 1
 #define ARGV_ANCHORED 2 // the set has ARGV_PROFILE entries (trust_profile_anchor)
+#define ARGV_FOLDED 4   // the set has ARGV_WORD_FOLD entries
 
 struct argv_set {
 	__u64 lens;
@@ -438,7 +442,7 @@ struct launch_scan {
 	__u32 rules;    // the exe has a trust_argv set
 	__u32 set;
 	__u32 argv_hit; // a deny rule matched
-	__u32 pad;
+	__u32 fold;     // the set is ARGV_FOLDED
 	__u64 lens;     // trust_argv_sets[set]
 	__u64 warn;
 	__u64 short_deny;
@@ -1652,7 +1656,8 @@ static __always_inline long launch_token(struct launch_scan *s)
 static __noinline __u64 *argv_rule_at(struct launch_scan *s, __u32 kind)
 {
 	int done = 0;
-	int cut = kind == ARGV_ENV || (kind == ARGV_WORD && s->buf[0] == '-');
+	int fold = kind == ARGV_WORD_FOLD;
+	int cut = kind == ARGV_ENV || ((kind == ARGV_WORD || fold) && s->buf[0] == '-');
 	s->akey.set = s->set;
 	s->akey.kind = kind;
 	for (int j = 0; j < ARGV_KEY; j++) {
@@ -1663,6 +1668,8 @@ static __noinline __u64 *argv_rule_at(struct launch_scan *s, __u32 kind)
 				done = 1;
 				c = 0;
 			}
+			if (fold && c >= 'A' && c <= 'Z')
+				c += 'a' - 'A';
 		}
 		s->akey.name[j] = c;
 	}
@@ -1688,13 +1695,22 @@ static __always_inline void argv_matched(struct launch_scan *s, int warn)
 	bpf_ringbuf_submit(e, 0);
 }
 
-// argv_word advances every rule whose next word buf is.
+// argv_word advances every rule whose next word buf is. The exact lookup goes last: akey then holds
+// the word as written, which a match reports.
 static __noinline void argv_word(struct launch_scan *s)
 {
-	__u64 *m = argv_rule_at(s, ARGV_WORD);
-	if (!m)
+	__u64 mask = 0;
+	__u64 *m;
+	if (s->fold) {
+		m = argv_rule_at(s, ARGV_WORD_FOLD);
+		if (m)
+			mask = *m;
+	}
+	m = argv_rule_at(s, ARGV_WORD);
+	if (m)
+		mask |= *m;
+	if (!mask)
 		return;
-	__u64 mask = *m;
 	for (int i = 0; i < ARGV_RULES; i++) {
 		__u32 len = (s->lens >> (i * 4)) & 0xf;
 		__u32 p = s->prog[i];
@@ -1902,6 +1918,7 @@ int trust_exec_launch(unsigned long long *ctx)
 	if (!s)
 		return 0;
 	s->rules = 0;
+	s->fold = 0;
 	s->argv_hit = 0;
 	__builtin_memset(s->prog, 0, sizeof(s->prog));
 	if (set) {
@@ -1911,6 +1928,7 @@ int trust_exec_launch(unsigned long long *ctx)
 			if ((as->flags & ARGV_ROOT_ONLY) && (bpf_get_current_uid_gid() & 0xFFFFFFFF))
 				return argv_not_root(tgid);
 			s->rules = 1;
+			s->fold = !!(as->flags & ARGV_FOLDED);
 			s->set = id;
 			s->lens = as->lens;
 			s->warn = as->warn;

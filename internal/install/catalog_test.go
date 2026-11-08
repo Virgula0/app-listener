@@ -1116,7 +1116,8 @@ func TestCatalogLaunchRulesKeyedByWhitelistBasename(t *testing.T) {
 func TestCatalogAgentLaunchRules(t *testing.T) {
 	has := func(name string, want daemonconfig.LaunchRule) bool {
 		return slices.ContainsFunc(CatalogLaunchRules(name), func(r daemonconfig.LaunchRule) bool {
-			return r.Env == want.Env && slices.Equal(r.Words, want.Words) && !r.Warn
+			return r.Env == want.Env && slices.Equal(r.Words, want.Words) && !r.Warn &&
+				r.FoldCase == want.FoldCase && r.EitherDash == want.EitherDash
 		})
 	}
 	for name, rules := range map[string][]daemonconfig.LaunchRule{
@@ -1127,7 +1128,10 @@ func TestCatalogAgentLaunchRules(t *testing.T) {
 		"oc":       {deny("config", "view", "--raw")},
 		"rclone":   {deny("config", "show"), deny("config", "dump")},
 		"idea":     {deny("installPlugins")},
-		"firefox":  {deny("--headless"), deny("-headless"), deny("--remote-debugging-port"), {Env: "MOZ_HEADLESS"}},
+		"firefox": {{Words: []string{"-headless"}, FoldCase: true, EitherDash: true},
+			{Words: []string{"-remote-debugging-port"}, FoldCase: true, EitherDash: true},
+			{Words: []string{"-MOZ_LOG"}, EitherDash: true}, {Env: "MOZ_HEADLESS"}},
+		"bitcoin-cli": {{Words: []string{"-stdin"}, EitherDash: true}, deny("dumpprivkey")},
 	} {
 		for _, want := range rules {
 			if !has(name, want) {

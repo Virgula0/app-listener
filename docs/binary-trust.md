@@ -234,13 +234,15 @@ file's name, in every section that whitelists a file of that name:
 - `rclone`: `config show`, `config dump` (every remote's tokens and passwords).
 - `firefox` (not a Chromium runtime, so the launch scan doesn't judge it): `--headless`,
   `--screenshot`, `--remote-debugging-port`, `--marionette`, `--start-debugger-server`,
-  `--jsdebugger` and `--MOZ_LOG`, each with one or two dashes, and the variables `MOZ_HEADLESS`,
+  `--jsdebugger` and `--MOZ_LOG`, each with one or two dashes and, but for `--MOZ_LOG`, in any
+  case (Firefox ignores a flag's case: `-HEADLESS` runs headless), and the variables `MOZ_HEADLESS`,
   `MOZ_MARIONETTE`, `MOZ_LOG` and `SSLKEYLOGFILE`: the same output, remote-control and log routes
   as Chromium's.
 - JetBrains launchers (`idea`, `pycharm`, ..., Android Studio's `studio`): `installPlugins`, which
   installs a plugin from any repository; the plugin then runs in the IDE.
 - `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
-  `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag (it reads the method from stdin).
+  `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag, with one or two dashes (it reads
+  the method from stdin).
 - `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,
   `fundchannel`, `multifundchannel`, `close`, `exposesecret`.
 - Every whitelisted binary (built into the daemon, not the catalog): `SSL_CERT_FILE` or `SSL_CERT_DIR` (Go, OpenSSL, GnuTLS) or
