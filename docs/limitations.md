@@ -117,8 +117,7 @@ over a channel the guard doesn't see answers whoever asks:
 - **Agents as oracles.** A guarded agent socket stops other programs from connecting, but a
   whitelisted client run by malware still asks on its behalf: `ssh-add -L`, `ssh` signing to a host
   of the attacker's choice, `gpg --decrypt`. `git credential fill`, run by anyone, prints what your
-  credential helper (`store`, `cache`, libsecret, Git Credential Manager, `gh auth git-credential`)
-  hands back. `ssh-add` sends the key it read to whatever socket it is pointed at, so it may reach
+  credential helper (`store`, `cache`, libsecret, Git Credential Manager) hands back. `ssh-add` sends the key it read to whatever socket it is pointed at, so it may reach
   only an agent: a socket inside a guarded tree (the catalog's `ssh-agent`, gcr and `gpg-agent`
   runtime sections, or one in a guarded directory), whose connection only a whitelisted agent
   program (`ssh-agent`, `gpg-agent`, `gcr-ssh-agent`, 1Password) may read or answer. An agent started
@@ -238,7 +237,7 @@ opens it. The full list is in [Binary trust](binary-trust.md#launch-rules).
 | Browsers, Electron apps | `--proxy-server`, `--proxy-pac-url`, `--ignore-certificate-errors*` | The app would send its cookies and tokens to the caller's server | Use the desktop's proxy settings |
 | Browsers, Electron apps | `--load-extension`, `--disable-extensions-except`, `--pack-extension`, `--remote-debugging-*`, `--inspect*` | They run code of the caller's choosing in the app | Install extensions from the store; debug on a separate profile |
 | Node, Electron, Bun, JVM apps | Code-loading variables and flags (`NODE_OPTIONS=--require`, `ELECTRON_RUN_AS_NODE`, `BUN_OPTIONS`, `JAVA_TOOL_OPTIONS=-javaagent`, ...) | Same | Leave them unset for whitelisted apps |
-| `gh` | `auth token`, `auth status`, `alias set`, `alias import` | They print the token (`auth status -t`, also as `-tt` or `-at`), or make `gh` run a command of the caller's choosing | `gh api user -q .login` shows who is logged in |
+| `gh` | `auth token`, `auth status`, `auth git-credential`, `alias set`, `alias import` | They print the token (`auth status -t`, also as `-tt` or `-at`; `git-credential` to anyone who asks), or make `gh` run a command of the caller's choosing | `gh api user -q .login` shows who is logged in. `gh` can't be git's credential helper (`gh auth setup-git`): push over SSH |
 | `aws` | `configure export-credentials`, `configure get` | They print the keys | Read `~/.aws` with an editor through `edit-protected` |
 | `gpg` | `--export-secret-keys`, `--export-secret-subkeys`, `--export-secret-ssh-key`, `--enarmor`, `--store`, in every abbreviation | They print the secret keys, or wrap any file `gpg` reads | None today |
 | `kubectl`, `oc` | `config view --raw` | It prints the client keys and tokens | `config view` (redacted) |

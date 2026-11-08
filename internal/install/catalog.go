@@ -628,9 +628,8 @@ var Catalog = []CandidateDir{
 		LaunchRules: map[string][]daemonconfig.LaunchRule{"gh": {
 			// auth status: pflag reads -t in any cluster (-tt, -at) or as -t=true, so no flag list holds.
 			deny("auth", "token"), deny("auth", "status"),
-			deny("alias", "set"), deny("alias", "import"),
-			// git's credential helper: denying it breaks every git push, so it is only logged.
-			warn("auth", "git-credential"),
+			// git-credential prints the token to whoever runs it: gh is never git's credential helper.
+			deny("alias", "set"), deny("alias", "import"), deny("auth", "git-credential"),
 		}}},
 	// A Python app: its lines never match (see Google Cloud SDK).
 	{Name: "Azure CLI", RelPaths: []string{".azure", ".config/azure"},

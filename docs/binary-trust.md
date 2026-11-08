@@ -211,8 +211,8 @@ name the binary, who ran it and the word that matched:
 From the catalog (each entry's `LaunchRules` in `internal/install/catalog.go`), by the whitelisted
 file's name, in every section that whitelists a file of that name:
 
-- `gh`: `auth token`, `auth status` (its `-t` hides in any flag cluster), `alias set`, `alias import`;
-  `auth git-credential` is only logged, since git runs it on every push.
+- `gh`: `auth token`, `auth status` (its `-t` hides in any flag cluster), `auth git-credential`,
+  `alias set`, `alias import`.
 - `aws`: `configure export-credentials`, `configure get`.
 - `pi`: `-e` and `--extension` (it runs the extension in its own process), and
   `PI_CODING_AGENT_DIR` set (an agent directory whose `extensions/` its caller wrote).
