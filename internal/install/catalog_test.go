@@ -1111,6 +1111,22 @@ func TestCatalogLaunchRulesKeyedByWhitelistBasename(t *testing.T) {
 	}
 }
 
+// Apps whose own binary hands out the secret to whoever starts it, so no whitelist protects it:
+// docker reads config.json on every command; age -e re-encrypts its identity; bitcoind under another
+// HOME loads the real walletdir and serves listdescriptors over its caller's RPC, and prints a
+// cookie its config includes. Proposing them would offer a false sense of protection.
+func TestCatalogLeavesOutSelfDisclosingApps(t *testing.T) {
+	out := []string{"docker", "age", "bitcoind", "bitcoin-qt", "bitcoin-cli", "bitcoin-tx", "bitcoin-node",
+		"bitcoin-gui", "litecoind", "litecoin-qt", "litecoin-cli"}
+	for i := range Catalog {
+		for p := range Catalog[i].Whitelist {
+			if slices.Contains(out, filepath.Base(p)) {
+				t.Errorf("%s whitelists %s", Catalog[i].Name, p)
+			}
+		}
+	}
+}
+
 // Extension loaders, env and config flags that redirect an agent's token or load a config of its
 // caller's choosing, and a browser's headless and remote-control switches.
 func TestCatalogAgentLaunchRules(t *testing.T) {
