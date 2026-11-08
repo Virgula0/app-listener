@@ -1,10 +1,13 @@
 package guard
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
@@ -123,7 +126,13 @@ func (s *guardUnitTest) TestSetBinariesRefusedAfterStop() {
 
 // appendByte changes path's content (and so its hash) while keeping it a runnable ELF.
 func appendByte(s *guardUnitTest, path string) {
+	// ETXTBSY: the reaped tool's mm (which denies writes to its exe) can outlive wait4 while
+	// another task holds a reference to it.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	for deadline := time.Now().Add(5 * time.Second); errors.Is(err, syscall.ETXTBSY) && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+		f, err = os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	}
 	s.Require().NoError(err)
 	_, err = f.Write([]byte{0})
 	s.Require().NoError(err)

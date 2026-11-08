@@ -8,6 +8,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 )
 
 // generalTools run attacker-chosen code or copy attacker-chosen bytes from their arguments (`git`,
@@ -20,7 +21,7 @@ var generalTools = []string{
 	"git", "node", "nodejs", "npm", "npx", "bun", "deno",
 	"python", "perl", "ruby", "irb", "php", "lua", "luajit", "java", "tclsh", "wish", "expect", "guile",
 	"Rscript", "R", "julia", "pwsh", "gdb", "m4", "make", "sqlite3",
-	"cp", "mv", "install", "rsync", "tar", "curl", "wget",
+	"cp", "mv", "install", "rsync", "scp", "sftp", "sftp-server", "tar", "curl", "wget",
 	"cat", "tac", "head", "tail", "dd", "od", "xxd", "hexdump", "hd", "strings", "base64", "base32",
 	"basenc", "sed", "awk", "gawk", "mawk", "grep", "egrep", "fgrep", "rg", "tee", "less", "more",
 	"sort", "uniq", "nl", "cut", "paste", "fold", "fmt", "pr", "rev", "expand", "unexpand", "join",
@@ -65,10 +66,36 @@ func GeneralToolsOf(res *daemonconfig.Resource) []string {
 	return out
 }
 
-// WarnGeneralTools logs, per resource, the general tools that make it readable by any script.
-func WarnGeneralTools(cfg *daemonconfig.Config) {
+// ScriptsOf lists res's whitelist lines that are "#!" scripts: the exe is their interpreter, so
+// such a line never matches.
+func ScriptsOf(res *daemonconfig.Resource) []string {
+	var out []string
+	for _, b := range res.Binaries {
+		line := b.Path
+		if b.Link != "" {
+			line = b.Link
+		}
+		if ebpf.IsScript(b.Path) && !slices.Contains(out, line) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// WarnWhitelistLines logs, per resource, the general tools that make it readable by any script, and
+// the script lines that never match once per distinct set (one app's resources share theirs).
+func WarnWhitelistLines(cfg *daemonconfig.Config) {
+	var sets []string
+	resourcesOf := map[string][]string{}
 	for i := range cfg.Resources {
 		res := &cfg.Resources[i]
+		if scripts := ScriptsOf(res); len(scripts) > 0 {
+			set := strings.Join(scripts, ", ")
+			if _, seen := resourcesOf[set]; !seen {
+				sets = append(sets, set)
+			}
+			resourcesOf[set] = append(resourcesOf[set], res.Path)
+		}
 		if res.ReadOnly {
 			continue // a lib_dir holds no secret: a tool there is a writer, judged by the updater plan
 		}
@@ -76,5 +103,10 @@ func WarnGeneralTools(cfg *daemonconfig.Config) {
 			log.Warnf("%s whitelists general tool(s) %s: identity is the executable, so any script or "+
 				"arguments run through them can read it (not an updater either)", res.Path, strings.Join(tools, ", "))
 		}
+	}
+	for _, set := range sets {
+		log.Warnf("%s whitelist(s) script(s) %s, which never match: a #! script runs as its interpreter "+
+			"(never whitelist that), so the app is denied too; whitelist the ELF it ends up running, if any "+
+			"(`install catalog refresh` drops catalog script lines)", strings.Join(resourcesOf[set], ", "), set)
 	}
 }

@@ -1,16 +1,19 @@
 package install
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/Virgula0/app-listener/internal/daemonconfig"
 )
 
 // TestCatalogSanity verifies the master list is well-formed: every entry
-// has a name, exactly one non-empty of RelPaths/AbsPaths, absolute
+// has a name, exactly one non-empty of RelPaths/AbsPaths/RuntimeDir/Ports/Secret, absolute
 // whitelist binaries, WatchRelPaths only with a single RelPaths entry, and
 // no two entries probe the same path.
 func TestCatalogSanity(t *testing.T) {
@@ -19,9 +22,34 @@ func TestCatalogSanity(t *testing.T) {
 		if entry.Name == "" {
 			t.Errorf("entry with empty name: %+v", entry)
 		}
-		rel, abs := len(entry.RelPaths), len(entry.AbsPaths)
-		if (rel == 0) == (abs == 0) {
-			t.Errorf("entry %q must set exactly one of RelPaths or AbsPaths (non-empty)", entry.Name)
+		set := 0
+		for _, n := range []int{len(entry.RelPaths), len(entry.AbsPaths), len(entry.RuntimeDir), len(entry.Ports), len(entry.Secret)} {
+			if n > 0 {
+				set++
+			}
+		}
+		if set != 1 {
+			t.Errorf("entry %q must set exactly one of RelPaths, AbsPaths, RuntimeDir, Ports or Secret", entry.Name)
+		}
+		for _, p := range entry.Ports {
+			if p >= 32768 {
+				t.Errorf("entry %q: port %d is in the default ephemeral range, which the daemon refuses", entry.Name, p)
+			}
+			if prev, ok := seen[daemonconfig.PortAnchor(p)]; ok {
+				t.Errorf("duplicate catalog port %d (%s and %s)", p, prev, entry.Name)
+			}
+			seen[daemonconfig.PortAnchor(p)] = entry.Name
+		}
+		for bin, events := range entry.Whitelist {
+			for _, e := range events {
+				if len(entry.Ports) > 0 && e != "CONNECT" && e != "MKNOD" {
+					t.Errorf("entry %q: %s %s: a port entry takes CONNECT and MKNOD only", entry.Name, bin, e)
+				}
+			}
+		}
+		if entry.IsRuntime() && (entry.RuntimeIf == "" || filepath.IsAbs(entry.RuntimeIf) ||
+			strings.Contains(entry.RuntimeDir, "/")) {
+			t.Errorf("entry %q: RuntimeDir must be one name and RuntimeIf home-relative", entry.Name)
 		}
 		for _, p := range entry.RelPaths {
 			if p == "" || filepath.IsAbs(p) {
@@ -201,33 +229,48 @@ func TestSSHWhitelistIncludesDaemon(t *testing.T) {
 	if !found {
 		t.Fatal(".ssh whitelist does not include sshd: public-key logins would be denied while guarded")
 	}
-	if events := entry.Whitelist["/usr/bin/ssh"]; len(events) != 5 || events[0] != "READ" || events[1] != "WRITE" || events[2] != "DELETE" || events[3] != "RENAME" || events[4] != "HARDLINK" {
-		t.Errorf("/usr/bin/ssh must be READ,WRITE,DELETE,RENAME,HARDLINK, got %v", events)
+	if events := entry.Whitelist["/usr/bin/ssh"]; !slices.Equal(events, []string{"READ", "WRITE", "DELETE", "RENAME", "HARDLINK", "MKNOD", "CONNECT"}) {
+		t.Errorf("/usr/bin/ssh must be READ,WRITE,DELETE,RENAME,HARDLINK,MKNOD,CONNECT, got %v", events)
 	}
 }
 
-// docker-buildx (CLI plugin at /usr/lib/docker/cli-plugins) must be whitelisted in both .kube and
-// .docker entries: it reads ~/.kube/config (kubernetes driver) and ~/.docker/config.json plus the
-// buildx store (buildx/.lock, instance state). Otherwise every docker buildx invocation is denied
-// while the dirs are guarded.
-func TestBuildxWhitelistedInKubeAndDocker(t *testing.T) {
-	const buildx = "/usr/lib/docker/cli-plugins/docker-buildx"
-	seen := map[string]bool{}
-	for i := range Catalog {
-		for _, rel := range Catalog[i].RelPaths {
-			if rel != ".kube" && rel != ".docker" {
-				continue
+// TestRuntimeEntriesNeverDeleteRoot: a DELETE grant to a binary a caller can steer into removing
+// the runtime root (rmdir) would let the user recreate it unguarded.
+func TestRuntimeEntriesNeverDeleteRoot(t *testing.T) {
+	for _, e := range Catalog {
+		if !e.IsRuntime() {
+			continue
+		}
+		for _, bin := range []string{"/usr/lib/systemd/systemd", "/usr/bin/gpgconf", "/usr/bin/rmdir", "/usr/bin/mkdir"} {
+			if slices.Contains(e.Whitelist[bin], "DELETE") {
+				t.Errorf("%s: %s must not get DELETE", e.Name, bin)
 			}
-			if _, ok := Catalog[i].Whitelist[buildx]; !ok {
-				t.Errorf("%s entry does not whitelist docker-buildx", rel)
+		}
+		for bin, events := range e.Whitelist {
+			if events == nil {
+				t.Errorf("%s: %s needs an explicit event list", e.Name, bin)
 			}
-			seen[rel] = true
 		}
 	}
-	for _, rel := range []string{".kube", ".docker"} {
-		if !seen[rel] {
-			t.Errorf("%s entry not found in catalog", rel)
+}
+
+// docker-buildx (CLI plugin at /usr/lib/docker/cli-plugins) must be whitelisted on .kube: it reads
+// ~/.kube/config for the kubernetes driver. Otherwise every docker buildx invocation is denied
+// while .kube is guarded. (~/.docker itself is deliberately not in the catalog; see catalog.go.)
+func TestBuildxWhitelistedInKube(t *testing.T) {
+	const buildx = "/usr/lib/docker/cli-plugins/docker-buildx"
+	seen := false
+	for i := range Catalog {
+		if !slices.Contains(Catalog[i].RelPaths, ".kube") {
+			continue
 		}
+		if _, ok := Catalog[i].Whitelist[buildx]; !ok {
+			t.Error(".kube entry does not whitelist docker-buildx")
+		}
+		seen = true
+	}
+	if !seen {
+		t.Error(".kube entry not found in catalog")
 	}
 }
 
@@ -250,12 +293,17 @@ func TestSSHWhitelistIncludesModularDaemon(t *testing.T) {
 	required := []string{
 		"/usr/lib/openssh/sshd-auth", "/usr/lib/ssh/sshd-auth",
 		"/usr/lib/openssh/sshd-session", "/usr/lib/ssh/sshd-session",
-		"/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server",
+	}
+	// sftp-server serves any file its client names: an sftp -D session reads the keys.
+	for _, bin := range []string{"/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server"} {
+		if _, ok := entry.Whitelist[bin]; ok {
+			t.Errorf(".ssh whitelists %s", bin)
+		}
 	}
 	for _, bin := range required {
 		events, ok := entry.Whitelist[bin]
 		if !ok {
-			t.Errorf(".ssh whitelist is missing %s: public-key logins and scp reads would be denied while guarded", bin)
+			t.Errorf(".ssh whitelist is missing %s: public-key logins would be denied while guarded", bin)
 			continue
 		}
 		if len(events) != 1 || events[0] != "READ" {
@@ -391,26 +439,35 @@ func TestDiscoverSystemOnlyAbsolute(t *testing.T) {
 	}
 }
 
-// TestFilterExistingWhitelist verifies that non-existent binaries are
-// dropped from the generated whitelist.
+// TestFilterExistingWhitelist verifies that non-existent binaries and "#!" scripts are
+// dropped from the generated whitelist, while discovery still sees the script.
 func TestFilterExistingWhitelist(t *testing.T) {
-	existing := filepath.Join(t.TempDir(), "existing-bin")
-	if err := os.WriteFile(existing, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "existing-bin")
+	if err := os.WriteFile(existing, []byte("\x7fELF\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "launcher")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	c := Candidate{
 		User: User{Name: "tester", Home: "/home/tester"},
 		Entry: CandidateDir{Whitelist: map[string][]string{
 			existing:                      nil,
+			script:                        nil,
 			"/definitely/not/here/binary": nil,
 		}},
 	}
 	got := c.FilterExistingWhitelist()
 	if len(got) != 1 || got[0].Path != existing {
-		t.Errorf("FilterExistingWhitelist = %v, want [%s]", got, existing)
+		t.Fatalf("FilterExistingWhitelist = %v, want [%s]", got, existing)
 	}
 	if len(got[0].Events) != 0 {
 		t.Errorf("existing binary should have no event restriction: %v", got[0].Events)
+	}
+	if n := len(c.existingWhitelist()); n != 2 {
+		t.Errorf("existingWhitelist has %d lines, want 2: discovery must still see the script", n)
 	}
 }
 
@@ -423,7 +480,7 @@ func TestFilterExistingWhitelistSkipsOpaqueMulticall(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain := filepath.Join(dir, "tool")
-	if err := os.WriteFile(plain, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(plain, []byte("\x7fELF\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	c := Candidate{User: User{Name: "tester", Home: "/home/tester"},
@@ -910,5 +967,240 @@ func TestCatalogGuardsAppCodeAndUpdaterInputs(t *testing.T) {
 	}
 	if !slices.Contains(d.LibDirWriters, "/usr/share/discord/updater_bootstrap") {
 		t.Errorf("Discord's bootstrap must stay able to create the first app dir: %v", d.LibDirWriters)
+	}
+}
+
+func TestSeedMissingMakesCodeDirsGuardable(t *testing.T) {
+	home := t.TempDir()
+	agent := filepath.Join(home, ".pi", "agent")
+	if err := os.MkdirAll(agent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pi := catalogEntry(t, "pi coding agent")
+	u := User{Name: "u", UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), Home: home}
+	if err := pi.SeedMissing(u); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(filepath.Join(agent, "extensions")); err != nil || !st.IsDir() || st.Mode().Perm() != 0o700 {
+		t.Fatalf("extensions not seeded as a 0700 dir: %v %v", st, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(agent, "trust.json")); err != nil || string(b) != "{}\n" {
+		t.Fatalf("trust.json not seeded empty: %q %v", b, err)
+	}
+	got := pi.ExtraWatchPathsFor(home, "u")
+	for _, want := range []string{"extensions", "trust.json"} {
+		if !slices.Contains(got, filepath.Join(agent, want)) {
+			t.Errorf("%s seeded but not watched: %v", want, got)
+		}
+	}
+	// An existing one is left alone.
+	if err := os.WriteFile(filepath.Join(agent, "trust.json"), []byte(`{"/p": true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := pi.SeedMissing(u); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(agent, "trust.json")); string(b) != `{"/p": true}` {
+		t.Errorf("an existing trust.json was rewritten: %q", b)
+	}
+}
+
+func TestSeedMissingRefusesSymlinkedParent(t *testing.T) {
+	home, elsewhere := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".pi"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(home, ".pi", "agent")); err != nil {
+		t.Fatal(err)
+	}
+	pi := catalogEntry(t, "pi coding agent")
+	if err := pi.SeedMissing(User{Name: "u", Home: home}); err == nil {
+		t.Fatal("seeded through a symlinked parent")
+	}
+	if ents, _ := os.ReadDir(elsewhere); len(ents) != 0 {
+		t.Errorf("wrote through the symlink: %v", ents)
+	}
+}
+
+func TestSeedWatchPathsAreWatched(t *testing.T) {
+	for _, e := range Catalog {
+		for rel := range e.SeedWatchPaths {
+			if !slices.Contains(e.WatchRelPaths, rel) {
+				t.Errorf("%s: seed %s is not a WatchRelPaths entry", e.Name, rel)
+			}
+		}
+	}
+}
+
+// pi runs, in its own process, every extension in these: they must be guarded with its secrets.
+func TestPiCodeLoadersGuarded(t *testing.T) {
+	pi := catalogEntry(t, "pi coding agent")
+	for _, rel := range []string{".pi/agent/extensions", ".pi/agent/npm", ".pi/agent/git", ".pi/agent/trust.json"} {
+		if !slices.Contains(pi.WatchRelPaths, rel) {
+			t.Errorf("pi: %s is not watched", rel)
+		}
+	}
+	for _, rel := range []string{".pi/agent/extensions", ".pi/agent/trust.json"} {
+		if _, ok := pi.SeedWatchPaths[rel]; !ok {
+			t.Errorf("pi: %s is not seeded: one made after install would be unguarded", rel)
+		}
+	}
+}
+
+func catalogEntry(t *testing.T, name string) CandidateDir {
+	t.Helper()
+	for i := range Catalog {
+		if Catalog[i].Name == name {
+			return Catalog[i]
+		}
+	}
+	t.Fatalf("no catalog entry %q", name)
+	return CandidateDir{}
+}
+
+func TestRuntimeServersGateTheOffer(t *testing.T) {
+	i := slices.IndexFunc(Catalog, func(c CandidateDir) bool { return c.Name == "GCR SSH agent socket" })
+	if i < 0 {
+		t.Fatal("no GCR SSH agent socket entry")
+	}
+	saved := Catalog[i].RuntimeServers
+	t.Cleanup(func() { Catalog[i].RuntimeServers = saved })
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	users := []User{{Name: "u", UID: 4242, Home: home}}
+	offered := func() bool {
+		return slices.ContainsFunc(DiscoverRuntime(users), func(c Candidate) bool { return c.Entry.Name == Catalog[i].Name })
+	}
+	Catalog[i].RuntimeServers = []string{filepath.Join(home, "missing")}
+	if offered() {
+		t.Fatal("offered without its server installed")
+	}
+	server := filepath.Join(home, "gcr-ssh-agent")
+	if err := os.WriteFile(server, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	Catalog[i].RuntimeServers = []string{filepath.Join(home, "missing"), server}
+	if !offered() {
+		t.Fatal("not offered with its server installed")
+	}
+}
+
+// A rule sits beside the binary it judges: its key is the basename of one of the entry's lines.
+func TestCatalogLaunchRulesKeyedByWhitelistBasename(t *testing.T) {
+	for _, entry := range Catalog {
+		for name, rules := range entry.LaunchRules {
+			if len(rules) == 0 || !slices.ContainsFunc(slices.Collect(maps.Keys(entry.Whitelist)),
+				func(p string) bool { return filepath.Base(p) == name }) {
+				t.Errorf("%s: launch rules for %q, no whitelisted binary of that name (or no rule)", entry.Name, name)
+			}
+			for _, r := range rules {
+				for _, w := range r.Words {
+					if _, err := daemonconfig.LaunchWordForms(w); err != nil {
+						t.Errorf("%s: %v", entry.Name, err)
+					}
+				}
+			}
+		}
+	}
+	a := CatalogLaunchRules("kubectl")
+	a[0].Words = []string{"mine"}
+	if CatalogLaunchRules("oc")[0].Words[0] == "mine" || CatalogLaunchRules("kubectl")[0].Words[0] == "mine" {
+		t.Fatal("CatalogLaunchRules must return a copy")
+	}
+}
+
+// Apps whose own binary hands out the secret to whoever starts it, so no whitelist protects it:
+// docker reads config.json on every command; age -e re-encrypts its identity; bitcoind under another
+// HOME loads the real walletdir and serves listdescriptors over its caller's RPC, and prints a
+// cookie its config includes. Proposing them would offer a false sense of protection.
+func TestCatalogLeavesOutSelfDisclosingApps(t *testing.T) {
+	out := []string{"docker", "age", "bitcoind", "bitcoin-qt", "bitcoin-cli", "bitcoin-tx", "bitcoin-node",
+		"bitcoin-gui", "litecoind", "litecoin-qt", "litecoin-cli"}
+	for i := range Catalog {
+		for p := range Catalog[i].Whitelist {
+			if slices.Contains(out, filepath.Base(p)) {
+				t.Errorf("%s whitelists %s", Catalog[i].Name, p)
+			}
+		}
+	}
+}
+
+// Extension loaders, env and config flags that redirect an agent's token or load a config of its
+// caller's choosing, and a browser's headless and remote-control switches.
+func TestCatalogAgentLaunchRules(t *testing.T) {
+	has := func(name string, want daemonconfig.LaunchRule) bool {
+		return slices.ContainsFunc(CatalogLaunchRules(name), func(r daemonconfig.LaunchRule) bool {
+			return r.Env == want.Env && slices.Equal(r.Words, want.Words) && !r.Warn &&
+				r.FoldCase == want.FoldCase && r.EitherDash == want.EitherDash
+		})
+	}
+	for name, rules := range map[string][]daemonconfig.LaunchRule{
+		"pi":       {deny("-e"), deny("--extension"), {Env: "PI_CODING_AGENT_DIR"}},
+		"opencode": {{Env: "OPENCODE_CONFIG"}, {Env: "OPENCODE_CONFIG_DIR"}, {Env: "OPENCODE_CONFIG_CONTENT"}},
+		"codex":    {{Env: "OPENAI_BASE_URL"}},
+		"kubectl":  {deny("config", "view", "--raw")},
+		"oc":       {deny("config", "view", "--raw")},
+		"rclone":   {deny("config", "show"), deny("config", "dump")},
+		"idea":     {deny("installPlugins")},
+		"firefox": {{Words: []string{"-headless"}, FoldCase: true, EitherDash: true},
+			{Words: []string{"-remote-debugging-port"}, FoldCase: true, EitherDash: true},
+			{Words: []string{"-MOZ_LOG"}, EitherDash: true}, {Env: "MOZ_HEADLESS"}},
+	} {
+		for _, want := range rules {
+			if !has(name, want) {
+				t.Errorf("%s has no deny rule %+v: %+v", name, want, CatalogLaunchRules(name))
+			}
+		}
+	}
+}
+
+// A Narrowed spec naming no whitelisted binary, or an event its line lacks, would silently grant less
+// than written (narrowAllow drops it).
+func TestCatalogNarrowedNameWhitelistedBinaries(t *testing.T) {
+	for i := range Catalog {
+		e := &Catalog[i]
+		for rel, spec := range e.Narrowed {
+			if filepath.IsAbs(rel) || filepath.Clean(rel) != rel || strings.HasPrefix(rel, "..") {
+				t.Errorf("%s: narrowed path %q is not a clean relative path", e.Name, rel)
+			}
+			for base, events := range spec {
+				found := false
+				for path, parent := range e.Whitelist {
+					if filepath.Base(path) != base {
+						continue
+					}
+					found = true
+					if _, ok := intersectEvents(parent, events); !ok || (len(parent) > 0 && len(events) == 0) {
+						t.Errorf("%s: %s in %s asks for more than %s may do", e.Name, base, rel, path)
+					}
+					for _, ev := range events {
+						if len(parent) > 0 && !slices.Contains(parent, ev) {
+							t.Errorf("%s: %s may not %s in the location", e.Name, base, ev)
+						}
+					}
+				}
+				if !found {
+					t.Errorf("%s: narrowed %s names %s, which the entry doesn't whitelist", e.Name, rel, base)
+				}
+			}
+		}
+	}
+}
+
+// Every browser's main binary carries its profile anchors: bare names that fit the kernel's key.
+func TestCatalogBrowserProfileAnchors(t *testing.T) {
+	for name, want := range map[string]string{"firefox": "user.js", "firefox-bin": "user.js", "chrome": "SingletonLock",
+		"chromium": "SingletonLock", "brave": "SingletonLock"} {
+		rules := CatalogLaunchRules(name)
+		if !slices.ContainsFunc(rules, func(r daemonconfig.LaunchRule) bool { return r.Profile == want }) {
+			t.Errorf("%s: no %s profile anchor", name, want)
+		}
+		for _, r := range rules {
+			if r.Profile != "" && (strings.ContainsRune(r.Profile, '/') || len(r.Profile) >= 64) {
+				t.Errorf("%s: anchor %q must be a file name under 64 bytes", name, r.Profile)
+			}
+		}
 	}
 }

@@ -202,6 +202,43 @@ func TestWatchSetLibDirAppearanceTriggers(t *testing.T) {
 	}
 }
 
+// An updater removing an old version after the new one was admitted must schedule the refresh that
+// drops its lines and lib_dir section; nothing ever arrives then.
+func TestWatchSetHomeDepartureTriggersRefresh(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "discord")
+	mkdirs(t, root)
+	fi := newFakeInotify()
+	s := fi.set()
+	s.build([]*watchPattern{
+		newWatchPattern(filepath.Join(root, "app-*", "Discord"), true, false),
+		newWatchPattern(filepath.Join(root, "app-*"), true, true),
+	})
+	s.handle(fi.wds[root], unix.IN_DELETE|unix.IN_ISDIR, "SingletonLock")
+	if r, rs, _ := s.take(); r || rs {
+		t.Fatal("a name no pattern matches must not trigger")
+	}
+	s.handle(fi.wds[root], unix.IN_DELETE|unix.IN_ISDIR, "app-1.0.166")
+	if r, rs, _ := s.take(); !r || rs {
+		t.Fatalf("an old version dir deleted: refresh=%v resync=%v, want refresh only", r, rs)
+	}
+	s.handle(fi.wds[root], unix.IN_MOVED_FROM|unix.IN_ISDIR, "app-1.0.167")
+	if r, _, _ := s.take(); !r {
+		t.Fatal("an old version dir moved away must trigger the refresh")
+	}
+}
+
+func TestWatchSetSystemDepartureDoesNotTrigger(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "usr", "bin")
+	mkdirs(t, bin)
+	fi := newFakeInotify()
+	s := fi.set()
+	s.build([]*watchPattern{newWatchPattern(filepath.Join(bin, "ssh"), false, false)})
+	s.handle(fi.wds[bin], unix.IN_DELETE, "ssh")
+	if r, rs, _ := s.take(); r || rs {
+		t.Fatalf("a removed system binary has nothing to admit: refresh=%v resync=%v", r, rs)
+	}
+}
+
 func TestDebouncerCoalescesAndBoundsWait(t *testing.T) {
 	var runs atomic.Int32
 	d := &debouncer{quiet: 50 * time.Millisecond, maxWait: 200 * time.Millisecond, minGap: 0,

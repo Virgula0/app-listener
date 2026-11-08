@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"syscall"
@@ -302,6 +305,36 @@ var commands = map[string]func(args []string) int{
 	"unix-server": func(args []string) int {
 		needArgs(args, 1)
 		unixServer(args[0])
+		return 0
+	},
+	// read prints a file as launch_probe does: a Go binary for the guard's Go-only launch rules.
+	"read": func(args []string) int {
+		needArgs(args, 1)
+		b, err := os.ReadFile(args[0])
+		if err != nil {
+			fmt.Printf("DENIED|%v\n", err)
+			return 1
+		}
+		fmt.Printf("STOLEN|%s\n", b)
+		return 0
+	},
+	// http-sink appends "<path> <body>" per request to file: a browser test page's report.
+	"http-sink": func(args []string) int {
+		needArgs(args, 2)
+		f, err := os.OpenFile(args[1], os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Printf("%v\n", err)
+			return 1
+		}
+		srv := &http.Server{Addr: args[0], ReadHeaderTimeout: 10 * time.Second,
+			Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+				fmt.Fprintf(f, "%s %s\n", r.URL.Path, b)
+			})}
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			fmt.Printf("%v\n", err)
+			return 1
+		}
 		return 0
 	},
 	"dns": func(args []string) int {

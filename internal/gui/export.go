@@ -5,7 +5,8 @@ package gui
 import (
 	"bytes"
 	"encoding/csv"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -38,10 +39,9 @@ func encodeTable(format string, headers []string, rows [][]string) ([]byte, erro
 				objs[i][h] = r[c]
 			}
 		}
-		enc := json.NewEncoder(&buf)
-		enc.SetIndent("", "  ")
-		err := enc.Encode(objs)
-		return buf.Bytes(), err
+		// v2 leaves map order random: Deterministic keeps v1's sorted keys.
+		b, err := json.Marshal(objs, json.Deterministic(true), jsontext.WithIndent("  "))
+		return append(b, '\n'), err
 	}
 	w := csv.NewWriter(&buf)
 	if err := w.Write(headers); err != nil {

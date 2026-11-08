@@ -61,6 +61,9 @@ type engine struct {
 	started    bool
 	// ioctlCompat: this kernel has file_ioctl_compat (6.8+), so guard_file_ioctl_compat attaches.
 	ioctlCompat bool
+	// busPidNS: guard_bus_pidns holds the daemon's pid namespace, so bus rows are keyed by the
+	// pids its pidfds report (setBusPidNSLocked). False refuses every bus client.
+	busPidNS bool
 
 	// allows tracks each resource's whitelisted exe inodes and their action (GUARD_ALLOW or
 	// GUARD_ALLOW_ROOT), the source for the union and intersection views (noteAllow).
@@ -78,6 +81,8 @@ type engine struct {
 	inspectors map[GuardInodeKey]string
 	// mcNames: the applets written to guard_multicall_names per multicall inode (ensureMulticall).
 	mcNames map[GuardInodeKey][]string
+	// ports: per guarded TCP port, its live guards (port.go).
+	ports map[uint32][]portOwner
 	// rawOwner receives the reserved slot's events (the raw block-device gate): it is the guard
 	// that registered the backing devices, whose consumer labels them as such. Delivering them to
 	// every guard duplicated each denial and let the self-guards label it with their own path.
@@ -87,6 +92,8 @@ type engine struct {
 	pinPrefix   string
 	pinDegraded bool
 	mapsPinned  bool
+	// retained: a slot was kept enforced past its Guard's Stop (handover.go).
+	retained bool
 
 	// inodeCap is guard_inodes' max_entries for the next load (ConfigureInodeCapacity); 0 = the
 	// object's default, inodeCapDefault. inodeWarned: occupancy is past inodeWarnPercent.
@@ -298,6 +305,12 @@ func (e *engine) startLocked() error {
 		e.stopLocked()
 		return err
 	}
+	if err := e.syncUnixRolesLocked(); err != nil {
+		e.stopLocked()
+		return err
+	}
+	e.setPortNetNSLocked()
+	e.setBusPidNSLocked()
 
 	rd, err := ringbuf.NewReader(e.objs.Rb)
 	if err != nil {
@@ -756,7 +769,10 @@ func (e *engine) release(id uint32) {
 
 // stopLocked detaches everything and resets the engine so a later Guard starts clean.
 func (e *engine) stopLocked() {
-	e.unpinSharedMaps()
+	handOver := e.handOverLocked()
+	if !handOver {
+		e.unpinSharedMaps()
+	}
 	if e.done != nil {
 		select {
 		case <-e.done:
@@ -769,11 +785,13 @@ func (e *engine) stopLocked() {
 		e.rd = nil
 	}
 	for _, l := range e.links {
-		if e.pinPrefix != "" {
+		if e.pinPrefix != "" && !handOver {
 			_ = l.Unpin()
 		}
 		_ = l.Close()
 	}
+	e.mapsPinned = false
+	e.retained = false
 	e.links = nil
 	e.linkNames = nil
 	_ = e.objs.Close()
@@ -785,6 +803,7 @@ func (e *engine) stopLocked() {
 	e.prevOwner = nil
 	e.successor = nil
 	e.mcNames = nil
+	e.ports = nil
 }
 
 // readLoop drains the shared ringbuf and routes each event to the Guard that owns its resource.

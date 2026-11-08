@@ -18,6 +18,7 @@ import (
 
 	"github.com/Virgula0/app-listener/internal/backups"
 	"github.com/Virgula0/app-listener/internal/fscrypt"
+	"github.com/Virgula0/app-listener/internal/guard"
 	inst "github.com/Virgula0/app-listener/internal/install"
 	"github.com/Virgula0/app-listener/internal/protected"
 	"github.com/Virgula0/app-listener/internal/wizard"
@@ -90,6 +91,10 @@ func uninstallAll(req Request) error {
 	wizard.Stage("Checking the daemon is stopped")
 	if err := protected.RequireDaemonStopped(); err != nil {
 		return err
+	}
+	// A clean stop leaves the runtime sections guarded for a next start that won't come.
+	if err := guard.RetireHandover(guard.ResolvePinBase(guard.DefaultPinMount)); err != nil {
+		log.Warnf("retiring the stopped daemon's runtime-section guards: %v (they go at the next reboot)", err)
 	}
 	// First: an uninstall interrupted past this point leaves a system the wizard may resume.
 	if err := protected.RemoveInstallCert(); err != nil {

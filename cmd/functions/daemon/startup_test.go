@@ -25,6 +25,7 @@ func (f *fakeDaemon) Reload([]daemonconfig.Resource, []repository.GuardRepositor
 	return nil
 }
 func (f *fakeDaemon) Stop()                              { f.stopped.Store(true) }
+func (f *fakeDaemon) HandOverOnStop()                    {}
 func (f *fakeDaemon) ResyncBinaries()                    {}
 func (f *fakeDaemon) Events() <-chan usecase.DaemonEvent { return nil }
 func (f *fakeDaemon) Resources() []daemonconfig.Resource { return nil }
@@ -36,6 +37,9 @@ func (f *fakeDaemon) GrantTemporaryAccess([]string, []string, guard.TempRule,
 	return nil, errors.New("unused")
 }
 func (f *fakeDaemon) WithRuntimeAccess(string, func() error) error { return errors.New("unused") }
+func (f *fakeDaemon) WithRuntimeRoot(string, func(guard.GuardInodeKey) error) error {
+	return errors.New("unused")
+}
 
 // TestAwaitStartupOrSignalCompletes: no signal — the started daemon is passed
 // through untouched.

@@ -212,7 +212,7 @@ bpftool-headers:
 
 install-linter:
 	@GOPATH=$$(go env GOPATH); \
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $$GOPATH/bin v2.9.0
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $$GOPATH/bin v2.15.0
 .PHONY: install-linter
 
 install-deps:
@@ -264,9 +264,12 @@ test-e2e:
 		go test -tags gui,e2e ./internal/gui/ -run 'TestSnapshots|TestIconGallery|TestDemoReel' -v --count=1
 .PHONY: test-e2e
 
+# APPLISTENER_BROWSER_TESTS=1 runs TestDaemon_RealBrowserProfiles: it downloads Firefox and Chrome
+# (~300 MB). Pass APPLISTENER_BROWSER_TESTS= to skip it.
+APPLISTENER_BROWSER_TESTS ?= 1
 test-integration:
 	$(MAKE) -C integrationtests/exploits
-	go test ./integrationtests/ -v --count=1 -timeout 60m
+	APPLISTENER_BROWSER_TESTS=$(APPLISTENER_BROWSER_TESTS) go test ./integrationtests/ -v --count=1 -timeout 120m
 .PHONY: test-integration
 
 check-compatibility:

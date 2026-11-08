@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"debug/elf"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,7 +104,7 @@ func rootOwnedInode(path string) error {
 // architecture this machine can't run natively (Steam ships pressure-vessel-arm64 for FEX), whose
 // interpreter isn't on the host.
 func LibraryClosure(binaryPath string) (trusted []string, rejected map[string]error, err error) {
-	if isScript(binaryPath) {
+	if IsScript(binaryPath) {
 		return nil, nil, nil
 	}
 	f, err := elf.Open(binaryPath)
@@ -357,15 +358,23 @@ func LdSoPreloadPaths() ([]string, error) {
 	return paths, nil
 }
 
-// isScript reports whether path starts with a "#!" interpreter line.
-func isScript(path string) bool {
-	f, err := os.Open(path)
+// IsScript reports whether path is a regular file starting with a "#!" interpreter line. Stat
+// first and O_NONBLOCK: a device or FIFO planted at a whitelist line must not be opened or block.
+func IsScript(path string) bool {
+	if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
+		return false
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return false
 	}
+	f := os.NewFile(uintptr(fd), path)
 	defer f.Close()
+	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+		return false
+	}
 	magic := make([]byte, 2)
-	n, _ := f.Read(magic)
+	n, _ := io.ReadFull(f, magic)
 	return n == 2 && bytes.Equal(magic, []byte("#!"))
 }
 

@@ -64,6 +64,9 @@ These must attach or the guard refuses to start:
 - `file_ioctl`, `file_ioctl_compat` (btrfs copy ioctls)
 - `task_prctl` (refuses `prctl(PR_SET_MM)` rewrites of a process's executable, which would borrow
   another binary's identity); `network guard` requires it too
+- `unix_stream_connect`, `unix_may_send`, `socket_sendmsg`, `socket_recvmsg`, `socket_connect`,
+  `socket_listen`, `socket_bind`, `socket_accept`, `sock_graft`, `socket_getsockopt`, `mmap_file` (unix sockets
+  bound inside a guarded tree, and [port sections](config-reference.md#port-tcpn))
 
 Every other LSM hook is best-effort: a kernel that lacks one logs a warning and keeps enforcing the
 rest.
@@ -84,7 +87,7 @@ an arm64 host.
 - The guard's BPF maps are preallocated kernel memory, about 50 MiB whatever the RAM, on top of
   the daemon's own ~70 MiB. `check-compatibility` reports the running daemon's figure and warns
   below 1 GiB of RAM. Of that, `guard_inodes` (about 22 MiB) can be shrunk with `max_inodes`
-  in `[settings]` ([Daemon configuration](daemon-config.md#daemon-settings-settings)) when the
+  in `[settings]` ([`max_inodes`](config-reference.md#max_inodes)) when the
   guarded trees are small.
 - The first start hashes every whitelisted binary once (a binary several sections list is read
   once); on SD/eMMC storage and CPUs without SHA-2 instructions (Raspberry Pi 4) that takes longer,

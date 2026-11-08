@@ -59,6 +59,9 @@ type GuardRepository interface {
 	// commit a maintainer run there (internal/maintainer), for fn only. Refused while
 	// a live edit grant holds the self mask.
 	WithSelfRuntimeAccess(fn func() error) error
+	// WithSelfOwnerAccess lets the daemon chown this runtime resource's root to its user, or move
+	// it aside, for fn only. Refused while a live edit grant holds the self mask.
+	WithSelfOwnerAccess(fn func() error) error
 	// PlanTemporaryGrant validates an `edit-protected forward` rule against this resource's
 	// rows without writing; the caller journals the grant's allow rows, then Applies it.
 	PlanTemporaryGrant(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error)
@@ -74,6 +77,9 @@ type GuardRepository interface {
 	// exists. Reload compares a kept resource's old and new anchors with it: a new root while the
 	// old one still exists means the path was re-pointed through an unguarded ancestor.
 	RootAnchor() (key guard.GuardInodeKey, alive bool, err error)
+	// HandOver makes the next Stop keep a runtime section enforced by its pinned links until the
+	// next daemon start's guards hold it. The final shutdown's only: see guard.Guard.HandOver.
+	HandOver()
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

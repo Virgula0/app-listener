@@ -71,10 +71,23 @@ var launchRules = func() []launchRule {
 		rules = append(rules, launchRule{launchArg, a, trustedNode, launchPresent})
 	}
 	// The DevTools protocol runs script in the process and reads its cookies; an unpacked extension
-	// reads them too. Chromium takes "-" as a switch prefix as well as "--".
-	for _, a := range []string{"--remote-debugging", "--load-extension", "-remote-debugging", "-load-extension"} {
-		rules = append(rules, launchRule{launchArg, a, trustedNode | trustedChromium, launchPresent})
+	// reads them too (--disable-extensions-except loads the ones it names; both are refused whatever
+	// --disable-features re-enables). Chromium takes "-" as a switch prefix as well as "--".
+	// --ignore-certificate-errors (and -spki-list, by its first two words) trusts any server, and a
+	// proxy flag routes every request to the caller's.
+	// Headless prints or renders any file:// it reads (--dump-dom, --screenshot, --print-to-pdf; an
+	// iframe of the profile in the caller's page), the net log and key log write cookies and TLS keys
+	// to the caller's file, and --pack-extension writes a crx of the directory it names beside it.
+	// --allow-file-access-from-files and --disable-web-security let a file:// page read any other
+	// file and post it out, windowed or not (--ozone-platform=headless only hides it, as Xvfb does).
+	for _, a := range []string{"remote-debugging", "load-extension", "disable-extensions-except", "load-apps",
+		"ignore-certificate", "proxy-server", "proxy-pac-url",
+		"headless", "dump-dom", "screenshot", "print-to-pdf", "log-net-log", "net-log-capture-mode",
+		"ssl-key-log-file", "pack-extension", "allow-file-access-from-files", "disable-web-security"} {
+		rules = append(rules, launchRule{launchArg, "--" + a, trustedNode | trustedChromium, launchPresent},
+			launchRule{launchArg, "-" + a, trustedNode | trustedChromium, launchPresent})
 	}
+	rules = append(rules, launchRule{launchEnv, "SSLKEYLOGFILE", trustedNode | trustedChromium, launchPresent})
 	// Child-process launchers: the exe named runs as the app's renderer, utility (network service:
 	// brokered cookie fds) or GPU process and is handed what that process is handed.
 	for _, a := range []string{"renderer-cmd-prefix", "utility-cmd-prefix", "zygote-cmd-prefix",
@@ -107,6 +120,14 @@ var launchRules = func() []launchRule {
 		"--tls-min-v1.2", "--tls-min-v1.3", "--tls-max-v1.2", "--tls-max-v1.3",
 	} {
 		rules = append(rules, launchRule{launchOpt, o, trustedNode, 0})
+	}
+	// A JetBrains launcher reads <PRODUCT>_VM_OPTIONS (a -javaagent there), _JDK (another JVM) and
+	// _PROPERTIES (idea.plugins.path) from the file each names. PhpStorm's prefix is WEBIDE.
+	for _, p := range []string{"IDEA", "PYCHARM", "WEBSTORM", "CLION", "GOLAND", "WEBIDE", "PHPSTORM", "RIDER",
+		"DATAGRIP", "RUSTROVER", "RUBYMINE", "DATASPELL", "STUDIO"} {
+		for _, suffix := range []string{"_VM_OPTIONS", "_JDK", "_PROPERTIES"} {
+			rules = append(rules, launchRule{launchEnv, p + suffix, trustedJVM, launchPresent})
+		}
 	}
 	for _, o := range []string{
 		"-Xmx", "-Xms", "-Xss",
@@ -165,7 +186,8 @@ func (t *TrustGuard) attachLaunchScan() error {
 }
 
 // Markers of a runtime whose launch env/argv can make it run other code. The java launcher's own
-// options live in libjli, so a JVM is also known by its name. trustedElectron here means any
+// options live in libjli, so a JVM is also known by its name, or by JNI_CreateJavaVM: a launcher
+// that loads libjvm into its own process (JetBrains' bin/idea) names it to dlsym. trustedElectron here means any
 // Electron; runtimeClass keeps it only for a generic one.
 var runtimeMarkers = []struct {
 	marker []byte
@@ -176,6 +198,7 @@ var runtimeMarkers = []struct {
 	{[]byte("remote-debugging-port"), trustedChromium},
 	{[]byte("JDK_JAVA_OPTIONS"), trustedJVM},
 	{[]byte("JAVA_TOOL_OPTIONS"), trustedJVM},
+	{[]byte("JNI_CreateJavaVM"), trustedJVM},
 	{[]byte("BUN_INSPECT"), trustedBun},
 	{[]byte("BUN_BE_BUN"), trustedBun},
 	{[]byte("BUN_OPTIONS"), trustedBun},
@@ -195,13 +218,13 @@ var (
 	classCache = map[classCacheKey]uint8{}
 )
 
-// runtimeClass returns the trustedRuntimes classes of the image f holds (path names it). Scanned once
-// per inode and content fingerprint: an Electron app's image is ~200 MB. An unreadable image is
-// classed as every runtime, so its launches are judged (fail closed).
+// runtimeClass returns the trustedRuntimes classes of the image f holds (path names it), plus
+// trustedBunfig. Scanned once per inode and content fingerprint: an Electron app's image is ~200 MB.
+// An unreadable image is classed as every runtime, so its launches are judged (fail closed).
 func runtimeClass(f *os.File, path string) uint8 {
 	var st unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
-		return trustedRuntimes
+		return trustedRuntimes | trustedBunfig
 	}
 	key := classCacheKey{dev: st.Dev, ino: st.Ino, size: st.Size, mtime: st.Mtim, ctime: st.Ctim}
 	classMu.Lock()
@@ -210,10 +233,15 @@ func runtimeClass(f *os.File, path string) uint8 {
 	if !ok {
 		var err error
 		if c, err = scanRuntimeClass(f); err != nil {
-			return trustedRuntimes
+			return trustedRuntimes | trustedBunfig
 		}
 		if base := filepath.Base(path); base == "java" || base == "javaw" {
 			c |= trustedJVM
+		}
+		if c&trustedBun != 0 && bunAutoloadsBunfig(f) {
+			c |= trustedBunfig
+			log.Warnf("trust guard: %s is a Bun app that loads ./bunfig.toml: it never reads a secret; "+
+				"rebuild it with --no-compile-autoload-bunfig", logging.SanitizeText(path))
 		}
 		classMu.Lock()
 		if len(classCache) > 4096 {

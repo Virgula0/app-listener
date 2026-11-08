@@ -6,20 +6,108 @@ The install wizard doesn't ask you to know where every app keeps its secrets. It
 catalog (`internal/install/catalog.go`) of sensitive directories with a ready-made whitelist for
 each, and offers the ones that exist on your host. It covers, among others:
 
-- **Keys and credentials:** SSH, GnuPG, age, AWS, Google Cloud, Azure, Kubernetes, Docker,
-  GitHub CLI, adb keys, rclone, pip, Git
-- **AI agents and editors:** Claude Code, Gemini CLI, opencode, Codeium, Cursor, GitHub Copilot,
-  VS Code (and Insiders, server, VSCodium), JetBrains IDEs, Zed, Sublime Text
+- **Keys and credentials:** SSH, GnuPG (and the `ssh-agent`, gcr `ssh` and `gpg-agent` sockets in
+  `/run/user/<uid>`, guarded as [runtime sections](config-reference.md#runtime)), AWS, Google Cloud, Azure, Kubernetes,
+  GitHub CLI, adb keys, rclone, pip
+- **AI agents and editors:** Claude Code, Gemini CLI and Antigravity (CLI, 2.0 and IDE), OpenAI
+  Codex CLI, pi, opencode, Codeium, Cursor, GitHub Copilot (and Copilot CLI), VS Code (and Insiders, server, VSCodium), JetBrains IDEs, Zed, Sublime Text
 - **API and database clients:** Insomnia, Postman, DBeaver
 - **Password managers:** pass, gopass, Bitwarden, 1Password, KeePassXC, GNOME keyring, KDE Wallet
 - **Browsers:** Firefox, Chrome, Chromium, Brave
 - **Messaging and apps:** Discord, Telegram, Signal, Element, Steam
 - **VPNs:** NordVPN, Mullvad, ProtonVPN, OpenVPN, WireGuard
-- **Crypto wallets:** Bitcoin Core, Litecoin Core, Monero, Electrum, Sparrow, Wasabi, Ledger Live,
+- **Crypto wallets:** Monero, Electrum, Sparrow, Wasabi, Ledger Live,
   Trezor Suite, Exodus, Solana CLI, geth, LND, Core Lightning, Foundry
+- **Keyring items** ([secret scopes](config-reference.md#secret-name)): the `gh`, Codex
+  and Antigravity CLI tokens, `git`'s libsecret credentials and the Chrome and Chromium Safe Storage keys, plus gnome-keyring's
+  sockets as a runtime section. Offered when gnome-keyring and one of the binaries are installed.
+- **Loopback services** ([port sections](config-reference.md#port-tcpn)): the `adb` server, the
+  Ollama API, `opencode serve`. Offered when one of their binaries is installed.
 
 The catalog narrows each watch to the sensitive subtrees, so apps that update themselves inside
 their own config directory keep working (see below).
+
+Inside a watch, an entry can give a subtree a narrower whitelist (a
+[`[narrow]`](config-reference.md#narrow-path) section): `~/.gnupg/private-keys-v1.d` is
+`gpg-agent`'s alone, as gpg can be made to print any file it reads. The installer makes such a
+directory when it is missing, so it is narrowed from the start.
+
+An entry also carries the [launch rules](binary-trust.md#launch-rules) of the CLIs it whitelists
+that print or spend its secret on request (`gh auth token`, `gpg --export-secret-keys`). The daemon
+applies them by the binary's file name in every section, a hand-written one too, so a rule changes
+with the catalog, never in the guard. Add your own in
+[`[launch_rules]`](config-reference.md#launch_rules).
+
+### What an entry can't cover
+
+- **Tokens in the keyring.** These apps keep their main token in the Secret Service keyring by
+  default, so their entry protects only the files: `gh`, Copilot CLI, Gemini CLI, JetBrains IDEs, Zed,
+  ProtonVPN, and anything stored in the GNOME keyring or KDE Wallet. Any of your programs can ask
+  the keyring ([Secrets served over IPC](limitations.md#secrets-served-over-ipc)) unless a secret
+  scope covers the item: the catalog has scopes for `gh`, Codex, the Antigravity CLI, git and
+  Chromium browsers only, on gnome-keyring. Codex's keyring mode also caches its token in the
+  session's kernel keyring, which no scope covers: keep `cli_auth_credentials_store = "file"` (the
+  default) and the guarded `auth.json`. `install catalog refresh` leaves secret sections as written. The installer
+  says when `gh` could keep the token in its guarded file instead
+  (`gh auth login --insecure-storage`), and names your git credential helper.
+- **Script launchers.** A `#!` script runs as its interpreter, so a whitelist line naming one never
+  matches, and the app is denied like any other program. Google Cloud SDK, Azure CLI, pip, Electrum
+  and ProtonVPN are Python apps, and Gemini CLI and pi (from npm or pi's installer) are Node apps:
+  their entries lock the guarded files against everyone, the app included, unless you whitelist an
+  ELF they end up running (pi's release tarball ships one). Never whitelist the interpreter. The
+  installer writes no line for a file that is a script on this machine (a launcher may be a script on
+  one distro and an ELF on another), so such a section may have an empty whitelist. The daemon's own
+  catalog refresh keeps existing whitelist lines, so one an older installer wrote stays until
+  `install catalog refresh` drops it. A catalog `lib_binary` writer that is a script (Steam's
+  `pressure-vessel-unruntime` and `pv-locale-gen` match its helper globs) is dropped by every
+  refresh; a hand-written one stays. The installer and the daemon warn about every script line left,
+  once per set of lines with every section that lists it.
+- **opencode snapshots.** opencode 2 keeps provider credentials in
+  `~/.local/share/opencode/opencode.db`, which the entry guards. opencode runs `git` on its snapshot
+  repositories in the same directory, and `git` is never whitelisted (it would print the database), so
+  snapshots fail while the directory is guarded.
+- **File copiers on `~/.ssh`.** The SSH entry whitelists neither `scp`, `sftp` nor `sftp-server`:
+  each copies or serves whatever file its caller names, the keys included. Their `ssh` child does the
+  reading they need, so `scp` and `sftp` keep working. A section an older installer wrote may still
+  list them (and `git` on `~/.config/github-copilot`): remove those lines with
+  `sudo app-listener edit-protected config`; the installer and the daemon warn about each.
+- **Git.** There is no entry for `~/.config/git` or `~/.git-credentials`: `git` reads its config on
+  every run, so a guard there would have to whitelist it, and `git` prints any file it is pointed at
+  (`git diff --no-index /dev/null <file>`); its `store` and `cache` credential helpers are `git`
+  itself. Keep git credentials in the keyring (`git-credential-libsecret`, which the catalog's secret
+  scope covers). A section an older installer wrote for `~/.config/git` whitelists `git`: remove it
+  with `sudo app-listener edit-protected config`; the installer and the daemon warn about it.
+- **Cursor logins.** The Cursor entry guards `~/.cursor` (MCP and extension config). The IDE keeps
+  its login in `~/.config/Cursor/User/globalStorage/state.vscdb` and `cursor-agent` in
+  `~/.config/cursor/auth.json`; neither is in the catalog. Add a section for them yourself,
+  whitelisting the executable that actually runs, not a launcher script. `cursor-agent` runs on a
+  bundled `node`, which is an interpreter: whitelisting it admits any script.
+- **`~/.gemini` is shared.** Gemini CLI and every Antigravity product (`agy`, the 2.0 hub's
+  `language_server`, the IDE) keep state there, so one entry covers it and each whitelisted binary
+  can read the others' tokens. It guards the token files and the config the agents run (MCP servers,
+  hooks, plugins), not the whole directory. The binaries are matched at the paths the Arch packages
+  and `agy`'s installer use (`/opt/Antigravity`, `/opt/antigravity-ide`, `~/.local/bin/agy`); add
+  yours if you unpacked the tarball elsewhere.
+- **Files created after install.** The Codex, pi and `~/.gemini` entries guard named files
+  (`auth.json`, `oauth_creds.json`, ...) inside their directory, and only those that exist when the
+  section is written; `install catalog refresh` updates whitelists, never `watch:` lines. Log in to
+  the app before you install, or add the missing `watch: <path>` line later with
+  `sudo app-listener edit-protected config` ([`watch:`](config-reference.md#watch)).
+  If none of them exists yet, the section guards the whole directory, which breaks Codex's
+  standalone updates in `~/.codex/packages`.
+- **pi extensions.** pi runs every extension in `~/.pi/agent/extensions`, the packages in
+  `~/.pi/agent/npm` and `~/.pi/agent/git`, and the `.pi/extensions` of each project
+  `~/.pi/agent/trust.json` trusts, in its own process, where they can read its tokens. The entry
+  guards all of them; the installer creates an empty `extensions` and `trust.json` when missing, so
+  they are guarded from the start. `pi install` then fails while the daemon runs: npm and git write
+  the package, and they are not pi. A section written by an older installer lacks these `watch:`
+  lines: add them with `sudo app-listener edit-protected config`.
+- **Copilot CLI `/ide`.** The VS Code Copilot extension writes lock files to `~/.copilot/ide`.
+  Whitelist the VS Code binary on `~/.copilot` for that integration.
+- **Other clients of a guarded port.** A port entry whitelists the service and its own client: a
+  web UI for Ollama or an IDE plugin talking to `opencode serve` needs its own `CONNECT` line. A
+  port in the default ephemeral range can't be guarded (the daemon refuses it), and
+  `install catalog refresh` leaves port sections as written.
 
 To add catalog directories that appeared after you installed (a newly installed app), run
 `sudo app-listener install catalog diff`.
@@ -27,8 +115,9 @@ To add catalog directories that appeared after you installed (a newly installed 
 ## Catalog refresh
 
 The daemon keeps the catalog whitelists current by itself. It watches the catalog's directories
-(inotify, as a hint only) and re-expands the catalog whitelists at startup and whenever a binary
-is written below a catalog pattern, with the same rules as `install catalog refresh`,
+(inotify, as a hint only) and re-expands the catalog whitelists at startup, whenever a binary
+is written below a catalog pattern, and whenever a match of a home pattern is deleted or moved
+away, with the same rules as `install catalog refresh`,
 keeping lines whose binary still exists. In the app's `[libraries]` block it also drops the
 `lib_dir` and `lib_binary` lines a catalog pattern produced whose path is gone (an old version
 directory the updater removed). Hand-written lines stay, and nothing is dropped from an encrypted
@@ -52,6 +141,8 @@ The daemon follows them:
 - A new version directory (Discord's `~/.config/discord/0.0.N/`) is admitted by the catalog
   refresh as soon as the updater finishes writing the binary, also when it deletes the old version
   first. No restart, no manual step.
+- An old version directory the app deletes later (Discord removes it on its next start) is dropped
+  from `daemon.conf` by the refresh that deletion triggers.
 - A process that creates such a directory without being one of the app's binaries can't plant the
   binary name there (the names are reserved), so nothing it does is admitted.
 

@@ -245,6 +245,9 @@ func ReloadDaemonIfActive() error {
 // EnableAndVerify brings the daemon to enabled-and-running from any state: a changed config on a
 // running daemon is delivered via SIGHUP (restart fallback); both states verified.
 func EnableAndVerify(configChanged bool) error {
+	if err := WriteLoginDropIn(); err != nil {
+		return err
+	}
 	if err := RunCmd("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
@@ -474,6 +477,11 @@ func DeployInstalledBinaryNoRestart(srcPath string, unit []byte) error {
 	dropLegacyCatalogRefresh()
 	if unit != nil {
 		if err := WriteDaemonUnit(unit); err != nil {
+			return err
+		}
+	}
+	if DaemonUnitInstalled() {
+		if err := WriteLoginDropIn(); err != nil {
 			return err
 		}
 	}

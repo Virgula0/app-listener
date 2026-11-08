@@ -58,12 +58,15 @@ type fakeGuardRepo struct {
 	editGrantErr     error
 	vaultAccessCalls int
 	runtimeGrants    int
+	ownerGrants      int
 	tap              func(guard.GuardEvent)
 	tempPlan         func(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error)
 	events           chan guard.GuardEvent
 	taintedPIDs      []uint32
 	anchor           guard.GuardInodeKey
 	anchorAlive      bool
+	// handedOver: HandOver came before Stop.
+	handedOver bool
 }
 
 func newFakeGuardRepo() *fakeGuardRepo {
@@ -123,6 +126,11 @@ func (f *fakeGuardRepo) WithSelfRuntimeAccess(fn func() error) error {
 	return fn()
 }
 
+func (f *fakeGuardRepo) WithSelfOwnerAccess(fn func() error) error {
+	f.ownerGrants++
+	return fn()
+}
+
 func (f *fakeGuardRepo) PlanTemporaryGrant(bins []*guard.TempBinary, rule guard.TempRule) (guard.TemporaryGrant, error) {
 	if f.tempPlan == nil {
 		return nil, errBoom
@@ -170,6 +178,12 @@ func (f *fakeGuardRepo) RestoreTaintedPIDs(pids []uint32) error {
 func (f *fakeGuardRepo) Start() error {
 	f.started = true
 	return f.startErr
+}
+
+func (f *fakeGuardRepo) HandOver() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.handedOver = !f.stopped
 }
 
 func (f *fakeGuardRepo) Stop() {

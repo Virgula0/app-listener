@@ -8,6 +8,9 @@ import (
 // unknownLabel is the display name used when an event type cannot be mapped.
 const unknownLabel = "UNKNOWN"
 
+// connectLabel names both a file guard's CONNECT (unix socket in a tree) and a network CONNECT.
+const connectLabel = "CONNECT"
+
 type EventType int
 
 const (
@@ -23,6 +26,7 @@ const (
 	EventAttr
 	EventStat
 	EventMknod
+	EventConnect
 )
 
 func (t EventType) String() string {
@@ -51,6 +55,8 @@ func (t EventType) String() string {
 		return "STAT"
 	case EventMknod:
 		return "MKNOD"
+	case EventConnect:
+		return connectLabel
 	default:
 		return unknownLabel
 	}
@@ -182,6 +188,8 @@ func ParseEventType(s string) (EventType, bool) {
 		return EventStat, true
 	case "MKNOD":
 		return EventMknod, true
+	case connectLabel:
+		return EventConnect, true
 	default:
 		return 0, false
 	}
@@ -191,6 +199,6 @@ func EventTypes() []EventType {
 	return []EventType{
 		EventOpen, EventRead, EventWrite, EventDelete,
 		EventRename, EventSymlink, EventHardlink, EventMkdir, EventMmap,
-		EventAttr, EventStat, EventMknod,
+		EventAttr, EventStat, EventMknod, EventConnect,
 	}
 }

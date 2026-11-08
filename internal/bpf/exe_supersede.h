@@ -64,10 +64,13 @@ struct {
 // exec-mapped code trust_mmap would refuse a whitelisted binary while the exe was not TRUSTED_BINARY
 // (trust_mmap judges only new mappings, so a reload whitelisting the exe would not catch it).
 // SUSPECT_LAUNCH: a runtime started with env/argv that run its caller's code (trust_exec_launch).
+// SUSPECT_ARGV: a whitelisted binary started with argv/env one of its rules names (trust_argv).
+// SUSPECT_PROFILE: a browser that locked or opened a profile outside every secret root
+// (trust_profile_anchor). Kept across exec: the profile, not the image, is the caller's.
 // Either is refused every regular file below a secret root, any change below a code tree, its exe's
 // writer and updater rights (trust_suspect), guard_ptrace_access_check's inspector grant and, by the
 // guard's whitelist decision, any access below a secret (stat, readdir, xattrs).
-// Inherited across fork, cleared on exec and on leader exit (guard_tainted_pids' lifecycle), all by
+// Inherited across fork, cleared on exec (bar SUSPECT_PROFILE) and on leader exit (guard_tainted_pids' lifecycle), all by
 // the trust object. A mark that can't be recorded refuses the mapping / kills the launch.
 // networkguard.bpf.c keeps its own instance with the same values and lifecycle: a marked process
 // loses its exe's network whitelist.
@@ -81,6 +84,9 @@ struct {
 // trust_code_suspect values; also guard_event.reason bits 8-15 (guard.bpf.c).
 #define SUSPECT_PRELOAD 1
 #define SUSPECT_LAUNCH 2
+#define SUSPECT_ARGV 3
+#define SUSPECT_BUNFIG 4 // a TRUSTED_BUNFIG image: from exec, before ./bunfig.toml's preload runs
+#define SUSPECT_PROFILE 5
 
 static __always_inline __u64 leader_start(struct task_struct *task)
 {
@@ -92,8 +98,10 @@ static __always_inline __u64 leader_start(struct task_struct *task)
 	return start;
 }
 
-// exe_refused: exe is superseded and task's image was exec'd at or after that, or its stamp can't
-// be trusted. Callers fold the result into a lookup key instead of branching on it.
+// exe_refused: exe is superseded and task's image was exec'd after that, or its stamp can't be
+// trusted. Callers fold the result into a lookup key instead of branching on it. A supersede records
+// exe_seq without incrementing, so an equal stamp is the last exec before it (bprm_committed_creds
+// runs after the image's open): `>`, or a binary that deletes its own last link loses its rows.
 static __noinline int exe_refused(struct task_struct *task, struct inode_key *exe)
 {
 	struct inode_key real = *exe;
@@ -107,7 +115,7 @@ static __noinline int exe_refused(struct task_struct *task, struct inode_key *ex
 	bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
 	struct exec_stamp *st = bpf_map_lookup_elem(&exe_stamps, &tgid);
 	if (st)
-		return st->start != leader_start(task) || st->seq >= s->seq;
+		return st->start != leader_start(task) || st->seq > s->seq;
 	__u32 k = EXE_SEQ_LOST;
 	__u64 *lost = bpf_map_lookup_elem(&exe_seq, &k);
 	return !lost || *lost != 0;

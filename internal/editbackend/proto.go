@@ -7,7 +7,7 @@ package editbackend
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -253,18 +253,21 @@ type TrustDone struct {
 
 // Writer serializes messages as JSON lines.
 type Writer struct {
-	enc *json.Encoder
+	w io.Writer
 }
 
 // NewWriter writes to w.
-func NewWriter(w io.Writer) *Writer {
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	return &Writer{enc: enc}
-}
+func NewWriter(w io.Writer) *Writer { return &Writer{w: w} }
 
-// Write sends one message.
-func (w *Writer) Write(v any) error { return w.enc.Encode(v) }
+// Write sends one message as one line, in one write.
+func (w *Writer) Write(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = w.w.Write(append(b, '\n'))
+	return err
+}
 
 // Reader parses JSON lines of at most MaxLine bytes.
 type Reader struct {

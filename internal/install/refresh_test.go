@@ -61,6 +61,47 @@ func TestLiveEmptyWhitelistRejected(t *testing.T) {
 	}
 }
 
+// A section whose old lines are all scripts (they never match) refreshes to empty, while one with
+// an unreadable line still looks locked and is refused.
+func TestRefreshCatalogLiveEmptyIgnoresScriptLines(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".config", "discord")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "launcher")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	empty := func(_ *daemonconfig.Resource, _ func() []BinaryRule) ([]BinaryRule, bool, error) {
+		return nil, true, nil
+	}
+	refresh := func(lines ...string) (string, error) {
+		conf := "[watch " + root + "]\nneed_encryption: true\n" + strings.Join(lines, "\n") + "\n"
+		confPath := filepath.Join(t.TempDir(), "daemon.conf")
+		if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := daemonconfig.Load(confPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text, _, err := RefreshCatalog(conf, cfg, []User{{Name: "u", Home: home}},
+			RefreshOptions{Live: true, Scan: empty})
+		return text, err
+	}
+	text, err := refresh(script)
+	if err != nil {
+		t.Fatalf("a script-only section must refresh: %v", err)
+	}
+	if strings.Contains(text, script) {
+		t.Errorf("the script line survived the refresh:\n%s", text)
+	}
+	if _, err := refresh(script, filepath.Join(root, "locked", "Discord")); err == nil {
+		t.Error("an unreadable line must still make an empty live re-scan refuse")
+	}
+}
+
 func TestRefreshCatalogReportsVersionBump(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".config", "discord")
@@ -251,6 +292,40 @@ func staleDiscordLibConf(t *testing.T, home string, encrypt bool) (conf string, 
 		t.Fatal(err)
 	}
 	return conf, cfg
+}
+
+// A catalog-pattern lib_binary that is a script never matches: every refresh drops it, while a
+// hand-written one stays (the daemon only warns about it).
+func TestRefreshCatalogDropsScriptLibWriters(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".config", "discord")
+	conf, cfg := staleDiscordLibConf(t, home, false)
+	catalogScript := filepath.Join(root, "app-2", "Discord")
+	handWritten := filepath.Join(home, "opt", "hand-written")
+	if err := os.MkdirAll(filepath.Dir(handWritten), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{catalogScript, handWritten} {
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plain := func(_ *daemonconfig.Resource, expand func() []BinaryRule) ([]BinaryRule, bool, error) {
+		return expand(), false, nil
+	}
+	for _, keep := range []bool{false, true} {
+		text, _, err := RefreshCatalog(conf, cfg, []User{{Name: "u", Home: home}},
+			RefreshOptions{Live: true, KeepExisting: keep, Scan: plain})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(text, `lib_binary "`+catalogScript+`"`) {
+			t.Errorf("KeepExisting=%v: the catalog script writer survived:\n%s", keep, text)
+		}
+		if !strings.Contains(text, `lib_binary "`+handWritten+`"`) {
+			t.Errorf("KeepExisting=%v: the hand-written writer was dropped:\n%s", keep, text)
+		}
+	}
 }
 
 func TestRefreshCatalogPrunesVanishedAppVersionLibLines(t *testing.T) {

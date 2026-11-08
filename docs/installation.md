@@ -45,7 +45,7 @@ sudo ./build/linux/app-listener install
 `make build` dumps `vmlinux.h` from the host BTF, regenerates the BPF bindings and builds
 `build/linux/app-listener`. Nothing but Docker is needed on the host.
 
-Without Docker, install a recent clang/LLVM, `bpftool`, Go 1.26+ and GCC, then run
+Without Docker, install a recent clang/LLVM, `bpftool`, Go 1.27+ and GCC, then run
 `make build-host`. Builds are native only: build arm64 on an arm64 host. See
 [Development](development.md) for every target.
 
@@ -98,7 +98,12 @@ Earlier versions installed pacman/apt hooks and a boot unit to refresh the catal
 When a user's `~/.ssh` ends up guarded, the wizard offers (one question per user, naming the user
 and the unit path, asked before encryption):
 
-- a per-user `ssh-agent` systemd unit,
+- a per-user `ssh-agent` systemd unit. It binds `$XDG_RUNTIME_DIR/ssh-agent/socket`, which the
+  catalog's "SSH agent socket" entry guards (a [runtime section](config-reference.md#runtime)),
+  so only the programs whitelisted there (`ssh`, `ssh-add`, `ssh-keygen`) may use a loaded key.
+  The wizard says so when that entry is not selected. A unit from an earlier release binds
+  `$XDG_RUNTIME_DIR/ssh-agent.socket`, unguarded: `install facultatives` offers the new one and
+  rewrites the shell block, and `install catalog diff` adds the runtime section,
 - `AddKeysToAgent yes` at the top of `~/.ssh/config` (created if missing; an existing
   `AddKeysToAgent` is kept), written before `~/.ssh` is encrypted, so `ssh` loads a key into the
   agent on first use,
@@ -224,6 +229,7 @@ sudo app-listener uninstall --keep-gui
 ```
 
 - Refuses while the daemon runs.
+- Retires the [runtime-section guards](daemon.md#shutdown-and-crashes) a clean stop left.
 - Removes the completed-install record first, so an interrupted uninstall can be followed by a
   fresh `install`.
 - Re-scans the catalog and asks, per encrypted directory, whether to decrypt it in place for good

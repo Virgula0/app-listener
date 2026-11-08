@@ -29,7 +29,7 @@ const (
 func (t NetEventType) String() string {
 	switch t {
 	case NetConnect:
-		return "CONNECT"
+		return connectLabel
 	case NetAccept:
 		return "ACCEPT"
 	case NetSend:
@@ -72,7 +72,7 @@ type NetEvent struct {
 
 func ParseNetEventType(s string) (NetEventType, bool) {
 	switch strings.ToUpper(s) {
-	case "CONNECT":
+	case connectLabel:
 		return NetConnect, true
 	case "ACCEPT":
 		return NetAccept, true

@@ -71,3 +71,14 @@ func TestArchiveMembersIgnoresNonArchives(t *testing.T) {
 		t.Fatalf("%v %v", m, err)
 	}
 }
+
+// A file on another filesystem than the lib_dir (a FUSE mount below it) is never a source.
+func TestSourcesRefuseOtherFilesystem(t *testing.T) {
+	s := newSources(t.TempDir())
+	if err := s.index(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.sum("/proc/self/status"); err == nil {
+		t.Fatal("a file on another filesystem must not be summed as a source")
+	}
+}

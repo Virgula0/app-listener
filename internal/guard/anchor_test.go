@@ -181,3 +181,88 @@ func TestMountinfoShowsSbRoot(t *testing.T) {
 		t.Error("an unknown mount must be an error")
 	}
 }
+
+func slotFixture(t *testing.T, file bool) (parent, root string, slot rootSlot, key GuardInodeKey) {
+	t.Helper()
+	parent = filepath.Join(t.TempDir(), "parent")
+	root = filepath.Join(parent, "root")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if file {
+		err = os.WriteFile(root, []byte("s"), 0o600)
+	} else {
+		err = os.Mkdir(root, 0o755)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := openRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.close()
+	slot = slotOf(h)
+	if slot.dir == "" {
+		t.Fatalf("no slot recorded for %s", root)
+	}
+	return parent, root, slot, h.key
+}
+
+func TestRootSlotHoldsInPlace(t *testing.T) {
+	for _, file := range []bool{false, true} {
+		_, _, slot, key := slotFixture(t, file)
+		if !slot.holds(key) {
+			t.Fatalf("file=%v: a root left in place must hold its slot", file)
+		}
+	}
+}
+
+// A judged operation on the root itself releases it.
+func TestRootSlotReleasedByRootOps(t *testing.T) {
+	for _, file := range []bool{false, true} {
+		_, root, slot, key := slotFixture(t, file)
+		if err := os.Rename(root, root+".old"); err != nil {
+			t.Fatal(err)
+		}
+		if slot.holds(key) {
+			t.Fatalf("file=%v: a root renamed aside must leave its slot", file)
+		}
+		if err := os.Mkdir(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if slot.holds(key) {
+			t.Fatalf("file=%v: a root replaced at its name must leave its slot", file)
+		}
+	}
+	_, root, slot, key := slotFixture(t, false)
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	if slot.holds(key) {
+		t.Fatal("a removed root must leave its slot")
+	}
+}
+
+// Moving the unguarded parent aside and making a decoy at the path proves nothing: hold.
+func TestRootSlotHeldAcrossAncestorSwap(t *testing.T) {
+	for _, file := range []bool{false, true} {
+		parent, root, slot, key := slotFixture(t, file)
+		if err := os.Rename(parent, parent+".x"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if !slot.holds(key) {
+			t.Fatalf("file=%v: an ancestor swap must not count as the root's release", file)
+		}
+	}
+}
+
+func TestRootSlotZeroHolds(t *testing.T) {
+	if !(rootSlot{}).holds(GuardInodeKey{Dev: 1, Ino: 2}) {
+		t.Fatal("an unknown slot must keep the anchor")
+	}
+}

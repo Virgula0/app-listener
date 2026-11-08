@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	logtest "github.com/sirupsen/logrus/hooks/test"
+
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
@@ -335,6 +337,42 @@ func TestDaemonUseCaseGrantEditAccess(t *testing.T) {
 	}
 }
 
+func TestDaemonUseCaseGrantEditAccessWidensNarrows(t *testing.T) {
+	vault := newFakeVault("/vault")
+	keys := resource("/vault/keys")
+	keys.NarrowOf, keys.EncryptionRoot = "/vault", "/vault"
+	g0, g1, g2 := newFakeGuardRepo(), newFakeGuardRepo(), newFakeGuardRepo()
+	d, err := NewDaemonUseCase(
+		[]daemonconfig.Resource{resource("/vault"), keys, resource("/vault2")},
+		vault,
+		[]repository.GuardRepository{g0, g1, g2},
+	)
+	if err != nil {
+		t.Fatalf("NewDaemonUseCase: %v", err)
+	}
+	revoke, err := d.GrantEditAccess("/vault")
+	if err != nil {
+		t.Fatalf("GrantEditAccess: %v", err)
+	}
+	if !g0.editGranted || !g1.editGranted || g2.editGranted {
+		t.Fatalf("grants = %v %v %v, want the resource and its narrow only", g0.editGranted, g1.editGranted,
+			g2.editGranted)
+	}
+	if err := revoke(); err != nil || g0.editGranted || g1.editGranted {
+		t.Fatalf("revoke: %v, grants %v %v", err, g0.editGranted, g1.editGranted)
+	}
+
+	// A narrow that refuses the grant undoes the parent's.
+	g1.editGrantErr = errBoom
+	if _, err := d.GrantEditAccess("/vault"); err == nil || g0.editGranted {
+		t.Fatalf("err %v, parent granted %v", err, g0.editGranted)
+	}
+	g1.editGrantErr = nil
+	if _, err := d.GrantEditAccess("/vault"); err != nil {
+		t.Fatalf("a failed grant must not hold the session: %v", err)
+	}
+}
+
 func TestDaemonUseCaseResolveFailureFailsStart(t *testing.T) {
 	// Set after unlock+populate, so a failed resolution must leave the
 	// resource in the pre-unlock state once the caller runs Stop().
@@ -651,6 +689,27 @@ func TestDaemonUseCaseStopNonEncryptedResourceNotLocked(t *testing.T) {
 	}
 	if !repo.stopped {
 		t.Error("guard must still stop")
+	}
+}
+
+func TestDaemonUseCaseStopHandsOverOnlyWhenAsked(t *testing.T) {
+	for _, handOver := range []bool{false, true} {
+		repo := newFakeGuardRepo()
+		d, err := NewDaemonUseCase([]daemonconfig.Resource{{Path: "/run/user/1000/ssh-agent", Runtime: true}},
+			newFakeVault(), []repository.GuardRepository{repo})
+		if err != nil {
+			t.Fatalf("NewDaemonUseCase: %v", err)
+		}
+		if err := d.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if handOver {
+			d.HandOverOnStop()
+		}
+		d.Stop()
+		if repo.handedOver != handOver || !repo.stopped {
+			t.Errorf("HandOverOnStop %v: guard handed over %v, stopped %v", handOver, repo.handedOver, repo.stopped)
+		}
 	}
 }
 
@@ -1311,5 +1370,73 @@ func TestDaemonUseCaseReloadAddsUnencryptedResource(t *testing.T) {
 		if p == "/lib" {
 			t.Error("an unencrypted resource must never be unlocked")
 		}
+	}
+}
+
+// withMounted fakes the mount table: dev is mounted while *on.
+func withMounted(t *testing.T, dev uint64, on *bool) {
+	t.Helper()
+	orig := mountedDev
+	mountedDev = func(d uint64) (bool, error) { return d == dev && *on, nil }
+	t.Cleanup(func() { mountedDev = orig })
+}
+
+func TestDaemonUseCaseReloadRuntimeRootReleasedOnlyWhenUnmounted(t *testing.T) {
+	run := daemonconfig.Resource{Path: "/run/user/1000/ssh-agent", Runtime: true}
+	for _, mounted := range []bool{true, false} {
+		oldA, oldRun := newFakeGuardRepo(), newFakeGuardRepo()
+		oldRun.anchor, oldRun.anchorAlive = guard.GuardInodeKey{Dev: 7, Ino: 10}, true
+		withMounted(t, 7, &mounted)
+		d := startDaemon(t, newFakeVault("/a"), []daemonconfig.Resource{resource("/a"), run},
+			[]repository.GuardRepository{oldA, oldRun})
+
+		err := d.Reload([]daemonconfig.Resource{resource("/a")}, []repository.GuardRepository{newFakeGuardRepo()})
+		if mounted && err == nil {
+			t.Error("a runtime root whose mount is still there (hidden by another mount) must not be dropped")
+		}
+		if !mounted && err != nil {
+			t.Errorf("a runtime root whose mount went at logout must be dropped: %v", err)
+		}
+	}
+}
+
+func TestDaemonUseCaseReloadRuntimeRootMovedWhileMounted(t *testing.T) {
+	run := daemonconfig.Resource{Path: "/run/user/1000/ssh-agent", Runtime: true}
+	for _, mounted := range []bool{true, false} {
+		oldRun := newFakeGuardRepo()
+		oldRun.anchor, oldRun.anchorAlive = guard.GuardInodeKey{Dev: 7, Ino: 10}, true
+		withMounted(t, 7, &mounted)
+		d := startDaemon(t, newFakeVault(), []daemonconfig.Resource{run}, []repository.GuardRepository{oldRun})
+
+		newRun := newFakeGuardRepo()
+		newRun.anchor, newRun.anchorAlive = guard.GuardInodeKey{Dev: 9, Ino: 3}, true
+		err := d.Reload([]daemonconfig.Resource{run}, []repository.GuardRepository{newRun})
+		if mounted && err == nil {
+			t.Error("a runtime path naming another directory while the guarded one's mount lives must be refused")
+		}
+		if !mounted && err != nil {
+			t.Errorf("a new login's mount must replace a logged-out one: %v", err)
+		}
+	}
+}
+
+func TestRepeatLogOncePerErrorAndOnRecovery(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	var r repeatLog
+	gone := errors.New("stating guarded path /x: no such file or directory")
+	for range 3 {
+		r.report("sweep /x", &r.inodes, gone)
+	}
+	r.report("sweep /x", &r.inodes, errors.New("another"))
+	r.report("sweep /x", &r.inodes, nil)
+	r.report("sweep /x", &r.inodes, nil)
+	var msgs []string
+	for _, e := range hook.AllEntries() {
+		msgs = append(msgs, e.Message)
+	}
+	if len(msgs) != 3 || !strings.Contains(msgs[0], "no such file") || !strings.Contains(msgs[1], "another") ||
+		!strings.Contains(msgs[2], "ok again") {
+		t.Fatalf("want one line per distinct error and one on recovery, got %q", msgs)
 	}
 }

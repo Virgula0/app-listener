@@ -514,7 +514,8 @@ func selectAndEditConfig() (string, *daemonconfig.Config, error) {
 	}
 	text, cfg, err := editConfig(candidates)
 	if err == nil {
-		inst.WarnGeneralTools(cfg)
+		inst.WarnWhitelistLines(cfg)
+		inst.WarnSecretStores(cfg, users)
 	}
 	return text, cfg, err
 }

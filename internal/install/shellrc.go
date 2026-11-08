@@ -28,7 +28,8 @@ const (
 // (else only existing files are touched). Dedicated: deleted when its block is removed and nothing
 // else is left. Setting: keyword whose presence in a non-comment line means the user configured it
 // themselves (case-insensitive; empty skips the check). Prepend: block goes first (ssh_config scopes
-// a trailing directive to the last Host/Match, and the first value wins).
+// a trailing directive to the last Host/Match, and the first value wins). Refresh: an existing block
+// that differs is rewritten (the ssh-agent socket path moved between releases).
 type rcTarget struct {
 	Path      string
 	Begin     string
@@ -39,6 +40,7 @@ type rcTarget struct {
 	Create    bool
 	Dedicated bool
 	Prepend   bool
+	Refresh   bool
 }
 
 func rcBlock(begin, end string, lines ...string) string {
@@ -46,20 +48,21 @@ func rcBlock(begin, end string, lines ...string) string {
 }
 
 // rcTargets lists every startup file the installer may edit for u. The socket path mirrors
-// ssh-agent.service (%t/ssh-agent.socket = $XDG_RUNTIME_DIR); an already-set SSH_AUTH_SOCK
-// (e.g. a forwarded agent) is never overridden.
+// ssh-agent.service (%t = $XDG_RUNTIME_DIR); an already-set SSH_AUTH_SOCK (e.g. a forwarded agent)
+// is never overridden.
 func rcTargets(u User) []rcTarget {
 	posix := rcBlock(rcBegin, rcEnd, fmt.Sprintf(
-		`export SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-${XDG_RUNTIME_DIR:-/run/user/%d}/ssh-agent.socket}"`, u.UID))
+		`export SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-${XDG_RUNTIME_DIR:-/run/user/%d}/ssh-agent/socket}"`, u.UID))
 	fish := rcBlock(rcBegin, rcEnd, fmt.Sprintf(
-		`set -q SSH_AUTH_SOCK; or set -gx SSH_AUTH_SOCK (set -q XDG_RUNTIME_DIR; and echo $XDG_RUNTIME_DIR; or echo /run/user/%d)/ssh-agent.socket`,
+		`set -q SSH_AUTH_SOCK; or set -gx SSH_AUTH_SOCK (set -q XDG_RUNTIME_DIR; and echo $XDG_RUNTIME_DIR; or echo /run/user/%d)/ssh-agent/socket`,
 		u.UID))
 	sh := filepath.Base(u.Shell)
 	return []rcTarget{
-		{Path: filepath.Join(u.Home, ".zshrc"), Begin: rcBegin, End: rcEnd, Block: posix, Setting: authSock, Mode: 0o644, Create: sh == "zsh"},
-		{Path: filepath.Join(u.Home, ".bashrc"), Begin: rcBegin, End: rcEnd, Block: posix, Setting: authSock, Mode: 0o644, Create: sh == "bash"},
+		{Path: filepath.Join(u.Home, ".zshrc"), Begin: rcBegin, End: rcEnd, Block: posix, Setting: authSock, Mode: 0o644, Create: sh == "zsh", Refresh: true},
+		{Path: filepath.Join(u.Home, ".bashrc"), Begin: rcBegin, End: rcEnd, Block: posix, Setting: authSock, Mode: 0o644, Create: sh == "bash", Refresh: true},
 		{Path: filepath.Join(u.Home, ".config", "fish", "conf.d", "app-listener-ssh-agent.fish"),
-			Begin: rcBegin, End: rcEnd, Block: fish, Setting: authSock, Mode: 0o644, Create: sh == "fish", Dedicated: true},
+			Begin: rcBegin, End: rcEnd, Block: fish, Setting: authSock, Mode: 0o644, Create: sh == "fish", Dedicated: true,
+			Refresh: true},
 	}
 }
 
@@ -234,7 +237,10 @@ func ensureRCBlock(t *rcTarget, u User) (bool, error) {
 	}
 	text := string(data)
 	if strings.Contains(text, t.Begin) {
-		return false, nil
+		if !t.Refresh {
+			return false, nil
+		}
+		return replaceRCBlock(f, text, t)
 	}
 	if t.Setting != "" && setsKeyword(text, t.Setting) {
 		log.Infof("%s already sets %s: leaving it alone", t.Path, t.Setting)
@@ -258,6 +264,27 @@ func ensureRCBlock(t *rcTarget, u User) (bool, error) {
 	}
 	_, err = f.WriteString(add)
 	return err == nil, err
+}
+
+// replaceRCBlock rewrites a block of t that differs from t.Block in place.
+func replaceRCBlock(f *os.File, text string, t *rcTarget) (bool, error) {
+	start := strings.Index(text, t.Begin)
+	n := strings.Index(text[start:], t.End)
+	if n < 0 {
+		return false, errors.New("unterminated app-listener block: remove it by hand")
+	}
+	blockEnd := start + n + len(t.End)
+	if strings.HasPrefix(text[blockEnd:], "\n") {
+		blockEnd++
+	}
+	if text[start:blockEnd] == t.Block {
+		return false, nil
+	}
+	merged := text[:start] + t.Block + text[blockEnd:]
+	if _, err := f.WriteAt([]byte(merged), 0); err != nil {
+		return false, err
+	}
+	return true, f.Truncate(int64(len(merged)))
 }
 
 func removeRCBlock(t *rcTarget, u User) (bool, error) {

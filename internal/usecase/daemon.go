@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -13,6 +15,7 @@ import (
 	"github.com/Virgula0/app-listener/internal/constants"
 	"github.com/Virgula0/app-listener/internal/daemonconfig"
 	"github.com/Virgula0/app-listener/internal/guard"
+	ebpf "github.com/Virgula0/app-listener/internal/infrastructure"
 	"github.com/Virgula0/app-listener/internal/pulse"
 	"github.com/Virgula0/app-listener/internal/repository"
 )
@@ -58,6 +61,9 @@ type DaemonUseCase interface {
 	Start() error
 	Reload(resources []daemonconfig.Resource, guards []repository.GuardRepository) error
 	Stop()
+	// HandOverOnStop makes Stop keep the runtime sections enforced for the next start (see
+	// repository.GuardRepository.HandOver).
+	HandOverOnStop()
 	Events() <-chan DaemonEvent
 	Resources() []daemonconfig.Resource
 	// GrantEditAccess widens one resource's guard so the app-listener binary (uid 0 only) may
@@ -76,6 +82,9 @@ type DaemonUseCase interface {
 	// binary's (uid 0) runtime writes (GuardRepository.WithSelfRuntimeAccess). Refused while a live
 	// edit grant is active; reloads, grants and shutdown wait for fn.
 	WithRuntimeAccess(resourcePath string, fn func() error) error
+	// WithRuntimeRoot runs fn with the anchored root of the runtime resource resourcePath while
+	// the app-listener binary (uid 0) may chown or move it (GuardRepository.WithSelfOwnerAccess).
+	WithRuntimeRoot(resourcePath string, fn func(root guard.GuardInodeKey) error) error
 }
 
 type daemonUseCase struct {
@@ -96,6 +105,8 @@ type daemonUseCase struct {
 	// stopping is set once lockdown begins; Reload refuses when set, so a SIGHUP mid-shutdown never
 	// attaches or unlocks.
 	stopping bool
+	// handOver: Stop keeps the runtime sections enforced (HandOverOnStop).
+	handOver atomic.Bool
 	// orphans: not-yet-committed guards from an aborted reload whose freshly unlocked resources
 	// couldn't be locked back within the rollback budget. They stay attached (denying) and are
 	// retired by Stop after its lockdown (rollbackReload).
@@ -364,6 +375,7 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 		follow = followRootPulse.Subscribe()
 	}
 	var lastResync time.Time
+	var sweepLog repeatLog
 	for {
 		var followRoot <-chan struct{}
 		if follow != nil {
@@ -383,7 +395,7 @@ func (d *daemonUseCase) forwardEvents(resource string, g repository.GuardReposit
 			}
 		case <-sweep.C():
 			sweep.Ack()
-			d.periodicSweep(resource, g)
+			d.periodicSweep(resource, g, &sweepLog)
 			lastResync = time.Now()
 		case <-inodeGC.C():
 			inodeGC.Ack()
@@ -427,12 +439,24 @@ func (d *daemonUseCase) dispatchGuardEvent(resource string, g repository.GuardRe
 // and refreshes the inode map. SweepInodes only works when the root's fingerprint moved (recreated
 // single-file root, or a directory that gained/lost a top-level entry); an unconditional re-walk
 // per tick was a large share of steady-state CPU.
-func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardRepository) {
-	if _, err := g.SweepReSyncBinaries(); err != nil {
-		log.Errorf("daemon: periodic binary re-sync for %s: %v", resource, err)
-	}
-	if err := g.SweepInodes(); err != nil {
-		log.Errorf("daemon: periodic inode sweep for %s: %v", resource, err)
+func (d *daemonUseCase) periodicSweep(resource string, g repository.GuardRepository, logged *repeatLog) {
+	_, resyncErr := g.SweepReSyncBinaries()
+	logged.report(fmt.Sprintf("daemon: periodic binary re-sync for %s", resource), &logged.resync, resyncErr)
+	logged.report(fmt.Sprintf("daemon: periodic inode sweep for %s", resource), &logged.inodes, g.SweepInodes())
+}
+
+// repeatLog logs a periodic error once, not every tick (a released lib_dir's root stays gone until
+// the refresh drops it), then once more when it clears.
+type repeatLog struct{ resync, inodes string }
+
+func (repeatLog) report(what string, last *string, err error) {
+	switch {
+	case err == nil && *last != "":
+		log.Infof("%s: ok again", what)
+		*last = ""
+	case err != nil && err.Error() != *last:
+		log.Errorf("%s: %v (logged once while it repeats)", what, err)
+		*last = err.Error()
 	}
 }
 
@@ -513,10 +537,14 @@ func (d *daemonUseCase) refuseRemovedResources(resources []daemonconfig.Resource
 			continue
 		}
 		released, err := d.libDirReleased(i)
+		if err == nil && !released {
+			released, err = d.runtimeReleased(i)
+		}
 		if err != nil {
 			return fmt.Errorf("reload refused: %w", err)
 		}
-		if !released {
+		// A daemon-made root has no vault: dropping it only stops guarding the port or scope.
+		if !released && !d.resources[i].Anchored() {
 			removed = append(removed, d.resources[i].Path)
 		}
 	}
@@ -540,6 +568,35 @@ func (d *daemonUseCase) libDirReleased(i int) (bool, error) {
 	return !alive, nil
 }
 
+// runtimeReleased reports whether the running resource i is a runtime one whose user logged out:
+// no mount of its anchored root's filesystem is left (the /run/user/<uid> tmpfs went at logout). A
+// path that only stopped resolving (a FUSE mount the user put over /run/user/<uid>, through setuid
+// fusermount3) keeps the guard: the reload is refused instead. An unmount frees no inode with
+// nlink 0, so the anchor stays set and alive.
+func (d *daemonUseCase) runtimeReleased(i int) (bool, error) {
+	if !d.resources[i].Runtime {
+		return false, nil
+	}
+	root, _, err := d.guards[i].RootAnchor()
+	if err != nil {
+		return false, fmt.Errorf("reading the root of %s: %w", d.resources[i].Path, err)
+	}
+	mounted, err := mountedDev(root.Dev)
+	if err != nil {
+		return false, fmt.Errorf("reading the mount table for %s: %w", d.resources[i].Path, err)
+	}
+	return !mounted, nil
+}
+
+// mountedDev reports whether a filesystem with dev (KernelDev) is mounted in the daemon's namespace.
+var mountedDev = func(dev uint64) (bool, error) {
+	mounts, err := ebpf.ReadMountinfo()
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(mounts, func(m ebpf.MountInfo) bool { return uint64(m.Dev) == dev }), nil
+}
+
 // refuseMovedRoots refuses a reload whose guard for a kept resource anchored on a different root
 // while the old root still exists: the path was re-pointed through an unguarded ancestor, and
 // committing would guard the new target and leave the real tree unguarded. A deleted root (anchor
@@ -549,6 +606,17 @@ func (d *daemonUseCase) refuseMovedRoots(resources []daemonconfig.Resource, guar
 		oi, kept := oldByPath[resources[i].Path]
 		if !kept {
 			continue
+		}
+		// A runtime root's new anchor is a new login's mount only once the old one is unmounted: a
+		// user can mount FUSE over /run/user/<uid> (setuid fusermount3).
+		if resources[i].Runtime {
+			released, err := d.runtimeReleased(oi)
+			if err != nil {
+				return fmt.Errorf("reload refused: %w", err)
+			}
+			if released {
+				continue
+			}
 		}
 		oldKey, alive, err := d.guards[oi].RootAnchor()
 		if err != nil {
@@ -735,6 +803,8 @@ func (d *daemonUseCase) carryTaintAcrossReload(resources []daemonconfig.Resource
 	}
 }
 
+func (d *daemonUseCase) HandOverOnStop() { d.handOver.Store(true) }
+
 // Stop performs the secure lockdown: guards stay attached (denying all non-whitelisted access)
 // until every resource is keyless; only then do LSM hooks detach. A resource whose key can't be
 // deprovisioned blocks shutdown indefinitely (the daemon logs how to find the pinning process):
@@ -770,6 +840,9 @@ func (d *daemonUseCase) Stop() {
 		d.lockUntilAllKeyless(resources, guards, roots)
 
 		for _, g := range guards {
+			if d.handOver.Load() {
+				g.HandOver()
+			}
 			g.Stop()
 		}
 		// Guards orphaned by an aborted reload (their resource could not
@@ -874,9 +947,24 @@ func (d *daemonUseCase) GrantEditAccess(resourcePath string) (func() error, erro
 		return nil, fmt.Errorf("%s is not a guarded resource in the running configuration", resourcePath)
 	}
 
-	g := d.guards[idx]
-	if err := g.GrantSelfEditAccess(); err != nil {
-		return nil, err
+	// A [narrow] inside the resource owns its own inodes: it is widened with it, or its files
+	// stay read-only to the session.
+	var granted []repository.GuardRepository
+	revokeAll := func() error {
+		errs := make([]error, 0, len(granted))
+		for _, g := range granted {
+			errs = append(errs, g.RevokeSelfEditAccess())
+		}
+		return errors.Join(errs...)
+	}
+	for i := range d.resources {
+		if i != idx && d.resources[i].NarrowOf != resourcePath {
+			continue
+		}
+		if err := d.guards[i].GrantSelfEditAccess(); err != nil {
+			return nil, errors.Join(err, revokeAll())
+		}
+		granted = append(granted, d.guards[i])
 	}
 	d.editGrantActive = true
 
@@ -884,7 +972,7 @@ func (d *daemonUseCase) GrantEditAccess(resourcePath string) (func() error, erro
 	revoke := func() error {
 		var rerr error
 		once.Do(func() {
-			rerr = g.RevokeSelfEditAccess()
+			rerr = revokeAll()
 			d.mu.Lock()
 			d.editGrantActive = false
 			d.mu.Unlock()
@@ -911,6 +999,28 @@ func (d *daemonUseCase) WithRuntimeAccess(resourcePath string, fn func() error) 
 		}
 	}
 	return fmt.Errorf("%s is not a lib_dir in the running configuration", resourcePath)
+}
+
+func (d *daemonUseCase) WithRuntimeRoot(resourcePath string, fn func(root guard.GuardInodeKey) error) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.stopping {
+		return errors.New("daemon: shutdown in progress")
+	}
+	for i := range d.resources {
+		if d.resources[i].Path != resourcePath || !d.resources[i].Runtime {
+			continue
+		}
+		root, alive, err := d.guards[i].RootAnchor()
+		if err != nil {
+			return err
+		}
+		if !alive {
+			return fmt.Errorf("the guarded root of %s is gone", resourcePath)
+		}
+		return d.guards[i].WithSelfOwnerAccess(func() error { return fn(root) })
+	}
+	return fmt.Errorf("%s is not a runtime resource in the running configuration", resourcePath)
 }
 
 func (d *daemonUseCase) ResyncBinaries() {

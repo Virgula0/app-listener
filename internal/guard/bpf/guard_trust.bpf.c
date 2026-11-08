@@ -60,6 +60,7 @@
 #define TRUSTED_CHROMIUM 16 // a whitelisted Chromium-based binary (launch argv judged, trust_launch)
 #define TRUSTED_ELECTRON 32 // a generic Electron: runs the app its first positional argv names
 #define TRUSTED_BUN 64      // a Bun runtime or `bun build --compile` exe (launch env judged)
+#define TRUSTED_BUNFIG 128  // a Bun image that runs ./bunfig.toml's preload (not a runtime class)
 #define TRUSTED_RUNTIMES (TRUSTED_NODE | TRUSTED_JVM | TRUSTED_CHROMIUM | TRUSTED_ELECTRON | TRUSTED_BUN)
 
 // trust_event.kind
@@ -68,6 +69,12 @@
 #define TRUST_PLANT 2      // a non-writer tried to bind a reserved glob name
 #define TRUST_SUSPECT 3    // a code-suspect process of a whitelisted exe opened a guarded file
 #define TRUST_LAUNCH 4     // the same, marked for its launch env/argv (trust_launch)
+#define TRUST_ARGV 5       // the same, marked by one of its exe's argv/env rules (trust_argv)
+#define TRUST_ARGV_MATCH 6 // a launch matched a deny rule: marked (path: the completing word)
+#define TRUST_ARGV_WARN 7  // a launch matched a warn rule: logged only
+#define TRUST_BUNFIG 8     // a code-suspect TRUSTED_BUNFIG process opened a guarded file (marked at exec)
+#define TRUST_PROFILE 9    // the same, marked for running on a profile its caller made
+#define TRUST_PROFILE_MARK 10 // a browser locked or opened a profile anchor outside every secret root
 
 struct inode_key {
 	__u64 dev;
@@ -351,6 +358,72 @@ struct {
 	__type(value, struct launch_rule);
 } trust_launch SEC(".maps");
 
+// trust_argv: per-binary argv/env rules (issue #113), a tripwire: a whitelisted CLI started with words
+// that print or spend its secret (`gh auth token`) is marked code-suspect (SUSPECT_ARGV). An ARGV_WORD
+// entry's value has bit rule*ARGV_WORDS+pos set for each rule word it is; a rule matches once its
+// words appear in argv in order, others between (unanchored: a global flag taking a separate value
+// would shift any anchor). A word starting with '-' is compared up to '='. An ARGV_WORD_FOLD entry is a
+// rule word of a parser that ignores ASCII case, stored lowercase and looked up with the argv word
+// lowercased, in sets flagged ARGV_FOLDED only. An ARGV_ENV entry matches
+// when the variable is set (value ARGV_DENY or ARGV_WARN), unless the whole NAME=value string is an
+// ARGV_ENV_OK entry (a root-owned CA bundle). Filled by userspace (guard/trust_argv.go).
+#define ARGV_RULES 16
+#define ARGV_WORDS 4
+#define ARGV_WORD 1
+#define ARGV_ENV 2
+#define ARGV_ENV_OK 3
+#define ARGV_PROFILE 4 // a profile anchor: a file name the browser creates or opens in its profile
+#define ARGV_WORD_FOLD 5
+#define ARGV_DENY 1
+#define ARGV_WARN 2
+#define ARGV_KEY 64
+
+struct argv_key {
+	__u32 set;
+	__u32 kind;
+	char name[ARGV_KEY];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct argv_key);
+	__type(value, __u64);
+} trust_argv SEC(".maps");
+
+// trust_argv_sets[set]: each rule's word count, 4 bits per rule (0: none), and the rules that only
+// log. short_deny/short_arg: getopt letters (A-Z, a-z, 0-9 = bits 0-61) refused anywhere in an
+// option cluster, and those taking the rest of it as their value (`ssh -4F/x`). ARGV_ROOT_ONLY: any
+// launch by a non-root uid matches (sshd reads a config of the caller's choosing and prints its
+// lines). Written before any guard_bin_rules row names the set, never changed after.
+#define ARGV_ROOT_ONLY 1
+#define ARGV_ANCHORED 2 // the set has ARGV_PROFILE entries (trust_profile_anchor)
+#define ARGV_FOLDED 4   // the set has ARGV_WORD_FOLD entries
+
+struct argv_set {
+	__u64 lens;
+	__u64 warn;
+	__u64 short_deny;
+	__u64 short_arg;
+	__u64 flags;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1024);
+	__type(key, __u32);
+	__type(value, struct argv_set);
+} trust_argv_sets SEC(".maps");
+
+// guard_bin_rules[exe]: the trust_argv set of a whitelisted binary that has rules. A row like
+// guard_bin_owner's (trustBitMaps): a replacement admitted for the binary inherits it.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct inode_key);
+	__type(value, __u64);
+} guard_bin_rules SEC(".maps");
+
 // launch_scan is trust_exec_launch's walk over the new image's argv and env strings, one bpf_loop
 // step at a time (kept in a per-CPU map: the callback re-reads it, see symlink_scan_step).
 struct launch_scan {
@@ -366,7 +439,17 @@ struct launch_scan {
 	__u32 app;     // a generic Electron's app argument judged
 	__u32 risky;
 	__u32 done;
+	__u32 rules;    // the exe has a trust_argv set
+	__u32 set;
+	__u32 argv_hit; // a deny rule matched
+	__u32 fold;     // the set is ARGV_FOLDED
+	__u64 lens;     // trust_argv_sets[set]
+	__u64 warn;
+	__u64 short_deny;
+	__u64 short_arg;
+	__u8 prog[ARGV_RULES]; // each rule's words seen so far
 	struct launch_key key;
+	struct argv_key akey;
 	char buf[LAUNCH_BUF];
 };
 
@@ -1054,7 +1137,8 @@ __noinline int trust_suspect_denied(__u64 dir, int change)
 	__u8 *why = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
 	if (!why)
 		return 0;
-	__u32 kind = *why == SUSPECT_LAUNCH ? TRUST_LAUNCH : TRUST_SUSPECT;
+	__u32 kind = *why == SUSPECT_LAUNCH ? TRUST_LAUNCH : *why == SUSPECT_ARGV ? TRUST_ARGV :
+		     *why == SUSPECT_BUNFIG ? TRUST_BUNFIG : *why == SUSPECT_PROFILE ? TRUST_PROFILE : TRUST_SUSPECT;
 	int root = guarded_root_kind(dentry);
 	if (root != ROOT_SECRET && !(root == ROOT_CODE && change))
 		return 0;
@@ -1066,6 +1150,63 @@ __noinline int trust_suspect_denied(__u64 dir, int change)
 static __always_inline int suspect_denied(struct dentry *dentry, int change)
 {
 	return trust_suspect_denied((__u64)dentry, change) ? -EPERM : 0;
+}
+
+// creds_overridden: the kernel acts with other creds on the task's behalf. overlayfs opens a file's
+// backing file so, after file_open judged the overlay file at the path the caller sees; the
+// backing file's dentry is in the upper or lower layer, outside every guarded root.
+static __always_inline int creds_overridden(void)
+{
+	struct task_struct *t = (struct task_struct *)bpf_get_current_task();
+	const struct cred *c = NULL, *rc = NULL;
+	bpf_probe_read_kernel(&c, sizeof(c), &t->cred);
+	bpf_probe_read_kernel(&rc, sizeof(rc), &t->real_cred);
+	return c != rc;
+}
+
+// trust_profile_anchor: the current exe's rule set names dentry (in dir) a profile anchor and no
+// secret root holds dir: the browser runs on a profile its caller made (a user.js turning file://
+// isolation off, an extension), whose pages read whatever the exe may. It and every process it
+// starts, across exec, are code-suspect for life (SUSPECT_PROFILE). A planted profile in another
+// guarded tree is refused to the browser by that tree's guard. 1: the mark can't be recorded, the
+// caller refuses the operation. Static: path_symlink passes its BTF ctx pointer, which a global
+// function's scalar argument refuses; each hook calls it once.
+static __noinline int trust_profile_anchor(struct dentry *dir, struct dentry *dentry)
+{
+	if (!dir || !dentry)
+		return 0;
+	struct inode_key ek = {};
+	if (!current_exe_key(&ek))
+		return 0;
+	__u64 *set = bpf_map_lookup_elem(&guard_bin_rules, &ek);
+	if (!set)
+		return 0;
+	__u32 id = *set;
+	struct argv_set *as = bpf_map_lookup_elem(&trust_argv_sets, &id);
+	if (!as || !(as->flags & ARGV_ANCHORED))
+		return 0;
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *cur = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
+	if (cur && *cur == SUSPECT_PROFILE)
+		return 0;
+	const unsigned char *name = NULL;
+	__u32 n = 0;
+	bpf_probe_read_kernel(&name, sizeof(name), &dentry->d_name.name);
+	bpf_probe_read_kernel(&n, sizeof(n), &dentry->d_name.len);
+	if (!name || !n || n >= ARGV_KEY)
+		return 0;
+	struct argv_key k = {.set = id, .kind = ARGV_PROFILE};
+	if (bpf_probe_read_kernel_str(k.name, sizeof(k.name), name) < 0)
+		return 0;
+	if (!bpf_map_lookup_elem(&trust_argv, &k))
+		return 0;
+	if (guarded_root_kind(dir) == ROOT_SECRET)
+		return 0;
+	__u8 v = SUSPECT_PROFILE;
+	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
+		return 1;
+	emit(dentry, TRUST_PROFILE_MARK);
+	return 0;
 }
 
 // #2 library load allowlist: a whitelisted binary may map executable code only from a trusted
@@ -1280,6 +1421,8 @@ int trust_file_open(unsigned long long *ctx)
 		int r = suspect_denied(dentry, (f_mode & FMODE_WRITE) != 0);
 		if (r)
 			return r;
+		if (!creds_overridden() && trust_profile_anchor(dentry_parent(dentry), dentry))
+			return -EPERM;
 	}
 
 	if (!(f_mode & FMODE_WRITE))
@@ -1320,6 +1463,8 @@ int trust_path_mkdir(unsigned long long *ctx)
 	return 0;
 }
 
+// Chromium's profile lock (SingletonLock) is a symlink: this hook runs before the filesystem can
+// refuse it, so a profile on one that has no symlinks is marked too.
 SEC("lsm/path_symlink")
 int trust_path_symlink(unsigned long long *ctx)
 {
@@ -1328,6 +1473,8 @@ int trust_path_symlink(unsigned long long *ctx)
 	int r = suspect_denied(dir, 1);
 	if (r)
 		return r;
+	if (trust_profile_anchor(dir, dentry))
+		return -EPERM;
 	if (glob_denied(dir, dentry))
 		return deny_plant(dentry);
 	return 0;
@@ -1504,6 +1651,120 @@ static __always_inline long launch_token(struct launch_scan *s)
 	return 0;
 }
 
+// argv_rule_at reads buf's word (a flag or an ENV name up to '=', an ENV_OK whole) into s->akey and
+// looks it up. A word too long for the key matches nothing.
+static __noinline __u64 *argv_rule_at(struct launch_scan *s, __u32 kind)
+{
+	int done = 0;
+	int fold = kind == ARGV_WORD_FOLD;
+	int cut = kind == ARGV_ENV || ((kind == ARGV_WORD || fold) && s->buf[0] == '-');
+	s->akey.set = s->set;
+	s->akey.kind = kind;
+	for (int j = 0; j < ARGV_KEY; j++) {
+		char c = 0;
+		if (!done) {
+			c = s->buf[j];
+			if (c == 0 || (c == '=' && cut)) {
+				done = 1;
+				c = 0;
+			}
+			if (fold && c >= 'A' && c <= 'Z')
+				c += 'a' - 'A';
+		}
+		s->akey.name[j] = c;
+	}
+	if (!done)
+		return NULL;
+	return bpf_map_lookup_elem(&trust_argv, &s->akey);
+}
+
+// argv_matched reports a matched rule: a deny marks the launch (argv_hit), a warn is only logged.
+// The event's path is the word that completed it.
+static __always_inline void argv_matched(struct launch_scan *s, int warn)
+{
+	if (!warn)
+		s->argv_hit = 1;
+	struct trust_event *e = bpf_ringbuf_reserve(&trust_rb, sizeof(*e), 0);
+	if (!e)
+		return;
+	e->pid = bpf_get_current_pid_tgid() >> 32;
+	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+	e->kind = warn ? TRUST_ARGV_WARN : TRUST_ARGV_MATCH;
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	bpf_probe_read_kernel_str(e->path, ARGV_KEY, s->akey.name);
+	bpf_ringbuf_submit(e, 0);
+}
+
+// argv_word advances every rule whose next word buf is. The exact lookup goes last: akey then holds
+// the word as written, which a match reports.
+static __noinline void argv_word(struct launch_scan *s)
+{
+	__u64 mask = 0;
+	__u64 *m;
+	if (s->fold) {
+		m = argv_rule_at(s, ARGV_WORD_FOLD);
+		if (m)
+			mask = *m;
+	}
+	m = argv_rule_at(s, ARGV_WORD);
+	if (m)
+		mask |= *m;
+	if (!mask)
+		return;
+	for (int i = 0; i < ARGV_RULES; i++) {
+		__u32 len = (s->lens >> (i * 4)) & 0xf;
+		__u32 p = s->prog[i];
+		if (!len || p >= len || p >= ARGV_WORDS || !(mask & (1ULL << (i * ARGV_WORDS + p))))
+			continue;
+		s->prog[i] = p + 1;
+		if (p + 1 == len)
+			argv_matched(s, (s->warn >> i) & 1);
+	}
+}
+
+static __always_inline int short_bit(char c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return 26 + c - 'a';
+	if (c >= '0' && c <= '9')
+		return 52 + c - '0';
+	return -1;
+}
+
+// argv_short judges buf as a getopt cluster: a short_deny letter before any short_arg one (whose
+// value the rest is) matches. Unanchored like the word rules: `ssh host ls -F` matches too. getopt
+// reads a cluster to its end, so one longer than the scan's bound matches (fail closed).
+static __noinline void argv_short(struct launch_scan *s)
+{
+	if (!s->short_deny || s->buf[0] != '-' || s->buf[1] == '-')
+		return;
+	for (int j = 1; j < 32; j++) {
+		int b = short_bit(s->buf[j]);
+		if (b < 0)
+			return;
+		if (s->short_deny & (1ULL << b)) {
+			argv_matched(s, 0);
+			return;
+		}
+		if (s->short_arg & (1ULL << b))
+			return;
+	}
+	argv_matched(s, 0);
+}
+
+// argv_env judges an env string. ENV_OK is looked up first so the key a match reports is the NAME
+// alone: a value may be a secret.
+static __noinline void argv_env(struct launch_scan *s)
+{
+	if (argv_rule_at(s, ARGV_ENV_OK))
+		return;
+	__u64 *m = argv_rule_at(s, ARGV_ENV);
+	if (m)
+		argv_matched(s, *m == ARGV_WARN);
+}
+
 // launch_step reads the next argv/env string (or judges a token of the last one). Strings longer
 // than the buffer are read in pieces; only a piece starting a string is judged, and a value to
 // tokenize must fit whole. Any read failure is risky (fail closed).
@@ -1533,6 +1794,27 @@ static long launch_step(__u64 i, void *ctx)
 	if (argv && s->first) {
 		s->first = 0;
 		return 0;
+	}
+	if (s->rules) {
+		if (argv) {
+			argv_word(s); // fills akey with the word: argv_short's match reports it
+			argv_short(s);
+		} else {
+			argv_env(s);
+		}
+		if (s->argv_hit) {
+			s->done = 1;
+			return 1;
+		}
+	}
+	if (!s->classes)
+		return 0;
+	// Chromium trims ASCII whitespace off every argument before parsing it (base/command_line.cc):
+	// " --load-extension=x" is a live switch no rule's name matches.
+	char c0 = s->buf[0];
+	if (argv && (s->classes & (TRUSTED_NODE | TRUSTED_CHROMIUM)) && (c0 == ' ' || (c0 >= '\t' && c0 <= '\r'))) {
+		s->risky = 1;
+		return 1;
 	}
 	struct launch_rule *r;
 	if (argv && (s->classes & TRUSTED_ELECTRON) && !s->app && s->buf[0] != '-') {
@@ -1568,6 +1850,27 @@ static long launch_step(__u64 i, void *ctx)
 	return 0;
 }
 
+// argv_not_root marks an ARGV_ROOT_ONLY binary run by another uid, logged as the word "uid".
+static __noinline int argv_not_root(__u32 tgid)
+{
+	__u8 v = SUSPECT_ARGV;
+	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
+		bpf_send_signal(9); // SIGKILL
+	struct trust_event *e = bpf_ringbuf_reserve(&trust_rb, sizeof(*e), 0);
+	if (!e)
+		return 0;
+	e->pid = tgid;
+	e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+	e->kind = TRUST_ARGV_MATCH;
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	e->path[0] = 'u';
+	e->path[1] = 'i';
+	e->path[2] = 'd';
+	e->path[3] = 0;
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
 // trust_exec_launch judges a whitelisted Node/Electron, Chromium, JVM or Bun runtime's launch: an env var or argv
 // flag that makes it run code its caller chose (trust_launch) marks the process code-suspect
 // (SUSPECT_LAUNCH), so it never reads a secret nor changes an app's code tree. sched_process_exec
@@ -1576,22 +1879,63 @@ static long launch_step(__u64 i, void *ctx)
 // image's mark just before. An unmarkable process is killed: the hook cannot refuse the exec.
 // The launch is never judged again: an updater-made exe not admitted yet (updater_origin) is
 // judged by every runtime's rules, as its classes are unknown, bar the generic-Electron app check
-// (any other exe's positional argv, `steam steam://...`, would mark it).
+// (any other exe's positional argv, `steam steam://...`, would mark it). A whitelisted binary with
+// argv/env rules (guard_bin_rules) is scanned too, and a matched deny rule marks it SUSPECT_ARGV.
+// A TRUSTED_BUNFIG image is marked SUSPECT_BUNFIG unscanned.
 SEC("tp_btf/sched_process_exec")
 int trust_exec_launch(unsigned long long *ctx)
 {
 	struct task_struct *p = (struct task_struct *)ctx[0];
-	__u8 flags = current_exe_flags();
+	struct inode_key k = {};
+	__u8 flags = 0;
+	__u64 *set = NULL;
+	if (current_exe_key(&k)) {
+		__u8 *f = bpf_map_lookup_elem(&guard_trusted_files, &k);
+		flags = f ? *f : 0;
+		if (flags & TRUSTED_BINARY)
+			set = bpf_map_lookup_elem(&guard_bin_rules, &k);
+	}
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *prof = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
+	if (prof && *prof == SUSPECT_PROFILE)
+		return 0; // already marked for life
+	if (flags & TRUSTED_BUNFIG) {
+		// Its preload is any ./bunfig.toml the open reaches (a symlink, a bind mount): no name check
+		// can tell, so the image never reads a secret. Its launch is moot.
+		__u8 v = SUSPECT_BUNFIG;
+		if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
+			bpf_send_signal(9); // SIGKILL
+		return 0;
+	}
 	__u32 classes = flags & TRUSTED_RUNTIMES;
 	int unadmitted = !classes && !(flags & TRUSTED_BINARY) && updater_origin();
 	if (unadmitted)
 		classes = TRUSTED_RUNTIMES;
-	if (!p || !classes)
+	if (!p || (!classes && !set))
 		return 0;
 	__u32 z = 0;
 	struct launch_scan *s = bpf_map_lookup_elem(&trust_launch_scan, &z);
 	if (!s)
 		return 0;
+	s->rules = 0;
+	s->fold = 0;
+	s->argv_hit = 0;
+	__builtin_memset(s->prog, 0, sizeof(s->prog));
+	if (set) {
+		__u32 id = *set;
+		struct argv_set *as = bpf_map_lookup_elem(&trust_argv_sets, &id);
+		if (as) {
+			if ((as->flags & ARGV_ROOT_ONLY) && (bpf_get_current_uid_gid() & 0xFFFFFFFF))
+				return argv_not_root(tgid);
+			s->rules = 1;
+			s->fold = !!(as->flags & ARGV_FOLDED);
+			s->set = id;
+			s->lens = as->lens;
+			s->warn = as->warn;
+			s->short_deny = as->short_deny;
+			s->short_arg = as->short_arg;
+		}
+	}
 	struct mm_struct *mm = BPF_CORE_READ(p, mm);
 	if (!mm)
 		return 0;
@@ -1609,21 +1953,25 @@ int trust_exec_launch(unsigned long long *ctx)
 	s->done = 0;
 	long ret = bpf_loop(LAUNCH_STEPS, launch_step, NULL, 0);
 	s = bpf_map_lookup_elem(&trust_launch_scan, &z);
-	if (s && ret >= 0 && s->done && !s->risky)
+	int clean = s && ret >= 0 && s->done && !s->risky;
+	if (clean && !s->argv_hit)
 		return 0;
-	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
-	__u8 v = SUSPECT_LAUNCH;
+	__u8 v = clean ? SUSPECT_ARGV : SUSPECT_LAUNCH;
 	if (bpf_map_update_elem(&trust_code_suspect, &tgid, &v, BPF_ANY))
 		bpf_send_signal(9); // SIGKILL
 	return 0;
 }
 
 // Exec replaces every mapping; runs before the new image's segments and libraries are mapped, so
-// those are judged afresh by trust_mmap.
+// those are judged afresh by trust_mmap. A SUSPECT_PROFILE mark stays: Firefox execs its fork
+// server, which forks every content process, after it reads the profile's prefs.
 SEC("lsm/bprm_committed_creds")
 int trust_bprm_committed(unsigned long long *ctx)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *why = bpf_map_lookup_elem(&trust_code_suspect, &tgid);
+	if (why && *why == SUSPECT_PROFILE)
+		return 0;
 	bpf_map_delete_elem(&trust_code_suspect, &tgid);
 	return 0;
 }
