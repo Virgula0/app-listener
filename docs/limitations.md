@@ -12,7 +12,7 @@ authorizes which executable opens the file, not why. Any process that can run th
 binary with arguments of its choosing gets whatever that binary prints.
 
 [Launch rules](binary-trust.md#launch-rules) refuse the secret to the known disclosure commands
-(`gh auth token`, `aws configure export-credentials`, `bitcoin-cli dumpprivkey`), but they are a
+(`gh auth token`, `aws configure export-credentials`, `kubectl config view --raw`), but they are a
 tripwire: a CLI has more ways to print a secret than any list names.
 
 Programs that read a configuration file can disclose too: `ssh` and `sshd` print each line of a
@@ -41,6 +41,12 @@ sense of protection:
   registry logins on request. Keep them in the Secret Service keyring (`credsStore` set to a keyring
   helper) and gate that with a [secret scope](config-reference.md#secret-name), or use short-lived
   tokens.
+- **Bitcoin Core, Litecoin Core** (`~/.bitcoin`, `~/.litecoin`): the node opens the wallets for
+  whoever starts it. Run with another `HOME` whose `bitcoin.conf` names the real `walletdir` and a
+  cookie of its own, `bitcoind` loads the wallet and answers `listdescriptors true` (the private
+  keys) over its caller's RPC; any config it reads can `includeconf` the RPC cookie, which it prints
+  as a parse error. `bitcoin-cli` sends the cookie to whatever `-rpcport` or config names. Keep the
+  wallet encrypted (`encryptwallet`) and locked when not spending.
 - **`age`** (`~/.config/age`): `age -d` decrypts with the identity it reads, and `age -e -r
   <recipient>` re-encrypts that identity to any key the caller names. A file guard cannot stop age
   from handing out the key it is meant to use.
@@ -139,9 +145,9 @@ over a channel the guard doesn't see answers whoever asks:
   - gnome-keyring's control and pkcs11 sockets in `/run/user/<uid>/keyring` bypass the bus: guard
     them with the catalog's runtime section, which a browser loading the keyring's PKCS#11 module
     then can't use.
-- **Local servers.** A service on a loopback port (`bitcoind` RPC on 8332, `ollama` on 11434, `adb`
-  on 5037, `opencode serve`) answers any local client that has its credential, or any client when it
-  has none, unless a [port section](config-reference.md#port-tcpn) guards the port. Even then:
+- **Local servers.** A service on a loopback port (`ollama` on 11434, `adb` on 5037, `opencode
+  serve`) answers any local client that has its credential, or any client when it has none, unless
+  a [port section](config-reference.md#port-tcpn) guards the port. Even then:
   - a whitelisted client run by malware still asks on its behalf, as with agents;
   - connections opened before the daemon started are not judged;
   - UDP, other hosts and other network namespaces are out of scope;
@@ -237,7 +243,7 @@ opens it. The full list is in [Binary trust](binary-trust.md#launch-rules).
 | `gpg` | `--export-secret-keys`, `--export-secret-subkeys`, `--export-secret-ssh-key`, `--enarmor`, `--store`, in every abbreviation | They print the secret keys, or wrap any file `gpg` reads | None today |
 | `kubectl`, `oc` | `config view --raw` | It prints the client keys and tokens | `config view` (redacted) |
 | `rclone` | `config show`, `config dump` | They print every remote's tokens | `rclone config redacted` |
-| `bitcoin-cli`, `litecoin-cli`, `lightning-cli` | Key dumps and every send or payment command | They print keys or spend funds | None today |
+| `lightning-cli` | Key dumps and every send or payment command | They print keys or spend funds | None today |
 | JetBrains IDEs, `pi`, `opencode`, `codex` | `installPlugins`; `pi -e` / `--extension`; `OPENCODE_CONFIG*`; `OPENAI_BASE_URL` | They load code, or send the token to a server of the caller's choosing | Install plugins from the IDE; keep these in the app's own config |
 | Every whitelisted program | `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED` set to anything but the system bundle | The program would trust a certificate of the caller's choosing | Add the corporate bundle with [`allow_env`](config-reference.md#allow_env) |
 

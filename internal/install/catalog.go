@@ -173,13 +173,8 @@ var (
 var firefoxRules = slices.Concat(flagRules(true,
 	"-headless", "-screenshot", "-remote-debugging-port", "-marionette", "-start-debugger-server", "-jsdebugger"),
 	flagRules(false, "-MOZ_LOG"), []daemonconfig.LaunchRule{
-	{Env: "MOZ_HEADLESS"}, {Env: "MOZ_MARIONETTE"}, {Env: "MOZ_LOG"}, {Env: "SSLKEYLOGFILE"}},
+		{Env: "MOZ_HEADLESS"}, {Env: "MOZ_MARIONETTE"}, {Env: "MOZ_LOG"}, {Env: "SSLKEYLOGFILE"}},
 	firefoxAnchors)
-
-// coinRules: an unlocked wallet's keys and funds over RPC; -stdin carries the method on stdin
-// (ArgsManager reads --stdin as -stdin, case-sensitively on Linux).
-var coinRules = append(flagRules(false, "-stdin"), denyEach("dumpprivkey", "dumpwallet", "walletpassphrase", "send", "sendall",
-	"sendmany", "sendtoaddress")...)
 
 // catalogLaunchRules indexes every entry's LaunchRules by basename.
 var catalogLaunchRules = func() map[string][]daemonconfig.LaunchRule {
@@ -686,35 +681,8 @@ var Catalog = []CandidateDir{
 
 	// --- Wallets and crypto -------------------------------------------------------
 	// Surface only once the wallet is installed. Solana keeps its keypair as a plaintext id.json.
-	{Name: "Bitcoin Core", RelPaths: []string{".bitcoin/wallets"},
-		Whitelist: map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil, "/usr/bin/bitcoin-tx": nil}},
-	{Name: "Litecoin Core", RelPaths: []string{".litecoin/wallets"},
-		Whitelist: map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil}},
-	// The RPC cookie grants every RPC (spending from an unlocked wallet). By default it is written to
-	// the datadir root as .cookie.tmp then renamed, outside any guarded tree: these entries appear
-	// once you create rpc/ and set `rpccookiefile=rpc/.cookie` (docs/catalog.md).
-	{Name: "Bitcoin Core RPC cookie", RelPaths: []string{".bitcoin/rpc"},
-		Whitelist:   map[string][]string{"/usr/bin/bitcoind": nil, "/usr/bin/bitcoin-qt": nil, "/usr/bin/bitcoin-cli": nil},
-		LaunchRules: map[string][]daemonconfig.LaunchRule{"bitcoin-cli": coinRules}},
-	{Name: "Litecoin Core RPC cookie", RelPaths: []string{".litecoin/rpc"},
-		Whitelist:   map[string][]string{"/usr/bin/litecoind": nil, "/usr/bin/litecoin-qt": nil, "/usr/bin/litecoin-cli": nil},
-		LaunchRules: map[string][]daemonconfig.LaunchRule{"litecoin-cli": coinRules}},
-	// RPC over loopback TCP (mainnet, testnet3, regtest; signet and testnet4 sit in the default
-	// ephemeral range). With rpcuser/rpcpassword in bitcoin.conf a client needs no cookie at all,
-	// and a process listening on a stopped node's port collects the credentials clients send.
-	{Name: "Bitcoin Core RPC port", Ports: []uint16{8332, 18332, 18443},
-		Whitelist: map[string][]string{
-			"/usr/bin/bitcoind": {"MKNOD"}, "/usr/bin/bitcoin-qt": {"MKNOD"},
-			"/usr/bin/bitcoin-node": {"MKNOD"}, "/usr/bin/bitcoin-gui": {"MKNOD"},
-			"/usr/bin/bitcoin-cli":    {"CONNECT"},
-			"/usr/local/bin/bitcoind": {"MKNOD"}, "/usr/local/bin/bitcoin-qt": {"MKNOD"},
-			"/usr/local/bin/bitcoin-cli": {"CONNECT"},
-		}},
-	{Name: "Litecoin Core RPC port", Ports: []uint16{9332, 19332, 19443},
-		Whitelist: map[string][]string{
-			"/usr/bin/litecoind": {"MKNOD"}, "/usr/bin/litecoin-qt": {"MKNOD"},
-			"/usr/bin/litecoin-cli": {"CONNECT"},
-		}},
+	// No Bitcoin or Litecoin Core: bitcoind run under another HOME serves the real walletdir over its
+	// caller's RPC, and prints a cookie its config includes (docs/limitations.md).
 	{Name: "Monero", RelPaths: []string{".bitmonero/wallets"},
 		Whitelist: map[string][]string{"/usr/bin/monero-wallet-gui": nil, "/usr/bin/monero-wallet-cli": nil, "/usr/bin/monerod": nil}},
 	// A Python app: its lines never match (see Google Cloud SDK).

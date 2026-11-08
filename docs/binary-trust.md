@@ -240,9 +240,6 @@ file's name, in every section that whitelists a file of that name:
   as Chromium's.
 - JetBrains launchers (`idea`, `pycharm`, ..., Android Studio's `studio`): `installPlugins`, which
   installs a plugin from any repository; the plugin then runs in the IDE.
-- `bitcoin-cli`, `litecoin-cli`: `dumpprivkey`, `dumpwallet`, `walletpassphrase`, `send`,
-  `sendall`, `sendmany`, `sendtoaddress`, and the `-stdin` flag, with one or two dashes (it reads
-  the method from stdin).
 - `lightning-cli`: `pay`, `xpay`, `renepay`, `keysend`, `withdraw`, `sendpay`, `sendonion`,
   `fundchannel`, `multifundchannel`, `close`, `exposesecret`.
 - Every whitelisted binary (built into the daemon, not the catalog): `SSL_CERT_FILE` or `SSL_CERT_DIR` (Go, OpenSSL, GnuTLS) or

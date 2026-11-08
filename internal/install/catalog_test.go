@@ -1104,9 +1104,9 @@ func TestCatalogLaunchRulesKeyedByWhitelistBasename(t *testing.T) {
 			}
 		}
 	}
-	a := CatalogLaunchRules("bitcoin-cli")
+	a := CatalogLaunchRules("kubectl")
 	a[0].Words = []string{"mine"}
-	if CatalogLaunchRules("litecoin-cli")[0].Words[0] == "mine" || CatalogLaunchRules("bitcoin-cli")[0].Words[0] == "mine" {
+	if CatalogLaunchRules("oc")[0].Words[0] == "mine" || CatalogLaunchRules("kubectl")[0].Words[0] == "mine" {
 		t.Fatal("CatalogLaunchRules must return a copy")
 	}
 }
@@ -1147,7 +1147,6 @@ func TestCatalogAgentLaunchRules(t *testing.T) {
 		"firefox": {{Words: []string{"-headless"}, FoldCase: true, EitherDash: true},
 			{Words: []string{"-remote-debugging-port"}, FoldCase: true, EitherDash: true},
 			{Words: []string{"-MOZ_LOG"}, EitherDash: true}, {Env: "MOZ_HEADLESS"}},
-		"bitcoin-cli": {{Words: []string{"-stdin"}, EitherDash: true}, deny("dumpprivkey")},
 	} {
 		for _, want := range rules {
 			if !has(name, want) {

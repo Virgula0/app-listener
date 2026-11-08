@@ -10,7 +10,7 @@ import (
 
 const portSecret = "INET-SERVICE-SECRET"
 
-// A [port tcp/N] section guards a loopback TCP service (bitcoind RPC, the adb server): only its
+// A [port tcp/N] section guards a loopback TCP service (the adb server, ollama): only its
 // MKNOD binary listens on the port, and only on loopback (a listener older than the daemon is judged
 // at accept); only its CONNECT binaries reach it,
 // through every connect path; a connection handed to another exe is judged by that exe.

@@ -16,14 +16,13 @@ each, and offers the ones that exist on your host. It covers, among others:
 - **Browsers:** Firefox, Chrome, Chromium, Brave
 - **Messaging and apps:** Discord, Telegram, Signal, Element, Steam
 - **VPNs:** NordVPN, Mullvad, ProtonVPN, OpenVPN, WireGuard
-- **Crypto wallets:** Bitcoin Core and Litecoin Core (wallets and RPC cookie), Monero, Electrum, Sparrow, Wasabi, Ledger Live,
+- **Crypto wallets:** Monero, Electrum, Sparrow, Wasabi, Ledger Live,
   Trezor Suite, Exodus, Solana CLI, geth, LND, Core Lightning, Foundry
 - **Keyring items** ([secret scopes](config-reference.md#secret-name)): the `gh`, Codex
   and Antigravity CLI tokens, `git`'s libsecret credentials and the Chrome and Chromium Safe Storage keys, plus gnome-keyring's
   sockets as a runtime section. Offered when gnome-keyring and one of the binaries are installed.
-- **Loopback services** ([port sections](config-reference.md#port-tcpn)): Bitcoin Core and
-  Litecoin Core RPC (mainnet, testnet3 and regtest ports), the `adb` server, the Ollama API,
-  `opencode serve`. Offered when one of their binaries is installed.
+- **Loopback services** ([port sections](config-reference.md#port-tcpn)): the `adb` server, the
+  Ollama API, `opencode serve`. Offered when one of their binaries is installed.
 
 The catalog narrows each watch to the sensitive subtrees, so apps that update themselves inside
 their own config directory keep working (see below).
@@ -105,19 +104,10 @@ with the catalog, never in the guard. Add your own in
   lines: add them with `sudo app-listener edit-protected config`.
 - **Copilot CLI `/ide`.** The VS Code Copilot extension writes lock files to `~/.copilot/ide`.
   Whitelist the VS Code binary on `~/.copilot` for that integration.
-- **Bitcoin and Litecoin RPC cookie.** The cookie grants every RPC call, including spending from an
-  unlocked wallet. By default the node writes it to the datadir root, outside any guarded tree, as
-  `.cookie.tmp`, then renames it. To guard it, create `~/.bitcoin/rpc` (`~/.litecoin/rpc`), add
-  `rpccookiefile=rpc/.cookie` to the node's config, and run `sudo app-listener install catalog diff`:
-  the "RPC cookie" entry whitelists the node, its GUI and its CLI. Whitelist there any other RPC client
-  that reads the cookie (electrs, LND, Core Lightning's `bcli` runs `bitcoin-cli`), not on
-  `wallets`. The node's config file stays writable, so malware can add an `rpcauth` login of its own
-  and wait for a restart.
-
 - **Other clients of a guarded port.** A port entry whitelists the service and its own client: a
-  web UI for Ollama, electrs or LND talking to `bitcoind`, an IDE plugin talking to `opencode serve`
-  needs its own `CONNECT` line. Signet and testnet4 RPC ports sit in the default ephemeral range,
-  which the daemon refuses, and `install catalog refresh` leaves port sections as written.
+  web UI for Ollama or an IDE plugin talking to `opencode serve` needs its own `CONNECT` line. A
+  port in the default ephemeral range can't be guarded (the daemon refuses it), and
+  `install catalog refresh` leaves port sections as written.
 
 To add catalog directories that appeared after you installed (a newly installed app), run
 `sudo app-listener install catalog diff`.

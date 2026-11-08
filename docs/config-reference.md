@@ -243,12 +243,11 @@ wizard's editor writes before you pick a directory. It means the same as `[watch
 ## `[port tcp/<n>]`
 
 ```ini
-[port tcp/8332]
-/usr/bin/bitcoind MKNOD
-/usr/bin/bitcoin-cli CONNECT
+[port tcp/11434]
+/usr/bin/ollama MKNOD,CONNECT
 ```
 
-A service on a loopback TCP port (`bitcoind` RPC, the `adb` server, `ollama`) answers any local
+A service on a loopback TCP port (the `adb` server, `ollama`, `opencode serve`) answers any local
 program that can reach it. This section guards one such port: only its `CONNECT` lines may connect
 to it, and only its `MKNOD` lines may listen on it, so another program can't take the port while
 the service is stopped and collect the credentials its clients send. A listener made while the
@@ -598,10 +597,9 @@ need_encryption: false
 /usr/bin/ssh CONNECT,STAT
 /usr/bin/ssh-add CONNECT,STAT
 
-# bitcoind's RPC port.
-[port tcp/8332]
-/usr/bin/bitcoind MKNOD
-/usr/bin/bitcoin-cli CONNECT
+# The Ollama API.
+[port tcp/11434]
+/usr/bin/ollama MKNOD,CONNECT
 
 # The gh token in the keyring.
 [secret_service]
