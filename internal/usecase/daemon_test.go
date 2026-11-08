@@ -692,6 +692,27 @@ func TestDaemonUseCaseStopNonEncryptedResourceNotLocked(t *testing.T) {
 	}
 }
 
+func TestDaemonUseCaseStopHandsOverOnlyWhenAsked(t *testing.T) {
+	for _, handOver := range []bool{false, true} {
+		repo := newFakeGuardRepo()
+		d, err := NewDaemonUseCase([]daemonconfig.Resource{{Path: "/run/user/1000/ssh-agent", Runtime: true}},
+			newFakeVault(), []repository.GuardRepository{repo})
+		if err != nil {
+			t.Fatalf("NewDaemonUseCase: %v", err)
+		}
+		if err := d.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if handOver {
+			d.HandOverOnStop()
+		}
+		d.Stop()
+		if repo.handedOver != handOver || !repo.stopped {
+			t.Errorf("HandOverOnStop %v: guard handed over %v, stopped %v", handOver, repo.handedOver, repo.stopped)
+		}
+	}
+}
+
 func TestDaemonUseCaseStopIdempotent(t *testing.T) {
 	vault := newFakeVault("/vault")
 	d, err := NewDaemonUseCase(

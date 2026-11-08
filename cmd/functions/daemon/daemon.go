@@ -47,7 +47,7 @@ const (
 	pidFile = "/run/app-listener-daemon.pid"
 	// bpffsMount: conventional bpffs mountpoint for LSM link pins (a SIGKILL leaves trees enforced
 	// until ExecStopPost locks the vaults and the next start retires stale pins).
-	bpffsMount = "/sys/fs/bpf"
+	bpffsMount = guard.DefaultPinMount
 )
 
 // pinCfg: where and under which generation this instance pins LSM links. gen is fresh per start and
@@ -55,6 +55,9 @@ const (
 type pinCfg struct {
 	base string
 	gen  string
+	// handover: the generation a clean stop left guarding the runtime sections ("" = none), retired
+	// once this start's guards hold them (guard.Guard.HandOver).
+	handover string
 }
 
 func (p pinCfg) prefix(resourcePath string) string {
@@ -313,7 +316,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	reload, stopRefresh := startCatalogRefresh(d, configPath, cfg, vault, pin, control, trust, login)
 	defer stopRefresh()
-	return runDaemonUI(events, cfg, reload, termSig, hup, serve)
+	uiErr := runDaemonUI(events, cfg, reload, termSig, hup, serve)
+	// Down, the user could plant a listener or symlink in a runtime section that the next start
+	// would guard as found: the stop keeps them guarded until that start's guards hold them.
+	d.HandOverOnStop()
+	return uiErr
 }
 
 // startCatalogRefresh starts the in-daemon catalog refresh (catalogrefresh.go) and the app
@@ -653,8 +660,14 @@ func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinC
 	// Retire pins a killed predecessor left. relockStaleVaults (and ExecStopPost `daemon lockdown`)
 	// already locked any vault they were the last guard for, so removing them exposes only
 	// encrypted data. Must precede this run's fscrypt use: a stale guard pinned by an OLDER binary
-	// would deny this process's unlock/lock ioctls.
-	if _, cleanErr := guard.CleanupStalePins(pin.base, map[string]bool{pin.gen: true}); cleanErr != nil {
+	// would deny this process's unlock/lock ioctls. A handover guards only runtime sections, which
+	// this binary was admitted to read: it stays until this start's guards hold them.
+	pin.handover = takeHandover(cfg, pin.base)
+	keep := map[string]bool{pin.gen: true}
+	if pin.handover != "" {
+		keep[pin.handover] = true
+	}
+	if _, cleanErr := guard.CleanupStalePins(pin.base, keep); cleanErr != nil {
 		log.Warnf("daemon: could not sweep stale guard pins: %v", cleanErr)
 	}
 
@@ -690,8 +703,13 @@ func startGuardedDaemon(cfg *daemonconfig.Config, vault *fscrypt.Vault, pin pinC
 		d.Stop()
 		return nil, startErr
 	}
-	// Real guards attached and populated: the ephemeral guards are done.
+	// Real guards attached and populated: the ephemeral guards and the handover are done.
 	pending.stop()
+	if pin.handover != "" {
+		if err := guard.RetireHandover(pin.base); err != nil {
+			log.Warnf("daemon: could not retire the stopped run's runtime-section pins: %v", err)
+		}
+	}
 	return d, nil
 }
 
@@ -1115,6 +1133,9 @@ func buildOneGuard(r *daemonconfig.Resource, self guard.BinaryEntry, deviceSet [
 	}
 	if r.NarrowOf != "" {
 		opts = append(opts, guard.WithNested())
+	}
+	if r.Runtime {
+		opts = append(opts, guard.WithHandOver())
 	}
 	g, err := guard.NewGuard(r.Path, mode, binaries, true, 0, opts...)
 	if err != nil {

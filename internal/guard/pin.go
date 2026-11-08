@@ -16,6 +16,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// DefaultPinMount is the conventional bpffs mountpoint the daemon pins its LSM links under.
+const DefaultPinMount = "/sys/fs/bpf"
+
 // pinFilePrefix tags every pin file this daemon creates so CleanupStalePins
 // never touches another tool's pins sharing the bpffs mount.
 const pinFilePrefix = "al-"
@@ -159,6 +162,11 @@ func sanitizeGen(g string) string {
 // the LSM program a killed predecessor left attached) and closes it. Used at start and after a
 // reload. A missing or empty base isn't an error.
 func CleanupStalePins(base string, keep map[string]bool) (removed int, err error) {
+	return retirePins(base, func(gen string) bool { return !keep[gen] })
+}
+
+// retirePins unpins and removes every pin of ours whose generation retire selects.
+func retirePins(base string, retire func(gen string) bool) (removed int, err error) {
 	if base == "" {
 		return 0, nil
 	}
@@ -174,7 +182,7 @@ func CleanupStalePins(base string, keep map[string]bool) (removed int, err error
 			continue
 		}
 		gen := genOfPinFile(e.Name())
-		if gen == "" || keep[gen] {
+		if gen == "" || !retire(gen) {
 			continue
 		}
 		path := filepath.Join(base, e.Name())
@@ -236,5 +244,9 @@ func SharedPinPrefix(base, generation string) string {
 	if base == "" {
 		return "" // pinning disabled on this host
 	}
-	return filepath.Join(base, pinFilePrefix+sanitizeGen(generation)+"-shared-")
+	return filepath.Join(base, sharedPinName(generation))
+}
+
+func sharedPinName(generation string) string {
+	return pinFilePrefix + sanitizeGen(generation) + "-shared-"
 }

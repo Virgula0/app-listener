@@ -65,6 +65,8 @@ type fakeGuardRepo struct {
 	taintedPIDs      []uint32
 	anchor           guard.GuardInodeKey
 	anchorAlive      bool
+	// handedOver: HandOver came before Stop.
+	handedOver bool
 }
 
 func newFakeGuardRepo() *fakeGuardRepo {
@@ -176,6 +178,12 @@ func (f *fakeGuardRepo) RestoreTaintedPIDs(pids []uint32) error {
 func (f *fakeGuardRepo) Start() error {
 	f.started = true
 	return f.startErr
+}
+
+func (f *fakeGuardRepo) HandOver() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.handedOver = !f.stopped
 }
 
 func (f *fakeGuardRepo) Stop() {

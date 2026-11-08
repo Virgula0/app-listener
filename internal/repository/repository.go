@@ -77,6 +77,9 @@ type GuardRepository interface {
 	// exists. Reload compares a kept resource's old and new anchors with it: a new root while the
 	// old one still exists means the path was re-pointed through an unguarded ancestor.
 	RootAnchor() (key guard.GuardInodeKey, alive bool, err error)
+	// HandOver makes the next Stop keep a runtime section enforced by its pinned links until the
+	// next daemon start's guards hold it. The final shutdown's only: see guard.Guard.HandOver.
+	HandOver()
 	Start() error
 	Stop()
 	Events() <-chan guard.GuardEvent

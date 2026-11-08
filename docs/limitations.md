@@ -90,7 +90,9 @@ sending a datagram, or sending and receiving on a connection handed to another p
   `gpg` or `ssh` send it. What `ssh-add` sends (the key) only an agent program may read: see
   [Agents as oracles](#secrets-served-over-ipc).
 - **Logins with no daemon running.** A runtime directory created then (by the agent's own unit) is
-  guarded once the daemon starts, but may already hold sockets bound by any program.
+  guarded once the daemon starts, but may already hold sockets bound by any program. A clean stop
+  keeps the sections already there guarded ([details](daemon.md#shutdown-and-crashes)), but a
+  logout and a new login while the daemon is down make a new, unguarded directory.
 - **Abstract sockets** have no file and are never judged.
 
 ## Secrets served over IPC

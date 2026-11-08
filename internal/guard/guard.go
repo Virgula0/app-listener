@@ -294,6 +294,10 @@ type Guard struct {
 	movePeer uint64
 	// nested: WithNested.
 	nested bool
+	// handOver: may be kept enforced across a clean stop (WithHandOver); handingOver: the next
+	// Stop does (HandOver).
+	handOver    bool
+	handingOver bool
 	// systemPatterns: WithSystemPatterns.
 	systemPatterns []daemonconfig.BinaryRule
 	// vetted: whitelist path -> the inode it was hashed from (binaryKey). Guarded by mu.
@@ -397,6 +401,14 @@ func WithMovePeer(peer uint64) GuardOption {
 func WithNested() GuardOption {
 	return func(g *Guard) {
 		g.nested = true
+	}
+}
+
+// WithHandOver lets HandOver keep this resource enforced past its Stop: a runtime section must not
+// be open to plants while the daemon is down.
+func WithHandOver() GuardOption {
+	return func(g *Guard) {
+		g.handOver = true
 	}
 }
 
@@ -2677,6 +2689,9 @@ func (g *Guard) Stop() {
 		g.verifyStop = nil
 	}
 	close(g.done)
+	if g.handingOver && sharedEngine.retainSlot(g.resID) {
+		return
+	}
 	g.cleanup()
 }
 

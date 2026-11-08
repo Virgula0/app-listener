@@ -104,7 +104,7 @@ daemon restarted since: it remembers what it made in memory only. `/run/user/<ui
 tmpfs, not a filesystem the user mounted over it.
 
 A directory present when the daemon itself starts (the user logged in while no daemon
-ran) is guarded as found, and may hold sockets bound before the guard. The daemon plants its
+ran, see [Shutdown and crashes](#shutdown-and-crashes) for a stop) is guarded as found, and may hold sockets bound before the guard. The daemon plants its
 sentinel in it then (and at every reload), so an agent removing its own socket can't leave it
 empty.
 
@@ -160,6 +160,16 @@ hooks detach only after every vault is keyless.
 
 A hard `SIGKILL` can't be caught, but the guards' LSM links are pinned under `/sys/fs/bpf`, so the
 trees stay enforced until `ExecStopPost` (`daemon lockdown`) locks the vaults.
+
+A clean stop (`systemctl stop` or `restart`, `update`, the GUI's Daemon page) keeps the
+[runtime sections](#runtime-sections-at-login) guarded: their pins stay, while every other tree's guard
+detaches as before. Otherwise a program could, while the daemon is down, remove an agent's socket
+and listen at its name, or leave a symlink to a listener of its own, and the next start would guard
+that as found. The next start first lets its own binary read those sections (an `update` changes
+its inode), and retires the old pins only once its own guards hold the sections. If it can't (the
+old pins deny it anyway), it logs a `CRITICAL` line and retires them first, as before. Until then
+they keep the stopped daemon's policy: a whitelisted program replaced in the meantime is refused
+there. `uninstall` retires them; otherwise they last until the next start or reboot.
 
 A wrong or old master key fails immediately with "invalid wrapping key". The daemon never silently
 generates a new one.

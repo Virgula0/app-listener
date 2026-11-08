@@ -92,6 +92,8 @@ type engine struct {
 	pinPrefix   string
 	pinDegraded bool
 	mapsPinned  bool
+	// retained: a slot was kept enforced past its Guard's Stop (handover.go).
+	retained bool
 
 	// inodeCap is guard_inodes' max_entries for the next load (ConfigureInodeCapacity); 0 = the
 	// object's default, inodeCapDefault. inodeWarned: occupancy is past inodeWarnPercent.
@@ -767,7 +769,10 @@ func (e *engine) release(id uint32) {
 
 // stopLocked detaches everything and resets the engine so a later Guard starts clean.
 func (e *engine) stopLocked() {
-	e.unpinSharedMaps()
+	handOver := e.handOverLocked()
+	if !handOver {
+		e.unpinSharedMaps()
+	}
 	if e.done != nil {
 		select {
 		case <-e.done:
@@ -780,11 +785,13 @@ func (e *engine) stopLocked() {
 		e.rd = nil
 	}
 	for _, l := range e.links {
-		if e.pinPrefix != "" {
+		if e.pinPrefix != "" && !handOver {
 			_ = l.Unpin()
 		}
 		_ = l.Close()
 	}
+	e.mapsPinned = false
+	e.retained = false
 	e.links = nil
 	e.linkNames = nil
 	_ = e.objs.Close()

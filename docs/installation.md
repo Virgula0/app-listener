@@ -229,6 +229,7 @@ sudo app-listener uninstall --keep-gui
 ```
 
 - Refuses while the daemon runs.
+- Retires the [runtime-section guards](daemon.md#shutdown-and-crashes) a clean stop left.
 - Removes the completed-install record first, so an interrupted uninstall can be followed by a
   fresh `install`.
 - Re-scans the catalog and asks, per encrypted directory, whether to decrypt it in place for good

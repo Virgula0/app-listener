@@ -34,7 +34,8 @@ running (up to 5 minutes), so an app that deletes its old version right after wr
 
 ## Binary ledger
 
-Nothing guards a whitelisted path while the daemon is stopped, booting or being reinstalled. So
+Nothing guards a whitelisted path while the daemon is stopped (apart from the runtime sections a
+clean stop leaves guarded), booting or being reinstalled. So
 every start and reload checks each whitelisted binary against the content hash recorded for its
 line in `/etc/app-listener/binaries.db` (for a symlink line, the link path).
 

@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -60,6 +61,9 @@ type DaemonUseCase interface {
 	Start() error
 	Reload(resources []daemonconfig.Resource, guards []repository.GuardRepository) error
 	Stop()
+	// HandOverOnStop makes Stop keep the runtime sections enforced for the next start (see
+	// repository.GuardRepository.HandOver).
+	HandOverOnStop()
 	Events() <-chan DaemonEvent
 	Resources() []daemonconfig.Resource
 	// GrantEditAccess widens one resource's guard so the app-listener binary (uid 0 only) may
@@ -101,6 +105,8 @@ type daemonUseCase struct {
 	// stopping is set once lockdown begins; Reload refuses when set, so a SIGHUP mid-shutdown never
 	// attaches or unlocks.
 	stopping bool
+	// handOver: Stop keeps the runtime sections enforced (HandOverOnStop).
+	handOver atomic.Bool
 	// orphans: not-yet-committed guards from an aborted reload whose freshly unlocked resources
 	// couldn't be locked back within the rollback budget. They stay attached (denying) and are
 	// retired by Stop after its lockdown (rollbackReload).
@@ -797,6 +803,8 @@ func (d *daemonUseCase) carryTaintAcrossReload(resources []daemonconfig.Resource
 	}
 }
 
+func (d *daemonUseCase) HandOverOnStop() { d.handOver.Store(true) }
+
 // Stop performs the secure lockdown: guards stay attached (denying all non-whitelisted access)
 // until every resource is keyless; only then do LSM hooks detach. A resource whose key can't be
 // deprovisioned blocks shutdown indefinitely (the daemon logs how to find the pinning process):
@@ -832,6 +840,9 @@ func (d *daemonUseCase) Stop() {
 		d.lockUntilAllKeyless(resources, guards, roots)
 
 		for _, g := range guards {
+			if d.handOver.Load() {
+				g.HandOver()
+			}
 			g.Stop()
 		}
 		// Guards orphaned by an aborted reload (their resource could not
