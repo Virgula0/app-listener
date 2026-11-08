@@ -245,6 +245,90 @@ func (s *IntegrationSuite) TestDaemon_RuntimeSectionLogin() {
 	s.Require().Equalf(0, code, "with no daemon running a login goes ahead: %s", out)
 }
 
+// A clean stop keeps a runtime section guarded until the next start's guards hold it, also when an
+// update replaced the binary in between: a listener, symlink or entry the user planted while the
+// daemon was down would be guarded as found, and an agent client would hand its secret to it.
+func (s *IntegrationSuite) TestDaemon_RuntimeSectionGuardedAcrossRestart() {
+	c := s.startContainer("ubuntu:latest", "linux/amd64", true, amd64Bin)
+	defer c.Terminate(s.ctx)
+
+	code, out := s.exec(c, []string{"sh", "-c", "command -v ssh-agent >/dev/null 2>&1 || " +
+		"(timeout 120 apt-get update -qq && timeout 120 apt-get install -y -qq --no-install-recommends openssh-client >/dev/null)"})
+	if code != 0 {
+		s.T().Skipf("openssh-client unavailable: %s", out)
+	}
+	const dir = "/run/user/1000/ssh-agent"
+	const sock = dir + "/socket"
+	code, out = s.exec(c, []string{"sh", "-c", "(id -u 1000 >/dev/null 2>&1 || useradd -u 1000 -m u1000) && " +
+		"mkdir -p /watch /etc/app-listener /exploits /run/user/1000 && " +
+		"mount -t tmpfs -o mode=0700,uid=1000,gid=1000 tmpfs /run/user/1000"})
+	s.Require().Equalf(0, code, "setup: %s", out)
+	s.Require().NoError(c.CopyFileToContainer(s.ctx, absPath("./exploits/unix_connect"), "/exploits/unix_connect", 0755))
+	asUser := func(cmd string) (int, string) {
+		return s.exec(c, []string{"setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "sh", "-c", cmd})
+	}
+
+	const always = "[watch /watch]\nneed_encryption: false\n/usr/bin/true\n"
+	conf := always + "\n[watch " + dir + "]\nruntime: true\n/usr/bin/ssh-agent MKNOD,DELETE,STAT\n" +
+		"/usr/bin/ssh-add CONNECT,STAT\n/usr/bin/stat STAT\nneed_encryption: false\n"
+	s.exec(c, []string{"sh", "-c", "cat > /etc/app-listener/daemon.conf <<'EOF'\n" + conf + "EOF"})
+	s.launchDaemon(c)
+	s.awaitDaemonUp(c, always)
+	code, out = s.exec(c, []string{"/app-listener", "daemon", "login", "1000"})
+	s.Require().Equalf(0, code, "daemon login: %s\n%s", out, s.readDaemonLog(c))
+	isSock := "[ \"$(stat -c %F " + sock + ")\" = socket ]"
+	code, out = asUser("(nohup /usr/bin/ssh-agent -D -a " + sock + " >/tmp/agent.log 2>&1 &) && " +
+		"for i in $(seq 50); do " + isSock + " 2>/dev/null && exit 0; sleep 0.1; done; cat /tmp/agent.log; exit 1")
+	s.Require().Equalf(0, code, "ssh-agent could not bind in the runtime dir: %s", out)
+
+	// Hammers the section from before the stop until the restarted daemon is up.
+	planter := s.capturePID(c, "setpriv --reuid=1000 --regid=1000 --clear-groups nohup sh -c 'while :; do "+
+		"mkdir "+dir+"/race 2>/dev/null && touch /tmp/raced; mv "+sock+" "+sock+".x 2>/dev/null && touch /tmp/raced; "+
+		"done' >/dev/null 2>&1 &")
+	defer s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null; true", planter)})
+
+	s.exec(c, []string{"sh", "-c", "pkill -f 'app-listener daemon' || true"})
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
+
+	plants := []struct{ name, cmd string }{
+		{"unlink", "unlink " + sock},
+		{"rename", "mv " + sock + " " + dir + "/moved"},
+		{"symlink", "ln -s /tmp/evil.sock " + dir + "/evil"},
+		{"mkdir", "mkdir " + dir + "/sub"},
+		{"bind", "timeout 2 /exploits/unix_connect serve " + dir + "/evil.sock stream"},
+	}
+	for _, p := range plants {
+		code, out := asUser(p.cmd + " 2>&1")
+		s.Require().NotEqualf(0, code, "%s in the runtime section succeeded while the daemon was stopped: %s", p.name, out)
+	}
+	// Through the whitelisted stat: the guard denies every other probe inside the section.
+	code, out = s.exec(c, []string{"sh", "-c", "stat -c %F " + sock + "; for p in moved evil sub evil.sock; do " +
+		"stat " + dir + "/$p >/dev/null 2>&1 && echo planted $p; done; true"})
+	s.Require().Equalf("socket", strings.TrimSpace(out), "the section changed while stopped: %d", code)
+
+	// An update deploys a new inode at the same path: the stopped daemon's pins know only the old one.
+	code, out = s.exec(c, []string{"sh", "-c", "cp /app-listener /app-listener.new && mv /app-listener.new /app-listener"})
+	s.Require().Equalf(0, code, "replacing the binary: %s", out)
+	s.launchDaemon(c)
+	s.awaitDaemonUp(c, conf)
+	s.exec(c, []string{"sh", "-c", fmt.Sprintf("kill %d 2>/dev/null; true", planter)})
+	raced, _ := s.exec(c, []string{"test", "-e", "/tmp/raced"})
+	s.Require().NotEqualf(0, raced, "the user changed the runtime section across the restart:\n%s", s.readDaemonLog(c))
+
+	code, out = asUser("SSH_AUTH_SOCK=" + sock + " /usr/bin/ssh-add -l 2>&1")
+	s.Require().Equalf(1, code, "whitelisted ssh-add must reach the agent after the restart: %s\n%s", out, s.readDaemonLog(c))
+	code, out = asUser("mkdir " + dir + "/sub 2>&1")
+	s.Require().NotEqualf(0, code, "the restarted daemon does not guard the section: %s", out)
+	// Only this run's pins are left: the stopped run's were retired once the new guards held the tree.
+	code, out = s.exec(c, []string{"sh", "-c",
+		"ls /sys/fs/bpf/app-listener | sed -n 's/^al-\\([a-z0-9]*\\)-.*/\\1/p' | sort -u | wc -l"})
+	s.Require().Equalf("1", strings.TrimSpace(out), "stale pin generations left after the restart (%d):\n%s",
+		code, s.readDaemonLog(c))
+
+	s.exec(c, []string{"sh", "-c", "pkill ssh-agent; pkill -f 'app-listener daemon' || true"})
+	s.Require().True(s.awaitDaemonDead(c, daemonShutdownTimeout), "daemon did not exit")
+}
+
 // A runtime dir the user made before the daemon started (an agent unit's `mkdir -p`) is guarded as
 // found: the daemon plants the root-owned sentinel then too, so a TERMed agent's cleanup can't leave
 // the root empty for an rmdir and a re-made, unguarded dir. An empty watch root's own rmdir is judged.
