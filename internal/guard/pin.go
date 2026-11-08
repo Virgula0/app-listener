@@ -208,9 +208,9 @@ func retirePins(base string, retire func(gen string) bool) (removed int, err err
 	return removed, nil
 }
 
-// foreignPinnedLink returns a short description when l is demonstrably NOT one of this guard's LSM
-// links (a non-LSM program, or an LSM program outside our guard_* namespace), so CleanupStalePins
-// leaves it alone even if its file name matched. Conservative: if the link/program can't be
+// foreignPinnedLink returns a short description when l is demonstrably NOT one of this guard's links
+// (a program neither LSM nor tracing, the tp_btf fork/exec hooks, or one outside our guard_*
+// namespace), so CleanupStalePins leaves it alone even if its file name matched. Conservative: if the link/program can't be
 // introspected (older kernel, missing capability) it returns "" and the file-name match (already
 // app-listener specific) decides.
 func foreignPinnedLink(l link.Link) string {
@@ -227,11 +227,11 @@ func foreignPinnedLink(l link.Link) string {
 	if err != nil {
 		return ""
 	}
-	if pInfo.Type != cilium.LSM {
+	if pInfo.Type != cilium.LSM && pInfo.Type != cilium.Tracing {
 		return fmt.Sprintf("%s program", pInfo.Type)
 	}
 	if !strings.HasPrefix(pInfo.Name, "guard_") {
-		return fmt.Sprintf("foreign LSM program %q", pInfo.Name)
+		return fmt.Sprintf("foreign %s program %q", pInfo.Type, pInfo.Name)
 	}
 	return ""
 }
